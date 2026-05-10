@@ -1,0 +1,135 @@
+{
+  "description": "Ground truth font identification for historical test documents",
+  "documents": [
+    {
+      "file": "1545-garamond-estienne-bible.pdf",
+      "era": "French Renaissance",
+      "year": 1545,
+      "expected_font": "Garamond",
+      "font_class": "serif",
+      "modern_equivalent": "EB Garamond",
+      "confidence": "high",
+      "notes": "Robert Estienne's Bible, set in Claude Garamond's original roman types"
+    },
+    {
+      "file": "1734-caslon-type-specimen.pdf",
+      "era": "English Old Style",
+      "year": 1734,
+      "expected_font": "Caslon",
+      "font_class": "serif",
+      "modern_equivalent": "Libre Caslon Text",
+      "confidence": "high",
+      "notes": "Direct specimen from the Caslon type foundry"
+    },
+    {
+      "file": "1757-baskerville-virgil.pdf",
+      "era": "Transitional",
+      "year": 1757,
+      "expected_font": "Baskerville",
+      "font_class": "serif",
+      "modern_equivalent": "Libre Baskerville",
+      "confidence": "high",
+      "notes": "First book from Baskerville's press, debut of the typeface"
+    },
+    {
+      "file": "1776-caslon-dunlap-broadside.pdf",
+      "era": "Colonial American",
+      "year": 1776,
+      "expected_font": "Caslon",
+      "font_class": "serif",
+      "modern_equivalent": "Libre Caslon Text",
+      "confidence": "high",
+      "notes": "Dunlap Broadside - first printing of the Declaration of Independence"
+    },
+    {
+      "file": "1818-bodoni-manuale-tipografico.pdf",
+      "era": "Modern/Didone",
+      "year": 1818,
+      "expected_font": "Bodoni",
+      "font_class": "serif",
+      "modern_equivalent": "Libre Bodoni",
+      "confidence": "high",
+      "notes": "Bodoni's definitive type specimen, 250+ faces in 8 languages"
+    },
+    {
+      "file": "1870s-victorian-slab-serif-specimen.pdf",
+      "era": "Victorian/Industrial",
+      "year": 1875,
+      "expected_font": "Clarendon/Slab Serif",
+      "font_class": "slab-serif",
+      "modern_equivalent": "Clarendon, Rockwell",
+      "confidence": "medium-high",
+      "notes": "H.W. Caslon & Co. display type catalog - various Victorian display faces"
+    },
+    {
+      "file": "1923-bauhaus-weimar-catalog.pdf",
+      "era": "Bauhaus/Modernist",
+      "year": 1923,
+      "expected_font": "Geometric sans-serif",
+      "font_class": "sans",
+      "modern_equivalent": "Futura, Jost",
+      "confidence": "medium",
+      "notes": "Bauhaus exhibition catalog - various geometric and sans-serif types"
+    },
+    {
+      "file": "1961-courier-eisenhower-farewell.pdf",
+      "era": "Typewriter",
+      "year": 1961,
+      "expected_font": "Courier",
+      "font_class": "mono",
+      "modern_equivalent": "Courier New",
+      "confidence": "high",
+      "notes": "White House press release - IBM typewriter monospace"
+    },
+    {
+      "file": "1961-courier-cia-memo.pdf",
+      "era": "Typewriter",
+      "year": 1961,
+      "expected_font": "Courier",
+      "font_class": "mono",
+      "modern_equivalent": "Courier New",
+      "confidence": "high",
+      "notes": "CIA declassified memo - government typewriter monospace"
+    },
+    {
+      "file": "1970-tnr-irs-1040.pdf",
+      "era": "Government Forms",
+      "year": 1970,
+      "expected_font": "Times New Roman",
+      "font_class": "serif",
+      "modern_equivalent": "Times New Roman",
+      "confidence": "medium",
+      "notes": "IRS Form 1040 - likely TNR body with Helvetica headings"
+    },
+    {
+      "file": "1976-helvetica-nasa-standards.pdf",
+      "era": "Swiss Style/Helvetica",
+      "year": 1976,
+      "expected_font": "Helvetica",
+      "font_class": "sans",
+      "modern_equivalent": "Helvetica, NimbusSans",
+      "confidence": "high",
+      "notes": "NASA Graphics Standards Manual - Helvetica specimen and usage guide"
+    },
+    {
+      "file": "1999-tnr-irs-w4.pdf",
+      "era": "Digital Forms",
+      "year": 1999,
+      "expected_font": "Times New Roman",
+      "font_class": "serif",
+      "modern_equivalent": "Times New Roman",
+      "confidence": "medium",
+      "notes": "IRS Form W-4 - digital-era government form"
+    },
+    {
+      "file": "2000-tnr-irs-1040.pdf",
+      "era": "Digital Forms",
+      "year": 2000,
+      "expected_font": "Times New Roman",
+      "font_class": "serif",
+      "modern_equivalent": "Times New Roman",
+      "confidence": "medium",
+      "notes": "IRS Form 1040 - digital-era government form"
+    }
+  ]
+}

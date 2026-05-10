@@ -1,0 +1,6 @@
+/target/
+*.pdf
+*.png
+/test-docs/resolution-series/
+/test-docs/font-timeline-specimen.pdf
+/test-docs/font-timeline-specimen-scanned.pdf

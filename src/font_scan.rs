@@ -1,0 +1,557 @@
+//! Font scanning — discover .ttf / .otf fonts on all standard system paths,
+//! with aliasing for Microsoft and LaTeX font families.
+//!
+//! For each font file, the scanner creates a base `FontEntry` plus one
+//! additional entry per OpenType feature that changes glyph shapes for
+//! common Latin characters. This means a font like Source Serif 4 with
+//! `onum`, `smcp`, `ss01`, and `ss02` support produces 5 catalog entries:
+//! the default plus one per feature variant.
+//!
+//! During matching (`font_match.rs`), each variant entry carries a
+//! `glyph_overrides` map so the renderer uses the correct glyph IDs.
+//! SSIM comparison naturally picks the best-matching variant without
+//! needing explicit figure-style or small-caps detection heuristics.
+//!
+//! The OT feature detection uses `rustybuzz` (a pure-Rust harfbuzz port)
+//! to shape a Latin probe string with each feature enabled, then compares
+//! the resulting glyph IDs against the default shaping. Only features
+//! that produce at least one different glyph ID are emitted as variants.
+
+use ab_glyph::{Font, FontRef, PxScale, ScaleFont};
+use log::debug;
+use std::collections::HashMap;
+use std::path::{Path, PathBuf};
+use walkdir::WalkDir;
+
+// ---------------------------------------------------------------------------
+// Types
+// ---------------------------------------------------------------------------
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum FontClass {
+    Serif,
+    Sans,
+    Mono,
+    Unknown,
+}
+
+#[derive(Debug, Clone)]
+pub struct FontEntry {
+    pub path: PathBuf,
+    pub family_name: String,
+    pub is_bold: bool,
+    pub is_italic: bool,
+    pub class: FontClass,
+    pub data: Vec<u8>,
+    /// True if the font uses old-style (text/ranging) figures where digits
+    /// like 3, 5, 7, 9 have descenders below the baseline.
+    pub oldstyle_figures: bool,
+    /// OT feature tag this variant represents (empty string for default entry).
+    pub variant_tag: String,
+    /// For variant entries: maps characters to their feature-specific glyph IDs.
+    /// Only characters whose glyph ID differs from default are included.
+    /// None for the default entry (use normal cmap lookup).
+    pub glyph_overrides: Option<Vec<(char, u16)>>,
+}
+
+// ---------------------------------------------------------------------------
+// Public API
+// ---------------------------------------------------------------------------
+
+/// Build the full set of font search directories for the current platform,
+/// plus any user-supplied extra dirs.
+pub fn default_font_dirs(extra: &[PathBuf]) -> Vec<PathBuf> {
+    let mut dirs: Vec<PathBuf> = Vec::new();
+
+    // ── Linux ────────────────────────────────────────────────────────
+    dirs.push("/usr/share/fonts".into());
+    dirs.push("/usr/local/share/fonts".into());
+    dirs.push("/usr/share/fonts/truetype/msttcorefonts".into());
+
+    // TeX Live (OTF + TTF)
+    dirs.push("/usr/share/texlive/texmf-dist/fonts/opentype".into());
+    dirs.push("/usr/share/texlive/texmf-dist/fonts/truetype".into());
+    dirs.push("/usr/share/texmf/fonts/opentype".into());
+    dirs.push("/usr/share/texmf/fonts/truetype".into());
+
+    // ── macOS ────────────────────────────────────────────────────────
+    dirs.push("/Library/Fonts".into());
+    dirs.push("/System/Library/Fonts".into());
+
+    // ── Windows ──────────────────────────────────────────────────────
+    dirs.push("C:\\Windows\\Fonts".into());
+
+    // ── User-level dirs ──────────────────────────────────────────────
+    if let Some(home) = std::env::var_os("HOME") {
+        let h = PathBuf::from(home);
+        dirs.push(h.join(".fonts"));
+        dirs.push(h.join(".local/share/fonts"));
+        // macOS user
+        dirs.push(h.join("Library/Fonts"));
+        // User TeX fonts
+        dirs.push(h.join("texmf/fonts"));
+    }
+
+    // User-supplied extras
+    for d in extra {
+        dirs.push(d.clone());
+    }
+
+    dirs
+}
+
+/// Walk the given directories for .ttf / .otf files and return a catalogue.
+pub fn scan_fonts(dirs: &[PathBuf]) -> Vec<FontEntry> {
+    let aliases = build_alias_table();
+    let mut fonts = Vec::new();
+
+    for dir in dirs {
+        if !dir.exists() {
+            continue;
+        }
+        for entry in WalkDir::new(dir)
+            .follow_links(true)
+            .into_iter()
+            .filter_map(|e| e.ok())
+        {
+            let path = entry.path();
+            let ext = path
+                .extension()
+                .and_then(|e| e.to_str())
+                .unwrap_or("")
+                .to_lowercase();
+            if ext != "ttf" && ext != "otf" {
+                continue;
+            }
+            if let Some(fe) = load_font_entry(path, &aliases) {
+                let fig_label = if fe.oldstyle_figures { "OLDSTYLE" } else { "lining" };
+                debug!("  Font: {} [{}] [{}] {}", fe.family_name, class_label(fe.class), fig_label, fe.path.display());
+                // Probe all OT features — emit a variant entry for each that changes glyphs
+                let variants = detect_ot_variants(&fe.data);
+                for (tag, overrides) in &variants {
+                    let mut var_entry = fe.clone();
+                    var_entry.variant_tag = tag.clone();
+                    var_entry.glyph_overrides = Some(overrides.clone());
+                    var_entry.family_name = format!("{} [{}]", fe.family_name, tag);
+                    debug!("    + variant [{}]: {} glyph overrides", tag, overrides.len());
+                    fonts.push(var_entry);
+                }
+                fonts.push(fe);
+            }
+        }
+    }
+
+    fonts
+}
+
+// ---------------------------------------------------------------------------
+// Alias table
+// ---------------------------------------------------------------------------
+
+struct Alias {
+    family: &'static str,
+    bold: bool,
+    italic: bool,
+}
+
+fn build_alias_table() -> HashMap<String, Alias> {
+    let mut m = HashMap::new();
+
+    macro_rules! a {
+        ($stem:expr, $fam:expr, $b:expr, $i:expr) => {
+            m.insert($stem.to_string(), Alias { family: $fam, bold: $b, italic: $i });
+        };
+    }
+
+    // ── Microsoft core fonts ─────────────────────────────────────────
+    a!("arial",       "Arial", false, false);
+    a!("arialbd",     "Arial", true,  false);
+    a!("ariali",      "Arial", false, true);
+    a!("arialbi",     "Arial", true,  true);
+    a!("arial_bold",  "Arial", true,  false);
+    a!("arialn",      "Arial Narrow", false, false);
+    a!("arialnb",     "Arial Narrow", true,  false);
+    a!("arialni",     "Arial Narrow", false, true);
+    a!("arialnbi",    "Arial Narrow", true,  true);
+    a!("ariblk",      "Arial Black", false, false);
+
+    a!("times",       "Times New Roman", false, false);
+    a!("timesbd",     "Times New Roman", true,  false);
+    a!("timesi",      "Times New Roman", false, true);
+    a!("timesbi",     "Times New Roman", true,  true);
+
+    a!("cour",        "Courier New", false, false);
+    a!("courbd",      "Courier New", true,  false);
+    a!("couri",       "Courier New", false, true);
+    a!("courbi",      "Courier New", true,  true);
+
+    a!("calibri",     "Calibri", false, false);
+    a!("calibrib",    "Calibri", true,  false);
+    a!("calibrii",    "Calibri", false, true);
+    a!("calibriz",    "Calibri", true,  true);
+    a!("calibril",    "Calibri Light", false, false);
+    a!("calibrili",   "Calibri Light", false, true);
+
+    a!("cambria",     "Cambria", false, false);
+    a!("cambriab",    "Cambria", true,  false);
+    a!("cambriai",    "Cambria", false, true);
+    a!("cambriaz",    "Cambria", true,  true);
+
+    a!("verdana",     "Verdana", false, false);
+    a!("verdanab",    "Verdana", true,  false);
+    a!("verdanai",    "Verdana", false, true);
+    a!("verdanaz",    "Verdana", true,  true);
+
+    a!("tahoma",      "Tahoma", false, false);
+    a!("tahomabd",    "Tahoma", true,  false);
+
+    a!("georgia",     "Georgia", false, false);
+    a!("georgiab",    "Georgia", true,  false);
+    a!("georgiai",    "Georgia", false, true);
+    a!("georgiaz",    "Georgia", true,  true);
+
+    a!("trebuc",      "Trebuchet MS", false, false);
+    a!("trebucbd",    "Trebuchet MS", true,  false);
+    a!("trebucit",    "Trebuchet MS", false, true);
+    a!("trebucbi",    "Trebuchet MS", true,  true);
+
+    a!("comic",       "Comic Sans MS", false, false);
+    a!("comicbd",     "Comic Sans MS", true,  false);
+    a!("comici",      "Comic Sans MS", false, true);
+
+    a!("consola",     "Consolas", false, false);
+    a!("consolab",    "Consolas", true,  false);
+    a!("consolai",    "Consolas", false, true);
+    a!("consolaz",    "Consolas", true,  true);
+
+    a!("segoeui",     "Segoe UI", false, false);
+    a!("segoeuib",    "Segoe UI", true,  false);
+    a!("segoeuii",    "Segoe UI", false, true);
+    a!("segoeuiz",    "Segoe UI", true,  true);
+    a!("seguisb",     "Segoe UI Semibold", true, false);
+
+    a!("garamond",    "Garamond", false, false);
+    a!("aptos",       "Aptos", false, false);
+    a!("aptosb",      "Aptos", true,  false);
+
+    a!("gothicb",     "Century Gothic", true,  false);
+    a!("gothic",      "Century Gothic", false, false);
+
+    a!("bkant",       "Book Antiqua", false, false);
+    a!("pala",        "Palatino Linotype", false, false);
+    a!("palab",       "Palatino Linotype", true,  false);
+    a!("palai",       "Palatino Linotype", false, true);
+    a!("palabi",      "Palatino Linotype", true,  true);
+
+    // ── LaTeX / TeX fonts ────────────────────────────────────────────
+    a!("lmroman10-regular",     "Latin Modern Roman", false, false);
+    a!("lmroman10-bold",        "Latin Modern Roman", true,  false);
+    a!("lmroman10-italic",      "Latin Modern Roman", false, true);
+    a!("lmroman10-bolditalic",  "Latin Modern Roman", true,  true);
+    a!("lmroman12-regular",     "Latin Modern Roman", false, false);
+    a!("lmroman12-bold",        "Latin Modern Roman", true,  false);
+    a!("lmsans10-regular",      "Latin Modern Sans",  false, false);
+    a!("lmsans10-bold",         "Latin Modern Sans",  true,  false);
+    a!("lmsans10-oblique",      "Latin Modern Sans",  false, true);
+    a!("lmmono10-regular",      "Latin Modern Mono",  false, false);
+    a!("lmmono10-italic",       "Latin Modern Mono",  false, true);
+
+    // STIX Two
+    a!("stixtwotextregular",     "STIX Two Text", false, false);
+    a!("stixtwotextbold",        "STIX Two Text", true,  false);
+    a!("stixtwotextitalic",      "STIX Two Text", false, true);
+    a!("stixtwotextbolditalic",  "STIX Two Text", true,  true);
+
+    // TeX Gyre families
+    a!("texgyretermes-regular",  "TeX Gyre Termes", false, false);
+    a!("texgyretermes-bold",     "TeX Gyre Termes", true,  false);
+    a!("texgyretermes-italic",   "TeX Gyre Termes", false, true);
+    a!("texgyreheros-regular",   "TeX Gyre Heros",  false, false);
+    a!("texgyreheros-bold",      "TeX Gyre Heros",  true,  false);
+    a!("texgyrepagella-regular", "TeX Gyre Pagella", false, false);
+    a!("texgyrepagella-bold",    "TeX Gyre Pagella", true,  false);
+    a!("texgyrecursor-regular",  "TeX Gyre Cursor",  false, false);
+    a!("texgyrecursor-bold",     "TeX Gyre Cursor",  true,  false);
+    a!("texgyrebonum-regular",   "TeX Gyre Bonum",   false, false);
+    a!("texgyreschola-regular",  "TeX Gyre Schola",  false, false);
+    a!("texgyreadventor-regular","TeX Gyre Adventor", false, false);
+
+    // Libertinus
+    a!("libertinusserif-regular",  "Libertinus Serif", false, false);
+    a!("libertinusserif-bold",     "Libertinus Serif", true,  false);
+    a!("libertinusserif-italic",   "Libertinus Serif", false, true);
+    a!("libertinussans-regular",   "Libertinus Sans",  false, false);
+
+    // ── Typewriter fonts ─────────────────────────────────────────────
+    a!("ogcourier",               "OGCourier", false, false);
+    a!("ogcourier-bold",          "OGCourier", true,  false);
+    a!("ogcourier-italic",        "OGCourier", false, true);
+    a!("ogcourier-bolditalic",    "OGCourier", true,  true);
+    a!("courierprime-regular",    "CourierPrime", false, false);
+    a!("courierprime-bold",       "CourierPrime", true,  false);
+    a!("courierprime-italic",     "CourierPrime", false, true);
+    a!("courierprime-bolditalic", "CourierPrime", true,  true);
+    a!("cutivemono-regular",      "CutiveMono", false, false);
+    a!("specialelite-regular",    "SpecialElite", false, false);
+    a!("ibmselectriclightregular","IBM Selectric Light", false, false);
+    a!("ibmselectriclightitalic", "IBM Selectric Light", false, true);
+
+    // Prestige Elite
+    a!("prestigeelitestd-bd",     "Prestige Elite Std", true,  false);
+    a!("prestigeelitestd-regular","Prestige Elite Std", false, false);
+    a!("prestigeelitestd",        "Prestige Elite Std", false, false);
+
+    // Letter Gothic (URW)
+    a!("lettergothic-reg",        "Letter Gothic", false, false);
+    a!("lettergothic-bol",        "Letter Gothic", true,  false);
+    a!("lettergothic-ita",        "Letter Gothic", false, true);
+    a!("lettergothic-bolita",     "Letter Gothic", true,  true);
+    // letr45w is URW Letter Gothic Regular (URW naming convention)
+    a!("letr45w",                 "Letter Gothic", false, false);
+
+    m
+}
+
+// ---------------------------------------------------------------------------
+// Classification
+// ---------------------------------------------------------------------------
+
+const SERIF_HINTS: &[&str] = &[
+    "times", "georgia", "garamond", "cambria", "palatino", "book antiqua",
+    "bookman", "century schoolbook", "century", "computer modern",
+    "latin modern roman", "cmu serif", "stix", "libertinus serif",
+    "tex gyre termes", "tex gyre pagella", "tex gyre bonum", "tex gyre schola",
+    "concrete", "minion", "caslon", "baskerville",
+];
+
+const SANS_HINTS: &[&str] = &[
+    "arial", "helvetica", "calibri", "verdana", "tahoma", "segoe",
+    "trebuchet", "comic sans", "aptos", "century gothic", "avant garde",
+    "cmu sans", "latin modern sans", "computer modern sans",
+    "libertinus sans", "tex gyre heros", "tex gyre adventor",
+    "fira sans", "open sans", "roboto", "lato", "noto sans",
+];
+
+const MONO_HINTS: &[&str] = &[
+    "courier", "consolas", "menlo", "monaco", "cmu typewriter",
+    "latin modern mono", "computer modern typewriter", "tex gyre cursor",
+    "fira code", "fira mono", "source code", "inconsolata", "lucida console",
+    "dejavu sans mono", "liberation mono", "ubuntu mono",
+    "freemono",
+    // Typewriter fonts — monospaced by nature
+    "prestige", "selectric", "letter gothic", "lettergothic",
+    "cutive mono", "cutivemono", "special elite", "specialelite",
+    "og courier", "ogcourier", "courier prime", "courierprime",
+];
+
+fn classify(family: &str) -> FontClass {
+    let lower = family.to_lowercase();
+    if MONO_HINTS.iter().any(|h| lower.contains(h)) {
+        FontClass::Mono
+    } else if SERIF_HINTS.iter().any(|h| lower.contains(h)) {
+        FontClass::Serif
+    } else if SANS_HINTS.iter().any(|h| lower.contains(h)) {
+        FontClass::Sans
+    } else {
+        FontClass::Unknown
+    }
+}
+
+fn class_label(c: FontClass) -> &'static str {
+    match c {
+        FontClass::Serif => "serif",
+        FontClass::Sans  => "sans",
+        FontClass::Mono  => "mono",
+        FontClass::Unknown => "?",
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Font loading
+// ---------------------------------------------------------------------------
+
+/// Detect whether a font uses old-style (text/ranging) figures.
+///
+/// Old-style figures have varying heights: digits like 3, 5, 7, 9 typically
+/// descend below the baseline, while 6 and 8 ascend higher. Lining figures
+/// are all the same height (cap-height) and sit on the baseline.
+///
+/// We check by rendering '0' and '3' and comparing their vertical bounds.
+/// If '3' descends noticeably below '0', it's old-style.
+fn detect_oldstyle_figures(data: &[u8]) -> bool {
+    let font = match FontRef::try_from_slice(data) {
+        Ok(f) => f,
+        Err(_) => return false,
+    };
+
+    let scale = PxScale::from(100.0);
+    let ascent = font.as_scaled(scale).ascent();
+
+    // Position glyphs at the baseline so we can compare their actual outlines.
+    let gid_0 = font.glyph_id('0');
+    let gid_3 = font.glyph_id('3');
+    if gid_0.0 == 0 || gid_3.0 == 0 {
+        return false;
+    }
+
+    let g0 = gid_0.with_scale_and_position(scale, ab_glyph::point(0.0, ascent));
+    let g3 = gid_3.with_scale_and_position(scale, ab_glyph::point(0.0, ascent));
+
+    let og0 = match font.outline_glyph(g0) {
+        Some(o) => o,
+        None => return false,
+    };
+    let og3 = match font.outline_glyph(g3) {
+        Some(o) => o,
+        None => return false,
+    };
+
+    let b0 = og0.px_bounds();
+    let b3 = og3.px_bounds();
+
+    let height_0 = b0.max.y - b0.min.y;
+    if height_0 < 1.0 {
+        return false;
+    }
+
+    // If '3' extends further below than '0', it has a descender (old-style).
+    let descent_diff = b3.max.y - b0.max.y;
+
+    // 15% of '0' height threshold
+    descent_diff > height_0 * 0.15
+}
+
+/// OpenType features to probe for variant generation.
+/// Only features that are OFF by default in most renderers — so they represent
+/// deliberate typographic choices that change glyph shapes.
+const VARIANT_FEATURES: &[&[u8; 4]] = &[
+    b"onum",  // Old-style (text) numerals
+    b"lnum",  // Lining numerals (explicit — some fonts default to onum)
+    b"smcp",  // Small capitals
+    b"c2sc",  // Capitals to small caps
+    b"swsh",  // Swash alternates
+    b"salt",  // Stylistic alternates
+    b"titl",  // Titling alternates
+    b"hist",  // Historical forms
+    b"ss01", b"ss02", b"ss03", b"ss04", b"ss05",
+    b"ss06", b"ss07", b"ss08", b"ss09", b"ss10",
+    b"ss11", b"ss12", b"ss13", b"ss14", b"ss15",
+    b"ss16", b"ss17", b"ss18", b"ss19", b"ss20",
+];
+
+/// Test string covering Latin alphanumerics + a few common punctuation marks.
+const PROBE_STRING: &str = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789";
+
+/// Use rustybuzz to detect which OT features produce different glyph IDs
+/// for common Latin characters. Returns a vec of (feature_tag, glyph_overrides)
+/// for each feature that changes at least one glyph.
+fn detect_ot_variants(data: &[u8]) -> Vec<(String, Vec<(char, u16)>)> {
+    let face = match rustybuzz::Face::from_slice(data, 0) {
+        Some(f) => f,
+        None => return Vec::new(),
+    };
+
+    // Shape with no extra features (default rendering)
+    let mut buf_default = rustybuzz::UnicodeBuffer::new();
+    buf_default.push_str(PROBE_STRING);
+    let out_default = rustybuzz::shape(&face, &[], buf_default);
+    let default_ids: Vec<u16> = out_default
+        .glyph_infos()
+        .iter()
+        .map(|gi| gi.glyph_id as u16)
+        .collect();
+
+    let chars: Vec<char> = PROBE_STRING.chars().collect();
+    if default_ids.len() != chars.len() {
+        return Vec::new();
+    }
+
+    let mut variants = Vec::new();
+
+    for tag_bytes in VARIANT_FEATURES {
+        let tag = rustybuzz::ttf_parser::Tag::from_bytes(tag_bytes);
+        let features = [rustybuzz::Feature::new(tag, 1, ..)];
+
+        let mut buf = rustybuzz::UnicodeBuffer::new();
+        buf.push_str(PROBE_STRING);
+        let out = rustybuzz::shape(&face, &features, buf);
+        let feat_ids: Vec<u16> = out
+            .glyph_infos()
+            .iter()
+            .map(|gi| gi.glyph_id as u16)
+            .collect();
+
+        if feat_ids.len() != chars.len() {
+            continue;
+        }
+
+        // Collect only characters whose glyph ID actually changed
+        let overrides: Vec<(char, u16)> = chars
+            .iter()
+            .zip(default_ids.iter())
+            .zip(feat_ids.iter())
+            .filter(|((_, def), feat)| def != feat)
+            .map(|((ch, _), feat)| (*ch, *feat))
+            .collect();
+
+        if !overrides.is_empty() {
+            let tag_str = std::str::from_utf8(tag_bytes.as_slice())
+                .unwrap_or("????")
+                .to_string();
+            variants.push((tag_str, overrides));
+        }
+    }
+
+    variants
+}
+
+fn load_font_entry(path: &Path, aliases: &HashMap<String, Alias>) -> Option<FontEntry> {
+    let data = std::fs::read(path).ok()?;
+
+    // Verify ab_glyph can parse it (reject corrupt files)
+    let _ = ab_glyph::FontRef::try_from_slice(&data).ok()?;
+
+    let oldstyle_figures = detect_oldstyle_figures(&data);
+
+    let stem = path
+        .file_stem()
+        .and_then(|s| s.to_str())
+        .unwrap_or("Unknown");
+
+    let stem_lower = stem.to_lowercase().replace(' ', "");
+
+    // Try alias table first (exact match on lowercase stem)
+    if let Some(alias) = aliases.get(&stem_lower) {
+        let class = classify(alias.family);
+        return Some(FontEntry {
+            path: path.to_path_buf(),
+            family_name: alias.family.to_string(),
+            is_bold: alias.bold,
+            is_italic: alias.italic,
+            class,
+            data,
+            oldstyle_figures,
+            variant_tag: String::new(),
+            glyph_overrides: None,
+        });
+    }
+
+    // Fallback: derive from filename
+    let family_name = stem.replace('-', " ").replace('_', " ");
+    let lower = family_name.to_lowercase();
+    let is_bold = lower.contains("bold") || lower.contains("black") || lower.contains("heavy");
+    let is_italic = lower.contains("italic") || lower.contains("oblique") || lower.contains("slant");
+    let class = classify(&family_name);
+
+    Some(FontEntry {
+        path: path.to_path_buf(),
+        family_name,
+        is_bold,
+        is_italic,
+        class,
+        data,
+        oldstyle_figures,
+        variant_tag: String::new(),
+        glyph_overrides: None,
+    })
+}
