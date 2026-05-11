@@ -1,256 +1,425 @@
 {
   "description": "Ground truth for font-timeline-specimen.pdf",
-  "generated": "2025-05-10",
+  "note": "Vector PDF with embedded TTF fonts + SVG logos. Scanned version is raster.",
   "sections": [
     {
       "index": 0,
       "era": "c. 1530 \u2014 The Garamond",
       "font_family": "EB Garamond",
-      "pango_font": "EB Garamond 12",
+      "rl_font": "EBGaramond",
       "source": "fonts.google.com/specimen/EB+Garamond \u2014 OFL, Georg Mayr-Duffner",
-      "features_demonstrated": [
-        "onum",
-        "smcp",
-        "ss01"
+      "has_logo_svg": true,
+      "has_headshot": true,
+      "styles_demonstrated": [
+        "regular",
+        "bold",
+        "italic"
       ]
     },
     {
       "index": 1,
       "era": "1722 \u2014 The Caslon",
       "font_family": "Libre Caslon Text",
-      "pango_font": "Libre Caslon Text",
+      "rl_font": "LibreCaslonText",
       "source": "fonts.google.com/specimen/Libre+Caslon+Text \u2014 OFL, Impallari Type",
-      "features_demonstrated": []
+      "has_logo_svg": false,
+      "has_headshot": true,
+      "styles_demonstrated": [
+        "regular",
+        "bold",
+        "italic"
+      ]
     },
     {
       "index": 2,
       "era": "1757 \u2014 The Baskerville",
       "font_family": "Libre Baskerville",
-      "pango_font": "Libre Baskerville",
+      "rl_font": "LibreBaskerville",
       "source": "fonts.google.com/specimen/Libre+Baskerville \u2014 OFL, Impallari Type",
-      "features_demonstrated": []
+      "has_logo_svg": false,
+      "has_headshot": true,
+      "styles_demonstrated": [
+        "regular",
+        "bold",
+        "italic"
+      ]
     },
     {
       "index": 3,
       "era": "1798 \u2014 The Bodoni",
       "font_family": "Libre Bodoni",
-      "pango_font": "Libre Bodoni",
+      "rl_font": "LibreBodoni",
       "source": "fonts.google.com/specimen/Libre+Bodoni \u2014 OFL, Impallari Type",
-      "features_demonstrated": []
+      "has_logo_svg": false,
+      "has_headshot": true,
+      "styles_demonstrated": [
+        "regular",
+        "bold",
+        "italic"
+      ]
     },
     {
       "index": 4,
       "era": "1845 \u2014 The Slab Serif",
       "font_family": "Zilla Slab",
-      "pango_font": "Zilla Slab",
+      "rl_font": "ZillaSlab",
       "source": "fonts.google.com/specimen/Zilla+Slab \u2014 OFL, Typotheque for Mozilla",
-      "features_demonstrated": []
+      "has_logo_svg": false,
+      "has_headshot": false,
+      "styles_demonstrated": [
+        "regular",
+        "bold",
+        "italic"
+      ]
     },
     {
       "index": 5,
-      "era": "1927 \u2014 Futura",
-      "font_family": "Jost",
-      "pango_font": "Jost",
-      "source": "fonts.google.com/specimen/Jost \u2014 OFL, Owen Earl (Futura stand-in)",
-      "features_demonstrated": []
+      "era": "c. 1895 \u2014 The Manual Typewriter",
+      "font_family": "Special Elite",
+      "rl_font": "SpecialElite",
+      "source": "fonts.google.com/specimen/Special+Elite \u2014 OFL, Astigmatic (manual typewriter recreation)",
+      "has_logo_svg": false,
+      "has_headshot": false,
+      "styles_demonstrated": [
+        "regular",
+        "bold",
+        "italic"
+      ]
     },
     {
       "index": 6,
-      "era": "1931 \u2014 Times New Roman",
-      "font_family": "Times New Roman",
-      "pango_font": "Times New Roman",
-      "source": "Bundled with Windows/Office \u2014 Monotype. Linux: apt install ttf-mscorefonts-installer",
-      "features_demonstrated": []
+      "era": "1927 \u2014 Futura",
+      "font_family": "Jost",
+      "rl_font": "Jost",
+      "source": "fonts.google.com/specimen/Jost \u2014 OFL, Owen Earl (Futura stand-in)",
+      "has_logo_svg": false,
+      "has_headshot": true,
+      "styles_demonstrated": [
+        "regular",
+        "bold",
+        "italic"
+      ]
     },
     {
       "index": 7,
-      "era": "1955 \u2014 Courier (IBM)",
-      "font_family": "Courier New",
-      "pango_font": "Courier New",
-      "source": "Bundled with Windows/Office \u2014 IBM origin. Linux: apt install ttf-mscorefonts-installer",
-      "features_demonstrated": []
+      "era": "1931 \u2014 Times New Roman",
+      "font_family": "Times New Roman",
+      "rl_font": "TimesNewRoman",
+      "source": "Bundled with Windows/Office \u2014 Monotype",
+      "has_logo_svg": false,
+      "has_headshot": true,
+      "styles_demonstrated": [
+        "regular",
+        "bold",
+        "italic"
+      ]
     },
     {
       "index": 8,
-      "era": "1957 \u2014 Helvetica / Arial",
-      "font_family": "Nimbus Sans",
-      "pango_font": "Nimbus Sans",
-      "source": "URW++ Helvetica clone \u2014 ships with ghostscript/texlive. fonts.urwpp.de",
-      "features_demonstrated": []
+      "era": "1953 \u2014 Prestige Elite",
+      "font_family": "Prestige Elite",
+      "rl_font": "PrestigeElite",
+      "source": "Originally for IBM Executive typewriters \u2014 12 characters per inch",
+      "has_logo_svg": false,
+      "has_headshot": false,
+      "styles_demonstrated": [
+        "regular",
+        "bold",
+        "italic"
+      ]
     },
     {
       "index": 9,
-      "era": "1982 \u2014 Arial (Microsoft)",
-      "font_family": "Arial",
-      "pango_font": "Arial",
-      "source": "Bundled with Windows/Office \u2014 Monotype. Linux: apt install ttf-mscorefonts-installer",
-      "features_demonstrated": []
+      "era": "1955 \u2014 Courier (IBM)",
+      "font_family": "Courier New",
+      "rl_font": "CourierNew",
+      "source": "IBM origin \u2014 Bundled with Windows/Office",
+      "has_logo_svg": true,
+      "has_headshot": false,
+      "styles_demonstrated": [
+        "regular",
+        "bold",
+        "italic"
+      ]
     },
     {
       "index": 10,
-      "era": "1993 \u2014 Georgia (Microsoft)",
-      "font_family": "Georgia",
-      "pango_font": "Georgia",
-      "source": "Bundled with Windows/Office \u2014 Matthew Carter. Linux: apt install ttf-mscorefonts-installer",
-      "features_demonstrated": []
+      "era": "1957 \u2014 Helvetica / Nimbus Sans",
+      "font_family": "Nimbus Sans",
+      "rl_font": "NimbusSans",
+      "source": "URW++ Helvetica clone \u2014 fonts.urwpp.de",
+      "has_logo_svg": false,
+      "has_headshot": true,
+      "styles_demonstrated": [
+        "regular",
+        "bold",
+        "italic"
+      ]
     },
     {
       "index": 11,
-      "era": "1996 \u2014 Verdana (Microsoft)",
-      "font_family": "Verdana",
-      "pango_font": "Verdana",
-      "source": "Bundled with Windows/Office \u2014 Matthew Carter. Linux: apt install ttf-mscorefonts-installer",
-      "features_demonstrated": []
+      "era": "1982 \u2014 Arial (Microsoft)",
+      "font_family": "Arial",
+      "rl_font": "Arial",
+      "source": "Bundled with Windows/Office \u2014 Monotype",
+      "has_logo_svg": true,
+      "has_headshot": false,
+      "styles_demonstrated": [
+        "regular",
+        "bold",
+        "italic"
+      ]
     },
     {
       "index": 12,
-      "era": "1994 \u2014 Comic Sans (Microsoft)",
-      "font_family": "Comic Sans MS",
-      "pango_font": "Comic Sans MS",
-      "source": "Bundled with Windows/Office \u2014 Vincent Connare. Linux: apt install ttf-mscorefonts-installer",
-      "features_demonstrated": []
+      "era": "1993 \u2014 Georgia (Microsoft)",
+      "font_family": "Georgia",
+      "rl_font": "Georgia",
+      "source": "Bundled with Windows/Office \u2014 Matthew Carter",
+      "has_logo_svg": false,
+      "has_headshot": true,
+      "styles_demonstrated": [
+        "regular",
+        "bold",
+        "italic"
+      ]
     },
     {
       "index": 13,
-      "era": "1996 \u2014 Trebuchet MS",
-      "font_family": "Trebuchet MS",
-      "pango_font": "Trebuchet MS",
-      "source": "Bundled with Windows/Office \u2014 Vincent Connare. Linux: apt install ttf-mscorefonts-installer",
-      "features_demonstrated": []
+      "era": "1996 \u2014 Verdana (Microsoft)",
+      "font_family": "Verdana",
+      "rl_font": "Verdana",
+      "source": "Bundled with Windows/Office \u2014 Matthew Carter",
+      "has_logo_svg": false,
+      "has_headshot": true,
+      "styles_demonstrated": [
+        "regular",
+        "bold",
+        "italic"
+      ]
     },
     {
       "index": 14,
-      "era": "2004 \u2014 The ClearType Collection (Microsoft)",
-      "font_family": "Caladea",
-      "pango_font": "Caladea",
-      "source": "fonts.google.com/specimen/Caladea \u2014 OFL, Carolina Giovagnoli (Cambria-compatible)",
-      "features_demonstrated": [
-        "onum"
+      "era": "1994 \u2014 Comic Sans (Microsoft)",
+      "font_family": "Comic Sans MS",
+      "rl_font": "ComicSansMS",
+      "source": "Bundled with Windows/Office \u2014 Vincent Connare",
+      "has_logo_svg": false,
+      "has_headshot": true,
+      "styles_demonstrated": [
+        "regular",
+        "bold",
+        "italic"
       ]
     },
     {
       "index": 15,
-      "era": "2010 \u2014 The Google Fonts Revolution: Roboto",
-      "font_family": "Roboto",
-      "pango_font": "Roboto",
-      "source": "fonts.google.com/specimen/Roboto \u2014 Apache 2.0, Christian Robertson for Google",
-      "features_demonstrated": [
-        "onum",
-        "smcp"
+      "era": "1996 \u2014 Trebuchet MS",
+      "font_family": "Trebuchet MS",
+      "rl_font": "TrebuchetMS",
+      "source": "Bundled with Windows/Office \u2014 Vincent Connare",
+      "has_logo_svg": false,
+      "has_headshot": true,
+      "styles_demonstrated": [
+        "regular",
+        "bold",
+        "italic"
       ]
     },
     {
       "index": 16,
-      "era": "2010 \u2014 Open Sans",
-      "font_family": "Open Sans",
-      "pango_font": "Open Sans",
-      "source": "fonts.google.com/specimen/Open+Sans \u2014 OFL, Steve Matteson for Google",
-      "features_demonstrated": []
+      "era": "2004 \u2014 The ClearType Collection",
+      "font_family": "Caladea",
+      "rl_font": "Caladea",
+      "source": "fonts.google.com/specimen/Caladea \u2014 OFL, Carolina Giovagnoli (Cambria-compatible)",
+      "has_logo_svg": true,
+      "has_headshot": false,
+      "styles_demonstrated": [
+        "regular",
+        "bold",
+        "italic"
+      ]
     },
     {
       "index": 17,
-      "era": "2010 \u2014 Lato",
-      "font_family": "Lato",
-      "pango_font": "Lato",
-      "source": "fonts.google.com/specimen/Lato \u2014 OFL, \u0141ukasz Dziedzic",
-      "features_demonstrated": []
+      "era": "2010 \u2014 Roboto (Google)",
+      "font_family": "Roboto",
+      "rl_font": "Roboto",
+      "source": "fonts.google.com/specimen/Roboto \u2014 Apache 2.0, Christian Robertson for Google",
+      "has_logo_svg": true,
+      "has_headshot": true,
+      "styles_demonstrated": [
+        "regular",
+        "bold",
+        "italic"
+      ]
     },
     {
       "index": 18,
-      "era": "2011 \u2014 Merriweather",
-      "font_family": "Merriweather",
-      "pango_font": "Merriweather",
-      "source": "fonts.google.com/specimen/Merriweather \u2014 OFL, Eben Sorkin",
-      "features_demonstrated": []
+      "era": "2010 \u2014 Open Sans (Google)",
+      "font_family": "Open Sans",
+      "rl_font": "OpenSans",
+      "source": "fonts.google.com/specimen/Open+Sans \u2014 OFL, Steve Matteson for Google",
+      "has_logo_svg": true,
+      "has_headshot": true,
+      "styles_demonstrated": [
+        "regular",
+        "bold",
+        "italic"
+      ]
     },
     {
       "index": 19,
-      "era": "2012 \u2014 Source Sans Pro (Adobe)",
-      "font_family": "Source Sans 3",
-      "pango_font": "Source Sans 3",
-      "source": "fonts.google.com/specimen/Source+Sans+3 \u2014 OFL, Paul Hunt for Adobe",
-      "features_demonstrated": [
-        "onum",
-        "smcp",
-        "ss01",
-        "titl"
+      "era": "2010 \u2014 Lato",
+      "font_family": "Lato",
+      "rl_font": "Lato",
+      "source": "fonts.google.com/specimen/Lato \u2014 OFL, \u0141ukasz Dziedzic",
+      "has_logo_svg": false,
+      "has_headshot": true,
+      "styles_demonstrated": [
+        "regular",
+        "bold",
+        "italic"
       ]
     },
     {
       "index": 20,
-      "era": "2014 \u2014 Source Serif 4 (Adobe)",
-      "font_family": "Source Serif 4",
-      "pango_font": "Source Serif 4",
-      "source": "fonts.google.com/specimen/Source+Serif+4 \u2014 OFL, Frank Grie\u00dfhammer for Adobe",
-      "features_demonstrated": [
-        "onum",
-        "smcp",
-        "ss01",
-        "ss02"
+      "era": "2011 \u2014 Merriweather",
+      "font_family": "Merriweather",
+      "rl_font": "Merriweather",
+      "source": "fonts.google.com/specimen/Merriweather \u2014 OFL, Eben Sorkin",
+      "has_logo_svg": false,
+      "has_headshot": true,
+      "styles_demonstrated": [
+        "regular",
+        "bold",
+        "italic"
       ]
     },
     {
       "index": 21,
-      "era": "2014 \u2014 Noto Serif (Google + Monotype)",
-      "font_family": "Noto Serif",
-      "pango_font": "Noto Serif",
-      "source": "fonts.google.com/specimen/Noto+Serif \u2014 OFL, Google + Monotype",
-      "features_demonstrated": [
-        "onum",
-        "smcp"
+      "era": "2012 \u2014 Source Sans Pro (Adobe)",
+      "font_family": "Source Sans 3",
+      "rl_font": "SourceSans3",
+      "source": "fonts.google.com/specimen/Source+Sans+3 \u2014 OFL, Paul Hunt for Adobe",
+      "has_logo_svg": true,
+      "has_headshot": true,
+      "styles_demonstrated": [
+        "regular",
+        "bold",
+        "italic"
       ]
     },
     {
       "index": 22,
-      "era": "2009 \u2014 PT Serif (ParaType)",
-      "font_family": "PT Serif",
-      "pango_font": "PT Serif",
-      "source": "fonts.google.com/specimen/PT+Serif \u2014 OFL, Alexandra Korolkova at ParaType",
-      "features_demonstrated": []
+      "era": "2014 \u2014 Source Serif 4 (Adobe)",
+      "font_family": "Source Serif 4",
+      "rl_font": "SourceSerif4",
+      "source": "fonts.google.com/specimen/Source+Serif+4 \u2014 OFL, Frank Grie\u00dfhammer for Adobe",
+      "has_logo_svg": true,
+      "has_headshot": false,
+      "styles_demonstrated": [
+        "regular",
+        "bold",
+        "italic"
+      ]
     },
     {
       "index": 23,
-      "era": "2011 \u2014 Playfair Display",
-      "font_family": "Playfair Display",
-      "pango_font": "Playfair Display",
-      "source": "fonts.google.com/specimen/Playfair+Display \u2014 OFL, Claus Eggers S\u00f8rensen",
-      "features_demonstrated": []
+      "era": "2014 \u2014 Noto Serif (Google + Monotype)",
+      "font_family": "Noto Serif",
+      "rl_font": "NotoSerif",
+      "source": "fonts.google.com/specimen/Noto+Serif \u2014 OFL, Google + Monotype",
+      "has_logo_svg": false,
+      "has_headshot": false,
+      "styles_demonstrated": [
+        "regular",
+        "bold",
+        "italic"
+      ]
     },
     {
       "index": 24,
-      "era": "2017 \u2014 IBM Plex (IBM)",
-      "font_family": "IBM Plex Sans",
-      "pango_font": "IBM Plex Sans",
-      "source": "fonts.google.com/specimen/IBM+Plex+Sans \u2014 OFL, Mike Abbink + Bold Monday for IBM",
-      "features_demonstrated": []
+      "era": "2009 \u2014 PT Serif (ParaType)",
+      "font_family": "PT Serif",
+      "rl_font": "PTSerif",
+      "source": "fonts.google.com/specimen/PT+Serif \u2014 OFL, Alexandra Korolkova at ParaType",
+      "has_logo_svg": false,
+      "has_headshot": true,
+      "styles_demonstrated": [
+        "regular",
+        "bold",
+        "italic"
+      ]
     },
     {
       "index": 25,
-      "era": "2017 \u2014 IBM Plex Serif",
-      "font_family": "IBM Plex Serif",
-      "pango_font": "IBM Plex Serif",
-      "source": "fonts.google.com/specimen/IBM+Plex+Serif \u2014 OFL, Mike Abbink + Bold Monday for IBM",
-      "features_demonstrated": []
+      "era": "2011 \u2014 Playfair Display",
+      "font_family": "Playfair Display",
+      "rl_font": "PlayfairDisplay",
+      "source": "fonts.google.com/specimen/Playfair+Display \u2014 OFL, Claus Eggers S\u00f8rensen",
+      "has_logo_svg": false,
+      "has_headshot": true,
+      "styles_demonstrated": [
+        "regular",
+        "bold",
+        "italic"
+      ]
     },
     {
       "index": 26,
-      "era": "2017 \u2014 IBM Plex Mono",
-      "font_family": "IBM Plex Mono",
-      "pango_font": "IBM Plex Mono",
-      "source": "fonts.google.com/specimen/IBM+Plex+Mono \u2014 OFL, Mike Abbink + Bold Monday for IBM",
-      "features_demonstrated": []
+      "era": "2017 \u2014 IBM Plex Sans",
+      "font_family": "IBM Plex Sans",
+      "rl_font": "IBMPlexSans",
+      "source": "fonts.google.com/specimen/IBM+Plex+Sans \u2014 OFL, Mike Abbink + Bold Monday for IBM",
+      "has_logo_svg": true,
+      "has_headshot": true,
+      "styles_demonstrated": [
+        "regular",
+        "bold",
+        "italic"
+      ]
     },
     {
       "index": 27,
+      "era": "2017 \u2014 IBM Plex Serif",
+      "font_family": "IBM Plex Serif",
+      "rl_font": "IBMPlexSerif",
+      "source": "fonts.google.com/specimen/IBM+Plex+Serif \u2014 OFL, Mike Abbink + Bold Monday for IBM",
+      "has_logo_svg": false,
+      "has_headshot": true,
+      "styles_demonstrated": [
+        "regular",
+        "bold",
+        "italic"
+      ]
+    },
+    {
+      "index": 28,
+      "era": "2017 \u2014 IBM Plex Mono",
+      "font_family": "IBM Plex Mono",
+      "rl_font": "IBMPlexMono",
+      "source": "fonts.google.com/specimen/IBM+Plex+Mono \u2014 OFL, Mike Abbink + Bold Monday for IBM",
+      "has_logo_svg": false,
+      "has_headshot": true,
+      "styles_demonstrated": [
+        "regular",
+        "bold",
+        "italic"
+      ]
+    },
+    {
+      "index": 29,
       "era": "2018 \u2014 Inter (Rasmus Andersson)",
       "font_family": "Inter",
-      "pango_font": "Inter",
+      "rl_font": "Inter",
       "source": "fonts.google.com/specimen/Inter \u2014 OFL, Rasmus Andersson. Also rsms.me/inter",
-      "features_demonstrated": [
-        "smcp",
-        "ss01",
-        "ss02",
-        "ss03"
+      "has_logo_svg": true,
+      "has_headshot": true,
+      "styles_demonstrated": [
+        "regular",
+        "bold",
+        "italic"
       ]
     }
   ]

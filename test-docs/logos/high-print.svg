@@ -1,0 +1,21 @@
+<?xml version="1.0" encoding="UTF-8" ?>
+<!DOCTYPE svg PUBLIC "-//W3C//DTD SVG 1.0//EN" "http://www.w3.org/TR/2001/REC-SVG-20010904/DTD/svg10.dtd">
+<svg xmlns="http://www.w3.org/2000/svg" version="1.0" width="420" height="150">
+  <rect width="195" height="45" x="15" y="14" fill="white" stroke="black" stroke-width="2" />
+  <path d="M 19,102 L 31,102 L 31,80 L 46,80 L 46,102 L 68,102 L 68,80 L 83,80 L 83,102 L 105,102 L 105,80 L 120,80 L 120,102 L 142,102 L 142,80 L 157,80 L 157,102 L 179,102 L 179,80 L 194,80 L 194,102 L 206,102 L 206,136 L 19,136 L 19,102 z " fill="white" stroke="black" stroke-width="2" />
+  <g fill="#4186CC">
+    <rect width="17" height="7" x="30" y="72" />
+    <rect width="17" height="7" x="67" y="72" />
+    <rect width="17" height="7" x="104" y="72" />
+    <rect width="17" height="7" x="141" y="72" />
+    <rect width="17" height="7" x="178" y="72" />
+  </g>
+  <polygon points="239,30 225,34 239,38 235.5,34.5 310,34.5 310,33.5 235.5,33.5 239,30" />
+  <polygon points="223,70 209,74 223,78 219.5,74.5 310,74.5 310,73.5 219.5,73.5 223,70" />
+  <polygon points="231,114 217,118 231,122 227.5,118.5 310,118.5 310,117.5 227.5,117.5 231,114" />
+  <g font-family="Arial" font-size="20" text-anchor="middle">
+    <text x="360" y="31">Tiskovni<tspan x="360" y="49">material</tspan></text>
+    <text x="360" y="73">Tiskarska<tspan x="360" y="91">barva</tspan></text>
+    <text x="360" y="115">Tiskovna<tspan x="360" y="133">forma</tspan></text>
+  </g>
+</svg>

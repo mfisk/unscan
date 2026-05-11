@@ -5,9 +5,13 @@ mod error;
 mod font_match;
 mod font_scan;
 mod geometry;
+pub mod char_index;
+pub mod layout;
+mod compare;
 mod ocr;
 mod pdf_out;
-mod verify;
+mod smooth;
+pub(crate) mod verify;
 
 use crate::audit::{AuditEntry, AuditLog, BBox, Decision, GeometryEntry, PageSummary};
 use crate::error::ScanTextError;
@@ -22,17 +26,276 @@ fn main() {
         .init();
 
     let args = cli::parse();
-    if let Err(e) = run(&args) {
-        eprintln!("Error: {e}");
+    if let Err(msg) = args.validate() {
+        eprintln!("Error: {msg}");
         std::process::exit(1);
+    }
+
+    if args.index {
+        if let Err(e) = run_index(&args) {
+            eprintln!("Error: {e}");
+            std::process::exit(1);
+        }
+    } else {
+        if let Err(e) = run(&args) {
+            eprintln!("Error: {e}");
+            std::process::exit(1);
+        }
     }
 }
 
+/// Scan available fonts, compare against the cached index, and incrementally
+/// update: add new fonts, remove stale fonts, or report "Index is current".
+/// With `--rebuild-index`, forces a full rebuild.
+fn run_index(args: &cli::Args) -> Result<(), ScanTextError> {
+    let font_dirs = font_scan::default_font_dirs(&args.font_dir);
+    info!("Scanning for fonts…");
+    let font_catalog = font_scan::scan_fonts(&font_dirs);
+    info!("Found {} system fonts", font_catalog.len());
+    if font_catalog.is_empty() {
+        return Err(ScanTextError::NoFonts);
+    }
+
+    let index_path = args.resolved_index_path();
+
+    // Collect system font keys → data for lookup.
+    // Keys are unique per weight/style/variant (path + optional variant tag).
+    let system_fonts: std::collections::HashMap<String, Vec<u8>> = font_catalog
+        .iter()
+        .map(|e| (e.font_key(), e.data.clone()))
+        .collect();
+    let system_names: std::collections::HashSet<String> =
+        system_fonts.keys().cloned().collect();
+
+    // ── Full rebuild path ──────────────────────────────────────────
+    if args.rebuild_index {
+        info!("Forced full rebuild requested");
+        return do_full_build(&system_fonts, &index_path);
+    }
+
+    // ── Try loading existing index ─────────────────────────────────
+    if !index_path.exists() {
+        info!("No cached index found — building from scratch");
+        return do_full_build(&system_fonts, &index_path);
+    }
+
+    // Fast header check first (12 bytes, no full deserialize).
+    match char_index::peek_header(&index_path) {
+        Ok((version, feat_len)) => {
+            let (exp_ver, exp_fl) = char_index::expected_header();
+            if version != exp_ver || feat_len != exp_fl {
+                info!(
+                    "Index format changed (v{version}/feat{feat_len} → v{exp_ver}/feat{exp_fl}) — full rebuild"
+                );
+                return do_full_build(&system_fonts, &index_path);
+            }
+        }
+        Err(e) => {
+            info!("Cannot read index header ({e}) — full rebuild");
+            return do_full_build(&system_fonts, &index_path);
+        }
+    }
+
+    // Header OK — load the full index for incremental comparison.
+    info!("Loading cached index from {}", index_path.display());
+    let start = std::time::Instant::now();
+    let mut index = match char_index::load_index(&index_path) {
+        Ok(idx) => idx,
+        Err(e) => {
+            warn!("Failed to load index ({e}) — full rebuild");
+            return do_full_build(&system_fonts, &index_path);
+        }
+    };
+    let load_time = start.elapsed();
+    let indexed_names = index.font_names(); // includes both indexed + skipped
+    let indexed_count = index.indexed_font_names().len();
+    let skipped_count = index.skipped_fonts.len();
+    info!(
+        "  Loaded {} fonts ({} indexed, {} skipped) in {:.1}s",
+        indexed_names.len(),
+        indexed_count,
+        skipped_count,
+        load_time.as_secs_f64()
+    );
+
+    // ── Diff: new vs removed ───────────────────────────────────────
+    let new_fonts: Vec<String> = system_names
+        .difference(&indexed_names)
+        .cloned()
+        .collect();
+    let removed_fonts: std::collections::HashSet<String> = indexed_names
+        .difference(&system_names)
+        .cloned()
+        .collect();
+
+    if new_fonts.is_empty() && removed_fonts.is_empty() {
+        info!("━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━");
+        info!("  Index is current ({} indexed, {} skipped, {} chars)",
+            indexed_count, skipped_count, index.entries.len());
+        info!("━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━");
+        return Ok(());
+    }
+
+    // ── Remove stale fonts ─────────────────────────────────────────
+    if !removed_fonts.is_empty() {
+        info!("Removing {} stale fonts from index", removed_fonts.len());
+        for name in removed_fonts.iter().take(10) {
+            debug!("  - {name}");
+        }
+        if removed_fonts.len() > 10 {
+            debug!("  … and {} more", removed_fonts.len() - 10);
+        }
+        index.remove_fonts(&removed_fonts);
+    }
+
+    // ── Build entries for new fonts only ────────────────────────────
+    if !new_fonts.is_empty() {
+        info!("Indexing {} new fonts…", new_fonts.len());
+        for name in new_fonts.iter().take(10) {
+            debug!("  + {name}");
+        }
+        if new_fonts.len() > 10 {
+            debug!("  … and {} more", new_fonts.len() - 10);
+        }
+        let pairs: Vec<(String, Vec<u8>)> = new_fonts
+            .iter()
+            .filter_map(|name| system_fonts.get(name).map(|d| (name.clone(), d.clone())))
+            .collect();
+        let start = std::time::Instant::now();
+        let partial = char_index::build_char_index(&pairs);
+        info!("  Built entries for {} fonts in {:.1}s", new_fonts.len(), start.elapsed().as_secs_f64());
+        index.merge(partial);
+    }
+
+    // ── Save updated index ─────────────────────────────────────────
+    if let Some(parent) = index_path.parent() {
+        let _ = std::fs::create_dir_all(parent);
+    }
+    char_index::save_index(&index, &index_path).map_err(ScanTextError::Io)?;
+    let file_size = std::fs::metadata(&index_path).map(|m| m.len()).unwrap_or(0);
+    let final_count = char_index::count_fonts(&index);
+
+    info!("━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━");
+    info!("          CHARACTER INDEX UPDATED");
+    info!("━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━");
+    if !new_fonts.is_empty() {
+        info!("  Added:              {} fonts", new_fonts.len());
+    }
+    if !removed_fonts.is_empty() {
+        info!("  Removed:            {} stale fonts", removed_fonts.len());
+    }
+    info!("  Total fonts:        {}", final_count);
+    info!("  Characters:         {}", index.entries.len());
+    info!("  Index size:         {:.2} MB", file_size as f64 / (1024.0 * 1024.0));
+    info!("  Saved to:           {}", index_path.display());
+    info!("━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━");
+
+    Ok(())
+}
+
+/// Full index build from scratch (used for first build, format changes, --rebuild-index).
+fn do_full_build(
+    system_fonts: &std::collections::HashMap<String, Vec<u8>>,
+    index_path: &Path,
+) -> Result<(), ScanTextError> {
+    let pairs: Vec<(String, Vec<u8>)> = system_fonts
+        .iter()
+        .map(|(n, d)| (n.clone(), d.clone()))
+        .collect();
+
+    info!("Building character index ({} fonts × {} chars)…",
+        pairs.len(), char_index::indexed_chars().len());
+
+    let start = std::time::Instant::now();
+    let index = char_index::build_char_index(&pairs);
+    let elapsed = start.elapsed();
+
+    if let Some(parent) = index_path.parent() {
+        std::fs::create_dir_all(parent).map_err(ScanTextError::Io)?;
+    }
+    char_index::save_index(&index, index_path).map_err(ScanTextError::Io)?;
+
+    let file_size = std::fs::metadata(index_path).map(|m| m.len()).unwrap_or(0);
+    let n_entries: usize = index.entries.values().map(|v| v.len()).sum();
+
+    info!("━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━");
+    info!("          CHARACTER INDEX BUILT");
+    info!("━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━");
+    info!("  Fonts indexed:      {}", pairs.len());
+    info!("  Characters:         {}", index.entries.len());
+    info!("  Total entries:      {} (font × char)", n_entries);
+    info!("  Time:               {:.1}s", elapsed.as_secs_f64());
+    info!("  Index size:         {:.2} MB", file_size as f64 / (1024.0 * 1024.0));
+    info!("  Saved to:           {}", index_path.display());
+    info!("━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━");
+
+    Ok(())
+}
+
+/// Load or build the character index with caching.
+fn load_or_build_index(
+    args: &cli::Args,
+    font_catalog: &[font_scan::FontEntry],
+) -> Result<char_index::CharIndex, ScanTextError> {
+    let index_path = args.resolved_index_path();
+
+    if !args.rebuild_index && index_path.exists() {
+        info!("Loading cached character index from {}", index_path.display());
+        let start = std::time::Instant::now();
+        match char_index::load_index(&index_path) {
+            Ok(index) => {
+                let n_entries: usize = index.entries.values().map(|v| v.len()).sum();
+                info!(
+                    "  Loaded {} chars × {} entries in {:.1}s",
+                    index.entries.len(),
+                    n_entries,
+                    start.elapsed().as_secs_f64()
+                );
+                return Ok(index);
+            }
+            Err(e) => {
+                warn!("  Stale/corrupt index cache: {e}");
+                info!("  Auto-rebuilding index…");
+            }
+        }
+    }
+
+    info!("Building character index ({} fonts × {} chars)…",
+        font_catalog.len(), char_index::indexed_chars().len());
+    let start = std::time::Instant::now();
+    let pairs: Vec<(String, Vec<u8>)> = font_catalog
+        .iter()
+        .map(|e| (e.font_key(), e.data.clone()))
+        .collect();
+    let index = char_index::build_char_index(&pairs);
+    let elapsed = start.elapsed();
+    info!("  Built index in {:.1}s", elapsed.as_secs_f64());
+
+    // Cache to disk
+    if let Some(parent) = index_path.parent() {
+        let _ = std::fs::create_dir_all(parent);
+    }
+    match char_index::save_index(&index, &index_path) {
+        Ok(()) => {
+            let sz = std::fs::metadata(&index_path).map(|m| m.len()).unwrap_or(0);
+            info!("  Cached index to {} ({:.2} MB)", index_path.display(), sz as f64 / (1024.0 * 1024.0));
+        }
+        Err(e) => {
+            warn!("  Failed to cache index: {e}");
+        }
+    }
+
+    Ok(index)
+}
+
 fn run(args: &cli::Args) -> Result<(), ScanTextError> {
-    let input_size = std::fs::metadata(&args.input).map(|m| m.len()).unwrap_or(0);
+    let input = args.input.as_ref().expect("input validated");
+    let output = args.output.as_ref().expect("output validated");
+
+    let input_size = std::fs::metadata(input).map(|m| m.len()).unwrap_or(0);
     info!(
         "Input: {} ({:.2} MB)",
-        args.input.display(),
+        input.display(),
         input_size as f64 / (1024.0 * 1024.0)
     );
 
@@ -45,14 +308,17 @@ fn run(args: &cli::Args) -> Result<(), ScanTextError> {
         return Err(ScanTextError::NoFonts);
     }
 
+    // ── 1b. Load or build character index ────────────────────────────
+    let char_index = load_or_build_index(args, &font_catalog)?;
+
     // ── 2. Load input pages ──────────────────────────────────────────
     info!("Loading input pages…");
-    let pages = load_pages(&args.input, args.dpi)?;
+    let pages = load_pages(input, args.dpi)?;
     info!("Loaded {} page(s)", pages.len());
 
     // ── 2b. Extract source image data for pass-through ───────────────
-    let source_images = if args.input.extension().and_then(|e| e.to_str()) == Some("pdf") {
-        extract_source_images(&args.input)
+    let source_images = if input.extension().and_then(|e| e.to_str()) == Some("pdf") {
+        extract_source_images(input)
     } else {
         Vec::new()
     };
@@ -78,7 +344,7 @@ fn run(args: &cli::Args) -> Result<(), ScanTextError> {
 
         // 3a. OCR ─────────────────────────────────────────────────────
         let word_regions = ocr::extract_text_regions(page_img, args.dpi)?;
-        let lines = ocr::assemble_lines(&word_regions);
+        let mut lines = ocr::assemble_lines(&word_regions);
         info!("  OCR: {} words → {} lines", word_regions.len(), lines.len());
 
         // 3b. Background colour ───────────────────────────────────────
@@ -87,6 +353,13 @@ fn run(args: &cli::Args) -> Result<(), ScanTextError> {
 
         // 3c. Font match + decision matrix ────────────────────────────
         let gray_page = page_img.to_luma8();
+
+        // Expand OCR bboxes to actual ink extent — Tesseract often clips
+        // descenders, under-reporting line height by up to 10 px.
+        // Use a threshold relative to the background: anything darker than
+        // (bg - 56) counts as ink (works for both light and dark backgrounds).
+        let ink_thresh = bg_color.0.saturating_sub(56);
+        ocr::expand_bbox_to_ink(&mut lines, &gray_page, ink_thresh);
         let mut placed_texts: Vec<pdf_out::PlacedText> = Vec::new();
         let mut pg_vec = 0u32;
         let mut pg_raster = 0u32;
@@ -109,10 +382,29 @@ fn run(args: &cli::Args) -> Result<(), ScanTextError> {
                     level: 5, block_num: 0, par_num: 0, line_num: 0, word_num: 0,
                 },
             );
-            let font_result = font_match::match_font(
-                page_img, line, &font_catalog,
-                args.min_font_confidence, args.dpi,
-            );
+            let font_result = {
+                // Query char index for candidate font keys
+                let gray_page = page_img.to_luma8();
+                let word_placements: Vec<crate::verify::WordPlacement> = line.words.iter()
+                    .map(|w| crate::verify::WordPlacement {
+                        text: w.text.clone(),
+                        x_off: w.x,
+                        y_off: w.y,
+                        width: w.width,
+                        height: w.height,
+                    })
+                    .collect();
+                let line_height = line.words.iter().map(|w| w.height).max().unwrap_or(0);
+                let char_crops = char_index::extract_line_chars(&gray_page, &word_placements, line_height);
+                let ci_results = char_index::search_candidates(&char_index, &char_crops, 100);
+                let ci_keys: std::collections::HashSet<String> = ci_results.into_iter().map(|(name, _score)| name).collect();
+                let ci_arg = if ci_keys.is_empty() { None } else { Some(&ci_keys) };
+                font_match::match_font(
+                    page_img, line, &font_catalog,
+                    args.min_font_confidence, args.dpi,
+                    ci_arg,
+                )
+            };
             line_matches.push(LineMatch { font_result, text_color });
         }
 
@@ -176,7 +468,7 @@ fn run(args: &cli::Args) -> Result<(), ScanTextError> {
                             if current_name == majority_name.as_str() { continue; }
 
                             // Run SSIM with majority font
-                            let majority_ssim = verify::verify_text_region(
+                            let (majority_ssim, _majority_dy) = verify::verify_text_region(
                                 &gray_page,
                                 majority_data,
                                 "",
@@ -212,6 +504,7 @@ fn run(args: &cli::Args) -> Result<(), ScanTextError> {
                                     font_path: majority_path,
                                     score: majority_ssim,
                                     font_data: majority_data.clone(),
+                                    best_dy: 0, // majority override, no shift data
                                 });
                             }
                         }
@@ -255,7 +548,7 @@ fn run(args: &cli::Args) -> Result<(), ScanTextError> {
             let mut ssim_score: Option<f32> = None;
             if !keep_raster && !args.no_verify {
                 if let Some(ref fm) = font_result {
-                    let score = verify::verify_text_region(
+                    let (score, _dy) = verify::verify_text_region(
                         &gray_page,
                         &fm.font_data,
                         &line.text,
@@ -365,6 +658,7 @@ fn run(args: &cli::Args) -> Result<(), ScanTextError> {
                     y: w.y as f32,
                     width: w.width as f32,
                     height: w.height as f32,
+                    smoothed_em_px: None,
                 }).collect(),
             });
         }
@@ -500,6 +794,21 @@ fn run(args: &cli::Args) -> Result<(), ScanTextError> {
             raster_fragments: raster_fragments.len() as u32,
         });
 
+        // 3f. Comparison output ───────────────────────────────────────
+        if args.compare {
+            let compare_dir = output.with_extension("").to_string_lossy().to_string()
+                + "-compare";
+            let compare_path = std::path::PathBuf::from(&compare_dir);
+            if let Err(e) = compare::generate_comparison(
+                &gray_page,
+                &placed_texts,
+                page_idx,
+                &compare_path,
+            ) {
+                warn!("  Compare output failed: {e}");
+            }
+        }
+
         all_pages.push(pdf_out::PageContent {
             width_px: page_img.width(),
             height_px: page_img.height(),
@@ -513,17 +822,24 @@ fn run(args: &cli::Args) -> Result<(), ScanTextError> {
     }
 
     // ── 4. Generate output PDF ───────────────────────────────────────
-    info!("Generating output PDF: {}", args.output.display());
-    pdf_out::generate_pdf(&args.output, &all_pages, args.overlay)?;
+    // Optional smoothing pass: unify per-word font sizes within same-font runs.
+    if args.smooth {
+        for page in all_pages.iter_mut() {
+            smooth::smooth_font_sizes(&mut page.text_regions, page.dpi as f32);
+        }
+    }
 
-    let output_size = std::fs::metadata(&args.output).map(|m| m.len()).unwrap_or(0);
+    info!("Generating output PDF: {}", output.display());
+    pdf_out::generate_pdf(output, &all_pages, args.overlay)?;
+
+    let output_size = std::fs::metadata(output).map(|m| m.len()).unwrap_or(0);
     let ratio = if output_size > 0 { input_size as f64 / output_size as f64 } else { 0.0 };
 
     // ── 5. Write audit log ───────────────────────────────────────────
     let audit_path = args.audit_log_path();
     let audit = AuditLog {
-        input_file: args.input.display().to_string(),
-        output_file: args.output.display().to_string(),
+        input_file: input.display().to_string(),
+        output_file: output.display().to_string(),
         input_size_bytes: input_size,
         output_size_bytes: output_size,
         compression_ratio: ratio,
@@ -554,7 +870,7 @@ fn run(args: &cli::Args) -> Result<(), ScanTextError> {
     );
     info!("  Ratio:       {:.1}× smaller", ratio);
     info!("━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━");
-    info!("Output: {}", args.output.display());
+    info!("Output: {}", output.display());
 
     Ok(())
 }
@@ -699,7 +1015,13 @@ fn truncate_str(s: &str, max: usize) -> String {
     if s.len() <= max {
         s
     } else {
-        format!("{}…", &s[..max])
+        // Walk backwards from `max` to find the nearest char boundary,
+        // avoiding panics on multi-byte UTF-8 (e.g. em-dash '—' is 3 bytes).
+        let mut end = max;
+        while end > 0 && !s.is_char_boundary(end) {
+            end -= 1;
+        }
+        format!("{}…", &s[..end])
     }
 }
 
@@ -902,3 +1224,4 @@ fn get_integer(dict: &lopdf::Dictionary, key: &[u8]) -> Option<i64> {
         _ => None,
     }
 }
+

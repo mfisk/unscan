@@ -1,8 +1,8 @@
 //! OCR module — runs Tesseract via CLI to extract text with bounding boxes.
 
 use crate::error::ScanTextError;
-use image::DynamicImage;
-use log::debug;
+use image::{DynamicImage, GrayImage};
+use log::{debug, info};
 use std::process::Command;
 
 /// A detected text region from OCR (word-level).
@@ -19,6 +19,7 @@ pub struct TextRegion {
     pub block_num: u32,
     pub par_num: u32,
     pub line_num: u32,
+    #[allow(dead_code)]
     pub word_num: u32,
 }
 
@@ -149,6 +150,104 @@ pub fn assemble_lines(words: &[TextRegion]) -> Vec<TextLine> {
         });
     }
     lines
+}
+
+// ---------------------------------------------------------------------------
+// Ink-extent expansion: Tesseract bboxes often clip descenders.
+// Scan the actual grayscale pixels to find true ink boundaries.
+// ---------------------------------------------------------------------------
+
+/// Expand each line's (and its words') bounding boxes vertically so they
+/// encompass the actual ink extent on the page.  Tesseract frequently
+/// under-reports height by clipping descenders (measured 10 px / ~3 pt on
+/// 300 dpi Bodoni body text).
+///
+/// Only **expands** — never shrinks a bbox.  Horizontal bounds are untouched.
+pub fn expand_bbox_to_ink(lines: &mut [TextLine], gray: &GrayImage, ink_threshold: u8) {
+    let (page_w, page_h) = gray.dimensions();
+    let margin: u32 = 20; // search this many px above/below the OCR bbox
+    let mut expanded_count = 0u32;
+
+    for line in lines.iter_mut() {
+        // ── expand the line bbox ────────────────────────────────────
+        let lx = line.x.min(page_w.saturating_sub(1));
+        let lw = line.width.min(page_w - lx);
+        let search_top = line.y.saturating_sub(margin);
+        let search_bot = (line.y + line.height + margin).min(page_h);
+
+        let (ink_top, ink_bot) = ink_vertical_extent(gray, lx, lw, search_top, search_bot, ink_threshold);
+
+        // Only expand, never shrink
+        let new_y = ink_top.min(line.y);
+        let new_bottom = ink_bot.max(line.y + line.height);
+        let new_h = new_bottom.saturating_sub(new_y);
+
+        if new_h > line.height {
+            expanded_count += 1;
+            debug!(
+                "  bbox expand: '{}' y {}→{} h {}→{} (+{}px)",
+                &line.text[..line.text.len().min(40)],
+                line.y, new_y, line.height, new_h, new_h - line.height
+            );
+        }
+        line.y = new_y;
+        line.height = new_h;
+
+        // ── expand each word bbox the same way ──────────────────────
+        for word in line.words.iter_mut() {
+            let wx = word.x.min(page_w.saturating_sub(1));
+            let ww = word.width.min(page_w - wx);
+            let w_search_top = word.y.saturating_sub(margin);
+            let w_search_bot = (word.y + word.height + margin).min(page_h);
+
+            let (w_ink_top, w_ink_bot) = ink_vertical_extent(
+                gray, wx, ww, w_search_top, w_search_bot, ink_threshold,
+            );
+
+            let w_new_y = w_ink_top.min(word.y);
+            let w_new_bottom = w_ink_bot.max(word.y + word.height);
+            word.y = w_new_y;
+            word.height = w_new_bottom.saturating_sub(w_new_y);
+        }
+    }
+
+    if expanded_count > 0 {
+        info!("  Expanded {expanded_count}/{} line bboxes to ink extent", lines.len());
+    }
+}
+
+/// Scan a horizontal strip of the grayscale image for the topmost and
+/// bottommost rows that contain ink (pixel value < `threshold`).
+/// Returns (ink_top_row, ink_bottom_row) — both inclusive pixel rows.
+/// If no ink is found, returns (search_top, search_top) so the caller's
+/// `min()`/`max()` logic leaves the bbox unchanged.
+pub fn ink_vertical_extent(
+    gray: &GrayImage,
+    x: u32,
+    w: u32,
+    search_top: u32,
+    search_bot: u32,
+    threshold: u8,
+) -> (u32, u32) {
+    let mut first_ink: Option<u32> = None;
+    let mut last_ink: u32 = search_top;
+
+    for row in search_top..search_bot {
+        for col in x..x + w {
+            if gray.get_pixel(col, row).0[0] < threshold {
+                if first_ink.is_none() {
+                    first_ink = Some(row);
+                }
+                last_ink = row;
+                break; // found ink in this row, move to next
+            }
+        }
+    }
+
+    match first_ink {
+        Some(top) => (top, last_ink + 1), // +1 so bottom is exclusive (height = bot - top)
+        None => (search_top, search_top), // no ink found — don't change anything
+    }
 }
 
 // ---------------------------------------------------------------------------

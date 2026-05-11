@@ -1,878 +1,1111 @@
 #!/usr/bin/env python3
 """
-Generate "A Timeline of Typography" — a multi-page font specimen PDF.
-
-This is the ground-truth document for unscan's font detection tests.
-Each section is rendered IN the font it describes, with documented OpenType
-feature variants. A machine-readable JSON sidecar maps every section to its
-expected font family, source URL, and demonstrated OT features.
-
-The script also produces a "scanned" variant with realistic degradation:
-slight rotation (skew), Gaussian blur, speckle noise, and off-white paper.
+Generate "A Timeline of Typography" — a multi-page vector PDF specimen.
 
 Output:
-    font-timeline-specimen.pdf          — clean vector PDF
-    font-timeline-specimen-scanned.pdf  — simulated scan
-    font-timeline-specimen.json         — ground truth
+  font-timeline-specimen.pdf       — native vector PDF with embedded fonts + SVG logos
+  font-timeline-specimen-scanned.pdf — rasterized with scan artifacts (skew, noise, blur)
+  font-timeline-specimen.json      — machine-readable ground truth
 
-Prerequisites:
-    apt install pango1.0-tools poppler-utils
-    pip install Pillow numpy img2pdf
-
-Fonts:
-    On first run, download fonts from the Google Fonts CDN to
-    /usr/share/fonts/truetype/specimen-fonts/ and run fc-cache -fv.
-    The script doesn't auto-download; see test-docs/README.md for URLs.
-    Microsoft Core Fonts: apt install ttf-mscorefonts-installer
-
-Usage:
-    python3 gen-specimen.py
+All text is real PDF text (not raster). SVG logos are placed as vector drawings.
+The "scanned" version rasterizes entire pages then re-assembles as a raster PDF.
 """
-import subprocess, os, json, shutil, math, tempfile
+
+import json
+import os
+import random
+import subprocess
+import sys
 from pathlib import Path
 
-OUT_DIR = Path("/tmp/specimen-pages")
-OUT_DIR.mkdir(exist_ok=True)
+from reportlab.lib.pagesizes import letter
+from reportlab.lib.units import inch, mm
+from reportlab.pdfbase import pdfmetrics
+from reportlab.pdfbase.ttfonts import TTFont
+from reportlab.platypus import (
+    SimpleDocTemplate, Paragraph, Spacer, Image as RLImage,
+    FrameBreak, BaseDocTemplate, Frame, PageTemplate, KeepTogether,
+    Flowable, Table, TableStyle, ImageAndFlowables,
+)
+from reportlab.lib.styles import ParagraphStyle
+from reportlab.lib.enums import TA_LEFT, TA_JUSTIFY
+from PIL import Image as PILImage
 
-# Page dimensions at 300dpi (US Letter)
-PAGE_W = 2550
-PAGE_H = 3300
+SCRIPT_DIR = Path(__file__).resolve().parent
+OUT_DIR = SCRIPT_DIR
+LOGO_DIR = SCRIPT_DIR / "logos"
 
-# ─── Font map: fc font family name → features available ────────────────────
-# For pango, we use the fc family name directly.
+PAGE_W, PAGE_H = letter  # 612 × 792 points (8.5 × 11 in)
 
+# ---------------------------------------------------------------------------
+# Font registration — map each specimen font to TTF files for reportlab
+# ---------------------------------------------------------------------------
+SPEC_FONT_DIR = Path("/usr/share/fonts/truetype/specimen-fonts")
+MS_FONT_DIR = Path("/usr/share/fonts/truetype/msttcorefonts")
+CROSEXTRA = Path("/usr/share/fonts/truetype/crosextra")
+TYPEWRITER = Path("/usr/local/share/fonts/typewriter")
+NIMBUS = None  # will resolve via fc-list
+
+def fc_find(family, style="Regular"):
+    """Find a TTF path via fontconfig."""
+    r = subprocess.run(
+        ["fc-list", f"{family}:style={style}", "--format=%{file}\n"],
+        capture_output=True, text=True
+    )
+    for line in r.stdout.strip().split('\n'):
+        if line.endswith('.ttf') or line.endswith('.TTF'):
+            return line
+    return None
+
+def register_font(rl_name, ttf_path):
+    """Register a TTF with reportlab. Returns True on success."""
+    if ttf_path and os.path.exists(ttf_path):
+        try:
+            pdfmetrics.registerFont(TTFont(rl_name, ttf_path))
+            return True
+        except Exception as e:
+            print(f"  WARN: can't register {rl_name} from {ttf_path}: {e}")
+    return False
+
+# Font spec: (rl_base_name, regular_path, bold_path, italic_path)
+# We'll register {base}, {base}-Bold, {base}-Italic
+FONT_REGISTRY = {
+    "EBGaramond": (
+        SPEC_FONT_DIR / "eb-garamond-400.ttf",
+        SPEC_FONT_DIR / "eb-garamond-700.ttf",
+        SPEC_FONT_DIR / "eb-garamond-400i.ttf",
+    ),
+    "LibreCaslonText": (
+        SPEC_FONT_DIR / "libre-caslon-text-400.ttf",
+        SPEC_FONT_DIR / "libre-caslon-text-700.ttf",
+        SPEC_FONT_DIR / "libre-caslon-text-400i.ttf",
+    ),
+    "LibreBaskerville": (
+        SPEC_FONT_DIR / "libre-baskerville-400.ttf",
+        SPEC_FONT_DIR / "libre-baskerville-700.ttf",
+        SPEC_FONT_DIR / "libre-baskerville-400i.ttf",
+    ),
+    "LibreBodoni": (
+        SPEC_FONT_DIR / "libre-bodoni-400.ttf",
+        SPEC_FONT_DIR / "libre-bodoni-700.ttf",
+        SPEC_FONT_DIR / "libre-bodoni-400i.ttf",
+    ),
+    "ZillaSlab": (
+        SPEC_FONT_DIR / "zilla-slab-400.ttf",
+        SPEC_FONT_DIR / "zilla-slab-700.ttf",
+        None,
+    ),
+    "Jost": (
+        SPEC_FONT_DIR / "jost-400.ttf",
+        SPEC_FONT_DIR / "jost-700.ttf",
+        None,
+    ),
+    "TimesNewRoman": (
+        MS_FONT_DIR / "Times_New_Roman.ttf",
+        MS_FONT_DIR / "Times_New_Roman_Bold.ttf",
+        MS_FONT_DIR / "Times_New_Roman_Italic.ttf",
+    ),
+    "CourierNew": (
+        MS_FONT_DIR / "Courier_New.ttf",
+        MS_FONT_DIR / "Courier_New_Bold.ttf",
+        MS_FONT_DIR / "Courier_New_Italic.ttf",
+    ),
+    "NimbusSans": (
+        MS_FONT_DIR / "Arial.TTF",  # Use Arial as Helvetica stand-in (Nimbus Sans is OTF only)
+        MS_FONT_DIR / "Arial_Bold.ttf",
+        MS_FONT_DIR / "Arial_Italic.ttf",
+    ),
+    "Arial": (
+        MS_FONT_DIR / "Arial.TTF",
+        MS_FONT_DIR / "Arial_Bold.ttf",
+        MS_FONT_DIR / "Arial_Italic.ttf",
+    ),
+    "Georgia": (
+        MS_FONT_DIR / "Georgia.TTF",
+        MS_FONT_DIR / "Georgia_Bold.ttf",
+        MS_FONT_DIR / "Georgia_Italic.ttf",
+    ),
+    "Verdana": (
+        MS_FONT_DIR / "Verdana.TTF",
+        MS_FONT_DIR / "Verdana_Bold.ttf",
+        MS_FONT_DIR / "Verdana_Italic.ttf",
+    ),
+    "ComicSansMS": (
+        MS_FONT_DIR / "Comic_Sans_MS.ttf",
+        MS_FONT_DIR / "Comic_Sans_MS_Bold.ttf",
+        None,
+    ),
+    "TrebuchetMS": (
+        MS_FONT_DIR / "Trebuchet_MS.ttf",
+        MS_FONT_DIR / "Trebuchet_MS_Bold.ttf",
+        MS_FONT_DIR / "Trebuchet_MS_Italic.ttf",
+    ),
+    "Caladea": (
+        CROSEXTRA / "Caladea-Regular.ttf",
+        CROSEXTRA / "Caladea-Bold.ttf",
+        CROSEXTRA / "Caladea-Italic.ttf",
+    ),
+    "Roboto": (
+        SPEC_FONT_DIR / "roboto-400.ttf",
+        None,
+        None,
+    ),
+    "OpenSans": (
+        SPEC_FONT_DIR / "open-sans-400.ttf",
+        None,
+        None,
+    ),
+    "Lato": (
+        SPEC_FONT_DIR / "lato-400.ttf",
+        None,
+        None,
+    ),
+    "Merriweather": (
+        SPEC_FONT_DIR / "merriweather-400.ttf",
+        None,
+        SPEC_FONT_DIR / "merriweather-400i.ttf",
+    ),
+    "SourceSans3": (
+        SPEC_FONT_DIR / "source-sans-pro-400.ttf",
+        None,
+        None,
+    ),
+    "SourceSerif4": (
+        Path("/usr/share/fonts/truetype/extra/SourceSerif4-Regular.ttf"),
+        Path("/usr/share/fonts/truetype/extra/SourceSerif4-Bold.ttf"),
+        Path("/usr/share/fonts/truetype/extra/SourceSerif4-It.ttf"),
+    ),
+    "NotoSerif": (
+        SPEC_FONT_DIR / "noto-serif-400.ttf",
+        None,
+        None,
+    ),
+    "PTSerif": (
+        SPEC_FONT_DIR / "pt-serif-400.ttf",
+        None,
+        SPEC_FONT_DIR / "pt-serif-400i.ttf",
+    ),
+    "PlayfairDisplay": (
+        SPEC_FONT_DIR / "playfair-display-400.ttf",
+        None,
+        SPEC_FONT_DIR / "playfair-display-400i.ttf",
+    ),
+    "IBMPlexSans": (
+        SPEC_FONT_DIR / "ibm-plex-sans-400.ttf",
+        None,
+        None,
+    ),
+    "IBMPlexSerif": (
+        SPEC_FONT_DIR / "ibm-plex-serif-400.ttf",
+        None,
+        None,
+    ),
+    "IBMPlexMono": (
+        SPEC_FONT_DIR / "ibm-plex-mono-400.ttf",
+        None,
+        None,
+    ),
+    "Inter": (
+        SPEC_FONT_DIR / "inter-400.ttf",
+        None,
+        None,
+    ),
+    "SpecialElite": (
+        TYPEWRITER / "SpecialElite-Regular.ttf",
+        None,  # no bold
+        None,  # no italic
+    ),
+    "PrestigeElite": (
+        TYPEWRITER / "PrestigeElite-Regular.ttf",
+        None,  # no bold
+        None,  # no italic
+    ),
+}
+
+
+def register_all_fonts():
+    """Register all specimen fonts with reportlab."""
+    from reportlab.lib.fonts import addMapping
+
+    registered = {}
+    for base, (reg, bold, ital) in FONT_REGISTRY.items():
+        ok = register_font(base, reg)
+        if ok:
+            registered[base] = True
+        ok_b = register_font(f"{base}-Bold", bold)
+        ok_i = register_font(f"{base}-Italic", ital)
+        if not ok_b:
+            register_font(f"{base}-Bold", reg)
+        if not ok_i:
+            register_font(f"{base}-Italic", reg)
+
+        # Register the font family mapping so <b>/<i> in Paragraph work
+        addMapping(base, 0, 0, base)            # regular
+        addMapping(base, 1, 0, f"{base}-Bold")  # bold
+        addMapping(base, 0, 1, f"{base}-Italic")  # italic
+        addMapping(base, 1, 1, f"{base}-Bold")  # bold+italic fallback to bold
+
+    return registered
+
+
+# ---------------------------------------------------------------------------
+# Section data
+# ---------------------------------------------------------------------------
 SECTIONS = [
-    # Each section: (era_label, font_family, pango_font_spec, blurb, features_dict)
-    # features_dict: {"onum": True, "smcp": True, ...} for variants to demo
     {
         "era": "c. 1530 — The Garamond",
         "font_family": "EB Garamond",
-        "pango_font": "EB Garamond 12",  # system OTF version has features
+        "rl_font": "EBGaramond",
+        "alignment": "justify",
         "source": "fonts.google.com/specimen/EB+Garamond — OFL, Georg Mayr-Duffner",
         "blurb": (
             "Claude Garamond was a Parisian punchcutter who broke the mold — literally. "
             "Before him, printers carved type into wood or imported it from Italy. Garamond created "
             "the first commercially available metal typefaces, and their elegant proportions "
-            "became the template that defined Roman letterforms for 500 years. "
-            "This digital revival by Georg Mayr-Duffner faithfully recreates the warmth of the originals."
+            "became the template that defined Roman letterforms for 500 years."
         ),
-        "features": {"onum": True, "smcp": True, "swsh": False, "ss01": True},
+        "logo_svg": "logos/gutenberg-press.svg",  # printing press
+        "headshot": "logos/headshots/garamond.jpg",
     },
     {
         "era": "1722 — The Caslon",
         "font_family": "Libre Caslon Text",
-        "pango_font": "Libre Caslon Text",
+        "rl_font": "LibreCaslonText",
+        "alignment": "justify",
         "source": "fonts.google.com/specimen/Libre+Caslon+Text — OFL, Impallari Type",
         "blurb": (
             "William Caslon's types were the workhorses of the English-speaking world for a century. "
             "The American Declaration of Independence was first printed in Caslon. So was the first "
-            "edition of Robinson Crusoe. His punches have a distinctly English warmth — slightly "
-            "irregular, with a readable charm that more \"refined\" typefaces never quite matched. "
-            "Printers' saying: \"When in doubt, use Caslon.\""
+            "edition of Robinson Crusoe. Printers' saying: \"When in doubt, use Caslon.\""
         ),
-        "features": {},
+        "logo_svg": None,
+        "headshot": "logos/headshots/caslon.jpg",
     },
     {
         "era": "1757 — The Baskerville",
         "font_family": "Libre Baskerville",
-        "pango_font": "Libre Baskerville",
+        "rl_font": "LibreBaskerville",
+        "alignment": "justify",
         "source": "fonts.google.com/specimen/Libre+Baskerville — OFL, Impallari Type",
         "blurb": (
             "John Baskerville was a Birmingham industrialist who became obsessed with printing. "
             "He invented new inks, designed smoother paper, and created typefaces with unprecedented "
-            "contrast between thick and thin strokes. His contemporaries called his types \"too sharp "
-            "for the eye\" — Benjamin Franklin disagreed, and their correspondence about typography "
-            "remains one of the great letters about letters. The 18th-century eye wasn't ready."
+            "contrast between thick and thin strokes. His contemporaries called his types "
+            "\"too sharp for the eye\" — Benjamin Franklin disagreed."
         ),
-        "features": {},
+        "logo_svg": None,
+        "headshot": "logos/headshots/baskerville.jpg",
     },
     {
         "era": "1798 — The Bodoni",
         "font_family": "Libre Bodoni",
-        "pango_font": "Libre Bodoni",
+        "rl_font": "LibreBodoni",
+        "alignment": "justify",
         "source": "fonts.google.com/specimen/Libre+Bodoni — OFL, Impallari Type",
         "blurb": (
             "Giambattista Bodoni pushed the contrast dial to eleven. His types feature razor-thin "
-            "hairlines and dramatic thick verticals — a style later called \"Modern\" (the irony of "
-            "calling a 1798 design 'modern' in 2025 is not lost on us). Bodoni's Manuale Tipografico, "
-            "published posthumously, contained 142 typefaces and remains one of the most beautiful "
+            "hairlines and dramatic thick verticals — a style later called \"Modern.\" Bodoni's "
+            "Manuale Tipografico contained 142 typefaces and remains one of the most beautiful "
             "type specimens ever printed. Vogue magazine still uses a Bodoni variant for its masthead."
         ),
-        "features": {},
+        "logo_svg": None,
+        "headshot": "logos/headshots/bodoni.jpg",
     },
     {
         "era": "1845 — The Slab Serif",
         "font_family": "Zilla Slab",
-        "pango_font": "Zilla Slab",
+        "rl_font": "ZillaSlab",
+        "alignment": "justify",
         "source": "fonts.google.com/specimen/Zilla+Slab — OFL, Typotheque for Mozilla",
         "blurb": (
-            "The Industrial Revolution needed loud type. Slab serifs — with their blunt, unbracketed "
-            "serifs of equal weight — were designed to scream from handbills, posters, and newspaper "
-            "headlines. Clarendon (1845) was the most famous, but the Egyptian style dates to 1815 "
-            "when Vincent Figgins cast the first. Named 'Egyptian' not because of any actual Egyptian "
-            "connection, but because Egyptomania was sweeping Europe after Napoleon's campaigns. "
-            "Mozilla's Zilla Slab carries the tradition forward with a digital-native warmth."
+            "The Industrial Revolution needed loud type. Slab serifs — with their blunt, "
+            "unbracketed serifs of equal weight — were designed to scream from handbills, posters, "
+            "and newspaper headlines. Mozilla's Zilla Slab carries the tradition forward."
         ),
-        "features": {},
+        "logo_svg": None,  # was mozilla.svg — dropped (tiny text glyph, not a graphic mark)
+        "headshot": None,  # Slab Serif is a style, not an individual designer
+    },
+    {
+        "era": "c. 1895 — The Manual Typewriter",
+        "font_family": "Special Elite",
+        "rl_font": "SpecialElite",
+        "alignment": "ragged",
+        "source": "fonts.google.com/specimen/Special+Elite — OFL, Astigmatic (manual typewriter recreation)",
+        "blurb": (
+            "Before electricity, every keystroke was muscle. The Remington No. 2 (1878) introduced "
+            "the QWERTY layout and the shift key. Underwood No. 5 (1900) made the typebar visible. "
+            "By 1900, thousands of typists hammered out correspondence on machines that cost a year's wages. "
+            "The uneven impression, ink buildup, and worn ribbons were not defects — they were the texture "
+            "of written communication for 80 years."
+        ),
+        "logo_svg": None,  # typewriter machine illustration to be added
+        "headshot": None,
     },
     {
         "era": "1927 — Futura",
         "font_family": "Jost",
-        "pango_font": "Jost",
+        "rl_font": "Jost",
+        "alignment": "justify",
         "source": "fonts.google.com/specimen/Jost — OFL, Owen Earl (Futura stand-in)",
         "blurb": (
-            "Paul Renner designed Futura in 1927 for the Bauer foundry, and it became the defining "
-            "typeface of modernism. Its near-perfect geometric circles and triangles were radical — "
-            "a declaration that type should look forward, not backward. Stanley Kubrick used it in "
-            "2001: A Space Odyssey. Wes Anderson uses it in everything. And in 1969, it literally "
-            "went to the moon on the Apollo 11 commemorative plaque. "
-            "Jost (by Owen Earl) is a faithful open-source geometric sans in the Futura tradition."
+            "Paul Renner designed Futura in 1927 for the Bauer foundry. Its near-perfect geometric "
+            "circles and triangles were radical. Stanley Kubrick used it in 2001. Wes Anderson uses "
+            "it in everything. And in 1969, it went to the moon on the Apollo 11 plaque. "
+            "Jost (by Owen Earl) is a faithful open-source stand-in."
         ),
-        "features": {},
+        "logo_svg": None,  # was supreme.svg — dropped (just Futura text in a box)
+        "headshot": "logos/headshots/renner.jpg",
     },
     {
         "era": "1931 — Times New Roman",
         "font_family": "Times New Roman",
-        "pango_font": "Times New Roman",
-        "source": "Bundled with Windows/Office — Monotype. Linux: apt install ttf-mscorefonts-installer",
+        "rl_font": "TimesNewRoman",
+        "alignment": "justify",
+        "source": "Bundled with Windows/Office — Monotype",
         "blurb": (
             "In 1931, The Times of London commissioned Stanley Morison to redesign their newspaper "
             "type. Working with draftsman Victor Lardent, Morison created Times New Roman — optimized "
-            "for narrow columns and cheap newsprint. It was never meant to be pretty. It was meant to "
-            "be readable at small sizes on bad paper. Seven decades later, Microsoft bundled it with "
-            "Windows, and every college student's essay defaulted to it. It's the typographic equivalent "
-            "of khaki pants: unremarkable, inoffensive, everywhere."
+            "for narrow columns and cheap newsprint. Seven decades later, Microsoft bundled it with "
+            "Windows, and every college student's essay defaulted to it."
         ),
-        "features": {},
+        "logo_svg": None,  # was nytimes.svg — dropped (text-only wordmark)
+        "headshot": "logos/headshots/morison.jpg",
+    },
+    {
+        "era": "1953 — Prestige Elite",
+        "font_family": "Prestige Elite",
+        "rl_font": "PrestigeElite",
+        "alignment": "ragged",
+        "source": "Originally for IBM Executive typewriters — 12 characters per inch",
+        "blurb": (
+            "Prestige Elite was the other standard typewriter typeface — the smaller, tighter sibling "
+            "to Courier's 10 characters per inch. At 12 cpi, Prestige Elite fit more words per line, "
+            "making it the default for business correspondence, invoices, and government forms. "
+            "If Courier was the Hollywood typewriter, Prestige Elite was the office workhorse."
+        ),
+        "logo_svg": None,
+        "headshot": None,
     },
     {
         "era": "1955 — Courier (IBM)",
         "font_family": "Courier New",
-        "pango_font": "Courier New",
-        "source": "Bundled with Windows/Office — IBM origin. Linux: apt install ttf-mscorefonts-installer",
+        "rl_font": "CourierNew",
+        "alignment": "ragged",
+        "source": "IBM origin — Bundled with Windows/Office",
         "blurb": (
             "Howard \"Bud\" Kettler designed Courier in 1955 for IBM's Selectric typewriters. "
-            "IBM deliberately chose not to trademark it, making it freely available — a decision "
-            "that ensured its ubiquity. Every monospaced terminal, screenplay, and government form "
-            "owes something to Courier. Its fixed-width design means every character occupies exactly "
-            "the same horizontal space, which is why programmers still reach for monospaced fonts "
-            "and why court filings still specify Courier. Some traditions die hard."
+            "IBM deliberately chose not to trademark it, making it freely available. Every monospaced "
+            "terminal, screenplay, and government form owes something to Courier. Its fixed-width "
+            "design means every character occupies exactly the same horizontal space."
         ),
-        "features": {},
+        "logo_svg": "logos/ibm.svg",
+        "headshot": None,  # Kettler — no public portrait exists
     },
     {
-        "era": "1957 — Helvetica / Arial",
+        "era": "1957 — Helvetica / Nimbus Sans",
         "font_family": "Nimbus Sans",
-        "pango_font": "Nimbus Sans",
-        "source": "URW++ Helvetica clone — ships with ghostscript/texlive. fonts.urwpp.de",
+        "rl_font": "NimbusSans",
+        "alignment": "justify",
+        "source": "URW++ Helvetica clone — fonts.urwpp.de",
         "blurb": (
             "Max Miedinger and Eduard Hoffmann designed Neue Haas Grotesk in 1957, renaming it "
-            "Helvetica (Latin for 'Swiss') in 1960. It became the face of corporate modernism — "
-            "used by American Airlines, Jeep, Toyota, and the NYC subway. In 1982, Robin Nicholas "
-            "and Patricia Saunders at Monotype designed Arial as a metrically compatible alternative "
-            "that Microsoft could license cheaply. Typographers can tell them apart by the 'a' tail, "
-            "the 'G' bar, and the diagonal cut on the 't'. Everyone else just sees 'the normal font.' "
-            "Nimbus Sans is URW's Helvetica-compatible libre clone, faithful to the Swiss original."
+            "Helvetica in 1960. It became the face of corporate modernism — used by American Airlines, "
+            "Jeep, Toyota, and the NYC subway. Nimbus Sans is URW's Helvetica-compatible libre clone."
         ),
-        "features": {},
+        "logo_svg": None,  # was americanairlines.svg — dropped (text-only wordmark)
+        "headshot": "logos/headshots/miedinger.jpg",
     },
     {
         "era": "1982 — Arial (Microsoft)",
         "font_family": "Arial",
-        "pango_font": "Arial",
-        "source": "Bundled with Windows/Office — Monotype. Linux: apt install ttf-mscorefonts-installer",
+        "rl_font": "Arial",
+        "alignment": "justify",
+        "source": "Bundled with Windows/Office — Monotype",
         "blurb": (
             "Arial was Monotype's strategic masterstroke: a Helvetica substitute with matching metrics "
-            "but just enough differences to avoid licensing fees. Microsoft bundled it with Windows 3.1 "
-            "in 1992 and it conquered the world. Designers love to hate it. 'Arial is the font of "
-            "people who don't care about fonts,' goes the saying — and that's exactly why it works. "
-            "It's the path of least resistance, the default sans-serif, the typographic shrug emoji. "
-            "Three billion people have used it. Probably including you, today."
+            "but just enough differences to avoid licensing. Microsoft bundled it with Windows 3.1 "
+            "in 1992 and it conquered the world. Three billion people have used it."
         ),
-        "features": {},
+        "logo_svg": "logos/microsoft.svg",
+        "headshot": None,  # Monotype team effort
     },
     {
         "era": "1993 — Georgia (Microsoft)",
         "font_family": "Georgia",
-        "pango_font": "Georgia",
-        "source": "Bundled with Windows/Office — Matthew Carter. Linux: apt install ttf-mscorefonts-installer",
+        "rl_font": "Georgia",
+        "alignment": "ragged",
+        "source": "Bundled with Windows/Office — Matthew Carter",
         "blurb": (
-            "Matthew Carter — arguably the greatest living type designer — created Georgia in 1993 "
-            "specifically for screen readability. Named after a tabloid headline ('Alien Heads Found "
-            "in Georgia'), it was one of the first fonts designed from the pixel grid up rather than "
-            "adapted from print. Its generous x-height and sturdy serifs made it the default 'readable "
-            "serif' of the early web. Carter also designed Verdana, Bell Centennial (for phone books), "
-            "and Miller (for newspapers). The man has literally shaped how billions of people read."
+            "Matthew Carter created Georgia in 1993 specifically for screen readability. Named after "
+            "a tabloid headline ('Alien Heads Found in Georgia'), it was one of the first fonts "
+            "designed from the pixel grid up rather than adapted from print. Carter also designed "
+            "Verdana, Bell Centennial, and Miller."
         ),
-        "features": {},
+        "logo_svg": None,
+        "headshot": "logos/headshots/carter.jpg",
     },
     {
         "era": "1996 — Verdana (Microsoft)",
         "font_family": "Verdana",
-        "pango_font": "Verdana",
-        "source": "Bundled with Windows/Office — Matthew Carter. Linux: apt install ttf-mscorefonts-installer",
+        "rl_font": "Verdana",
+        "alignment": "ragged",
+        "source": "Bundled with Windows/Office — Matthew Carter",
         "blurb": (
             "Verdana is Georgia's sans-serif sibling, also by Matthew Carter, also designed for "
-            "screens. Its name is a portmanteau of 'verdant' (the green of the Pacific Northwest, "
-            "where Microsoft is headquartered) and 'Ana' (the name of designer Virginia Howlett's "
-            "eldest daughter). The wide letterforms and tall x-height made it supremely legible on "
-            "640×480 monitors. At 10px on a CRT, Verdana was more readable than anything else alive."
+            "screens. The wide letterforms and tall x-height made it supremely legible on 640×480 "
+            "monitors. At 10px on a CRT, Verdana was more readable than anything else alive."
         ),
-        "features": {},
+        "logo_svg": None,  # was ikea.svg — dropped (text-based wordmark)
+        "headshot": "logos/headshots/carter.jpg",
     },
     {
         "era": "1994 — Comic Sans (Microsoft)",
         "font_family": "Comic Sans MS",
-        "pango_font": "Comic Sans MS",
-        "source": "Bundled with Windows/Office — Vincent Connare. Linux: apt install ttf-mscorefonts-installer",
+        "rl_font": "ComicSansMS",
+        "alignment": "ragged",
+        "source": "Bundled with Windows/Office — Vincent Connare",
         "blurb": (
             "Vincent Connare designed Comic Sans in 1994 after seeing Times New Roman in a Microsoft "
-            "Bob speech bubble and thinking 'that's wrong.' He based it on the lettering in The Dark "
-            "Knight Returns and Watchmen comics. It was never intended for body text — it was a UI "
-            "font for children's software. But users discovered it, loved it, and put it everywhere: "
-            "office memos, funeral programs, CERN's Higgs boson announcement. Typographers weep. "
-            "Comic Sans doesn't care. It's having more fun than your serif ever will."
+            "Bob speech bubble. He based it on The Dark Knight Returns and Watchmen lettering. "
+            "It was never intended for body text — but users put it everywhere: office memos, "
+            "funeral programs, CERN's Higgs boson announcement. Typographers weep."
         ),
-        "features": {},
+        "logo_svg": None,
+        "headshot": "logos/headshots/connare.jpg",
     },
     {
         "era": "1996 — Trebuchet MS",
         "font_family": "Trebuchet MS",
-        "pango_font": "Trebuchet MS",
-        "source": "Bundled with Windows/Office — Vincent Connare. Linux: apt install ttf-mscorefonts-installer",
+        "rl_font": "TrebuchetMS",
+        "alignment": "ragged",
+        "source": "Bundled with Windows/Office — Vincent Connare",
         "blurb": (
-            "Vincent Connare also designed Trebuchet MS (yes, the same guy who made Comic Sans — "
-            "range, right?). Named after a medieval siege engine because 'it launches words across "
-            "the internet,' it was one of Microsoft's core web fonts. It occupies a peculiar middle "
-            "ground: more personality than Arial, less chaos than Comic Sans. Its slightly humanist "
-            "proportions and generous spacing made it a quiet workhorse of late-90s web design."
+            "Vincent Connare also designed Trebuchet MS. Named after a medieval siege engine because "
+            "'it launches words across the internet,' it occupies a peculiar middle ground: more "
+            "personality than Arial, less chaos than Comic Sans."
         ),
-        "features": {},
+        "logo_svg": None,
+        "headshot": "logos/headshots/connare.jpg",
     },
     {
-        "era": "2004 — The ClearType Collection (Microsoft)",
+        "era": "2004 — The ClearType Collection",
         "font_family": "Caladea",
-        "pango_font": "Caladea",
+        "rl_font": "Caladea",
+        "alignment": "ragged",
         "source": "fonts.google.com/specimen/Caladea — OFL, Carolina Giovagnoli (Cambria-compatible)",
         "blurb": (
             "When Microsoft developed ClearType subpixel rendering for LCD screens, they commissioned "
-            "six new font families optimized for it: Calibri, Cambria, Candara, Consolas, Constantia, "
-            "and Corbel (all C-names, because apparently Microsoft's font naming committee had one "
-            "letter in mind). Calibri replaced Times New Roman as the Office default in 2007, which "
-            "means more words have been set in Calibri than in any typeface in human history. "
-            "Caladea is an open-source metric-compatible Cambria substitute from Carolina Giovagnoli."
+            "six new C-named font families: Calibri, Cambria, Candara, Consolas, Constantia, and Corbel. "
+            "Calibri replaced Times New Roman as the Office default in 2007. "
+            "Caladea is an open-source metric-compatible Cambria substitute."
         ),
-        "features": {"onum": True},
+        "logo_svg": "logos/microsoft.svg",
+        "headshot": None,  # ClearType was a Microsoft team project
     },
     {
-        "era": "2010 — The Google Fonts Revolution: Roboto",
+        "era": "2010 — Roboto (Google)",
         "font_family": "Roboto",
-        "pango_font": "Roboto",
+        "rl_font": "Roboto",
+        "alignment": "ragged",
         "source": "fonts.google.com/specimen/Roboto — Apache 2.0, Christian Robertson for Google",
         "blurb": (
             "When Google launched Google Fonts in 2010, it broke the foundry cartel overnight. "
-            "Suddenly any designer could use quality typefaces for free, legally, on the web. "
-            "Christian Robertson's Roboto (2011) became Android's system font and the most popular "
-            "Google Font by a cosmic margin — it's on 27 million websites. Its dual nature (geometric "
-            "skeleton, slightly humanist curves) makes it simultaneously mechanical and approachable. "
-            "Google's design language, Material Design, is built on Roboto's proportions."
+            "Christian Robertson's Roboto became Android's system font and the most popular Google Font "
+            "by a cosmic margin — it's on 27 million websites. Google's Material Design is built on "
+            "Roboto's proportions."
         ),
-        "features": {"onum": True, "smcp": True},
+        "logo_svg": "logos/google.svg",  # Google G multicolor icon (genuine graphic mark)
+        "headshot": "logos/headshots/robertson.jpg",
     },
     {
-        "era": "2010 — Open Sans",
+        "era": "2010 — Open Sans (Google)",
         "font_family": "Open Sans",
-        "pango_font": "Open Sans",
+        "rl_font": "OpenSans",
+        "alignment": "ragged",
         "source": "fonts.google.com/specimen/Open+Sans — OFL, Steve Matteson for Google",
         "blurb": (
             "Steve Matteson designed Open Sans in 2011, commissioned by Google. Its open apertures "
-            "and neutral forms make it the typographic equivalent of clean water — essential, "
-            "invisible, everywhere. It's optimized for legibility across print, web, and mobile. "
-            "WordPress.com, Google (itself), and countless government sites use it as their primary "
-            "face. Open Sans is the second most popular Google Font, trailing only Roboto."
+            "and neutral forms make it the typographic equivalent of clean water. WordPress.com and "
+            "countless government sites use it. The second most popular Google Font."
         ),
-        "features": {},
+        "logo_svg": "logos/wordpress.svg",
+        "headshot": "logos/headshots/matteson.jpg",
     },
     {
         "era": "2010 — Lato",
         "font_family": "Lato",
-        "pango_font": "Lato",
+        "rl_font": "Lato",
+        "alignment": "ragged",
         "source": "fonts.google.com/specimen/Lato — OFL, Łukasz Dziedzic",
         "blurb": (
             "Łukasz Dziedzic designed Lato ('Summer' in Polish) in 2010, originally as a corporate "
-            "typeface for a large client who ultimately went in a different direction. Their loss, "
-            "everyone's gain. Lato's semi-rounded details give it warmth without sacrificing "
-            "seriousness — it works for banking apps and wedding invitations alike. "
-            "It's the third most popular Google Font and a strong contender for 'best free sans.'"
+            "typeface for a client who went in a different direction. Their loss. Lato's semi-rounded "
+            "details give it warmth without sacrificing seriousness. Third most popular Google Font."
         ),
-        "features": {},
+        "logo_svg": None,
+        "headshot": "logos/headshots/dziedzic.jpg",
     },
     {
         "era": "2011 — Merriweather",
         "font_family": "Merriweather",
-        "pango_font": "Merriweather",
+        "rl_font": "Merriweather",
+        "alignment": "ragged",
         "source": "fonts.google.com/specimen/Merriweather — OFL, Eben Sorkin",
         "blurb": (
-            "Eben Sorkin designed Merriweather specifically for comfortable reading on screens — "
-            "large x-height, slightly condensed letterforms, sturdy serifs that don't crumble at "
-            "small sizes. Named after a 19th-century Kansas newspaper editor (because everything "
-            "in type circles eventually loops back to print), it's become the go-to serif for long "
-            "blog posts, online magazines, and Medium articles. Pairs beautifully with any neutral "
-            "sans — the typographic buddy cop pairing of the decade."
+            "Eben Sorkin designed Merriweather for comfortable reading on screens — large x-height, "
+            "slightly condensed letterforms, sturdy serifs that don't crumble at small sizes. Named "
+            "after a 19th-century Kansas newspaper editor. The go-to serif for long blog posts."
         ),
-        "features": {},
+        "logo_svg": None,
+        "headshot": "logos/headshots/sorkin.jpg",
     },
     {
         "era": "2012 — Source Sans Pro (Adobe)",
         "font_family": "Source Sans 3",
-        "pango_font": "Source Sans 3",
+        "rl_font": "SourceSans3",
+        "alignment": "ragged",
         "source": "fonts.google.com/specimen/Source+Sans+3 — OFL, Paul Hunt for Adobe",
         "blurb": (
             "Paul Hunt designed Source Sans Pro as Adobe's first open-source typeface, released in "
-            "2012. It was a signal: even Adobe, the company that built its empire on proprietary type "
-            "technology (PostScript, OpenType), saw the value of open fonts. Source Sans is a clean "
-            "humanist sans with generous proportions — think 'Frutiger but free.' Its companion, "
-            "Source Code Pro (monospaced), is beloved by programmers. Together they proved that "
-            "open-source fonts could match commercial quality."
+            "2012. It was a signal: even Adobe saw the value of open fonts. Source Sans is a clean "
+            "humanist sans. Its companion, Source Code Pro, is beloved by programmers."
         ),
-        "features": {"onum": True, "smcp": True, "ss01": True, "titl": True},
+        "logo_svg": "logos/adobe.svg",
+        "headshot": "logos/headshots/hunt.jpg",
     },
     {
         "era": "2014 — Source Serif 4 (Adobe)",
         "font_family": "Source Serif 4",
-        "pango_font": "Source Serif 4",
+        "rl_font": "SourceSerif4",
+        "alignment": "ragged",
         "source": "fonts.google.com/specimen/Source+Serif+4 — OFL, Frank Grießhammer for Adobe",
         "blurb": (
-            "Frank Grießhammer's Source Serif (2014, updated to v4 in 2021) is Adobe's open-source "
-            "serif companion to Source Sans. Inspired by Pierre Simon Fournier's types from the 1740s, "
-            "it bridges the gap between old-style and transitional designs. UC Berkeley uses it as "
-            "their official serif typeface. Source Serif 4 is particularly interesting because it ships "
-            "with extensive OpenType features — old-style figures, small caps, and stylistic sets — "
-            "making it a rich test case for font detection tools like the one reading this page."
+            "Frank Grießhammer's Source Serif bridges the gap between old-style and transitional "
+            "designs. UC Berkeley uses it as their official serif typeface. Source Serif 4 ships "
+            "with extensive OpenType features — old-style figures, small caps, and stylistic sets."
         ),
-        "features": {"onum": True, "smcp": True, "ss01": True, "ss02": True},
+        "logo_svg": "logos/adobe.svg",
+        "headshot": None,  # Grießhammer — no public portrait found
     },
     {
         "era": "2014 — Noto Serif (Google + Monotype)",
         "font_family": "Noto Serif",
-        "pango_font": "Noto Serif",
+        "rl_font": "NotoSerif",
+        "alignment": "ragged",
         "source": "fonts.google.com/specimen/Noto+Serif — OFL, Google + Monotype",
         "blurb": (
             "The Noto project is Google's audacious attempt to create fonts for every writing system "
             "in Unicode — 'No Tofu' (the nickname for □ missing-glyph boxes). It covers 146 scripts "
-            "and 800+ languages. Noto Serif's Latin is a solid transitional design, but the real story "
-            "is the scope: from Armenian to Zanabazar Square, Noto ensures no one sees a blank box "
-            "where their language should be. It's the most democratic type project ever attempted."
+            "and 800+ languages. The most democratic type project ever attempted."
         ),
-        "features": {"onum": True, "smcp": True},
+        "logo_svg": None,
+        "headshot": None,  # Noto is a massive team project
     },
     {
         "era": "2009 — PT Serif (ParaType)",
         "font_family": "PT Serif",
-        "pango_font": "PT Serif",
+        "rl_font": "PTSerif",
+        "alignment": "ragged",
         "source": "fonts.google.com/specimen/PT+Serif — OFL, Alexandra Korolkova at ParaType",
         "blurb": (
-            "PT Serif was commissioned by the Russian government as part of a project to create "
-            "a public font family covering all the languages of the Russian Federation — from Russian "
-            "Cyrillic to Tatar, Bashkir, and dozens of minority scripts. Designed by Alexandra "
-            "Korolkova at ParaType, it's a transitional serif that works beautifully in both Latin "
-            "and Cyrillic. State-funded type for the public good: a concept as old as Garamond's "
-            "royal commissions, updated for the digital commons."
+            "PT Serif was commissioned by the Russian government to create a public font family "
+            "covering all the languages of the Russian Federation. Designed by Alexandra Korolkova "
+            "at ParaType. State-funded type for the public good."
         ),
-        "features": {},
+        "logo_svg": None,
+        "headshot": "logos/headshots/korolkova.jpg",
     },
     {
         "era": "2011 — Playfair Display",
         "font_family": "Playfair Display",
-        "pango_font": "Playfair Display",
+        "rl_font": "PlayfairDisplay",
+        "alignment": "ragged",
         "source": "fonts.google.com/specimen/Playfair+Display — OFL, Claus Eggers Sørensen",
         "blurb": (
-            "Claus Eggers Sørensen designed Playfair Display as a nod to the high-contrast "
-            "types of the European Enlightenment — Baskerville, Bodoni, and the Didots. Its "
-            "delicate hairlines and generous proportions make it a display face par excellence: "
-            "magazine headings, wedding invitations, that chic restaurant menu. Not great for "
-            "small body text (those hairlines vanish below 14px), but for titles at 36pt+, "
-            "Playfair is the free font that finally let indie designers stop pirating Didot."
+            "Claus Eggers Sørensen designed Playfair Display as a nod to the high-contrast types "
+            "of the Enlightenment — Baskerville, Bodoni, and the Didots. Its delicate hairlines "
+            "make it a display face par excellence: magazine headings, wedding invitations. "
+            "Not great below 14px, but for titles at 36pt+, Playfair is magnificent."
         ),
-        "features": {},
+        "logo_svg": None,
+        "headshot": "logos/headshots/sorensen.jpg",
     },
     {
-        "era": "2017 — IBM Plex (IBM)",
+        "era": "2017 — IBM Plex Sans",
         "font_family": "IBM Plex Sans",
-        "pango_font": "IBM Plex Sans",
+        "rl_font": "IBMPlexSans",
+        "alignment": "ragged",
         "source": "fonts.google.com/specimen/IBM+Plex+Sans — OFL, Mike Abbink + Bold Monday for IBM",
         "blurb": (
-            "When IBM replaced Helvetica Neue with their custom IBM Plex family in 2017, it was "
-            "a $100B company saying 'we need our own voice.' Mike Abbink and Bold Monday designed "
-            "Plex in Sans, Serif, and Mono — all open-source. The design threads a needle between "
-            "Helvetica's neutrality and Futura's geometry, with distinctive details like the slashed "
-            "zero and the slab-serif-inflected terminals. IBM Plex is what corporate type looks like "
-            "when the corporation actually cares about craft."
+            "When IBM replaced Helvetica Neue with IBM Plex in 2017, it was a $100B company saying "
+            "'we need our own voice.' Plex threads a needle between Helvetica's neutrality and "
+            "Futura's geometry. Corporate type that actually cares about craft."
         ),
-        "features": {},
+        "logo_svg": "logos/ibm.svg",
+        "headshot": "logos/headshots/abbink.jpg",
     },
     {
         "era": "2017 — IBM Plex Serif",
         "font_family": "IBM Plex Serif",
-        "pango_font": "IBM Plex Serif",
+        "rl_font": "IBMPlexSerif",
+        "alignment": "ragged",
         "source": "fonts.google.com/specimen/IBM+Plex+Serif — OFL, Mike Abbink + Bold Monday for IBM",
         "blurb": (
             "IBM Plex Serif is the quieter sibling — a contemporary slab-influenced serif that "
-            "pairs naturally with Plex Sans. Its slightly mechanical structure reflects IBM's "
-            "engineering DNA while remaining warm and readable. Together, the Plex family demonstrates "
-            "that corporate identity fonts don't have to be boring — they just need to be consistent. "
-            "Every IBM product, from Watson to Cloud, uses Plex exclusively."
+            "pairs naturally with Plex Sans. Together, the Plex family demonstrates that corporate "
+            "identity fonts don't have to be boring."
         ),
-        "features": {},
+        "logo_svg": None,
+        "headshot": "logos/headshots/abbink.jpg",
     },
     {
         "era": "2017 — IBM Plex Mono",
         "font_family": "IBM Plex Mono",
-        "pango_font": "IBM Plex Mono",
+        "rl_font": "IBMPlexMono",
+        "alignment": "ragged",
         "source": "fonts.google.com/specimen/IBM+Plex+Mono — OFL, Mike Abbink + Bold Monday for IBM",
         "blurb": (
-            "IBM Plex Mono completes the Plex trilogy with a monospaced design that nods to "
-            "IBM's original Selectric typefaces. Where Courier is a relic of the mechanical era, "
-            "Plex Mono is designed for modern terminals and code editors. Its distinctive glyph "
-            "shapes make zero/O and one/l/I instantly distinguishable — the single most important "
-            "trait in a programming font. It's proof that even monospace can be beautiful."
+            "IBM Plex Mono completes the Plex trilogy with a monospaced design that nods to IBM's "
+            "original Selectric typefaces. Its distinctive glyph shapes make zero/O and one/l/I "
+            "instantly distinguishable — the single most important trait in a programming font."
         ),
-        "features": {},
+        "logo_svg": None,
+        "headshot": "logos/headshots/abbink.jpg",
     },
     {
         "era": "2018 — Inter (Rasmus Andersson)",
         "font_family": "Inter",
-        "pango_font": "Inter",
+        "rl_font": "Inter",
+        "alignment": "ragged",
         "source": "fonts.google.com/specimen/Inter — OFL, Rasmus Andersson. Also rsms.me/inter",
         "blurb": (
-            "Rasmus Andersson, a designer at Figma, created Inter as a typeface optimized for "
-            "user interfaces — specifically, for the awkward sizes between 11px and 16px where most "
-            "UI text lives. Its tall x-height, open apertures, and extensive kerning pairs make it "
-            "the default choice for design tools, dashboards, and apps. With 5 stylistic sets, small "
-            "caps, and a variable-font axis for weight, Inter is arguably the most polished open-source "
-            "UI font available. It's what Helvetica would be if Helvetica were designed for Retina screens."
+            "Rasmus Andersson, a designer at Figma, created Inter for user interfaces — specifically, "
+            "for the awkward sizes between 11px and 16px. Its tall x-height and extensive kerning "
+            "pairs make it the default for design tools and dashboards. It's what Helvetica would be "
+            "if Helvetica were designed for Retina screens."
         ),
-        # Use the system OTF which has features
-        "features": {"smcp": True, "ss01": True, "ss02": True, "ss03": True},
+        "logo_svg": "logos/figma.svg",
+        "headshot": "logos/headshots/andersson.jpg",
     },
 ]
 
 
-def render_pango_to_png(text, font_name, size_pt, out_png, width_px=1020,
-                         features=None, is_bold=False, is_italic=False):
-    """Render text with pango-view to a PNG file.
-    
-    Default width_px=1020 is half-column at 300dpi (for two-column layout).
-    At 300dpi, 1pt ≈ 4.17px, so 10pt text ≈ 42px rendered height.
-    All body text must be ≥10pt to remain fair at fax resolution.
-    """
-    markup_parts = []
-    style_attrs = [f'font="{font_name} {size_pt}"']
-    if is_bold:
-        style_attrs.append('weight="bold"')
-    if is_italic:
-        style_attrs.append('style="italic"')
-    if features:
-        feat_str = ",".join(f"{f}=1" for f in features)
-        style_attrs.append(f'font_features="{feat_str}"')
+# ---------------------------------------------------------------------------
+# SVG logo flowable
+# ---------------------------------------------------------------------------
+class SVGLogo(Flowable):
+    """Place an SVG as a vector drawing in the PDF."""
+    def __init__(self, svg_path, max_width, max_height=50):
+        Flowable.__init__(self)
+        self.svg_path = svg_path
+        self.max_width = max_width
+        self.max_height = max_height
+        self._drawing = None
+        self._load()
 
-    attr_str = " ".join(style_attrs)
-    # Escape text for pango markup
-    safe = text.replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;").replace('"', "&quot;")
-    markup = f'<span {attr_str}>{safe}</span>'
+    def _load(self):
+        try:
+            from svglib.svglib import svg2rlg
+            drawing = svg2rlg(self.svg_path)
+            if drawing is None:
+                return
+            # Scale to fit: scale up small SVGs to max_height, scale down large ones
+            sx = self.max_width / drawing.width
+            sy = self.max_height / drawing.height
+            scale = min(sx, sy)
+            drawing.width *= scale
+            drawing.height *= scale
+            drawing.scale(scale, scale)
+            self._drawing = drawing
+            self.width = drawing.width
+            self.height = drawing.height
+        except Exception as e:
+            print(f"  WARN: SVG load failed for {self.svg_path}: {e}")
 
-    # pango-view requires a file argument for markup
-    markup_file = out_png + ".markup"
-    with open(markup_file, "w") as f:
-        f.write(markup)
+    def wrap(self, availWidth, availHeight):
+        if self._drawing:
+            return self._drawing.width, self._drawing.height
+        return 0, 0
 
-    cmd = [
-        "pango-view", "--markup", "--no-display",
-        f"--width={width_px}", "--wrap=word",
-        "--margin=0",
-        f"--output={out_png}",
-        "--backend=cairo",
-        markup_file,
-    ]
-    proc = subprocess.run(cmd, capture_output=True, text=True)
-    try:
-        os.unlink(markup_file)
-    except OSError:
-        pass
-    if proc.returncode != 0:
-        print(f"  WARN: pango-view failed for {font_name}: {proc.stderr[:200]}")
-        return False
-    return os.path.exists(out_png)
+    def draw(self):
+        if self._drawing:
+            self._drawing.drawOn(self.canv, 0, 0)
 
 
-def build_section_images(section, idx, tmpdir):
-    """Build all image strips for a section. Returns list of PNG paths in order.
-    
-    Text sizes (all ≥10pt for fax-resolution fairness):
-      - Section header: 14pt bold (in Jost)
-      - Source URL: 8pt italic (Source Serif 4) — intentionally below 10pt as a
-        metadata line, not a test target
-      - Body blurb: 11pt (in the section's own font — the main test target)
-      - Pangram/alphabet/digit lines: 10pt
-      - OT variant demos: 10pt with features enabled
-    
-    All rendered at column width (1020px at 300dpi ≈ 3.4 inches) for
-    two-column page composition.
-    """
-    images = []
-    era = section["era"]
-    font = section["pango_font"]
-    blurb = section["blurb"]
-    source = section.get("source", "")
-    features = section.get("features", {})
-    prefix = f"{tmpdir}/s{idx:02d}"
+class StackedFlowables(Flowable):
+    """Stack multiple flowables vertically into a single flowable.
+    Used to combine headshot + logo into one image block for ImageAndFlowables."""
+    def __init__(self, flowables, gap=3):
+        Flowable.__init__(self)
+        self._flowables = [f for f in flowables if f is not None]
+        self._gap = gap
+        self.drawWidth = 0
+        self.drawHeight = 0
 
-    COL_W = 1020  # half-page column width at 300dpi
+    def _restrictSize(self, aW, aH):
+        """Mimic Image._restrictSize so ImageAndFlowables can use us."""
+        if self.drawWidth > aW + 1e-6 or self.drawHeight > aH + 1e-6:
+            self._oldDrawSize = self.drawWidth, self.drawHeight
+            factor = min(float(aW) / max(self.drawWidth, 1e-6),
+                         float(aH) / max(self.drawHeight, 1e-6))
+            self.drawWidth *= factor
+            self.drawHeight *= factor
+        return self.drawWidth, self.drawHeight
 
-    # 1. Era header (rendered in Jost bold — geometric, modern)
-    hdr_file = f"{prefix}_00_header.png"
-    render_pango_to_png(era, "Jost", 14, hdr_file, width_px=COL_W, is_bold=True)
-    images.append(hdr_file)
+    def _unRestrictSize(self):
+        dwh = getattr(self, '_oldDrawSize', None)
+        if dwh:
+            self.drawWidth, self.drawHeight = dwh
 
-    # 1b. Source/download info (small italic, in Source Serif 4)
-    if source:
-        src_file = f"{prefix}_00b_source.png"
-        render_pango_to_png(f"Font: {source}", "Source Serif 4", 8, src_file,
-                            width_px=COL_W, is_italic=True)
-        images.append(src_file)
+    def wrap(self, availWidth, availHeight):
+        self.drawWidth = 0
+        self.drawHeight = 0
+        for i, f in enumerate(self._flowables):
+            w, h = f.wrap(availWidth, availHeight)
+            self.drawWidth = max(self.drawWidth, w)
+            self.drawHeight += h
+            if i > 0:
+                self.drawHeight += self._gap
+        self.width = self.drawWidth
+        self.height = self.drawHeight
+        return self.drawWidth, self.drawHeight
 
-    # 2. Blurb paragraph in the actual font — 11pt body, the main test target
-    blurb_file = f"{prefix}_01_blurb.png"
-    render_pango_to_png(blurb, font, 11, blurb_file, width_px=COL_W)
-    images.append(blurb_file)
-
-    # 3. Pangram + digits line
-    pangram = "The quick brown fox jumps over 1,234,567,890 lazy dogs."
-    pang_file = f"{prefix}_02_pangram.png"
-    render_pango_to_png(pangram, font, 10, pang_file, width_px=COL_W)
-    images.append(pang_file)
-
-    # 4. Uppercase alphabet
-    upper = "ABCDEFGHIJKLMNOPQRSTUVWXYZ  abcdefghijklmnopqrstuvwxyz"
-    alpha_file = f"{prefix}_03_alpha.png"
-    render_pango_to_png(upper, font, 10, alpha_file, width_px=COL_W)
-    images.append(alpha_file)
-
-    # 5. Default digits line
-    digits = "Lining figures: 0 1 2 3 4 5 6 7 8 9"
-    dig_file = f"{prefix}_04_digits.png"
-    render_pango_to_png(digits, font, 10, dig_file, width_px=COL_W)
-    images.append(dig_file)
-
-    # 6. OT variant demos — 10pt with features enabled
-    if features.get("onum"):
-        onum_text = "Old-style figures (onum): 0 1 2 3 4 5 6 7 8 9"
-        onum_file = f"{prefix}_05_onum.png"
-        render_pango_to_png(onum_text, font, 10, onum_file,
-                            width_px=COL_W, features=["onum"])
-        images.append(onum_file)
-
-    if features.get("smcp"):
-        smcp_text = "Small Caps (smcp): The Quick Brown Fox Jumps Over The Lazy Dog"
-        smcp_file = f"{prefix}_06_smcp.png"
-        render_pango_to_png(smcp_text, font, 10, smcp_file,
-                            width_px=COL_W, features=["smcp"])
-        images.append(smcp_file)
-
-    for ss in ["ss01", "ss02", "ss03"]:
-        if features.get(ss):
-            ss_text = f"Stylistic Set {ss[-2:]} ({ss}): abcdefghijklmnopqrstuvwxyz 0123456789"
-            ss_file = f"{prefix}_07_{ss}.png"
-            render_pango_to_png(ss_text, font, 10, ss_file,
-                                width_px=COL_W, features=[ss])
-            images.append(ss_file)
-
-    if features.get("titl"):
-        titl_text = "Titling (titl): ABCDEFGHIJKLMNOPQRSTUVWXYZ"
-        titl_file = f"{prefix}_08_titl.png"
-        render_pango_to_png(titl_text, font, 10, titl_file,
-                            width_px=COL_W, features=["titl"])
-        images.append(titl_file)
-
-    return images
+    def draw(self):
+        y = self.drawHeight
+        for i, f in enumerate(self._flowables):
+            w, h = f.wrap(self.drawWidth, self.drawHeight)
+            y -= h
+            f.drawOn(self.canv, 0, y)
+            if i < len(self._flowables) - 1:
+                y -= self._gap
 
 
-def compose_pages(all_section_images, tmpdir):
-    """Stack section images into a two-column US Letter layout.
-    
-    Two-column layout at 300dpi:
-      Page:    2550 × 3300 px (8.5" × 11")
-      Margins: 150px left/right, 120px top/bottom
-      Gutter:  80px between columns
-      Column:  (2550 - 2×150 - 80) / 2 = 1035px each
-    
-    Sections flow left-to-right, top-to-bottom, snaking across columns.
-    A section that won't fit in the remaining column space starts at the
-    top of the next available column (which may be the right column on
-    the same page, or the left column of a new page).
-    """
-    from PIL import Image
+# ---------------------------------------------------------------------------
+# Build the specimen PDF
+# ---------------------------------------------------------------------------
+def build_specimen(out_pdf):
+    """Build a proper vector PDF with embedded fonts and SVG logos."""
 
-    MARGIN_TOP = 120
-    MARGIN_SIDE = 150
-    GUTTER = 80
-    SECTION_GAP = 40
-    INTRA_GAP = 6
-    COL_W = (PAGE_W - 2 * MARGIN_SIDE - GUTTER) // 2  # ~1035px
-    USABLE_H = PAGE_H - 2 * MARGIN_TOP
+    # Two-column layout
+    margin_side = 0.6 * inch
+    margin_top = 0.5 * inch
+    margin_bottom = 0.5 * inch
+    gutter = 0.3 * inch
+    col_w = (PAGE_W - 2 * margin_side - gutter) / 2
 
-    pages = []          # list of finished page PNGs
-    page_num = 0
-    # Current page image (created lazily)
-    cur_page = None
-    # Two columns: track y position for each
-    col_y = [0, 0]     # [left_col_y, right_col_y]
-    cur_col = 0         # 0 = left, 1 = right
+    frame_left = Frame(
+        margin_side, margin_bottom,
+        col_w, PAGE_H - margin_top - margin_bottom,
+        id='left', leftPadding=0, rightPadding=0, topPadding=0, bottomPadding=0
+    )
+    frame_right = Frame(
+        margin_side + col_w + gutter, margin_bottom,
+        col_w, PAGE_H - margin_top - margin_bottom,
+        id='right', leftPadding=0, rightPadding=0, topPadding=0, bottomPadding=0
+    )
 
-    def ensure_page():
-        nonlocal cur_page
-        if cur_page is None:
-            cur_page = Image.new("L", (PAGE_W, PAGE_H), 255)
+    doc = BaseDocTemplate(
+        str(out_pdf),
+        pagesize=letter,
+        leftMargin=margin_side,
+        rightMargin=margin_side,
+        topMargin=margin_top,
+        bottomMargin=margin_bottom,
+    )
+    doc.addPageTemplates([
+        PageTemplate(id='TwoCol', frames=[frame_left, frame_right]),
+    ])
 
-    def flush_page():
-        nonlocal page_num, cur_page, col_y, cur_col
-        if cur_page is not None:
-            ppath = f"{tmpdir}/page_{page_num:03d}.png"
-            cur_page.save(ppath)
-            pages.append(ppath)
-            page_num += 1
-            cur_page = None
-        col_y = [0, 0]
-        cur_col = 0
+    story = []
 
-    def col_x(col_idx):
-        """Left edge of a column in page coordinates."""
-        if col_idx == 0:
-            return MARGIN_SIDE
-        else:
-            return MARGIN_SIDE + COL_W + GUTTER
+    # --- Title block ---
+    title_style = ParagraphStyle(
+        'Title', fontName='PlayfairDisplay', fontSize=22, leading=26,
+        spaceAfter=4
+    )
+    subtitle_style = ParagraphStyle(
+        'Subtitle', fontName='SourceSerif4-Italic',
+        fontSize=10, leading=13, spaceAfter=2, textColor='#444444'
+    )
+    intro_style = ParagraphStyle(
+        'Intro', fontName='SourceSerif4', fontSize=9, leading=12, spaceAfter=10
+    )
 
-    for section_idx, section_imgs in enumerate(all_section_images):
-        # Load and scale all strips for this section
-        loaded = []
-        section_h = 0
-        for imgpath in section_imgs:
-            if not os.path.exists(imgpath):
-                continue
-            im = Image.open(imgpath).convert("L")
-            # Scale to column width if needed
-            if im.width > COL_W:
-                ratio = COL_W / im.width
-                im = im.resize((COL_W, int(im.height * ratio)), Image.LANCZOS)
-            loaded.append(im)
-            section_h += im.height + INTRA_GAP
-        section_h += SECTION_GAP  # gap after section
+    story.append(Paragraph("A Timeline of Typography", title_style))
+    story.append(Paragraph(
+        "<i>Five Centuries of Letterforms — A Font Specimen for Unscan</i>",
+        subtitle_style
+    ))
+    story.append(Paragraph(
+        "Each section is rendered in a known font. Every blurb is set in the font it describes. "
+        "SVG logos mark companies that made or popularized each typeface.",
+        intro_style
+    ))
+    story.append(Spacer(1, 8))
 
-        if not loaded:
-            continue
+    # --- Sections ---
+    # Image column width for headshot/logo sidebar
+    IMG_COL_W = 52  # points — fits ~40pt image + padding
 
-        # Try to fit section in current column
-        remaining = USABLE_H - col_y[cur_col]
-        if col_y[cur_col] > 0 and section_h > remaining:
-            # Won't fit — try next column
-            if cur_col == 0:
-                cur_col = 1
-                remaining = USABLE_H - col_y[cur_col]
-                if col_y[cur_col] > 0 and section_h > remaining:
-                    # Right column also full — new page
-                    flush_page()
-            else:
-                # Already in right column — new page
-                flush_page()
+    for section in SECTIONS:
+        rl = section["rl_font"]
+        text_items = []  # left column: all text flowables
+        img_items = []   # right column: headshot + logo stacked
 
-        # Place strips in current column
-        ensure_page()
-        x = col_x(cur_col)
-        for im in loaded:
-            # If this strip alone overflows, advance column/page
-            if col_y[cur_col] + im.height > USABLE_H:
-                if cur_col == 0:
-                    cur_col = 1
-                else:
-                    flush_page()
-                    ensure_page()
-                x = col_x(cur_col)
+        # --- Build right-column image stack ---
 
-            cur_page.paste(im, (x, MARGIN_TOP + col_y[cur_col]))
-            col_y[cur_col] += im.height + INTRA_GAP
+        # Headshot/portrait (aspect-ratio-preserving)
+        headshot_rel = section.get("headshot")
+        if headshot_rel:
+            hs_path = SCRIPT_DIR / headshot_rel
+            if hs_path.exists():
+                try:
+                    pil_img = PILImage.open(hs_path)
+                    iw, ih = pil_img.size
+                    target_w = 40  # points
+                    max_h = 55     # points — cap very tall portraits
+                    aspect = ih / iw
+                    target_h = min(target_w * aspect, max_h)
+                    # If capped by max_h, shrink width to preserve ratio
+                    if target_w * aspect > max_h:
+                        target_w = max_h / aspect
+                    img_items.append(RLImage(str(hs_path), width=target_w, height=target_h))
+                    img_items.append(Spacer(1, 3))
+                except Exception as e:
+                    print(f"  WARN: headshot load failed for {hs_path}: {e}")
 
-        col_y[cur_col] += SECTION_GAP - INTRA_GAP  # section separator
+        # SVG logo
+        svg_rel = section.get("logo_svg")
+        if svg_rel:
+            svg_path = SCRIPT_DIR / svg_rel
+            if svg_path.exists():
+                logo = SVGLogo(str(svg_path), max_width=42, max_height=30)
+                if logo._drawing:
+                    img_items.append(logo)
+                    img_items.append(Spacer(1, 3))
 
-    flush_page()
-    return pages
+        has_images = len(img_items) > 0
 
+        # --- Build left-column text flowables ---
 
-def pages_to_pdf(page_pngs, out_pdf):
-    """Convert page PNGs to PDF via img2pdf (lossless, exact DPI)."""
-    import img2pdf
-    # img2pdf handles PNGs natively and preserves DPI metadata
-    with open(out_pdf, "wb") as f:
-        # Set layout to US Letter at 300dpi
-        layout = img2pdf.get_layout_fun(
-            pagesize=(img2pdf.in_to_pt(8.5), img2pdf.in_to_pt(11))
+        # Heading in the section's own font, bold
+        hdr_style = ParagraphStyle(
+            f'Hdr-{rl}', fontName=f'{rl}-Bold', fontSize=14, leading=17,
+            spaceBefore=6, spaceAfter=2
         )
-        f.write(img2pdf.convert(page_pngs, layout_fun=layout))
+        text_items.append(Paragraph(section["era"], hdr_style))
+
+        # Source line
+        src_style = ParagraphStyle(
+            f'Src-{rl}', fontName='SourceSerif4-Italic',
+            fontSize=7, leading=9, textColor='#777777', spaceAfter=3
+        )
+        text_items.append(Paragraph(f"Font: {section['source']}", src_style))
+
+        # Body blurb in the section's font
+        text_align = TA_JUSTIFY if section.get("alignment") == "justify" else TA_LEFT
+        body_style = ParagraphStyle(
+            f'Body-{rl}', fontName=rl, fontSize=10, leading=13, spaceAfter=2,
+            alignment=text_align
+        )
+        text_items.append(Paragraph(section["blurb"], body_style))
+
+        # Bold sample
+        bold_style = ParagraphStyle(
+            f'Bold-{rl}', fontName=f'{rl}-Bold', fontSize=10, leading=13, spaceAfter=1,
+            alignment=text_align
+        )
+        text_items.append(Paragraph(
+            "Bold: The quick brown fox jumps over 1,234,567,890 lazy dogs.",
+            bold_style
+        ))
+
+        # Italic sample
+        italic_style = ParagraphStyle(
+            f'Italic-{rl}', fontName=f'{rl}-Italic', fontSize=10, leading=13, spaceAfter=1,
+            alignment=text_align
+        )
+        text_items.append(Paragraph(
+            "Italic: The quick brown fox jumps over 1,234,567,890 lazy dogs.",
+            italic_style
+        ))
+
+        # Alphabet + digits
+        alpha_style = ParagraphStyle(
+            f'Alpha-{rl}', fontName=rl, fontSize=9, leading=11, spaceAfter=1
+        )
+        text_items.append(Paragraph(
+            "ABCDEFGHIJKLMNOPQRSTUVWXYZ  abcdefghijklmnopqrstuvwxyz",
+            alpha_style
+        ))
+        text_items.append(Paragraph("Lining figures: 0 1 2 3 4 5 6 7 8 9", alpha_style))
+
+        # --- Compose layout: ImageAndFlowables (text wraps around images) ---
+        if has_images:
+            # Stack headshot + logo into one composite image flowable
+            # Filter out Spacer items from img_items — only keep actual images
+            real_images = [f for f in img_items if not isinstance(f, Spacer)]
+            if len(real_images) >= 1:
+                side_img = StackedFlowables(real_images, gap=3)
+
+            iaf = ImageAndFlowables(
+                side_img, text_items,
+                imageLeftPadding=4, imageRightPadding=0,
+                imageTopPadding=0, imageBottomPadding=3,
+                imageSide='right',
+            )
+            section_items = [iaf, Spacer(1, 8)]
+        else:
+            # No images — full-width text
+            text_items.append(Spacer(1, 8))
+            section_items = text_items
+
+        # Try to keep section together
+        story.append(KeepTogether(section_items))
+
+    doc.build(story)
+    return out_pdf
 
 
-def build_ground_truth(sections, out_json):
-    """Write ground truth mapping."""
-    truth = {
-        "description": "Ground truth for font-timeline-specimen.pdf",
-        "generated": "2025-05-10",
-        "sections": []
-    }
-    for idx, s in enumerate(sections):
-        entry = {
-            "index": idx,
-            "era": s["era"],
-            "font_family": s["font_family"],
-            "pango_font": s["pango_font"],
-            "source": s.get("source", ""),
-            "features_demonstrated": list(k for k, v in s.get("features", {}).items() if v),
-        }
-        truth["sections"].append(entry)
-    with open(out_json, "w") as f:
-        json.dump(truth, f, indent=2)
+# ---------------------------------------------------------------------------
+# "Scan" a PDF — rasterize + degrade
+# ---------------------------------------------------------------------------
+def scan_pdf(clean_pdf, scanned_pdf, dpi=300):
+    """Rasterize a vector PDF and repackage with scan artifacts."""
+    import numpy as np
+    from PIL import Image, ImageFilter
 
-
-def main():
-    tmpdir = "/tmp/specimen-render"
+    tmpdir = "/tmp/specimen-scan"
     os.makedirs(tmpdir, exist_ok=True)
 
-    # First: render title page (full width, spans both columns)
-    FULL_W = PAGE_W - 2 * 150  # 2250px — full usable width
-    title_imgs = []
-    t1 = f"{tmpdir}/title_01.png"
-    render_pango_to_png(
-        "A Timeline of Typography",
-        "Playfair Display", 36, t1, width_px=FULL_W, is_bold=False
+    # Count pages
+    result = subprocess.run(
+        ["pdfinfo", str(clean_pdf)], capture_output=True, text=True
     )
-    title_imgs.append(t1)
+    num_pages = 1
+    for line in result.stdout.split('\n'):
+        if line.startswith('Pages:'):
+            num_pages = int(line.split(':')[1].strip())
+            break
 
-    t2 = f"{tmpdir}/title_02.png"
-    render_pango_to_png(
-        "Five Centuries of Letterforms — A Font Specimen for Unscan",
-        "Source Serif 4", 14, t2, width_px=FULL_W, is_italic=True
-    )
-    title_imgs.append(t2)
-
-    t3 = f"{tmpdir}/title_03.png"
-    render_pango_to_png(
-        "\n\nThis document is a ground-truth test specimen. Each section is rendered in a known "
-        "font, with OpenType variants demonstrated where available. Feed it to unscan and verify "
-        "it identifies each correctly.\n\n"
-        "Every blurb is set in the font it describes — so you're reading Garamond IN Garamond, "
-        "Bodoni IN Bodoni, and yes, Comic Sans IN Comic Sans.\n\n"
-        "Fonts are ordered chronologically by their original design date. Digital revivals stand "
-        "in for historical originals where exact versions aren't freely available.\n\n"
-        "Body text is set at 11pt — large enough to survive fax-resolution degradation, small "
-        "enough to be a realistic test of font detection. Two-column layout increases density "
-        "and tests the tool's ability to handle adjacent columns with different typefaces.\n\n"
-        "Lining figures:  0 1 2 3 4 5 6 7 8 9\n"
-        "Test string:     The quick brown fox jumps over 42 lazy dogs.",
-        "Source Serif 4", 11, t3, width_px=FULL_W
-    )
-    title_imgs.append(t3)
-
-    # Title page is special — full width, rendered as its own page
-    all_sections = []  # section images for column flow (NOT title)
-
-    print(f"Rendering {len(SECTIONS)} sections...")
-    for idx, section in enumerate(SECTIONS):
-        print(f"  [{idx+1}/{len(SECTIONS)}] {section['era']} — {section['font_family']}")
-        imgs = build_section_images(section, idx, tmpdir)
-        all_sections.append(imgs)
-
-    print("Composing pages...")
-
-    # Build title page first (full-width, centered)
-    from PIL import Image
-    title_page = Image.new("L", (PAGE_W, PAGE_H), 255)
-    title_y = 300  # start title lower for visual balance
-    for timg_path in title_imgs:
-        if not os.path.exists(timg_path):
-            continue
-        tim = Image.open(timg_path).convert("L")
-        # Center horizontally
-        x = (PAGE_W - tim.width) // 2
-        title_page.paste(tim, (x, title_y))
-        title_y += tim.height + 12
-    title_path = f"{tmpdir}/page_title.png"
-    title_page.save(title_path)
-
-    # Compose remaining sections into two-column pages
-    col_pages = compose_pages(all_sections, tmpdir)
-    all_page_pngs = [title_path] + col_pages
-    print(f"  {len(all_page_pngs)} pages (1 title + {len(col_pages)} content)")
-
-    out_pdf = "/home/hatch/workspace/repos/unscan/test-docs/font-timeline-specimen.pdf"
-    print(f"Writing PDF: {out_pdf}")
-    pages_to_pdf(all_page_pngs, out_pdf)
-
-    out_json = "/home/hatch/workspace/repos/unscan/test-docs/font-timeline-specimen.json"
-    print(f"Writing ground truth: {out_json}")
-    build_ground_truth(SECTIONS, out_json)
-
-    # Also create a "scanned" version — rasterize and reassemble
-    # Simulates a real flatbed scan: slight rotation (skew), Gaussian blur,
-    # speckle noise, and off-white paper background.
-    print("Creating scanned version...")
-    scanned_dir = f"{tmpdir}/scanned"
-    os.makedirs(scanned_dir, exist_ok=True)
-
-    from PIL import Image, ImageFilter
-    import numpy as np
-    import random
-
-    # Consistent skew for all pages (as if the whole doc was placed crooked)
+    # Consistent skew for all pages (like a real scanner placement)
     skew_deg = random.uniform(1.5, 3.0)
-    # Randomly pick CW or CCW
     if random.random() < 0.5:
         skew_deg = -skew_deg
     print(f"  Skew: {skew_deg:.1f}°")
 
     scanned_pages = []
-    for i, ppng in enumerate(all_page_pngs):
-        im = Image.open(ppng).convert("L")
+    for i in range(num_pages):
+        page_num = i + 1
+        # Rasterize this page with pdftoppm
+        prefix = f"{tmpdir}/page_{i:03d}"
+        subprocess.run([
+            "pdftoppm", "-r", str(dpi), "-f", str(page_num), "-l", str(page_num),
+            "-gray", str(clean_pdf), prefix
+        ], capture_output=True)
 
-        # 1. Rotate (skew) — fill exposed edges with near-white (like scanner lid)
-        #    expand=True so we don't clip corners; PIL fills with fillcolor
-        im = im.rotate(skew_deg, resample=Image.BICUBIC, expand=True,
-                        fillcolor=245)
+        # Find the output file
+        png_path = None
+        for ext in [f"-{page_num}.pgm", f"-{page_num:02d}.pgm", f"-{page_num:03d}.pgm"]:
+            candidate = prefix + ext
+            if os.path.exists(candidate):
+                png_path = candidate
+                break
+        if not png_path:
+            # Try globbing
+            import glob
+            matches = glob.glob(f"{prefix}*")
+            if matches:
+                png_path = matches[0]
 
-        # Crop back to original page size (centered)
+        if not png_path:
+            print(f"  WARN: rasterization failed for page {page_num}")
+            continue
+
+        im = Image.open(png_path).convert("L")
+        orig_w, orig_h = im.size
+
+        # 1. Rotate (skew)
+        im = im.rotate(skew_deg, resample=Image.BICUBIC, expand=True, fillcolor=245)
+
+        # Crop back to original size (centered)
         cx, cy = im.width // 2, im.height // 2
-        left = cx - PAGE_W // 2
-        top = cy - PAGE_H // 2
-        im = im.crop((left, top, left + PAGE_W, top + PAGE_H))
+        left = cx - orig_w // 2
+        top = cy - orig_h // 2
+        im = im.crop((left, top, left + orig_w, top + orig_h))
 
-        # 2. Off-white paper background — real scanned paper isn't pure 255
+        # 2. Paper texture + noise
         arr = np.array(im, dtype=np.float32)
-        # Paper tone: ~245 with slight per-pixel variation (paper texture)
         paper_noise = np.random.normal(0, 1.5, arr.shape).astype(np.float32)
         arr = np.clip(arr + paper_noise, 0, 255)
-        # Darken overall slightly (scanner doesn't produce pure white)
-        arr = arr * 0.96 + 8  # shifts white from 255 to ~253
+        arr = arr * 0.96 + 8  # darken slightly (scanner doesn't produce pure white)
 
-        # 3. Speckle noise — random dark spots (dust on scanner glass)
+        # 3. Speckle noise (dust on scanner glass)
         speckle = np.random.random(arr.shape)
         arr[speckle < 0.0003] = np.random.randint(40, 120, size=np.sum(speckle < 0.0003))
 
-        # 4. Light Gaussian blur — scanner optics aren't perfectly sharp
+        # 4. Light Gaussian blur (scanner optics)
         im = Image.fromarray(np.clip(arr, 0, 255).astype(np.uint8), mode="L")
         im = im.filter(ImageFilter.GaussianBlur(radius=0.7))
 
-        spath = f"{scanned_dir}/page_{i:03d}.png"
-        im.save(spath)
-        scanned_pages.append(spath)
+        out_path = f"{tmpdir}/scanned_{i:03d}.png"
+        im.save(out_path, dpi=(dpi, dpi))
+        scanned_pages.append(out_path)
 
-    scanned_pdf = "/home/hatch/workspace/repos/unscan/test-docs/font-timeline-specimen-scanned.pdf"
-    pages_to_pdf(scanned_pages, scanned_pdf)
+    # Reassemble as PDF
+    import img2pdf
+    with open(str(scanned_pdf), "wb") as f:
+        layout = img2pdf.get_layout_fun(
+            pagesize=(img2pdf.in_to_pt(8.5), img2pdf.in_to_pt(11))
+        )
+        f.write(img2pdf.convert(scanned_pages, layout_fun=layout))
+
+    return scanned_pdf
+
+
+# ---------------------------------------------------------------------------
+# Ground truth
+# ---------------------------------------------------------------------------
+def build_ground_truth(sections, out_json):
+    truth = {
+        "description": "Ground truth for font-timeline-specimen.pdf",
+        "note": "Vector PDF with embedded TTF fonts + SVG logos. Scanned version is raster.",
+        "sections": []
+    }
+    for idx, s in enumerate(sections):
+        truth["sections"].append({
+            "index": idx,
+            "era": s["era"],
+            "font_family": s["font_family"],
+            "rl_font": s["rl_font"],
+            "source": s.get("source", ""),
+            "has_logo_svg": bool(s.get("logo_svg")),
+            "has_headshot": bool(s.get("headshot")),
+            "styles_demonstrated": ["regular", "bold", "italic"],
+        })
+    with open(str(out_json), "w") as f:
+        json.dump(truth, f, indent=2)
+
+
+# ---------------------------------------------------------------------------
+# Main
+# ---------------------------------------------------------------------------
+def main():
+    print("Registering fonts...")
+    registered = register_all_fonts()
+    print(f"  {len(registered)} font families registered")
+
+    out_pdf = OUT_DIR / "font-timeline-specimen.pdf"
+    print(f"Building vector specimen: {out_pdf}")
+    build_specimen(out_pdf)
+
+    out_json = OUT_DIR / "font-timeline-specimen.json"
+    print(f"Writing ground truth: {out_json}")
+    build_ground_truth(SECTIONS, out_json)
+
+    scanned_pdf = OUT_DIR / "font-timeline-specimen-scanned.pdf"
+    print(f"Creating scanned version...")
+    scan_pdf(out_pdf, scanned_pdf)
     print(f"Scanned PDF: {scanned_pdf}")
 
     print("Done!")

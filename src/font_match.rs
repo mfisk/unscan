@@ -14,7 +14,7 @@ use crate::font_scan::{FontClass, FontEntry};
 use crate::ocr::TextLine;
 use ab_glyph::{point, Font, FontRef, PxScale, ScaleFont};
 use image::{GrayImage, Luma};
-use log::debug;
+use log::{debug, info, warn};
 use std::path::PathBuf;
 
 // ---------------------------------------------------------------------------
@@ -27,6 +27,8 @@ pub struct FontMatchResult {
     pub font_path: PathBuf,
     pub score: f32,
     pub font_data: Vec<u8>,
+    /// Best vertical pixel shift from SSIM alignment search (0 if coarse-only).
+    pub best_dy: i32,
 }
 
 /// Pre-processed source word ready for comparison.
@@ -48,8 +50,14 @@ struct SourceSample {
 /// Normalisation height for tight-crop comparison.
 const NORM_H: u32 = 48;
 
-/// Number of top coarse candidates to re-rank with full-resolution SSIM.
-const TOP_N_RERANK: usize = 30;
+/// SSIM reranking: keep all coarse candidates within this factor of the best
+/// coarse score, rather than a fixed top-N.  E.g. 1.2 means keep everything
+/// scoring ≥ best_coarse / 1.2.
+const RERANK_SCORE_FACTOR: f32 = 1.2;
+
+/// Warn when the within-factor pool exceeds this many candidates (suggests
+/// the coarse scores are poorly separated).
+const RERANK_WARN_THRESHOLD: usize = 40;
 
 /// Detail-score signal weights.
 const W_IOU: f32 = 0.35;
@@ -70,6 +78,7 @@ pub fn match_font(
     catalog: &[FontEntry],
     threshold: f32,
     _dpi: u32,
+    char_index_keys: Option<&std::collections::HashSet<String>>,
 ) -> Option<FontMatchResult> {
     // ── 1. Select sample words ───────────────────────────────────────
     let word_refs = select_sample_words(line);
@@ -156,9 +165,26 @@ pub fn match_font(
 
     let mut best_score = f32::NEG_INFINITY;
     let mut best_entry: Option<&FontEntry> = None;
-    let mut top_candidates: Vec<(f32, &FontEntry)> = Vec::with_capacity(TOP_N_RERANK + 16);
+    let mut top_candidates: Vec<(f32, &FontEntry)> = Vec::new();
 
-    for entry in catalog {
+    // If char index returned candidates, ONLY score those (skip brute-force).
+    // Fall back to full catalog only when char index is unavailable.
+    let use_char_gate = char_index_keys.is_some();
+    let score_entries: Vec<&FontEntry> = if let Some(ci) = char_index_keys {
+        catalog.iter().filter(|e| ci.contains(&e.font_key())).collect()
+    } else {
+        catalog.iter().collect()
+    };
+
+    info!(
+        "  Coarse scoring: {} fonts (gated={}, ci_keys={}) for '{:.40}…'",
+        score_entries.len(),
+        use_char_gate,
+        char_index_keys.map_or(0, |k| k.len()),
+        line_text,
+    );
+
+    for entry in &score_entries {
         // ── Pre-filter: mono ────────────────────────────────────────
         // Only apply mono filter — serif/sans classification from raster
         // is unreliable (transition heuristic returns wrong class).
@@ -398,24 +424,34 @@ pub fn match_font(
             best_entry = Some(entry);
         }
 
-        // Collect top-N for re-ranking
+        // Collect all candidates — we'll filter by score factor after the loop.
         top_candidates.push((score, entry));
-        if top_candidates.len() > TOP_N_RERANK + 10 {
-            // Prune periodically to avoid growing unbounded
-            top_candidates.sort_by(|a, b| b.0.partial_cmp(&a.0).unwrap_or(std::cmp::Ordering::Equal));
-            top_candidates.truncate(TOP_N_RERANK);
-        }
     }
 
     // ── Stage 2: Re-rank top candidates with full-resolution SSIM ────
     if top_candidates.len() >= 2 {
         top_candidates.sort_by(|a, b| b.0.partial_cmp(&a.0).unwrap_or(std::cmp::Ordering::Equal));
-        top_candidates.truncate(TOP_N_RERANK);
+        let best_coarse = top_candidates[0].0;
+        let score_floor = if best_coarse > 0.0 { best_coarse / RERANK_SCORE_FACTOR } else { 0.0 };
+        top_candidates.retain(|&(s, _)| s >= score_floor);
 
-        debug!("  rerank: {} candidates, coarse best='{}'({:.3})",
+        if top_candidates.len() > RERANK_WARN_THRESHOLD {
+            warn!(
+                "  rerank: {} candidates within {:.1}× of best coarse ({:.3}) — scores poorly separated for '{:.40}…'",
+                top_candidates.len(),
+                RERANK_SCORE_FACTOR,
+                best_coarse,
+                line_text,
+            );
+        }
+
+        info!("  rerank: {} candidates within {:.1}× (floor={:.3}), coarse best='{}'({:.3}) for '{:.40}…'",
             top_candidates.len(),
+            RERANK_SCORE_FACTOR,
+            score_floor,
             top_candidates[0].1.family_name,
-            top_candidates[0].0);
+            top_candidates[0].0,
+            line_text);
 
         let gray = page_img.to_luma8();
         // Use the full line bbox for SSIM
@@ -429,9 +465,10 @@ pub fn match_font(
         let mut best_rerank_ssim = -1.0f32;
         let mut best_rerank_entry: Option<&FontEntry> = None;
         let mut best_rerank_coarse = 0.0f32;
+        let mut best_rerank_dy = 0i32;
 
         for &(coarse_score, entry) in &top_candidates {
-            let ssim = crate::verify::verify_text_region(
+            let (ssim, dy) = crate::verify::verify_text_region(
                 &gray,
                 &entry.data,
                 "",  // text not used
@@ -443,6 +480,7 @@ pub fn match_font(
                 best_rerank_ssim = ssim;
                 best_rerank_entry = Some(entry);
                 best_rerank_coarse = coarse_score;
+                best_rerank_dy = dy;
             }
         }
 
@@ -458,6 +496,7 @@ pub fn match_font(
                     font_path: entry.path.clone(),
                     score: best_rerank_ssim,
                     font_data: entry.data.clone(),
+                    best_dy: best_rerank_dy,
                 });
             }
         }
@@ -473,6 +512,7 @@ pub fn match_font(
             font_path: e.path.clone(),
             score: best_score,
             font_data: e.data.clone(),
+            best_dy: 0, // coarse-only path, no SSIM shift
         }
     })
 }

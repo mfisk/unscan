@@ -24,6 +24,7 @@ use std::path::{Path, PathBuf};
 pub struct PlacedText {
     pub text: String,
     pub x: f32,
+    #[allow(dead_code)]
     pub y: f32,
     pub width: f32,
     pub height: f32,
@@ -31,6 +32,7 @@ pub struct PlacedText {
     pub font_match: Option<FontMatchResult>,
     pub keep_raster: bool,
     pub color: Rgb,
+    #[allow(dead_code)]
     pub confidence: f32,
     /// Word-level bounding boxes from OCR for per-word positioning.
     pub words: Vec<WordBox>,
@@ -41,9 +43,13 @@ pub struct PlacedText {
 pub struct WordBox {
     pub text: String,
     pub x: f32,
+    #[allow(dead_code)]
     pub y: f32,
     pub width: f32,
     pub height: f32,
+    /// If set by the smoothing pass, this overrides the per-word width-matched
+    /// em_px calculation.  All words in a same-font run share the median size.
+    pub smoothed_em_px: Option<f32>,
 }
 
 /// The encoding/filter used by an image stream in the source PDF.
@@ -294,77 +300,74 @@ for tr in &page.text_regions {
                 default_font_name.to_string()
             };
 
-            // Whole-line placement: height from line bbox, width via Tz scaling.
-            // This preserves the font's natural kerning and word spacing.
+            // Per-word placement: each word positioned at its OCR x-offset,
+            // width-matched independently. This avoids em-dash / special char
+            // width differences stealing space from regular letters.
+            log::debug!("pdf_out: '{}...' — {} words, font_match={}", 
+                &tr.text[..tr.text.len().min(30)], tr.words.len(), tr.font_match.is_some());
             if !tr.words.is_empty() && tr.font_match.is_some() {
                 let fm = tr.font_match.as_ref().unwrap();
                 let font_ok = ab_glyph::FontRef::try_from_slice(&fm.font_data).ok();
 
-                // Font size from line bbox height mapped through ascent-descent.
-                let (line_pt, h_scale) = if let Some(ref f) = font_ok {
-                    use ab_glyph::{Font, PxScale, ScaleFont};
-                    let ref_h = 100.0f32;
-                    let sf_ref = f.as_scaled(PxScale::from(ref_h));
-                    let ref_ink = sf_ref.ascent() - sf_ref.descent();
-
-                    let pt = if tr.height > 1.0 {
-                        let em_px = ref_h * (tr.height / ref_ink);
-                        em_px * 72.0 / page.dpi as f32
-                    } else {
-                        tr.font_size_pt
-                    };
-
-                    // Compute Tz: advance width of full line text at this size vs OCR line width.
-                    let em_px = pt * page.dpi as f32 / 72.0;
-                    let sf = f.as_scaled(PxScale::from(em_px));
-                    let mut adv = 0.0f32;
-                    let mut prev: Option<ab_glyph::GlyphId> = None;
-                    for c in tr.text.chars() {
-                        let gid = f.glyph_id(c);
-                        if let Some(p) = prev { adv += sf.kern(p, gid); }
-                        adv += sf.h_advance(gid);
-                        prev = Some(gid);
-                    }
-                    let tz = if adv > 0.1 {
-                        ((tr.width / adv) * 100.0).clamp(70.0, 150.0)
-                    } else {
-                        100.0
-                    };
-                    (pt, tz)
-                } else {
-                    (tr.font_size_pt, 100.0)
-                };
-
-                let pdf_x = page.px_to_pt_x(tr.x);
-                // Position baseline: bottom of bbox + |descent| to shift up
-                // from descender line to actual baseline.
-                let descent_pt = if let Some(ref f) = font_ok {
-                    use ab_glyph::{Font, PxScale, ScaleFont};
-                    let em_px = line_pt * page.dpi as f32 / 72.0;
-                    let sf = f.as_scaled(PxScale::from(em_px));
-                    sf.descent() * 72.0 / page.dpi as f32  // negative value
-                } else {
-                    0.0
-                };
-                let pdf_y = page.px_to_pt_y(tr.y + tr.height) - descent_pt;
-
                 if overlay {
                     ops.push(op("gs", &[Object::Name(b"GS_overlay".to_vec())]));
                 }
-                ops.push(op("BT", &[]));
-                if overlay {
-                    push_fill_color(&mut ops, 220, 0, 0);
-                } else {
-                    push_fill_color(&mut ops, cr, cg, cb);
+
+                if let Some(ref f) = font_ok {
+                    // Compute ONE baseline for the entire line — all words share it.
+                    // Use the smoothed em_px if available (most words), else the
+                    // first word's width-matched size.  This prevents per-word
+                    // baseline wobble from different em_px values.
+                    let line_em_px = tr.words.iter()
+                        .filter(|w| !w.text.is_empty() && w.width >= 1.0)
+                        .find_map(|w| w.smoothed_em_px)
+                        .or_else(|| {
+                            tr.words.iter()
+                                .filter(|w| !w.text.is_empty() && w.width >= 1.0)
+                                .find_map(|w| crate::layout::width_matched_em_px(f, &w.text, w.width))
+                        });
+
+                    let (line_baseline_offset_pt, _) = if let Some(em) = line_em_px {
+                        crate::layout::ink_centered_baseline_pt(f, em, tr.height, page.dpi as f32)
+                    } else {
+                        continue;
+                    };
+
+                    let dy_pt = fm.best_dy as f32 * 72.0 / page.dpi as f32;
+                    let pdf_y = page.px_to_pt_y(tr.y) - line_baseline_offset_pt - dy_pt;
+
+                    for word in &tr.words {
+                        if word.text.is_empty() || word.width < 1.0 {
+                            continue;
+                        }
+
+                        // Use smoothed size if available, otherwise compute per-word.
+                        let em_px = if let Some(smoothed) = word.smoothed_em_px {
+                            smoothed
+                        } else {
+                            match crate::layout::width_matched_em_px(f, &word.text, word.width) {
+                                Some(v) => v,
+                                None => continue,
+                            }
+                        };
+                        let word_pt = em_px * 72.0 / page.dpi as f32;
+
+                        // Word x position (word.x is absolute page coords)
+                        let pdf_x = page.px_to_pt_x(word.x);
+
+                        ops.push(op("BT", &[]));
+                        if overlay {
+                            push_fill_color(&mut ops, 220, 0, 0);
+                        } else {
+                            push_fill_color(&mut ops, cr, cg, cb);
+                        }
+                        ops.push(op("Tf", &[Object::Name(fname.clone().into_bytes()), real(word_pt as f64)]));
+                        ops.push(op("Td", &[real(pdf_x as f64), real(pdf_y as f64)]));
+                        let encoded = encode_pdf_text(&word.text);
+                        ops.push(op("Tj", &[Object::String(encoded, lopdf::StringFormat::Literal)]));
+                        ops.push(op("ET", &[]));
+                    }
                 }
-                ops.push(op("Tf", &[Object::Name(fname.clone().into_bytes()), real(line_pt as f64)]));
-                if (h_scale - 100.0).abs() > 0.5 {
-                    ops.push(op("Tz", &[real(h_scale as f64)]));
-                }
-                ops.push(op("Td", &[real(pdf_x as f64), real(pdf_y as f64)]));
-                let encoded = encode_pdf_text(&tr.text);
-                ops.push(op("Tj", &[Object::String(encoded, lopdf::StringFormat::Literal)]));
-                ops.push(op("ET", &[]));
             } else {
                 // Fallback: single Tj for the whole line.
                 if overlay {
@@ -537,7 +540,7 @@ fn embed_truetype_font(
 
     // Font dictionary.
     let font_subtype = if is_cff { "Type1" } else { "TrueType" };
-    let mut font_dict = dictionary! {
+    let font_dict = dictionary! {
         "Type" => "Font",
         "Subtype" => Object::Name(font_subtype.as_bytes().to_vec()),
         "BaseFont" => "EmbeddedFont",
@@ -673,10 +676,50 @@ fn push_stroke_color(ops: &mut Vec<Operation>, r: u8, g: u8, b: u8) {
     ]));
 }
 
-fn encode_pdf_text(text: &str) -> Vec<u8> {
-    // lopdf's StringFormat::Literal handles escaping of (, ), and \.
-    // We just need to map chars to bytes (latin-1 range).
+pub fn encode_pdf_text(text: &str) -> Vec<u8> {
+    // Map Unicode chars to WinAnsiEncoding byte values.
+    // WinAnsi is mostly latin-1 but bytes 0x80–0x9F map to specific Unicode chars.
     text.chars()
-        .map(|ch| if (ch as u32) <= 255 { ch as u8 } else { b'?' })
+        .map(|ch| unicode_to_winansi(ch).unwrap_or(b'?'))
         .collect()
+}
+
+/// Map a Unicode code point to its WinAnsiEncoding byte, if it exists.
+fn unicode_to_winansi(ch: char) -> Option<u8> {
+    let cp = ch as u32;
+    // ASCII + latin-1 supplement (U+00A0–U+00FF map 1:1)
+    if cp <= 0x7F || (0xA0..=0xFF).contains(&cp) {
+        return Some(cp as u8);
+    }
+    // WinAnsi 0x80–0x9F range — specific Unicode mappings
+    match cp {
+        0x20AC => Some(0x80), // €
+        0x201A => Some(0x82), // ‚
+        0x0192 => Some(0x83), // ƒ
+        0x201E => Some(0x84), // „
+        0x2026 => Some(0x85), // …
+        0x2020 => Some(0x86), // †
+        0x2021 => Some(0x87), // ‡
+        0x02C6 => Some(0x88), // ˆ
+        0x2030 => Some(0x89), // ‰
+        0x0160 => Some(0x8A), // Š
+        0x2039 => Some(0x8B), // ‹
+        0x0152 => Some(0x8C), // Œ
+        0x017D => Some(0x8E), // Ž
+        0x2018 => Some(0x91), // '
+        0x2019 => Some(0x92), // '
+        0x201C => Some(0x93), // "
+        0x201D => Some(0x94), // "
+        0x2022 => Some(0x95), // •
+        0x2013 => Some(0x96), // –  (en dash)
+        0x2014 => Some(0x97), // —  (em dash)
+        0x02DC => Some(0x98), // ˜
+        0x2122 => Some(0x99), // ™
+        0x0161 => Some(0x9A), // š
+        0x203A => Some(0x9B), // ›
+        0x0153 => Some(0x9C), // œ
+        0x017E => Some(0x9E), // ž
+        0x0178 => Some(0x9F), // Ÿ
+        _ => None,
+    }
 }

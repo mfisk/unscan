@@ -1,0 +1,55 @@
+{
+  "input_file": "test-docs/punchcutter-test.pdf",
+  "output_file": "test-docs/punchcutter-out.pdf",
+  "input_size_bytes": 11014,
+  "output_size_bytes": 9002,
+  "compression_ratio": 1.2235058875805376,
+  "pages": [
+    {
+      "page": 1,
+      "width_px": 918,
+      "height_px": 1188,
+      "lines_vectorized": 0,
+      "lines_kept_raster": 2,
+      "geometry_elements": 0,
+      "raster_fragments": 1
+    }
+  ],
+  "text_entries": [
+    {
+      "page": 1,
+      "line_index": 0,
+      "text": "punchcutter",
+      "ocr_confidence": 76.47293,
+      "font_matched": null,
+      "font_confidence": null,
+      "ssim_score": null,
+      "decision": "kept_raster",
+      "reason": "OCR confidence too low (76%)",
+      "bbox": {
+        "x": 55,
+        "y": 1103,
+        "width": 122,
+        "height": 46
+      }
+    },
+    {
+      "page": 1,
+      "line_index": 1,
+      "text": "Claude Garamond was a Parisian punchcutter who",
+      "ocr_confidence": 95.52464,
+      "font_matched": "Times New Roman",
+      "font_confidence": 0.32227284,
+      "ssim_score": null,
+      "decision": "kept_raster",
+      "reason": "No confident font match (best: Times New Roman at 0.322). Kept as raster.",
+      "bbox": {
+        "x": 56,
+        "y": 1117,
+        "width": 498,
+        "height": 54
+      }
+    }
+  ],
+  "geometry_entries": []
+}

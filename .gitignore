@@ -4,3 +4,7 @@
 /test-docs/resolution-series/
 /test-docs/font-timeline-specimen.pdf
 /test-docs/font-timeline-specimen-scanned.pdf
+
+# Personal documents — never commit
+test-docs/berkeley-acceptance.pdf
+test-docs/berkeley-output*.pdf

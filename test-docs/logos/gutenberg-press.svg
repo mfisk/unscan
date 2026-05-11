@@ -1,0 +1,28 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 200 120" width="200" height="120">
+  <!-- Simplified Gutenberg-style printing press -->
+  <g fill="#222" stroke="#222" stroke-width="1">
+    <!-- Base/table -->
+    <rect x="30" y="95" width="140" height="8" rx="2"/>
+    <!-- Legs -->
+    <rect x="40" y="103" width="8" height="17"/>
+    <rect x="152" y="103" width="8" height="17"/>
+    <!-- Platen (press bed) -->
+    <rect x="50" y="80" width="100" height="6" rx="1" fill="#444"/>
+    <!-- Paper on bed -->
+    <rect x="60" y="74" width="80" height="6" fill="#ddd" stroke="#999"/>
+    <!-- Uprights -->
+    <rect x="45" y="20" width="6" height="75"/>
+    <rect x="149" y="20" width="6" height="75"/>
+    <!-- Top beam -->
+    <rect x="40" y="15" width="120" height="8" rx="2"/>
+    <!-- Screw -->
+    <rect x="96" y="23" width="8" height="35"/>
+    <!-- Handle -->
+    <line x1="70" y1="30" x2="130" y2="30" stroke-width="4" stroke-linecap="round"/>
+    <!-- Press plate -->
+    <rect x="70" y="58" width="60" height="10" rx="2" fill="#555"/>
+    <!-- Text "TYPOGRAPHIA" -->
+    <text x="100" y="110" text-anchor="middle" font-size="9" font-family="serif" fill="#666" stroke="none">TYPOGRAPHIA</text>
+  </g>
+</svg>
