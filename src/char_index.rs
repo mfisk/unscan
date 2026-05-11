@@ -31,6 +31,7 @@ use std::collections::HashMap;
 use std::io;
 use std::path::Path;
 
+use crate::ocr::CharBox;
 use crate::verify::WordPlacement;
 
 // ---------------------------------------------------------------------------
@@ -1256,9 +1257,16 @@ pub fn extract_line_chars(
     page: &GrayImage,
     words: &[WordPlacement],
     line_height: u32,
+    page_char_boxes: &[CharBox],
 ) -> Vec<(char, GrayImage)> {
     if words.is_empty() || line_height == 0 {
         return Vec::new();
+    }
+
+    // If we have Tesseract makebox char boxes, use them directly
+    // instead of the column-valley segmenter.
+    if !page_char_boxes.is_empty() {
+        return extract_line_chars_from_charboxes(page, words, line_height, page_char_boxes);
     }
 
     let mut sorted: Vec<&WordPlacement> = words
@@ -1335,6 +1343,84 @@ pub fn extract_line_chars(
 }
 
 /// Given character boundaries, crop and normalise each character.
+/// Extract character crops from Tesseract makebox char-level bounding boxes.
+/// Filters the page-level char boxes to those overlapping the line's words,
+/// then crops and scales each character directly from the page.
+fn extract_line_chars_from_charboxes(
+    page: &GrayImage,
+    words: &[WordPlacement],
+    line_height: u32,
+    page_char_boxes: &[CharBox],
+) -> Vec<(char, GrayImage)> {
+    let (pw, ph) = page.dimensions();
+    let mut char_counts: HashMap<char, usize> = HashMap::new();
+    let mut results: Vec<(char, GrayImage)> = Vec::new();
+
+    // Compute the line's bounding box from its words
+    let line_y_min = words.iter().map(|w| w.y_off).min().unwrap_or(0);
+    let line_y_max = words.iter().map(|w| w.y_off + w.height.max(line_height)).max().unwrap_or(0);
+    let line_x_min = words.iter().map(|w| w.x_off).min().unwrap_or(0);
+    let line_x_max = words.iter().map(|w| w.x_off + w.width).max().unwrap_or(0);
+
+    // Expand vertical search range slightly for makebox alignment tolerance
+    let v_margin = line_height / 2;
+    let search_y_min = line_y_min.saturating_sub(v_margin);
+    let search_y_max = (line_y_max + v_margin).min(ph);
+
+    // Filter char boxes that fall within this line's region
+    let line_chars: Vec<&CharBox> = page_char_boxes
+        .iter()
+        .filter(|cb| {
+            let cb_cx = cb.x + cb.width / 2;
+            let cb_cy = cb.y + cb.height / 2;
+            cb_cx >= line_x_min && cb_cx <= line_x_max
+                && cb_cy >= search_y_min && cb_cy <= search_y_max
+                && cb.width >= 2 && cb.height >= 2
+        })
+        .collect();
+
+    for cb in &line_chars {
+        let c = cb.ch;
+        if !is_indexed(c) {
+            continue;
+        }
+        if char_counts.get(&c).copied().unwrap_or(0) >= 3 {
+            continue;
+        }
+
+        // Clamp to page bounds
+        let cx = cb.x.min(pw.saturating_sub(1));
+        let cy = cb.y.min(ph.saturating_sub(1));
+        let cw = cb.width.min(pw - cx);
+        let ch_px = cb.height.min(ph - cy);
+        if cw < 2 || ch_px < 2 {
+            continue;
+        }
+
+        // Skip impossibly narrow crops (aspect ratio filter)
+        let aspect = cw as f32 / ch_px as f32;
+        if aspect < 0.15 {
+            continue;
+        }
+
+        let char_crop = image::imageops::crop_imm(page, cx, cy, cw, ch_px).to_image();
+
+        // Scale to NORM_H, preserving aspect ratio
+        let scaled_w = ((cw as f32 * NORM_H as f32 / ch_px as f32).ceil() as u32).max(1);
+        let scaled = image::imageops::resize(
+            &char_crop,
+            scaled_w,
+            NORM_H,
+            image::imageops::FilterType::Lanczos3,
+        );
+
+        results.push((c, scaled));
+        *char_counts.entry(c).or_insert(0) += 1;
+    }
+
+    results
+}
+
 fn extract_chars_from_boundaries(
     word_img: &GrayImage,
     chars: &[char],
@@ -1539,6 +1625,13 @@ pub fn search_candidates(
         } else {
             continue;
         };
+
+        // Quality gate: if nearest neighbor is too far, this crop is noise.
+        // Skip it — it matches nothing well and will only pollute the vote.
+        let min_dist_sq = hits.iter().map(|(_, d)| *d).fold(f32::INFINITY, f32::min);
+        if min_dist_sq > 0.5 {
+            continue;
+        }
 
         for (font_id, dist_sq) in &hits {
             // ε = 1e-10 avoids log(0) for self-matches / identical OT variants

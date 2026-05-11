@@ -5,6 +5,16 @@ use image::{DynamicImage, GrayImage};
 use log::{debug, info};
 use std::process::Command;
 
+/// A character-level bounding box from Tesseract makebox output.
+#[derive(Debug, Clone)]
+pub struct CharBox {
+    pub ch: char,
+    pub x: u32,
+    pub y: u32,
+    pub width: u32,
+    pub height: u32,
+}
+
 /// A detected text region from OCR (word-level).
 #[derive(Debug, Clone)]
 pub struct TextRegion {
@@ -36,13 +46,14 @@ pub struct TextLine {
     pub words: Vec<TextRegion>,
 }
 
-/// Run Tesseract on a page image and return word-level regions.
+/// Run Tesseract on a page image and return word-level regions plus
+/// character-level bounding boxes (from makebox output).
 /// Applies contrast enhancement and sharpening before OCR to improve
 /// recognition on scanned documents.
 pub fn extract_text_regions(
     page_img: &DynamicImage,
     dpi: u32,
-) -> Result<Vec<TextRegion>, ScanTextError> {
+) -> Result<(Vec<TextRegion>, Vec<CharBox>), ScanTextError> {
     let tmp = tempfile::Builder::new()
         .suffix(".png")
         .tempfile()
@@ -110,7 +121,37 @@ pub fn extract_text_regions(
         return Err(ScanTextError::Ocr(format!("tesseract failed: {stderr}")));
     }
 
-    parse_tsv(&String::from_utf8_lossy(&output.stdout), dpi)
+    let regions = parse_tsv(&String::from_utf8_lossy(&output.stdout), dpi)?;
+
+    // Second pass: get character-level bounding boxes via makebox
+    let makebox_output = Command::new("tesseract")
+        .args([
+            tmp.path().to_str().unwrap(),
+            "stdout",
+            "--dpi",
+            &dpi.to_string(),
+            "-l",
+            "eng",
+            "makebox",
+        ])
+        .output()
+        .map_err(|e| {
+            ScanTextError::Ocr(format!(
+                "Failed to run tesseract makebox: {e}"
+            ))
+        })?;
+
+    let char_boxes = if makebox_output.status.success() {
+        let img_h = page_img.height();
+        parse_makebox(&String::from_utf8_lossy(&makebox_output.stdout), img_h)
+    } else {
+        debug!("  makebox pass failed, falling back to segment_characters");
+        Vec::new()
+    };
+
+    info!("  OCR: {} words, {} char boxes from makebox", regions.len(), char_boxes.len());
+
+    Ok((regions, char_boxes))
 }
 
 /// Group word regions into lines using Tesseract's block/par/line numbering.
@@ -302,4 +343,54 @@ fn parse_tsv(tsv: &str, dpi: u32) -> Result<Vec<TextRegion>, ScanTextError> {
         });
     }
     Ok(regions)
+}
+
+/// Parse Tesseract makebox output into CharBox structs.
+/// Makebox format: `char x1 y1 x2 y2 page_num`
+/// Coordinates use bottom-left origin (y increases upward), so we flip y.
+fn parse_makebox(makebox: &str, img_height: u32) -> Vec<CharBox> {
+    let mut boxes = Vec::new();
+    for line in makebox.lines() {
+        let line = line.trim();
+        if line.is_empty() {
+            continue;
+        }
+        // Format: "e 196 1528 219 1565 0"
+        // Last field is page number, first field is the character
+        // The char can be multi-byte UTF-8, so split carefully
+        // rsplitn approach doesn't work well here, use splitn
+        let parts: Vec<&str> = line.splitn(6, ' ').collect();
+        if parts.len() < 6 {
+            continue;
+        }
+        // parts[0] = char (could be multi-byte), parts[1..5] = x1 y1 x2 y2, parts[5] = page
+        let ch_str = parts[0];
+        let ch = match ch_str.chars().next() {
+            Some(c) => c,
+            None => continue,
+        };
+        let x1: u32 = match parts[1].parse() { Ok(v) => v, Err(_) => continue };
+        let y1_bottom: u32 = match parts[2].parse() { Ok(v) => v, Err(_) => continue };
+        let x2: u32 = match parts[3].parse() { Ok(v) => v, Err(_) => continue };
+        let y2_bottom: u32 = match parts[4].parse() { Ok(v) => v, Err(_) => continue };
+
+        if x2 <= x1 || y2_bottom <= y1_bottom {
+            continue;
+        }
+
+        // Flip y: makebox uses bottom-left origin, image uses top-left
+        // y1_bottom is the bottom of the char, y2_bottom is the top
+        // In image coords: top = img_height - y2_bottom, bottom = img_height - y1_bottom
+        let y_top = img_height.saturating_sub(y2_bottom);
+        let y_bot = img_height.saturating_sub(y1_bottom);
+
+        boxes.push(CharBox {
+            ch,
+            x: x1,
+            y: y_top,
+            width: x2 - x1,
+            height: y_bot.saturating_sub(y_top),
+        });
+    }
+    boxes
 }

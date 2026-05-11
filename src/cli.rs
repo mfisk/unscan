@@ -25,17 +25,17 @@ pub struct Args {
 
     /// Minimum OCR confidence to consider vectorizing text (0–100).
     /// Below this, the original raster is kept unconditionally.
-    #[arg(long, default_value = "80")]
+    #[arg(long, default_value = "0")]
     pub min_ocr_confidence: u32,
 
     /// Minimum font-match confidence (0.0–1.0).
     /// Below this, text is kept as raster — we never replace with a wrong font.
-    #[arg(long, default_value = "0.40")]
+    #[arg(long, default_value = "0.10")]
     pub min_font_confidence: f32,
 
     /// Minimum SSIM score for the verification pass (0.0–1.0).
     /// After rendering vector text, compare with original. Below this → revert to raster.
-    #[arg(long, default_value = "0.30")]
+    #[arg(long, default_value = "0.12")]
     pub min_verify_ssim: f32,
 
     /// DPI for PDF page rasterization

@@ -501,8 +501,8 @@ fn specimen_vectorizes_enough_lines() {
         parse_vectorized_count(&output).expect("could not parse vectorized count from specimen");
     eprintln!("specimen vectorized = {}", count);
     assert!(
-        count >= 25,
-        "specimen vectorized {} lines, expected >= 25",
+        count >= 90,
+        "specimen vectorized {} lines, expected >= 90",
         count
     );
 }

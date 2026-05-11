@@ -344,7 +344,7 @@ fn run(args: &cli::Args) -> Result<(), ScanTextError> {
         );
 
         // 3a. OCR ─────────────────────────────────────────────────────
-        let word_regions = ocr::extract_text_regions(page_img, args.dpi)?;
+        let (word_regions, page_char_boxes) = ocr::extract_text_regions(page_img, args.dpi)?;
         let mut lines = ocr::assemble_lines(&word_regions);
         info!("  OCR: {} words → {} lines", word_regions.len(), lines.len());
 
@@ -400,15 +400,25 @@ fn run(args: &cli::Args) -> Result<(), ScanTextError> {
                     })
                     .collect();
                 let line_height = line.words.iter().map(|w| w.height).max().unwrap_or(0);
-                let char_crops = char_index::extract_line_chars(&gray_page, &word_placements, line_height);
-                let ci_results = char_index::search_candidates(&char_index, &char_crops, 100);
+                let char_crops = char_index::extract_line_chars(&gray_page, &word_placements, line_height, &page_char_boxes);
+                let ci_results = char_index::search_candidates(&char_index, &char_crops, 50);
                 let ci_keys: std::collections::HashSet<String> = ci_results.into_iter().map(|(name, _score)| name).collect();
                 let ci_arg = if ci_keys.is_empty() { None } else { Some(&ci_keys) };
-                font_match::match_font(
+                let result = font_match::match_font(
                     &gray_page, line, &font_catalog, &parsed_fonts,
                     args.min_font_confidence, args.dpi,
                     ci_arg,
-                )
+                );
+                // Fallback: if gated match returned None but we had ci_keys, retry ungated
+                if result.is_none() && ci_arg.is_some() {
+                    font_match::match_font(
+                        &gray_page, line, &font_catalog, &parsed_fonts,
+                        args.min_font_confidence, args.dpi,
+                        None,
+                    )
+                } else {
+                    result
+                }
             };
             LineMatch { font_result, text_color }
         }).collect();
