@@ -28,7 +28,7 @@ pub struct WordPlacement {
 pub fn verify_text_region(
     original_gray: &GrayImage,
     font_data: &[u8],
-    text: &str,
+    _text: &str,
     x: u32,
     y: u32,
     width: u32,
@@ -65,24 +65,47 @@ pub fn verify_text_region(
         original_crop.clone()
     };
 
-    // Render at height-matched scale with natural width — SSIM sees width
-    // mismatches directly as misaligned ink vs whitespace.
-    let rendered = match render_words_height_scaled(font_data, &placements, w, h, text) {
-        Some(r) => r,
-        None => return (0.0, 0),
+    // Try multiple render scales and pick the best SSIM.
+    // The optimal scale depends on the scan's original render resolution (unknown).
+    // Scale 2 matches typical 2:1 downsample; scale 4 handles higher downsample ratios.
+    let scales = if let Ok(s) = std::env::var("UNSCAN_RENDER_SCALE") {
+        vec![s.parse::<u32>().unwrap_or(2)]
+    } else {
+        vec![2, 4]
     };
 
-    // Debug: dump both sides of the SSIM comparison
-    if std::env::var("UNSCAN_DUMP_SSIM").is_ok() {
-        let _ = deskewed.save("/tmp/ssim_scan_crop.png");
-        let _ = rendered.save("/tmp/ssim_rendered.png");
-        log::info!("SSIM debug: dumped scan crop ({}x{}) and rendered ({}x{}) to /tmp/",
-            deskewed.width(), deskewed.height(), rendered.width(), rendered.height());
+    let deskewed_blur = gaussian_blur_3x3(&deskewed);
+    let mut best_score = 0.0f32;
+    let mut best_dy = 0i32;
+
+    for &scale in &scales {
+        let rendered = match render_via_freetype_scaled(font_data, &placements, w, h, scale) {
+            Some(r) => r,
+            None => continue,
+        };
+
+        // Debug: dump both sides of the SSIM comparison (last scale wins for files)
+        if std::env::var("UNSCAN_DUMP_SSIM").is_ok() {
+            let _ = deskewed.save("/tmp/ssim_scan_crop.png");
+            let _ = rendered.save("/tmp/ssim_rendered.png");
+            log::info!("SSIM debug: dumped scan crop ({}x{}) and rendered ({}x{}) to /tmp/",
+                deskewed.width(), deskewed.height(), rendered.width(), rendered.height());
+        }
+
+        let rendered_blur = gaussian_blur_3x3(&rendered);
+        let (score, dy) = ssim_windowed_best_vshift(&deskewed_blur, &rendered_blur, 12);
+
+        if std::env::var("UNSCAN_DUMP_SSIM").is_ok() {
+            log::info!("SSIM scale={}: dy={} score={:.4}", scale, dy, score);
+        }
+
+        if score > best_score {
+            best_score = score;
+            best_dy = dy;
+        }
     }
 
-    // Windowed SSIM with vertical shift search — try offsets from -12 to +12
-    // pixels to find best vertical alignment (bumped from ±6 in v8f).
-    ssim_windowed_best_vshift(&deskewed, &rendered, 12)
+    (best_score, best_dy)
 }
 
 // ---------------------------------------------------------------------------
@@ -93,234 +116,215 @@ pub fn verify_text_region(
 // Word-by-word renderer — width-matched scale, natural height
 // ---------------------------------------------------------------------------
 
-fn render_words_height_scaled(
+fn render_via_freetype_scaled(
     font_data: &[u8],
     words: &[WordPlacement],
     canvas_w: u32,
     canvas_h: u32,
-    _line_text: &str,
+    render_scale: u32,
 ) -> Option<GrayImage> {
     // Try PDF-based rendering first (proper OT shaping via the PDF renderer).
     // Falls back to ab_glyph if PDF rendering fails.
-    if let Some(img) = render_via_pdf(font_data, words, canvas_w, canvas_h) {
+    if let Some(img) = render_via_freetype(font_data, words, canvas_w, canvas_h, render_scale) {
         return Some(img);
     }
-    log::warn!("PDF rendering failed, falling back to ab_glyph for SSIM");
-    render_words_ab_glyph(font_data, words, canvas_w, canvas_h)
+    if render_scale == 2 {
+        // Only fall back for the default scale
+        log::warn!("FreeType rendering failed, falling back to ab_glyph for SSIM");
+        render_words_ab_glyph(font_data, words, canvas_w, canvas_h)
+    } else {
+        None
+    }
 }
 
-/// Render text by generating a tiny single-page PDF with the candidate font,
-/// then rasterising it with `pdftoppm`.  The PDF viewer applies full OpenType
-/// shaping (GPOS kerning, GSUB ligatures, etc.) so the output matches what a
-/// real PDF with this font would look like.
-fn render_via_pdf(
+/// Render text using rustybuzz (OT shaping) + FreeType (rasterisation).
+/// Subpixel glyph positioning, no intermediate PDF, no subprocess.
+fn render_via_freetype(
     font_data: &[u8],
     words: &[WordPlacement],
     canvas_w: u32,
     canvas_h: u32,
+    render_scale: u32,
 ) -> Option<GrayImage> {
-    use lopdf::{dictionary, Document, Object, Stream};
-    use lopdf::content::{Content, Operation as Op};
+    use std::cell::RefCell;
 
-    // We build a PDF whose media box is exactly canvas_w × canvas_h points
-    // (at 72 DPI). We'll render at a DPI that gives us exactly the pixel
-    // dimensions we need.
+    thread_local! {
+        static FT_LIB: RefCell<Option<freetype::Library>> = RefCell::new(None);
+    }
 
-    let pt_w = canvas_w as f64;
-    let pt_h = canvas_h as f64;
-
-    // Embed the font as a simple TrueType/OpenType resource.
-    let mut doc = Document::with_version("1.7");
-
-    // Font stream (compressed)
-    let font_stream = Stream::new(
-        dictionary! {
-            "Length1" => Object::Integer(font_data.len() as i64),
-        },
-        font_data.to_vec(),
-    ).with_compression(true);
-    let font_stream_id = doc.add_object(font_stream);
-
-    // Detect CFF vs TrueType
-    let is_cff = font_data.starts_with(&[0x4F, 0x54, 0x54, 0x4F]) // OTTO
-        || (font_data.len() > 4 && &font_data[0..4] == b"OTTO");
-
-    let font_descriptor = dictionary! {
-        "Type" => Object::Name(b"FontDescriptor".to_vec()),
-        "FontName" => Object::Name(b"CandidateFont".to_vec()),
-        "Flags" => Object::Integer(32), // non-symbolic
-        "ItalicAngle" => Object::Integer(0),
-        "Ascent" => Object::Integer(800),
-        "Descent" => Object::Integer(-200),
-        "CapHeight" => Object::Integer(700),
-        "StemV" => Object::Integer(80),
-        if is_cff { "FontFile3" } else { "FontFile2" } => Object::Reference(font_stream_id),
-    };
-    let fd_id = doc.add_object(font_descriptor);
-
-    // Compute font size: median of per-word width-matched sizes.
+    // Compute font size from ab_glyph (consistent with coarse scoring).
     let font_ref = FontRef::try_from_slice(font_data).ok()?;
     let mut all_em: Vec<f32> = words.iter()
         .filter(|w| !w.text.is_empty() && w.width >= 1)
-        .filter_map(|w| crate::layout::width_matched_em_px(&font_ref, &w.text, w.width as f32))
+        .filter_map(|w| {
+            // Prefer rustybuzz-shaped advance for consistency with FreeType rendering
+            crate::layout::width_matched_em_px_shaped(font_data, &w.text, w.width as f32)
+                .or_else(|| crate::layout::width_matched_em_px(&font_ref, &w.text, w.width as f32))
+        })
         .collect();
     if all_em.is_empty() {
         return None;
     }
     all_em.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
     let line_em_px = all_em[all_em.len() / 2];
-    // At 72 DPI, 1 pt = 1 px, so font size in pt = em_px.
-    let font_size_pt = line_em_px as f64;
-
-    // Baseline: ink-centered within the canvas height.
-    let baseline_px = crate::layout::ink_centered_baseline_px(&font_ref, line_em_px, canvas_h as f32);
-    // PDF Y is bottom-up: pdf_y = canvas_h - baseline_px
-    // But baseline_px is measured from top (ab_glyph style), and in PDF coords
-    // baseline should be at (canvas_h - baseline_from_top).
-    // Actually in our 72-DPI identity mapping: pdf_baseline_y = pt_h - baseline_px as f64
-    let sf = font_ref.as_scaled(PxScale::from(line_em_px));
-    let ink_h = sf.ascent() - sf.descent();
-    let baseline_from_bottom = (pt_h - ink_h as f64) / 2.0 - sf.descent() as f64;
-
-    // Simple Type1-style font (WinAnsiEncoding, first 256 glyphs).
-    // For SSIM comparison this is sufficient — we only need Latin text.
-    let font_dict = dictionary! {
-        "Type" => Object::Name(b"Font".to_vec()),
-        "Subtype" => Object::Name(if is_cff { b"Type1".to_vec() } else { b"TrueType".to_vec() }),
-        "BaseFont" => Object::Name(b"CandidateFont".to_vec()),
-        "Encoding" => Object::Name(b"WinAnsiEncoding".to_vec()),
-        "FontDescriptor" => Object::Reference(fd_id),
-    };
-    let font_id = doc.add_object(font_dict);
-
-    // Build page content: position each word with Td, render with Tj.
-    let mut ops: Vec<Op> = Vec::new();
-    fn op(name: &str, args: &[Object]) -> Op {
-        Op::new(name, args.to_vec())
+    if std::env::var("UNSCAN_DUMP_SSIM").is_ok() {
+        log::info!("render: line_em_px={:.2}, canvas={}x{}, scale={}", line_em_px, canvas_w, canvas_h, render_scale);
     }
-    fn real(v: f64) -> Object {
-        Object::Real(v as f32)
-    }
+
+    let render_w = canvas_w * render_scale;
+    let render_h = canvas_h * render_scale;
+    let render_em = line_em_px * render_scale as f32;
+
+    // Baseline for the 2× canvas
+    let sf2 = font_ref.as_scaled(PxScale::from(render_em));
+    let ink_h2 = sf2.ascent() - sf2.descent();
+    let baseline_y = ((render_h as f32 - ink_h2) / 2.0 + sf2.ascent()) as f64;
+
+    // Set up FreeType (reuse thread-local library)
+    let ft_result: Option<GrayImage> = FT_LIB.with(|cell| {
+        let mut borrow = cell.borrow_mut();
+        if borrow.is_none() {
+            *borrow = freetype::Library::init().ok();
+        }
+        let lib = borrow.as_ref()?;
+        let ft_face = lib.new_memory_face2(font_data.to_vec(), 0).ok()?;
+        let size_26_6 = (render_em as f64 * 64.0) as isize;
+        ft_face.set_char_size(size_26_6, size_26_6, 72, 72).ok()?;
+
+    // Set up rustybuzz for shaping
+    let buzz_face = rustybuzz::Face::from_slice(font_data, 0)?;
+    let units_per_em = buzz_face.units_per_em() as f64;
+    let px_per_unit = render_em as f64 / units_per_em;
+
+    let mut canvas = GrayImage::from_pixel(render_w, render_h, Luma([255u8]));
 
     for word in words {
         if word.text.is_empty() || word.width < 1 {
             continue;
         }
-        let pdf_x = word.x_off as f64;
-        let pdf_y = baseline_from_bottom;
 
-        // Per-word horizontal scaling to match OCR bbox width.
-        let sf_line = font_ref.as_scaled(PxScale::from(line_em_px));
-        let natural_adv: f32 = {
-            let mut adv = 0.0f32;
-            let mut prev: Option<ab_glyph::GlyphId> = None;
-            for c in word.text.chars() {
-                let gid = font_ref.glyph_id(c);
-                if let Some(p) = prev {
-                    adv += sf_line.kern(p, gid);
-                }
-                adv += sf_line.h_advance(gid);
-                prev = Some(gid);
+        // Shape with rustybuzz
+        let mut buffer = rustybuzz::UnicodeBuffer::new();
+        buffer.push_str(&word.text);
+        let glyphs = rustybuzz::shape(&buzz_face, &[], buffer);
+        let infos = glyphs.glyph_infos();
+        let positions = glyphs.glyph_positions();
+
+        // Walk glyphs, accumulating pen position in subpixel floats
+        let mut pen_x = word.x_off as f64 * render_scale as f64;
+        let pen_y = baseline_y;
+
+        // Compensate for first glyph's left side bearing so ink aligns
+        // with the OCR bbox edge (which is ink-extent, not advance-extent).
+        let mut lsb_compensated = false;
+
+        for (info, pos) in infos.iter().zip(positions.iter()) {
+            let glyph_id = info.glyph_id; // after shaping = glyph ID
+            let x_offset = pos.x_offset as f64 * px_per_unit;
+            let y_offset = pos.y_offset as f64 * px_per_unit;
+
+            // Load glyph in FreeType
+            ft_face.load_glyph(glyph_id, freetype::face::LoadFlag::RENDER | freetype::face::LoadFlag::NO_HINTING).ok()?;
+            let glyph = ft_face.glyph();
+            let bitmap = glyph.bitmap();
+            let bmp_w = bitmap.width() as usize;
+            let bmp_h = bitmap.rows() as usize;
+            let bmp_buf = bitmap.buffer();
+            let bmp_pitch = bitmap.pitch().unsigned_abs() as usize;
+
+            if bmp_w == 0 || bmp_h == 0 || bmp_buf.is_empty() {
+                pen_x += pos.x_advance as f64 * px_per_unit;
+                continue;
             }
-            adv
-        };
-        let tz = if natural_adv > 0.1 {
-            (word.width as f64 / natural_adv as f64) * 100.0
-        } else {
-            100.0
-        };
 
-        ops.push(op("BT", &[]));
-        ops.push(op("Tf", &[Object::Name(b"F1".to_vec()), real(font_size_pt)]));
-        ops.push(op("Tz", &[real(tz)]));
-        ops.push(op("Td", &[real(pdf_x), real(pdf_y)]));
-        let encoded = crate::pdf_out::encode_pdf_text(&word.text);
-        ops.push(op("Tj", &[Object::String(encoded, lopdf::StringFormat::Literal)]));
-        ops.push(op("ET", &[]));
-    }
+            // Shift pen left by first glyph's bitmap_left so ink starts at crop edge
+            if !lsb_compensated {
+                pen_x -= glyph.bitmap_left() as f64;
+                lsb_compensated = true;
+            }
 
-    let content = Content { operations: ops };
-    let content_bytes = content.encode().ok()?;
-    let content_stream = Stream::new(dictionary! {}, content_bytes);
-    let content_id = doc.add_object(content_stream);
+            if bmp_w == 0 || bmp_h == 0 || bmp_buf.is_empty() {
+                pen_x += pos.x_advance as f64 * px_per_unit;
+                continue;
+            }
 
-    let resources = dictionary! {
-        "Font" => dictionary! {
-            "F1" => Object::Reference(font_id),
-        },
-    };
+            // Glyph bitmap origin: (pen_x + x_offset + bitmap_left, pen_y - y_offset - bitmap_top)
+            let blit_x = (pen_x + x_offset + glyph.bitmap_left() as f64).round() as i32;
+            let blit_y = (pen_y - y_offset - glyph.bitmap_top() as f64).round() as i32;
 
-    let page = dictionary! {
-        "Type" => Object::Name(b"Page".to_vec()),
-        "MediaBox" => Object::Array(vec![
-            Object::Integer(0), Object::Integer(0),
-            real(pt_w), real(pt_h),
-        ]),
-        "Contents" => Object::Reference(content_id),
-        "Resources" => resources,
-    };
-    let page_id = doc.add_object(page);
+            // Blit the glyph bitmap onto the canvas
+            for row in 0..bmp_h {
+                for col in 0..bmp_w {
+                    let cx = blit_x + col as i32;
+                    let cy = blit_y + row as i32;
+                    if cx < 0 || cy < 0 || cx >= render_w as i32 || cy >= render_h as i32 {
+                        continue;
+                    }
+                    let alpha = bmp_buf[row * bmp_pitch + col] as f32 / 255.0;
+                    if alpha < 0.01 {
+                        continue;
+                    }
+                    let existing = canvas.get_pixel(cx as u32, cy as u32).0[0] as f32;
+                    let blended = existing * (1.0 - alpha); // black ink on white
+                    canvas.put_pixel(cx as u32, cy as u32, Luma([blended as u8]));
+                }
+            }
 
-    let pages = dictionary! {
-        "Type" => Object::Name(b"Pages".to_vec()),
-        "Kids" => Object::Array(vec![Object::Reference(page_id)]),
-        "Count" => Object::Integer(1),
-    };
-    let pages_id = doc.add_object(pages);
-
-    // Patch page's Parent
-    if let Ok(page_obj) = doc.get_object_mut(page_id) {
-        if let Object::Dictionary(ref mut d) = page_obj {
-            d.set("Parent", Object::Reference(pages_id));
+            pen_x += pos.x_advance as f64 * px_per_unit;
         }
     }
 
-    let catalog = dictionary! {
-        "Type" => Object::Name(b"Catalog".to_vec()),
-        "Pages" => Object::Reference(pages_id),
+    // Measure rendered ink extent and correct for advance-vs-ink mismatch.
+    // width_matched_em_px matches advance width to target, but the OCR bbox
+    // is ink extent (excluding sidebearings). Resize to match.
+    let target_ink_w = words.iter().map(|w| w.x_off as u32 + w.width).max().unwrap_or(canvas_w);
+    let rend_ink_right = {
+        let mut right = 0u32;
+        for x in (0..canvas.width()).rev() {
+            if (0..canvas.height()).any(|y| canvas.get_pixel(x, y).0[0] < 240) {
+                right = x + 1;
+                break;
+            }
+        }
+        right
     };
-    let catalog_id = doc.add_object(catalog);
-    doc.trailer.set("Root", Object::Reference(catalog_id));
-
-    // Write to a temp file.
-    let tmp_pdf = std::env::temp_dir().join(format!("unscan_ssim_{}.pdf", std::process::id()));
-    let tmp_png_prefix = std::env::temp_dir().join(format!("unscan_ssim_{}", std::process::id()));
-    doc.save(&tmp_pdf).ok()?;
-
-    // Render at 72 DPI so 1 pt = 1 px → output dimensions = canvas_w × canvas_h.
-    let status = std::process::Command::new("pdftoppm")
-        .args([
-            "-r", "72",
-            "-gray",
-            "-f", "1", "-l", "1",
-            "-singlefile",
-        ])
-        .arg(&tmp_pdf)
-        .arg(&tmp_png_prefix)
-        .stdout(std::process::Stdio::null())
-        .stderr(std::process::Stdio::null())
-        .status()
-        .ok()?;
-
-    let _ = std::fs::remove_file(&tmp_pdf);
-
-    if !status.success() {
-        let _ = std::fs::remove_file(tmp_png_prefix.with_extension("pgm"));
-        return None;
+    let rend_ink_left = {
+        let mut left = canvas.width();
+        for x in 0..canvas.width() {
+            if (0..canvas.height()).any(|y| canvas.get_pixel(x, y).0[0] < 240) {
+                left = x;
+                break;
+            }
+        }
+        left
+    };
+    // Scale canvas horizontally so rendered ink extent matches scan ink extent (the OCR bbox).
+    // Only apply if there's a meaningful difference (>1px) and rendered ink is non-empty.
+    let rendered_ink_w = rend_ink_right.saturating_sub(rend_ink_left);
+    let target_ink_w_rs = target_ink_w * render_scale;
+    if rendered_ink_w > 0 && rendered_ink_w.abs_diff(target_ink_w_rs) > render_scale {
+        let scale_x = target_ink_w_rs as f64 / rendered_ink_w as f64;
+        let new_w = (canvas.width() as f64 * scale_x).round() as u32;
+        canvas = image::imageops::resize(&canvas, new_w, canvas.height(), image::imageops::FilterType::Lanczos3);
+        // Crop or pad back to render_w
+        if canvas.width() > render_w {
+            canvas = image::imageops::crop_imm(&canvas, 0, 0, render_w, canvas.height()).to_image();
+        } else if canvas.width() < render_w {
+            let mut padded = GrayImage::from_pixel(render_w, canvas.height(), Luma([255u8]));
+            image::imageops::overlay(&mut padded, &canvas, 0, 0);
+            canvas = padded;
+        }
     }
 
-    // pdftoppm -gray outputs a PGM file.
-    let pgm_path = tmp_png_prefix.with_extension("pgm");
-    let img = image::open(&pgm_path).ok()?.to_luma8();
-    let _ = std::fs::remove_file(&pgm_path);
-
-    // The rendered image might be slightly different dimensions due to rounding.
-    // Resize to exact canvas dimensions if needed.
-    if img.width() != canvas_w || img.height() != canvas_h {
-        Some(image::imageops::resize(&img, canvas_w, canvas_h, image::imageops::FilterType::Lanczos3))
+    // Downsample from render resolution to canvas size
+    if render_scale > 1 {
+        Some(image::imageops::resize(&canvas, canvas_w, canvas_h, image::imageops::FilterType::Lanczos3))
     } else {
-        Some(img)
+        Some(canvas)
     }
+    }); // end FT_LIB.with
+
+    ft_result
 }
 
 /// Fallback: ab_glyph-based rendering (no OT shaping, legacy kern only).
@@ -434,42 +438,72 @@ fn gaussian_kernel_11x11() -> [[f64; 11]; 11] {
 /// - Only windows containing ink (pixels < 240 in either image) contribute
 /// - Returns mean SSIM over ink-containing windows, or 0.0 if none
 /// Try vertical shifts of the rendered image from -max_shift to +max_shift pixels
+/// 3×3 Gaussian blur with σ≈0.7 (kernel [1,2,1]/4 separable).
+fn gaussian_blur_3x3(img: &GrayImage) -> GrayImage {
+    let (w, h) = img.dimensions();
+    if w < 3 || h < 3 {
+        return img.clone();
+    }
+    let mut tmp = GrayImage::new(w, h);
+    for y in 0..h {
+        for x in 0..w {
+            let p = |dx: i32| -> u32 {
+                let xx = (x as i32 + dx).clamp(0, w as i32 - 1) as u32;
+                img.get_pixel(xx, y).0[0] as u32
+            };
+            let v = p(-1) + 2 * p(0) + p(1);
+            tmp.put_pixel(x, y, Luma([((v + 2) / 4) as u8]));
+        }
+    }
+    let mut out = GrayImage::new(w, h);
+    for y in 0..h {
+        for x in 0..w {
+            let p = |dy: i32| -> u32 {
+                let yy = (y as i32 + dy).clamp(0, h as i32 - 1) as u32;
+                tmp.get_pixel(x, yy).0[0] as u32
+            };
+            let v = p(-1) + 2 * p(0) + p(1);
+            out.put_pixel(x, y, Luma([((v + 2) / 4) as u8]));
+        }
+    }
+    out
+}
+
+
 /// and return the best (highest) SSIM and the shift that produced it.
 /// Positive dy = rendered image moved DOWN.
+/// Searches from center outward (0, -1, 1, -2, 2, …) and exits early if SSIM ≥ 0.92.
 fn ssim_windowed_best_vshift(a: &GrayImage, b: &GrayImage, max_shift: i32) -> (f32, i32) {
-    let (aw, ah) = a.dimensions();
+    const EARLY_EXIT_THRESHOLD: f32 = 0.92;
     let mut best = 0.0f32;
     let mut best_dy = 0i32;
-    for dy in -max_shift..=max_shift {
-        // Shift image b vertically by dy pixels
-        let mut shifted = GrayImage::from_pixel(aw, ah, Luma([255u8]));
-        for sy in 0..ah {
-            let ty = sy as i32 + dy;
-            if ty < 0 || ty >= ah as i32 { continue; }
-            for sx in 0..aw.min(b.width()) {
-                shifted.put_pixel(sx, ty as u32, *b.get_pixel(sx, sy));
-            }
-        }
-        let score = ssim_windowed(a, &shifted);
+
+    // Search center-outward: 0, -1, 1, -2, 2, …
+    let mut shifts = Vec::with_capacity((2 * max_shift + 1) as usize);
+    shifts.push(0i32);
+    for d in 1..=max_shift {
+        shifts.push(-d);
+        shifts.push(d);
+    }
+
+    for dy in shifts {
+        let score = ssim_windowed(a, b, dy);
         if score > best {
             best = score;
             best_dy = dy;
+            if best >= EARLY_EXIT_THRESHOLD {
+                break;
+            }
         }
     }
     (best, best_dy)
 }
 
-fn ssim_windowed(a: &GrayImage, b: &GrayImage) -> f32 {
-    let b = if a.dimensions() != b.dimensions() {
-        image::imageops::resize(b, a.width(), a.height(), image::imageops::FilterType::Lanczos3)
-    } else {
-        b.clone()
-    };
-
+fn ssim_windowed(a: &GrayImage, b: &GrayImage, b_dy: i32) -> f32 {
     let (w, h) = a.dimensions();
     if w < 11 || h < 11 {
-        // Fallback to global for tiny images
-        return ssim_global(a, &b);
+        // Fallback to global for tiny images (shift not applied in global path)
+        return ssim_global(a, b);
     }
 
     let kernel = gaussian_kernel_11x11();
@@ -482,6 +516,8 @@ fn ssim_windowed(a: &GrayImage, b: &GrayImage) -> f32 {
     const MIN_INK_PIXELS: u32 = 3;
 
     let half = 5i32; // 11/2
+    let bw = b.width() as i32;
+    let bh = b.height() as i32;
 
     let mut ssim_sum = 0.0f64;
     let mut window_count = 0u64;
@@ -493,54 +529,49 @@ fn ssim_windowed(a: &GrayImage, b: &GrayImage) -> f32 {
     while cy + (half as u32) < h {
         let mut cx = half as u32;
         while cx + (half as u32) < w {
-            // Check if this window contains ink
+            // Single pass: accumulate ink count, weighted means, and weighted
+            // squared/cross terms simultaneously.
             let mut ink_count = 0u32;
+            let mut mu_a = 0.0f64;
+            let mut mu_b = 0.0f64;
+            let mut sum_wa2 = 0.0f64;
+            let mut sum_wb2 = 0.0f64;
+            let mut sum_wab = 0.0f64;
+
             for ky in 0..11u32 {
+                let py = (cy as i32 - half + ky as i32) as u32;
+                // b pixel y with shift
+                let by = py as i32 + b_dy;
                 for kx in 0..11u32 {
                     let px = (cx as i32 - half + kx as i32) as u32;
-                    let py = (cy as i32 - half + ky as i32) as u32;
-                    let va = a.get_pixel(px, py).0[0];
-                    let vb = b.get_pixel(px, py).0[0];
-                    if va < INK_THRESHOLD || vb < INK_THRESHOLD {
+                    let va_u8 = a.get_pixel(px, py).0[0];
+                    // Read b with offset; out-of-bounds → 255 (white background)
+                    let vb_u8 = if by >= 0 && by < bh && (px as i32) < bw {
+                        b.get_pixel(px, by as u32).0[0]
+                    } else {
+                        255u8
+                    };
+
+                    if va_u8 < INK_THRESHOLD || vb_u8 < INK_THRESHOLD {
                         ink_count += 1;
                     }
+
+                    let wt = kernel[ky as usize][kx as usize];
+                    let va = va_u8 as f64;
+                    let vb = vb_u8 as f64;
+                    mu_a += wt * va;
+                    mu_b += wt * vb;
+                    sum_wa2 += wt * va * va;
+                    sum_wb2 += wt * vb * vb;
+                    sum_wab += wt * va * vb;
                 }
             }
 
             if ink_count >= MIN_INK_PIXELS {
-                // Compute weighted statistics for this window
-                let mut mu_a = 0.0f64;
-                let mut mu_b = 0.0f64;
-                let mut sig_a2 = 0.0f64;
-                let mut sig_b2 = 0.0f64;
-                let mut sig_ab = 0.0f64;
-
-                for ky in 0..11usize {
-                    for kx in 0..11usize {
-                        let px = (cx as i32 - half + kx as i32) as u32;
-                        let py = (cy as i32 - half + ky as i32) as u32;
-                        let va = a.get_pixel(px, py).0[0] as f64;
-                        let vb = b.get_pixel(px, py).0[0] as f64;
-                        let wt = kernel[ky][kx];
-                        mu_a += wt * va;
-                        mu_b += wt * vb;
-                    }
-                }
-
-                for ky in 0..11usize {
-                    for kx in 0..11usize {
-                        let px = (cx as i32 - half + kx as i32) as u32;
-                        let py = (cy as i32 - half + ky as i32) as u32;
-                        let va = a.get_pixel(px, py).0[0] as f64;
-                        let vb = b.get_pixel(px, py).0[0] as f64;
-                        let wt = kernel[ky][kx];
-                        let da = va - mu_a;
-                        let db = vb - mu_b;
-                        sig_a2 += wt * da * da;
-                        sig_b2 += wt * db * db;
-                        sig_ab += wt * da * db;
-                    }
-                }
+                // One-pass variance: sig2 = E[x²] - (E[x])²
+                let sig_a2 = sum_wa2 - mu_a * mu_a;
+                let sig_b2 = sum_wb2 - mu_b * mu_b;
+                let sig_ab = sum_wab - mu_a * mu_b;
 
                 let num = (2.0 * mu_a * mu_b + c1) * (2.0 * sig_ab + c2);
                 let den = (mu_a * mu_a + mu_b * mu_b + c1) * (sig_a2 + sig_b2 + c2);
@@ -557,7 +588,7 @@ fn ssim_windowed(a: &GrayImage, b: &GrayImage) -> f32 {
 
     if window_count == 0 {
         // No ink windows found — fall back to global
-        return ssim_global(a, &b);
+        return ssim_global(a, b);
     }
 
     (ssim_sum / window_count as f64).clamp(0.0, 1.0) as f32

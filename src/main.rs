@@ -18,6 +18,7 @@ use crate::error::ScanTextError;
 use crate::ocr::TextRegion;
 use image::DynamicImage;
 use log::{debug, info, warn};
+use rayon::prelude::*;
 use std::path::Path;
 
 fn main() {
@@ -369,8 +370,13 @@ fn run(args: &cli::Args) -> Result<(), ScanTextError> {
             font_result: Option<font_match::FontMatchResult>,
             text_color: (u8, u8, u8),
         }
-        let mut line_matches: Vec<LineMatch> = Vec::with_capacity(lines.len());
-        for line in lines.iter() {
+
+        // Pre-parse all catalog fonts once (avoids per-candidate per-line re-parsing)
+        let parsed_fonts: Vec<Option<ab_glyph::FontRef>> = font_catalog.iter()
+            .map(|e| ab_glyph::FontRef::try_from_slice(&e.data).ok())
+            .collect();
+
+        let mut line_matches: Vec<LineMatch> = lines.par_iter().map(|line| {
             let text_color = color::detect_text_color(
                 page_img,
                 &TextRegion {
@@ -384,7 +390,6 @@ fn run(args: &cli::Args) -> Result<(), ScanTextError> {
             );
             let font_result = {
                 // Query char index for candidate font keys
-                let gray_page = page_img.to_luma8();
                 let word_placements: Vec<crate::verify::WordPlacement> = line.words.iter()
                     .map(|w| crate::verify::WordPlacement {
                         text: w.text.clone(),
@@ -400,13 +405,13 @@ fn run(args: &cli::Args) -> Result<(), ScanTextError> {
                 let ci_keys: std::collections::HashSet<String> = ci_results.into_iter().map(|(name, _score)| name).collect();
                 let ci_arg = if ci_keys.is_empty() { None } else { Some(&ci_keys) };
                 font_match::match_font(
-                    page_img, line, &font_catalog,
+                    &gray_page, line, &font_catalog, &parsed_fonts,
                     args.min_font_confidence, args.dpi,
                     ci_arg,
                 )
             };
-            line_matches.push(LineMatch { font_result, text_color });
-        }
+            LineMatch { font_result, text_color }
+        }).collect();
 
         // ── Pass 1.5: Paragraph-level font grouping ─────────────────
         // Find the dominant body font: most common font among matched lines
@@ -505,6 +510,7 @@ fn run(args: &cli::Args) -> Result<(), ScanTextError> {
                                     score: majority_ssim,
                                     font_data: majority_data.clone(),
                                     best_dy: 0, // majority override, no shift data
+                                    ssim_verified: false,
                                 });
                             }
                         }
@@ -548,23 +554,35 @@ fn run(args: &cli::Args) -> Result<(), ScanTextError> {
             let mut ssim_score: Option<f32> = None;
             if !keep_raster && !args.no_verify {
                 if let Some(ref fm) = font_result {
-                    let (score, _dy) = verify::verify_text_region(
-                        &gray_page,
-                        &fm.font_data,
-                        &line.text,
-                        line.x,
-                        line.y,
-                        line.width,
-                        line.height,
-                        &line.words,
-                    );
-                    ssim_score = Some(score);
-                    if score < args.min_verify_ssim {
-                        keep_raster = true;
-                        reason = format!(
-                            "SSIM verification failed ({score:.3} < {:.2}). Reverted to raster.",
-                            args.min_verify_ssim
+                    if fm.ssim_verified {
+                        // Score already comes from SSIM rerank — skip redundant verify
+                        ssim_score = Some(fm.score);
+                        if fm.score < args.min_verify_ssim {
+                            keep_raster = true;
+                            reason = format!(
+                                "SSIM verification failed ({:.3} < {:.2}). Reverted to raster.",
+                                fm.score, args.min_verify_ssim
+                            );
+                        }
+                    } else {
+                        let (score, _dy) = verify::verify_text_region(
+                            &gray_page,
+                            &fm.font_data,
+                            &line.text,
+                            line.x,
+                            line.y,
+                            line.width,
+                            line.height,
+                            &line.words,
                         );
+                        ssim_score = Some(score);
+                        if score < args.min_verify_ssim {
+                            keep_raster = true;
+                            reason = format!(
+                                "SSIM verification failed ({score:.3} < {:.2}). Reverted to raster.",
+                                args.min_verify_ssim
+                            );
+                        }
                     }
                 }
             }
