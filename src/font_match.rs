@@ -29,6 +29,9 @@ pub struct FontMatchResult {
     pub font_data: Vec<u8>,
     /// Best vertical pixel shift from SSIM alignment search (0 if coarse-only).
     pub best_dy: i32,
+    /// True when the score already comes from SSIM verification (rerank path),
+    /// so Pass 2 can skip the redundant verify call.
+    pub ssim_verified: bool,
 }
 
 /// Pre-processed source word ready for comparison.
@@ -41,6 +44,8 @@ struct SourceSample {
     norm_w: u32,
     hu: [f64; 7],
     fill_ratio: f32,
+    /// Pre-computed Gaussian blur of the normalised image.
+    blur: GrayImage,
 }
 
 // ---------------------------------------------------------------------------
@@ -72,10 +77,11 @@ const WIDTH_RATIO_FLOOR: f32 = 0.60;
 // Public API
 // ---------------------------------------------------------------------------
 
-pub fn match_font(
-    page_img: &image::DynamicImage,
+pub fn match_font<'a>(
+    gray_page: &GrayImage,
     line: &TextLine,
-    catalog: &[FontEntry],
+    catalog: &'a [FontEntry],
+    parsed_fonts: &[Option<FontRef<'a>>],
     threshold: f32,
     _dpi: u32,
     char_index_keys: Option<&std::collections::HashSet<String>>,
@@ -85,8 +91,6 @@ pub fn match_font(
     if word_refs.is_empty() {
         return None;
     }
-
-    let gray_page = page_img.to_luma8();
 
     // ── 2. Pre-process source samples ────────────────────────────────
     let src_samples: Vec<SourceSample> = word_refs
@@ -110,6 +114,7 @@ pub fn match_font(
             let norm = threshold_mid(&norm_resized);
             let hu = hu_moments(&norm);
             let fill = fill_ratio(&norm);
+            let blur = gaussian_blur_3x3(&norm);
             Some(SourceSample {
                 text: w.text.clone(),
                 bbox_width: w.width,
@@ -118,6 +123,7 @@ pub fn match_font(
                 norm_w,
                 hu,
                 fill_ratio: fill,
+                blur,
             })
         })
         .collect();
@@ -130,9 +136,6 @@ pub fn match_font(
     let is_mono_source = detect_monospace_source(line);
     let detected_class = guess_class_from_samples(&src_samples);
     let source_is_bold = detect_bold_source(&src_samples);
-    let detected_class = guess_class_from_samples(&src_samples);
-    log::debug!("  bold={} class={:?} text={:.40}", source_is_bold, detected_class, 
-        line.words.iter().map(|w| w.text.as_str()).collect::<Vec<_>>().join(" "));
 
     // DEBUG: dump source sample images for the first line
     if std::env::var("SCANTEXT_DUMP").is_ok() {
@@ -161,7 +164,7 @@ pub fn match_font(
     // Check if source text contains digits — if so, we'll prefer fonts
     // with matching figure style (lining vs old-style).
     let line_text: String = line.words.iter().map(|w| w.text.as_str()).collect::<Vec<_>>().join(" ");
-    let source_has_digits = line_text.chars().any(|c| c.is_ascii_digit());
+    let _source_has_digits = line_text.chars().any(|c| c.is_ascii_digit());
 
     let mut best_score = f32::NEG_INFINITY;
     let mut best_entry: Option<&FontEntry> = None;
@@ -170,10 +173,10 @@ pub fn match_font(
     // If char index returned candidates, ONLY score those (skip brute-force).
     // Fall back to full catalog only when char index is unavailable.
     let use_char_gate = char_index_keys.is_some();
-    let score_entries: Vec<&FontEntry> = if let Some(ci) = char_index_keys {
-        catalog.iter().filter(|e| ci.contains(&e.font_key())).collect()
+    let score_entries: Vec<(usize, &FontEntry)> = if let Some(ci) = char_index_keys {
+        catalog.iter().enumerate().filter(|(_, e)| ci.contains(&e.font_key())).collect()
     } else {
-        catalog.iter().collect()
+        catalog.iter().enumerate().collect()
     };
 
     info!(
@@ -184,7 +187,7 @@ pub fn match_font(
         line_text,
     );
 
-    for entry in &score_entries {
+    for &(cat_idx, entry) in &score_entries {
         // ── Pre-filter: mono ────────────────────────────────────────
         // Only apply mono filter — serif/sans classification from raster
         // is unreliable (transition heuristic returns wrong class).
@@ -233,9 +236,9 @@ pub fn match_font(
         // as a filter — documents can use either style. Let SSIM pick
         // the best pixel match naturally.
         // ── Pre-filter: parse font ──────────────────────────────────
-        let font = match FontRef::try_from_slice(&entry.data) {
-            Ok(f) => f,
-            Err(_) => continue,
+        let font = match &parsed_fonts[cat_idx] {
+            Some(f) => f,
+            None => continue,
         };
         let overrides = entry.glyph_overrides.as_deref();
 
@@ -329,7 +332,7 @@ pub fn match_font(
             let iou = aligned_iou(&src_padded, &cand_padded, 2);
 
             // ── Signal 2: NCC on blurred images ──────────────────────
-            let src_blur = gaussian_blur_3x3(&src_padded);
+            let src_blur = center_pad(&src.blur, canvas_w, NORM_H);
             let cand_blur = gaussian_blur_3x3(&cand_padded);
             let ncc = ncc_score(&src_blur, &cand_blur);
 
@@ -453,7 +456,6 @@ pub fn match_font(
             top_candidates[0].0,
             line_text);
 
-        let gray = page_img.to_luma8();
         // Use the full line bbox for SSIM
         let lx = line.words.iter().map(|w| w.x).min().unwrap_or(0);
         let ly = line.words.iter().map(|w| w.y).min().unwrap_or(0);
@@ -464,12 +466,12 @@ pub fn match_font(
 
         let mut best_rerank_ssim = -1.0f32;
         let mut best_rerank_entry: Option<&FontEntry> = None;
-        let mut best_rerank_coarse = 0.0f32;
+        let mut _best_rerank_coarse = 0.0f32;
         let mut best_rerank_dy = 0i32;
 
         for &(coarse_score, entry) in &top_candidates {
             let (ssim, dy) = crate::verify::verify_text_region(
-                &gray,
+                gray_page,
                 &entry.data,
                 "",  // text not used
                 lx, ly, lw, lh,
@@ -479,7 +481,7 @@ pub fn match_font(
             if ssim > best_rerank_ssim {
                 best_rerank_ssim = ssim;
                 best_rerank_entry = Some(entry);
-                best_rerank_coarse = coarse_score;
+                _best_rerank_coarse = coarse_score;
                 best_rerank_dy = dy;
             }
         }
@@ -497,6 +499,7 @@ pub fn match_font(
                     score: best_rerank_ssim,
                     font_data: entry.data.clone(),
                     best_dy: best_rerank_dy,
+                    ssim_verified: true,
                 });
             }
         }
@@ -513,6 +516,7 @@ pub fn match_font(
             score: best_score,
             font_data: e.data.clone(),
             best_dy: 0, // coarse-only path, no SSIM shift
+            ssim_verified: false,
         }
     })
 }
@@ -849,6 +853,7 @@ fn detect_bold_source(samples: &[SourceSample]) -> bool {
 
 /// Italic detection result: definite, or indeterminate (gray zone).
 #[derive(Debug, Clone, Copy, PartialEq)]
+#[allow(dead_code)]
 enum ItalicGuess {
     No,        // slant < 0.04: definitely upright
     Maybe,     // 0.04..0.09: ambiguous (sans uprights overlap with mild italics)
@@ -857,6 +862,7 @@ enum ItalicGuess {
 
 /// Detect whether source text appears italic by measuring the horizontal
 /// centroid shift between the top and bottom halves of the image.
+#[allow(dead_code)]
 fn detect_italic_source(samples: &[SourceSample]) -> ItalicGuess {
     if samples.is_empty() {
         return ItalicGuess::No;

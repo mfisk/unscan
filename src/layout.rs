@@ -150,3 +150,24 @@ pub fn baseline_aligned_baseline_pt<F: Font>(
     let baseline_offset_pt = baseline_px * 72.0 / dpi;
     (baseline_offset_pt, ink_h_pt)
 }
+
+/// Compute em_px using rustybuzz shaped advances (full OT shaping).
+/// More accurate than `width_matched_em_px` which uses ab_glyph (no GPOS).
+pub fn width_matched_em_px_shaped(font_data: &[u8], text: &str, target_width_px: f32) -> Option<f32> {
+    let face = rustybuzz::Face::from_slice(font_data, 0)?;
+    let units_per_em = face.units_per_em() as f64;
+
+    let mut buffer = rustybuzz::UnicodeBuffer::new();
+    buffer.push_str(text);
+    let glyphs = rustybuzz::shape(&face, &[], buffer);
+    let positions = glyphs.glyph_positions();
+
+    let total_advance_fu: f64 = positions.iter().map(|p| p.x_advance as f64).sum();
+    if total_advance_fu < 0.1 {
+        return None;
+    }
+
+    // em_px such that total_advance_fu / units_per_em * em_px = target_width_px
+    let em_px = (target_width_px as f64 * units_per_em / total_advance_fu) as f32;
+    Some(em_px.clamp(4.0, 500.0))
+}
