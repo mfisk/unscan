@@ -1,0 +1,44 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 200 220" width="200" height="220">
+  <!-- IBM Selectric Type Ball (typeball/golf ball element) -->
+  <!-- The sphere body -->
+  <defs>
+    <radialGradient id="sphere" cx="40%" cy="35%" r="55%">
+      <stop offset="0%" stop-color="#888"/>
+      <stop offset="60%" stop-color="#444"/>
+      <stop offset="100%" stop-color="#111"/>
+    </radialGradient>
+  </defs>
+  <!-- Ball body -->
+  <circle cx="100" cy="95" r="75" fill="url(#sphere)"/>
+  <!-- Character bands - horizontal rows of raised type -->
+  <!-- Row 1 -->
+  <ellipse cx="100" cy="48" rx="65" ry="6" fill="none" stroke="#666" stroke-width="1.5"/>
+  <!-- Row 2 -->
+  <ellipse cx="100" cy="70" rx="73" ry="6" fill="none" stroke="#666" stroke-width="1.5"/>
+  <!-- Row 3 (equator) -->
+  <ellipse cx="100" cy="95" rx="75" ry="6" fill="none" stroke="#666" stroke-width="1.5"/>
+  <!-- Row 4 -->
+  <ellipse cx="100" cy="120" rx="73" ry="6" fill="none" stroke="#666" stroke-width="1.5"/>
+  <!-- Row 5 -->
+  <ellipse cx="100" cy="142" rx="65" ry="6" fill="none" stroke="#666" stroke-width="1.5"/>
+  <!-- Individual character bumps on the equator row -->
+  <rect x="30" y="91" width="4" height="8" rx="1" fill="#999" transform="rotate(-5 32 95)"/>
+  <rect x="42" y="90" width="4" height="8" rx="1" fill="#999" transform="rotate(-3 44 94)"/>
+  <rect x="54" y="90" width="4" height="8" rx="1" fill="#999"/>
+  <rect x="66" y="89" width="4" height="8" rx="1" fill="#999"/>
+  <rect x="78" y="89" width="4" height="8" rx="1" fill="#aaa"/>
+  <rect x="90" y="89" width="4" height="8" rx="1" fill="#aaa"/>
+  <rect x="102" y="89" width="4" height="8" rx="1" fill="#aaa"/>
+  <rect x="114" y="89" width="4" height="8" rx="1" fill="#999"/>
+  <rect x="126" y="89" width="4" height="8" rx="1" fill="#999"/>
+  <rect x="138" y="90" width="4" height="8" rx="1" fill="#999"/>
+  <rect x="150" y="90" width="4" height="8" rx="1" fill="#999" transform="rotate(3 152 94)"/>
+  <rect x="162" y="91" width="4" height="8" rx="1" fill="#999" transform="rotate(5 164 95)"/>
+  <!-- Mounting post at top -->
+  <rect x="94" y="10" width="12" height="18" rx="3" fill="#555"/>
+  <rect x="96" y="4" width="8" height="10" rx="2" fill="#666"/>
+  <!-- Notch/tooth at bottom for rotation mechanism -->
+  <path d="M88 170 L100 185 L112 170" fill="#333" stroke="#222" stroke-width="1"/>
+  <!-- Subtle highlight -->
+  <ellipse cx="78" cy="68" rx="20" ry="12" fill="white" opacity="0.08"/>
+</svg>

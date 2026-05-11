@@ -40,6 +40,7 @@ pub struct FontEntry {
     pub path: PathBuf,
     pub family_name: String,
     pub is_bold: bool,
+    #[allow(dead_code)]
     pub is_italic: bool,
     pub class: FontClass,
     pub data: Vec<u8>,
@@ -52,6 +53,19 @@ pub struct FontEntry {
     /// Only characters whose glyph ID differs from default are included.
     /// None for the default entry (use normal cmap lookup).
     pub glyph_overrides: Option<Vec<(char, u16)>>,
+}
+
+impl FontEntry {
+    /// Unique key for this font entry in the char index.
+    /// Encodes path + variant tag so each weight/style/OT-variant gets its own slot.
+    pub fn font_key(&self) -> String {
+        let p = self.path.display().to_string();
+        if self.variant_tag.is_empty() {
+            p
+        } else {
+            format!("{}|{}", p, self.variant_tag)
+        }
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -104,6 +118,7 @@ pub fn default_font_dirs(extra: &[PathBuf]) -> Vec<PathBuf> {
 pub fn scan_fonts(dirs: &[PathBuf]) -> Vec<FontEntry> {
     let aliases = build_alias_table();
     let mut fonts = Vec::new();
+    let mut seen_paths: std::collections::HashSet<PathBuf> = std::collections::HashSet::new();
 
     for dir in dirs {
         if !dir.exists() {
@@ -121,6 +136,11 @@ pub fn scan_fonts(dirs: &[PathBuf]) -> Vec<FontEntry> {
                 .unwrap_or("")
                 .to_lowercase();
             if ext != "ttf" && ext != "otf" {
+                continue;
+            }
+            // Canonicalize to avoid duplicates from overlapping dir walks
+            let canon = path.canonicalize().unwrap_or_else(|_| path.to_path_buf());
+            if !seen_paths.insert(canon) {
                 continue;
             }
             if let Some(fe) = load_font_entry(path, &aliases) {

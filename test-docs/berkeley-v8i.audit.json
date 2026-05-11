@@ -1,0 +1,623 @@
+{
+  "input_file": "test-docs/berkeley-acceptance.pdf",
+  "output_file": "test-docs/berkeley-v8i.pdf",
+  "input_size_bytes": 1785045,
+  "output_size_bytes": 3473466,
+  "compression_ratio": 0.5139088737301589,
+  "pages": [
+    {
+      "page": 1,
+      "width_px": 2550,
+      "height_px": 3300,
+      "lines_vectorized": 22,
+      "lines_kept_raster": 11,
+      "geometry_elements": 4,
+      "raster_fragments": 4
+    }
+  ],
+  "text_entries": [
+    {
+      "page": 1,
+      "line_index": 0,
+      "text": "UC Berkeley",
+      "ocr_confidence": 95.7839,
+      "font_matched": "libre baskerville 700",
+      "font_confidence": 0.22211194,
+      "ssim_score": null,
+      "decision": "kept_raster",
+      "reason": "No confident font match (best: libre baskerville 700 at 0.222). Kept as raster.",
+      "bbox": {
+        "x": 290,
+        "y": 309,
+        "width": 822,
+        "height": 155
+      }
+    },
+    {
+      "page": 1,
+      "line_index": 1,
+      "text": "March 26, 2026",
+      "ocr_confidence": 96.314674,
+      "font_matched": "libre bodoni 400",
+      "font_confidence": 0.4789032,
+      "ssim_score": 0.4789032,
+      "decision": "vectorized",
+      "reason": "Vectorised",
+      "bbox": {
+        "x": 284,
+        "y": 586,
+        "width": 260,
+        "height": 36
+      }
+    },
+    {
+      "page": 1,
+      "line_index": 2,
+      "text": "Eila Fisk",
+      "ocr_confidence": 84.07567,
+      "font_matched": "SourceSerif4SmText Regular [smcp]",
+      "font_confidence": 0.62979937,
+      "ssim_score": 0.62979937,
+      "decision": "vectorized",
+      "reason": "Vectorised",
+      "bbox": {
+        "x": 285,
+        "y": 686,
+        "width": 144,
+        "height": 30
+      }
+    },
+    {
+      "page": 1,
+      "line_index": 3,
+      "text": "1215 New Bridge Rd",
+      "ocr_confidence": 94.406265,
+      "font_matched": "SourceSerif4Display Regular",
+      "font_confidence": 0.36067653,
+      "ssim_score": null,
+      "decision": "kept_raster",
+      "reason": "No confident font match (best: SourceSerif4Display Regular at 0.361). Kept as raster.",
+      "bbox": {
+        "x": 285,
+        "y": 736,
+        "width": 329,
+        "height": 60
+      }
+    },
+    {
+      "page": 1,
+      "line_index": 4,
+      "text": "Aiken, SC 29805-6550",
+      "ocr_confidence": 96.34176,
+      "font_matched": "NotoSerifDisplay CondensedThin [c2sc]",
+      "font_confidence": 0.30950564,
+      "ssim_score": null,
+      "decision": "kept_raster",
+      "reason": "No confident font match (best: NotoSerifDisplay CondensedThin [c2sc] at 0.310). Kept as raster.",
+      "bbox": {
+        "x": 283,
+        "y": 766,
+        "width": 367,
+        "height": 78
+      }
+    },
+    {
+      "page": 1,
+      "line_index": 5,
+      "text": "United States",
+      "ocr_confidence": 96.12425,
+      "font_matched": "SourceSerif4 Regular [onum]",
+      "font_confidence": 0.63496363,
+      "ssim_score": 0.63496363,
+      "decision": "vectorized",
+      "reason": "Vectorised",
+      "bbox": {
+        "x": 284,
+        "y": 816,
+        "width": 229,
+        "height": 50
+      }
+    },
+    {
+      "page": 1,
+      "line_index": 6,
+      "text": "Dear Eila,",
+      "ocr_confidence": 92.804855,
+      "font_matched": "playfair display 400 [lnum]",
+      "font_confidence": 0.64560616,
+      "ssim_score": 0.64560616,
+      "decision": "vectorized",
+      "reason": "Vectorised",
+      "bbox": {
+        "x": 285,
+        "y": 926,
+        "width": 161,
+        "height": 36
+      }
+    },
+    {
+      "page": 1,
+      "line_index": 7,
+      "text": "Congratulations, and welcome to the University of California, Berkeley! We are pleased to offer you admission to",
+      "ocr_confidence": 96.63129,
+      "font_matched": "libre bodoni 400i",
+      "font_confidence": 0.32947773,
+      "ssim_score": null,
+      "decision": "kept_raster",
+      "reason": "No confident font match (best: libre bodoni 400i at 0.329). Kept as raster.",
+      "bbox": {
+        "x": 285,
+        "y": 1016,
+        "width": 1925,
+        "height": 62
+      }
+    },
+    {
+      "page": 1,
+      "line_index": 8,
+      "text": "the College of Letters and Science for the fall semester of 2026.",
+      "ocr_confidence": 96.703835,
+      "font_matched": "playfair display 400 [lnum]",
+      "font_confidence": 0.5448413,
+      "ssim_score": 0.5448413,
+      "decision": "vectorized",
+      "reason": "Vectorised",
+      "bbox": {
+        "x": 284,
+        "y": 1046,
+        "width": 1078,
+        "height": 60
+      }
+    },
+    {
+      "page": 1,
+      "line_index": 9,
+      "text": "Eila, your remarkable achievements both inside and outside the classroom made you stand tall amongst more than",
+      "ocr_confidence": 96.25958,
+      "font_matched": "P052 Roman [hist]",
+      "font_confidence": 0.55955815,
+      "ssim_score": 0.55955815,
+      "decision": "vectorized",
+      "reason": "Vectorised",
+      "bbox": {
+        "x": 285,
+        "y": 1157,
+        "width": 1950,
+        "height": 62
+      }
+    },
+    {
+      "page": 1,
+      "line_index": 10,
+      "text": "133,000 applicants to the nation’s leading public university. You, your loved ones, and supporters along the way",
+      "ocr_confidence": 96.70446,
+      "font_matched": "merriweather 400",
+      "font_confidence": 0.47932082,
+      "ssim_score": 0.47465312,
+      "decision": "vectorized",
+      "reason": "Vectorised",
+      "bbox": {
+        "x": 285,
+        "y": 1190,
+        "width": 1895,
+        "height": 81
+      }
+    },
+    {
+      "page": 1,
+      "line_index": 11,
+      "text": "have every reason to be proud of your success!",
+      "ocr_confidence": 96.78648,
+      "font_matched": "merriweather 400",
+      "font_confidence": 0.6391798,
+      "ssim_score": 0.6391798,
+      "decision": "vectorized",
+      "reason": "Vectorised",
+      "bbox": {
+        "x": 283,
+        "y": 1241,
+        "width": 788,
+        "height": 61
+      }
+    },
+    {
+      "page": 1,
+      "line_index": 12,
+      "text": "At UC Berkeley, you'll have the opportunity to learn and discover within a welcoming and dynamic community",
+      "ocr_confidence": 95.01985,
+      "font_matched": "EBGaramond08 Regular [c2sc]",
+      "font_confidence": 0.5208106,
+      "ssim_score": 0.5208106,
+      "decision": "vectorized",
+      "reason": "Vectorised",
+      "bbox": {
+        "x": 282,
+        "y": 1352,
+        "width": 1889,
+        "height": 61
+      }
+    },
+    {
+      "page": 1,
+      "line_index": 13,
+      "text": "united by our mission: education, research, and service to the greater good. Our community includes",
+      "ocr_confidence": 96.58679,
+      "font_matched": "NotoSerif ExtraCondensedLight [onum]",
+      "font_confidence": 0.41833133,
+      "ssim_score": 0.41833133,
+      "decision": "vectorized",
+      "reason": "Vectorised",
+      "bbox": {
+        "x": 283,
+        "y": 1382,
+        "width": 1714,
+        "height": 81
+      }
+    },
+    {
+      "page": 1,
+      "line_index": 14,
+      "text": "distinguished faculty and scholars -- Nobel laureates, MacArthur fellows, and pioneering experts across every field",
+      "ocr_confidence": 96.21986,
+      "font_matched": "SourceSerif4Display Regular [onum]",
+      "font_confidence": 0.43351164,
+      "ssim_score": 0.43351164,
+      "decision": "vectorized",
+      "reason": "Vectorised",
+      "bbox": {
+        "x": 284,
+        "y": 1432,
+        "width": 1943,
+        "height": 81
+      }
+    },
+    {
+      "page": 1,
+      "line_index": 15,
+      "text": "of inquiry. We will encourage you to challenge yourself to reach your full potential through the extensive",
+      "ocr_confidence": 96.65508,
+      "font_matched": "SourceSerif4Display Regular [onum]",
+      "font_confidence": 0.38756344,
+      "ssim_score": null,
+      "decision": "kept_raster",
+      "reason": "No confident font match (best: SourceSerif4Display Regular [onum] at 0.388). Kept as raster.",
+      "bbox": {
+        "x": 284,
+        "y": 1482,
+        "width": 1781,
+        "height": 82
+      }
+    },
+    {
+      "page": 1,
+      "line_index": 16,
+      "text": "opportunities and resources that UC Berkeley provides.",
+      "ocr_confidence": 96.18413,
+      "font_matched": "SourceSerif4Display Regular [c2sc]",
+      "font_confidence": 0.510496,
+      "ssim_score": 0.510496,
+      "decision": "vectorized",
+      "reason": "Vectorised",
+      "bbox": {
+        "x": 284,
+        "y": 1533,
+        "width": 944,
+        "height": 60
+      }
+    },
+    {
+      "page": 1,
+      "line_index": 17,
+      "text": "Our community celebrates you and your unique contributions, and we hope you will join us this fall. Accept your",
+      "ocr_confidence": 96.68037,
+      "font_matched": "NotoSerif CondensedLight [onum]",
+      "font_confidence": 0.38543966,
+      "ssim_score": null,
+      "decision": "kept_raster",
+      "reason": "No confident font match (best: NotoSerif CondensedLight [onum] at 0.385). Kept as raster.",
+      "bbox": {
+        "x": 285,
+        "y": 1653,
+        "width": 1919,
+        "height": 61
+      }
+    },
+    {
+      "page": 1,
+      "line_index": 18,
+      "text": "offer of admission in your MAP@Berkeley portal (apply.berkeley.edu/status) by 11:59 p.m. (Pacific time) on May 1,",
+      "ocr_confidence": 95.32913,
+      "font_matched": "EBGaramond12 Regular [c2sc]",
+      "font_confidence": 0.38652736,
+      "ssim_score": null,
+      "decision": "kept_raster",
+      "reason": "No confident font match (best: EBGaramond12 Regular [c2sc] at 0.387). Kept as raster.",
+      "bbox": {
+        "x": 284,
+        "y": 1683,
+        "width": 1919,
+        "height": 81
+      }
+    },
+    {
+      "page": 1,
+      "line_index": 19,
+      "text": "2026.",
+      "ocr_confidence": 95.85223,
+      "font_matched": "EBGaramond08 Regular [lnum]",
+      "font_confidence": 0.54658693,
+      "ssim_score": 0.54658693,
+      "decision": "vectorized",
+      "reason": "Vectorised",
+      "bbox": {
+        "x": 284,
+        "y": 1756,
+        "width": 89,
+        "height": 28
+      }
+    },
+    {
+      "page": 1,
+      "line_index": 20,
+      "text": "Welcome to UC Berkeley.",
+      "ocr_confidence": 96.52902,
+      "font_matched": "EBGaramond08 Regular [lnum]",
+      "font_confidence": 0.4043172,
+      "ssim_score": 0.4043172,
+      "decision": "vectorized",
+      "reason": "Vectorised",
+      "bbox": {
+        "x": 284,
+        "y": 1855,
+        "width": 437,
+        "height": 41
+      }
+    },
+    {
+      "page": 1,
+      "line_index": 21,
+      "text": "Go Bears!",
+      "ocr_confidence": 96.3077,
+      "font_matched": "EBGaramond08 Regular [lnum]",
+      "font_confidence": 0.50437105,
+      "ssim_score": 0.50437105,
+      "decision": "vectorized",
+      "reason": "Vectorised",
+      "bbox": {
+        "x": 286,
+        "y": 1958,
+        "width": 160,
+        "height": 28
+      }
+    },
+    {
+      "page": 1,
+      "line_index": 22,
+      "text": "Sincerely,",
+      "ocr_confidence": 96.528046,
+      "font_matched": "libre caslon text 400",
+      "font_confidence": 0.44817874,
+      "ssim_score": 0.44817874,
+      "decision": "vectorized",
+      "reason": "Vectorised",
+      "bbox": {
+        "x": 286,
+        "y": 2056,
+        "width": 163,
+        "height": 60
+      }
+    },
+    {
+      "page": 1,
+      "line_index": 23,
+      "text": "John Marfield, Ph. D.",
+      "ocr_confidence": 92.81597,
+      "font_matched": "NotoSans Italic [onum]",
+      "font_confidence": 0.3852387,
+      "ssim_score": null,
+      "decision": "kept_raster",
+      "reason": "No confident font match (best: NotoSans Italic [onum] at 0.385). Kept as raster.",
+      "bbox": {
+        "x": 284,
+        "y": 2256,
+        "width": 374,
+        "height": 57
+      }
+    },
+    {
+      "page": 1,
+      "line_index": 24,
+      "text": "Assistant Vice Chancellor",
+      "ocr_confidence": 96.818146,
+      "font_matched": "NotoSerifDisplay CondensedLight [c2sc]",
+      "font_confidence": 0.34736323,
+      "ssim_score": null,
+      "decision": "kept_raster",
+      "reason": "No confident font match (best: NotoSerifDisplay CondensedLight [c2sc] at 0.347). Kept as raster.",
+      "bbox": {
+        "x": 284,
+        "y": 2287,
+        "width": 436,
+        "height": 50
+      }
+    },
+    {
+      "page": 1,
+      "line_index": 25,
+      "text": "Director of Undergraduate Admissions",
+      "ocr_confidence": 96.545746,
+      "font_matched": "libre bodoni 400",
+      "font_confidence": 0.42045704,
+      "ssim_score": 0.42045704,
+      "decision": "vectorized",
+      "reason": "Vectorised",
+      "bbox": {
+        "x": 286,
+        "y": 2357,
+        "width": 659,
+        "height": 60
+      }
+    },
+    {
+      "page": 1,
+      "line_index": 26,
+      "text": "University of California, Berkeley",
+      "ocr_confidence": 96.55456,
+      "font_matched": "P052 Roman [hist]",
+      "font_confidence": 0.5617895,
+      "ssim_score": 0.56205344,
+      "decision": "vectorized",
+      "reason": "Vectorised",
+      "bbox": {
+        "x": 286,
+        "y": 2387,
+        "width": 568,
+        "height": 80
+      }
+    },
+    {
+      "page": 1,
+      "line_index": 27,
+      "text": "bal",
+      "ocr_confidence": 19.065788,
+      "font_matched": "NotoSans SemiCondensedExtraLightItalic [smcp]",
+      "font_confidence": 0.16857342,
+      "ssim_score": null,
+      "decision": "kept_raster",
+      "reason": "OCR confidence too low (19%)",
+      "bbox": {
+        "x": 285,
+        "y": 2475,
+        "width": 100,
+        "height": 123
+      }
+    },
+    {
+      "page": 1,
+      "line_index": 28,
+      "text": "Olufemi Ogundele, Ed.D.",
+      "ocr_confidence": 93.22994,
+      "font_matched": "libre bodoni 700",
+      "font_confidence": 0.5224145,
+      "ssim_score": 0.5224145,
+      "decision": "vectorized",
+      "reason": "Vectorised",
+      "bbox": {
+        "x": 287,
+        "y": 2701,
+        "width": 459,
+        "height": 61
+      }
+    },
+    {
+      "page": 1,
+      "line_index": 29,
+      "text": "Associate Vice Chancellor of Enrollment and Dean of Admission",
+      "ocr_confidence": 96.551956,
+      "font_matched": "pt serif 400",
+      "font_confidence": 0.7011823,
+      "ssim_score": 0.7011823,
+      "decision": "vectorized",
+      "reason": "Vectorised",
+      "bbox": {
+        "x": 285,
+        "y": 2729,
+        "width": 1097,
+        "height": 70
+      }
+    },
+    {
+      "page": 1,
+      "line_index": 30,
+      "text": "Office of Undergraduate Admissions",
+      "ocr_confidence": 96.558014,
+      "font_matched": "SourceSerif4 Regular [c2sc]",
+      "font_confidence": 0.33980817,
+      "ssim_score": null,
+      "decision": "kept_raster",
+      "reason": "No confident font match (best: SourceSerif4 Regular [c2sc] at 0.340). Kept as raster.",
+      "bbox": {
+        "x": 287,
+        "y": 2777,
+        "width": 620,
+        "height": 80
+      }
+    },
+    {
+      "page": 1,
+      "line_index": 31,
+      "text": "University of California, Berkeley",
+      "ocr_confidence": 96.71654,
+      "font_matched": "SourceSerif4Subhead Regular [c2sc]",
+      "font_confidence": 0.50283945,
+      "ssim_score": 0.50283945,
+      "decision": "vectorized",
+      "reason": "Vectorised",
+      "bbox": {
+        "x": 287,
+        "y": 2825,
+        "width": 567,
+        "height": 61
+      }
+    },
+    {
+      "page": 1,
+      "line_index": 32,
+      "text": "OFFICE OF UNDERGRADUATE ADMISSIONS | 103 SPROUL HALL | BERKELEY, CA 94720 | ADMISSIONS.BERKELEY.EDU",
+      "ocr_confidence": 95.81272,
+      "font_matched": "Inter Medium [c2sc]",
+      "font_confidence": 0.42611998,
+      "ssim_score": 0.42611998,
+      "decision": "vectorized",
+      "reason": "Vectorised",
+      "bbox": {
+        "x": 304,
+        "y": 3090,
+        "width": 1486,
+        "height": 31
+      }
+    }
+  ],
+  "geometry_entries": [
+    {
+      "page": 1,
+      "kind": "line",
+      "bbox": {
+        "x": 527,
+        "y": 2481,
+        "width": 1,
+        "height": 92
+      }
+    },
+    {
+      "page": 1,
+      "kind": "line",
+      "bbox": {
+        "x": 526,
+        "y": 2486,
+        "width": 1,
+        "height": 84
+      }
+    },
+    {
+      "page": 1,
+      "kind": "line",
+      "bbox": {
+        "x": 525,
+        "y": 2492,
+        "width": 1,
+        "height": 75
+      }
+    },
+    {
+      "page": 1,
+      "kind": "line",
+      "bbox": {
+        "x": 473,
+        "y": 2502,
+        "width": 2,
+        "height": 95
+      }
+    }
+  ]
+}

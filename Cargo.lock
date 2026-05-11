@@ -1045,15 +1045,6 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "384b8ab6d37215f3c5301a95a4accb5d64aa607f1fcb26a11b5303878451b4fe"
 
 [[package]]
-name = "ordered-float"
-version = "4.6.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "7bb71e1b3fa6ca1c61f383464aaf2bb0e2f8e772a1f01d486832464de363b951"
-dependencies = [
- "num-traits",
-]
-
-[[package]]
 name = "owned_ttf_parser"
 version = "0.25.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1390,26 +1381,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "scantext"
-version = "0.2.0"
-dependencies = [
- "ab_glyph",
- "clap",
- "env_logger",
- "image",
- "log",
- "lopdf",
- "ordered-float",
- "rayon",
- "rustybuzz",
- "serde",
- "serde_json",
- "tempfile",
- "thiserror",
- "walkdir",
-]
-
-[[package]]
 name = "semver"
 version = "1.0.28"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1648,6 +1619,25 @@ name = "unicode-xid"
 version = "0.2.6"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "ebc1c04c71510c7f702b52b7c350734c9ff1295c464a03335b00bb84fc54f853"
+
+[[package]]
+name = "unscan"
+version = "0.2.0"
+dependencies = [
+ "ab_glyph",
+ "clap",
+ "env_logger",
+ "image",
+ "log",
+ "lopdf",
+ "rayon",
+ "rustybuzz",
+ "serde",
+ "serde_json",
+ "tempfile",
+ "thiserror",
+ "walkdir",
+]
 
 [[package]]
 name = "utf8parse"

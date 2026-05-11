@@ -1,0 +1,101 @@
+<svg version="1.1" id="Layer_2" xmlns="http://www.w3.org/2000/svg" xmlns:xlink="http://www.w3.org/1999/xlink" x="0px" y="0px" width="880px" height="227.38px" viewBox="0 0 880 227.38" enable-background="new 0 0 880 227.38" xml:space="preserve">
+<rect x="162" y="199.32" fill="#323232" stroke="#000000" width="459" height="27.56"/>
+<rect x="194.07" y="171.76" fill="#C6C6C6" stroke="#000000" width="372.37" height="27.56"/>
+<rect x="162" y="129.57" fill="#343434" stroke="#000000" width="459" height="14.06"/>
+<circle fill="#373737" stroke="#000000" cx="619.88" cy="125.63" r="6.75"/>
+<rect x="176.63" y="143.63" fill="#FFFFFF" stroke="#000000" width="408.37" height="4.5"/>
+<rect x="212.63" y="154.32" fill="#989898" stroke="#000000" width="28.12" height="17.44"/>
+<rect x="212.63" y="171.76" fill="#CCCCCC" stroke="#000000" width="28.12" height="27.56"/>
+<rect x="217.13" y="148.13" fill="#616161" stroke="#000000" width="19.13" height="6.19"/>
+<rect x="249.78" y="154.32" fill="#989898" stroke="#000000" width="38.22" height="17.44"/>
+<rect x="249.78" y="171.76" fill="#CCCCCC" stroke="#000000" width="38.22" height="27.56"/>
+<rect x="255.89" y="148.13" fill="#616161" stroke="#000000" width="25.99" height="6.19"/>
+<rect x="287.51" y="154.32" fill="#989898" stroke="#000000" width="28.13" height="17.44"/>
+<rect x="287.51" y="171.76" fill="#CCCCCC" stroke="#000000" width="28.13" height="27.56"/>
+<rect x="292.01" y="148.13" fill="#616161" stroke="#000000" width="19.13" height="6.19"/>
+<rect x="315.64" y="154.32" fill="#989898" stroke="#000000" width="17.93" height="17.44"/>
+<rect x="315.64" y="171.76" fill="#CCCCCC" stroke="#000000" width="17.93" height="27.56"/>
+<rect x="318.5" y="148.13" fill="#616161" stroke="#000000" width="12.19" height="6.19"/>
+<rect x="333.57" y="154.32" fill="#989898" stroke="#000000" width="28.13" height="17.44"/>
+<rect x="333.57" y="171.76" fill="#CCCCCC" stroke="#000000" width="28.13" height="27.56"/>
+<rect x="338.07" y="148.13" fill="#616161" stroke="#000000" width="19.13" height="6.19"/>
+<rect x="361.69" y="154.32" fill="#989898" stroke="#000000" width="19.13" height="17.44"/>
+<rect x="361.69" y="171.76" fill="#CCCCCC" stroke="#000000" width="19.13" height="27.56"/>
+<rect x="364.75" y="148.13" fill="#616161" stroke="#000000" width="13" height="6.19"/>
+<rect x="398.25" y="154.32" fill="#989898" stroke="#000000" width="138.94" height="17.44"/>
+<rect x="398.25" y="171.76" fill="#CCCCCC" stroke="#000000" width="138.94" height="27.56"/>
+<rect x="402.75" y="148.13" fill="#616161" stroke="#000000" width="129.94" height="6.19"/>
+<g>
+	<g>
+		<path fill="none" stroke="#000000" d="M162,135.58c0-49.22,15.53-94.82,41.97-132.15"/>
+		<g>
+			<polygon points="206.45,0 205,6.28 203.82,3.72 201.01,3.47 			"/>
+		</g>
+	</g>
+</g>
+<g>
+	<g>
+		<line fill="none" stroke="#000000" x1="643.5" y1="83.44" x2="478.3" y2="124.61"/>
+		<g>
+			<polygon points="474.19,125.63 479.39,121.82 478.61,124.53 480.57,126.55 			"/>
+		</g>
+	</g>
+</g>
+<g>
+	<g>
+		<line fill="none" stroke="#000000" x1="643.5" y1="121.13" x2="633.66" y2="121.92"/>
+		<g>
+			<polygon points="629.44,122.26 635.2,119.35 633.98,121.89 635.59,124.21 			"/>
+		</g>
+	</g>
+</g>
+<g>
+	<g>
+		<line fill="none" stroke="#000000" x1="643.5" y1="163.04" x2="545.36" y2="163.04"/>
+		<g>
+			<polygon points="541.13,163.04 547.1,160.6 545.68,163.04 547.1,165.48 			"/>
+		</g>
+	</g>
+</g>
+<g>
+	<g>
+		<line fill="none" stroke="#000000" x1="643.5" y1="185.54" x2="574.61" y2="185.54"/>
+		<g>
+			<polygon points="570.38,185.54 576.35,183.1 574.93,185.54 576.35,187.97 			"/>
+		</g>
+	</g>
+</g>
+<g>
+	<g>
+		<line fill="none" stroke="#000000" x1="643.5" y1="213.1" x2="628.61" y2="213.1"/>
+		<g>
+			<polygon points="624.38,213.1 630.35,210.66 628.93,213.1 630.35,215.54 			"/>
+		</g>
+	</g>
+</g>
+<g>
+	<g>
+		<line fill="none" stroke="#000000" x1="60" y1="148.13" x2="169.58" y2="148.13"/>
+		<g>
+			<polygon points="173.82,148.13 167.85,150.57 169.26,148.13 167.85,145.69 			"/>
+		</g>
+	</g>
+</g>
+<g>
+	<g>
+		<line fill="none" stroke="#000000" x1="100.53" y1="179" x2="202.26" y2="163.67"/>
+		<g>
+			<polygon points="206.45,163.04 200.91,166.34 201.95,163.72 200.18,161.52 			"/>
+		</g>
+	</g>
+</g>
+<g font-family="Bitstream Vera Sans, sans-serif" font-size="16">
+<text x="649.002" y="87.4434">platen</text>
+<text x="649.002" y="125.6318">pivot</text>
+<text x="649.002" y="166.3184">block (photo, drawing, etc.)</text>
+<text x="649.002" y="189.3184">frame (forme)</text>
+<text x="649.002" y="217.8184">bed</text>
+<text x="6.501" y="153.2266">paper</text>
+<text x="6.501" y="185.5371">metal type</text>
+</g>
+</svg>

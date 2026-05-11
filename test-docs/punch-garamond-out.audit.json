@@ -1,0 +1,38 @@
+{
+  "input_file": "test-docs/punch-garamond.pdf",
+  "output_file": "test-docs/punch-garamond-out.pdf",
+  "input_size_bytes": 4350,
+  "output_size_bytes": 158102,
+  "compression_ratio": 0.027513883442334696,
+  "pages": [
+    {
+      "page": 1,
+      "width_px": 900,
+      "height_px": 120,
+      "lines_vectorized": 1,
+      "lines_kept_raster": 0,
+      "geometry_elements": 0,
+      "raster_fragments": 1
+    }
+  ],
+  "text_entries": [
+    {
+      "page": 1,
+      "line_index": 0,
+      "text": "punchcutter",
+      "ocr_confidence": 92.07601,
+      "font_matched": "EBGaramond08 Regular [lnum]",
+      "font_confidence": 0.27606657,
+      "ssim_score": 0.27606657,
+      "decision": "vectorized",
+      "reason": "Vectorised",
+      "bbox": {
+        "x": 31,
+        "y": 16,
+        "width": 283,
+        "height": 60
+      }
+    }
+  ],
+  "geometry_entries": []
+}
