@@ -58,7 +58,7 @@ const NORM_H: u32 = 48;
 /// SSIM reranking: keep all coarse candidates within this factor of the best
 /// coarse score, rather than a fixed top-N.  E.g. 1.2 means keep everything
 /// scoring ≥ best_coarse / 1.2.
-const RERANK_SCORE_FACTOR: f32 = 1.2;
+const RERANK_SCORE_FACTOR: f32 = 1.3;
 
 /// Warn when the within-factor pool exceeds this many candidates (suggests
 /// the coarse scores are poorly separated).
@@ -71,7 +71,7 @@ const W_HU: f32 = 0.20;
 const W_FILL: f32 = 0.20;
 
 /// Bbox-level width ratio below this → skip font entirely.
-const WIDTH_RATIO_FLOOR: f32 = 0.60;
+const WIDTH_RATIO_FLOOR: f32 = 0.45;
 
 // ---------------------------------------------------------------------------
 // Public API
@@ -198,11 +198,11 @@ pub fn match_font<'a>(
             continue;
         }
 
-        // ── Pre-filter: bold mismatch ─────────────────────────────
-        // Don't match bold fonts to regular text or vice versa.
-        if entry.is_bold != source_is_bold {
-            continue;
-        }
+        // ── Bold mismatch penalty (was: hard pre-filter) ─────────
+        // Instead of filtering out bold/regular mismatches entirely,
+        // we track it and apply a penalty later. Bold detection via
+        // fill ratio is unreliable for small text and some serif fonts.
+        let bold_mismatch = entry.is_bold != source_is_bold;
         // NOTE: no italic pre-filter — centroid-based slant detection is
         // unreliable (sans uprights overlap with italic serif). Let the
         // pixel scoring + SSIM verification sort it out.
@@ -385,7 +385,8 @@ pub fn match_font<'a>(
             0.0
         };
 
-        let score = width_factor * avg_detail + mono_bonus;
+        let score = width_factor * avg_detail + mono_bonus
+            - if bold_mismatch { 0.10 } else { 0.0 };
 
         // ── Diagnostic logging ───────────────────────────────────────
         let fl = entry.family_name.to_lowercase();
@@ -437,6 +438,13 @@ pub fn match_font<'a>(
         let best_coarse = top_candidates[0].0;
         let score_floor = if best_coarse > 0.0 { best_coarse / RERANK_SCORE_FACTOR } else { 0.0 };
         top_candidates.retain(|&(s, _)| s >= score_floor);
+
+        // Hard cap: even after score-factor filtering, limit SSIM reranking
+        // to the top N candidates to keep runtime bounded.
+        const RERANK_MAX: usize = 20;
+        if top_candidates.len() > RERANK_MAX {
+            top_candidates.truncate(RERANK_MAX);
+        }
 
         if top_candidates.len() > RERANK_WARN_THRESHOLD {
             warn!(
@@ -534,11 +542,21 @@ struct SampleWord {
 }
 
 fn select_sample_words(line: &TextLine) -> Vec<SampleWord> {
+    // First try words with ≥3 alphanumeric characters (higher quality matching)
     let mut candidates: Vec<&crate::ocr::TextRegion> = line
         .words
         .iter()
         .filter(|w| w.text.chars().filter(|c| c.is_alphanumeric()).count() >= 3)
         .collect();
+
+    // Fall back to words with ≥1 alphanumeric character if none qualify
+    if candidates.is_empty() {
+        candidates = line
+            .words
+            .iter()
+            .filter(|w| w.text.chars().any(|c| c.is_alphanumeric()))
+            .collect();
+    }
 
     candidates.sort_by(|a, b| b.text.len().cmp(&a.text.len()));
 

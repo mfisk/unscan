@@ -2,8 +2,8 @@
   "input_file": "test-docs/punch-hires.pdf",
   "output_file": "test-docs/punch-hires-out.pdf",
   "input_size_bytes": 8525,
-  "output_size_bytes": 244936,
-  "compression_ratio": 0.03480501028840187,
+  "output_size_bytes": 244937,
+  "compression_ratio": 0.03480486819059595,
   "pages": [
     {
       "page": 1,
@@ -22,8 +22,8 @@
       "text": "punchcutter",
       "ocr_confidence": 92.01393,
       "font_matched": "EBGaramond12 Regular [lnum]",
-      "font_confidence": 0.18494305,
-      "ssim_score": 0.18494305,
+      "font_confidence": 0.7074476,
+      "ssim_score": 0.7074476,
       "decision": "vectorized",
       "reason": "Vectorised",
       "bbox": {

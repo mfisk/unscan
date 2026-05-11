@@ -265,8 +265,8 @@ echo "── Specimen vectorization test ──"
 echo "  (full specimen must vectorize at least N lines)"
 echo ""
 
-# Specimen: 94 lines total, currently 32 vectorized. Floor at 25 to allow some variance.
-check_vectorized_count "specimen-count" "$TESTDIR/specimen-clean-raster.pdf" 25
+# Specimen: 94 lines total, currently 94 vectorized. Floor at 90 to allow some variance.
+check_vectorized_count "specimen-count" "$TESTDIR/specimen-clean-raster.pdf" 90
 
 echo ""
 echo "════════════════════════════════════"
