@@ -8,3 +8,7 @@
 # Personal documents — never commit
 test-docs/berkeley-acceptance.pdf
 test-docs/berkeley-output*.pdf
+
+# Test artifacts
+*.audit.json
+test-docs/diag-images/
