@@ -162,8 +162,7 @@ pub fn erase_regions(
 // ---------------------------------------------------------------------------
 
 /// Check if a region has visual content (not just uniform background).
-pub fn region_has_content(page_img: &DynamicImage, x: u32, y: u32, w: u32, h: u32) -> bool {
-    let gray = page_img.to_luma8();
+pub fn region_has_content(gray: &image::GrayImage, x: u32, y: u32, w: u32, h: u32) -> bool {
     let (iw, ih) = gray.dimensions();
     let x0 = x.min(iw);
     let y0 = y.min(ih);
