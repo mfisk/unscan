@@ -394,6 +394,7 @@ fn run(args: &cli::Args) -> Result<(), ScanTextError> {
             .collect();
 
         let mut line_matches: Vec<LineMatch> = lines.par_iter().enumerate().map(|(li, line)| {
+            let line_start = std::time::Instant::now();
             let text_color = color::detect_text_color(
                 page_img,
                 &TextRegion {
@@ -460,7 +461,11 @@ fn run(args: &cli::Args) -> Result<(), ScanTextError> {
                 let word_rerank_result: Option<font_match::FontMatchResult> = if ci_results.is_empty() {
                     None
                 } else {
-                    let mut top_names: Vec<String> = ci_results.iter().map(|(n, _)| n.clone()).collect();
+                    // CI results are pre-sorted by score (descending = better match).
+                    // Cap to top 20 to keep word-level SSIM tractable — beyond ~20
+                    // the char-index scores are too close to discriminate anyway.
+                    let ci_cap = 20;
+                    let mut top_names: Vec<String> = ci_results.iter().take(ci_cap).map(|(n, _)| n.clone()).collect();
 
                     // --force-font: inject any font_catalog entries matching the substring
                     if let Some(ref force) = args.force_font {
@@ -536,25 +541,27 @@ fn run(args: &cli::Args) -> Result<(), ScanTextError> {
                 if word_rerank_result.is_some() {
                     word_rerank_result
                 } else {
+                    // Gate font_match to CI candidates only.  Never fall back
+                    // to the full 4,700+ font catalog — ungated coarse scoring
+                    // takes 15-25s per line and wastes minutes on text the char
+                    // index couldn't resolve (attribution lines, watermarks).
                     let ci_keys: std::collections::HashSet<String> = ci_results.into_iter().map(|(name, _score)| name).collect();
-                    let ci_arg = if ci_keys.is_empty() { None } else { Some(&ci_keys) };
-                    let result = font_match::match_font(
-                        &gray_page, line, &font_catalog, &parsed_fonts,
-                        args.min_font_confidence, args.dpi,
-                        ci_arg,
-                    );
-                    // Fallback: if gated match returned None but we had ci_keys, retry ungated
-                    if result.is_none() && ci_arg.is_some() {
+                    if ci_keys.is_empty() {
+                        None
+                    } else {
                         font_match::match_font(
                             &gray_page, line, &font_catalog, &parsed_fonts,
                             args.min_font_confidence, args.dpi,
-                            None,
+                            Some(&ci_keys),
                         )
-                    } else {
-                        result
                     }
                 }
             };
+            let line_elapsed = line_start.elapsed();
+            if line_elapsed.as_millis() > 500 {
+                eprintln!("  LINE {}: {:.1}s '{:.30}…'", li, line_elapsed.as_secs_f32(),
+                    line.words.iter().map(|w| w.text.as_str()).collect::<Vec<_>>().join(" "));
+            }
             LineMatch { font_result, text_color, ci_top_for_audit, word_rerank_winner_name, word_diag_entries }
         }).collect();
 

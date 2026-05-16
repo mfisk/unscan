@@ -88,7 +88,7 @@ pub fn word_level_rerank(
     }
 
     // Filter to usable words
-    let usable_words: Vec<&WordBBox> = words
+    let mut usable_words: Vec<&WordBBox> = words
         .iter()
         .filter(|w| {
             w.text.len() >= MIN_WORD_LEN
@@ -103,6 +103,11 @@ pub fn word_level_rerank(
     if usable_words.is_empty() {
         return (None, Vec::new());
     }
+
+    // Cap to best 4 words — longer words have more signal.  Beyond 4 the
+    // marginal gain is negligible while the render cost is linear.
+    usable_words.sort_by(|a, b| b.text.len().cmp(&a.text.len()));
+    usable_words.truncate(4);
 
     let mut font_votes: HashMap<&str, u32> = HashMap::new();
     let mut total_words = 0u32;

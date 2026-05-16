@@ -13,7 +13,7 @@ Scanned PDF
   → PDF output → subsetted font + positioned words
 ```
 
-## 1. Character Index (Coarse Filter)
+## 1. Character Index (High Recall, Low Precision)
 
 **File:** `src/char_index.rs`
 
@@ -21,13 +21,17 @@ Each installed font (~4000+) is rendered at a reference size for ~70 printable c
 
 At query time, each OCR'd character's crop is feature-extracted and compared against the index via brute-force linear scan (flat `Vec` per character, not a KD-tree — at 59 dims KD-trees provide no pruning benefit). All fonts within `factor²` of the nearest distance are returned as candidates.
 
-**Key design choice:** The char index is a *coarse filter* — it narrows ~4000 fonts to ~50 candidates. It does not need to be precise. Precision comes from word-level SSIM.
+**Role:** The char index is the *recall* stage — it must not miss the true font. It examines individual character shapes without considering letter spacing, word spacing, or kerning. This gives it high recall but low precision: many visually similar fonts pass through. Precision comes from word-level SSIM in the next stage.
+
+**Always returns ≥1:** If the quorum gate drops all candidates, the single font with the lowest average distance is returned as a fallback. Downstream stages always have at least one candidate to work with — there is no "empty CI" path that triggers a full-catalog brute-force fallback.
+
+**Statistical cutoff (σ-based):** After scoring and sorting, candidates are pruned to the best score and any near-ties within `k·σ` of it (currently k=0.5). This adapts to each line's difficulty: when the score distribution is tight (many similar fonts, ambiguous), more candidates survive for word SSIM to sort out; when there's a clear winner (large gap to second place), only 1-2 candidates pass through. On the 6-page specimen this reduces CI output from ~4000 fonts to 1-17 per line, eliminating pathological 15-25s font_match calls while preserving accuracy.
 
 ## 2. Word-Level SSIM Reranking (Precision Filter)
 
 **File:** `src/word_match.rs`
 
-For each candidate font from the char index, every OCR word is:
+For each candidate font from the char index (capped at top 20 by CI score), the best 4 OCR words (longest first, ≥3 chars, confidence ≥50) are:
 1. Cropped from the scan image
 2. Rendered in the candidate font at the width-matched em size
 3. Both images are whitespace-trimmed (all 4 edges) and resized to match
@@ -92,7 +96,7 @@ Source image encoding is preserved where possible — JPEG passthrough avoids re
 ## Design Principles
 
 1. **Fix inputs, not algorithms.** Every SSIM failure traced to bad inputs (illustration contamination, garbage OCR words, wrong crop geometry), not bad math.
-2. **Coarse then precise.** Char index narrows cheaply; word SSIM discriminates accurately.
+2. **High recall → high precision.** The char index is the recall stage — it looks at character shapes (no spacing info) and must never miss the true font, even at the cost of false positives. Word SSIM is the precision stage — it renders full words with natural spacing and compares pixel-level structure. No ungated fallback to the full font catalog; CI always returns ≥1 candidate.
 3. **Natural font metrics.** Don't distort spacing to match OCR bboxes. Place words at OCR positions, let the font's natural advance widths handle letter spacing.
 4. **Smaller outputs.** Font subsetting + blank raster elimination should produce outputs smaller than inputs for text-heavy pages.
 

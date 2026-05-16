@@ -1519,20 +1519,21 @@ pub fn search_candidates(
         quality_gate_pass += 1;
 
         for (font_id, dist_sq) in &hits {
+
             // ε = 1e-10 avoids log(0) for self-matches / identical OT variants
             let log_d = (dist_sq + 1e-10_f32).ln();
             font_log_dists.entry(*font_id).or_default().push((log_d, weight));
         }
     }
 
-
-    // Debug: show how many chars the Bodoni fonts matched
-    for (font_id, dists) in &font_log_dists {
-        if let Some(name) = index.font_names_table.get(*font_id) {
-            if name.to_lowercase().contains("bodoni") {
-            }
-        }
-    }
+    eprintln!(
+        "  CI: {} crops, {} pass gate, {} fail gate, {} no_tree → {} fonts in voting",
+        crop_feats.len(),
+        quality_gate_pass,
+        quality_gate_fail,
+        no_tree,
+        font_log_dists.len(),
+    );
 
     // Aggregate: geometric mean of distances per font.
     //
@@ -1541,6 +1542,9 @@ pub fn search_candidates(
     // for that character slot).  But first we enforce the quorum — fonts
     // appearing in fewer than ceil(n/2) characters are dropped entirely.
     let penalty_log_dist = 0.0_f32; // log(1.0) = 0; i.e. d²=1.0, very far in normalized space
+
+    // Keep a backup for the "at least 1" fallback (quorum may drop everything)
+    let font_log_dists_backup: HashMap<usize, Vec<(f32, f32)>> = font_log_dists.clone();
 
     let mut scores: Vec<(String, f32)> = font_log_dists
         .into_iter()
@@ -1580,7 +1584,50 @@ pub fn search_candidates(
             .unwrap_or(std::cmp::Ordering::Equal)
             .then_with(|| a.0.contains('[').cmp(&b.0.contains('[')))
     });
-    // No truncation — return all fonts that pass the quorum gate.
+
+    // ── Statistical cutoff: keep best + near-ties ────────────────────
+    // CI is the recall stage — high recall, lower precision (no spacing
+    // info).  We keep the top score and anything within k·σ of it.
+    // Tight distributions (ambiguous) keep more candidates; spread-out
+    // distributions (clear winner) keep fewer.
+    if scores.len() >= 2 {
+        let vals: Vec<f32> = scores.iter().map(|(_, s)| *s).collect();
+        let n = vals.len() as f32;
+        let mean = vals.iter().sum::<f32>() / n;
+        let variance = vals.iter().map(|v| (v - mean).powi(2)).sum::<f32>() / n;
+        let sigma = variance.sqrt();
+        let best = vals[0];
+        // k=0.5: keeps candidates within half a stddev of the best.
+        // For a normal distribution this is roughly the top ~30% of the
+        // upper tail — conservative enough to not miss the true font.
+        let cutoff = best - 0.5 * sigma;
+        let before = scores.len();
+        scores.retain(|(_, s)| *s >= cutoff);
+        eprintln!(
+            "  CI sigma cutoff: best={:.3} σ={:.3} cutoff={:.3} → {} of {} kept",
+            best, sigma, cutoff, scores.len(), before,
+        );
+    }
+
+    // Guarantee at least 1 result: if quorum dropped everything, return the
+    // single font with the best (lowest) average distance across whatever
+    // characters it did appear in.
+    if scores.is_empty() && !font_log_dists_backup.is_empty() {
+        if let Some(best) = font_log_dists_backup
+            .into_iter()
+            .filter_map(|(font_id, log_dists)| {
+                let name = index.font_names_table.get(font_id)?.clone();
+                let total_weight: f32 = log_dists.iter().map(|(_, w)| w).sum();
+                let weighted_sum: f32 = log_dists.iter().map(|(ld, w)| ld * w).sum();
+                let mean = weighted_sum / total_weight.max(1e-9);
+                Some((name, -mean))
+            })
+            .max_by(|a, b| a.1.partial_cmp(&b.1).unwrap_or(std::cmp::Ordering::Equal))
+        {
+            scores.push(best);
+        }
+    }
+
     scores
 }
 
