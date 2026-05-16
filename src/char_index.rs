@@ -1502,9 +1502,9 @@ pub fn search_candidates(
     for (c, query_feat) in &crop_feats {
         let weight = char_weight(*c);
 
-        // Find nearest neighbor + everything within (1.5 × thoroughness)× that distance.
+        // Find nearest neighbor + everything within (2.5 × thoroughness)× that distance.
         let hits: Vec<(usize, f32)> = if let Some(points) = index.flat_vecs.get(c) {
-            nearest_within_factor_brute(points, query_feat, 1.5 * thoroughness)
+            nearest_within_factor_brute(points, query_feat, 2.5 * thoroughness)
         } else {
             no_tree += 1;
             continue;
