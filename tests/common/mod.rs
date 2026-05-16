@@ -179,6 +179,7 @@ pub fn run_unscan(input: &Path, extra_args: &[&str]) -> String {
         .arg(input)
         .args(["-o", "/dev/null"])
         .args(extra_args)
+        .env("RUST_LOG", "info")
         .output()
         .unwrap_or_else(|e| panic!("failed to run {:?}: {}", bin, e));
 
@@ -194,6 +195,7 @@ pub fn run_unscan_to(input: &Path, output_path: &Path, extra_args: &[&str]) -> S
         .arg(input)
         .args(["-o", output_path.to_str().unwrap()])
         .args(extra_args)
+        .env("RUST_LOG", "info")
         .output()
         .unwrap_or_else(|e| panic!("failed to run {:?}: {}", bin, e));
 

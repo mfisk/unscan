@@ -1,11 +1,11 @@
 //! Font-timeline specimen accuracy test.
 //!
-//! Runs unscan against the 6-page, 30-section font-timeline-specimen-scanned.pdf
-//! and compares every matched font line against the ground truth in
-//! font-timeline-specimen.json.
+//! Runs unscan against the 6-page, 30-section font-timeline-specimen-rasterized.pdf
+//! (clean raster, no scan skew) and compares every matched font line against the
+//! ground truth in font-timeline-specimen.json.
 //!
 //! This is intentionally a separate test binary because the specimen takes
-//! ~10 min uncached (or ~40s cached). Run with:
+//! ~3 min uncached (or ~40s cached). Run with:
 //!   cargo test --release --test t60_specimen_accuracy
 //!
 //! The ground truth JSON has sections with `font_family` names. Each section
@@ -18,7 +18,7 @@ use common::{test_doc, run_unscan};
 use std::collections::HashMap;
 
 /// Minimum acceptable accuracy (correct / total matched lines).
-const MIN_ACCURACY: f64 = 0.78;
+const MIN_ACCURACY: f64 = 0.88;
 
 /// Parse ground truth: section index → lowercase font family (spaces removed).
 fn load_ground_truth() -> HashMap<usize, String> {
@@ -63,19 +63,42 @@ fn parse_all_font_matches(output: &str) -> Vec<String> {
     matches
 }
 
+/// Known font renames / aliases.  If the matched font contains any alias
+/// value for a ground-truth family, it counts as correct.
+fn font_aliases() -> HashMap<String, Vec<String>> {
+    let mut m: HashMap<String, Vec<String>> = HashMap::new();
+    // Source Sans 3 was formerly Source Sans Pro
+    m.insert("sourcesans3".into(), vec!["sourcesanspro".into()]);
+    m
+}
+
 /// Check if a matched font name corresponds to any ground truth font family.
-/// Returns true if the matched name contains or is contained by any expected family.
+/// Returns true if the matched name contains or is contained by any expected family
+/// (or a known alias).
 fn is_correct(matched: &str, ground_truth: &HashMap<usize, String>) -> bool {
-    ground_truth
-        .values()
-        .any(|expected| matched.contains(expected.as_str()) || expected.contains(matched))
+    let aliases = font_aliases();
+    ground_truth.values().any(|expected| {
+        if matched.contains(expected.as_str()) || expected.contains(matched) {
+            return true;
+        }
+        // Check aliases for this expected family
+        if let Some(alias_list) = aliases.get(expected.as_str()) {
+            if alias_list
+                .iter()
+                .any(|a| matched.contains(a.as_str()) || a.contains(matched))
+            {
+                return true;
+            }
+        }
+        false
+    })
 }
 
 #[test]
 fn specimen_font_accuracy() {
-    let input = test_doc("font-timeline-specimen-scanned.pdf");
+    let input = test_doc("font-timeline-specimen-rasterized.pdf");
     if !input.exists() {
-        eprintln!("SKIP: font-timeline-specimen-scanned.pdf not found");
+        eprintln!("SKIP: font-timeline-specimen-rasterized.pdf not found");
         return;
     }
     let gt_path = test_doc("font-timeline-specimen.json");
@@ -133,9 +156,9 @@ fn specimen_font_accuracy() {
 
 #[test]
 fn specimen_vectorizes_enough_lines() {
-    let input = test_doc("font-timeline-specimen-scanned.pdf");
+    let input = test_doc("font-timeline-specimen-rasterized.pdf");
     if !input.exists() {
-        eprintln!("SKIP: font-timeline-specimen-scanned.pdf not found");
+        eprintln!("SKIP: font-timeline-specimen-rasterized.pdf not found");
         return;
     }
 
