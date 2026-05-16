@@ -164,7 +164,7 @@ fn char_index_identifies_dejavu_sans() {
     eprintln!("\n=== Per-character nearest fonts ===");
     for (c, img) in &unique_crops {
         let single = vec![(*c, img.clone())];
-        let char_results = search_candidates(&index, &single, 3);
+        let char_results = search_candidates(&index, &single, 3.0);
         let top3: Vec<String> = char_results.iter()
             .map(|(n, s)| format!("{} ({:.4})", n, s))
             .collect();
@@ -172,7 +172,7 @@ fn char_index_identifies_dejavu_sans() {
     }
 
     // Overall query — top 5 (using both APIs to verify they agree)
-    let results = search_candidates(&index, &unique_crops, 5);
+    let results = search_candidates(&index, &unique_crops, 5.0);
     let results_legacy = match_line_chars(&unique_crops, &index, 5);
 
     eprintln!("\n=== Overall top {} matches (search_candidates) ===", results.len());

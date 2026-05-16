@@ -35,7 +35,8 @@ pub struct Args {
 
     /// Minimum SSIM score for the verification pass (0.0–1.0).
     /// After rendering vector text, compare with original. Below this → revert to raster.
-    #[arg(long, default_value = "0.12")]
+    /// Disabled by default (0.0) — word-level SSIM in the matching stage handles quality.
+    #[arg(long, default_value = "0.0")]
     pub min_verify_ssim: f32,
 
     /// DPI for PDF page rasterization
@@ -86,6 +87,25 @@ pub struct Args {
     /// for every vectorized line. Output goes to <output_base>-compare/ directory.
     #[arg(long)]
     pub compare: bool,
+
+    /// Generate a full diagnostic HTML report with CI candidates, word-level
+    /// SSIM scores, crop images, and rendered comparisons. Writes to the
+    /// specified directory (creates it if needed).
+    #[arg(long, value_name = "DIR")]
+    pub diagnostic: Option<PathBuf>,
+
+    /// Thoroughness factor for font matching. Default 1.0.
+    /// Higher values relax all CI thresholds (quorum, quality gate, kd-tree
+    /// search radius) so more candidate fonts survive to word-level SSIM.
+    /// Useful for diagnosing why a known font isn't being matched.
+    #[arg(long, default_value_t = 1.0)]
+    pub thoroughness: f32,
+
+    /// Force a font into word-level SSIM reranking for every line, even if CI
+    /// didn't select it. Substring match against font name (case-insensitive).
+    /// Useful with --diagnostic to see how a known-correct font renders.
+    #[arg(long, value_name = "NAME")]
+    pub force_font: Option<String>,
 }
 
 impl Args {

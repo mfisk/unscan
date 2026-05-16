@@ -11,6 +11,8 @@ mod compare;
 mod ocr;
 mod pdf_out;
 mod smooth;
+mod word_match;
+mod diagnostic;
 pub(crate) mod verify;
 
 use crate::audit::{AuditEntry, AuditLog, BBox, Decision, GeometryEntry, PageSummary};
@@ -293,6 +295,15 @@ fn run(args: &cli::Args) -> Result<(), ScanTextError> {
     let input = args.input.as_ref().expect("input validated");
     let output = args.output.as_ref().expect("output validated");
 
+    // ── Diagnostic collector (optional) ──────────────────────────────
+    let diag_collector: Option<std::sync::Mutex<diagnostic::DiagCollector>> = if let Some(ref dir) = args.diagnostic {
+        let mut dc = diagnostic::DiagCollector::new(dir)?;
+        dc.thoroughness = args.thoroughness;
+        Some(std::sync::Mutex::new(dc))
+    } else {
+        None
+    };
+
     let input_size = std::fs::metadata(input).map(|m| m.len()).unwrap_or(0);
     info!(
         "Input: {} ({:.2} MB)",
@@ -336,6 +347,9 @@ fn run(args: &cli::Args) -> Result<(), ScanTextError> {
     let mut stat_raster_frags = 0u32;
 
     for (page_idx, page_img) in pages.iter().enumerate() {
+        if let Some(ref dc) = diag_collector {
+            dc.lock().unwrap().start_page(page_idx + 1);
+        }
         info!(
             "━━━ Page {} ({} × {} px) ━━━",
             page_idx + 1,
@@ -369,6 +383,9 @@ fn run(args: &cli::Args) -> Result<(), ScanTextError> {
         struct LineMatch {
             font_result: Option<font_match::FontMatchResult>,
             text_color: (u8, u8, u8),
+            ci_top_for_audit: Vec<(String, f32)>,
+            word_rerank_winner_name: Option<String>,
+            word_diag_entries: Vec<diagnostic::WordDiag>,
         }
 
         // Pre-parse all catalog fonts once (avoids per-candidate per-line re-parsing)
@@ -376,7 +393,7 @@ fn run(args: &cli::Args) -> Result<(), ScanTextError> {
             .map(|e| ab_glyph::FontRef::try_from_slice(&e.data).ok())
             .collect();
 
-        let mut line_matches: Vec<LineMatch> = lines.par_iter().map(|line| {
+        let mut line_matches: Vec<LineMatch> = lines.par_iter().enumerate().map(|(li, line)| {
             let text_color = color::detect_text_color(
                 page_img,
                 &TextRegion {
@@ -388,6 +405,9 @@ fn run(args: &cli::Args) -> Result<(), ScanTextError> {
                     level: 5, block_num: 0, par_num: 0, line_num: 0, word_num: 0,
                 },
             );
+            let mut ci_top_for_audit: Vec<(String, f32)> = Vec::new();
+            let mut word_rerank_winner_name: Option<String> = None;
+            let mut word_diag_entries: Vec<diagnostic::WordDiag> = Vec::new();
             let font_result = {
                 // Query char index for candidate font keys
                 let word_placements: Vec<crate::verify::WordPlacement> = line.words.iter()
@@ -397,31 +417,167 @@ fn run(args: &cli::Args) -> Result<(), ScanTextError> {
                         y_off: w.y,
                         width: w.width,
                         height: w.height,
+                        confidence: w.confidence,
                     })
                     .collect();
                 let line_height = line.words.iter().map(|w| w.height).max().unwrap_or(0);
                 let char_crops = char_index::extract_line_chars(&gray_page, &word_placements, line_height, &page_char_boxes);
-                let ci_results = char_index::search_candidates(&char_index, &char_crops, 50);
-                let ci_keys: std::collections::HashSet<String> = ci_results.into_iter().map(|(name, _score)| name).collect();
-                let ci_arg = if ci_keys.is_empty() { None } else { Some(&ci_keys) };
-                let result = font_match::match_font(
-                    &gray_page, line, &font_catalog, &parsed_fonts,
-                    args.min_font_confidence, args.dpi,
-                    ci_arg,
-                );
-                // Fallback: if gated match returned None but we had ci_keys, retry ungated
-                if result.is_none() && ci_arg.is_some() {
-                    font_match::match_font(
+
+                // Dump character crops when UNSCAN_DUMP_CROPS is set
+                if std::env::var("UNSCAN_DUMP_CROPS").is_ok() && !char_crops.is_empty() {
+                    let dump_dir = format!("/tmp/unscan-crops/p{}_line_{}", page_idx + 1,
+                        line.text.chars().take(40).collect::<String>()
+                            .replace(|c: char| !c.is_alphanumeric() && c != ' ', "")
+                            .replace(' ', "_"));
+                    let _ = std::fs::create_dir_all(&dump_dir);
+                    for (i, (ch, img)) in char_crops.iter().enumerate() {
+                        let path = format!("{}/crop_{:02}_{}.png", dump_dir, i,
+                            if ch.is_alphanumeric() { format!("{}", ch) }
+                            else { format!("U{:04X}", *ch as u32) });
+                        let _ = img.save(&path);
+                    }
+                }
+
+                let ci_results = char_index::search_candidates(&char_index, &char_crops, args.thoroughness);
+                ci_top_for_audit = ci_results.iter()
+                    .map(|(name, score)| (name.clone(), *score)).collect();
+
+                // --force-font: inject into CI audit list so it shows in diagnostic
+                if let Some(ref force) = args.force_font {
+                    let force_lc = force.to_lowercase();
+                    for fe in &font_catalog {
+                        let key = fe.font_key();
+                        if key.to_lowercase().contains(&force_lc) && !ci_top_for_audit.iter().any(|(n, _)| n == &key) {
+                            ci_top_for_audit.push((key, -999.0)); // sentinel score = forced
+                        }
+                    }
+                }
+
+                // ── Word-level SSIM reranking ────────────────────────
+                // Use the top N char-level candidates and rerank using
+                // full-word SSIM — word bboxes are reliable even when
+                // character bboxes are noisy.
+                let word_rerank_result: Option<font_match::FontMatchResult> = if ci_results.is_empty() {
+                    None
+                } else {
+                    let mut top_names: Vec<String> = ci_results.iter().map(|(n, _)| n.clone()).collect();
+
+                    // --force-font: inject any font_catalog entries matching the substring
+                    if let Some(ref force) = args.force_font {
+                        let force_lc = force.to_lowercase();
+                        for fe in &font_catalog {
+                            let key = fe.font_key();
+                            if key.to_lowercase().contains(&force_lc) && !top_names.iter().any(|n| n == &key) {
+                                top_names.push(key);
+                            }
+                        }
+                    }
+
+                    // Build WordBBox list from this line's words
+                    let wbboxes: Vec<word_match::WordBBox> = line.words.iter().map(|w| {
+                        word_match::WordBBox {
+                            text: w.text.clone(),
+                            x: w.x,
+                            y: w.y,
+                            width: w.width,
+                            height: w.height,
+                            confidence: w.confidence,
+                            line_y: line.y,
+                            line_h: line.height,
+                        }
+                    }).collect();
+
+                    // Find font data for each candidate from font_catalog.
+                    // Every variant is treated as its own candidate — no dedup.
+                    let candidates: Vec<word_match::WordMatchCandidate> = top_names.iter().filter_map(|name| {
+                        font_catalog.iter().find(|fe| {
+                            fe.font_key() == *name
+                        }).map(|fe| word_match::WordMatchCandidate {
+                            name: name.to_string(),
+                            font_data: &fe.data,
+                        })
+                    }).collect();
+
+                    if candidates.len() >= 1 && !wbboxes.is_empty() {
+                        let diag_ctx = word_match::WordRerankDiagCtx {
+                            page: page_idx + 1,
+                            line: li,
+                        };
+                        let diag_arg = diag_collector.as_ref().map(|dc| {
+                            dc.lock().unwrap()
+                        });
+                        // Build the Option<(&DiagCollector, &ctx)> from the guard
+                        let diag_param = diag_arg.as_ref().map(|guard| {
+                            (std::ops::Deref::deref(guard), &diag_ctx)
+                        });
+                        let (winner, wd) = word_match::word_level_rerank(
+                            &gray_page, &wbboxes, &candidates, diag_param,
+                        );
+                        word_diag_entries = wd;
+                        winner.and_then(|winner_name| {
+                                font_catalog.iter().find(|fe| {
+                                    fe.font_key() == winner_name
+                                }).map(|fe| font_match::FontMatchResult {
+                                    font_name: fe.family_name.clone(),
+                                    font_path: fe.path.clone(),
+                                    score: 0.90,
+                                    font_data: fe.data.clone(),
+                                    best_dy: 0,
+                                    ssim_verified: true,
+                                })
+                            })
+                    } else {
+                        None
+                    }
+                };
+
+                // If word-level rerank succeeded, use that; otherwise fall back to font_match
+                word_rerank_winner_name = word_rerank_result.as_ref().map(|r| r.font_name.clone());
+                if word_rerank_result.is_some() {
+                    word_rerank_result
+                } else {
+                    let ci_keys: std::collections::HashSet<String> = ci_results.into_iter().map(|(name, _score)| name).collect();
+                    let ci_arg = if ci_keys.is_empty() { None } else { Some(&ci_keys) };
+                    let result = font_match::match_font(
                         &gray_page, line, &font_catalog, &parsed_fonts,
                         args.min_font_confidence, args.dpi,
-                        None,
-                    )
-                } else {
-                    result
+                        ci_arg,
+                    );
+                    // Fallback: if gated match returned None but we had ci_keys, retry ungated
+                    if result.is_none() && ci_arg.is_some() {
+                        font_match::match_font(
+                            &gray_page, line, &font_catalog, &parsed_fonts,
+                            args.min_font_confidence, args.dpi,
+                            None,
+                        )
+                    } else {
+                        result
+                    }
                 }
             };
-            LineMatch { font_result, text_color }
+            LineMatch { font_result, text_color, ci_top_for_audit, word_rerank_winner_name, word_diag_entries }
         }).collect();
+
+        // ── Populate diagnostic from line_matches ───────────────────
+        if let Some(ref dc) = diag_collector {
+            let mut dc = dc.lock().unwrap();
+            for (li, (line, lm)) in lines.iter().zip(line_matches.iter()).enumerate() {
+                let ci_cands: Vec<diagnostic::CiCandidate> = lm.ci_top_for_audit.iter()
+                    .map(|(k, s)| diagnostic::CiCandidate { font_key: k.clone(), score: *s })
+                    .collect();
+                dc.current_page_mut().lines.push(diagnostic::LineDiag {
+                    line_index: li,
+                    text: line.text.clone(),
+                    ocr_confidence: line.confidence,
+                    bbox: [line.x, line.y, line.width, line.height],
+                    ci_candidates: ci_cands,
+                    words: std::mem::take(&mut lm.word_diag_entries.clone()),
+                    word_rerank_winner: lm.word_rerank_winner_name.clone(),
+                    final_font: lm.font_result.as_ref().map(|f| f.font_name.clone()),
+                    final_score: lm.font_result.as_ref().map(|f| f.score),
+                });
+            }
+        }
 
         // ── Pass 1.5: Paragraph-level font grouping ─────────────────
         // Find the dominant body font: most common font among matched lines
@@ -561,41 +717,11 @@ fn run(args: &cli::Args) -> Result<(), ScanTextError> {
             };
 
             // ── SSIM verification (if vectorising) ───────────────────
-            let mut ssim_score: Option<f32> = None;
-            if !keep_raster && !args.no_verify {
-                if let Some(ref fm) = font_result {
-                    if fm.ssim_verified {
-                        // Score already comes from SSIM rerank — skip redundant verify
-                        ssim_score = Some(fm.score);
-                        if fm.score < args.min_verify_ssim {
-                            keep_raster = true;
-                            reason = format!(
-                                "SSIM verification failed ({:.3} < {:.2}). Reverted to raster.",
-                                fm.score, args.min_verify_ssim
-                            );
-                        }
-                    } else {
-                        let (score, _dy) = verify::verify_text_region(
-                            &gray_page,
-                            &fm.font_data,
-                            &line.text,
-                            line.x,
-                            line.y,
-                            line.width,
-                            line.height,
-                            &line.words,
-                        );
-                        ssim_score = Some(score);
-                        if score < args.min_verify_ssim {
-                            keep_raster = true;
-                            reason = format!(
-                                "SSIM verification failed ({score:.3} < {:.2}). Reverted to raster.",
-                                args.min_verify_ssim
-                            );
-                        }
-                    }
-                }
-            }
+            let ssim_score: Option<f32> = if let Some(ref fm) = font_result {
+                Some(fm.score)
+            } else {
+                None
+            };
 
             // ── Logging ──────────────────────────────────────────────
             if keep_raster {
@@ -642,6 +768,8 @@ fn run(args: &cli::Args) -> Result<(), ScanTextError> {
                     width: line.width,
                     height: line.height,
                 },
+                ci_top: if lm.ci_top_for_audit.is_empty() { None } else { Some(lm.ci_top_for_audit.clone()) },
+                word_rerank_winner: lm.word_rerank_winner_name.clone(),
             });
 
             placed_texts.push(pdf_out::PlacedText {
@@ -899,6 +1027,14 @@ fn run(args: &cli::Args) -> Result<(), ScanTextError> {
     info!("  Ratio:       {:.1}× smaller", ratio);
     info!("━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━");
     info!("Output: {}", output.display());
+
+    // ── 6. Write diagnostic report ──────────────────────────────────
+    if let Some(dc) = diag_collector {
+        let dc = dc.into_inner().unwrap();
+        if let Err(e) = dc.finish() {
+            warn!("Failed to write diagnostic report: {}", e);
+        }
+    }
 
     Ok(())
 }

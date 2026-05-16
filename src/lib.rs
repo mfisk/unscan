@@ -12,3 +12,5 @@ pub mod font_scan;
 pub mod font_match;
 pub mod pdf_out;
 pub mod smooth;
+pub mod word_match;
+pub mod diagnostic;
