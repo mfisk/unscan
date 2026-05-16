@@ -242,205 +242,42 @@ impl CharFeatures {
 }
 
 // ---------------------------------------------------------------------------
-// K-d tree implementation
+// Brute-force nearest-neighbor search
 // ---------------------------------------------------------------------------
+// At 59 dimensions the KD-tree degrades to near-linear scan anyway (the
+// single-axis pruning test checks 1/59th of total distance — far branch is
+// almost always explored). A flat vector with linear scan is simpler, faster
+// (cache-friendly + LLVM auto-vectorizes the distance loop), and trivially
+// correct.
 
-/// A point in the k-d tree: weighted feature vector + font index.
-#[derive(Debug, Clone)]
-pub(crate) struct KdPoint {
-    coords: [f32; FEAT_LEN],
-    font_id: usize,
-}
-
-/// A node in the k-d tree.
-#[derive(Debug)]
-enum KdNode {
-    Leaf {
-        points: Vec<KdPoint>,
-    },
-    Split {
-        axis: usize,
-        median: f32,
-        left: Box<KdNode>,
-        right: Box<KdNode>,
-    },
-}
-
-/// K-d tree for spatial nearest-neighbor queries in FEAT_LEN dimensions.
-#[derive(Debug)]
-pub struct KdTree {
-    root: Option<KdNode>,
-    size: usize,
-}
-
-/// Maximum points in a leaf node before splitting.
-const KD_LEAF_SIZE: usize = 16;
-
-impl KdTree {
-    /// Build a k-d tree from a set of points.
-    pub(crate) fn build(points: Vec<KdPoint>) -> Self {
-        let size = points.len();
-        if points.is_empty() {
-            return KdTree { root: None, size: 0 };
-        }
-        let root = Self::build_recursive(points, 0);
-        KdTree { root: Some(root), size }
+/// Find the nearest neighbor, then return ALL points within `factor`× that
+/// distance. Returns `(font_id, squared_distance)` pairs sorted by distance.
+fn nearest_within_factor_brute(
+    points: &[(usize, [f32; FEAT_LEN])],
+    query: &[f32; FEAT_LEN],
+    factor: f32,
+) -> Vec<(usize, f32)> {
+    if points.is_empty() {
+        return Vec::new();
     }
-
-    fn build_recursive(mut points: Vec<KdPoint>, depth: usize) -> KdNode {
-        if points.len() <= KD_LEAF_SIZE {
-            return KdNode::Leaf { points };
-        }
-
-        // Pick the axis with the widest spread
-        let axis = Self::best_axis(&points);
-
-        // Sort by axis and split at median
-        points.sort_by(|a, b| {
-            a.coords[axis].partial_cmp(&b.coords[axis]).unwrap_or(std::cmp::Ordering::Equal)
-        });
-        let mid = points.len() / 2;
-        let median = points[mid].coords[axis];
-
-        let right_points = points.split_off(mid);
-        let left_points = points;
-
-        KdNode::Split {
-            axis,
-            median,
-            left: Box::new(Self::build_recursive(left_points, depth + 1)),
-            right: Box::new(Self::build_recursive(right_points, depth + 1)),
+    // Single pass: find min squared distance
+    let mut best_dist_sq = f32::MAX;
+    for (_, coords) in points {
+        let d = squared_distance(coords, query);
+        if d < best_dist_sq {
+            best_dist_sq = d;
         }
     }
-
-    /// Find the axis with the widest spread (max - min).
-    fn best_axis(points: &[KdPoint]) -> usize {
-        let mut best = 0;
-        let mut best_spread = 0.0f32;
-        for d in 0..FEAT_LEN {
-            let mut lo = f32::MAX;
-            let mut hi = f32::MIN;
-            for p in points {
-                lo = lo.min(p.coords[d]);
-                hi = hi.max(p.coords[d]);
-            }
-            let spread = hi - lo;
-            if spread > best_spread {
-                best_spread = spread;
-                best = d;
-            }
-        }
-        best
-    }
-
-
-    /// Find the k nearest neighbors of `query`.
-    /// Returns (font_id, squared_distance) pairs sorted by distance.
-    pub fn knn(&self, query: &[f32; FEAT_LEN], k: usize) -> Vec<(usize, f32)> {
-        let mut best: Vec<(usize, f32)> = Vec::with_capacity(k + 1);
-        let mut worst_dist_sq = f32::MAX;
-        if let Some(ref root) = self.root {
-            Self::knn_recursive(root, query, k, &mut best, &mut worst_dist_sq);
-        }
-        best.sort_by(|a, b| a.1.partial_cmp(&b.1).unwrap_or(std::cmp::Ordering::Equal));
-        best.truncate(k);
-        best
-    }
-
-    fn knn_recursive(
-        node: &KdNode,
-        query: &[f32; FEAT_LEN],
-        k: usize,
-        best: &mut Vec<(usize, f32)>,
-        worst_dist_sq: &mut f32,
-    ) {
-        match node {
-            KdNode::Leaf { points } => {
-                for p in points {
-                    let d_sq = squared_distance(&p.coords, query);
-                    if best.len() < k || d_sq < *worst_dist_sq {
-                        best.push((p.font_id, d_sq));
-                        best.sort_by(|a, b| a.1.partial_cmp(&b.1).unwrap_or(std::cmp::Ordering::Equal));
-                        if best.len() > k {
-                            best.truncate(k);
-                        }
-                        if best.len() == k {
-                            *worst_dist_sq = best.last().unwrap().1;
-                        }
-                    }
-                }
-            }
-            KdNode::Split { axis, median, left, right } => {
-                let diff = query[*axis] - median;
-                let (near, far) = if diff <= 0.0 {
-                    (left.as_ref(), right.as_ref())
-                } else {
-                    (right.as_ref(), left.as_ref())
-                };
-
-                Self::knn_recursive(near, query, k, best, worst_dist_sq);
-
-                if diff * diff <= *worst_dist_sq || best.len() < k {
-                    Self::knn_recursive(far, query, k, best, worst_dist_sq);
-                }
-            }
-        }
-    }
-
-    /// Find the nearest neighbor, then return ALL points within `factor`× that distance.
-    /// Returns (font_id, squared_distance) pairs sorted by distance.
-    /// Two-phase approach: Phase 1 finds the single NN via knn(1). Phase 2
-    /// does a range search with cutoff = factor² × d²_best.
-    pub fn nearest_within_factor(&self, query: &[f32; FEAT_LEN], factor: f32) -> Vec<(usize, f32)> {
-        // Phase 1: find the nearest neighbor
-        let nn = self.knn(query, 1);
-        if nn.is_empty() {
-            return Vec::new();
-        }
-        let best_dist_sq = nn[0].1.max(1e-12); // guard against perfect-zero distance
-        let cutoff_sq = factor * factor * best_dist_sq;
-
-        // Phase 2: range search — collect everything within cutoff
-        let mut results: Vec<(usize, f32)> = Vec::new();
-        if let Some(ref root) = self.root {
-            Self::range_recursive(root, query, cutoff_sq, &mut results);
-        }
-        results.sort_by(|a, b| a.1.partial_cmp(&b.1).unwrap_or(std::cmp::Ordering::Equal));
-        results
-    }
-
-    fn range_recursive(
-        node: &KdNode,
-        query: &[f32; FEAT_LEN],
-        cutoff_sq: f32,
-        results: &mut Vec<(usize, f32)>,
-    ) {
-        match node {
-            KdNode::Leaf { points } => {
-                for p in points {
-                    let d_sq = squared_distance(&p.coords, query);
-                    if d_sq <= cutoff_sq {
-                        results.push((p.font_id, d_sq));
-                    }
-                }
-            }
-            KdNode::Split { axis, median, left, right } => {
-                let diff = query[*axis] - median;
-                let (near, far) = if diff <= 0.0 {
-                    (left.as_ref(), right.as_ref())
-                } else {
-                    (right.as_ref(), left.as_ref())
-                };
-
-                Self::range_recursive(near, query, cutoff_sq, results);
-
-                // Only explore far branch if the splitting plane is within cutoff
-                if diff * diff <= cutoff_sq {
-                    Self::range_recursive(far, query, cutoff_sq, results);
-                }
-            }
-        }
-    }
+    let cutoff = factor * factor * best_dist_sq.max(1e-12);
+    // Second pass: collect everything within cutoff
+    let mut results: Vec<(usize, f32)> = points.iter()
+        .filter_map(|(id, coords)| {
+            let d = squared_distance(coords, query);
+            if d <= cutoff { Some((*id, d)) } else { None }
+        })
+        .collect();
+    results.sort_by(|a, b| a.1.partial_cmp(&b.1).unwrap_or(std::cmp::Ordering::Equal));
+    results
 }
 
 /// Squared Euclidean distance between two feature vectors.
@@ -1022,7 +859,7 @@ pub struct FontCharEntry {
 }
 
 /// The full index: for each indexed character, a list of (font, features)
-/// plus a k-d tree for spatial lookup.
+/// plus flat per-character vectors for brute-force spatial lookup.
 #[derive(Debug)]
 pub struct CharIndex {
     /// char → Vec<(font_name, features)> — raw entries for serialization + merge
@@ -1031,30 +868,29 @@ pub struct CharIndex {
     pub skipped_fonts: std::collections::HashSet<String>,
     /// Ordered font name table: font_id → font_name
     font_names_table: Vec<String>,
-    /// Per-character k-d trees (built from weighted feature vectors)
-    kd_trees: HashMap<char, KdTree>,
+    /// Per-character flat vectors: (font_id, weighted_features) for brute-force search
+    flat_vecs: HashMap<char, Vec<(usize, [f32; FEAT_LEN])>>,
     /// Per-character per-dimension standard deviations (for diagnostics)
     dim_sigmas: HashMap<char, [f32; FEAT_LEN]>,
 }
 
 impl Clone for CharIndex {
     fn clone(&self) -> Self {
-        // Rebuild trees from entries on clone
         let mut idx = CharIndex {
             entries: self.entries.clone(),
             skipped_fonts: self.skipped_fonts.clone(),
             font_names_table: Vec::new(),
-            kd_trees: HashMap::new(),
+            flat_vecs: HashMap::new(),
             dim_sigmas: HashMap::new(),
         };
-        idx.rebuild_trees();
+        idx.rebuild_vecs();
         idx
     }
 }
 
 impl CharIndex {
-    /// Build the k-d trees and compute per-dimension σ from entries.
-    pub fn rebuild_trees(&mut self) {
+    /// Build flat per-character vectors and compute per-dimension σ from entries.
+    pub fn rebuild_vecs(&mut self) {
         // Build font name → id mapping
         let mut name_set: std::collections::HashSet<String> = std::collections::HashSet::new();
         for entries in self.entries.values() {
@@ -1070,7 +906,7 @@ impl CharIndex {
             .map(|(i, n)| (n.as_str(), i))
             .collect();
 
-        self.kd_trees.clear();
+        self.flat_vecs.clear();
         self.dim_sigmas.clear();
 
         for (c, char_entries) in &self.entries {
@@ -1078,14 +914,14 @@ impl CharIndex {
                 continue;
             }
 
-            // Build weighted feature vectors and k-d points
-            let mut points: Vec<KdPoint> = Vec::with_capacity(char_entries.len());
+            // Build flat vec of (font_id, weighted_features)
+            let mut points: Vec<(usize, [f32; FEAT_LEN])> = Vec::with_capacity(char_entries.len());
             let mut all_weighted: Vec<[f32; FEAT_LEN]> = Vec::with_capacity(char_entries.len());
 
             for e in char_entries {
                 let weighted = e.features.as_weighted_slice();
                 if let Some(&font_id) = name_to_id.get(e.font_name.as_str()) {
-                    points.push(KdPoint { coords: weighted, font_id });
+                    points.push((font_id, weighted));
                     all_weighted.push(weighted);
                 }
             }
@@ -1118,10 +954,7 @@ impl CharIndex {
             }
 
             self.dim_sigmas.insert(*c, sigmas);
-
-            // Build k-d tree
-            let tree = KdTree::build(points);
-            self.kd_trees.insert(*c, tree);
+            self.flat_vecs.insert(*c, points);
         }
     }
 }
@@ -1191,10 +1024,10 @@ pub fn build_char_index(font_paths: &[(String, Vec<u8>)]) -> CharIndex {
         entries,
         skipped_fonts,
         font_names_table: Vec::new(),
-        kd_trees: HashMap::new(),
+        flat_vecs: HashMap::new(),
         dim_sigmas: HashMap::new(),
     };
-    index.rebuild_trees();
+    index.rebuild_vecs();
     index
 }
 
@@ -1362,25 +1195,43 @@ fn extract_line_chars_from_charboxes(
     let line_x_min = words.iter().map(|w| w.x_off).min().unwrap_or(0);
     let line_x_max = words.iter().map(|w| w.x_off + w.width).max().unwrap_or(0);
 
-    // Expand vertical search range slightly for makebox alignment tolerance
-    let v_margin = line_height / 2;
-    let search_y_min = line_y_min.saturating_sub(v_margin);
-    let search_y_max = (line_y_max + v_margin).min(ph);
-
-    // Filter char boxes that fall within this line's region
+    // Match char boxes against individual word bounding boxes rather than the
+    // whole line bbox. This prevents cross-line contamination where chars from
+    // adjacent lines (e.g. "Font:" reference line) leak into body text lines.
+    // A charbox must have its center within a word bbox (with small vertical tolerance).
+    let v_tol = line_height / 4;  // small vertical tolerance for alignment jitter
     let line_chars: Vec<&CharBox> = page_char_boxes
         .iter()
         .filter(|cb| {
+            if cb.width < 2 || cb.height < 2 {
+                return false;
+            }
+            // Match charbox center to word bounding boxes.
+            // With HOCR, charboxes are structurally nested in words so
+            // image-area contamination is already eliminated.
             let cb_cx = cb.x + cb.width / 2;
             let cb_cy = cb.y + cb.height / 2;
-            cb_cx >= line_x_min && cb_cx <= line_x_max
-                && cb_cy >= search_y_min && cb_cy <= search_y_max
-                && cb.width >= 2 && cb.height >= 2
+            words.iter().any(|w| {
+                if w.confidence < 10.0 {
+                    return false;
+                }
+                let w_top = w.y_off.saturating_sub(v_tol);
+                let w_bot = w.y_off + w.height.max(line_height) + v_tol;
+                let w_left = w.x_off;
+                let w_right = w.x_off + w.width;
+                cb_cx >= w_left && cb_cx <= w_right
+                    && cb_cy >= w_top && cb_cy <= w_bot
+            })
         })
         .collect();
 
     for cb in &line_chars {
         let c = cb.ch;
+        // Filter on per-character OCR confidence (from HOCR x_conf).
+        // Low-confidence chars are likely image fragments or misdetections.
+        if cb.confidence < 75.0 {
+            continue;
+        }
         if !is_indexed(c) {
             continue;
         }
@@ -1413,6 +1264,33 @@ fn extract_line_chars_from_charboxes(
             NORM_H,
             image::imageops::FilterType::Lanczos3,
         );
+
+        // Crop quality gate: reject image fragments and non-text crops.
+        // Real text characters have near-black ink (min ≈ 0) on near-white
+        // background (max ≈ 255) with high pixel variance (std > 80).
+        // Image fragments lack this contrast — their min pixel is well
+        // above 0, their max is well below 255, or they have low variance.
+        {
+            let mut pmin = 255u8;
+            let mut pmax = 0u8;
+            let n = scaled.pixels().len() as f64;
+            let mut sum = 0f64;
+            let mut sum_sq = 0f64;
+            for p in scaled.pixels() {
+                let v = p.0[0];
+                if v < pmin { pmin = v; }
+                if v > pmax { pmax = v; }
+                let vf = v as f64;
+                sum += vf;
+                sum_sq += vf * vf;
+            }
+            let variance = (sum_sq / n) - (sum / n).powi(2);
+            let std_dev = variance.max(0.0).sqrt();
+            // Reject if no real ink, no real background, or too little contrast
+            if pmin > 20 || pmax < 235 || std_dev < 75.0 {
+                continue;
+            }
+        }
 
         results.push((c, scaled));
         *char_counts.entry(c).or_insert(0) += 1;
@@ -1590,7 +1468,7 @@ pub struct CharSearchResult {
 pub fn search_candidates(
     index: &CharIndex,
     char_crops: &[(char, GrayImage)],
-    top_n: usize,
+    thoroughness: f32,
 ) -> Vec<(String, f32)> {
     if char_crops.is_empty() {
         return Vec::new();
@@ -1610,33 +1488,49 @@ pub fn search_candidates(
 
     let n_chars = crop_feats.len();
     // Quorum: font must appear in at least half the character neighborhoods.
-    let quorum = (n_chars + 1) / 2; // ceil(n/2)
+    let quorum = ((n_chars + 1) / 2).max(1) as f32 / thoroughness;
+    let quorum = (quorum.ceil() as usize).max(1);
+
 
     // For each character, find nearby fonts and record their distances.
     // font_id → Vec<(log_dist, weight)>
     let mut font_log_dists: HashMap<usize, Vec<(f32, f32)>> = HashMap::new();
+    let mut quality_gate_pass = 0usize;
+    let mut quality_gate_fail = 0usize;
+    let mut no_tree = 0usize;
 
     for (c, query_feat) in &crop_feats {
         let weight = char_weight(*c);
 
-        // Find nearest neighbor + everything within 1.5× that distance.
-        let hits: Vec<(usize, f32)> = if let Some(tree) = index.kd_trees.get(c) {
-            tree.nearest_within_factor(query_feat, 1.5)
+        // Find nearest neighbor + everything within (1.5 × thoroughness)× that distance.
+        let hits: Vec<(usize, f32)> = if let Some(points) = index.flat_vecs.get(c) {
+            nearest_within_factor_brute(points, query_feat, 1.5 * thoroughness)
         } else {
+            no_tree += 1;
             continue;
         };
 
-        // Quality gate: if nearest neighbor is too far, this crop is noise.
-        // Skip it — it matches nothing well and will only pollute the vote.
+        // Quality gate: scaled by thoroughness (default 0.5, higher = more permissive)
         let min_dist_sq = hits.iter().map(|(_, d)| *d).fold(f32::INFINITY, f32::min);
-        if min_dist_sq > 0.5 {
+        if min_dist_sq > 0.5 * thoroughness {
+            quality_gate_fail += 1;
             continue;
         }
+        quality_gate_pass += 1;
 
         for (font_id, dist_sq) in &hits {
             // ε = 1e-10 avoids log(0) for self-matches / identical OT variants
             let log_d = (dist_sq + 1e-10_f32).ln();
             font_log_dists.entry(*font_id).or_default().push((log_d, weight));
+        }
+    }
+
+
+    // Debug: show how many chars the Bodoni fonts matched
+    for (font_id, dists) in &font_log_dists {
+        if let Some(name) = index.font_names_table.get(*font_id) {
+            if name.to_lowercase().contains("bodoni") {
+            }
         }
     }
 
@@ -1686,7 +1580,7 @@ pub fn search_candidates(
             .unwrap_or(std::cmp::Ordering::Equal)
             .then_with(|| a.0.contains('[').cmp(&b.0.contains('[')))
     });
-    scores.truncate(top_n);
+    // No truncation — return all fonts that pass the quorum gate.
     scores
 }
 
@@ -1700,10 +1594,10 @@ pub fn search_single_char(
     let feats = compute_features(crop)?;
     let query = feats.as_weighted_slice();
 
-    let tree = index.kd_trees.get(&ch)?;
+    let points = index.flat_vecs.get(&ch)?;
 
     // Find nearest neighbor + everything within 2× that distance
-    let hits = tree.nearest_within_factor(&query, 2.0);
+    let hits = nearest_within_factor_brute(points, &query, 2.0);
     let n_within_radius = hits.len();
 
     // Score with cosine similarity
@@ -1736,9 +1630,9 @@ pub fn search_single_char(
 pub fn match_line_chars(
     crops: &[(char, GrayImage)],
     index: &CharIndex,
-    top_n: usize,
+    _top_n: usize,
 ) -> Vec<(String, f32)> {
-    search_candidates(index, crops, top_n)
+    search_candidates(index, crops, 1.0)
 }
 
 /// Cosine similarity between two feature vectors.
@@ -1979,11 +1873,11 @@ pub fn load_index(path: &Path) -> io::Result<CharIndex> {
         entries,
         skipped_fonts,
         font_names_table: Vec::new(),
-        kd_trees: HashMap::new(),
+        flat_vecs: HashMap::new(),
         dim_sigmas,
     };
-    // Rebuild trees from loaded entries (and use loaded sigmas)
-    index.rebuild_trees();
+    // Build flat vecs from loaded entries
+    index.rebuild_vecs();
     Ok(index)
 }
 
@@ -2051,8 +1945,8 @@ impl CharIndex {
             }
         }
         self.skipped_fonts.extend(other.skipped_fonts);
-        // Rebuild trees after merge
-        self.rebuild_trees();
+        // Rebuild vecs after merge
+        self.rebuild_vecs();
     }
 
     /// Remove all entries for the given font names.
@@ -2061,8 +1955,8 @@ impl CharIndex {
             entries.retain(|e| !names.contains(&e.font_name));
         }
         self.skipped_fonts.retain(|n| !names.contains(n));
-        // Rebuild trees after removal
-        self.rebuild_trees();
+        // Rebuild vecs after removal
+        self.rebuild_vecs();
     }
 
     /// Get the per-dimension σ values for a given character (for diagnostics).
@@ -2075,8 +1969,8 @@ impl CharIndex {
         self.font_names_table.get(id).map(|s| s.as_str())
     }
 
-    /// Number of fonts in the k-d tree for a given character.
+    /// Number of fonts indexed for a given character.
     pub fn tree_size(&self, c: char) -> usize {
-        self.kd_trees.get(&c).map(|t| t.size).unwrap_or(0)
+        self.flat_vecs.get(&c).map(|v| v.len()).unwrap_or(0)
     }
 }

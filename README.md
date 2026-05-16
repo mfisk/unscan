@@ -323,6 +323,49 @@ The `test-docs/` directory contains a comprehensive ground-truth corpus for
 validating font detection accuracy. See [`test-docs/README.md`](test-docs/README.md)
 for full documentation.
 
+### Test font prerequisites
+
+The test suite requires **Microsoft core TTF fonts** and the **specimen fonts**
+(Google Fonts / OFL) to be installed. These are hard prerequisites — without
+them, the ground truth sections for Times New Roman, Arial, Courier New,
+Georgia, Verdana, Trebuchet MS, and Comic Sans MS cannot be scored.
+
+```bash
+# Check whether required fonts are installed
+./scripts/check-fonts.sh
+
+# Install missing fonts automatically (requires sudo)
+./scripts/check-fonts.sh --install
+```
+
+**MS Core Fonts** (required for ground truth sections 7, 9, 11–15):
+
+```bash
+sudo apt install ttf-mscorefonts-installer
+```
+
+This installs Arial, Times New Roman, Courier New, Georgia, Verdana,
+Trebuchet MS, Comic Sans MS, and others into
+`/usr/share/fonts/truetype/msttcorefonts/`.
+
+**Specimen fonts** (required for ground truth sections 0–6, 16–29):
+
+```bash
+# Downloaded automatically by gen-specimen.py on first run
+cd test-docs && python3 gen-specimen.py
+```
+
+These install into `/usr/share/fonts/truetype/specimen-fonts/`.
+
+### Test cases
+
+| Test | Input | Ground truth | What it tests |
+|------|-------|-------------|---------------|
+| **Font timeline specimen** | `font-timeline-specimen-scanned.pdf` | `font-timeline-specimen.json` | 30 fonts across 500 years — the full ground truth |
+| **Bodoni sentence** | `bodoni-sentence-raster.pdf` | `bodoni-sentence.json` | Single-font smoke test (Libre Bodoni 400, one sentence) |
+| **Bodoni only** | `bodoni-only.pdf` | — | Multi-style Bodoni (regular/bold/italic) |
+| **Mixed-font specimen** | `mixed-font-specimen-raster.pdf` | `mixed-font-ground-truth.json` | Intra-line font switching (sans/serif/mono/bold/italic) |
+
 ### Quick start
 
 ```bash
@@ -346,7 +389,8 @@ cargo run --release -- test-docs/resolution-series/specimen-300dpi.pdf \
 
 | Tier | Source | What it tests |
 |------|--------|---------------|
-| **Clean specimen** | `font-timeline-specimen.pdf` | 28 fonts, 500 years, OT variants — the vector ground truth |
+| **Clean specimen** | `font-timeline-specimen.pdf` | 30 fonts, 500 years, OT variants — the vector ground truth |
+| **Bodoni sentence** | `bodoni-sentence-raster.pdf` | Single-font smoke test — must match Libre Bodoni 400 |
 | **Resolution series** | `resolution-series/specimen-*.pdf` | Same content at 600→fax dpi — measures degradation tolerance |
 | **Historical scans** | `historical/*.pdf` | Real documents from archives — Baskerville's 1757 Virgil, CIA memos, NASA standards |
 | **Existing test docs** | `berkeley-acceptance.pdf`, `irs-w4.pdf` | Real-world documents with known fonts |

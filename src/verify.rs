@@ -18,6 +18,7 @@ pub struct WordPlacement {
     pub y_off: u32,
     pub width: u32,
     pub height: u32,
+    pub confidence: f32,
 }
 
 /// Verify a vectorised text region by:
@@ -55,6 +56,7 @@ pub fn verify_text_region(
             y_off: wr.y.saturating_sub(y),
             width: wr.width,
             height: wr.height,
+            confidence: wr.confidence,
         })
         .collect();
 

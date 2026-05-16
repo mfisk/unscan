@@ -17,6 +17,10 @@ pub struct AuditEntry {
     pub decision: Decision,
     pub reason: String,
     pub bbox: BBox,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub ci_top: Option<Vec<(String, f32)>>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub word_rerank_winner: Option<String>,
 }
 
 #[derive(Debug, Serialize, Clone)]

@@ -12,7 +12,7 @@ use crate::geometry::{DetectedFill, DetectedLine};
 use lopdf::content::{Content, Operation};
 use lopdf::{dictionary, Document, Object, Stream};
 use log::debug;
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 
 // ---------------------------------------------------------------------------
@@ -180,24 +180,39 @@ pub fn generate_pdf(output_path: &Path, pages: &[PageContent], overlay: bool) ->
     let mut doc = Document::with_version("1.7");
     let pages_id = doc.new_object_id();
 
-    // Dedup embedded fonts by path.
-    let mut font_map: HashMap<PathBuf, (lopdf::ObjectId, String)> = HashMap::new();
-    let mut font_counter = 0u32;
-
+    // ── Collect unique chars per font path ───────────────────────────
+    let mut font_chars: HashMap<PathBuf, HashSet<char>> = HashMap::new();
+    let mut font_data_map: HashMap<PathBuf, Vec<u8>> = HashMap::new();
     for page in pages {
         for tr in &page.text_regions {
-            if tr.keep_raster {
-                continue;
-            }
+            if tr.keep_raster { continue; }
             if let Some(ref fm) = tr.font_match {
-                if !font_map.contains_key(&fm.font_path) {
-                    let name = format!("F{font_counter}");
-                    font_counter += 1;
-                    let id = embed_truetype_font(&mut doc, &fm.font_data, &name)?;
-                    font_map.insert(fm.font_path.clone(), (id, name));
+                let chars = font_chars.entry(fm.font_path.clone()).or_default();
+                // Collect from per-word text if available, else whole line
+                if !tr.words.is_empty() {
+                    for w in &tr.words {
+                        chars.extend(w.text.chars());
+                    }
+                } else {
+                    chars.extend(tr.text.chars());
                 }
+                font_data_map.entry(fm.font_path.clone())
+                    .or_insert_with(|| fm.font_data.clone());
             }
         }
+    }
+
+    // ── Embed subsetted fonts ────────────────────────────────────────
+    // font_map: font_path → (object_id, pdf_name, char→CID mapping)
+    let mut font_map: HashMap<PathBuf, (lopdf::ObjectId, String, HashMap<char, u16>)> = HashMap::new();
+    let mut font_counter = 0u32;
+
+    for (font_path, chars) in &font_chars {
+        let name = format!("F{font_counter}");
+        font_counter += 1;
+        let font_data = &font_data_map[font_path];
+        let (id, cid_map) = embed_subsetted_font(&mut doc, font_data, &name, chars)?;
+        font_map.insert(font_path.clone(), (id, name, cid_map));
     }
 
     let mut page_ids = Vec::new();
@@ -279,7 +294,7 @@ pub fn generate_pdf(output_path: &Path, pages: &[PageContent], overlay: bool) ->
         for tr in &page.text_regions {
             if tr.keep_raster { continue; }
             if let Some(ref fm) = tr.font_match {
-                if let Some((obj_id, ref name)) = font_map.get(&fm.font_path) {
+                if let Some((obj_id, ref name, _)) = font_map.get(&fm.font_path) {
                     if !page_font_names.contains_key(&fm.font_path) {
                         font_resources.push((name.clone(), *obj_id));
                         page_font_names.insert(fm.font_path.clone(), name.clone());
@@ -294,10 +309,13 @@ for tr in &page.text_regions {
             }
             let (cr, cg, cb) = tr.color;
 
-            let fname = if let Some(ref fm) = tr.font_match {
-                page_font_names.get(&fm.font_path).cloned().unwrap_or_else(|| default_font_name.to_string())
+            let (fname, cid_map) = if let Some(ref fm) = tr.font_match {
+                let name = page_font_names.get(&fm.font_path)
+                    .cloned().unwrap_or_else(|| default_font_name.to_string());
+                let cmap = font_map.get(&fm.font_path).map(|(_, _, m)| m);
+                (name, cmap)
             } else {
-                default_font_name.to_string()
+                (default_font_name.to_string(), None)
             };
 
             // Per-word placement: each word positioned at its OCR x-offset,
@@ -315,17 +333,19 @@ for tr in &page.text_regions {
 
                 if let Some(ref f) = font_ok {
                     // Compute ONE baseline for the entire line — all words share it.
-                    // Use the smoothed em_px if available (most words), else the
-                    // first word's width-matched size.  This prevents per-word
-                    // baseline wobble from different em_px values.
-                    let line_em_px = tr.words.iter()
-                        .filter(|w| !w.text.is_empty() && w.width >= 1.0)
-                        .find_map(|w| w.smoothed_em_px)
-                        .or_else(|| {
-                            tr.words.iter()
-                                .filter(|w| !w.text.is_empty() && w.width >= 1.0)
-                                .find_map(|w| crate::layout::width_matched_em_px(f, &w.text, w.width))
-                        });
+                    // Use height-based em sizing: the OCR bbox height determines the
+                    // font size, preserving natural letter spacing.  Width-matching
+                    // would shrink/stretch spacing to fit OCR bbox widths.
+                    let line_em_px = {
+                        use ab_glyph::{Font, PxScale, ScaleFont};
+                        let sf = f.as_scaled(PxScale::from(1000.0));
+                        let ink_h = sf.ascent() - sf.descent();
+                        if ink_h > 0.1 {
+                            Some(tr.height * 1000.0 / ink_h)
+                        } else {
+                            None
+                        }
+                    };
 
                     let (line_baseline_offset_pt, _) = if let Some(em) = line_em_px {
                         crate::layout::ink_centered_baseline_pt(f, em, tr.height, page.dpi as f32)
@@ -336,21 +356,16 @@ for tr in &page.text_regions {
                     let dy_pt = fm.best_dy as f32 * 72.0 / page.dpi as f32;
                     let pdf_y = page.px_to_pt_y(tr.y) - line_baseline_offset_pt - dy_pt;
 
+                    // Use the line-level em size for all words — no per-word
+                    // width matching that would distort natural letter spacing.
+                    let line_pt = line_em_px.unwrap() * 72.0 / page.dpi as f32;
+
                     for word in &tr.words {
                         if word.text.is_empty() || word.width < 1.0 {
                             continue;
                         }
 
-                        // Use smoothed size if available, otherwise compute per-word.
-                        let em_px = if let Some(smoothed) = word.smoothed_em_px {
-                            smoothed
-                        } else {
-                            match crate::layout::width_matched_em_px(f, &word.text, word.width) {
-                                Some(v) => v,
-                                None => continue,
-                            }
-                        };
-                        let word_pt = em_px * 72.0 / page.dpi as f32;
+                        let word_pt = line_pt;
 
                         // Word x position (word.x is absolute page coords)
                         let pdf_x = page.px_to_pt_x(word.x);
@@ -363,8 +378,8 @@ for tr in &page.text_regions {
                         }
                         ops.push(op("Tf", &[Object::Name(fname.clone().into_bytes()), real(word_pt as f64)]));
                         ops.push(op("Td", &[real(pdf_x as f64), real(pdf_y as f64)]));
-                        let encoded = encode_pdf_text(&word.text);
-                        ops.push(op("Tj", &[Object::String(encoded, lopdf::StringFormat::Literal)]));
+                        let encoded = encode_text_for_font(&word.text, cid_map);
+                        ops.push(op("Tj", &[Object::String(encoded, lopdf::StringFormat::Hexadecimal)]));
                         ops.push(op("ET", &[]));
                     }
                 }
@@ -383,8 +398,8 @@ for tr in &page.text_regions {
                 let pdf_x = page.px_to_pt_x(tr.x);
                 let pdf_y = page.px_to_pt_y(tr.y + tr.height);
                 ops.push(op("Td", &[real(pdf_x as f64), real(pdf_y as f64)]));
-                let encoded = encode_pdf_text(&tr.text);
-                ops.push(op("Tj", &[Object::String(encoded, lopdf::StringFormat::Literal)]));
+                let encoded = encode_text_for_font(&tr.text, cid_map);
+                ops.push(op("Tj", &[Object::String(encoded, lopdf::StringFormat::Hexadecimal)]));
                 ops.push(op("ET", &[]));
             }
         }
@@ -469,57 +484,99 @@ for tr in &page.text_regions {
 // Embedding helpers
 // ---------------------------------------------------------------------------
 
-fn embed_truetype_font(
+/// Embed a subsetted font as a CID-keyed Type0 font in the PDF.
+/// Returns (font_object_id, char→CID mapping).
+fn embed_subsetted_font(
     doc: &mut Document,
     font_data: &[u8],
     _name: &str,
-) -> Result<lopdf::ObjectId, ScanTextError> {
-    // Detect font type from magic bytes.
+    used_chars: &HashSet<char>,
+) -> Result<(lopdf::ObjectId, HashMap<char, u16>), ScanTextError> {
+    use ab_glyph::{Font, ScaleFont};
+
+    let ab_font = ab_glyph::FontRef::try_from_slice(font_data)
+        .map_err(|e| ScanTextError::PdfGen(format!("parse font: {e}")))?;
+
+    // Map chars → original glyph IDs
+    let mut char_to_orig_gid: Vec<(char, u16)> = Vec::new();
+    for &ch in used_chars {
+        let gid = ab_font.glyph_id(ch);
+        let gid_val = gid.0;
+        if gid_val != 0 {
+            char_to_orig_gid.push((ch, gid_val));
+        }
+    }
+    // Always include .notdef (GID 0)
+    char_to_orig_gid.sort_by_key(|&(_, gid)| gid);
+    char_to_orig_gid.dedup_by_key(|e| e.1);
+
+    // Build subset via subsetter crate
+    let mut remapper = subsetter::GlyphRemapper::new();
+    for &(_, gid) in &char_to_orig_gid {
+        remapper.remap(gid);
+    }
+
+    let (embed_bytes, char_to_cid) = match subsetter::subset(font_data, 0, &remapper) {
+        Ok(subsetted) => {
+            // Build char → remapped CID map
+            let mut cid_map = HashMap::new();
+            for &(ch, orig_gid) in &char_to_orig_gid {
+                if let Some(new_gid) = remapper.get(orig_gid) {
+                    cid_map.insert(ch, new_gid);
+                }
+            }
+            log::debug!("pdf_out: subsetted font {} → {} bytes ({} glyphs)",
+                font_data.len(), subsetted.len(), cid_map.len());
+            (subsetted, cid_map)
+        }
+        Err(e) => {
+            // Fallback: embed full font, use original GIDs as CIDs
+            log::warn!("pdf_out: font subsetting failed ({e}), embedding full font");
+            let mut cid_map = HashMap::new();
+            for &(ch, orig_gid) in &char_to_orig_gid {
+                cid_map.insert(ch, orig_gid);
+            }
+            (font_data.to_vec(), cid_map)
+        }
+    };
+
     let is_cff = font_data.len() >= 4 && &font_data[0..4] == b"OTTO";
 
-    // Build font stream — CFF fonts need Subtype in the stream dict.
+    // ── Font stream ──────────────────────────────────────────────────
     let stream_dict = if is_cff {
-        dictionary! {
-            "Subtype" => "OpenType"
-        }
+        dictionary! { "Subtype" => "CIDFontType0C" }
     } else {
-        dictionary! {
-            "Length1" => Object::Integer(font_data.len() as i64)
-        }
+        dictionary! { "Length1" => Object::Integer(embed_bytes.len() as i64) }
     };
-    let font_stream = Stream::new(stream_dict, font_data.to_vec());
+    let font_stream = Stream::new(stream_dict, embed_bytes);
     let file_id = doc.add_object(font_stream);
 
-    // Compute per-glyph widths for WinAnsiEncoding (chars 32–255)
-    // in PDF width units (thousandths of em-square).
-    let widths: Vec<Object> = if let Ok(f) = ab_glyph::FontRef::try_from_slice(font_data) {
-        use ab_glyph::{Font, PxScale, ScaleFont};
-        let sf = f.as_scaled(PxScale::from(1000.0));
-        (32u8..=255)
-            .map(|code| {
-                let ch = code as char;
-                let gid = f.glyph_id(ch);
-                let w = sf.h_advance(gid);
-                Object::Integer(w.round() as i64)
-            })
-            .collect()
-    } else {
-        // Fallback: 500 for all glyphs.
-        (32..=255).map(|_| Object::Integer(500)).collect()
-    };
+    // ── Font metrics ─────────────────────────────────────────────────
+    let sf = ab_font.as_scaled(ab_glyph::PxScale::from(1000.0));
+    let ascent = sf.ascent().round() as i64;
+    let descent = sf.descent().round() as i64;
+    let bbox = vec![
+        Object::Integer(0), Object::Integer(descent),
+        Object::Integer(1000), Object::Integer(ascent),
+    ];
 
-    // Compute actual font metrics from the font data.
-    let (ascent, descent, bbox) = if let Ok(f) = ab_glyph::FontRef::try_from_slice(font_data) {
-        use ab_glyph::{Font, PxScale, ScaleFont};
-        let sf = f.as_scaled(PxScale::from(1000.0));
-        let a = sf.ascent().round() as i64;
-        let d = sf.descent().round() as i64;
-        (a, d, vec![Object::Integer(0), Object::Integer(d), Object::Integer(1000), Object::Integer(a)])
-    } else {
-        (800, -200, vec![Object::Integer(0), Object::Integer(-200), Object::Integer(1000), Object::Integer(800)])
-    };
+    // ── CID widths array (W entry) ───────────────────────────────────
+    // Format: [cid [w1 w2 ...]] for each CID
+    let mut w_entries: Vec<Object> = Vec::new();
+    let mut cid_widths: Vec<(u16, i64)> = char_to_cid.iter()
+        .map(|(&ch, &cid)| {
+            let gid = ab_font.glyph_id(ch);
+            let w = sf.h_advance(gid).round() as i64;
+            (cid, w)
+        })
+        .collect();
+    cid_widths.sort_by_key(|&(cid, _)| cid);
+    for &(cid, w) in &cid_widths {
+        w_entries.push(Object::Integer(cid as i64));
+        w_entries.push(Object::Array(vec![Object::Integer(w)]));
+    }
 
-    // FontDescriptor — use FontFile3 for CFF, FontFile2 for TrueType.
+    // ── FontDescriptor ───────────────────────────────────────────────
     let mut desc_dict = dictionary! {
         "Type" => "FontDescriptor",
         "FontName" => "EmbeddedFont",
@@ -538,20 +595,86 @@ fn embed_truetype_font(
     }
     let desc_id = doc.add_object(desc_dict);
 
-    // Font dictionary.
-    let font_subtype = if is_cff { "Type1" } else { "TrueType" };
+    // ── CIDFont dictionary ───────────────────────────────────────────
+    let cid_subtype = if is_cff { "CIDFontType0" } else { "CIDFontType2" };
+    let cid_font_dict = dictionary! {
+        "Type" => "Font",
+        "Subtype" => Object::Name(cid_subtype.as_bytes().to_vec()),
+        "BaseFont" => "EmbeddedFont",
+        "CIDSystemInfo" => Object::Dictionary(dictionary! {
+            "Registry" => Object::String(b"Adobe".to_vec(), lopdf::StringFormat::Literal),
+            "Ordering" => Object::String(b"Identity".to_vec(), lopdf::StringFormat::Literal),
+            "Supplement" => Object::Integer(0),
+        }),
+        "FontDescriptor" => Object::Reference(desc_id),
+        "DW" => Object::Integer(1000),
+        "W" => Object::Array(w_entries),
+    };
+    let cid_font_id = doc.add_object(cid_font_dict);
+
+    // ── ToUnicode CMap (enables copy/paste of text) ──────────────────
+    let tounicode_id = build_tounicode_cmap(doc, &char_to_cid);
+
+    // ── Type0 (composite) font ───────────────────────────────────────
     let font_dict = dictionary! {
         "Type" => "Font",
-        "Subtype" => Object::Name(font_subtype.as_bytes().to_vec()),
+        "Subtype" => "Type0",
         "BaseFont" => "EmbeddedFont",
-        "Encoding" => "WinAnsiEncoding",
-        "FontDescriptor" => Object::Reference(desc_id),
-        "FirstChar" => Object::Integer(32),
-        "LastChar" => Object::Integer(255),
-        "Widths" => Object::Array(widths),
+        "Encoding" => "Identity-H",
+        "DescendantFonts" => Object::Array(vec![Object::Reference(cid_font_id)]),
+        "ToUnicode" => Object::Reference(tounicode_id),
     };
     let dict_id = doc.add_object(font_dict);
-    Ok(dict_id)
+    Ok((dict_id, char_to_cid))
+}
+
+/// Build a ToUnicode CMap stream so PDF viewers can extract text.
+fn build_tounicode_cmap(doc: &mut Document, char_to_cid: &HashMap<char, u16>) -> lopdf::ObjectId {
+    let mut entries: Vec<(u16, char)> = char_to_cid.iter().map(|(&ch, &cid)| (cid, ch)).collect();
+    entries.sort_by_key(|&(cid, _)| cid);
+
+    let mut cmap = String::new();
+    cmap.push_str("/CIDInit /ProcSet findresource begin\n");
+    cmap.push_str("12 dict begin\n");
+    cmap.push_str("begincmap\n");
+    cmap.push_str("/CIDSystemInfo << /Registry (Adobe) /Ordering (UCS) /Supplement 0 >> def\n");
+    cmap.push_str("/CMapName /Adobe-Identity-UCS def\n");
+    cmap.push_str("/CMapType 2 def\n");
+    cmap.push_str("1 begincodespacerange\n");
+    cmap.push_str("<0000> <FFFF>\n");
+    cmap.push_str("endcodespacerange\n");
+
+    // Write in chunks of 100 (PDF spec limit)
+    for chunk in entries.chunks(100) {
+        cmap.push_str(&format!("{} beginbfchar\n", chunk.len()));
+        for &(cid, ch) in chunk {
+            cmap.push_str(&format!("<{:04X}> <{:04X}>\n", cid, ch as u32));
+        }
+        cmap.push_str("endbfchar\n");
+    }
+
+    cmap.push_str("endcmap\n");
+    cmap.push_str("CMapName currentdict /CMap defineresource pop\n");
+    cmap.push_str("end\nend\n");
+
+    doc.add_object(Stream::new(dictionary! {}, cmap.into_bytes()))
+}
+
+/// Encode text as 2-byte CID values using the char→CID map.
+/// Falls back to WinAnsi encoding if no CID map is available (e.g. default Helvetica).
+fn encode_text_for_font(text: &str, cid_map: Option<&HashMap<char, u16>>) -> Vec<u8> {
+    match cid_map {
+        Some(map) => {
+            let mut out = Vec::with_capacity(text.len() * 2);
+            for ch in text.chars() {
+                let cid = map.get(&ch).copied().unwrap_or(0);
+                out.push((cid >> 8) as u8);
+                out.push((cid & 0xFF) as u8);
+            }
+            out
+        }
+        None => encode_pdf_text(text),
+    }
 }
 
 /// Embed raw RGB pixel data as an XObject Image.
