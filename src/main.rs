@@ -9,6 +9,7 @@ pub mod char_index;
 pub mod layout;
 mod compare;
 mod ocr;
+mod page_cache;
 mod pdf_out;
 mod smooth;
 mod word_match;
@@ -323,10 +324,51 @@ fn run(args: &cli::Args) -> Result<(), ScanTextError> {
     // ── 1b. Load or build character index ────────────────────────────
     let char_index = load_or_build_index(args, &font_catalog)?;
 
-    // ── 2. Load input pages ──────────────────────────────────────────
+    // ── 2. Load input pages (with raster cache) ──────────────────────
+    let cache_dir = page_cache::cache_key(input, args.dpi)
+        .and_then(|key| page_cache::cache_dir(&key));
+
     info!("Loading input pages…");
-    let pages = load_pages(input, args.dpi)?;
-    info!("Loaded {} page(s)", pages.len());
+    let raster_start = std::time::Instant::now();
+
+    // Try loading all pages from cache first.
+    let (pages, raster_cached) = if let Some(ref cdir) = cache_dir {
+        // Probe page-0 to see if cache is populated; then load all sequentially.
+        if page_cache::load_cached_image(cdir, 0).is_some() {
+            let mut cached_pages = Vec::new();
+            let mut idx = 0;
+            while let Some(img) = page_cache::load_cached_image(cdir, idx) {
+                cached_pages.push(img);
+                idx += 1;
+            }
+            if !cached_pages.is_empty() {
+                (cached_pages, true)
+            } else {
+                (load_pages(input, args.dpi)?, false)
+            }
+        } else {
+            (load_pages(input, args.dpi)?, false)
+        }
+    } else {
+        (load_pages(input, args.dpi)?, false)
+    };
+
+    // If we rasterized fresh, save to cache for next time.
+    if !raster_cached {
+        if let Some(ref cdir) = cache_dir {
+            for (i, img) in pages.iter().enumerate() {
+                page_cache::save_cached_image(cdir, i, img);
+            }
+        }
+    }
+
+    let raster_elapsed = raster_start.elapsed();
+    info!(
+        "Loaded {} page(s) ({:.1}s{})",
+        pages.len(),
+        raster_elapsed.as_secs_f32(),
+        if raster_cached { ", cached" } else { "" },
+    );
 
     // ── 2b. Extract source image data for pass-through ───────────────
     let source_images = if input.extension().and_then(|e| e.to_str()) == Some("pdf") {
@@ -357,10 +399,27 @@ fn run(args: &cli::Args) -> Result<(), ScanTextError> {
             page_img.height()
         );
 
-        // 3a. OCR ─────────────────────────────────────────────────────
-        let (word_regions, page_char_boxes) = ocr::extract_text_regions(page_img, args.dpi)?;
+        // 3a. OCR (with cache) ─────────────────────────────────────────
+        let ocr_start = std::time::Instant::now();
+        let (word_regions, page_char_boxes, ocr_cached) =
+            if let Some((wr, cb)) = cache_dir.as_ref().and_then(|d| page_cache::load_cached_ocr(d, page_idx)) {
+                (wr, cb, true)
+            } else {
+                let (wr, cb) = ocr::extract_text_regions(page_img, args.dpi)?;
+                if let Some(ref cdir) = cache_dir {
+                    page_cache::save_cached_ocr(cdir, page_idx, &wr, &cb);
+                }
+                (wr, cb, false)
+            };
         let mut lines = ocr::assemble_lines(&word_regions);
-        info!("  OCR: {} words → {} lines", word_regions.len(), lines.len());
+        let ocr_elapsed = ocr_start.elapsed();
+        info!(
+            "  OCR: {} words → {} lines ({:.1}s{})",
+            word_regions.len(),
+            lines.len(),
+            ocr_elapsed.as_secs_f32(),
+            if ocr_cached { ", cached" } else { "" },
+        );
 
         // 3b. Background colour ───────────────────────────────────────
         let bg_color = color::detect_background_color(page_img);
@@ -393,6 +452,7 @@ fn run(args: &cli::Args) -> Result<(), ScanTextError> {
             .map(|e| ab_glyph::FontRef::try_from_slice(&e.data).ok())
             .collect();
 
+        let fontmatch_start = std::time::Instant::now();
         let mut line_matches: Vec<LineMatch> = lines.par_iter().enumerate().map(|(li, line)| {
             let line_start = std::time::Instant::now();
             let text_color = color::detect_text_color(
@@ -564,6 +624,8 @@ fn run(args: &cli::Args) -> Result<(), ScanTextError> {
             }
             LineMatch { font_result, text_color, ci_top_for_audit, word_rerank_winner_name, word_diag_entries }
         }).collect();
+        let fontmatch_elapsed = fontmatch_start.elapsed();
+        eprintln!("  Font matching: {:.1}s ({} lines)", fontmatch_elapsed.as_secs_f32(), lines.len());
 
         // ── Populate diagnostic from line_matches ───────────────────
         if let Some(ref dc) = diag_collector {

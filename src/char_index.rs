@@ -1588,23 +1588,28 @@ pub fn search_candidates(
     // ── Statistical cutoff: keep best + near-ties ────────────────────
     // CI is the recall stage — high recall, lower precision (no spacing
     // info).  We keep the top score and anything within k·σ of it.
-    // Tight distributions (ambiguous) keep more candidates; spread-out
-    // distributions (clear winner) keep fewer.
+    //
+    // σ is computed on the top 50 scores only (the contender pool), not
+    // the full distribution.  The full distribution has a long left tail
+    // of clearly-wrong fonts that inflates σ and makes the cutoff too
+    // generous.  The top-50 σ measures spread among actual contenders.
+    //
+    // k = 0.5 * thoroughness: default thoroughness=1.0 → k=0.5.
+    // Higher thoroughness widens the window (more candidates, slower).
     if scores.len() >= 2 {
-        let vals: Vec<f32> = scores.iter().map(|(_, s)| *s).collect();
+        let top_n = 50.min(scores.len());
+        let vals: Vec<f32> = scores.iter().take(top_n).map(|(_, s)| *s).collect();
         let n = vals.len() as f32;
         let mean = vals.iter().sum::<f32>() / n;
         let variance = vals.iter().map(|v| (v - mean).powi(2)).sum::<f32>() / n;
         let sigma = variance.sqrt();
         let best = vals[0];
-        // k=0.5: keeps candidates within half a stddev of the best.
-        // For a normal distribution this is roughly the top ~30% of the
-        // upper tail — conservative enough to not miss the true font.
-        let cutoff = best - 0.5 * sigma;
+        let k = 0.5 * thoroughness;
+        let cutoff = best - k * sigma;
         let before = scores.len();
         scores.retain(|(_, s)| *s >= cutoff);
         eprintln!(
-            "  CI sigma cutoff: best={:.3} σ={:.3} cutoff={:.3} → {} of {} kept",
+            "  CI sigma cutoff: best={:.3} top50_σ={:.3} cutoff={:.3} → {} of {} kept",
             best, sigma, cutoff, scores.len(), before,
         );
     }
