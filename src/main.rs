@@ -1183,13 +1183,14 @@ fn extract_raster_fragments(
     let rows = (h + cell - 1) / cell;
 
     let mut interesting = vec![false; (cols * rows) as usize];
+    let gray = cleaned_img.to_luma8();
     for row in 0..rows {
         for col in 0..cols {
             let cx = col * cell;
             let cy = row * cell;
             let cw = cell.min(w - cx);
             let ch = cell.min(h - cy);
-            if color::region_has_content(cleaned_img, cx, cy, cw, ch) {
+            if color::region_has_content(&gray, cx, cy, cw, ch) {
                 interesting[(row * cols + col) as usize] = true;
             }
         }
