@@ -6,7 +6,7 @@ use log::{debug, info};
 use std::process::Command;
 
 /// A character-level bounding box from Tesseract HOCR output.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub struct CharBox {
     pub ch: char,
     pub x: u32,
@@ -17,7 +17,7 @@ pub struct CharBox {
 }
 
 /// A detected text region from OCR (word-level).
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub struct TextRegion {
     pub text: String,
     pub x: u32,
@@ -35,7 +35,7 @@ pub struct TextRegion {
 }
 
 /// A line of text assembled from word-level regions.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub struct TextLine {
     pub text: String,
     pub x: u32,
