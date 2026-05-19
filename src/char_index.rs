@@ -1082,6 +1082,61 @@ pub fn render_char_normalised<F: Font>(font: &F, c: char) -> Option<GrayImage> {
 }
 
 // ---------------------------------------------------------------------------
+// Shared normalisation: tight ink crop → NORM_H scale
+// ---------------------------------------------------------------------------
+
+/// Crop an image to its ink bounds (with 1px padding) and resize so the height
+/// equals `NORM_H`, preserving aspect ratio. Used by scan-time extraction to
+/// match the geometry of index-time rendering (tight ink crop, 1px padding,
+/// NORM_H height).
+///
+/// Ink threshold matches `compute_features` (pixel < 200 = ink).
+pub fn normalize_to_ink_bounds(img: &GrayImage) -> Option<GrayImage> {
+    let (w, h) = img.dimensions();
+    if w == 0 || h == 0 {
+        return None;
+    }
+    const THRESH: u8 = 200;
+    let mut min_x = w;
+    let mut max_x = 0u32;
+    let mut min_y = h;
+    let mut max_y = 0u32;
+    for y in 0..h {
+        for x in 0..w {
+            if img.get_pixel(x, y).0[0] < THRESH {
+                if x < min_x { min_x = x; }
+                if x > max_x { max_x = x; }
+                if y < min_y { min_y = y; }
+                if y > max_y { max_y = y; }
+            }
+        }
+    }
+    if min_x > max_x || min_y > max_y {
+        return None;
+    }
+    // 1px padding each side, matching index-time canvas sizing (+2)
+    let pad = 1u32;
+    let crop_x = min_x.saturating_sub(pad);
+    let crop_y = min_y.saturating_sub(pad);
+    let crop_w = (max_x + pad + 1).min(w) - crop_x;
+    let crop_h = (max_y + pad + 1).min(h) - crop_y;
+    if crop_w < 2 || crop_h < 2 {
+        return None;
+    }
+    let cropped = image::imageops::crop_imm(img, crop_x, crop_y, crop_w, crop_h).to_image();
+    let scaled_w = (crop_w as f32 * NORM_H as f32 / crop_h as f32).ceil() as u32;
+    if scaled_w < 2 {
+        return None;
+    }
+    Some(image::imageops::resize(
+        &cropped,
+        scaled_w,
+        NORM_H,
+        image::imageops::FilterType::Lanczos3,
+    ))
+}
+
+// ---------------------------------------------------------------------------
 // Character extraction from scan
 // ---------------------------------------------------------------------------
 
@@ -1328,12 +1383,10 @@ fn extract_chars_from_boundaries(
 
         let char_crop = image::imageops::crop_imm(word_img, x0, 0, x1 - x0, crop_h).to_image();
 
-        let scaled = image::imageops::resize(
-            &char_crop,
-            ((x1 - x0) as f32 * NORM_H as f32 / crop_h as f32).ceil() as u32,
-            NORM_H,
-            image::imageops::FilterType::Lanczos3,
-        );
+        let scaled = match normalize_to_ink_bounds(&char_crop) {
+            Some(img) => img,
+            None => continue,
+        };
 
         results.push((c, scaled));
         *char_counts.entry(c).or_insert(0) += 1;

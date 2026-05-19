@@ -17,8 +17,8 @@ mod common;
 use common::{test_doc, run_unscan};
 use std::collections::HashMap;
 
-/// Minimum acceptable accuracy (correct / total matched lines).
-const MIN_ACCURACY: f64 = 0.95;
+/// Minimum acceptable accuracy (correct / total OCR lines).
+const MIN_ACCURACY: f64 = 0.85;
 
 /// Parse ground truth: section index → lowercase font family (spaces removed).
 fn load_ground_truth() -> HashMap<usize, String> {
@@ -61,6 +61,24 @@ fn parse_all_font_matches(output: &str) -> Vec<String> {
         }
     }
     matches
+}
+
+/// Count total OCR lines from unscan output (the denominator for accuracy).
+/// Parses "OCR: N words → M lines" from each page.
+fn count_total_ocr_lines(output: &str) -> usize {
+    let mut total = 0;
+    for line in output.lines() {
+        if let Some(arrow) = line.find('→') {
+            let after = &line[arrow + '→'.len_utf8()..];
+            let after = after.trim_start();
+            if after.contains("lines") {
+                if let Some(n) = after.split_whitespace().next().and_then(|s| s.parse::<usize>().ok()) {
+                    total += n;
+                }
+            }
+        }
+    }
+    total
 }
 
 /// Known font renames / aliases.  If the matched font contains any alias
@@ -122,22 +140,30 @@ fn specimen_font_accuracy() {
 
     let output = run_unscan(&input, &[]);
     let matched_fonts = parse_all_font_matches(&output);
+    let total_lines = count_total_ocr_lines(&output);
 
-    let total = matched_fonts.len();
-    assert!(total > 0, "No font matches found in specimen output");
+    let matched = matched_fonts.len();
+    assert!(matched > 0, "No font matches found in specimen output");
+    assert!(total_lines > 0, "No OCR lines found in specimen output");
 
     let correct = matched_fonts
         .iter()
         .filter(|m| is_correct(m, &ground_truth))
         .count();
 
-    let accuracy = correct as f64 / total as f64;
+    let accuracy = correct as f64 / total_lines as f64;
     eprintln!(
         "Specimen accuracy: {}/{} = {:.1}% (threshold: {:.0}%)",
         correct,
-        total,
+        total_lines,
         accuracy * 100.0,
         MIN_ACCURACY * 100.0,
+    );
+    eprintln!(
+        "  ({} matched, {} unmatched, {} incorrect)",
+        matched,
+        total_lines - matched,
+        matched - correct,
     );
 
     // Log misses for debugging
@@ -161,7 +187,7 @@ fn specimen_font_accuracy() {
         accuracy * 100.0,
         MIN_ACCURACY * 100.0,
         correct,
-        total,
+        total_lines,
     );
 }
 
