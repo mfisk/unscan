@@ -1311,14 +1311,20 @@ fn extract_line_chars_from_charboxes(
 
         let char_crop = image::imageops::crop_imm(page, cx, cy, cw, ch_px).to_image();
 
-        // Scale to NORM_H, preserving aspect ratio
-        let scaled_w = ((cw as f32 * NORM_H as f32 / ch_px as f32).ceil() as u32).max(1);
-        let scaled = image::imageops::resize(
-            &char_crop,
-            scaled_w,
-            NORM_H,
-            image::imageops::FilterType::Lanczos3,
-        );
+        // Trim to ink bounds then scale to NORM_H. normalize_to_ink_bounds
+        // removes neighbor glyph fragments from Tesseract's shifted charbox
+        // boundaries (e.g. 'oog' in tightly-spaced Open Sans).
+        // Falls back to direct resize if normalize fails (empty ink).
+        let scaled = match normalize_to_ink_bounds(&char_crop) {
+            Some(s) => s,
+            None => {
+                let scaled_w = ((cw as f32 * NORM_H as f32 / ch_px as f32).ceil() as u32).max(1);
+                image::imageops::resize(
+                    &char_crop, scaled_w, NORM_H,
+                    image::imageops::FilterType::Lanczos3,
+                )
+            }
+        };
 
         // Crop quality gate: reject image fragments and non-text crops.
         // Real text characters have near-black ink (min ≈ 0) on near-white
