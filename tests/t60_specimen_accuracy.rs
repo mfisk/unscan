@@ -18,7 +18,11 @@ use common::{test_doc, run_unscan};
 use std::collections::HashMap;
 
 /// Minimum acceptable accuracy (correct / total OCR lines).
-const MIN_ACCURACY: f64 = 0.85;
+/// The specimen is rasterized on-demand via PyMuPDF (same FreeType engine as
+/// the CI index). Accuracy is lower than the original pre-made raster because
+/// PyMuPDF's hinting choices differ from whatever originally generated it.
+const MIN_ACCURACY_AA: f64 = 0.87;
+const MIN_ACCURACY_NOAA: f64 = 0.85;
 
 /// Parse ground truth: section index → lowercase font family (spaces removed).
 fn load_ground_truth() -> HashMap<usize, String> {
@@ -125,14 +129,21 @@ fn is_correct(matched: &str, ground_truth: &HashMap<usize, String>) -> bool {
 
 #[test]
 fn specimen_font_accuracy() {
-    let input = test_doc("font-timeline-specimen-rasterized.pdf");
-    if !input.exists() {
-        eprintln!("SKIP: font-timeline-specimen-rasterized.pdf not found");
+    let vector_src = test_doc("font-timeline-specimen.pdf");
+    if !vector_src.exists() {
+        eprintln!("SKIP: font-timeline-specimen.pdf not found");
         return;
     }
     let gt_path = test_doc("font-timeline-specimen.json");
     if !gt_path.exists() {
         eprintln!("SKIP: font-timeline-specimen.json not found");
+        return;
+    }
+
+    // Generate (or reuse cached) clean raster with anti-aliasing
+    let input = test_doc("font-timeline-specimen-rasterized.pdf");
+    if !common::rasterize_pdf(&vector_src, &input, 300, true) {
+        eprintln!("SKIP: rasterization failed (pdftoppm/img2pdf missing?)");
         return;
     }
 
@@ -157,7 +168,7 @@ fn specimen_font_accuracy() {
         correct,
         total_lines,
         accuracy * 100.0,
-        MIN_ACCURACY * 100.0,
+        MIN_ACCURACY_AA * 100.0,
     );
     eprintln!(
         "  ({} matched, {} unmatched, {} incorrect)",
@@ -182,10 +193,10 @@ fn specimen_font_accuracy() {
     }
 
     assert!(
-        accuracy >= MIN_ACCURACY,
+        accuracy >= MIN_ACCURACY_AA,
         "Specimen accuracy {:.1}% below threshold {:.0}% ({}/{})",
         accuracy * 100.0,
-        MIN_ACCURACY * 100.0,
+        MIN_ACCURACY_AA * 100.0,
         correct,
         total_lines,
     );
@@ -210,5 +221,84 @@ fn specimen_vectorizes_enough_lines() {
         count >= 350,
         "specimen vectorized {} lines, expected >= 350",
         count,
+    );
+}
+
+/// Same as specimen_font_accuracy but against a no-AA rasterized version.
+/// Tests whether anti-aliasing blurring affects CI feature matching.
+/// The no-AA PDF is generated on demand from the vector source and cached
+/// between runs (regenerated if the source PDF is newer).
+#[test]
+fn specimen_font_accuracy_noaa() {
+    let vector_src = test_doc("font-timeline-specimen.pdf");
+    if !vector_src.exists() {
+        eprintln!("SKIP: font-timeline-specimen.pdf not found");
+        return;
+    }
+    let gt_path = test_doc("font-timeline-specimen.json");
+    if !gt_path.exists() {
+        eprintln!("SKIP: font-timeline-specimen.json not found");
+        return;
+    }
+
+    // Generate / cache the no-AA rasterized PDF
+    let noaa_pdf = test_doc("font-timeline-specimen-rasterized-noaa.pdf");
+    if !common::rasterize_pdf(&vector_src, &noaa_pdf, 300, false) {
+        eprintln!("SKIP: could not generate no-AA rasterized PDF (missing pdftoppm or img2pdf?)");
+        return;
+    }
+
+    let ground_truth = load_ground_truth();
+
+    let output = run_unscan(&noaa_pdf, &[]);
+    let matched_fonts = parse_all_font_matches(&output);
+    let total_lines = count_total_ocr_lines(&output);
+
+    let matched = matched_fonts.len();
+    assert!(matched > 0, "No font matches found in noaa specimen output");
+    assert!(total_lines > 0, "No OCR lines found in noaa specimen output");
+
+    let correct = matched_fonts
+        .iter()
+        .filter(|m| is_correct(m, &ground_truth))
+        .count();
+
+    let accuracy = correct as f64 / total_lines as f64;
+    eprintln!(
+        "Specimen noaa accuracy: {}/{} = {:.1}% (threshold: {:.0}%)",
+        correct,
+        total_lines,
+        accuracy * 100.0,
+        MIN_ACCURACY_NOAA * 100.0,
+    );
+    eprintln!(
+        "  ({} matched, {} unmatched, {} incorrect)",
+        matched,
+        total_lines - matched,
+        matched - correct,
+    );
+
+    // Log misses for debugging
+    let misses: Vec<&String> = matched_fonts
+        .iter()
+        .filter(|m| !is_correct(m, &ground_truth))
+        .collect();
+    if !misses.is_empty() {
+        eprintln!("Misses ({}):", misses.len());
+        for m in misses.iter().take(15) {
+            eprintln!("  {}", m);
+        }
+        if misses.len() > 15 {
+            eprintln!("  ... and {} more", misses.len() - 15);
+        }
+    }
+
+    assert!(
+        accuracy >= MIN_ACCURACY_NOAA,
+        "Specimen noaa accuracy {:.1}% below threshold {:.0}% ({}/{})",
+        accuracy * 100.0,
+        MIN_ACCURACY_NOAA * 100.0,
+        correct,
+        total_lines,
     );
 }
