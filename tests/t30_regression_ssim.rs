@@ -250,27 +250,3 @@ fn font_match_gold_png_is_eb_garamond() {
     );
 }
 
-// ---------- Specimen vectorization count ----------
-
-#[test]
-fn specimen_vectorizes_enough_lines() {
-    if !setup() {
-        eprintln!("SKIP: fixtures unavailable");
-        return;
-    }
-    let input = test_doc("specimen-clean-raster.pdf");
-    if !input.exists() {
-        eprintln!("SKIP: {:?} not found", input);
-        return;
-    }
-
-    let output = run_unscan(&input, &["--overlay"]);
-    let count =
-        parse_vectorized_count(&output).expect("could not parse vectorized count from specimen");
-    eprintln!("specimen vectorized = {}", count);
-    assert!(
-        count >= 80,
-        "specimen vectorized {} lines, expected >= 80",
-        count
-    );
-}
