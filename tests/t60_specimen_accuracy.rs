@@ -21,8 +21,8 @@ use std::collections::HashMap;
 /// The specimen is rasterized on-demand via PyMuPDF (same FreeType engine as
 /// the CI index). Accuracy is lower than the original pre-made raster because
 /// PyMuPDF's hinting choices differ from whatever originally generated it.
-const MIN_ACCURACY_AA: f64 = 0.87;
-const MIN_ACCURACY_NOAA: f64 = 0.85;
+const MIN_ACCURACY_AA: f64 = 0.95;
+const MIN_ACCURACY_NOAA: f64 = 0.90;
 
 /// Parse ground truth: section index → lowercase font family (spaces removed).
 fn load_ground_truth() -> HashMap<usize, String> {

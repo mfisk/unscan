@@ -1091,6 +1091,43 @@ pub fn render_char_normalised<F: Font>(font: &F, c: char) -> Option<GrayImage> {
 /// NORM_H height).
 ///
 /// Ink threshold matches `compute_features` (pixel < 200 = ink).
+/// Crop a word image to its ink bounds with 1px padding.
+/// Unlike `normalize_to_ink_bounds`, this does NOT rescale — it returns the
+/// cropped image at original resolution so seam carving works on real pixels.
+fn normalize_word_to_ink(img: &GrayImage) -> Option<GrayImage> {
+    let (w, h) = img.dimensions();
+    if w == 0 || h == 0 {
+        return None;
+    }
+    const THRESH: u8 = 200;
+    let mut min_x = w;
+    let mut max_x = 0u32;
+    let mut min_y = h;
+    let mut max_y = 0u32;
+    for y in 0..h {
+        for x in 0..w {
+            if img.get_pixel(x, y).0[0] < THRESH {
+                if x < min_x { min_x = x; }
+                if x > max_x { max_x = x; }
+                if y < min_y { min_y = y; }
+                if y > max_y { max_y = y; }
+            }
+        }
+    }
+    if min_x > max_x || min_y > max_y {
+        return None;
+    }
+    let pad = 1u32;
+    let crop_x = min_x.saturating_sub(pad);
+    let crop_y = min_y.saturating_sub(pad);
+    let crop_w = (max_x + pad + 1).min(w) - crop_x;
+    let crop_h = (max_y + pad + 1).min(h) - crop_y;
+    if crop_w < 2 || crop_h < 2 {
+        return None;
+    }
+    Some(image::imageops::crop_imm(img, crop_x, crop_y, crop_w, crop_h).to_image())
+}
+
 pub fn normalize_to_ink_bounds(img: &GrayImage) -> Option<GrayImage> {
     let (w, h) = img.dimensions();
     if w == 0 || h == 0 {
@@ -1151,11 +1188,10 @@ pub fn extract_line_chars(
         return Vec::new();
     }
 
-    // If we have Tesseract makebox char boxes, use them directly
-    // instead of the column-valley segmenter.
-    if !page_char_boxes.is_empty() {
-        return extract_line_chars_from_charboxes(page, words, line_height, page_char_boxes);
-    }
+    // Always use word-crop + seam-carving segmentation.
+    // Tesseract charboxes have unreliable boundaries (shifted, bleed into
+    // neighbors) so we crop whole words (reliable bboxes) and split them
+    // ourselves using vertical whitespace + seam carving.
 
     let mut sorted: Vec<&WordPlacement> = words
         .iter()
@@ -1180,27 +1216,14 @@ pub fn extract_line_chars(
         }
 
         let wx = word.x_off;
-        let mut wy = word.y_off;
+        let wy = word.y_off;
         let ww = word.width;
-        let mut wh = word.height.max(line_height);
+        let wh = word.height;
 
         let (pw, ph) = page.dimensions();
         if wx >= pw || wy >= ph {
             continue;
         }
-
-        // Ink-expand: search ±15 px above/below for actual ink
-        let margin: u32 = 15;
-        let search_top = wy.saturating_sub(margin);
-        let search_bot = (wy + wh + margin).min(ph);
-        let clamped_w = ww.min(pw - wx);
-        let (ink_top, ink_bot) = crate::ocr::ink_vertical_extent(
-            page, wx, clamped_w, search_top, search_bot, 200,
-        );
-        let new_y = ink_top.min(wy);
-        let new_bot = ink_bot.max(wy + wh);
-        wy = new_y;
-        wh = new_bot.saturating_sub(new_y);
 
         let crop_w = ww.min(pw - wx);
         let crop_h = wh.min(ph - wy);
@@ -1208,23 +1231,27 @@ pub fn extract_line_chars(
             continue;
         }
 
+        // Crop the word at Tesseract's bbox (reliable at word level).
+        // Don't ink-expand or ink-trim — the bbox is already tight and
+        // ink-trimming picks up stray text from adjacent lines.
         let word_img = image::imageops::crop_imm(page, wx, wy, crop_w, crop_h).to_image();
 
-        let boundaries = segment_characters(&word_img, chars_in_word.len());
-        let all_chars: Vec<char> = word.text.chars().collect();
-
-        if boundaries.len() != all_chars.len() + 1 {
-            let uniform = uniform_boundaries(crop_w, all_chars.len());
-            extract_chars_from_boundaries(
-                &word_img, &all_chars, &uniform, crop_h,
-                &mut char_counts, &mut results,
-            );
-        } else {
-            extract_chars_from_boundaries(
-                &word_img, &all_chars, &boundaries, crop_h,
-                &mut char_counts, &mut results,
-            );
+        // Debug: dump pre-segmentation word image
+        if std::env::var("UNSCAN_DUMP_CROPS").is_ok() {
+            let dump_dir = std::path::PathBuf::from("/tmp/unscan-crops");
+            std::fs::create_dir_all(&dump_dir).ok();
+            let fname = format!("word_{}.png", word.text.replace(' ', "_").replace('/', "_"));
+            word_img.save(dump_dir.join(&fname)).ok();
         }
+
+        let (word_w, word_h) = word_img.dimensions();
+        let all_chars: Vec<char> = word.text.chars().collect();
+        let boundaries = segment_characters(&word_img, all_chars.len());
+
+        extract_chars_from_boundaries(
+            &word_img, &all_chars, &boundaries, word_h,
+            &mut char_counts, &mut results,
+        );
     }
 
     results
@@ -1399,50 +1426,258 @@ fn extract_chars_from_boundaries(
     }
 }
 
-/// Segment a word image into N characters using column ink valleys.
+/// Segment a word image into N characters.
+///
+/// Pass 1 — Vertical whitespace: find contiguous runs of zero-ink columns
+///          (threshold 200). Each interior run gives one split at its midpoint.
+///          If that yields ≥ N-1 splits, pick the N-1 widest runs.
+///
+/// Pass 2 — Seam carving: if whitespace splits aren't enough, find the cheapest
+///          vertical seam in each existing segment, pick the globally cheapest
+///          one, split there, and repeat until we have N-1 splits.
 fn segment_characters(img: &GrayImage, n_chars: usize) -> Vec<u32> {
     let (w, h) = img.dimensions();
     if n_chars <= 1 {
         return vec![0, w];
     }
+    if w < 2 || h < 2 {
+        return uniform_boundaries(w, n_chars);
+    }
 
+    let need = n_chars - 1; // number of splits needed
+
+    // --- Pass 1: vertical whitespace splits ---
     let threshold = 200u8;
-    let mut col_ink = vec![0.0f32; w as usize];
+
+    // Compute total ink per column (sum of dark-pixel intensities).
+    let col_ink: Vec<u32> = (0..w)
+        .map(|x| {
+            (0..h)
+                .map(|y| {
+                    let px = img.get_pixel(x, y).0[0];
+                    if px < threshold { (255 - px) as u32 } else { 0 }
+                })
+                .sum()
+        })
+        .collect();
+
+    // A column counts as "whitespace" if its ink is below a fraction of the
+    // peak column ink.  A stray serif intruding into a gap has far less ink
+    // than a real stroke, so 5 % of the peak is a safe cutoff.
+    let max_ink = col_ink.iter().copied().max().unwrap_or(0);
+    let ink_cutoff = max_ink / 20; // 5 %
+
+    let col_has_ink: Vec<bool> = col_ink.iter().map(|&v| v > ink_cutoff).collect();
+
+    // Find contiguous runs of low-ink columns (interior only: not touching edges).
+    let mut ws_runs: Vec<(u32, u32)> = Vec::new(); // (start, end) exclusive
+    let mut run_start: Option<u32> = None;
     for x in 0..w {
-        let mut s = 0.0f32;
-        for y in 0..h {
-            let px = img.get_pixel(x, y).0[0];
-            if px < threshold {
-                s += (255 - px) as f32;
+        if !col_has_ink[x as usize] {
+            if run_start.is_none() {
+                run_start = Some(x);
+            }
+        } else if let Some(start) = run_start {
+            // Interior run: doesn't touch left edge (start > 0) or right edge (x < w)
+            if start > 0 {
+                ws_runs.push((start, x));
+            }
+            run_start = None;
+        }
+    }
+    // Don't include runs touching right edge
+
+    // Sort by run width descending — widest gaps are the most confident splits.
+    ws_runs.sort_by(|a, b| (b.1 - b.0).cmp(&(a.1 - a.0)));
+
+    // Take up to `need` whitespace splits (midpoint of each run).
+    let ws_count = ws_runs.len().min(need);
+    let mut splits: Vec<u32> = ws_runs[..ws_count]
+        .iter()
+        .map(|(s, e)| (s + e) / 2)
+        .collect();
+    splits.sort();
+
+    // --- Pass 2: greedy seam selection (SEGMENTATION.md) ---
+    //
+    // VP splits divide the word into segments.  For each segment, compute the
+    // cheapest vertical seam and push it onto a min-heap keyed by cost.
+    // Pop the cheapest seam, record its midpoint as a split, recompute seams
+    // for the two child sub-segments, push them back.  Repeat until we have
+    // enough splits.  This guarantees each split lands in a distinct segment
+    // (no re-splitting the same valley) and always picks the easiest remaining
+    // cut first.
+    if splits.len() < need {
+        use std::cmp::Ordering;
+        use std::collections::BinaryHeap;
+
+        // Precompute energy map: ink energy = (255 - pixel) for dark pixels, 0 for light.
+        let energy: Vec<Vec<f32>> = (0..h)
+            .map(|y| {
+                (0..w)
+                    .map(|x| {
+                        let px = img.get_pixel(x, y).0[0];
+                        if px < threshold {
+                            (255 - px) as f32
+                        } else {
+                            0.0
+                        }
+                    })
+                    .collect()
+            })
+            .collect();
+
+        // Min-heap entry: (cost, split_col, seg_start, seg_end).
+        // BinaryHeap is a max-heap, so wrap cost in Reverse-style ordering.
+        #[derive(PartialEq)]
+        struct SeamEntry {
+            cost: f32,
+            col: u32,
+            seg_start: u32,
+            seg_end: u32,
+        }
+        impl Eq for SeamEntry {}
+        impl PartialOrd for SeamEntry {
+            fn partial_cmp(&self, other: &Self) -> Option<Ordering> {
+                Some(self.cmp(other))
             }
         }
-        col_ink[x as usize] = s;
+        impl Ord for SeamEntry {
+            fn cmp(&self, other: &Self) -> Ordering {
+                // Reverse: lower cost = higher priority
+                other.cost.partial_cmp(&self.cost).unwrap_or(Ordering::Equal)
+            }
+        }
+
+        let mut heap: BinaryHeap<SeamEntry> = BinaryHeap::new();
+
+        // Build initial segments from VP splits and seed the heap.
+        let mut initial_segs: Vec<(u32, u32)> = Vec::new();
+        {
+            let mut prev = 0u32;
+            for &s in &splits {
+                if s > prev {
+                    initial_segs.push((prev, s));
+                }
+                prev = s;
+            }
+            if prev < w {
+                initial_segs.push((prev, w));
+            }
+        }
+        for &(seg_start, seg_end) in &initial_segs {
+            if seg_end - seg_start >= 3 {
+                if let Some((col, cost)) = cheapest_seam(&energy, seg_start, seg_end, h) {
+                    heap.push(SeamEntry { cost, col, seg_start, seg_end });
+                }
+            }
+        }
+
+        // Greedy loop: pop cheapest, split, recompute children.
+        while splits.len() < need {
+            let entry = match heap.pop() {
+                Some(e) => e,
+                None => break, // no valid seams remain
+            };
+
+            splits.push(entry.col);
+
+            // Left child: [seg_start, col)
+            let left_end = entry.col;
+            if left_end - entry.seg_start >= 3 {
+                if let Some((col, cost)) = cheapest_seam(&energy, entry.seg_start, left_end, h) {
+                    heap.push(SeamEntry { cost, col, seg_start: entry.seg_start, seg_end: left_end });
+                }
+            }
+
+            // Right child: [col, seg_end)
+            let right_start = entry.col;
+            if entry.seg_end - right_start >= 3 {
+                if let Some((col, cost)) = cheapest_seam(&energy, right_start, entry.seg_end, h) {
+                    heap.push(SeamEntry { cost, col, seg_start: right_start, seg_end: entry.seg_end });
+                }
+            }
+        }
+
+        splits.sort();
     }
 
-    let smoothed = smooth_signal(&col_ink, 3);
+    // Build final boundaries: [0, split1, split2, ..., w]
+    let mut bounds = Vec::with_capacity(n_chars + 1);
+    bounds.push(0);
+    for &s in &splits {
+        if s > 0 && s < w {
+            bounds.push(s);
+        }
+    }
+    bounds.push(w);
+    bounds.dedup();
 
-    let mut valleys: Vec<(u32, f32)> = Vec::new();
-    for i in 1..smoothed.len().saturating_sub(1) {
-        if smoothed[i] <= smoothed[i - 1] && smoothed[i] <= smoothed[i + 1] {
-            valleys.push((i as u32, smoothed[i]));
+    bounds
+}
+
+/// Find the cheapest vertical seam through columns [seg_start, seg_end) of
+/// the energy map. Returns (split_column, total_cost).
+///
+/// Uses Avidan & Shamir DP: M(r,c) = energy(r,c) + min(M(r-1, c-1), M(r-1, c), M(r-1, c+1)).
+/// The split column is where the seam crosses the vertical midpoint row.
+fn cheapest_seam(
+    energy: &[Vec<f32>],
+    seg_start: u32,
+    seg_end: u32,
+    h: u32,
+) -> Option<(u32, f32)> {
+    let seg_w = (seg_end - seg_start) as usize;
+    // Need at least 3 columns so there's an interior column to split on.
+    if seg_w < 3 || h < 1 {
+        return None;
+    }
+
+    // DP cost matrix: cost[row][col_within_segment]
+    let mut cost = vec![vec![0.0f32; seg_w]; h as usize];
+
+    // First row
+    for c in 0..seg_w {
+        cost[0][c] = energy[0][(seg_start as usize) + c];
+    }
+
+    // Fill DP
+    for r in 1..h as usize {
+        for c in 0..seg_w {
+            let up = cost[r - 1][c];
+            let up_left = if c > 0 { cost[r - 1][c - 1] } else { f32::INFINITY };
+            let up_right = if c + 1 < seg_w { cost[r - 1][c + 1] } else { f32::INFINITY };
+            cost[r][c] = energy[r][(seg_start as usize) + c] + up.min(up_left).min(up_right);
         }
     }
 
-    valleys.sort_by(|a, b| a.1.partial_cmp(&b.1).unwrap_or(std::cmp::Ordering::Equal));
+    // Find minimum cost in last row — interior columns only (exclude edges)
+    let last_row = &cost[(h - 1) as usize];
+    let (min_c, &min_cost) = last_row
+        .iter()
+        .enumerate()
+        .filter(|&(c, _)| c > 0 && c + 1 < seg_w)
+        .min_by(|a, b| a.1.partial_cmp(b.1).unwrap_or(std::cmp::Ordering::Equal))?;
 
-    let need = n_chars - 1;
-
-    if valleys.len() >= need {
-        let mut splits: Vec<u32> = valleys[..need].iter().map(|v| v.0).collect();
-        splits.sort();
-        let mut bounds = Vec::with_capacity(n_chars + 1);
-        bounds.push(0);
-        bounds.extend_from_slice(&splits);
-        bounds.push(w);
-        bounds
-    } else {
-        uniform_boundaries(w, n_chars)
+    // Backtrace to find where the seam crosses the midpoint row,
+    // clamping to interior columns so the split never lands on an edge.
+    let mid_row = (h / 2) as usize;
+    let mut c = min_c;
+    for r in ((mid_row + 1)..h as usize).rev() {
+        let up = cost[r - 1][c];
+        let up_left = if c > 1 { cost[r - 1][c - 1] } else { f32::INFINITY };
+        let up_right = if c + 2 < seg_w { cost[r - 1][c + 1] } else { f32::INFINITY };
+        let best = up.min(up_left).min(up_right);
+        if c > 1 && cost[r - 1][c - 1] == best {
+            c -= 1;
+        } else if c + 2 < seg_w && cost[r - 1][c + 1] == best {
+            c += 1;
+        }
+        // else stay at c
     }
+
+    let split_col = seg_start + c as u32;
+    Some((split_col, min_cost))
 }
 
 /// Uniform character boundaries.
@@ -1454,18 +1689,6 @@ fn uniform_boundaries(width: u32, n: usize) -> Vec<u32> {
     b
 }
 
-/// Simple box-filter smoothing.
-fn smooth_signal(src: &[f32], radius: usize) -> Vec<f32> {
-    let n = src.len();
-    let mut out = vec![0.0f32; n];
-    for i in 0..n {
-        let lo = i.saturating_sub(radius);
-        let hi = (i + radius + 1).min(n);
-        let sum: f32 = src[lo..hi].iter().sum();
-        out[i] = sum / (hi - lo) as f32;
-    }
-    out
-}
 
 // ---------------------------------------------------------------------------
 // Matching — k-d tree based
@@ -1735,6 +1958,65 @@ pub fn search_single_char(
         radius: 0.0, // kNN mode — no radius
         n_within_radius,
     })
+}
+
+/// Per-character CI detail for diagnostics.
+#[derive(Debug, Clone)]
+pub struct CharCiDetail {
+    pub ch: char,
+    pub crop_index: usize,
+    pub min_dist_sq: f32,
+    pub passed_gate: bool,
+    /// Top-3 nearest fonts (name, dist_sq).
+    pub nearest: Vec<(String, f32)>,
+}
+
+/// Return per-character CI detail for a set of crops.
+/// This is the diagnostic companion to `search_candidates`.
+pub fn per_char_ci_detail(
+    index: &CharIndex,
+    char_crops: &[(char, GrayImage)],
+    thoroughness: f32,
+) -> Vec<CharCiDetail> {
+    let crop_feats: Vec<(usize, char, [f32; FEAT_LEN])> = char_crops
+        .iter()
+        .enumerate()
+        .filter_map(|(i, (c, img))| {
+            compute_features(img).map(|f| (i, *c, f.as_weighted_slice()))
+        })
+        .collect();
+
+    let mut results = Vec::with_capacity(crop_feats.len());
+    for (idx, c, query_feat) in &crop_feats {
+        let hits: Vec<(usize, f32)> = if let Some(points) = index.flat_vecs.get(c) {
+            nearest_within_factor_brute(points, query_feat, 2.5 * thoroughness)
+        } else {
+            Vec::new()
+        };
+
+        let min_dist_sq = hits.iter().map(|(_, d)| *d).fold(f32::INFINITY, f32::min);
+        let passed_gate = min_dist_sq <= 0.5 * thoroughness;
+
+        // Top-3 nearest by distance
+        let mut sorted_hits = hits.clone();
+        sorted_hits.sort_by(|a, b| a.1.partial_cmp(&b.1).unwrap_or(std::cmp::Ordering::Equal));
+        let nearest: Vec<(String, f32)> = sorted_hits.iter()
+            .take(3)
+            .filter_map(|(font_id, d)| {
+                let name = index.font_names_table.get(*font_id)?;
+                Some((name.clone(), *d))
+            })
+            .collect();
+
+        results.push(CharCiDetail {
+            ch: *c,
+            crop_index: *idx,
+            min_dist_sq,
+            passed_gate,
+            nearest,
+        });
+    }
+    results
 }
 
 /// Legacy API — thin wrapper around search_candidates for backward compat.
