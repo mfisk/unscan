@@ -26,10 +26,27 @@ pub struct LineDiag {
     pub ocr_confidence: f32,
     pub bbox: [u32; 4],  // x, y, w, h
     pub ci_candidates: Vec<CiCandidate>,
+    pub ci_char_votes: Vec<CharCiVote>,
     pub words: Vec<WordDiag>,
     pub word_rerank_winner: Option<String>,
     pub final_font: Option<String>,
     pub final_score: Option<f32>,
+}
+
+/// Per-character CI vote detail for diagnostics.
+#[derive(Debug, Serialize, Clone)]
+pub struct CharCiVote {
+    pub ch: char,
+    pub crop_index: usize,
+    /// Squared distance to nearest font in the index for this char.
+    pub min_dist_sq: f32,
+    /// Whether this char passed the quality gate.
+    pub passed_gate: bool,
+    /// Top-3 nearest fonts for this char (font_name, dist_sq).
+    pub nearest: Vec<(String, f32)>,
+    /// Path to the crop image (relative to diag dir), if saved.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub crop_path: Option<String>,
 }
 
 #[derive(Debug, Serialize)]

@@ -8,6 +8,7 @@ mod geometry;
 pub mod char_index;
 pub mod layout;
 mod compare;
+pub mod seg_diag;
 mod ocr;
 mod page_cache;
 mod pdf_out;
@@ -443,8 +444,10 @@ fn run(args: &cli::Args) -> Result<(), ScanTextError> {
             font_result: Option<font_match::FontMatchResult>,
             text_color: (u8, u8, u8),
             ci_top_for_audit: Vec<(String, f32)>,
+            ci_char_detail: Vec<char_index::CharCiDetail>,
             word_rerank_winner_name: Option<String>,
             word_diag_entries: Vec<diagnostic::WordDiag>,
+            diag_seg_dir: Option<std::path::PathBuf>,
         }
 
         // Pre-parse all catalog fonts once (avoids per-candidate per-line re-parsing)
@@ -467,8 +470,17 @@ fn run(args: &cli::Args) -> Result<(), ScanTextError> {
                 },
             );
             let mut ci_top_for_audit: Vec<(String, f32)> = Vec::new();
+            let mut ci_char_detail: Vec<char_index::CharCiDetail> = Vec::new();
             let mut word_rerank_winner_name: Option<String> = None;
             let mut word_diag_entries: Vec<diagnostic::WordDiag> = Vec::new();
+            let diag_seg_dir: Option<std::path::PathBuf> = args.diag_seg.as_ref().map(|d| {
+                let line_slug: String = line.text.chars().take(30)
+                    .map(|c| if c.is_alphanumeric() { c } else { '_' })
+                    .collect();
+                let p = d.join(format!("p{}_{}", page_idx + 1, line_slug));
+                let _ = std::fs::create_dir_all(&p);
+                p
+            });
             let font_result = {
                 // Query char index for candidate font keys
                 let word_placements: Vec<crate::verify::WordPlacement> = line.words.iter()
@@ -482,7 +494,10 @@ fn run(args: &cli::Args) -> Result<(), ScanTextError> {
                     })
                     .collect();
                 let line_height = line.words.iter().map(|w| w.height).max().unwrap_or(0);
-                let char_crops = char_index::extract_line_chars(&gray_page, &word_placements, line_height, &page_char_boxes);
+                let char_crops = char_index::extract_line_chars(
+                    &gray_page, &word_placements, line_height, &page_char_boxes,
+                    diag_seg_dir.as_deref(),
+                );
 
                 // Dump character crops when UNSCAN_DUMP_CROPS is set
                 if std::env::var("UNSCAN_DUMP_CROPS").is_ok() && !char_crops.is_empty() {
@@ -503,13 +518,21 @@ fn run(args: &cli::Args) -> Result<(), ScanTextError> {
                 ci_top_for_audit = ci_results.iter()
                     .map(|(name, score)| (name.clone(), *score)).collect();
 
-                // --force-font: inject into CI audit list so it shows in diagnostic
-                if let Some(ref force) = args.force_font {
-                    let force_lc = force.to_lowercase();
+                // Collect per-character CI detail when diagnostic mode is active
+                let ci_char_detail_vec = if diag_collector.is_some() {
+                    char_index::per_char_ci_detail(&char_index, &char_crops, args.thoroughness)
+                } else {
+                    Vec::new()
+                };
+                ci_char_detail = ci_char_detail_vec;
+
+                // --include-font: inject into CI audit list so it shows in diagnostic
+                if let Some(ref include) = args.include_font {
+                    let include_lc = include.to_lowercase();
                     for fe in &font_catalog {
                         let key = fe.font_key();
-                        if key.to_lowercase().contains(&force_lc) && !ci_top_for_audit.iter().any(|(n, _)| n == &key) {
-                            ci_top_for_audit.push((key, -999.0)); // sentinel score = forced
+                        if key.to_lowercase().contains(&include_lc) && !ci_top_for_audit.iter().any(|(n, _)| n == &key) {
+                            ci_top_for_audit.push((key, -999.0)); // sentinel score = included
                         }
                     }
                 }
@@ -527,12 +550,12 @@ fn run(args: &cli::Args) -> Result<(), ScanTextError> {
                     let ci_cap = 20;
                     let mut top_names: Vec<String> = ci_results.iter().take(ci_cap).map(|(n, _)| n.clone()).collect();
 
-                    // --force-font: inject any font_catalog entries matching the substring
-                    if let Some(ref force) = args.force_font {
-                        let force_lc = force.to_lowercase();
+                    // --include-font: inject any font_catalog entries matching the substring
+                    if let Some(ref include) = args.include_font {
+                        let include_lc = include.to_lowercase();
                         for fe in &font_catalog {
                             let key = fe.font_key();
-                            if key.to_lowercase().contains(&force_lc) && !top_names.iter().any(|n| n == &key) {
+                            if key.to_lowercase().contains(&include_lc) && !top_names.iter().any(|n| n == &key) {
                                 top_names.push(key);
                             }
                         }
@@ -622,7 +645,7 @@ fn run(args: &cli::Args) -> Result<(), ScanTextError> {
                 eprintln!("  LINE {}: {:.1}s '{:.30}…'", li, line_elapsed.as_secs_f32(),
                     line.words.iter().map(|w| w.text.as_str()).collect::<Vec<_>>().join(" "));
             }
-            LineMatch { font_result, text_color, ci_top_for_audit, word_rerank_winner_name, word_diag_entries }
+            LineMatch { font_result, text_color, ci_top_for_audit, ci_char_detail, word_rerank_winner_name, word_diag_entries, diag_seg_dir }
         }).collect();
         let fontmatch_elapsed = fontmatch_start.elapsed();
         eprintln!("  Font matching: {:.1}s ({} lines)", fontmatch_elapsed.as_secs_f32(), lines.len());
@@ -634,12 +657,23 @@ fn run(args: &cli::Args) -> Result<(), ScanTextError> {
                 let ci_cands: Vec<diagnostic::CiCandidate> = lm.ci_top_for_audit.iter()
                     .map(|(k, s)| diagnostic::CiCandidate { font_key: k.clone(), score: *s })
                     .collect();
+                let ci_char_votes: Vec<diagnostic::CharCiVote> = lm.ci_char_detail.iter()
+                    .map(|d| diagnostic::CharCiVote {
+                        ch: d.ch,
+                        crop_index: d.crop_index,
+                        min_dist_sq: d.min_dist_sq,
+                        passed_gate: d.passed_gate,
+                        nearest: d.nearest.clone(),
+                        crop_path: None,
+                    })
+                    .collect();
                 dc.current_page_mut().lines.push(diagnostic::LineDiag {
                     line_index: li,
                     text: line.text.clone(),
                     ocr_confidence: line.confidence,
                     bbox: [line.x, line.y, line.width, line.height],
                     ci_candidates: ci_cands,
+                    ci_char_votes,
                     words: std::mem::take(&mut lm.word_diag_entries.clone()),
                     word_rerank_winner: lm.word_rerank_winner_name.clone(),
                     final_font: lm.font_result.as_ref().map(|f| f.font_name.clone()),
@@ -817,6 +851,29 @@ fn run(args: &cli::Args) -> Result<(), ScanTextError> {
                     text_color.0,
                     text_color.1,
                     text_color.2,
+                );
+            }
+
+            // ── Diag-seg line-level summary ──────────────────────────
+            if let Some(ref ddir) = lm.diag_seg_dir {
+                let fname = font_result.as_ref().map(|f| f.font_name.as_str()).unwrap_or("?");
+                let fscore = font_result.as_ref().map(|f| f.score).unwrap_or(0.0);
+                let line_summary = serde_json::json!({
+                    "page": page_idx + 1,
+                    "line_index": li,
+                    "text": &line.text,
+                    "font_matched": fname,
+                    "font_score": fscore,
+                    "ssim_score": ssim_score,
+                    "word_rerank_winner": &lm.word_rerank_winner_name,
+                    "ci_top_5": lm.ci_top_for_audit.iter().take(5)
+                        .map(|(k, s)| serde_json::json!({"font": k, "score": s}))
+                        .collect::<Vec<_>>(),
+                    "decision": if keep_raster { "raster" } else { "vectorized" },
+                });
+                let _ = std::fs::write(
+                    ddir.join("line_summary.json"),
+                    serde_json::to_string_pretty(&line_summary).unwrap_or_default(),
                 );
             }
 

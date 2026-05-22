@@ -456,6 +456,10 @@ pub fn match_font<'a>(
             );
         }
 
+        if top_candidates.is_empty() {
+            return None;
+        }
+
         info!("  rerank: {} candidates within {:.1}× (floor={:.3}), coarse best='{}'({:.3}) for '{:.40}…'",
             top_candidates.len(),
             RERANK_SCORE_FACTOR,
