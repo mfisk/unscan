@@ -1964,25 +1964,43 @@ pub struct CharSearchResult {
 /// Returns top `top_n` fonts by geometric-mean distance (ascending = best).
 /// The returned f32 score is negated log-geometric-mean so that higher = better,
 /// matching the convention expected by downstream callers.
+/// Per-character CI detail, collected from the real search_candidates loop.
+#[derive(Debug, Clone)]
+pub struct CharCiDetail {
+    pub ch: char,
+    pub crop_index: usize,
+    pub min_dist_sq: f32,
+    pub passed_gate: bool,
+    /// Top-3 nearest fonts (name, dist_sq).
+    pub nearest: Vec<(String, f32)>,
+}
+
+/// Result of `search_candidates`: ranked font scores + per-character CI detail.
+pub struct CiSearchResult {
+    pub scores: Vec<(String, f32)>,
+    pub char_detail: Vec<CharCiDetail>,
+}
+
 pub fn search_candidates(
     index: &CharIndex,
     char_crops: &[(char, GrayImage)],
     thoroughness: f32,
-) -> Vec<(String, f32)> {
+) -> CiSearchResult {
     if char_crops.is_empty() {
-        return Vec::new();
+        return CiSearchResult { scores: Vec::new(), char_detail: Vec::new() };
     }
 
     // Pre-compute weighted feature vectors for all crops
-    let crop_feats: Vec<(char, [f32; FEAT_LEN])> = char_crops
+    let crop_feats: Vec<(usize, char, [f32; FEAT_LEN])> = char_crops
         .iter()
-        .filter_map(|(c, img)| {
-            compute_features(img).map(|f| (*c, f.as_weighted_slice()))
+        .enumerate()
+        .filter_map(|(i, (c, img))| {
+            compute_features(img).map(|f| (i, *c, f.as_weighted_slice()))
         })
         .collect();
 
     if crop_feats.is_empty() {
-        return Vec::new();
+        return CiSearchResult { scores: Vec::new(), char_detail: Vec::new() };
     }
 
     let n_chars = crop_feats.len();
@@ -1997,8 +2015,9 @@ pub fn search_candidates(
     let mut quality_gate_pass = 0usize;
     let mut quality_gate_fail = 0usize;
     let mut no_tree = 0usize;
+    let mut char_detail: Vec<CharCiDetail> = Vec::with_capacity(crop_feats.len());
 
-    for (c, query_feat) in &crop_feats {
+    for (crop_idx, c, query_feat) in &crop_feats {
         let weight = char_weight(*c);
 
         // Find nearest neighbor + everything within (2.5 × thoroughness)× that distance.
@@ -2011,11 +2030,34 @@ pub fn search_candidates(
 
         // Quality gate: scaled by thoroughness (default 0.5, higher = more permissive)
         let min_dist_sq = hits.iter().map(|(_, d)| *d).fold(f32::INFINITY, f32::min);
-        if min_dist_sq > 0.5 * thoroughness {
+        let passed_gate = min_dist_sq <= 0.5 * thoroughness;
+        if !passed_gate {
             quality_gate_fail += 1;
+        } else {
+            quality_gate_pass += 1;
+        }
+
+        // Collect per-char detail from the real search
+        let mut sorted_hits = hits.clone();
+        sorted_hits.sort_by(|a, b| a.1.partial_cmp(&b.1).unwrap_or(std::cmp::Ordering::Equal));
+        let nearest: Vec<(String, f32)> = sorted_hits.iter()
+            .take(3)
+            .filter_map(|(font_id, d)| {
+                let name = index.font_names_table.get(*font_id)?;
+                Some((name.clone(), *d))
+            })
+            .collect();
+        char_detail.push(CharCiDetail {
+            ch: *c,
+            crop_index: *crop_idx,
+            min_dist_sq,
+            passed_gate,
+            nearest,
+        });
+
+        if !passed_gate {
             continue;
         }
-        quality_gate_pass += 1;
 
         for (font_id, dist_sq) in &hits {
 
@@ -2132,7 +2174,7 @@ pub fn search_candidates(
         }
     }
 
-    scores
+    CiSearchResult { scores, char_detail }
 }
 
 /// Search the index for a single character and return detailed results.
@@ -2177,72 +2219,13 @@ pub fn search_single_char(
     })
 }
 
-/// Per-character CI detail for diagnostics.
-#[derive(Debug, Clone)]
-pub struct CharCiDetail {
-    pub ch: char,
-    pub crop_index: usize,
-    pub min_dist_sq: f32,
-    pub passed_gate: bool,
-    /// Top-3 nearest fonts (name, dist_sq).
-    pub nearest: Vec<(String, f32)>,
-}
-
-/// Return per-character CI detail for a set of crops.
-/// This is the diagnostic companion to `search_candidates`.
-pub fn per_char_ci_detail(
-    index: &CharIndex,
-    char_crops: &[(char, GrayImage)],
-    thoroughness: f32,
-) -> Vec<CharCiDetail> {
-    let crop_feats: Vec<(usize, char, [f32; FEAT_LEN])> = char_crops
-        .iter()
-        .enumerate()
-        .filter_map(|(i, (c, img))| {
-            compute_features(img).map(|f| (i, *c, f.as_weighted_slice()))
-        })
-        .collect();
-
-    let mut results = Vec::with_capacity(crop_feats.len());
-    for (idx, c, query_feat) in &crop_feats {
-        let hits: Vec<(usize, f32)> = if let Some(points) = index.flat_vecs.get(c) {
-            nearest_within_factor_brute(points, query_feat, 2.5 * thoroughness)
-        } else {
-            Vec::new()
-        };
-
-        let min_dist_sq = hits.iter().map(|(_, d)| *d).fold(f32::INFINITY, f32::min);
-        let passed_gate = min_dist_sq <= 0.5 * thoroughness;
-
-        // Top-3 nearest by distance
-        let mut sorted_hits = hits.clone();
-        sorted_hits.sort_by(|a, b| a.1.partial_cmp(&b.1).unwrap_or(std::cmp::Ordering::Equal));
-        let nearest: Vec<(String, f32)> = sorted_hits.iter()
-            .take(3)
-            .filter_map(|(font_id, d)| {
-                let name = index.font_names_table.get(*font_id)?;
-                Some((name.clone(), *d))
-            })
-            .collect();
-
-        results.push(CharCiDetail {
-            ch: *c,
-            crop_index: *idx,
-            min_dist_sq,
-            passed_gate,
-            nearest,
-        });
-    }
-    results
-}
-
 /// Legacy API — thin wrapper around search_candidates for backward compat.
 pub fn match_line_chars(
     crops: &[(char, GrayImage)],
     index: &CharIndex,
     _top_n: usize,
 ) -> Vec<(String, f32)> {
-    search_candidates(index, crops, 1.0)
+    search_candidates(index, crops, 1.0).scores
 }
 
 /// Cosine similarity between two feature vectors.
