@@ -101,11 +101,18 @@ pub struct Args {
     #[arg(long, default_value_t = 1.0)]
     pub thoroughness: f32,
 
-    /// Force a font into word-level SSIM reranking for every line, even if CI
+    /// Include a font in word-level SSIM reranking for every line, even if CI
     /// didn't select it. Substring match against font name (case-insensitive).
-    /// Useful with --diagnostic to see how a known-correct font renders.
+    /// Useful with --diagnostic to see how a known-correct font scores.
     #[arg(long, value_name = "NAME")]
-    pub force_font: Option<String>,
+    pub include_font: Option<String>,
+
+    /// Dump per-word segmentation diagnostics: OCR bboxes, VP splits,
+    /// seam splits, charbox fallback, final char crops, and images for
+    /// each pass.  Writes to the specified directory.
+    /// Use with a small test PDF to inspect the full segmentation pipeline.
+    #[arg(long, value_name = "DIR")]
+    pub diag_seg: Option<PathBuf>,
 }
 
 impl Args {

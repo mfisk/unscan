@@ -238,22 +238,10 @@ pub fn expand_bbox_to_ink(lines: &mut [TextLine], gray: &GrayImage, ink_threshol
         line.y = new_y;
         line.height = new_h;
 
-        // ── expand each word bbox the same way ──────────────────────
-        for word in line.words.iter_mut() {
-            let wx = word.x.min(page_w.saturating_sub(1));
-            let ww = word.width.min(page_w - wx);
-            let w_search_top = word.y.saturating_sub(margin);
-            let w_search_bot = (word.y + word.height + margin).min(page_h);
-
-            let (w_ink_top, w_ink_bot) = ink_vertical_extent(
-                gray, wx, ww, w_search_top, w_search_bot, ink_threshold,
-            );
-
-            let w_new_y = w_ink_top.min(word.y);
-            let w_new_bottom = w_ink_bot.max(word.y + word.height);
-            word.y = w_new_y;
-            word.height = w_new_bottom.saturating_sub(w_new_y);
-        }
+        // ── NOTE: word bboxes are NOT expanded ─────────────────────
+        // The line-level expansion above covers ascenders/descenders.
+        // Expanding individual word bboxes grabs adjacent-line text
+        // that corrupts character segmentation downstream.
     }
 
     if expanded_count > 0 {
