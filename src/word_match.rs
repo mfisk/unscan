@@ -12,7 +12,7 @@ use image::{GrayImage, Luma};
 use log::debug;
 use std::collections::HashMap;
 
-use crate::diagnostic;
+use crate::audit;
 
 /// Word rerank uses all CI candidates — no artificial cap.
 
@@ -59,14 +59,14 @@ pub struct WordRerankDiagCtx {
 /// Returns the font name that wins the majority vote across words, or None
 /// if no words could be matched.
 ///
-/// When `diag` is Some, saves crop/render images and populates word-level
-/// diagnostic entries on the collector.
+/// When `audit_imgs` is Some, saves crop/render images and populates word-level
+/// audit entries.
 pub fn word_level_rerank(
     page_gray: &GrayImage,
     words: &[WordBBox],
     candidates: &[WordMatchCandidate],
-    diag: Option<(&diagnostic::DiagCollector, &WordRerankDiagCtx)>,
-) -> (Option<String>, Vec<diagnostic::WordDiag>) {
+    audit_imgs: Option<(&audit::AuditImageDir, &WordRerankDiagCtx)>,
+) -> (Option<String>, Vec<audit::WordAudit>) {
     if candidates.is_empty() || words.is_empty() {
         return (None, Vec::new());
     }
@@ -111,7 +111,7 @@ pub fn word_level_rerank(
 
     let mut font_votes: HashMap<&str, u32> = HashMap::new();
     let mut total_words = 0u32;
-    let mut word_diags: Vec<diagnostic::WordDiag> = Vec::new();
+    let mut word_diags: Vec<audit::WordAudit> = Vec::new();
 
     for (wi, word) in usable_words.iter().enumerate() {
         // Crop word from page, clamped to line vertical bounds
@@ -133,9 +133,9 @@ pub fn word_level_rerank(
         // Trim vertical whitespace — Tesseract bboxes include interline gap
         let crop = trim_whitespace(&raw_crop);
 
-        // Save crop for diagnostic
-        let crop_path = if let Some((dc, ctx)) = &diag {
-            dc.save_crop(ctx.page, ctx.line, wi, &word.text, &crop)
+        // Save crop for audit
+        let crop_path = if let Some((aid, ctx)) = &audit_imgs {
+            aid.save_crop(ctx.page, ctx.line, wi, &word.text, &crop)
         } else {
             String::new()
         };
@@ -143,8 +143,8 @@ pub fn word_level_rerank(
         // Score all candidates
         let mut all_scores: Vec<(&str, f32, i32, Option<image::GrayImage>)> = Vec::new();
 
-        // Save the crop as SSIM actually sees it (trimmed) for diagnostic
-        let mut diag_crop_saved = false;
+        // Save the crop as SSIM actually sees it (trimmed) for audit
+        let mut audit_crop_saved = false;
 
         for (fname, font) in &parsed {
             let rendered = match render_word(font, &word.text, crop.width(), crop.height()) {
@@ -155,21 +155,19 @@ pub fn word_level_rerank(
             let result = ssim_compare(&crop, &rendered);
 
             // Save the SSIM-processed crop once (same for all candidates)
-            if !diag_crop_saved && diag.is_some() {
-                if let Some((dc, ctx)) = &diag {
+            if !audit_crop_saved && audit_imgs.is_some() {
+                if let Some((aid, ctx)) = &audit_imgs {
                     let compared_crop_path = format!("crops/p{}_l{}_w{}_{}_compared.png",
                         ctx.page, ctx.line, wi,
                         word.text.chars().take(15)
                             .map(|c| if c.is_alphanumeric() { c } else { '_' })
                             .collect::<String>());
-                    let _ = result.crop_compared.save(dc.dir.join(&compared_crop_path));
+                    let _ = result.crop_compared.save(aid.dir.join(&compared_crop_path));
                 }
-                diag_crop_saved = true;
+                audit_crop_saved = true;
             }
 
-            let rc_w = result.render_compared.width();
-            let rc_h = result.render_compared.height();
-            let diag_render = if diag.is_some() {
+            let diag_render = if audit_imgs.is_some() {
                 Some(result.render_compared)
             } else {
                 None
@@ -188,21 +186,21 @@ pub fn word_level_rerank(
             }
         }
 
-        // Collect diagnostic for this word
-        if let Some((dc, ctx)) = &diag {
-            let mut cand_diags: Vec<diagnostic::WordCandidateScore> = Vec::new();
+        // Collect audit entry for this word
+        if let Some((aid, ctx)) = &audit_imgs {
+            let mut cand_entries: Vec<audit::WordCandidateAudit> = Vec::new();
             // Save top 5 renders — these are the actual images SSIM compared
             for (rank, (fname, ssim_score, dy, rendered_opt)) in all_scores.iter().enumerate() {
                 let render_path = if rank < 5 {
                     if let Some(ref rendered) = rendered_opt {
-                        dc.save_render(ctx.page, ctx.line, wi, fname, rendered)
+                        aid.save_render(ctx.page, ctx.line, wi, fname, rendered)
                     } else {
                         String::new()
                     }
                 } else {
                     String::new()
                 };
-                cand_diags.push(diagnostic::WordCandidateScore {
+                cand_entries.push(audit::WordCandidateAudit {
                     font_key: fname.to_string(),
                     ssim: *ssim_score,
                     dy: *dy,
@@ -212,11 +210,11 @@ pub fn word_level_rerank(
             }
 
             let winner = all_scores.first().map(|(n, _, _, _)| n.to_string());
-            word_diags.push(diagnostic::WordDiag {
+            word_diags.push(audit::WordAudit {
                 text: word.text.clone(),
                 bbox: [word.x, crop_y, word.width, crop_h],
                 crop_path,
-                candidates: cand_diags,
+                candidates: cand_entries,
                 winner,
             });
         }

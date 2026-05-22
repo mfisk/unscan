@@ -88,11 +88,11 @@ pub struct Args {
     #[arg(long)]
     pub compare: bool,
 
-    /// Generate a full diagnostic HTML report with CI candidates, word-level
-    /// SSIM scores, crop images, and rendered comparisons. Writes to the
-    /// specified directory (creates it if needed).
-    #[arg(long, value_name = "DIR")]
-    pub diagnostic: Option<PathBuf>,
+    /// Include a font in word-level SSIM reranking for every line, even if CI
+    /// didn't select it. Substring match against font name (case-insensitive).
+    /// Useful for diagnosing why a known-correct font scores poorly in the audit.
+    #[arg(long, value_name = "NAME")]
+    pub include_font: Option<String>,
 
     /// Thoroughness factor for font matching. Default 1.0.
     /// Higher values relax all CI thresholds (quorum, quality gate, kd-tree
@@ -100,12 +100,6 @@ pub struct Args {
     /// Useful for diagnosing why a known font isn't being matched.
     #[arg(long, default_value_t = 1.0)]
     pub thoroughness: f32,
-
-    /// Include a font in word-level SSIM reranking for every line, even if CI
-    /// didn't select it. Substring match against font name (case-insensitive).
-    /// Useful with --diagnostic to see how a known-correct font scores.
-    #[arg(long, value_name = "NAME")]
-    pub include_font: Option<String>,
 
     /// Dump per-word segmentation diagnostics: OCR bboxes, VP splits,
     /// seam splits, charbox fallback, final char crops, and images for

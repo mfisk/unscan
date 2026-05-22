@@ -14,7 +14,6 @@ mod page_cache;
 mod pdf_out;
 mod smooth;
 mod word_match;
-mod diagnostic;
 pub(crate) mod verify;
 
 use crate::audit::{AuditEntry, AuditLog, BBox, Decision, GeometryEntry, PageSummary};
@@ -297,13 +296,10 @@ fn run(args: &cli::Args) -> Result<(), ScanTextError> {
     let input = args.input.as_ref().expect("input validated");
     let output = args.output.as_ref().expect("output validated");
 
-    // ── Diagnostic collector (optional) ──────────────────────────────
-    let diag_collector: Option<std::sync::Mutex<diagnostic::DiagCollector>> = if let Some(ref dir) = args.diagnostic {
-        let mut dc = diagnostic::DiagCollector::new(dir)?;
-        dc.thoroughness = args.thoroughness;
-        Some(std::sync::Mutex::new(dc))
-    } else {
-        None
+    // ── Audit image directory (created alongside audit JSON) ──────────
+    let audit_image_dir: Option<audit::AuditImageDir> = {
+        let audit_path = args.audit_log_path();
+        audit::AuditImageDir::from_audit_path(&audit_path).ok()
     };
 
     let input_size = std::fs::metadata(input).map(|m| m.len()).unwrap_or(0);
@@ -390,9 +386,6 @@ fn run(args: &cli::Args) -> Result<(), ScanTextError> {
     let mut stat_raster_frags = 0u32;
 
     for (page_idx, page_img) in pages.iter().enumerate() {
-        if let Some(ref dc) = diag_collector {
-            dc.lock().unwrap().start_page(page_idx + 1);
-        }
         info!(
             "━━━ Page {} ({} × {} px) ━━━",
             page_idx + 1,
@@ -446,7 +439,7 @@ fn run(args: &cli::Args) -> Result<(), ScanTextError> {
             ci_top_for_audit: Vec<(String, f32)>,
             ci_char_detail: Vec<char_index::CharCiDetail>,
             word_rerank_winner_name: Option<String>,
-            word_diag_entries: Vec<diagnostic::WordDiag>,
+            word_audit_entries: Vec<audit::WordAudit>,
             diag_seg_dir: Option<std::path::PathBuf>,
         }
 
@@ -472,7 +465,7 @@ fn run(args: &cli::Args) -> Result<(), ScanTextError> {
             let mut ci_top_for_audit: Vec<(String, f32)> = Vec::new();
             let mut ci_char_detail: Vec<char_index::CharCiDetail> = Vec::new();
             let mut word_rerank_winner_name: Option<String> = None;
-            let mut word_diag_entries: Vec<diagnostic::WordDiag> = Vec::new();
+            let mut word_audit_entries: Vec<audit::WordAudit> = Vec::new();
             let diag_seg_dir: Option<std::path::PathBuf> = args.diag_seg.as_ref().map(|d| {
                 let line_slug: String = line.text.chars().take(30)
                     .map(|c| if c.is_alphanumeric() { c } else { '_' })
@@ -514,19 +507,12 @@ fn run(args: &cli::Args) -> Result<(), ScanTextError> {
                     }
                 }
 
-                let ci_results = char_index::search_candidates(&char_index, &char_crops, args.thoroughness);
-                ci_top_for_audit = ci_results.iter()
+                let ci_result = char_index::search_candidates(&char_index, &char_crops, args.thoroughness);
+                ci_top_for_audit = ci_result.scores.iter()
                     .map(|(name, score)| (name.clone(), *score)).collect();
+                ci_char_detail = ci_result.char_detail;
 
-                // Collect per-character CI detail when diagnostic mode is active
-                let ci_char_detail_vec = if diag_collector.is_some() {
-                    char_index::per_char_ci_detail(&char_index, &char_crops, args.thoroughness)
-                } else {
-                    Vec::new()
-                };
-                ci_char_detail = ci_char_detail_vec;
-
-                // --include-font: inject into CI audit list so it shows in diagnostic
+                // --include-font: inject into CI audit list so it shows in audit
                 if let Some(ref include) = args.include_font {
                     let include_lc = include.to_lowercase();
                     for fe in &font_catalog {
@@ -541,14 +527,14 @@ fn run(args: &cli::Args) -> Result<(), ScanTextError> {
                 // Use the top N char-level candidates and rerank using
                 // full-word SSIM — word bboxes are reliable even when
                 // character bboxes are noisy.
-                let word_rerank_result: Option<font_match::FontMatchResult> = if ci_results.is_empty() {
+                let word_rerank_result: Option<font_match::FontMatchResult> = if ci_result.scores.is_empty() {
                     None
                 } else {
                     // CI results are pre-sorted by score (descending = better match).
                     // Cap to top 20 to keep word-level SSIM tractable — beyond ~20
                     // the char-index scores are too close to discriminate anyway.
                     let ci_cap = 20;
-                    let mut top_names: Vec<String> = ci_results.iter().take(ci_cap).map(|(n, _)| n.clone()).collect();
+                    let mut top_names: Vec<String> = ci_result.scores.iter().take(ci_cap).map(|(n, _)| n.clone()).collect();
 
                     // --include-font: inject any font_catalog entries matching the substring
                     if let Some(ref include) = args.include_font {
@@ -591,17 +577,13 @@ fn run(args: &cli::Args) -> Result<(), ScanTextError> {
                             page: page_idx + 1,
                             line: li,
                         };
-                        let diag_arg = diag_collector.as_ref().map(|dc| {
-                            dc.lock().unwrap()
-                        });
-                        // Build the Option<(&DiagCollector, &ctx)> from the guard
-                        let diag_param = diag_arg.as_ref().map(|guard| {
-                            (std::ops::Deref::deref(guard), &diag_ctx)
+                        let audit_param = audit_image_dir.as_ref().map(|aid| {
+                            (aid, &diag_ctx)
                         });
                         let (winner, wd) = word_match::word_level_rerank(
-                            &gray_page, &wbboxes, &candidates, diag_param,
+                            &gray_page, &wbboxes, &candidates, audit_param,
                         );
-                        word_diag_entries = wd;
+                        word_audit_entries = wd;
                         winner.and_then(|winner_name| {
                                 font_catalog.iter().find(|fe| {
                                     fe.font_key() == winner_name
@@ -628,7 +610,7 @@ fn run(args: &cli::Args) -> Result<(), ScanTextError> {
                     // to the full 4,700+ font catalog — ungated coarse scoring
                     // takes 15-25s per line and wastes minutes on text the char
                     // index couldn't resolve (attribution lines, watermarks).
-                    let ci_keys: std::collections::HashSet<String> = ci_results.into_iter().map(|(name, _score)| name).collect();
+                    let ci_keys: std::collections::HashSet<String> = ci_result.scores.into_iter().map(|(name, _score)| name).collect();
                     if ci_keys.is_empty() {
                         None
                     } else {
@@ -645,42 +627,10 @@ fn run(args: &cli::Args) -> Result<(), ScanTextError> {
                 eprintln!("  LINE {}: {:.1}s '{:.30}…'", li, line_elapsed.as_secs_f32(),
                     line.words.iter().map(|w| w.text.as_str()).collect::<Vec<_>>().join(" "));
             }
-            LineMatch { font_result, text_color, ci_top_for_audit, ci_char_detail, word_rerank_winner_name, word_diag_entries, diag_seg_dir }
+            LineMatch { font_result, text_color, ci_top_for_audit, ci_char_detail, word_rerank_winner_name, word_audit_entries, diag_seg_dir }
         }).collect();
         let fontmatch_elapsed = fontmatch_start.elapsed();
         eprintln!("  Font matching: {:.1}s ({} lines)", fontmatch_elapsed.as_secs_f32(), lines.len());
-
-        // ── Populate diagnostic from line_matches ───────────────────
-        if let Some(ref dc) = diag_collector {
-            let mut dc = dc.lock().unwrap();
-            for (li, (line, lm)) in lines.iter().zip(line_matches.iter()).enumerate() {
-                let ci_cands: Vec<diagnostic::CiCandidate> = lm.ci_top_for_audit.iter()
-                    .map(|(k, s)| diagnostic::CiCandidate { font_key: k.clone(), score: *s })
-                    .collect();
-                let ci_char_votes: Vec<diagnostic::CharCiVote> = lm.ci_char_detail.iter()
-                    .map(|d| diagnostic::CharCiVote {
-                        ch: d.ch,
-                        crop_index: d.crop_index,
-                        min_dist_sq: d.min_dist_sq,
-                        passed_gate: d.passed_gate,
-                        nearest: d.nearest.clone(),
-                        crop_path: None,
-                    })
-                    .collect();
-                dc.current_page_mut().lines.push(diagnostic::LineDiag {
-                    line_index: li,
-                    text: line.text.clone(),
-                    ocr_confidence: line.confidence,
-                    bbox: [line.x, line.y, line.width, line.height],
-                    ci_candidates: ci_cands,
-                    ci_char_votes,
-                    words: std::mem::take(&mut lm.word_diag_entries.clone()),
-                    word_rerank_winner: lm.word_rerank_winner_name.clone(),
-                    final_font: lm.font_result.as_ref().map(|f| f.font_name.clone()),
-                    final_score: lm.font_result.as_ref().map(|f| f.score),
-                });
-            }
-        }
 
         // ── Pass 1.5: Paragraph-level font grouping ─────────────────
         // Find the dominant body font: most common font among matched lines
@@ -894,8 +844,21 @@ fn run(args: &cli::Args) -> Result<(), ScanTextError> {
                     width: line.width,
                     height: line.height,
                 },
-                ci_top: if lm.ci_top_for_audit.is_empty() { None } else { Some(lm.ci_top_for_audit.clone()) },
+                ci_candidates: lm.ci_top_for_audit.iter()
+                    .map(|(k, s)| audit::CiCandidate { font_key: k.clone(), score: *s })
+                    .collect(),
                 word_rerank_winner: lm.word_rerank_winner_name.clone(),
+                ci_char_votes: lm.ci_char_detail.iter()
+                    .map(|d| audit::CharCiVote {
+                        ch: d.ch,
+                        crop_index: d.crop_index,
+                        min_dist_sq: d.min_dist_sq,
+                        passed_gate: d.passed_gate,
+                        nearest: d.nearest.clone(),
+                        crop_path: None,
+                    })
+                    .collect(),
+                words: lm.word_audit_entries.clone(),
             });
 
             placed_texts.push(pdf_out::PlacedText {
@@ -1125,6 +1088,7 @@ fn run(args: &cli::Args) -> Result<(), ScanTextError> {
         input_size_bytes: input_size,
         output_size_bytes: output_size,
         compression_ratio: ratio,
+        images_dir: audit_image_dir.as_ref().map(|aid| aid.rel_dir()),
         pages: page_summaries,
         text_entries: audit_text,
         geometry_entries: audit_geo,
@@ -1153,14 +1117,6 @@ fn run(args: &cli::Args) -> Result<(), ScanTextError> {
     info!("  Ratio:       {:.1}× smaller", ratio);
     info!("━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━");
     info!("Output: {}", output.display());
-
-    // ── 6. Write diagnostic report ──────────────────────────────────
-    if let Some(dc) = diag_collector {
-        let dc = dc.into_inner().unwrap();
-        if let Err(e) = dc.finish() {
-            warn!("Failed to write diagnostic report: {}", e);
-        }
-    }
 
     Ok(())
 }
