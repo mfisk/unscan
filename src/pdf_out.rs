@@ -176,13 +176,13 @@ pub fn extract_raster_fragment(
 // PDF generation
 // ---------------------------------------------------------------------------
 
-pub fn generate_pdf(output_path: &Path, pages: &[PageContent], overlay: bool) -> Result<(), ScanTextError> {
+pub fn generate_pdf(output_path: &Path, pages: &[PageContent], overlay: bool, font_cache: &crate::font_cache::FontCache) -> Result<(), ScanTextError> {
     let mut doc = Document::with_version("1.7");
     let pages_id = doc.new_object_id();
 
     // ── Collect unique chars per font path ───────────────────────────
     let mut font_chars: HashMap<PathBuf, HashSet<char>> = HashMap::new();
-    let mut font_data_map: HashMap<PathBuf, Vec<u8>> = HashMap::new();
+    let mut font_data_map: HashMap<PathBuf, std::sync::Arc<Vec<u8>>> = HashMap::new();
     for page in pages {
         for tr in &page.text_regions {
             if tr.keep_raster { continue; }
@@ -197,7 +197,10 @@ pub fn generate_pdf(output_path: &Path, pages: &[PageContent], overlay: bool) ->
                     chars.extend(tr.text.chars());
                 }
                 font_data_map.entry(fm.font_path.clone())
-                    .or_insert_with(|| fm.font_data.clone());
+                    .or_insert_with(|| {
+                        font_cache.load(&fm.font_path)
+                            .unwrap_or_else(|_| std::sync::Arc::new(Vec::new()))
+                    });
             }
         }
     }
@@ -211,7 +214,7 @@ pub fn generate_pdf(output_path: &Path, pages: &[PageContent], overlay: bool) ->
         let name = format!("F{font_counter}");
         font_counter += 1;
         let font_data = &font_data_map[font_path];
-        let (id, cid_map) = embed_subsetted_font(&mut doc, font_data, &name, chars)?;
+        let (id, cid_map) = embed_subsetted_font(&mut doc, font_data.as_slice(), &name, chars)?;
         font_map.insert(font_path.clone(), (id, name, cid_map));
     }
 
@@ -325,7 +328,8 @@ for tr in &page.text_regions {
                 &tr.text[..tr.text.len().min(30)], tr.words.len(), tr.font_match.is_some());
             if !tr.words.is_empty() && tr.font_match.is_some() {
                 let fm = tr.font_match.as_ref().unwrap();
-                let font_ok = ab_glyph::FontRef::try_from_slice(&fm.font_data).ok();
+                let font_bytes = font_cache.load(&fm.font_path).ok();
+                let font_ok = font_bytes.as_ref().and_then(|b| ab_glyph::FontRef::try_from_slice(b.as_slice()).ok());
 
                 if overlay {
                     ops.push(op("gs", &[Object::Name(b"GS_overlay".to_vec())]));

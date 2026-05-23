@@ -12,3 +12,4 @@ test-docs/berkeley-output*.pdf
 # Test artifacts
 *.audit.json
 test-docs/diag-images/
+test-docs/font-timeline-specimen-rasterized.pdf.old

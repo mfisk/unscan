@@ -15,7 +15,7 @@ use crate::pdf_out::PlacedText;
 /// median of the survivors into `word.smoothed_em_px`.
 ///
 /// The PDF renderer will prefer `smoothed_em_px` over recalculating per-word.
-pub fn smooth_font_sizes(entries: &mut [PlacedText], dpi: f32) {
+pub fn smooth_font_sizes(entries: &mut [PlacedText], dpi: f32, font_cache: &crate::font_cache::FontCache) {
     if entries.is_empty() {
         return;
     }
@@ -45,20 +45,23 @@ pub fn smooth_font_sizes(entries: &mut [PlacedText], dpi: f32) {
         }
 
         // Process this run: [run_start .. run_end)
-        smooth_run(&mut entries[run_start..run_end], dpi);
+        smooth_run(&mut entries[run_start..run_end], dpi, font_cache);
         run_start = run_end;
     }
 }
 
 /// Smooth a single run of entries that all share the same font file.
-fn smooth_run(run: &mut [PlacedText], dpi: f32) {
+fn smooth_run(run: &mut [PlacedText], dpi: f32, font_cache: &crate::font_cache::FontCache) {
     if run.is_empty() {
         return;
     }
 
-    // Clone font data up front to avoid borrow conflict with mutable pass later.
+    // Load font data via shared cache.
     let font_data = match run[0].font_match {
-        Some(ref fm) => fm.font_data.clone(),
+        Some(ref fm) => match font_cache.load(&fm.font_path) {
+            Ok(d) => d,
+            Err(_) => return,
+        },
         None => return,
     };
     let font = match ab_glyph::FontRef::try_from_slice(&font_data) {

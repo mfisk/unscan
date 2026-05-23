@@ -179,12 +179,10 @@ impl CharFeatures {
         v
     }
 
-    /// Weighted-normalised feature vector for matching.
+    /// Weighted feature vector for matching.
     ///
-    /// L2-normalises three groups independently then weights them:
-    ///   - 32-bin column profile: weight 0.40
-    ///   - 7 original scalars:    weight 0.30
-    ///   - 18 new v2 features:    weight 0.30
+    /// Per-feature weights from Fisher discriminant analysis (signal/noise ratio)
+    /// over 353K index entries and 9K rasterized scan crops.
     pub fn as_weighted_slice(&self) -> [f32; FEAT_LEN] {
         let mut v = [0.0f32; FEAT_LEN];
 
@@ -914,15 +912,27 @@ impl CharIndex {
                 continue;
             }
 
-            // Build flat vec of (font_id, weighted_features)
+            // Build flat vec of (font_id, weighted_features), deduplicating
+            // identical weighted vectors.  OT variants that render the same glyph
+            // produce identical features; keeping them wastes memory and dilutes
+            // between-font variance.  Variants that genuinely differ are preserved.
             let mut points: Vec<(usize, [f32; FEAT_LEN])> = Vec::with_capacity(char_entries.len());
-            let mut all_weighted: Vec<[f32; FEAT_LEN]> = Vec::with_capacity(char_entries.len());
+            let mut seen: std::collections::HashSet<[u32; FEAT_LEN]> = std::collections::HashSet::new();
 
             for e in char_entries {
                 let weighted = e.features.as_weighted_slice();
-                if let Some(&font_id) = name_to_id.get(e.font_name.as_str()) {
-                    points.push((font_id, weighted));
-                    all_weighted.push(weighted);
+                // Round to f32 bit pattern for dedup (exact match)
+                let key: [u32; FEAT_LEN] = {
+                    let mut k = [0u32; FEAT_LEN];
+                    for (i, &v) in weighted.iter().enumerate() {
+                        k[i] = v.to_bits();
+                    }
+                    k
+                };
+                if seen.insert(key) {
+                    if let Some(&font_id) = name_to_id.get(e.font_name.as_str()) {
+                        points.push((font_id, weighted));
+                    }
                 }
             }
 
@@ -931,9 +941,9 @@ impl CharIndex {
             }
 
             // Compute per-dimension mean and σ
-            let n = all_weighted.len() as f32;
+            let n = points.len() as f32;
             let mut means = [0.0f32; FEAT_LEN];
-            for w in &all_weighted {
+            for (_, w) in &points {
                 for d in 0..FEAT_LEN {
                     means[d] += w[d];
                 }
@@ -943,7 +953,7 @@ impl CharIndex {
             }
 
             let mut sigmas = [0.0f32; FEAT_LEN];
-            for w in &all_weighted {
+            for (_, w) in &points {
                 for d in 0..FEAT_LEN {
                     let diff = w[d] - means[d];
                     sigmas[d] += diff * diff;
@@ -960,7 +970,7 @@ impl CharIndex {
 }
 
 /// Build the per-character index for all provided fonts.
-pub fn build_char_index(font_paths: &[(String, Vec<u8>)]) -> CharIndex {
+pub fn build_char_index(font_paths: &[(String, std::path::PathBuf)]) -> CharIndex {
     use rayon::prelude::*;
 
     let chars = indexed_chars();
@@ -971,9 +981,20 @@ pub fn build_char_index(font_paths: &[(String, Vec<u8>)]) -> CharIndex {
         skipped: Option<String>,
     }
 
-    // Phase 1: process each font in parallel (CPU-bound: render + features)
-    let results: Vec<FontResult> = font_paths.par_iter().map(|(font_name, font_data)| {
-        let font = match FontRef::try_from_slice(font_data) {
+    // Phase 1: process each font in parallel (CPU-bound: render + features).
+    // Font bytes are loaded from disk per-thread and dropped after processing,
+    // so only ~N fonts are in memory at once (N = rayon thread count).
+    let results: Vec<FontResult> = font_paths.par_iter().map(|(font_name, font_path)| {
+        let font_data = match std::fs::read(font_path) {
+            Ok(d) => d,
+            Err(_) => {
+                return FontResult {
+                    char_entries: Vec::new(),
+                    skipped: Some(font_name.clone()),
+                };
+            }
+        };
+        let font = match FontRef::try_from_slice(&font_data) {
             Ok(f) => f,
             Err(_) => {
                 return FontResult {
@@ -1078,7 +1099,10 @@ pub fn render_char_normalised<F: Font>(font: &F, c: char) -> Option<GrayImage> {
         }
     });
 
-    Some(canvas)
+    // Run through the same normalize path the scan side uses, so both
+    // index-time and scan-time images have identical geometry (tight ink
+    // crop, 1px padding, resized to exactly NORM_H).
+    normalize_to_ink_bounds(&canvas)
 }
 
 // ---------------------------------------------------------------------------
@@ -1189,12 +1213,13 @@ pub fn normalize_to_ink_bounds(img: &GrayImage) -> Option<GrayImage> {
 // ---------------------------------------------------------------------------
 
 /// Extract individual character crops from a scan line.
-pub fn extract_line_chars(
+pub fn extract_line_chars<F: ab_glyph::Font>(
     page: &GrayImage,
     words: &[WordPlacement],
     line_height: u32,
     page_char_boxes: &[CharBox],
     diag_seg_dir: Option<&std::path::Path>,
+    diag_ref_font: Option<&F>,
 ) -> Vec<(char, GrayImage)> {
     if words.is_empty() || line_height == 0 {
         return Vec::new();
@@ -1305,6 +1330,7 @@ pub fn extract_line_chars(
             &word_img, &all_chars, &boundaries, word_h,
             &mut char_counts, &mut results,
             word_diag_dir.as_deref(),
+            diag_ref_font,
         );
     }
 
@@ -1441,7 +1467,7 @@ fn extract_line_chars_from_charboxes(
     results
 }
 
-fn extract_chars_from_boundaries(
+fn extract_chars_from_boundaries<F: ab_glyph::Font>(
     word_img: &GrayImage,
     chars: &[char],
     boundaries: &[u32],
@@ -1449,6 +1475,7 @@ fn extract_chars_from_boundaries(
     char_counts: &mut HashMap<char, usize>,
     results: &mut Vec<(char, GrayImage)>,
     diag_dir: Option<&std::path::Path>,
+    diag_ref_font: Option<&F>,
 ) {
     let (ww, _wh) = word_img.dimensions();
 
@@ -1485,6 +1512,14 @@ fn extract_chars_from_boundaries(
             let label = crate::seg_diag::sanitize_char(c);
             let fname = format!("{:02}_{}.png", i, label);
             let _ = scaled.save(ddir.join("chars").join(fname));
+
+            // Also save index-time render from reference font for comparison
+            if let Some(ref_font) = diag_ref_font {
+                if let Some(ref_img) = render_char_normalised(ref_font, c) {
+                    let ref_fname = format!("{:02}_{}_ref.png", i, label);
+                    let _ = ref_img.save(ddir.join("chars").join(ref_fname));
+                }
+            }
         }
 
         results.push((c, scaled));
@@ -1976,6 +2011,7 @@ pub struct CharCiDetail {
 }
 
 /// Result of `search_candidates`: ranked font scores + per-character CI detail.
+#[derive(Debug)]
 pub struct CiSearchResult {
     pub scores: Vec<(String, f32)>,
     pub char_detail: Vec<CharCiDetail>,
@@ -2119,6 +2155,25 @@ pub fn search_candidates(
         .collect();
 
     scores.retain(|(_, s)| s.is_finite());
+
+    // ── Dedup OT variants: merge scores for same base font path ──────
+    // Font entries like "NotoSans.ttf|salt" and "NotoSans.ttf|onum" have
+    // identical Latin glyphs, producing identical feature vectors and scores.
+    // Without dedup, one physical font occupies N slots (one per OT variant),
+    // crowding out genuinely different fonts after the σ cutoff.
+    // Keep only the best-scoring variant per base path.
+    {
+        let mut best_by_base: HashMap<String, (String, f32)> = HashMap::new();
+        for (name, score) in &scores {
+            let base = name.split('|').next().unwrap_or(name).to_string();
+            let entry = best_by_base.entry(base).or_insert_with(|| (name.clone(), *score));
+            if *score > entry.1 {
+                *entry = (name.clone(), *score);
+            }
+        }
+        scores = best_by_base.into_values().collect();
+    }
+
     // Sort descending (higher = better = closer match)
     scores.sort_by(|a, b| {
         b.1.partial_cmp(&a.1)
@@ -2560,6 +2615,25 @@ impl CharIndex {
     /// Get the font name for a font_id (for diagnostics).
     pub fn font_name_by_id(&self, id: usize) -> Option<&str> {
         self.font_names_table.get(id).map(|s| s.as_str())
+    }
+
+    /// Drop the raw `entries` HashMap to free memory after the index has been
+    /// saved to disk.  Only `flat_vecs` (used for search) is kept.
+    /// After compaction, `save_index` will no longer work — call this only once
+    /// the index is persisted and you're entering the search/match phase.
+    pub fn compact(&mut self) {
+        self.entries.clear();
+        self.entries.shrink_to_fit();
+    }
+
+    /// Number of indexed characters.
+    pub fn n_chars(&self) -> usize {
+        self.flat_vecs.len()
+    }
+
+    /// Total number of (deduplicated) font entries across all characters.
+    pub fn n_entries(&self) -> usize {
+        self.flat_vecs.values().map(|v| v.len()).sum()
     }
 
     /// Number of fonts indexed for a given character.

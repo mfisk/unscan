@@ -14,15 +14,15 @@
 
 mod common;
 
-use common::{test_doc, run_unscan};
+use common::{test_doc, run_unscan, ensure_index};
 use std::collections::HashMap;
 
 /// Minimum acceptable accuracy (correct / total OCR lines).
 /// The specimen is rasterized on-demand via PyMuPDF (same FreeType engine as
 /// the CI index). Accuracy is lower than the original pre-made raster because
 /// PyMuPDF's hinting choices differ from whatever originally generated it.
-const MIN_ACCURACY_AA: f64 = 0.94;
-const MIN_ACCURACY_NOAA: f64 = 0.91;
+const MIN_ACCURACY_AA: f64 = 0.975;
+const MIN_ACCURACY_NOAA: f64 = 0.931;
 
 /// Parse ground truth: section index → lowercase font family (spaces removed).
 fn load_ground_truth() -> HashMap<usize, String> {
@@ -92,16 +92,28 @@ fn font_aliases() -> HashMap<String, Vec<String>> {
     let mut m: HashMap<String, Vec<String>> = HashMap::new();
     // Source Sans 3 was formerly Source Sans Pro
     m.insert("sourcesans3".into(), vec!["sourcesanspro".into()]);
-    // Courier New ↔ NimbusMonoPS, FreeMono (metric-compatible)
-    m.insert("couriernew".into(), vec!["nimbusmonops".into(), "freemono".into()]);
+    // Courier New ↔ NimbusMonoPS, FreeMono, CourierPrime (metric-compatible)
+    m.insert("couriernew".into(), vec![
+        "nimbusmonops".into(), "freemono".into(), "courierprime".into(),
+    ]);
     // Arial ↔ Liberation Sans, Nimbus Sans, FreeSans (metric-compatible)
-    m.insert("arial".into(), vec!["liberationsans".into(), "nimbussans".into(), "freesans".into()]);
-    // PT Serif ↔ NimbusRoman, LiberationSerif, FreeSerif (Times clones)
-    m.insert("ptserif".into(), vec!["nimbusroman".into(), "liberationserif".into(), "freeserif".into()]);
+    m.insert("arial".into(), vec![
+        "liberationsans".into(), "nimbussans".into(), "freesans".into(),
+    ]);
+    // Times New Roman ↔ NimbusRoman, LiberationSerif, FreeSerif, Tinos, P052, C059
+    // (all metric-compatible Times clones)
+    m.insert("timesnewroman".into(), vec![
+        "nimbusroman".into(), "liberationserif".into(), "freeserif".into(),
+        "tinos".into(), "p052".into(), "c059".into(),
+    ]);
+    // PT Serif — its own design family, no metric clones in the index
+    // (NimbusRoman etc. are Times clones, NOT PT Serif clones)
     // Lato ↔ Carlito (designed as metric-compatible replacement)
     m.insert("lato".into(), vec!["carlito".into()]);
-    // Caladea ↔ Cambria, P052 (Palatino metric-compatible)
-    m.insert("caladea".into(), vec!["p052".into()]);
+    // Caladea ↔ Cambria (metric-compatible)
+    m.insert("caladea".into(), vec![]);
+    // Verdana ↔ DejaVu Sans (derived from Bitstream Vera, very similar)
+    m.insert("verdana".into(), vec!["dejavusans".into()]);
     m
 }
 
@@ -129,6 +141,7 @@ fn is_correct(matched: &str, ground_truth: &HashMap<usize, String>) -> bool {
 
 #[test]
 fn specimen_font_accuracy() {
+    ensure_index();
     let vector_src = test_doc("font-timeline-specimen.pdf");
     if !vector_src.exists() {
         eprintln!("SKIP: font-timeline-specimen.pdf not found");
@@ -204,6 +217,7 @@ fn specimen_font_accuracy() {
 
 #[test]
 fn specimen_vectorizes_enough_lines() {
+    ensure_index();
     let input = test_doc("font-timeline-specimen-rasterized.pdf");
     if !input.exists() {
         eprintln!("SKIP: font-timeline-specimen-rasterized.pdf not found");
@@ -230,6 +244,7 @@ fn specimen_vectorizes_enough_lines() {
 /// between runs (regenerated if the source PDF is newer).
 #[test]
 fn specimen_font_accuracy_noaa() {
+    ensure_index();
     let vector_src = test_doc("font-timeline-specimen.pdf");
     if !vector_src.exists() {
         eprintln!("SKIP: font-timeline-specimen.pdf not found");

@@ -224,10 +224,18 @@ pub fn word_level_rerank(
         return (None, Vec::new());
     }
 
-    // Winner = font with most votes
+    // Winner = font with most votes.
+    // Tiebreaker: prefer the font that appears earlier in `parsed` (= higher CI rank).
     let winner = font_votes
         .iter()
-        .max_by_key(|(_, &v)| v)
+        .max_by(|(a_name, a_votes), (b_name, b_votes)| {
+            a_votes.cmp(b_votes).then_with(|| {
+                // Lower index in parsed = higher CI rank = preferred
+                let a_idx = parsed.iter().position(|(n, _)| n == *a_name).unwrap_or(usize::MAX);
+                let b_idx = parsed.iter().position(|(n, _)| n == *b_name).unwrap_or(usize::MAX);
+                b_idx.cmp(&a_idx) // reverse: lower index wins
+            })
+        })
         .map(|(&f, &v)| {
             debug!(
                 "  word rerank: winner='{}' with {}/{} votes ({} candidates)",

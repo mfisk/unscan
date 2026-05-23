@@ -5,8 +5,37 @@
 
 use std::path::{Path, PathBuf};
 use std::process::Command;
+use std::sync::Once;
 
 pub const EB_GARAMOND: &str = "/usr/share/fonts/opentype/ebgaramond/EBGaramond12-Regular.otf";
+
+// ── Shared index pre-build ───────────────────────────────────────────
+
+static INDEX_ONCE: Once = Once::new();
+
+/// Ensure the character index exists before any test spawns unscan.
+/// Uses `Once` so parallel test threads only build it once; the rest block
+/// until it's ready, then all hit the cached file.
+pub fn ensure_index() {
+    INDEX_ONCE.call_once(|| {
+        let bin = unscan_bin();
+        eprintln!("[test setup] Pre-building character index via {:?} --index", bin);
+        let output = Command::new(&bin)
+            .arg("--index")
+            .env("RUST_LOG", "info")
+            .output()
+            .unwrap_or_else(|e| panic!("failed to run {:?} --index: {}", bin, e));
+        if !output.status.success() {
+            panic!(
+                "Index pre-build failed (exit {}):\n{}{}",
+                output.status,
+                String::from_utf8_lossy(&output.stdout),
+                String::from_utf8_lossy(&output.stderr),
+            );
+        }
+        eprintln!("[test setup] Index ready.");
+    });
+}
 
 // ── Binary & path helpers ────────────────────────────────────────────
 

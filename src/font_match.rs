@@ -26,7 +26,6 @@ pub struct FontMatchResult {
     pub font_name: String,
     pub font_path: PathBuf,
     pub score: f32,
-    pub font_data: Vec<u8>,
     /// Best vertical pixel shift from SSIM alignment search (0 if coarse-only).
     pub best_dy: i32,
     /// True when the score already comes from SSIM verification (rerank path),
@@ -77,11 +76,11 @@ const WIDTH_RATIO_FLOOR: f32 = 0.45;
 // Public API
 // ---------------------------------------------------------------------------
 
-pub fn match_font<'a>(
+pub fn match_font(
     gray_page: &GrayImage,
     line: &TextLine,
-    catalog: &'a [FontEntry],
-    parsed_fonts: &[Option<FontRef<'a>>],
+    catalog: &[FontEntry],
+    font_cache: &crate::font_cache::FontCache,
     threshold: f32,
     _dpi: u32,
     char_index_keys: Option<&std::collections::HashSet<String>>,
@@ -187,7 +186,7 @@ pub fn match_font<'a>(
         line_text,
     );
 
-    for &(cat_idx, entry) in &score_entries {
+    for &(_cat_idx, entry) in &score_entries {
         // ── Pre-filter: mono ────────────────────────────────────────
         // Only apply mono filter — serif/sans classification from raster
         // is unreliable (transition heuristic returns wrong class).
@@ -235,10 +234,14 @@ pub fn match_font<'a>(
         // Detection is available (entry.oldstyle_figures) but not used
         // as a filter — documents can use either style. Let SSIM pick
         // the best pixel match naturally.
-        // ── Pre-filter: parse font ──────────────────────────────────
-        let font = match &parsed_fonts[cat_idx] {
-            Some(f) => f,
-            None => continue,
+        // ── Pre-filter: parse font (via shared cache) ─────────────────
+        let font_bytes = match font_cache.load(&entry.path) {
+            Ok(b) => b,
+            Err(_) => continue,
+        };
+        let font = match ab_glyph::FontRef::try_from_slice(&font_bytes) {
+            Ok(f) => f,
+            Err(_) => continue,
         };
         let overrides = entry.glyph_overrides.as_deref();
 
@@ -482,9 +485,14 @@ pub fn match_font<'a>(
         let mut best_rerank_dy = 0i32;
 
         for &(coarse_score, entry) in &top_candidates {
+            // Load font data via shared cache for SSIM verification
+            let rerank_data = match font_cache.load(&entry.path) {
+                Ok(d) => d,
+                Err(_) => continue,
+            };
             let (ssim, dy) = crate::verify::verify_text_region(
                 gray_page,
-                &entry.data,
+                &rerank_data,
                 "",  // text not used
                 lx, ly, lw, lh,
                 &line.words,
@@ -509,7 +517,6 @@ pub fn match_font<'a>(
                     font_name: entry.family_name.clone(),
                     font_path: entry.path.clone(),
                     score: best_rerank_ssim,
-                    font_data: entry.data.clone(),
                     best_dy: best_rerank_dy,
                     ssim_verified: true,
                 });
@@ -526,7 +533,6 @@ pub fn match_font<'a>(
             font_name: e.family_name.clone(),
             font_path: e.path.clone(),
             score: best_score,
-            font_data: e.data.clone(),
             best_dy: 0, // coarse-only path, no SSIM shift
             ssim_verified: false,
         }
