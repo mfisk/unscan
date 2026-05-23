@@ -107,6 +107,13 @@ pub struct Args {
     /// Use with a small test PDF to inspect the full segmentation pipeline.
     #[arg(long, value_name = "DIR")]
     pub diag_seg: Option<PathBuf>,
+
+    /// When used with --diag-seg, also render each extracted character from
+    /// this font file using the index-time render_char_normalised() code path.
+    /// Saves as NN_c_ref.png next to the scan crop NN_c.png for side-by-side
+    /// comparison using identical normalization.
+    #[arg(long, value_name = "FONT", requires = "diag_seg")]
+    pub diag_ref_font: Option<PathBuf>,
 }
 
 impl Args {

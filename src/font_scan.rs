@@ -149,13 +149,24 @@ pub fn scan_fonts(dirs: &[PathBuf]) -> Vec<FontEntry> {
                 // Probe all OT features — emit a variant entry for each that changes glyphs
                 let variants = detect_ot_variants(&fe.data);
                 for (tag, overrides) in &variants {
-                    let mut var_entry = fe.clone();
-                    var_entry.variant_tag = tag.clone();
-                    var_entry.glyph_overrides = Some(overrides.clone());
-                    var_entry.family_name = format!("{} [{}]", fe.family_name, tag);
+                    let mut var_entry = FontEntry {
+                        path: fe.path.clone(),
+                        family_name: format!("{} [{}]", fe.family_name, tag),
+                        is_bold: fe.is_bold,
+                        is_italic: fe.is_italic,
+                        class: fe.class,
+                        data: Vec::new(), // bytes not retained
+                        oldstyle_figures: fe.oldstyle_figures,
+                        variant_tag: tag.clone(),
+                        glyph_overrides: Some(overrides.clone()),
+                    };
                     debug!("    + variant [{}]: {} glyph overrides", tag, overrides.len());
                     fonts.push(var_entry);
                 }
+                // Drop font bytes — metadata + path is all we keep.
+                // Index build and matching load from path on demand.
+                let mut fe = fe;
+                fe.data = Vec::new();
                 fonts.push(fe);
             }
         }

@@ -26,12 +26,16 @@ producing different effective images. Key symptoms:
 
 **Debugging procedure for CI misses:**
 1. Run `--diag-seg` to get the actual char crops CI receives.
-2. Identify the **single worst-scoring character** for the correct font (compute
-   per-char feature distances: aspect, v_center, ink_density between scan crop
-   and index render). Fix the worst char first — geometric mean amplifies outliers.
-3. Show the scan crop and index render **side by side at 8× zoom**. If the scan
-   is visibly wider/blurrier, the problem is rasterization blur, not the crop code.
-4. Only after per-char inspection rules out rasterization effects, check whether
+2. From the audit JSON `ci_char_votes`, identify which characters of the correct
+   font score worst. Show the crop images for those characters. Narrow glyphs
+   (I, l, t, i) are the canary — they're most sensitive to geometry mismatches.
+3. Use only actual tool output (diag-seg crops, audit JSON distances). Do not
+   reimplement feature computation or character rendering in Python — subtle
+   differences in thresholds, rounding, and resize filters produce misleading
+   comparisons. If you need index-side reference images, add a diagnostic dump
+   to the Rust code.
+4. Fix the worst character first — geometric mean amplifies outliers.
+5. Only after per-char inspection rules out rasterization effects, check whether
    both paths call the same normalize function.
 
 A line of scanned text goes through four stages. At each stage the correct font
@@ -342,6 +346,39 @@ ls /tmp/unscan-crops/p{PAGE}_line_{TEXT}*/
 amount of scoring refinement can fix the match. Fix extraction first.
 Everything downstream — distances, features, σ cutoffs — is irrelevant until
 the inputs are clean.
+
+### Step 1b: Show the Worst-Scoring Characters of the Correct Font
+
+After confirming crops are visually clean, identify which characters of the
+**correct font** score worst in CI. Use `--diag-seg` output — never
+reimplement feature computation in Python or another language. The Rust code
+is the source of truth; any reimplementation will have subtle differences
+(thresholds, rounding, padding, resize filter) that produce misleading
+comparisons.
+
+**Use actual tool output only:**
+
+1. Run with `--diag-seg` to get the per-char crop PNGs that CI actually scored
+   (these are in `word_NNN_text/chars/NN_c.png`).
+2. Use the audit JSON `ci_char_votes` to find which characters of the correct
+   font have the worst (largest) distances. If the correct font doesn't appear
+   in the top-3 nearest neighbors for a character, it's a CI recall failure for
+   that character.
+3. Show the scan crop images for the worst-scoring characters. Look at them —
+   compare narrow glyphs (I, l, t, i) against wider ones (e, S, M) to see if
+   narrow characters are systematically worse (rasterization blur has
+   proportionally larger impact on narrow glyphs).
+
+**Why narrow characters matter:** A 1px width difference on a 17px-wide `l` is
+a ~6% aspect shift and drastically changes the horizontal profile bins. The
+same 1px difference on a 50px-wide `M` is ~2% and barely registers. Narrow
+characters are where index/scan geometry mismatches hit hardest — they're the
+canary.
+
+**Do not** write Python scripts to compute feature vectors or render reference
+glyphs for comparison. If you need side-by-side scan-vs-index images, add a
+diagnostic mode to the Rust code that dumps both. The scan crop and the index
+render must come from the same binary using the same normalization code paths.
 
 ### Step 2: Identify Wrong Lines
 

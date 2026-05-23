@@ -13,6 +13,7 @@ pub fn generate_comparison(
     placed_texts: &[PlacedText],
     page_idx: usize,
     output_dir: &Path,
+    font_cache: &crate::font_cache::FontCache,
 ) -> std::io::Result<()> {
     std::fs::create_dir_all(output_dir)?;
 
@@ -51,8 +52,12 @@ pub fn generate_comparison(
 
         // ── Rendered crop ────────────────────────────────────────
         // Render the matched font using the same rendering as verify.rs
+        let font_data_loaded = match font_cache.load(&fm.font_path) {
+            Ok(d) => d,
+            Err(_) => continue,
+        };
         let rendered_crop = render_font_crop(
-            &fm.font_data,
+            &font_data_loaded,
             &pt.words,
             x, y, crop_x, crop_y,
             crop_w, crop_h,
