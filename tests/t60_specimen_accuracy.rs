@@ -21,8 +21,16 @@ use std::collections::HashMap;
 /// The specimen is rasterized on-demand via PyMuPDF (same FreeType engine as
 /// the CI index). Accuracy is lower than the original pre-made raster because
 /// PyMuPDF's hinting choices differ from whatever originally generated it.
-const MIN_ACCURACY_AA: f64 = 0.975;
-const MIN_ACCURACY_NOAA: f64 = 0.931;
+const MIN_ACCURACY_AA: f64 = 0.991;
+const MIN_ACCURACY_NOAA: f64 = 0.965;
+
+/// DPI-specific accuracy floors.  Lower DPI = less detail = lower accuracy.
+/// These are non-gating (report-only) until we establish stable baselines.
+const DPI_THRESHOLDS: &[(u32, f64)] = &[
+    (300, 0.991),  // primary gate — must pass
+    (200, 0.0),    // report-only for now
+    (150, 0.0),    // report-only for now
+];
 
 /// Parse ground truth: section index → lowercase font family (spaces removed).
 fn load_ground_truth() -> HashMap<usize, String> {
@@ -137,6 +145,98 @@ fn is_correct(matched: &str, ground_truth: &HashMap<usize, String>) -> bool {
         }
         false
     })
+}
+
+/// Result of a single accuracy measurement at a given DPI.
+struct AccuracyResult {
+    dpi: u32,
+    aa: bool,
+    correct: usize,
+    total_lines: usize,
+    matched: usize,
+    accuracy: f64,
+    misses: Vec<String>,
+}
+
+/// Run accuracy measurement for a single DPI + AA combination.
+/// Rasterizes on demand, runs unscan with --dpi, returns structured result.
+fn measure_accuracy(dpi: u32, aa: bool) -> Option<AccuracyResult> {
+    let vector_src = test_doc("font-timeline-specimen.pdf");
+    if !vector_src.exists() {
+        eprintln!("SKIP: font-timeline-specimen.pdf not found");
+        return None;
+    }
+    let gt_path = test_doc("font-timeline-specimen.json");
+    if !gt_path.exists() {
+        eprintln!("SKIP: font-timeline-specimen.json not found");
+        return None;
+    }
+
+    let aa_suffix = if aa { "" } else { "-noaa" };
+    let raster_name = format!("font-timeline-specimen-rasterized{}-{}dpi.pdf", aa_suffix, dpi);
+    let raster_path = test_doc(&raster_name);
+
+    if !common::rasterize_pdf(&vector_src, &raster_path, dpi, aa) {
+        eprintln!("SKIP: rasterization failed for {} dpi aa={}", dpi, aa);
+        return None;
+    }
+
+    let ground_truth = load_ground_truth();
+    let dpi_args = format!("{}", dpi);
+    let output = run_unscan(&raster_path, &["--dpi", &dpi_args]);
+    let matched_fonts = parse_all_font_matches(&output);
+    let total_lines = count_total_ocr_lines(&output);
+    let matched = matched_fonts.len();
+
+    if total_lines == 0 {
+        eprintln!("WARNING: 0 OCR lines at {} dpi aa={}", dpi, aa);
+        return None;
+    }
+
+    let correct = matched_fonts
+        .iter()
+        .filter(|m| is_correct(m, &ground_truth))
+        .count();
+    let accuracy = correct as f64 / total_lines as f64;
+
+    let misses: Vec<String> = matched_fonts
+        .iter()
+        .filter(|m| !is_correct(m, &ground_truth))
+        .cloned()
+        .collect();
+
+    Some(AccuracyResult {
+        dpi,
+        aa,
+        correct,
+        total_lines,
+        matched,
+        accuracy,
+        misses,
+    })
+}
+
+/// Print accuracy result in a consistent format.
+fn report_accuracy(r: &AccuracyResult, label: &str, threshold: f64) {
+    eprintln!(
+        "{} accuracy @ {}dpi: {}/{} = {:.1}% (threshold: {:.0}%)",
+        label, r.dpi, r.correct, r.total_lines, r.accuracy * 100.0, threshold * 100.0,
+    );
+    eprintln!(
+        "  ({} matched, {} unmatched, {} incorrect)",
+        r.matched,
+        r.total_lines - r.matched,
+        r.matched - r.correct,
+    );
+    if !r.misses.is_empty() {
+        eprintln!("  Misses ({}):", r.misses.len());
+        for m in r.misses.iter().take(15) {
+            eprintln!("    {}", m);
+        }
+        if r.misses.len() > 15 {
+            eprintln!("    ... and {} more", r.misses.len() - 15);
+        }
+    }
 }
 
 #[test]
@@ -316,4 +416,127 @@ fn specimen_font_accuracy_noaa() {
         correct,
         total_lines,
     );
+}
+
+/// Multi-DPI accuracy sweep.  Rasterizes the specimen at each DPI in
+/// DPI_THRESHOLDS, runs unscan with --dpi, and reports per-DPI accuracy.
+/// The 300 DPI gate is enforced by the dedicated tests above; lower DPIs
+/// are report-only until stable baselines are established.
+#[test]
+fn specimen_multi_dpi_accuracy() {
+    ensure_index();
+
+    let mut results: Vec<AccuracyResult> = Vec::new();
+
+    for &(dpi, _threshold) in DPI_THRESHOLDS {
+        if let Some(r) = measure_accuracy(dpi, true) {
+            results.push(r);
+        }
+    }
+
+    // Summary table
+    eprintln!("\n╔══════════════════════════════════════════════════╗");
+    eprintln!("║         MULTI-DPI ACCURACY SUMMARY (AA)         ║");
+    eprintln!("╠═══════╦════════════╦═══════╦═══════╦════════════╣");
+    eprintln!("║  DPI  ║  Accuracy  ║ Correct║ Total ║  Threshold ║");
+    eprintln!("╠═══════╬════════════╬═══════╬═══════╬════════════╣");
+    for r in &results {
+        let threshold = DPI_THRESHOLDS.iter()
+            .find(|(d, _)| *d == r.dpi)
+            .map(|(_, t)| *t)
+            .unwrap_or(0.0);
+        let gate = if threshold > 0.0 { "GATE" } else { "info" };
+        eprintln!(
+            "║  {:>3}  ║   {:>5.1}%   ║  {:>3}  ║  {:>3}  ║ {:>5.1}% {:>4} ║",
+            r.dpi, r.accuracy * 100.0, r.correct, r.total_lines,
+            threshold * 100.0, gate,
+        );
+    }
+    eprintln!("╚═══════╩════════════╩═══════╩═══════╩════════════╝");
+
+    // Report per-DPI detail
+    for r in &results {
+        let threshold = DPI_THRESHOLDS.iter()
+            .find(|(d, _)| *d == r.dpi)
+            .map(|(_, t)| *t)
+            .unwrap_or(0.0);
+        report_accuracy(r, "AA", threshold);
+    }
+
+    // Only enforce thresholds > 0
+    for r in &results {
+        let threshold = DPI_THRESHOLDS.iter()
+            .find(|(d, _)| *d == r.dpi)
+            .map(|(_, t)| *t)
+            .unwrap_or(0.0);
+        if threshold > 0.0 {
+            assert!(
+                r.accuracy >= threshold,
+                "AA accuracy at {}dpi: {:.1}% below threshold {:.0}% ({}/{})",
+                r.dpi, r.accuracy * 100.0, threshold * 100.0, r.correct, r.total_lines,
+            );
+        }
+    }
+}
+
+/// Same multi-DPI sweep but with no-AA rasterization.
+#[test]
+fn specimen_multi_dpi_accuracy_noaa() {
+    ensure_index();
+
+    let noaa_thresholds: &[(u32, f64)] = &[
+        (300, MIN_ACCURACY_NOAA),
+        (200, 0.0),
+        (150, 0.0),
+    ];
+
+    let mut results: Vec<AccuracyResult> = Vec::new();
+
+    for &(dpi, _threshold) in noaa_thresholds {
+        if let Some(r) = measure_accuracy(dpi, false) {
+            results.push(r);
+        }
+    }
+
+    // Summary table
+    eprintln!("\n╔══════════════════════════════════════════════════╗");
+    eprintln!("║       MULTI-DPI ACCURACY SUMMARY (NO-AA)        ║");
+    eprintln!("╠═══════╦════════════╦═══════╦═══════╦════════════╣");
+    eprintln!("║  DPI  ║  Accuracy  ║ Correct║ Total ║  Threshold ║");
+    eprintln!("╠═══════╬════════════╬═══════╬═══════╬════════════╣");
+    for r in &results {
+        let threshold = noaa_thresholds.iter()
+            .find(|(d, _)| *d == r.dpi)
+            .map(|(_, t)| *t)
+            .unwrap_or(0.0);
+        let gate = if threshold > 0.0 { "GATE" } else { "info" };
+        eprintln!(
+            "║  {:>3}  ║   {:>5.1}%   ║  {:>3}  ║  {:>3}  ║ {:>5.1}% {:>4} ║",
+            r.dpi, r.accuracy * 100.0, r.correct, r.total_lines,
+            threshold * 100.0, gate,
+        );
+    }
+    eprintln!("╚═══════╩════════════╩═══════╩═══════╩════════════╝");
+
+    for r in &results {
+        let threshold = noaa_thresholds.iter()
+            .find(|(d, _)| *d == r.dpi)
+            .map(|(_, t)| *t)
+            .unwrap_or(0.0);
+        report_accuracy(r, "noaa", threshold);
+    }
+
+    for r in &results {
+        let threshold = noaa_thresholds.iter()
+            .find(|(d, _)| *d == r.dpi)
+            .map(|(_, t)| *t)
+            .unwrap_or(0.0);
+        if threshold > 0.0 {
+            assert!(
+                r.accuracy >= threshold,
+                "noaa accuracy at {}dpi: {:.1}% below threshold {:.0}% ({}/{})",
+                r.dpi, r.accuracy * 100.0, threshold * 100.0, r.correct, r.total_lines,
+            );
+        }
+    }
 }

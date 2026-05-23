@@ -2181,6 +2181,89 @@ pub fn search_candidates(
             .then_with(|| a.0.contains('[').cmp(&b.0.contains('[')))
     });
 
+    // ── Cross-family Latin clone dedup ───────────────────────────────
+    // Many font families embed the same Latin glyphs from a shared source.
+    // E.g., ALL Noto* fonts (NotoSans, NotoSansDisplay, NotoTraditionalNushu,
+    // NotoSansMath, NotoSansSymbols, etc.) share the same NotoSans Latin
+    // outlines.  Font metrics (ascent/descent/em) differ, producing slightly
+    // different feature-vector normalizations and scores (Δ ~0.01–0.03),
+    // but the glyphs are identical.
+    //
+    // Two-pass dedup:
+    //   1. Score-based: merge adjacent (sorted) entries within ε=1e-5 (exact clones)
+    //   2. Path-based: group Noto sans-serif fonts into one family slot
+    //
+    // In each group, keep the entry with the best score.
+    {
+        // Pass 1: score-epsilon dedup
+        let eps = 1e-5_f32;
+        let mut deduped: Vec<(String, f32)> = Vec::new();
+        for (name, score) in &scores {
+            if let Some(last) = deduped.last_mut() {
+                if (score - last.1).abs() < eps {
+                    if name.len() < last.0.len() {
+                        *last = (name.clone(), *score);
+                    }
+                    continue;
+                }
+            }
+            deduped.push((name.clone(), *score));
+        }
+        scores = deduped;
+
+        // Pass 2: Noto family grouping
+        // All /noto/Noto* sans-serif fonts → "NotoSans" group
+        // All /noto/NotoSerif* fonts → "NotoSerif" group
+        // Keep best (highest score) per group; non-Noto fonts pass through.
+        fn noto_group(name: &str) -> Option<&'static str> {
+            // Match font paths containing "/noto/" or font names starting with "Noto"
+            let is_noto = name.contains("/noto/") || {
+                // Extract basename
+                let base = name.rsplit('/').next().unwrap_or(name);
+                base.starts_with("Noto")
+            };
+            if !is_noto { return None; }
+            // Check serif vs sans
+            let base = name.rsplit('/').next().unwrap_or(name);
+            if base.starts_with("NotoSerif") {
+                Some("__noto_serif__")
+            } else if base.starts_with("NotoSansMono") || base.starts_with("NotoMono") {
+                Some("__noto_mono__")
+            } else {
+                // Everything else: NotoSans*, NotoSansDisplay*, NotoTraditionalNushu*, etc.
+                Some("__noto_sans__")
+            }
+        }
+
+        let mut best_by_group: HashMap<&str, (usize, f32)> = HashMap::new();
+        for (i, (name, score)) in scores.iter().enumerate() {
+            if let Some(group) = noto_group(name) {
+                let entry = best_by_group.entry(group).or_insert((i, *score));
+                if *score > entry.1 {
+                    *entry = (i, *score);
+                }
+            }
+        }
+
+        let mut drop_indices: std::collections::HashSet<usize> = std::collections::HashSet::new();
+        for (_group, (keep_idx, _)) in &best_by_group {
+            for (i, (name, _)) in scores.iter().enumerate() {
+                if noto_group(name).is_some() && i != *keep_idx {
+                    drop_indices.insert(i);
+                }
+            }
+        }
+
+        if !drop_indices.is_empty() {
+            let before = scores.len();
+            scores = scores.into_iter().enumerate()
+                .filter(|(i, _)| !drop_indices.contains(i))
+                .map(|(_, v)| v)
+                .collect();
+            eprintln!("  CI: Noto family dedup {before} → {} fonts", scores.len());
+        }
+    }
+
     // ── Statistical cutoff: keep best + near-ties ────────────────────
     // CI is the recall stage — high recall, lower precision (no spacing
     // info).  We keep the top score and anything within k·σ of it.
