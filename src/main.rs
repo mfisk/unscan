@@ -536,10 +536,11 @@ fn run(args: &cli::Args) -> Result<(), ScanTextError> {
 
                 // Dump character crops when UNSCAN_DUMP_CROPS is set
                 if std::env::var("UNSCAN_DUMP_CROPS").is_ok() && !char_crops.is_empty() {
-                    let dump_dir = format!("/tmp/unscan-crops/p{}_line_{}", page_idx + 1,
-                        line.text.chars().take(40).collect::<String>()
-                            .replace(|c: char| !c.is_alphanumeric() && c != ' ', "")
-                            .replace(' ', "_"));
+                    let text_slug: String = line.text.chars().take(40)
+                        .filter(|c| c.is_alphanumeric() || *c == ' ')
+                        .collect::<String>()
+                        .replace(' ', "_");
+                    let dump_dir = format!("/tmp/unscan-crops/p{}_L{:03}_{}", page_idx + 1, li, text_slug);
                     let _ = std::fs::create_dir_all(&dump_dir);
                     for (i, (ch, img)) in char_crops.iter().enumerate() {
                         let path = format!("{}/crop_{:02}_{}.png", dump_dir, i,

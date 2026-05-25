@@ -2114,80 +2114,144 @@ fn segment_characters_inner(
         .collect();
 
     let max_ink = col_ink.iter().copied().max().unwrap_or(0);
-    let ink_cutoff_5pct = max_ink / 20; // 5% of peak
+    let ink_cutoff_5pct = max_ink / 17; // ~5.9% of peak
 
-    // --- Pass 1: strict zero-ink VP ---
-    // Find contiguous runs of truly empty columns (interior only).
+    // --- VP splitting: iterative, ink-trimmed ---
+    //
+    // Find character boundaries by iteratively splitting at the widest
+    // low-ink column run.  After each split, trim each resulting segment
+    // to its horizontal ink extent so that the whitespace margins around
+    // the split are excluded from future searches.  This prevents
+    // near-duplicate splits (e.g. 173 and 174) from consuming slots
+    // that should go to real inter-character gaps.
+    //
+    // Two passes per iteration:
+    //   1. Zero-ink columns (strict whitespace)
+    //   2. ≤5%-of-peak-ink columns (serif-bridged gaps)
+    // If neither finds a run in a segment, seam carving handles it later.
+
     let col_has_ink: Vec<bool> = col_ink.iter().map(|&v| v > 0).collect();
-    let mut ws_runs_zero: Vec<(u32, u32)> = Vec::new();
-    {
+    let col_has_ink_5: Vec<bool> = col_ink.iter().map(|&v| v > ink_cutoff_5pct).collect();
+
+    let mut splits: Vec<u32> = Vec::with_capacity(need);
+
+    /// Find the ink extent within [seg_start, seg_end) using the given
+    /// per-column ink flags.  Returns (ink_left, ink_right_exclusive).
+    fn ink_extent(col_ink_flags: &[bool], seg_start: u32, seg_end: u32) -> (u32, u32) {
+        let left = (seg_start..seg_end)
+            .find(|&x| col_ink_flags[x as usize])
+            .unwrap_or(seg_end);
+        let right = (seg_start..seg_end)
+            .rev()
+            .find(|&x| col_ink_flags[x as usize])
+            .map(|x| x + 1)
+            .unwrap_or(seg_start);
+        (left, right)
+    }
+
+    /// Find the best low-ink valley within [search_start, search_end).
+    /// Ranks runs by minimum ink value (deepest valley wins), breaking
+    /// ties by width (wider wins).  Returns (run_start, run_end, split_col)
+    /// where split_col is the column with minimum ink in the run.
+    fn best_low_ink_valley(is_ink: &[bool], col_ink: &[u32], search_start: u32, search_end: u32) -> Option<(u32, u32, u32)> {
+        if search_end <= search_start + 2 {
+            return None;
+        }
+        let mut best: Option<(u32, u32, u32, u32, u32)> = None; // (min_ink, neg_width, split_col, start, end)
         let mut run_start: Option<u32> = None;
-        for x in 0..w {
-            if !col_has_ink[x as usize] {
+        for x in search_start..search_end {
+            if !is_ink[x as usize] {
                 if run_start.is_none() { run_start = Some(x); }
             } else if let Some(start) = run_start {
-                if start > 0 { ws_runs_zero.push((start, x)); }
+                // Interior runs only (not touching search edges)
+                if start > search_start {
+                    let width = x - start;
+                    let (min_ink, min_col) = (start..x)
+                        .map(|c| (col_ink[c as usize], c))
+                        .min()
+                        .unwrap_or((u32::MAX, start));
+                    let neg_width = u32::MAX - width;
+                    if best.map_or(true, |b| (min_ink, neg_width) < (b.0, b.1)) {
+                        best = Some((min_ink, neg_width, min_col, start, x));
+                    }
+                }
                 run_start = None;
             }
         }
+        best.map(|(_, _, split, s, e)| (s, e, split))
     }
-    ws_runs_zero.sort_by(|a, b| (b.1 - b.0).cmp(&(a.1 - a.0)));
-    let mut splits: Vec<u32> = ws_runs_zero.iter()
-        .take(need)
-        .map(|(s, e)| (s + e) / 2)
-        .collect();
+
+    // Segments are stored as (left_edge, right_edge) of the full segment,
+    // plus (ink_left, ink_right) for the ink-trimmed region.
+    // Initially: one segment spanning the whole word.
+    struct Segment { left: u32, right: u32, ink_left: u32, ink_right: u32 }
+
+    let initial_ink = ink_extent(&col_has_ink, 0, w);
+    let mut segments: Vec<Segment> = vec![Segment {
+        left: 0, right: w,
+        ink_left: initial_ink.0, ink_right: initial_ink.1,
+    }];
+
+    while splits.len() < need {
+        // Find the best split across all segments — the deepest ink
+        // valley.  Try zero-ink first, then ≤5%-ink.
+        let mut best_valley: Option<(u32, u32, usize)> = None; // (min_ink, split_col, segment_index)
+
+        for (si, seg) in segments.iter().enumerate() {
+            if seg.ink_right <= seg.ink_left + 2 { continue; }
+
+            // Try zero-ink run within ink extent
+            if let Some((_s, _e, split)) = best_low_ink_valley(&col_has_ink, &col_ink, seg.ink_left, seg.ink_right) {
+                let min_ink = col_ink[split as usize];
+                if best_valley.map_or(true, |b: (u32, u32, usize)| min_ink < b.0) {
+                    best_valley = Some((min_ink, split, si));
+                }
+            }
+        }
+
+        if best_valley.is_none() {
+            for (si, seg) in segments.iter().enumerate() {
+                if seg.ink_right <= seg.ink_left + 2 { continue; }
+                if let Some((_s, _e, split)) = best_low_ink_valley(&col_has_ink_5, &col_ink, seg.ink_left, seg.ink_right) {
+                    let min_ink = col_ink[split as usize];
+                    if best_valley.map_or(true, |b: (u32, u32, usize)| min_ink < b.0) {
+                        best_valley = Some((min_ink, split, si));
+                    }
+                }
+            }
+        }
+
+        let (_min_ink, mid, si) = match best_valley {
+            Some(v) => v,
+            None => break, // no more VP splits possible
+        };
+
+        splits.push(mid);
+
+        // Split the segment at `mid` and compute ink extents for children.
+        let old = &segments[si];
+        let left_ink = ink_extent(&col_has_ink, old.left, mid);
+        let right_ink = ink_extent(&col_has_ink, mid, old.right);
+        let left_seg = Segment { left: old.left, right: mid, ink_left: left_ink.0, ink_right: left_ink.1 };
+        let right_seg = Segment { left: mid, right: old.right, ink_left: right_ink.0, ink_right: right_ink.1 };
+        segments.splice(si..=si, [left_seg, right_seg]);
+    }
+
     splits.sort();
     splits.dedup();
 
     let vp_splits = splits.clone();
 
-    // --- Pass 2: 5% ink VP ---
-    // If more splits needed, find runs of columns ≤ 5% of peak ink that
-    // weren't already covered by zero-ink runs.  These catch serif-bridged
-    // gaps where a stray serif contributes a small amount of ink.
-    if splits.len() < need {
-        let col_has_ink_5: Vec<bool> = col_ink.iter().map(|&v| v > ink_cutoff_5pct).collect();
-        let mut ws_runs_5pct: Vec<(u32, u32)> = Vec::new();
-        {
-            let mut run_start: Option<u32> = None;
-            for x in 0..w {
-                if !col_has_ink_5[x as usize] {
-                    if run_start.is_none() { run_start = Some(x); }
-                } else if let Some(start) = run_start {
-                    if start > 0 { ws_runs_5pct.push((start, x)); }
-                    run_start = None;
-                }
-            }
-        }
-        ws_runs_5pct.sort_by(|a, b| (b.1 - b.0).cmp(&(a.1 - a.0)));
-
-        // Only add runs whose midpoint isn't already a split.
-        let still_need = need - splits.len();
-        let mut added = 0usize;
-        for (s, e) in &ws_runs_5pct {
-            let mid = (s + e) / 2;
-            if !splits.contains(&mid) {
-                splits.push(mid);
-                added += 1;
-                if added >= still_need { break; }
-            }
-        }
-        splits.sort();
-        splits.dedup();
+    if w == 492 && n_chars == 10 {
     }
-
-    let vp5_splits: Vec<u32> = splits.iter()
-        .filter(|s| !vp_splits.contains(s))
-        .copied().collect();
 
     // Diag: dump VP passes
     if let (Some(ddir), Some(wtext)) = (diag_dir, word_text) {
         let _ = std::fs::create_dir_all(ddir);
         let _ = img.save(ddir.join("word_crop.png"));
-        crate::seg_diag::save_vp_overlay(img, &ws_runs_zero, &ddir.join("vp_overlay.png"));
         eprintln!(
-            "  DIAG-SEG VP: \"{}\" {}x{} — {} zero-ink, {} 5%ink, need {} total",
-            &wtext[..wtext.len().min(30)], w, h, vp_splits.len(), vp5_splits.len(), need,
+            "  DIAG-SEG VP: \"{}\" {}x{} — {} vp splits, need {} total",
+            &wtext[..wtext.len().min(30)], w, h, vp_splits.len(), need,
         );
     }
 
@@ -2290,7 +2354,10 @@ fn segment_characters_inner(
         splits.sort();
     }
 
-    let seam_splits: Vec<u32> = splits.iter().filter(|s| !vp_splits.contains(s) && !vp5_splits.contains(s)).copied().collect();
+    let seam_splits: Vec<u32> = splits.iter().filter(|s| !vp_splits.contains(s)).copied().collect();
+
+    if w == 492 && n_chars == 10 {
+    }
 
     // Diag: dump seam pass
     if let Some(ddir) = diag_dir {
@@ -2333,6 +2400,8 @@ fn segment_characters_inner(
         let mut cb_fallback_splits: Vec<u32> = Vec::new();
         for &(seg_start, seg_end) in &seg_bounds {
             let seg_w = seg_end - seg_start;
+            if w == 492 && n_chars == 10 {
+            }
             if seg_w <= avg_char_w * 3 {
                 continue; // narrow enough to be a single char
             }

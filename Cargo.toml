@@ -25,3 +25,8 @@ serde_json = "1"
 freetype-rs = "0.38"
 rustybuzz = "0.18"
 subsetter = "0.2"
+
+# Fast iteration: opt-level 1 gives ~10x runtime speedup over opt-level 0
+# while keeping incremental compilation fast
+[profile.dev]
+opt-level = 1
