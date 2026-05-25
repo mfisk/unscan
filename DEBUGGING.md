@@ -85,7 +85,7 @@ then segment word crops into individual characters ourselves.
 **Input:** Word crop image (trimmed to ink bounds via `ink_vertical_extent`),
 known text from Tesseract (gives us the target character count N).
 
-**Algorithm (two-pass):**
+**Algorithm (three-pass cascade — see SEGMENTATION.md):**
 
 1. **Pass 1 — Vertical whitespace splits.**
    Compute column ink profile (sum of dark pixels per column, threshold < 200).
@@ -161,8 +161,8 @@ ls /tmp/unscan-crops/p2_line_1931__Times_New_Roman/
 # crop_00_1.png  crop_04_T.png  crop_06_m.png ...
 ```
 
-These are the actual images being turned into 59-dimensional feature vectors and
-compared against the font index. If a character crop looks wrong (clipped,
+These are the actual images being turned into 99-dimensional feature vectors and
+compared against the font index (see FEATURES.md for the full vector layout). If a character crop looks wrong (clipped,
 merged with neighbor, includes artifacts), CI can't be expected to score it
 correctly — fix the extraction first.
 
@@ -466,6 +466,110 @@ output for `paragraph regroup` messages.
 This stage should be transparent on a specimen (each section has its own font,
 no majority vote applies). If it's interfering, the bug is upstream — the
 majority font shouldn't have won enough lines to trigger grouping.
+
+---
+
+## Procedure: "Show Me" a Miss
+
+**When to run:** Immediately after any test run that does not achieve 100%
+accuracy. Before analyzing, theorizing, or proposing fixes — produce the
+visual card for every miss first. This is step 1, not step N.
+
+When asked to "show" a miss, produce a **visual card** — not text tables, not
+raw JSON, not narration. The card must contain actual rendered images so the
+human can see what CI saw and compare it to what the correct answer looks like.
+
+### Card layout
+
+Each missed character is a **row** with three images side by side, followed by
+a score line below them:
+
+```
+┌─────────────┬─────────────┬─────────────┐
+│  Scan Crop  │  OCR Char   │ Correct Font│
+│  (48px img) │  (48px img) │  (48px img) │
+│  label:     │  label:     │  label:     │
+│  "crop 28"  │  "OCR: 'f'" │  "SrcSerif4"│
+└─────────────┴─────────────┴─────────────┘
+  d²=0.1002   #1 NotoSansDisplay...  Bold 'Tofu' T
+```
+
+**All three columns are images rendered at the same height (NORM_H = 48px).**
+Text labels go underneath each image. Scores and notes go on a separate line
+below the image group. Do NOT put OCR values as text in a table cell next to
+48px images — they become invisible.
+
+### Three images per character
+
+| Image | What it shows | Source |
+|-------|--------------|--------|
+| **Scan Crop** | The actual crop CI scored | `UNSCAN_DUMP_CROPS=1` output PNGs |
+| **OCR Char** | What Tesseract said, rendered at 48px in a neutral sans font (DejaVu Sans) | PIL render of the original OCR character |
+| **Correct Font** | The same character rendered from the ground-truth font | PIL render from the system font file at NORM_H |
+
+For OCR corrections, the label reads `OCR: 'f' → '0'`. For normal chars,
+just `OCR: 'm'`.
+
+### Score line (text below images)
+
+- **d²** value, color-coded: green (< 0.01), orange (0.01–0.05), red (> 0.05)
+- **CI nearest**: top 1-2 font names + distances
+- **Note**: brief description of what's wrong (e.g., "Bold 'Tofu' T",
+  "merged crop", "normal — for contrast")
+
+### Which characters to show
+
+Don't dump all 40 characters. Show:
+1. The **worst-scoring characters** of the correct font (highest d²)
+2. Any characters with **OCR corrections** (`.ocr_corrected_from` is set)
+3. One or two **normal characters** for contrast (d² in the 0.003–0.007 range)
+
+### Header metadata
+
+The card header should show:
+- Line identifier (page:line, OCR text)
+- What was matched (wrong answer)
+- What should have matched (correct answer, its CI rank + score)
+
+### Rendering reference characters
+
+Use PIL/FreeType to render characters at NORM_H (48px) from font files on disk.
+This is purely for **visual comparison** — it is NOT used for feature computation
+or distance measurement. The caveat from Step 1b still applies: never
+reimplement feature vectors or scoring in Python.
+
+- **OCR character**: render in a neutral sans font (DejaVu Sans) so it's
+  visually distinct from both the scan crop and the correct font render.
+- **Correct font character**: render in the ground-truth font file.
+
+### Output format
+
+Produce an HTML widget card with inline base64 images. The card must be
+theme-aware (light/dark) and self-contained. Present it with `present_now: true`
+so it renders immediately — don't embed it in a text reply.
+
+### Script: `tools/char-misses.py`
+
+Automates the full procedure — finds all real misses (ignoring metric-compatible
+clones), picks interesting characters, renders all three columns, and produces
+a self-contained HTML report.
+
+```bash
+# 1. Run unscan with crops + audit
+rm -rf /tmp/unscan-crops
+UNSCAN_DUMP_CROPS=1 ./target/release/unscan INPUT.pdf \
+    -o /dev/null --audit-log /tmp/audit.json
+
+# 2. Generate the visual report
+python3 tools/char-misses.py /tmp/audit.json test-docs/font-timeline-specimen.json \
+    --crops /tmp/unscan-crops -o /tmp/char-misses.html
+
+# 3. Present as widget card (present_now: true)
+```
+
+The script mirrors the clone/alias map from `t60_specimen_accuracy.rs` so its
+miss count matches the test. Output is a single HTML file with all base64
+images inlined.
 
 ---
 
