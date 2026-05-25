@@ -277,14 +277,13 @@ def pick_interesting_chars(chars, n_worst=4, n_normal=2):
 # Crop directory matching
 # ---------------------------------------------------------------------------
 
-def find_crop_dir(crops_root, page, text):
+def find_crop_dir(crops_root, page, line_index):
+    """Find crop directory by page and line index (deterministic)."""
     if not os.path.isdir(crops_root):
         return None, []
-    text_clean = re.sub(r'[^a-zA-Z0-9]', '', text[:30]).lower()
-    page_dirs = sorted(d for d in os.listdir(crops_root) if d.startswith(f"p{page}_"))
-    for d in page_dirs:
-        d_clean = re.sub(r'[^a-zA-Z0-9]', '', d).lower()
-        if text_clean[:15] in d_clean:
+    prefix = f"p{page}_L{line_index:03d}_"
+    for d in sorted(os.listdir(crops_root)):
+        if d.startswith(prefix):
             path = os.path.join(crops_root, d)
             return path, sorted(os.listdir(path))
     return None, []
@@ -357,6 +356,8 @@ def build_miss_html(entry, chars_to_show, crop_dir, crop_files,
                 alt_font = ""
             alt_dc = dist_class(alt_dist)
             alt_cell = f"<span class='char-label'>'{alt_ch}'</span><br><span class='font-mini'>{alt_font}</span><br><span class='num {alt_dc}'>{alt_dist:.4f}</span>"
+        elif cv.get("min_dist_sq", 1.0) <= 0.1:
+            alt_cell = "<span class='dimmed'>—</span>"
         else:
             alt_cell = "<span class='dimmed'>same</span>"
 
@@ -519,7 +520,7 @@ def main():
     # Build HTML
     miss_blocks = []
     for entry, actual_font, gt_key, gt_score, gt_rank in misses:
-        crop_dir, crop_files = find_crop_dir(args.crops, entry["page"], entry["text"])
+        crop_dir, crop_files = find_crop_dir(args.crops, entry["page"], entry["line_index"])
 
         chars = entry.get("ci_char_votes", [])
         interesting = pick_interesting_chars(chars)
