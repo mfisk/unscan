@@ -1573,7 +1573,15 @@ fn segment_characters_inner(
 
     let need = n_chars - 1; // number of splits needed
 
-    // --- Pass 1: vertical whitespace splits ---
+    // Three-pass segmentation cascade:
+    //   Pass 1 — VP strict zero-ink: split at columns with truly zero ink
+    //   Pass 2 — VP 5% ink: split at columns ≤ 5% of peak ink
+    //   Pass 3 — Seam carving: cheapest vertical path for remaining splits
+    //
+    // VP midpoints give geometrically centered boundaries.  Seam carving is
+    // last resort for genuinely connected characters (e.g. serif bridges
+    // at 10%+ ink where no column qualifies as low-ink).
+
     let threshold = 200u8;
 
     // Compute total ink per column (sum of dark-pixel intensities).
@@ -1588,71 +1596,88 @@ fn segment_characters_inner(
         })
         .collect();
 
-    // A column counts as "whitespace" if its ink is below a fraction of the
-    // peak column ink.  A stray serif intruding into a gap has far less ink
-    // than a real stroke, so 5 % of the peak is a safe cutoff.
     let max_ink = col_ink.iter().copied().max().unwrap_or(0);
-    let ink_cutoff = max_ink / 20; // 5 %
+    let ink_cutoff_5pct = max_ink / 20; // 5% of peak
 
-    let col_has_ink: Vec<bool> = col_ink.iter().map(|&v| v > ink_cutoff).collect();
-
-    // Find contiguous runs of low-ink columns (interior only: not touching edges).
-    let mut ws_runs: Vec<(u32, u32)> = Vec::new(); // (start, end) exclusive
-    let mut run_start: Option<u32> = None;
-    for x in 0..w {
-        if !col_has_ink[x as usize] {
-            if run_start.is_none() {
-                run_start = Some(x);
+    // --- Pass 1: strict zero-ink VP ---
+    // Find contiguous runs of truly empty columns (interior only).
+    let col_has_ink: Vec<bool> = col_ink.iter().map(|&v| v > 0).collect();
+    let mut ws_runs_zero: Vec<(u32, u32)> = Vec::new();
+    {
+        let mut run_start: Option<u32> = None;
+        for x in 0..w {
+            if !col_has_ink[x as usize] {
+                if run_start.is_none() { run_start = Some(x); }
+            } else if let Some(start) = run_start {
+                if start > 0 { ws_runs_zero.push((start, x)); }
+                run_start = None;
             }
-        } else if let Some(start) = run_start {
-            // Interior run: doesn't touch left edge (start > 0) or right edge (x < w)
-            if start > 0 {
-                ws_runs.push((start, x));
-            }
-            run_start = None;
         }
     }
-    // Don't include runs touching right edge
-
-    // Sort by run width descending — widest gaps are the most confident splits.
-    ws_runs.sort_by(|a, b| (b.1 - b.0).cmp(&(a.1 - a.0)));
-
-    // Take up to `need` whitespace splits (midpoint of each run).
-    // Take ALL whitespace splits — they're zero-ink gaps, so every one is a
-    // real character boundary.  Don't cap at `need`: if we get more splits
-    // than needed the extra splits just produce sub-character fragments that
-    // get merged later, while capping at `need` discards valid narrow gaps
-    // (e.g. monospace fonts with uniform 2-3px inter-character whitespace).
-    let mut splits: Vec<u32> = ws_runs
-        .iter()
+    ws_runs_zero.sort_by(|a, b| (b.1 - b.0).cmp(&(a.1 - a.0)));
+    let mut splits: Vec<u32> = ws_runs_zero.iter()
+        .take(need)
         .map(|(s, e)| (s + e) / 2)
         .collect();
     splits.sort();
+    splits.dedup();
 
     let vp_splits = splits.clone();
 
-    // Diag: dump VP pass
+    // --- Pass 2: 5% ink VP ---
+    // If more splits needed, find runs of columns ≤ 5% of peak ink that
+    // weren't already covered by zero-ink runs.  These catch serif-bridged
+    // gaps where a stray serif contributes a small amount of ink.
+    if splits.len() < need {
+        let col_has_ink_5: Vec<bool> = col_ink.iter().map(|&v| v > ink_cutoff_5pct).collect();
+        let mut ws_runs_5pct: Vec<(u32, u32)> = Vec::new();
+        {
+            let mut run_start: Option<u32> = None;
+            for x in 0..w {
+                if !col_has_ink_5[x as usize] {
+                    if run_start.is_none() { run_start = Some(x); }
+                } else if let Some(start) = run_start {
+                    if start > 0 { ws_runs_5pct.push((start, x)); }
+                    run_start = None;
+                }
+            }
+        }
+        ws_runs_5pct.sort_by(|a, b| (b.1 - b.0).cmp(&(a.1 - a.0)));
+
+        // Only add runs whose midpoint isn't already a split.
+        let still_need = need - splits.len();
+        let mut added = 0usize;
+        for (s, e) in &ws_runs_5pct {
+            let mid = (s + e) / 2;
+            if !splits.contains(&mid) {
+                splits.push(mid);
+                added += 1;
+                if added >= still_need { break; }
+            }
+        }
+        splits.sort();
+        splits.dedup();
+    }
+
+    let vp5_splits: Vec<u32> = splits.iter()
+        .filter(|s| !vp_splits.contains(s))
+        .copied().collect();
+
+    // Diag: dump VP passes
     if let (Some(ddir), Some(wtext)) = (diag_dir, word_text) {
         let _ = std::fs::create_dir_all(ddir);
-        // Word crop
         let _ = img.save(ddir.join("word_crop.png"));
-        // VP overlay
-        crate::seg_diag::save_vp_overlay(img, &ws_runs, &ddir.join("vp_overlay.png"));
+        crate::seg_diag::save_vp_overlay(img, &ws_runs_zero, &ddir.join("vp_overlay.png"));
         eprintln!(
-            "  DIAG-SEG VP: \"{}\" {}x{} — {} vp runs, {} vp splits, need {} total",
-            &wtext[..wtext.len().min(30)], w, h, ws_runs.len(), vp_splits.len(), need,
+            "  DIAG-SEG VP: \"{}\" {}x{} — {} zero-ink, {} 5%ink, need {} total",
+            &wtext[..wtext.len().min(30)], w, h, vp_splits.len(), vp5_splits.len(), need,
         );
     }
 
-    // --- Pass 2: greedy seam selection (SEGMENTATION.md) ---
+    // --- Pass 3: greedy seam carving ---
     //
-    // VP splits divide the word into segments.  For each segment, compute the
-    // cheapest vertical seam and push it onto a min-heap keyed by cost.
-    // Pop the cheapest seam, record its midpoint as a split, recompute seams
-    // for the two child sub-segments, push them back.  Repeat until we have
-    // enough splits.  This guarantees each split lands in a distinct segment
-    // (no re-splitting the same valley) and always picks the easiest remaining
-    // cut first.
+    // For remaining splits, find the cheapest vertical seam in each segment.
+    // Greedy: pop cheapest, split, recompute children, repeat.
     if splits.len() < need {
         use std::cmp::Ordering;
         use std::collections::BinaryHeap;
@@ -1748,7 +1773,7 @@ fn segment_characters_inner(
         splits.sort();
     }
 
-    let seam_splits: Vec<u32> = splits.iter().filter(|s| !vp_splits.contains(s)).copied().collect();
+    let seam_splits: Vec<u32> = splits.iter().filter(|s| !vp_splits.contains(s) && !vp5_splits.contains(s)).copied().collect();
 
     // Diag: dump seam pass
     if let Some(ddir) = diag_dir {
