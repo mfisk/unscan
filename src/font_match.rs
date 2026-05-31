@@ -25,6 +25,12 @@ use std::path::PathBuf;
 pub struct FontMatchResult {
     pub font_name: String,
     pub font_path: PathBuf,
+    /// Full font key (path + optional variant tag) for CI lookups.
+    pub font_key: String,
+    /// OT variant tag (e.g. "smcp", "onum") — empty for base fonts.
+    pub variant_tag: String,
+    /// Glyph overrides for OT variant rendering.
+    pub glyph_overrides: crate::char_index::GlyphOverrides,
     pub score: f32,
     /// Best vertical pixel shift from SSIM alignment search (0 if coarse-only).
     pub best_dy: i32,
@@ -254,7 +260,7 @@ pub fn match_font(
         let renderable = first_text
             .chars()
             .filter(|c| !c.is_whitespace())
-            .filter(|&c| font.glyph_id(c).0 != 0)
+            .filter(|&c| crate::char_index::resolve_glyph(&font, c, overrides).0 != 0)
             .count();
         if (renderable as f32 / total_chars as f32) < 0.8 {
             continue;
@@ -436,7 +442,8 @@ pub fn match_font(
     }
 
     // ── Stage 2: Re-rank top candidates with full-resolution SSIM ────
-    if top_candidates.len() >= 2 {
+    // DISABLED: investigating whether SSIM rerank hurts more than it helps
+    if false && top_candidates.len() >= 2 {
         top_candidates.sort_by(|a, b| b.0.partial_cmp(&a.0).unwrap_or(std::cmp::Ordering::Equal));
         let best_coarse = top_candidates[0].0;
         let score_floor = if best_coarse > 0.0 { best_coarse / RERANK_SCORE_FACTOR } else { 0.0 };
@@ -496,6 +503,8 @@ pub fn match_font(
                 "",  // text not used
                 lx, ly, lw, lh,
                 &line.words,
+                entry.glyph_overrides.as_deref(),
+                &entry.variant_tag,
             );
             debug!("    rerank '{}': coarse={:.3} ssim={:.3}", entry.family_name, coarse_score, ssim);
             if ssim > best_rerank_ssim {
@@ -516,6 +525,9 @@ pub fn match_font(
                 return Some(FontMatchResult {
                     font_name: entry.family_name.clone(),
                     font_path: entry.path.clone(),
+                    font_key: entry.font_key(),
+                    variant_tag: entry.variant_tag.clone(),
+                    glyph_overrides: entry.glyph_overrides.clone(),
                     score: best_rerank_ssim,
                     best_dy: best_rerank_dy,
                     ssim_verified: true,
@@ -532,6 +544,9 @@ pub fn match_font(
         FontMatchResult {
             font_name: e.family_name.clone(),
             font_path: e.path.clone(),
+            font_key: e.font_key(),
+            variant_tag: e.variant_tag.clone(),
+            glyph_overrides: e.glyph_overrides.clone(),
             score: best_score,
             best_dy: 0, // coarse-only path, no SSIM shift
             ssim_verified: false,

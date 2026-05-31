@@ -30,3 +30,4 @@ subsetter = "0.2"
 # while keeping incremental compilation fast
 [profile.dev]
 opt-level = 1
+split-debuginfo = "unpacked"

@@ -200,7 +200,7 @@ fn merge_horizontal(runs: &mut Vec<DetectedLine>) -> Vec<DetectedLine> {
             && r.x2.abs_diff(current.x2) <= 2
         {
             current.y2 = r.y2;
-            current.thickness = current.y2 - current.y1 + 1;
+            current.thickness = if current.y2 >= current.y1 { current.y2 - current.y1 + 1 } else { 1 };
         } else {
             merged.push(current.clone());
             current = r.clone();
@@ -226,7 +226,7 @@ fn merge_vertical(runs: &mut Vec<DetectedLine>) -> Vec<DetectedLine> {
             && r.y2.abs_diff(current.y2) <= 2
         {
             current.x2 = r.x2;
-            current.thickness = current.x2 - current.x1 + 1;
+            current.thickness = if current.x2 >= current.x1 { current.x2 - current.x1 + 1 } else { 1 };
         } else {
             merged.push(current.clone());
             current = r.clone();

@@ -1,0 +1,268 @@
+//! Whole-page deskewing via Hough line transform.
+//!
+//! Detects slight rotational skew (typically 0.1–2°) introduced by scanning
+//! and corrects it before OCR, improving character segmentation and font
+//! matching accuracy.
+
+use image::{GrayImage, Luma};
+
+/// Minimum absolute skew angle (degrees) that triggers correction.
+/// Below this threshold the image is returned unchanged to avoid
+/// unnecessary resampling artifacts that can degrade font matching.
+const MIN_ANGLE_DEG: f32 = 0.5;
+
+/// Maximum absolute skew angle (degrees) we'll correct.
+/// Larger rotations are likely intentional (e.g. rotated pages).
+const MAX_ANGLE_DEG: f32 = 5.0;
+
+/// Deskew a grayscale page image.
+///
+/// Returns `(corrected_image, detected_angle_degrees)`.
+/// If the detected angle is below `MIN_ANGLE_DEG`, the original image
+/// is returned unchanged (angle will still be reported).
+pub fn deskew(img: &GrayImage) -> (GrayImage, f32) {
+    let angle = detect_skew(img);
+
+    if angle.abs() < MIN_ANGLE_DEG || angle.abs() > MAX_ANGLE_DEG {
+        return (img.clone(), angle);
+    }
+
+    let corrected = rotate_gray(img, -angle);
+    (corrected, angle)
+}
+
+/// Detect the dominant skew angle of text lines using a simplified
+/// Hough line transform focused on near-horizontal lines.
+pub fn detect_skew(img: &GrayImage) -> f32 {
+    let (w, h) = (img.width() as usize, img.height() as usize);
+
+    // 1. Downsample for speed — work at ~600px wide max
+    let scale = if w > 600 { 600.0 / w as f32 } else { 1.0 };
+    let sw = (w as f32 * scale).max(1.0) as usize;
+    let sh = (h as f32 * scale).max(1.0) as usize;
+
+    // 2. Build binary edge image (Sobel-Y to find horizontal text edges)
+    let edges = compute_edges(img, sw, sh, scale);
+
+    // 3. Hough accumulator for near-horizontal lines
+    //    Standard Hough: x·cos(θ) + y·sin(θ) = ρ
+    //    A horizontal line has normal at θ = 90°.
+    //    Skew = detected_θ - 90°.
+    let theta_center: f32 = 90.0;
+    let theta_range: f32 = 5.0;
+    let theta_step: f32 = 0.05;
+    let n_theta: usize = ((2.0 * theta_range / theta_step) as usize) + 1;
+
+    let diag = ((sw * sw + sh * sh) as f32).sqrt().ceil() as usize;
+    let rho_max = diag;
+    let rho_offset = rho_max;
+    let n_rho = 2 * rho_max + 1;
+
+    // Pre-compute sin/cos for each θ
+    let thetas: Vec<(f32, f32, f32)> = (0..n_theta)
+        .map(|i| {
+            let deg = (theta_center - theta_range) + i as f32 * theta_step;
+            let rad = deg.to_radians();
+            (rad.sin(), rad.cos(), deg)
+        })
+        .collect();
+
+    // Accumulate votes
+    let mut accum = vec![0u32; n_theta * n_rho];
+
+    for y in 0..sh {
+        for x in 0..sw {
+            if edges[y * sw + x] {
+                for (ti, &(sin_t, cos_t, _)) in thetas.iter().enumerate() {
+                    let rho = (x as f32 * cos_t + y as f32 * sin_t).round() as i32;
+                    let ri = (rho + rho_offset as i32) as usize;
+                    if ri < n_rho {
+                        accum[ti * n_rho + ri] += 1;
+                    }
+                }
+            }
+        }
+    }
+
+    // 4. Find peak angle via vote-weighted average of strong bins
+    let max_votes = accum.iter().copied().max().unwrap_or(0);
+    if max_votes < 10 {
+        return 0.0;
+    }
+
+    let threshold = (max_votes as f32 * 0.3) as u32;
+    let mut weighted_sum: f64 = 0.0;
+    let mut total_weight: u64 = 0;
+
+    for ti in 0..n_theta {
+        let mut bin_total: u64 = 0;
+        for ri in 0..n_rho {
+            let votes = accum[ti * n_rho + ri];
+            if votes >= threshold {
+                bin_total += votes as u64;
+            }
+        }
+        if bin_total > 0 {
+            let skew = (thetas[ti].2 - theta_center) as f64;
+            weighted_sum += skew * bin_total as f64;
+            total_weight += bin_total;
+        }
+    }
+
+    if total_weight == 0 {
+        return 0.0;
+    }
+
+    (weighted_sum / total_weight as f64) as f32
+}
+
+/// Compute a binary edge map at the target resolution.
+/// Uses Sobel-Y gradient to find horizontal text edges (baselines, tops).
+fn compute_edges(img: &GrayImage, tw: usize, th: usize, scale: f32) -> Vec<bool> {
+    let (w, h) = (img.width() as usize, img.height() as usize);
+    let inv_scale = 1.0 / scale;
+
+    let mut grad = vec![0i32; tw * th];
+    let mut max_grad: i32 = 0;
+
+    for ty in 1..th.saturating_sub(1) {
+        for tx in 1..tw.saturating_sub(1) {
+            let sx = (tx as f32 * inv_scale) as usize;
+            let sy = (ty as f32 * inv_scale) as usize;
+
+            if sx < 1 || sy < 1 || sx >= w - 1 || sy >= h - 1 {
+                continue;
+            }
+
+            // Sobel-Y: detects horizontal edges
+            let p = |dx: i32, dy: i32| -> i32 {
+                let px = (sx as i32 + dx) as usize;
+                let py = (sy as i32 + dy) as usize;
+                img.get_pixel(px as u32, py as u32).0[0] as i32
+            };
+
+            let gy = -p(-1, -1) - 2 * p(0, -1) - p(1, -1)
+                + p(-1, 1) + 2 * p(0, 1) + p(1, 1);
+
+            let abs_gy = gy.abs();
+            grad[ty * tw + tx] = abs_gy;
+            if abs_gy > max_grad {
+                max_grad = abs_gy;
+            }
+        }
+    }
+
+    let thresh = (max_grad as f32 * 0.20) as i32;
+    grad.iter().map(|&g| g > thresh).collect()
+}
+
+/// Rotate a grayscale image by `angle_deg` degrees around its center using
+/// bilinear interpolation, filling new pixels with white (255).
+pub fn rotate_gray(img: &GrayImage, angle_deg: f32) -> GrayImage {
+    let (w, h) = (img.width(), img.height());
+    let mut out = GrayImage::from_pixel(w, h, Luma([255u8]));
+
+    let cx = w as f32 / 2.0;
+    let cy = h as f32 / 2.0;
+
+    let rad = angle_deg.to_radians();
+    let cos_a = rad.cos();
+    let sin_a = rad.sin();
+
+    let src = img.as_raw();
+    let dst = out.as_mut();
+    let stride = w as usize;
+
+    for oy in 0..h {
+        let dy = oy as f32 - cy;
+        let base_sx = sin_a * dy + cx;
+        let base_sy = cos_a * dy + cy;
+
+        for ox in 0..w {
+            let dx = ox as f32 - cx;
+            let sx = cos_a * dx + base_sx;
+            let sy = -sin_a * dx + base_sy;
+
+            let x0 = sx.floor() as i32;
+            let y0 = sy.floor() as i32;
+
+            if x0 < 0 || y0 < 0 || x0 + 1 >= w as i32 || y0 + 1 >= h as i32 {
+                continue;
+            }
+
+            let fx = sx - x0 as f32;
+            let fy = sy - y0 as f32;
+
+            let i00 = y0 as usize * stride + x0 as usize;
+            let val = src[i00] as f32 * (1.0 - fx) * (1.0 - fy)
+                + src[i00 + 1] as f32 * fx * (1.0 - fy)
+                + src[i00 + stride] as f32 * (1.0 - fx) * fy
+                + src[i00 + stride + 1] as f32 * fx * fy;
+
+            dst[oy as usize * stride + ox as usize] = val.round() as u8;
+        }
+    }
+
+    out
+}
+
+/// Rotate a full-colour `DynamicImage` by `angle_deg` degrees around its
+/// centre with bilinear interpolation and white fill.
+pub fn rotate_color(img: &image::DynamicImage, angle_deg: f32) -> image::DynamicImage {
+    let rgb = img.to_rgb8();
+    let (w, h) = (rgb.width(), rgb.height());
+    let mut out = image::RgbImage::from_pixel(w, h, image::Rgb([255, 255, 255]));
+
+    let cx = w as f32 / 2.0;
+    let cy = h as f32 / 2.0;
+
+    let rad = angle_deg.to_radians();
+    let cos_a = rad.cos();
+    let sin_a = rad.sin();
+
+    let src = rgb.as_raw();
+    let dst = out.as_mut();
+    let stride = w as usize * 3;
+
+    for oy in 0..h {
+        let dy = oy as f32 - cy;
+        let base_sx = sin_a * dy + cx;
+        let base_sy = cos_a * dy + cy;
+
+        for ox in 0..w {
+            let dx = ox as f32 - cx;
+            let sx = cos_a * dx + base_sx;
+            let sy = -sin_a * dx + base_sy;
+
+            let x0 = sx.floor() as i32;
+            let y0 = sy.floor() as i32;
+
+            if x0 < 0 || y0 < 0 || x0 + 1 >= w as i32 || y0 + 1 >= h as i32 {
+                continue;
+            }
+
+            let fx = sx - x0 as f32;
+            let fy = sy - y0 as f32;
+            let w00 = (1.0 - fx) * (1.0 - fy);
+            let w10 = fx * (1.0 - fy);
+            let w01 = (1.0 - fx) * fy;
+            let w11 = fx * fy;
+
+            let i00 = y0 as usize * stride + x0 as usize * 3;
+            let i10 = i00 + 3;
+            let i01 = i00 + stride;
+            let i11 = i01 + 3;
+
+            let out_idx = oy as usize * stride + ox as usize * 3;
+            for c in 0..3 {
+                let v = src[i00 + c] as f32 * w00
+                    + src[i10 + c] as f32 * w10
+                    + src[i01 + c] as f32 * w01
+                    + src[i11 + c] as f32 * w11;
+                dst[out_idx + c] = v.round() as u8;
+            }
+        }
+    }
+
+    image::DynamicImage::ImageRgb8(out)
+}

@@ -57,9 +57,9 @@ fn smooth_run(run: &mut [PlacedText], dpi: f32, font_cache: &crate::font_cache::
     }
 
     // Load font data via shared cache.
-    let font_data = match run[0].font_match {
+    let (font_data, overrides_owned) = match run[0].font_match {
         Some(ref fm) => match font_cache.load(&fm.font_path) {
-            Ok(d) => d,
+            Ok(d) => (d, fm.glyph_overrides.clone()),
             Err(_) => return,
         },
         None => return,
@@ -68,6 +68,7 @@ fn smooth_run(run: &mut [PlacedText], dpi: f32, font_cache: &crate::font_cache::
         Ok(f) => f,
         Err(_) => return,
     };
+    let overrides = overrides_owned.as_deref();
 
     // Collect all per-word em_px values across the run.
     let mut all_em_px: Vec<f32> = Vec::new();
@@ -76,7 +77,7 @@ fn smooth_run(run: &mut [PlacedText], dpi: f32, font_cache: &crate::font_cache::
             if word.text.is_empty() || word.width < 1.0 {
                 continue;
             }
-            if let Some(em) = layout::width_matched_em_px(&font, &word.text, word.width) {
+            if let Some(em) = layout::width_matched_em_px(&font, &word.text, word.width, overrides) {
                 all_em_px.push(em);
             }
         }
@@ -120,7 +121,7 @@ fn smooth_run(run: &mut [PlacedText], dpi: f32, font_cache: &crate::font_cache::
             }
             // Only smooth if this word's natural em_px is within the reasonable
             // range (i.e. was not itself a hard outlier worth keeping).
-            if let Some(em) = layout::width_matched_em_px(&font, &word.text, word.width) {
+            if let Some(em) = layout::width_matched_em_px(&font, &word.text, word.width, overrides) {
                 if (em - mean).abs() <= one_pt_px {
                     word.smoothed_em_px = Some(median);
                 }
