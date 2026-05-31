@@ -15,12 +15,13 @@ dramatic file-size reduction and quality improvement while maintaining
 ## How it works
 
 1. **OCR** — Tesseract extracts word-level bounding boxes and confidence scores.
-2. **Font matching** — each text line is rendered with every candidate font and
-   scored via a two-stage pipeline: coarse scoring (IoU, NCC, Hu moments,
-   fill ratio) narrows to the top 30 candidates, then SSIM re-ranking picks
-   the winner. OpenType feature variants (old-style figures, small caps,
-   stylistic sets, etc.) are matched as separate candidates — the SSIM
-   comparison naturally picks the correct variant without heuristics.
+2. **Font matching** — each word is segmented into individual character crops
+   (VP split + seam carving DP — see [`SEGMENTATION.md`](SEGMENTATION.md)),
+   then each crop is compared against every candidate font via per-character
+   SSIM. The font with the best aggregate word-level SSIM wins. OpenType
+   feature variants (old-style figures, small caps, stylistic sets, etc.) are
+   matched as separate candidates — the SSIM comparison naturally picks the
+   correct variant without heuristics.
 3. **Decision matrix** —
    | OCR confidence | Font match | Action |
    |----------------|-----------|--------|
