@@ -177,10 +177,10 @@ ls /tmp/unscan-crops/p4_line_ABCDEFGHIJKLMNOPQRSTUVWXYZ_abcdefghijklm/ | wc -l
 # 99 crops for 52 expected chars = over-segmentation
 ```
 
-Over-segmentation (more crops than chars) means the charbox fallback or seam
-pass is splitting inside glyphs. Each index in the dump gets two character
-labels (e.g., `crop_03_D.png` and `crop_03_E.png` at the same index), so the
-wrong glyph image is being compared against the wrong indexed character.
+Over-segmentation (more crops than chars) means the seam pass is splitting
+inside glyphs. Each index in the dump gets two character labels (e.g.,
+`crop_03_D.png` and `crop_03_E.png` at the same index), so the wrong glyph
+image is being compared against the wrong indexed character.
 
 Under-segmentation (fewer crops) means multiple characters are stuck in one
 crop, giving feature vectors that don't match any single indexed glyph.
@@ -214,8 +214,7 @@ print(f"VP splits: {len(interior)} interior runs for {N} expected chars")
 If VP alone produces enough splits for N-1 boundaries, seam carving never
 runs and you should see clean one-to-one crops. If VP falls short, seam
 carving (Pass 2) fills the gap. If the total *still* falls short, the
-charbox/uniform fallback fires — that's where over-splitting usually
-originates, because the fallback doesn't respect glyph boundaries.
+uniform fallback fires.
 
 ### `--include-font <NAME>`
 
@@ -650,8 +649,8 @@ Produces per-line directories, each containing per-word subdirectories:
       word_crop.png          # raw word image from Tesseract bbox
       vp_overlay.png         # VP pass: cyan runs, red split midpoints
       seam_overlay.png       # VP (red) + seam (blue) overlaid
-      final_overlay.png      # all passes: VP red, seam blue, charbox green
-      summary.json           # vp_splits, seam_splits, charbox_added_splits, boundaries
+      final_overlay.png      # all passes: VP red, seam blue
+      summary.json           # vp_splits, seam_splits, boundaries
       chars/                 # individual char crop PNGs: 00_A.png, 01_B.png, ...
     line_summary.json        # CI top 5, font_matched, ssim_score
 ```
@@ -661,7 +660,7 @@ Produces per-line directories, each containing per-word subdirectories:
 1. **segmentation mismatch** (summary.json `n_segments_produced != n_chars_expected`):
    Check VP overlay — did VP find enough zero-ink runs? If not, the font has
    touching/overlapping characters. Check seam overlay — did seam carving produce
-   reasonable splits? Check charbox — did charbox fallback over-split?
+   reasonable splits?
 
 2. **CI wrong** (correct font not in ci_top, or ranked low):
    Examine char crops in `chars/` — are they cleanly segmented? Compare against

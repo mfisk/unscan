@@ -4,7 +4,7 @@
 //!   word_NNN_TEXT.png         — raw word crop from Tesseract bbox
 //!   word_NNN_TEXT_vp.png      — VP pass: zero-ink runs highlighted cyan, split midpoints red
 //!   word_NNN_TEXT_seam.png    — VP (red) + seam splits (blue) overlaid
-//!   word_NNN_TEXT_final.png   — all splits (VP red, seam blue, charbox green) overlaid
+//!   word_NNN_TEXT_final.png   — all splits (VP red, seam blue) overlaid
 //!   word_NNN_TEXT_chars/      — per-character crop PNGs (00_A.png, 01_B.png, ...)
 //!   summary.json              — structured dump of everything
 
@@ -55,15 +55,15 @@ pub fn save_vp_overlay(
 }
 
 /// Overlay split lines on the word image.
-/// `vp` in red, `seam` in blue, `charbox` in green.
+/// `vp` in red, `seam` in blue.
 pub fn save_split_overlay(
     img: &GrayImage,
     vp: &[u32],
     seam: &[u32],
-    charbox: &[u32],
+    extra: &[u32],
     path: &Path,
 ) {
-    save_split_overlay_with_paths(img, vp, seam, charbox, &std::collections::HashMap::new(), path);
+    save_split_overlay_with_paths(img, vp, seam, extra, &std::collections::HashMap::new(), path);
 }
 
 /// Like save_split_overlay but draws actual diagonal seam paths instead of
@@ -72,7 +72,7 @@ pub fn save_split_overlay_with_paths(
     img: &GrayImage,
     vp: &[u32],
     _seam: &[u32],
-    charbox: &[u32],
+    _extra: &[u32],
     seam_paths: &std::collections::HashMap<u32, Vec<u32>>,
     path: &Path,
 ) {
@@ -93,12 +93,6 @@ pub fn save_split_overlay_with_paths(
                 if x > 0 { rgb.put_pixel(x - 1, y as u32, Rgb([0, 100, 255])); }
                 if x + 1 < w { rgb.put_pixel(x + 1, y as u32, Rgb([0, 100, 255])); }
             }
-        }
-    }
-    // Charbox splits: green vertical lines
-    for &x in charbox {
-        if x < w {
-            for y in 0..h { rgb.put_pixel(x, y, Rgb([0, 200, 0])); }
         }
     }
     let _ = rgb.save(path);

@@ -473,7 +473,7 @@ fn run(args: &cli::Args) -> Result<(), ScanTextError> {
 
         // 3a. OCR (with cache) ─────────────────────────────────────────
         let ocr_start = std::time::Instant::now();
-        let (word_regions, page_char_boxes, ocr_cached) =
+        let (word_regions, _page_char_boxes, ocr_cached) =
             if let Some((wr, cb)) = cache_dir.as_ref().and_then(|d| page_cache::load_cached_ocr(d, page_idx)) {
                 (wr, cb, true)
             } else {
@@ -536,7 +536,7 @@ fn run(args: &cli::Args) -> Result<(), ScanTextError> {
                     level: 5, block_num: 0, par_num: 0, line_num: 0, word_num: 0,
                 },
             );
-            let ci_top_for_audit: Vec<(String, f32)>;
+            let mut ci_top_for_audit: Vec<(String, f32)>;
             let ci_char_detail: Vec<char_index::CharCiDetail>;
             let diag_seg_dir: Option<std::path::PathBuf> = args.diag_seg_dir().map(|d| {
                 let line_slug: String = line.text.chars().take(30)
@@ -559,7 +559,7 @@ fn run(args: &cli::Args) -> Result<(), ScanTextError> {
                 .collect();
             let line_height = line.words.iter().map(|w| w.height).max().unwrap_or(0);
             let char_crops = char_index::extract_line_chars(
-                &gray_page, &word_placements, line_height, &page_char_boxes,
+                &gray_page, &word_placements, line_height,
                 diag_seg_dir.as_deref(),
                 diag_ref_font.as_ref(),
             );

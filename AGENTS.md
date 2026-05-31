@@ -25,14 +25,12 @@
 - **"Stop doing 1-off diagnostics and ONLY use the main code path."**
 - **"Focus on input quality, not fancier algorithms."** Fix images first.
 - **Show crops visually** — always present character crops as inline images.
-- **Tesseract charboxes are JUNK for segmentation** — use for character identity only, never for crop boundaries.
 - **Both index-build and index-lookup must use identical crop geometry.**
 
 ## Architecture
 
-- `segment_characters()`: VP (zero-ink columns) first, seam carving (Avidan & Shamir 2007) fallback
-- `extract_line_chars()`: word-level extraction path — our segmenter handles crop boundaries
-- `extract_line_chars_from_charboxes()`: DEAD CODE — charbox path bypassed, do not re-enable
+- `segment_characters()`: VP (zero-ink columns) first, dual-DP seam carving fallback
+- `extract_line_chars()`: word-level extraction — VP + seam carving handles crop boundaries
 - `normalize_to_ink_bounds()`: scan-time crop normalization to match index-time rendering
 
 ## Test Cheat Sheet
@@ -54,7 +52,6 @@ ls /tmp/unscan-crops/<line_dir>/
 
 ## Current State
 
-- Charbox path bypassed — word-level path with our segmenter is the only path
-- Segmenter: VP + seam carving hybrid (in progress, not yet working)
-- Accuracy baseline with charboxes: 86.8% (429/494) — this is what we need to beat
+- Segmenter: VP + dual-DP seam carving with diagonal masking and midpoint tie-breaking
+- Accuracy: 473/486 (97.3%) on font-timeline-specimen.pdf
 - Index version: 6, FEAT_LEN: 59, NORM_H: see code
