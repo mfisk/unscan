@@ -63,18 +63,39 @@ pub fn save_split_overlay(
     charbox: &[u32],
     path: &Path,
 ) {
+    save_split_overlay_with_paths(img, vp, seam, charbox, &std::collections::HashMap::new(), path);
+}
+
+/// Like save_split_overlay but draws actual diagonal seam paths instead of
+/// vertical lines for seam splits.
+pub fn save_split_overlay_with_paths(
+    img: &GrayImage,
+    vp: &[u32],
+    _seam: &[u32],
+    charbox: &[u32],
+    seam_paths: &std::collections::HashMap<u32, Vec<u32>>,
+    path: &Path,
+) {
     let (w, h) = img.dimensions();
     let mut rgb = gray_to_rgb(img);
+    // VP splits: red vertical lines
     for &x in vp {
         if x < w {
             for y in 0..h { rgb.put_pixel(x, y, Rgb([255, 0, 0])); }
         }
     }
-    for &x in seam {
-        if x < w {
-            for y in 0..h { rgb.put_pixel(x, y, Rgb([0, 100, 255])); }
+    // Seam splits: blue diagonal paths
+    for (_col, sp) in seam_paths {
+        for (y, &x) in sp.iter().enumerate() {
+            if x < w && (y as u32) < h {
+                rgb.put_pixel(x, y as u32, Rgb([0, 100, 255]));
+                // Thicken: draw ±1 pixel horizontally for visibility
+                if x > 0 { rgb.put_pixel(x - 1, y as u32, Rgb([0, 100, 255])); }
+                if x + 1 < w { rgb.put_pixel(x + 1, y as u32, Rgb([0, 100, 255])); }
+            }
         }
     }
+    // Charbox splits: green vertical lines
     for &x in charbox {
         if x < w {
             for y in 0..h { rgb.put_pixel(x, y, Rgb([0, 200, 0])); }
