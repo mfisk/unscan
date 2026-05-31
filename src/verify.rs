@@ -35,6 +35,8 @@ pub fn verify_text_region(
     width: u32,
     height: u32,
     words: &[TextRegion],
+    overrides: Option<&[(char, u16)]>,
+    variant_tag: &str,
 ) -> (f32, i32) {
     let (iw, ih) = original_gray.dimensions();
     let x = x.min(iw.saturating_sub(1));
@@ -81,7 +83,7 @@ pub fn verify_text_region(
     let mut best_dy = 0i32;
 
     for &scale in &scales {
-        let rendered = match render_via_freetype_scaled(font_data, &placements, w, h, scale) {
+        let rendered = match render_via_freetype_scaled(font_data, &placements, w, h, scale, overrides, variant_tag) {
             Some(r) => r,
             None => continue,
         };
@@ -124,16 +126,18 @@ fn render_via_freetype_scaled(
     canvas_w: u32,
     canvas_h: u32,
     render_scale: u32,
+    overrides: Option<&[(char, u16)]>,
+    variant_tag: &str,
 ) -> Option<GrayImage> {
     // Try PDF-based rendering first (proper OT shaping via the PDF renderer).
     // Falls back to ab_glyph if PDF rendering fails.
-    if let Some(img) = render_via_freetype(font_data, words, canvas_w, canvas_h, render_scale) {
+    if let Some(img) = render_via_freetype(font_data, words, canvas_w, canvas_h, render_scale, variant_tag) {
         return Some(img);
     }
     if render_scale == 2 {
         // Only fall back for the default scale
         log::warn!("FreeType rendering failed, falling back to ab_glyph for SSIM");
-        render_words_ab_glyph(font_data, words, canvas_w, canvas_h)
+        render_words_ab_glyph(font_data, words, canvas_w, canvas_h, overrides)
     } else {
         None
     }
@@ -147,6 +151,7 @@ fn render_via_freetype(
     canvas_w: u32,
     canvas_h: u32,
     render_scale: u32,
+    variant_tag: &str,
 ) -> Option<GrayImage> {
     use std::cell::RefCell;
 
@@ -160,8 +165,8 @@ fn render_via_freetype(
         .filter(|w| !w.text.is_empty() && w.width >= 1)
         .filter_map(|w| {
             // Prefer rustybuzz-shaped advance for consistency with FreeType rendering
-            crate::layout::width_matched_em_px_shaped(font_data, &w.text, w.width as f32)
-                .or_else(|| crate::layout::width_matched_em_px(&font_ref, &w.text, w.width as f32))
+            crate::layout::width_matched_em_px_shaped(font_data, &w.text, w.width as f32, variant_tag)
+                .or_else(|| crate::layout::width_matched_em_px(&font_ref, &w.text, w.width as f32, None))
         })
         .collect();
     if all_em.is_empty() {
@@ -198,6 +203,18 @@ fn render_via_freetype(
     let units_per_em = buzz_face.units_per_em() as f64;
     let px_per_unit = render_em as f64 / units_per_em;
 
+    // OT variant features for shaping (e.g. smcp, onum)
+    let ot_features: Vec<rustybuzz::Feature> = if !variant_tag.is_empty() && variant_tag.len() <= 4 {
+        let mut tag_bytes = [b' '; 4];
+        for (i, b) in variant_tag.as_bytes().iter().enumerate().take(4) {
+            tag_bytes[i] = *b;
+        }
+        let tag = rustybuzz::ttf_parser::Tag::from_bytes(&tag_bytes);
+        vec![rustybuzz::Feature::new(tag, 1, ..)]
+    } else {
+        vec![]
+    };
+
     let mut canvas = GrayImage::from_pixel(render_w, render_h, Luma([255u8]));
 
     for word in words {
@@ -208,7 +225,7 @@ fn render_via_freetype(
         // Shape with rustybuzz
         let mut buffer = rustybuzz::UnicodeBuffer::new();
         buffer.push_str(&word.text);
-        let glyphs = rustybuzz::shape(&buzz_face, &[], buffer);
+        let glyphs = rustybuzz::shape(&buzz_face, &ot_features, buffer);
         let infos = glyphs.glyph_infos();
         let positions = glyphs.glyph_positions();
 
@@ -335,6 +352,7 @@ fn render_words_ab_glyph(
     words: &[WordPlacement],
     canvas_w: u32,
     canvas_h: u32,
+    overrides: Option<&[(char, u16)]>,
 ) -> Option<GrayImage> {
     use ab_glyph::point;
     let font = FontRef::try_from_slice(font_data).ok()?;
@@ -344,7 +362,7 @@ fn render_words_ab_glyph(
 
     let mut all_em: Vec<f32> = words.iter()
         .filter(|w| !w.text.is_empty() && w.width >= 1)
-        .filter_map(|w| crate::layout::width_matched_em_px(&font, &w.text, w.width as f32))
+        .filter_map(|w| crate::layout::width_matched_em_px(&font, &w.text, w.width as f32, overrides))
         .collect();
     if all_em.is_empty() {
         return Some(canvas);
@@ -364,7 +382,7 @@ fn render_words_ab_glyph(
             let mut adv = 0.0f32;
             let mut prev: Option<ab_glyph::GlyphId> = None;
             for c in word.text.chars() {
-                let gid = font.glyph_id(c);
+                let gid = crate::char_index::resolve_glyph(&font, c, overrides);
                 if let Some(p) = prev {
                     adv += sf_line.kern(p, gid);
                 }
@@ -379,7 +397,7 @@ fn render_words_ab_glyph(
         let mut prev: Option<ab_glyph::GlyphId> = None;
 
         for c in word.text.chars() {
-            let gid = font.glyph_id(c);
+            let gid = crate::char_index::resolve_glyph(&font, c, overrides);
             if let Some(p) = prev {
                 cx += sf_line.kern(p, gid) * h_scale;
             }
@@ -628,7 +646,7 @@ fn ssim_global(a: &GrayImage, b: &GrayImage) -> f32 {
 // Skew detection & correction
 // ---------------------------------------------------------------------------
 
-fn detect_skew_from_words(words: &[WordPlacement]) -> f32 {
+pub fn detect_skew_from_words(words: &[WordPlacement]) -> f32 {
     let centres: Vec<(f32, f32)> = words
         .iter()
         .filter(|w| !w.text.is_empty() && w.width > 0 && w.height > 0)
@@ -651,7 +669,7 @@ fn detect_skew_from_words(words: &[WordPlacement]) -> f32 {
     slope.atan().clamp(-5.0_f32.to_radians(), 5.0_f32.to_radians())
 }
 
-fn rotate_gray(img: &GrayImage, angle: f32) -> GrayImage {
+pub fn rotate_gray(img: &GrayImage, angle: f32) -> GrayImage {
     let (w, h) = img.dimensions();
     let mut out = GrayImage::from_pixel(w, h, Luma([255u8]));
     let cx = w as f32 / 2.0;

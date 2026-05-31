@@ -180,14 +180,15 @@ pub fn generate_pdf(output_path: &Path, pages: &[PageContent], overlay: bool, fo
     let mut doc = Document::with_version("1.7");
     let pages_id = doc.new_object_id();
 
-    // ── Collect unique chars per font path ───────────────────────────
-    let mut font_chars: HashMap<PathBuf, HashSet<char>> = HashMap::new();
-    let mut font_data_map: HashMap<PathBuf, std::sync::Arc<Vec<u8>>> = HashMap::new();
+    // ── Collect unique chars per font key (path|variant_tag) ──────────
+    let mut font_chars: HashMap<String, HashSet<char>> = HashMap::new();
+    let mut font_data_map: HashMap<String, std::sync::Arc<Vec<u8>>> = HashMap::new();
+    let mut font_overrides_map: HashMap<String, Option<Vec<(char, u16)>>> = HashMap::new();
     for page in pages {
         for tr in &page.text_regions {
             if tr.keep_raster { continue; }
             if let Some(ref fm) = tr.font_match {
-                let chars = font_chars.entry(fm.font_path.clone()).or_default();
+                let chars = font_chars.entry(fm.font_key.clone()).or_default();
                 // Collect from per-word text if available, else whole line
                 if !tr.words.is_empty() {
                     for w in &tr.words {
@@ -196,26 +197,29 @@ pub fn generate_pdf(output_path: &Path, pages: &[PageContent], overlay: bool, fo
                 } else {
                     chars.extend(tr.text.chars());
                 }
-                font_data_map.entry(fm.font_path.clone())
+                font_data_map.entry(fm.font_key.clone())
                     .or_insert_with(|| {
                         font_cache.load(&fm.font_path)
                             .unwrap_or_else(|_| std::sync::Arc::new(Vec::new()))
                     });
+                font_overrides_map.entry(fm.font_key.clone())
+                    .or_insert_with(|| fm.glyph_overrides.clone());
             }
         }
     }
 
     // ── Embed subsetted fonts ────────────────────────────────────────
-    // font_map: font_path → (object_id, pdf_name, char→CID mapping)
-    let mut font_map: HashMap<PathBuf, (lopdf::ObjectId, String, HashMap<char, u16>)> = HashMap::new();
+    // font_map: font_key → (object_id, pdf_name, char→CID mapping)
+    let mut font_map: HashMap<String, (lopdf::ObjectId, String, HashMap<char, u16>)> = HashMap::new();
     let mut font_counter = 0u32;
 
-    for (font_path, chars) in &font_chars {
+    for (font_key, chars) in &font_chars {
         let name = format!("F{font_counter}");
         font_counter += 1;
-        let font_data = &font_data_map[font_path];
-        let (id, cid_map) = embed_subsetted_font(&mut doc, font_data.as_slice(), &name, chars)?;
-        font_map.insert(font_path.clone(), (id, name, cid_map));
+        let font_data = &font_data_map[font_key];
+        let overrides = font_overrides_map.get(font_key).and_then(|o| o.as_deref());
+        let (id, cid_map) = embed_subsetted_font(&mut doc, font_data.as_slice(), &name, chars, overrides)?;
+        font_map.insert(font_key.clone(), (id, name, cid_map));
     }
 
     let mut page_ids = Vec::new();
@@ -292,15 +296,15 @@ pub fn generate_pdf(output_path: &Path, pages: &[PageContent], overlay: bool, fo
         // 5. Vector text
         let default_font_name = "Fdef";
         let mut font_resources: Vec<(String, lopdf::ObjectId)> = Vec::new();
-        let mut page_font_names: HashMap<PathBuf, String> = HashMap::new();
+        let mut page_font_names: HashMap<String, String> = HashMap::new();
 
         for tr in &page.text_regions {
             if tr.keep_raster { continue; }
             if let Some(ref fm) = tr.font_match {
-                if let Some((obj_id, ref name, _)) = font_map.get(&fm.font_path) {
-                    if !page_font_names.contains_key(&fm.font_path) {
+                if let Some((obj_id, ref name, _)) = font_map.get(&fm.font_key) {
+                    if !page_font_names.contains_key(&fm.font_key) {
                         font_resources.push((name.clone(), *obj_id));
-                        page_font_names.insert(fm.font_path.clone(), name.clone());
+                        page_font_names.insert(fm.font_key.clone(), name.clone());
                     }
                 }
             }
@@ -313,9 +317,9 @@ for tr in &page.text_regions {
             let (cr, cg, cb) = tr.color;
 
             let (fname, cid_map) = if let Some(ref fm) = tr.font_match {
-                let name = page_font_names.get(&fm.font_path)
+                let name = page_font_names.get(&fm.font_key)
                     .cloned().unwrap_or_else(|| default_font_name.to_string());
-                let cmap = font_map.get(&fm.font_path).map(|(_, _, m)| m);
+                let cmap = font_map.get(&fm.font_key).map(|(_, _, m)| m);
                 (name, cmap)
             } else {
                 (default_font_name.to_string(), None)
@@ -495,16 +499,17 @@ fn embed_subsetted_font(
     font_data: &[u8],
     _name: &str,
     used_chars: &HashSet<char>,
+    overrides: Option<&[(char, u16)]>,
 ) -> Result<(lopdf::ObjectId, HashMap<char, u16>), ScanTextError> {
     use ab_glyph::{Font, ScaleFont};
 
     let ab_font = ab_glyph::FontRef::try_from_slice(font_data)
         .map_err(|e| ScanTextError::PdfGen(format!("parse font: {e}")))?;
 
-    // Map chars → original glyph IDs
+    // Map chars → original glyph IDs (with variant overrides)
     let mut char_to_orig_gid: Vec<(char, u16)> = Vec::new();
     for &ch in used_chars {
-        let gid = ab_font.glyph_id(ch);
+        let gid = crate::char_index::resolve_glyph(&ab_font, ch, overrides);
         let gid_val = gid.0;
         if gid_val != 0 {
             char_to_orig_gid.push((ch, gid_val));
@@ -569,7 +574,7 @@ fn embed_subsetted_font(
     let mut w_entries: Vec<Object> = Vec::new();
     let mut cid_widths: Vec<(u16, i64)> = char_to_cid.iter()
         .map(|(&ch, &cid)| {
-            let gid = ab_font.glyph_id(ch);
+            let gid = crate::char_index::resolve_glyph(&ab_font, ch, overrides);
             let w = sf.h_advance(gid).round() as i64;
             (cid, w)
         })

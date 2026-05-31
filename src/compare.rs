@@ -62,6 +62,7 @@ pub fn generate_comparison(
             x, y, crop_x, crop_y,
             crop_w, crop_h,
             &pt.text,
+            fm.glyph_overrides.as_deref(),
         );
 
         // ── Scale both to target width ───────────────────────────
@@ -203,6 +204,7 @@ fn render_font_crop(
     canvas_w: u32,
     canvas_h: u32,
     line_text: &str,
+    overrides: Option<&[(char, u16)]>,
 ) -> GrayImage {
     let mut canvas = GrayImage::from_pixel(canvas_w, canvas_h, Luma([255u8]));
 
@@ -222,6 +224,7 @@ fn render_font_crop(
                 &font,
                 &word.text,
                 word.width,
+                overrides,
             ) {
                 Some(v) => v,
                 None => continue,
@@ -244,7 +247,7 @@ fn render_font_crop(
             let mut prev: Option<ab_glyph::GlyphId> = None;
 
             for c in word.text.chars() {
-                let gid = font.glyph_id(c);
+                let gid = crate::char_index::resolve_glyph(&font, c, overrides);
                 if let Some(p) = prev {
                     cx += sf.kern(p, gid);
                 }
@@ -280,6 +283,7 @@ fn render_font_crop(
             &font,
             line_text,
             (line_x + (canvas_w - 8)) as f32 - line_x as f32,
+            overrides,
         ) {
             Some(v) => v,
             None => return canvas,
@@ -295,7 +299,7 @@ fn render_font_crop(
         let mut prev: Option<ab_glyph::GlyphId> = None;
 
         for c in line_text.chars() {
-            let gid = font.glyph_id(c);
+            let gid = crate::char_index::resolve_glyph(&font, c, overrides);
             if let Some(p) = prev {
                 cx += sf.kern(p, gid);
             }

@@ -16,12 +16,12 @@ const REF_H: f32 = 100.0;
 /// Compute the font em-height in pixels such that the advance width of `text`
 /// equals `target_width_px`.  Returns `None` when the font has zero advance
 /// for the given text (e.g. missing glyphs).
-pub fn width_matched_em_px<F: Font>(font: &F, text: &str, target_width_px: f32) -> Option<f32> {
+pub fn width_matched_em_px<F: Font>(font: &F, text: &str, target_width_px: f32, overrides: Option<&[(char, u16)]>) -> Option<f32> {
     let sf_ref = font.as_scaled(PxScale::from(REF_H));
     let mut adv = 0.0f32;
     let mut prev: Option<ab_glyph::GlyphId> = None;
     for c in text.chars() {
-        let gid = font.glyph_id(c);
+        let gid = crate::char_index::resolve_glyph(font, c, overrides);
         if let Some(p) = prev {
             adv += sf_ref.kern(p, gid);
         }
@@ -153,13 +153,27 @@ pub fn baseline_aligned_baseline_pt<F: Font>(
 
 /// Compute em_px using rustybuzz shaped advances (full OT shaping).
 /// More accurate than `width_matched_em_px` which uses ab_glyph (no GPOS).
-pub fn width_matched_em_px_shaped(font_data: &[u8], text: &str, target_width_px: f32) -> Option<f32> {
+/// When `variant_tag` is non-empty (e.g. "smcp", "onum"), the corresponding
+/// OT feature is activated during shaping.
+pub fn width_matched_em_px_shaped(font_data: &[u8], text: &str, target_width_px: f32, variant_tag: &str) -> Option<f32> {
     let face = rustybuzz::Face::from_slice(font_data, 0)?;
     let units_per_em = face.units_per_em() as f64;
 
     let mut buffer = rustybuzz::UnicodeBuffer::new();
     buffer.push_str(text);
-    let glyphs = rustybuzz::shape(&face, &[], buffer);
+
+    let features: Vec<rustybuzz::Feature> = if !variant_tag.is_empty() && variant_tag.len() <= 4 {
+        let mut tag_bytes = [b' '; 4];
+        for (i, b) in variant_tag.as_bytes().iter().enumerate().take(4) {
+            tag_bytes[i] = *b;
+        }
+        let tag = rustybuzz::ttf_parser::Tag::from_bytes(&tag_bytes);
+        vec![rustybuzz::Feature::new(tag, 1, ..)]
+    } else {
+        vec![]
+    };
+
+    let glyphs = rustybuzz::shape(&face, &features, buffer);
     let positions = glyphs.glyph_positions();
 
     let total_advance_fu: f64 = positions.iter().map(|p| p.x_advance as f64).sum();

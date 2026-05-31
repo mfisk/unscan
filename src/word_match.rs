@@ -31,6 +31,10 @@ const MIN_WORD_CONF: f32 = 50.0;
 pub struct WordMatchCandidate<'a> {
     pub name: String,
     pub font_data: &'a [u8],
+    /// OT variant tag (e.g. "smcp", "onum") — empty for base fonts.
+    pub variant_tag: String,
+    /// Glyph overrides for OT variant rendering.
+    pub glyph_overrides: crate::char_index::GlyphOverrides,
 }
 
 /// A word with its bounding box and text, for word-level matching.
@@ -74,12 +78,12 @@ pub fn word_level_rerank(
     let (pw, ph) = page_gray.dimensions();
 
     // Parse candidate fonts
-    let parsed: Vec<(&str, FontRef)> = candidates
+    let parsed: Vec<(&str, FontRef, Option<&[(char, u16)]>)> = candidates
         .iter()
         .filter_map(|c| {
             FontRef::try_from_slice(c.font_data)
                 .ok()
-                .map(|f| (c.name.as_str(), f))
+                .map(|f| (c.name.as_str(), f, c.glyph_overrides.as_deref()))
         })
         .collect();
 
@@ -146,8 +150,8 @@ pub fn word_level_rerank(
         // Save the crop as SSIM actually sees it (trimmed) for audit
         let mut audit_crop_saved = false;
 
-        for (fname, font) in &parsed {
-            let rendered = match render_word(font, &word.text, crop.width(), crop.height()) {
+        for (fname, font, overrides) in &parsed {
+            let rendered = match render_word(font, &word.text, crop.width(), crop.height(), *overrides) {
                 Some(r) => r,
                 None => continue,
             };
@@ -231,8 +235,8 @@ pub fn word_level_rerank(
         .max_by(|(a_name, a_votes), (b_name, b_votes)| {
             a_votes.cmp(b_votes).then_with(|| {
                 // Lower index in parsed = higher CI rank = preferred
-                let a_idx = parsed.iter().position(|(n, _)| n == *a_name).unwrap_or(usize::MAX);
-                let b_idx = parsed.iter().position(|(n, _)| n == *b_name).unwrap_or(usize::MAX);
+                let a_idx = parsed.iter().position(|(n, _, _)| n == *a_name).unwrap_or(usize::MAX);
+                let b_idx = parsed.iter().position(|(n, _, _)| n == *b_name).unwrap_or(usize::MAX);
                 b_idx.cmp(&a_idx) // reverse: lower index wins
             })
         })
@@ -253,12 +257,12 @@ pub fn word_level_rerank(
 // ── Word rendering ──────────────────────────────────────────────────────────
 
 /// Render `text` in `font` onto a canvas of `canvas_w × canvas_h`, width-matched.
-fn render_word(font: &FontRef, text: &str, canvas_w: u32, canvas_h: u32) -> Option<GrayImage> {
+fn render_word(font: &FontRef, text: &str, canvas_w: u32, canvas_h: u32, overrides: Option<&[(char, u16)]>) -> Option<GrayImage> {
     if text.is_empty() || canvas_w < 4 || canvas_h < 4 {
         return None;
     }
 
-    let em_px = width_matched_em(font, text, canvas_w as f32)?;
+    let em_px = width_matched_em(font, text, canvas_w as f32, overrides)?;
     let scale = PxScale::from(em_px);
     let sf = font.as_scaled(scale);
 
@@ -273,7 +277,7 @@ fn render_word(font: &FontRef, text: &str, canvas_w: u32, canvas_h: u32) -> Opti
         let mut cx = 0.0f32;
         let mut prev: Option<ab_glyph::GlyphId> = None;
         for c in text.chars() {
-            let gid = font.glyph_id(c);
+            let gid = crate::char_index::resolve_glyph(font, c, overrides);
             if let Some(p) = prev {
                 cx += sf.kern(p, gid);
             }
@@ -297,7 +301,7 @@ fn render_word(font: &FontRef, text: &str, canvas_w: u32, canvas_h: u32) -> Opti
     let (cw, ch) = canvas.dimensions();
 
     for c in text.chars() {
-        let gid = font.glyph_id(c);
+        let gid = crate::char_index::resolve_glyph(font, c, overrides);
         if let Some(p) = prev {
             cx += sf.kern(p, gid);
         }
@@ -323,13 +327,13 @@ fn render_word(font: &FontRef, text: &str, canvas_w: u32, canvas_h: u32) -> Opti
     Some(canvas)
 }
 
-fn width_matched_em(font: &FontRef, text: &str, target_w: f32) -> Option<f32> {
+fn width_matched_em(font: &FontRef, text: &str, target_w: f32, overrides: Option<&[(char, u16)]>) -> Option<f32> {
     let ref_h = 100.0f32;
     let sf = font.as_scaled(PxScale::from(ref_h));
     let mut adv = 0.0f32;
     let mut prev: Option<ab_glyph::GlyphId> = None;
     for c in text.chars() {
-        let gid = font.glyph_id(c);
+        let gid = crate::char_index::resolve_glyph(font, c, overrides);
         if let Some(p) = prev {
             adv += sf.kern(p, gid);
         }

@@ -1,6 +1,7 @@
 mod audit;
 mod cli;
 mod color;
+mod deskew;
 mod error;
 mod font_cache;
 mod font_match;
@@ -63,11 +64,11 @@ fn run_index(args: &cli::Args) -> Result<(), ScanTextError> {
 
     let index_path = args.resolved_index_path();
 
-    // Collect system font keys → paths for lookup.
+    // Collect system font keys → paths + glyph overrides for lookup.
     // Keys are unique per weight/style/variant (path + optional variant tag).
-    let system_fonts: std::collections::HashMap<String, PathBuf> = font_catalog
+    let system_fonts: std::collections::HashMap<String, (PathBuf, char_index::GlyphOverrides)> = font_catalog
         .iter()
-        .map(|e| (e.font_key(), e.path.clone()))
+        .map(|e| (e.font_key(), (e.path.clone(), e.glyph_overrides.clone())))
         .collect();
     let system_names: std::collections::HashSet<String> =
         system_fonts.keys().cloned().collect();
@@ -162,9 +163,9 @@ fn run_index(args: &cli::Args) -> Result<(), ScanTextError> {
         if new_fonts.len() > 10 {
             debug!("  … and {} more", new_fonts.len() - 10);
         }
-        let pairs: Vec<(String, PathBuf)> = new_fonts
+        let pairs: Vec<(String, PathBuf, char_index::GlyphOverrides)> = new_fonts
             .iter()
-            .filter_map(|name| system_fonts.get(name).map(|p| (name.clone(), p.clone())))
+            .filter_map(|name| system_fonts.get(name).map(|(p, g)| (name.clone(), p.clone(), g.clone())))
             .collect();
         let start = std::time::Instant::now();
         let partial = char_index::build_char_index(&pairs);
@@ -201,12 +202,12 @@ fn run_index(args: &cli::Args) -> Result<(), ScanTextError> {
 
 /// Full index build from scratch (used for first build, format changes, --rebuild-index).
 fn do_full_build(
-    system_fonts: &std::collections::HashMap<String, PathBuf>,
+    system_fonts: &std::collections::HashMap<String, (PathBuf, char_index::GlyphOverrides)>,
     index_path: &Path,
 ) -> Result<(), ScanTextError> {
-    let pairs: Vec<(String, PathBuf)> = system_fonts
+    let pairs: Vec<(String, PathBuf, char_index::GlyphOverrides)> = system_fonts
         .iter()
-        .map(|(n, p)| (n.clone(), p.clone()))
+        .map(|(n, (p, g))| (n.clone(), p.clone(), g.clone()))
         .collect();
 
     info!("Building character index ({} fonts × {} chars)…",
@@ -296,9 +297,9 @@ fn load_or_build_index(
     //     }
     //     deduped
     // };
-    let pairs: Vec<(String, PathBuf)> = font_catalog
+    let pairs: Vec<(String, PathBuf, char_index::GlyphOverrides)> = font_catalog
         .iter()
-        .map(|e| (e.font_key(), e.path.clone()))
+        .map(|e| (e.font_key(), e.path.clone(), e.glyph_overrides.clone()))
         .collect();
     let mut index = char_index::build_char_index(&pairs);
     let elapsed = start.elapsed();
@@ -439,13 +440,37 @@ fn run(args: &cli::Args) -> Result<(), ScanTextError> {
             page_img.height()
         );
 
+        // 3a-pre. Deskew ──────────────────────────────────────────────
+        // Detect and correct skew on the grayscale image used for OCR
+        // and font matching. The original colour page_img is kept for
+        // background colour detection, geometry, and raster fragments.
+        let orig_gray = page_img.to_luma8();
+        let skew_angle = deskew::detect_skew(&orig_gray);
+        let (deskewed_gray, did_deskew) = if skew_angle.abs() >= 1.5 && skew_angle.abs() <= 5.0 {
+            info!("  Deskew: {:.2}° rotation corrected", skew_angle);
+            (deskew::rotate_gray(&orig_gray, -skew_angle), true)
+        } else if skew_angle.abs() > 5.0 {
+            info!("  Deskew: {:.2}° detected (too large, skipped)", skew_angle);
+            (orig_gray.clone(), false)
+        } else {
+            info!("  Deskew: no significant skew detected ({:.3}°)", skew_angle);
+            (orig_gray, false)
+        };
+
+        // Build a DynamicImage from the deskewed gray for OCR input
+        let ocr_img: std::borrow::Cow<'_, image::DynamicImage> = if did_deskew {
+            std::borrow::Cow::Owned(image::DynamicImage::ImageLuma8(deskewed_gray.clone()))
+        } else {
+            std::borrow::Cow::Borrowed(page_img)
+        };
+
         // 3a. OCR (with cache) ─────────────────────────────────────────
         let ocr_start = std::time::Instant::now();
         let (word_regions, page_char_boxes, ocr_cached) =
             if let Some((wr, cb)) = cache_dir.as_ref().and_then(|d| page_cache::load_cached_ocr(d, page_idx)) {
                 (wr, cb, true)
             } else {
-                let (wr, cb) = ocr::extract_text_regions(page_img, args.dpi)?;
+                let (wr, cb) = ocr::extract_text_regions(&ocr_img, args.dpi)?;
                 if let Some(ref cdir) = cache_dir {
                     page_cache::save_cached_ocr(cdir, page_idx, &wr, &cb);
                 }
@@ -466,7 +491,8 @@ fn run(args: &cli::Args) -> Result<(), ScanTextError> {
         info!("  Background: #{:02x}{:02x}{:02x}", bg_color.0, bg_color.1, bg_color.2);
 
         // 3c. Font match + decision matrix ────────────────────────────
-        let gray_page = page_img.to_luma8();
+        // Use the deskewed grayscale for character segmentation and matching
+        let gray_page = deskewed_gray;
 
         // Expand OCR bboxes to actual ink extent — Tesseract often clips
         // descenders, under-reporting line height by up to 10 px.
@@ -487,6 +513,8 @@ fn run(args: &cli::Args) -> Result<(), ScanTextError> {
             word_rerank_winner_name: Option<String>,
             word_audit_entries: Vec<audit::WordAudit>,
             diag_seg_dir: Option<std::path::PathBuf>,
+            /// Per-char distances to the chosen font, keyed by crop_index.
+            chosen_char_dists: std::collections::HashMap<usize, f32>,
         }
 
         let fontmatch_start = std::time::Instant::now();
@@ -515,24 +543,25 @@ fn run(args: &cli::Args) -> Result<(), ScanTextError> {
                 let _ = std::fs::create_dir_all(&p);
                 p
             });
+            // Extract char crops (before font matching block so they're available after)
+            let word_placements: Vec<crate::verify::WordPlacement> = line.words.iter()
+                .map(|w| crate::verify::WordPlacement {
+                    text: w.text.clone(),
+                    x_off: w.x,
+                    y_off: w.y,
+                    width: w.width,
+                    height: w.height,
+                    confidence: w.confidence,
+                })
+                .collect();
+            let line_height = line.words.iter().map(|w| w.height).max().unwrap_or(0);
+            let char_crops = char_index::extract_line_chars(
+                &gray_page, &word_placements, line_height, &page_char_boxes,
+                diag_seg_dir.as_deref(),
+                diag_ref_font.as_ref(),
+            );
+
             let font_result = {
-                // Query char index for candidate font keys
-                let word_placements: Vec<crate::verify::WordPlacement> = line.words.iter()
-                    .map(|w| crate::verify::WordPlacement {
-                        text: w.text.clone(),
-                        x_off: w.x,
-                        y_off: w.y,
-                        width: w.width,
-                        height: w.height,
-                        confidence: w.confidence,
-                    })
-                    .collect();
-                let line_height = line.words.iter().map(|w| w.height).max().unwrap_or(0);
-                let char_crops = char_index::extract_line_chars(
-                    &gray_page, &word_placements, line_height, &page_char_boxes,
-                    diag_seg_dir.as_deref(),
-                    diag_ref_font.as_ref(),
-                );
 
                 // Dump character crops when UNSCAN_DUMP_CROPS is set
                 if std::env::var("UNSCAN_DUMP_CROPS").is_ok() && !char_crops.is_empty() {
@@ -547,6 +576,21 @@ fn run(args: &cli::Args) -> Result<(), ScanTextError> {
                             if ch.is_alphanumeric() { format!("{}", ch) }
                             else { format!("U{:04X}", *ch as u32) });
                         let _ = img.save(&path);
+                    }
+                }
+
+                // Also dump per-line crops into diag-seg dir when --diag-seg is set.
+                // This makes the miss report work without UNSCAN_DUMP_CROPS.
+                if let Some(ref ddir) = diag_seg_dir {
+                    if !char_crops.is_empty() {
+                        let crop_dir = ddir.join("crops");
+                        let _ = std::fs::create_dir_all(&crop_dir);
+                        for (i, (ch, img)) in char_crops.iter().enumerate() {
+                            let path = crop_dir.join(format!("crop_{:02}_{}.png", i,
+                                if ch.is_alphanumeric() { format!("{}", ch) }
+                                else { format!("U{:04X}", *ch as u32) }));
+                            let _ = img.save(&path);
+                        }
                     }
                 }
 
@@ -606,18 +650,20 @@ fn run(args: &cli::Args) -> Result<(), ScanTextError> {
 
                     // Find font data for each candidate via shared cache.
                     // Every variant is treated as its own candidate — no dedup.
-                    let candidate_data: Vec<(String, std::sync::Arc<Vec<u8>>)> = top_names.iter().filter_map(|name| {
+                    let candidate_data: Vec<(String, std::sync::Arc<Vec<u8>>, String, crate::char_index::GlyphOverrides)> = top_names.iter().filter_map(|name| {
                         font_catalog.iter().find(|fe| {
                             fe.font_key() == *name
                         }).and_then(|fe| {
                             let data = font_cache.load(&fe.path).ok()?;
-                            Some((name.to_string(), data))
+                            Some((name.to_string(), data, fe.variant_tag.clone(), fe.glyph_overrides.clone()))
                         })
                     }).collect();
-                    let candidates: Vec<word_match::WordMatchCandidate> = candidate_data.iter().map(|(name, data)| {
+                    let candidates: Vec<word_match::WordMatchCandidate> = candidate_data.iter().map(|(name, data, vtag, govs)| {
                         word_match::WordMatchCandidate {
                             name: name.clone(),
                             font_data: data,
+                            variant_tag: vtag.clone(),
+                            glyph_overrides: govs.clone(),
                         }
                     }).collect();
 
@@ -639,6 +685,9 @@ fn run(args: &cli::Args) -> Result<(), ScanTextError> {
                                 }).map(|fe| font_match::FontMatchResult {
                                     font_name: fe.family_name.clone(),
                                     font_path: fe.path.clone(),
+                                    font_key: fe.font_key(),
+                                    variant_tag: fe.variant_tag.clone(),
+                                    glyph_overrides: fe.glyph_overrides.clone(),
                                     score: 0.90,
                                     best_dy: 0,
                                     ssim_verified: true,
@@ -654,20 +703,10 @@ fn run(args: &cli::Args) -> Result<(), ScanTextError> {
                 if word_rerank_result.is_some() {
                     word_rerank_result
                 } else {
-                    // Gate font_match to CI candidates only.  Never fall back
-                    // to the full 4,700+ font catalog — ungated coarse scoring
-                    // takes 15-25s per line and wastes minutes on text the char
-                    // index couldn't resolve (attribution lines, watermarks).
-                    let ci_keys: std::collections::HashSet<String> = ci_result.scores.into_iter().map(|(name, _score)| name).collect();
-                    if ci_keys.is_empty() {
-                        None
-                    } else {
-                        font_match::match_font(
-                            &gray_page, line, &font_catalog, &font_cache,
-                            args.min_font_confidence, args.dpi,
-                            Some(&ci_keys),
-                        )
-                    }
+                    // Coarse scoring DISABLED — word SSIM rerank is the
+                    // primary reranker; coarse scoring adds complexity
+                    // without improving accuracy.
+                    None
                 }
             };
             let line_elapsed = line_start.elapsed();
@@ -675,7 +714,53 @@ fn run(args: &cli::Args) -> Result<(), ScanTextError> {
                 eprintln!("  LINE {}: {:.1}s '{:.30}…'", li, line_elapsed.as_secs_f32(),
                     line.words.iter().map(|w| w.text.as_str()).collect::<Vec<_>>().join(" "));
             }
-            LineMatch { font_result, text_color, ci_top_for_audit, ci_char_detail, word_rerank_winner_name, word_audit_entries, diag_seg_dir }
+            // Compute per-char distances for the chosen font
+            let chosen_char_dists: std::collections::HashMap<usize, f32> = if let Some(ref fr) = font_result {
+                if !fr.font_key.is_empty() {
+                    char_index::per_char_distances(&char_index, &fr.font_key, &char_crops)
+                        .into_iter()
+                        .map(|(_, crop_idx, d2)| (crop_idx, d2))
+                        .collect()
+                } else {
+                    std::collections::HashMap::new()
+                }
+            } else {
+                std::collections::HashMap::new()
+            };
+
+            // Dump CI reference images for the chosen font into diag-seg
+            if let (Some(ref ddir), Some(ref fr)) = (&diag_seg_dir, &font_result) {
+                let refs_dir = ddir.join("refs");
+                let _ = std::fs::create_dir_all(&refs_dir);
+                // Find the FontEntry for glyph overrides — use font_key for exact match
+                let fe_opt = font_catalog.iter().find(|e| e.font_key() == fr.font_key);
+                let override_map: std::collections::HashMap<char, u16> = fe_opt
+                    .and_then(|fe| fe.glyph_overrides.as_ref())
+                    .map(|v| v.iter().cloned().collect())
+                    .unwrap_or_default();
+                let font_data = font_cache.load(&fr.font_path).ok();
+                if let Some(ref fdata) = font_data {
+                    if let Ok(font) = ab_glyph::FontRef::try_from_slice(fdata) {
+                        for (i, (ch, _crop)) in char_crops.iter().enumerate() {
+                            let ref_img = if let Some(&gid) = override_map.get(ch) {
+                                char_index::render_glyph_normalised(&font, ab_glyph::GlyphId(gid))
+                            } else {
+                                char_index::render_char_normalised(&font, *ch)
+                            };
+                            if let Some(img) = ref_img {
+                                let safe_ch: String = if ch.is_alphanumeric() {
+                                    ch.to_string()
+                                } else {
+                                    format!("u{:04X}", *ch as u32)
+                                };
+                                let path = refs_dir.join(format!("ref_{:02}_{}.png", i, safe_ch));
+                                let _ = img.save(&path);
+                            }
+                        }
+                    }
+                }
+            }
+            LineMatch { font_result, text_color, ci_top_for_audit, ci_char_detail, word_rerank_winner_name, word_audit_entries, diag_seg_dir, chosen_char_dists }
         }).collect();
         let fontmatch_elapsed = fontmatch_start.elapsed();
         eprintln!("  Font matching: {:.1}s ({} lines)", fontmatch_elapsed.as_secs_f32(), lines.len());
@@ -686,7 +771,7 @@ fn run(args: &cli::Args) -> Result<(), ScanTextError> {
         {
             use std::collections::HashMap;
             // Collect (font_name, font_size_bucket) frequencies
-            let mut size_freq: HashMap<i32, u32> = HashMap::new();
+            let mut size_freq: HashMap<i32, u32> = std::collections::HashMap::new();
             for (i, lm) in line_matches.iter().enumerate() {
                 if let Some(ref fm) = lm.font_result {
                     if fm.score >= args.min_font_confidence {
@@ -704,13 +789,20 @@ fn run(args: &cli::Args) -> Result<(), ScanTextError> {
 
             if let Some(body_size) = body_size {
                 // Count fonts at body size (±1pt)
-                let mut font_freq: HashMap<String, (u32, PathBuf)> = HashMap::new();
+                let mut font_freq: HashMap<String, (u32, PathBuf)> = std::collections::HashMap::new();
                 for (i, lm) in line_matches.iter().enumerate() {
                     let sz = lines[i].font_size_pt.round() as i32;
                     if (sz - body_size).abs() <= 1 {
                         if let Some(ref fm) = lm.font_result {
                             if fm.score >= args.min_font_confidence {
-                                let entry = font_freq.entry(fm.font_name.clone())
+                                // Strip variant suffix "[tag]" so base and
+                                // variant contribute to the same majority count.
+                                let base_name = if let Some(idx) = fm.font_name.rfind('[') {
+                                    fm.font_name[..idx].trim_end().to_string()
+                                } else {
+                                    fm.font_name.clone()
+                                };
+                                let entry = font_freq.entry(base_name)
                                     .or_insert_with(|| (0, fm.font_path.clone()));
                                 entry.0 += 1;
                             }
@@ -728,7 +820,7 @@ fn run(args: &cli::Args) -> Result<(), ScanTextError> {
                         font_freq.iter().map(|(k,(c,_))| (k.as_str(), *c)).collect::<Vec<_>>(),
                         majority_name, majority_count, total_body);
                     // Only apply grouping if majority font has ≥40% of body lines
-                    if *majority_count as f32 / total_body as f32 >= 0.4 && *majority_count >= 3 && majority_data_opt.is_some() {
+                    if false && *majority_count as f32 / total_body as f32 >= 0.4 && *majority_count >= 3 && majority_data_opt.is_some() {
                         let majority_data = majority_data_opt.as_ref().unwrap();
                         info!("  Paragraph grouping: '{}' is body font ({}/{} body lines)",
                             majority_name, majority_count, total_body);
@@ -738,9 +830,26 @@ fn run(args: &cli::Args) -> Result<(), ScanTextError> {
                             let sz = lines[i].font_size_pt.round() as i32;
                             if (sz - body_size).abs() > 1 { continue; }
 
-                            let current_name = lm.font_result.as_ref()
+                            let current_name_raw = lm.font_result.as_ref()
                                 .map(|f| f.font_name.as_str()).unwrap_or("");
+                            let current_name = if let Some(idx) = current_name_raw.rfind('[') {
+                                current_name_raw[..idx].trim_end()
+                            } else {
+                                current_name_raw
+                            };
                             if current_name == majority_name.as_str() { continue; }
+
+                            // Look up majority entry for variant info
+                            // majority_name is the base name (tag stripped), so match base part of family_name
+                            let majority_entry = font_catalog.iter()
+                                .find(|e| {
+                                    let base = if let Some(idx) = e.family_name.rfind('[') {
+                                        e.family_name[..idx].trim_end()
+                                    } else {
+                                        &e.family_name
+                                    };
+                                    base == majority_name.as_str() && e.path == *majority_path
+                                });
 
                             // Run SSIM with majority font
                             let (majority_ssim, _majority_dy) = verify::verify_text_region(
@@ -750,6 +859,8 @@ fn run(args: &cli::Args) -> Result<(), ScanTextError> {
                                 lines[i].x, lines[i].y,
                                 lines[i].width, lines[i].height,
                                 &lines[i].words,
+                                majority_entry.and_then(|e| e.glyph_overrides.as_deref()),
+                                majority_entry.map(|e| e.variant_tag.as_str()).unwrap_or(""),
                             );
 
                             let current_score = lm.font_result.as_ref()
@@ -770,13 +881,25 @@ fn run(args: &cli::Args) -> Result<(), ScanTextError> {
                                     current_name, current_score,
                                     majority_name, majority_ssim);
                                 // Find the majority font's path from the catalog
-                                let majority_path = font_catalog.iter()
-                                    .find(|e| e.family_name == *majority_name)
+                                let majority_entry = font_catalog.iter()
+                                    .find(|e| e.family_name == *majority_name);
+                                let majority_path = majority_entry
                                     .map(|e| e.path.clone())
                                     .unwrap_or_default();
+                                let majority_key = majority_entry
+                                    .map(|e| e.font_key())
+                                    .unwrap_or_default();
+                                let majority_variant_tag = majority_entry
+                                    .map(|e| e.variant_tag.clone())
+                                    .unwrap_or_default();
+                                let majority_glyph_overrides = majority_entry
+                                    .and_then(|e| e.glyph_overrides.clone());
                                 lm.font_result = Some(font_match::FontMatchResult {
                                     font_name: majority_name.clone(),
                                     font_path: majority_path.clone(),
+                                    font_key: majority_key,
+                                    variant_tag: majority_variant_tag,
+                                    glyph_overrides: majority_glyph_overrides,
                                     score: majority_ssim,
                                     best_dy: 0, // majority override, no shift data
                                     ssim_verified: false,
@@ -899,13 +1022,17 @@ fn run(args: &cli::Args) -> Result<(), ScanTextError> {
                     .collect(),
                 word_rerank_winner: lm.word_rerank_winner_name.clone(),
                 ci_char_votes: lm.ci_char_detail.iter()
-                    .map(|d| audit::CharCiVote {
-                        ch: d.ch,
-                        crop_index: d.crop_index,
-                        min_dist_sq: d.min_dist_sq,
-                        passed_gate: d.passed_gate,
-                        nearest: d.nearest.clone(),
-                        crop_path: None,
+                    .map(|d| {
+                        let chosen_d2 = lm.chosen_char_dists.get(&d.crop_index).copied();
+                        audit::CharCiVote {
+                            ch: d.ch,
+                            crop_index: d.crop_index,
+                            min_dist_sq: d.min_dist_sq,
+                            passed_gate: d.passed_gate,
+                            nearest: d.nearest.clone(),
+                            crop_path: None,
+                            chosen_dist_sq: chosen_d2,
+                        }
                     })
                     .collect(),
                 words: lm.word_audit_entries.clone(),

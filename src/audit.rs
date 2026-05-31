@@ -45,6 +45,11 @@ pub struct CharCiVote {
     pub nearest: Vec<(String, f32)>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub crop_path: Option<String>,
+    /// Squared distance to the chosen (font_matched) font's reference glyph.
+    /// Populated after the winner is determined so the report can show
+    /// per-character match quality for the unscan pick.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub chosen_dist_sq: Option<f32>,
 }
 
 /// Per-word SSIM rerank detail.
