@@ -1487,7 +1487,22 @@ impl CharIndex {
 }
 
 /// Build the per-character index for all provided fonts.
-pub fn build_char_index(font_paths: &[(String, std::path::PathBuf)]) -> CharIndex {
+/// Glyph override map for OT variant entries (e.g. smcp, onum).
+/// Maps character → overridden glyph ID so the CI renders the correct variant glyph.
+pub type GlyphOverrides = Option<Vec<(char, u16)>>;
+
+/// Resolve glyph ID for a character, applying OT variant overrides when present.
+/// Falls back to the font's default cmap lookup if no override exists for this character.
+pub fn resolve_glyph<F: ab_glyph::Font>(font: &F, ch: char, overrides: Option<&[(char, u16)]>) -> ab_glyph::GlyphId {
+    if let Some(ovs) = overrides {
+        if let Some(&(_, gid)) = ovs.iter().find(|(c, _)| *c == ch) {
+            return ab_glyph::GlyphId(gid);
+        }
+    }
+    font.glyph_id(ch)
+}
+
+pub fn build_char_index(font_paths: &[(String, std::path::PathBuf, GlyphOverrides)]) -> CharIndex {
     use rayon::prelude::*;
 
     let chars = indexed_chars();
@@ -1501,7 +1516,7 @@ pub fn build_char_index(font_paths: &[(String, std::path::PathBuf)]) -> CharInde
     // Phase 1: process each font in parallel (CPU-bound: render + features).
     // Font bytes are loaded from disk per-thread and dropped after processing,
     // so only ~N fonts are in memory at once (N = rayon thread count).
-    let results: Vec<FontResult> = font_paths.par_iter().map(|(font_name, font_path)| {
+    let results: Vec<FontResult> = font_paths.par_iter().map(|(font_name, font_path, glyph_overrides)| {
         let font_data = match std::fs::read(font_path) {
             Ok(d) => d,
             Err(_) => {
@@ -1521,12 +1536,25 @@ pub fn build_char_index(font_paths: &[(String, std::path::PathBuf)]) -> CharInde
             }
         };
 
+        // Build fast lookup for glyph overrides
+        let override_map: HashMap<char, u16> = glyph_overrides
+            .as_ref()
+            .map(|v| v.iter().cloned().collect())
+            .unwrap_or_default();
+
         let xh_ratio = compute_xh_cap_ratio(&font);
         let serif = compute_font_serif_score(&font);
 
         let mut char_entries = Vec::with_capacity(chars.len());
         for &c in chars {
-            if let Some(img) = render_char_normalised(&font, c) {
+            // Use override glyph ID if this variant changes this character,
+            // otherwise fall back to default glyph.
+            let img = if let Some(&gid) = override_map.get(&c) {
+                render_glyph_normalised(&font, ab_glyph::GlyphId(gid))
+            } else {
+                render_char_normalised(&font, c)
+            };
+            if let Some(img) = img {
                 if let Some(mut feats) = compute_features(&img) {
                     feats.xh_cap_ratio = xh_ratio;
                     feats.serif_score = serif;
@@ -1571,7 +1599,11 @@ pub fn build_char_index(font_paths: &[(String, std::path::PathBuf)]) -> CharInde
 
 /// Render a single character in `font` at `NORM_H` ink height.
 pub fn render_char_normalised<F: Font>(font: &F, c: char) -> Option<GrayImage> {
-    let gid = font.glyph_id(c);
+    render_glyph_normalised(font, font.glyph_id(c))
+}
+
+/// Render a specific glyph ID, normalised to NORM_H with tight ink crop.
+pub fn render_glyph_normalised<F: Font>(font: &F, gid: ab_glyph::GlyphId) -> Option<GrayImage> {
     if gid.0 == 0 {
         return None;
     }
@@ -1834,7 +1866,7 @@ pub fn extract_line_chars<F: ab_glyph::Font>(
             splits
         };
 
-        let (boundaries, word_diag_dir) = if let Some(ddir) = diag_seg_dir {
+        let ((boundaries, seam_path_map), word_diag_dir) = if let Some(ddir) = diag_seg_dir {
             let word_slug = crate::seg_diag::sanitize_text(&word.text);
             let word_dir = ddir.join(format!("word_{:03}_{}", word_idx, word_slug));
             (segment_characters_diag(&word_img, all_chars.len(), &charbox_splits, &word_dir, &word.text),
@@ -1844,7 +1876,7 @@ pub fn extract_line_chars<F: ab_glyph::Font>(
         };
 
         extract_chars_from_boundaries(
-            &word_img, &all_chars, &boundaries, word_h,
+            &word_img, &all_chars, &boundaries, &seam_path_map, word_h,
             &mut char_counts, &mut results,
             word_diag_dir.as_deref(),
             diag_ref_font,
@@ -1988,6 +2020,7 @@ fn extract_chars_from_boundaries<F: ab_glyph::Font>(
     word_img: &GrayImage,
     chars: &[char],
     boundaries: &[u32],
+    seam_paths: &HashMap<u32, Vec<u32>>,
     crop_h: u32,
     char_counts: &mut HashMap<char, usize>,
     results: &mut Vec<(char, GrayImage)>,
@@ -2011,13 +2044,58 @@ fn extract_chars_from_boundaries<F: ab_glyph::Font>(
         if i + 1 >= boundaries.len() {
             break;
         }
-        let x0 = boundaries[i].min(ww);
-        let x1 = boundaries[i + 1].min(ww);
+        let b_left = boundaries[i];
+        let b_right = boundaries[i + 1];
+
+        // Look up seam paths for left and right boundaries.
+        let left_seam = seam_paths.get(&b_left);
+        let right_seam = seam_paths.get(&b_right);
+
+        // Compute crop x-range: extend to the full seam extent so we
+        // capture all pixels that belong to this character.
+        let x0 = if let Some(sp) = left_seam {
+            sp.iter().copied().min().unwrap_or(b_left).min(b_left)
+        } else {
+            b_left
+        }.min(ww);
+
+        let x1 = if let Some(sp) = right_seam {
+            sp.iter().copied().max().unwrap_or(b_right).max(b_right).saturating_add(1)
+        } else {
+            b_right
+        }.min(ww);
+
         if x1 <= x0 || (x1 - x0) < 2 {
             continue;
         }
 
-        let char_crop = image::imageops::crop_imm(word_img, x0, 0, x1 - x0, crop_h).to_image();
+        let mut char_crop = image::imageops::crop_imm(word_img, x0, 0, x1 - x0, crop_h).to_image();
+
+        // Mask out pixels on the wrong side of seam boundaries.
+        let crop_w = x1 - x0;
+        if left_seam.is_some() || right_seam.is_some() {
+            for y in 0..crop_h.min(char_crop.height()) {
+                // Left seam: blank pixels left of the seam path
+                if let Some(sp) = left_seam {
+                    if let Some(&seam_x) = sp.get(y as usize) {
+                        // seam_x is in word-image coords; convert to crop coords
+                        let limit = seam_x.saturating_sub(x0);
+                        for cx in 0..limit.min(crop_w) {
+                            char_crop.put_pixel(cx, y, image::Luma([255u8]));
+                        }
+                    }
+                }
+                // Right seam: blank pixels right of the seam path
+                if let Some(sp) = right_seam {
+                    if let Some(&seam_x) = sp.get(y as usize) {
+                        let start = seam_x.saturating_sub(x0);
+                        for cx in start..crop_w {
+                            char_crop.put_pixel(cx, y, image::Luma([255u8]));
+                        }
+                    }
+                }
+            }
+        }
 
         let scaled = match normalize_to_ink_bounds(&char_crop) {
             Some(img) => img,
@@ -2058,7 +2136,7 @@ fn extract_chars_from_boundaries<F: ab_glyph::Font>(
 /// `charbox_splits` are Tesseract charbox boundary x-positions (word-relative),
 /// used as fallback when seam carving can't produce enough splits.  Each value
 /// is the x-coordinate of a boundary between adjacent charboxes.
-pub fn segment_characters(img: &GrayImage, n_chars: usize, charbox_splits: &[u32]) -> Vec<u32> {
+pub fn segment_characters(img: &GrayImage, n_chars: usize, charbox_splits: &[u32]) -> (Vec<u32>, HashMap<u32, Vec<u32>>) {
     segment_characters_inner(img, n_chars, charbox_splits, None, None)
 }
 
@@ -2069,7 +2147,7 @@ pub fn segment_characters_diag(
     charbox_splits: &[u32],
     diag_dir: &std::path::Path,
     word_text: &str,
-) -> Vec<u32> {
+) -> (Vec<u32>, HashMap<u32, Vec<u32>>) {
     segment_characters_inner(img, n_chars, charbox_splits, Some(diag_dir), Some(word_text))
 }
 
@@ -2079,13 +2157,13 @@ fn segment_characters_inner(
     charbox_splits: &[u32],
     diag_dir: Option<&std::path::Path>,
     word_text: Option<&str>,
-) -> Vec<u32> {
+) -> (Vec<u32>, HashMap<u32, Vec<u32>>) {
     let (w, h) = img.dimensions();
     if n_chars <= 1 {
-        return vec![0, w];
+        return (vec![0, w], HashMap::new());
     }
     if w < 2 || h < 2 {
-        return uniform_boundaries(w, n_chars);
+        return (uniform_boundaries(w, n_chars), HashMap::new());
     }
 
     let need = n_chars - 1; // number of splits needed
@@ -2114,6 +2192,7 @@ fn segment_characters_inner(
         .collect();
 
     let max_ink = col_ink.iter().copied().max().unwrap_or(0);
+    // (5% ink cutoff for VP pass 2b.)
     let ink_cutoff_5pct = max_ink / 17; // ~5.9% of peak
 
     // --- VP splitting: iterative, ink-trimmed ---
@@ -2125,12 +2204,12 @@ fn segment_characters_inner(
     // near-duplicate splits (e.g. 173 and 174) from consuming slots
     // that should go to real inter-character gaps.
     //
-    // Two passes per iteration:
-    //   1. Zero-ink columns (strict whitespace)
-    //   2. ≤5%-of-peak-ink columns (serif-bridged gaps)
-    // If neither finds a run in a segment, seam carving handles it later.
+    // VP finds zero-ink columns (strict whitespace).
+    // 5% VP pass handles near-whitespace after seam carving.
+    // Seam carving handles diagonal zero-ink paths between those passes.
 
     let col_has_ink: Vec<bool> = col_ink.iter().map(|&v| v > 0).collect();
+    // (col_has_ink_5 for the 5% VP pass.)
     let col_has_ink_5: Vec<bool> = col_ink.iter().map(|&v| v > ink_cutoff_5pct).collect();
 
     let mut splits: Vec<u32> = Vec::with_capacity(need);
@@ -2192,16 +2271,30 @@ fn segment_characters_inner(
         ink_left: initial_ink.0, ink_right: initial_ink.1,
     }];
 
+    // Minimum ink on each side of a split for it to count as a real
+    // inter-character boundary.  A period is about the smallest symbol —
+    // roughly 12 fully-black pixels worth of ink.  At small font sizes
+    // the crops get scaled up so real characters always have substantial
+    // ink, while anti-aliasing bleed scales down proportionally.
+    let min_ink_for_symbol: u32 = 12 * 255;
+
+    // --- Pass 1: VP strict zero-ink only ---
     while splits.len() < need {
-        // Find the best split across all segments — the deepest ink
-        // valley.  Try zero-ink first, then ≤5%-ink.
         let mut best_valley: Option<(u32, u32, usize)> = None; // (min_ink, split_col, segment_index)
 
         for (si, seg) in segments.iter().enumerate() {
             if seg.ink_right <= seg.ink_left + 2 { continue; }
 
-            // Try zero-ink run within ink extent
             if let Some((_s, _e, split)) = best_low_ink_valley(&col_has_ink, &col_ink, seg.ink_left, seg.ink_right) {
+                // Reject splits that don't have substantial ink on both
+                // sides — each side should have at least as much ink as
+                // a period (~6 fully-black pixels = 6×255 = 1530 ink).
+                let ink_left_sum: u32 = (seg.left..split).map(|c| col_ink[c as usize]).sum();
+                let ink_right_sum: u32 = (split + 1..seg.right).map(|c| col_ink[c as usize]).sum();
+                if ink_left_sum < min_ink_for_symbol || ink_right_sum < min_ink_for_symbol {
+                    continue;
+                }
+
                 let min_ink = col_ink[split as usize];
                 if best_valley.map_or(true, |b: (u32, u32, usize)| min_ink < b.0) {
                     best_valley = Some((min_ink, split, si));
@@ -2209,26 +2302,13 @@ fn segment_characters_inner(
             }
         }
 
-        if best_valley.is_none() {
-            for (si, seg) in segments.iter().enumerate() {
-                if seg.ink_right <= seg.ink_left + 2 { continue; }
-                if let Some((_s, _e, split)) = best_low_ink_valley(&col_has_ink_5, &col_ink, seg.ink_left, seg.ink_right) {
-                    let min_ink = col_ink[split as usize];
-                    if best_valley.map_or(true, |b: (u32, u32, usize)| min_ink < b.0) {
-                        best_valley = Some((min_ink, split, si));
-                    }
-                }
-            }
-        }
-
         let (_min_ink, mid, si) = match best_valley {
             Some(v) => v,
-            None => break, // no more VP splits possible
+            None => break, // no more zero-ink valleys
         };
 
         splits.push(mid);
 
-        // Split the segment at `mid` and compute ink extents for children.
         let old = &segments[si];
         let left_ink = ink_extent(&col_has_ink, old.left, mid);
         let right_ink = ink_extent(&col_has_ink, mid, old.right);
@@ -2241,9 +2321,6 @@ fn segment_characters_inner(
     splits.dedup();
 
     let vp_splits = splits.clone();
-
-    if w == 492 && n_chars == 10 {
-    }
 
     // Diag: dump VP passes
     if let (Some(ddir), Some(wtext)) = (diag_dir, word_text) {
@@ -2259,21 +2336,46 @@ fn segment_characters_inner(
     //
     // For remaining splits, find the cheapest vertical seam in each segment.
     // Greedy: pop cheapest, split, recompute children, repeat.
+    let mut seam_paths: HashMap<u32, Vec<u32>> = HashMap::new();
     if splits.len() < need {
         use std::cmp::Ordering;
         use std::collections::BinaryHeap;
 
-        // Precompute energy map: ink energy = (255 - pixel) for dark pixels, 0 for light.
+        // Precompute energy map based on Avidan & Shamir's seam carving
+        // gradient magnitude (SIGGRAPH 2007, "Seam Carving for Content-Aware
+        // Image Resizing"). Base energy e1 = |∂I/∂x| + |∂I/∂y| using central
+        // differences — seams should pass through uniform gaps between
+        // characters (low gradient), not cross character edges (high gradient).
+        //
+        // We square the gradient magnitude: E = e1². This penalizes
+        // concentrated ink (a few rows of solid stroke) far more than
+        // diffuse anti-aliasing (many rows of gentle gradients). Without
+        // squaring, a serif font's anti-aliased inter-character gap (14 rows
+        // of mild gradients summing to ~409) costs more than a seam through
+        // a narrow ink stroke (4 rows of sharp spikes summing to ~332).
+        // Squaring inverts this: the spike rows dominate (94²≈8930) while
+        // the mild rows stay cheap, correctly preferring the whitespace gap.
         let energy: Vec<Vec<f32>> = (0..h)
             .map(|y| {
                 (0..w)
                     .map(|x| {
-                        let px = img.get_pixel(x, y).0[0];
-                        if px < threshold {
-                            (255 - px) as f32
+                        let px = |xx: u32, yy: u32| img.get_pixel(xx, yy).0[0] as f32;
+                        let dx = if x == 0 {
+                            px(1, y) - px(0, y)
+                        } else if x == w - 1 {
+                            px(w - 1, y) - px(w - 2, y)
                         } else {
-                            0.0
-                        }
+                            (px(x + 1, y) - px(x - 1, y)) / 2.0
+                        };
+                        let dy = if y == 0 {
+                            px(x, 1) - px(x, 0)
+                        } else if y == h - 1 {
+                            px(x, h - 1) - px(x, h - 2)
+                        } else {
+                            (px(x, y + 1) - px(x, y - 1)) / 2.0
+                        };
+                        let g = dx.abs() + dy.abs();
+                        g * g
                     })
                     .collect()
             })
@@ -2304,6 +2406,8 @@ fn segment_characters_inner(
         let mut heap: BinaryHeap<SeamEntry> = BinaryHeap::new();
 
         // Build initial segments from VP splits and seed the heap.
+        // Use ink_extent to trim whitespace so seam carving searches
+        // inside the ink region, not in adjacent whitespace.
         let mut initial_segs: Vec<(u32, u32)> = Vec::new();
         {
             let mut prev = 0u32;
@@ -2318,10 +2422,20 @@ fn segment_characters_inner(
             }
         }
         for &(seg_start, seg_end) in &initial_segs {
-            if seg_end - seg_start >= 3 {
-                if let Some((col, cost)) = cheapest_seam(&energy, seg_start, seg_end, h) {
-                    heap.push(SeamEntry { cost, col, seg_start, seg_end });
+            let (ink_l, ink_r) = ink_extent(&col_has_ink, seg_start, seg_end);
+            if ink_r > ink_l + 2 {
+                let cands = candidate_seams(&energy, ink_l, ink_r, h);
+                if word_text.map_or(false, |w| w.starts_with("tradition")) {
+                    eprintln!("  SEED seg=[{},{}) ink=[{},{}) {} candidates", seg_start, seg_end, ink_l, ink_r, cands.len());
+                    for (col, cost) in &cands {
+                        eprintln!("    candidate col={} cost={:.1}", col, cost);
+                    }
                 }
+                for (col, cost) in cands {
+                    heap.push(SeamEntry { cost, col, seg_start: ink_l, seg_end: ink_r });
+                }
+            } else if word_text.map_or(false, |w| w.starts_with("tradition")) {
+                eprintln!("  SKIP NARROW seg=[{},{}) ink=[{},{})", seg_start, seg_end, ink_l, ink_r);
             }
         }
 
@@ -2332,21 +2446,120 @@ fn segment_characters_inner(
                 None => break, // no valid seams remain
             };
 
+            if word_text.map_or(false, |w| w.starts_with("tradition")) {
+                eprintln!("  SEAM POP [{}]: col={} cost={:.1} seg=[{},{}) | accepted={:?}", word_text.unwrap_or("?"), entry.col, entry.cost, entry.seg_start, entry.seg_end, &splits);
+            }
+
+            // Only accept zero-ink paths.
+            // if entry.cost > 0.0 {
+            //     continue;
+            // }
+
+            // Cost ceiling: reject seam paths where the split column has
+            // more than 5% of peak column ink.  The seam DP finds cheap
+            // diagonal routes through internal glyph whitespace (e.g.
+            // between E's serif and crossbar), but a valid inter-character
+            // gap always has low column ink at the split point itself.
+            //
+            // DISABLED — col_ink ceiling kills valid seam splits like I|J
+            // (col 209 has col_ink=1145, 16.6% of peak) where the diagonal
+            // path threads cleanly through touching serifs at cost 0.
+            // Path cost alone can't distinguish inter-char gaps from
+            // intra-glyph whitespace — both can be zero.  Need the 5% VP
+            // pass as a separate mechanism.
+            //
+            // let col_ink_at_split = col_ink[entry.col as usize] as f32;
+            // let col_ink_ceiling = (max_ink as f32) * 0.05;
+            // if col_ink_at_split > col_ink_ceiling {
+            //     continue;
+            // }
+
+            // Seam cost now includes all pixel darkness (no threshold).
+            // Accept the cheapest path — the DP naturally prefers gaps
+            // over glyph interiors.
+
+            // Skip if this exact split column was already accepted.
+            if splits.contains(&entry.col) {
+                if word_text.map_or(false, |w| w.starts_with("tradition")) { eprintln!("    SKIP DUP col={}", entry.col); }
+                continue;
+            }
+
+            // Skip candidates whose split column is no longer valid because
+            // a previously accepted seam already divided this segment at a
+            // different point.  Check if any accepted split falls between
+            // this candidate's seg_start and seg_end — if so, the DP cost
+            // was computed over a range that no longer exists as one piece.
+            let stale = splits.iter().any(|&s| s > entry.seg_start && s < entry.seg_end && s != entry.col);
+            if stale {
+                if word_text.map_or(false, |w| w.starts_with("tradition")) { eprintln!("    SKIP STALE col={} seg=[{},{})", entry.col, entry.seg_start, entry.seg_end); }
+                continue;
+            }
+
+            // Validate: both children must have meaningful ink.
+            // A split that leaves one side empty is carving whitespace,
+            // not separating two characters.
+            let left_ink = ink_extent(&col_has_ink, entry.seg_start, entry.col);
+            let right_ink = ink_extent(&col_has_ink, entry.col + 1, entry.seg_end);
+            let left_ok = left_ink.1 > left_ink.0 + 2;
+            let right_ok = right_ink.1 > right_ink.0 + 2;
+
+            if !left_ok || !right_ok {
+                if word_text.map_or(false, |w| w.starts_with("tradition")) { eprintln!("    SKIP INK col={} left_ok={} right_ok={}", entry.col, left_ok, right_ok); }
+                // Seam hugged an edge → retry with narrowed range that
+                // excludes the failing side.
+                if !right_ok && left_ok {
+                    let new_end = entry.col;
+                    if new_end > entry.seg_start + 2 {
+                        if let Some((col, cost)) = cheapest_seam(&energy, entry.seg_start, new_end, h) {
+                            heap.push(SeamEntry { cost, col, seg_start: entry.seg_start, seg_end: new_end });
+                        }
+                    }
+                } else if !left_ok && right_ok {
+                    let new_start = entry.col + 1;
+                    if entry.seg_end > new_start + 2 {
+                        if let Some((col, cost)) = cheapest_seam(&energy, new_start, entry.seg_end, h) {
+                            heap.push(SeamEntry { cost, col, seg_start: new_start, seg_end: entry.seg_end });
+                        }
+                    }
+                }
+                continue;
+            }
+
+            // Reject seam splits without substantial ink on both sides
+            // (same minimum as VP — at least a period's worth of ink).
+            let seam_ink_left: u32 = (entry.seg_start..entry.col).map(|c| col_ink[c as usize]).sum();
+            let seam_ink_right: u32 = (entry.col + 1..entry.seg_end).map(|c| col_ink[c as usize]).sum();
+            if seam_ink_left < min_ink_for_symbol || seam_ink_right < min_ink_for_symbol {
+                if word_text.map_or(false, |w| w.starts_with("tradition")) { eprintln!("    SKIP MIN_INK col={} left={} right={} min={}", entry.col, seam_ink_left, seam_ink_right, min_ink_for_symbol); }
+                continue;
+            }
+
+            if word_text.map_or(false, |w| w.starts_with("tradition")) { eprintln!("    ACCEPT col={}", entry.col); }
             splits.push(entry.col);
 
-            // Left child: [seg_start, col)
-            let left_end = entry.col;
-            if left_end - entry.seg_start >= 3 {
-                if let Some((col, cost)) = cheapest_seam(&energy, entry.seg_start, left_end, h) {
-                    heap.push(SeamEntry { cost, col, seg_start: entry.seg_start, seg_end: left_end });
+            // Record the full seam path for this split — needed for
+            // character crop masking (diagonal boundaries).
+            // Path must pass through entry.col at mid-row (the split point).
+            let path = seam_path_through(&energy, entry.seg_start, entry.seg_end, h, entry.col);
+            seam_paths.insert(entry.col, path);
+
+            // Left child
+            {
+                let (ink_l, ink_r) = left_ink;
+                if ink_r > ink_l + 2 {
+                    for (col, cost) in candidate_seams(&energy, ink_l, ink_r, h) {
+                        heap.push(SeamEntry { cost, col, seg_start: ink_l, seg_end: ink_r });
+                    }
                 }
             }
 
-            // Right child: [col, seg_end)
-            let right_start = entry.col;
-            if entry.seg_end - right_start >= 3 {
-                if let Some((col, cost)) = cheapest_seam(&energy, right_start, entry.seg_end, h) {
-                    heap.push(SeamEntry { cost, col, seg_start: right_start, seg_end: entry.seg_end });
+            // Right child (col+1 so ink_extent skips past the split column)
+            {
+                let (ink_l, ink_r) = right_ink;
+                if ink_r > ink_l + 2 {
+                    for (col, cost) in candidate_seams(&energy, ink_l, ink_r, h) {
+                        heap.push(SeamEntry { cost, col, seg_start: ink_l, seg_end: ink_r });
+                    }
                 }
             }
         }
@@ -2362,10 +2575,81 @@ fn segment_characters_inner(
     // Diag: dump seam pass
     if let Some(ddir) = diag_dir {
         let vp_mids: Vec<u32> = vp_splits.clone();
-        crate::seg_diag::save_split_overlay(img, &vp_mids, &seam_splits, &[], &ddir.join("seam_overlay.png"));
+        crate::seg_diag::save_split_overlay_with_paths(img, &vp_mids, &seam_splits, &[], &seam_paths, &ddir.join("seam_overlay.png"));
         eprintln!(
             "  DIAG-SEG SEAM: {} seam splits added (total now {})",
             seam_splits.len(), splits.len(),
+        );
+    }
+
+    // --- Pass 2b: VP 5%-ink valleys ---
+    //
+    // After seam carving, sweep for columns with ≤5% of peak ink.
+    // These catch near-whitespace gaps (e.g. Y-Z anti-aliased serif
+    // bridges) that the zero-ink VP pass missed and where the seam's
+    // zero-cost constraint prevented a diagonal path.
+    if splits.len() < need {
+        // Rebuild segments from current splits.
+        let mut seg5: Vec<Segment> = Vec::new();
+        {
+            let mut sorted_splits = splits.clone();
+            sorted_splits.sort();
+            sorted_splits.dedup();
+            let mut prev = 0u32;
+            for &s in &sorted_splits {
+                if s > prev {
+                    let ink = ink_extent(&col_has_ink, prev, s);
+                    seg5.push(Segment { left: prev, right: s, ink_left: ink.0, ink_right: ink.1 });
+                }
+                prev = s;
+            }
+            if prev < w {
+                let ink = ink_extent(&col_has_ink, prev, w);
+                seg5.push(Segment { left: prev, right: w, ink_left: ink.0, ink_right: ink.1 });
+            }
+        }
+
+        while splits.len() < need {
+            let mut best_valley: Option<(u32, u32, usize)> = None;
+
+            for (si, seg) in seg5.iter().enumerate() {
+                if seg.ink_right <= seg.ink_left + 2 { continue; }
+                if let Some((_s, _e, split)) = best_low_ink_valley(&col_has_ink_5, &col_ink, seg.ink_left, seg.ink_right) {
+                    let min_ink = col_ink[split as usize];
+                    if best_valley.map_or(true, |b: (u32, u32, usize)| min_ink < b.0) {
+                        best_valley = Some((min_ink, split, si));
+                    }
+                }
+            }
+
+            let (_min_ink, mid, si) = match best_valley {
+                Some(v) => v,
+                None => break,
+            };
+
+            splits.push(mid);
+
+            let old = &seg5[si];
+            let left_ink = ink_extent(&col_has_ink, old.left, mid);
+            let right_ink = ink_extent(&col_has_ink, mid, old.right);
+            let left_seg = Segment { left: old.left, right: mid, ink_left: left_ink.0, ink_right: left_ink.1 };
+            let right_seg = Segment { left: mid, right: old.right, ink_left: right_ink.0, ink_right: right_ink.1 };
+            seg5.splice(si..=si, [left_seg, right_seg]);
+        }
+
+        splits.sort();
+        splits.dedup();
+    }
+
+    let fivepct_splits: Vec<u32> = splits.iter()
+        .filter(|s| !vp_splits.contains(s) && !seam_splits.contains(s))
+        .copied().collect();
+
+    // Diag: dump 5% pass
+    if let Some(_ddir) = diag_dir {
+        eprintln!(
+            "  DIAG-SEG 5%: {} fivepct splits added (total now {})",
+            fivepct_splits.len(), splits.len(),
         );
     }
 
@@ -2445,7 +2729,7 @@ fn segment_characters_inner(
     // Diag: dump charbox + final
     if let (Some(ddir), Some(wtext)) = (diag_dir, word_text) {
         let vp_mids: Vec<u32> = vp_splits.clone();
-        crate::seg_diag::save_split_overlay(img, &vp_mids, &seam_splits, &cb_splits, &ddir.join("final_overlay.png"));
+        crate::seg_diag::save_split_overlay_with_paths(img, &vp_mids, &seam_splits, &cb_splits, &seam_paths, &ddir.join("final_overlay.png"));
 
         // NOTE: char crops are saved by extract_chars_from_boundaries
         // (the actual CI code path), not here — so diag shows exact CI inputs.
@@ -2471,12 +2755,13 @@ fn segment_characters_inner(
             "charbox_input_splits": charbox_splits,
             "charbox_added_splits": cb_splits,
             "final_boundaries": bounds,
+            "seam_paths": seam_paths,
             "mismatch": n_segs != n_chars,
         });
         let _ = std::fs::write(ddir.join("summary.json"), serde_json::to_string_pretty(&summary).unwrap_or_default());
     }
 
-    bounds
+    (bounds, seam_paths)
 }
 
 /// Find the cheapest vertical seam through columns [seg_start, seg_end) of
@@ -2490,6 +2775,18 @@ fn cheapest_seam(
     seg_end: u32,
     h: u32,
 ) -> Option<(u32, f32)> {
+    let (col, cost, _path) = cheapest_seam_full(energy, seg_start, seg_end, h)?;
+    Some((col, cost))
+}
+
+/// Like cheapest_seam but also returns the full seam path (one x per row, in
+/// absolute image coordinates).
+fn cheapest_seam_full(
+    energy: &[Vec<f32>],
+    seg_start: u32,
+    seg_end: u32,
+    h: u32,
+) -> Option<(u32, f32, Vec<u32>)> {
     let seg_w = (seg_end - seg_start) as usize;
     // Need at least 3 columns so there's an interior column to split on.
     if seg_w < 3 || h < 1 {
@@ -2522,25 +2819,185 @@ fn cheapest_seam(
         .filter(|&(c, _)| c > 0 && c + 1 < seg_w)
         .min_by(|a, b| a.1.partial_cmp(b.1).unwrap_or(std::cmp::Ordering::Equal))?;
 
-    // Backtrace to find where the seam crosses the midpoint row,
-    // clamping to interior columns so the split never lands on an edge.
-    let mid_row = (h / 2) as usize;
-    let mut c = min_c;
-    for r in ((mid_row + 1)..h as usize).rev() {
+    // Full backtrace: build path from bottom row to top
+    let mut path_local = vec![0usize; h as usize];
+    path_local[(h - 1) as usize] = min_c;
+    for r in (1..h as usize).rev() {
+        let c = path_local[r];
         let up = cost[r - 1][c];
         let up_left = if c > 1 { cost[r - 1][c - 1] } else { f32::INFINITY };
         let up_right = if c + 2 < seg_w { cost[r - 1][c + 1] } else { f32::INFINITY };
         let best = up.min(up_left).min(up_right);
         if c > 1 && cost[r - 1][c - 1] == best {
-            c -= 1;
+            path_local[r - 1] = c - 1;
         } else if c + 2 < seg_w && cost[r - 1][c + 1] == best {
-            c += 1;
+            path_local[r - 1] = c + 1;
+        } else {
+            path_local[r - 1] = c;
         }
-        // else stay at c
     }
 
-    let split_col = seg_start + c as u32;
-    Some((split_col, min_cost))
+    // Convert to absolute coordinates
+    let path: Vec<u32> = path_local.iter().map(|&c| seg_start + c as u32).collect();
+
+    // Split column = where seam crosses midpoint row
+    let mid_row = (h / 2) as usize;
+    let split_col = path[mid_row];
+
+    Some((split_col, min_cost, path))
+}
+
+/// Build the cheapest seam path constrained to pass through `target_col`
+/// (absolute image coordinate) at the vertical midpoint.  Returns one x
+/// per row in absolute coordinates.
+///
+/// Uses the same dual-DP as `candidate_seams`: forward DP gives the
+/// optimal top-half, reverse DP gives the optimal bottom-half.
+/// Backtracing each half from the target column at mid-row yields the
+/// cheapest path that is guaranteed to cross the split point.
+fn seam_path_through(
+    energy: &[Vec<f32>],
+    seg_start: u32,
+    seg_end: u32,
+    h: u32,
+    target_col: u32,
+) -> Vec<u32> {
+    let seg_w = (seg_end - seg_start) as usize;
+    let base = seg_start as usize;
+    let mid_r = (h / 2) as usize;
+    let tc = (target_col - seg_start) as usize;
+
+    // Forward DP: top → bottom
+    let mut cost_fwd = vec![vec![0.0f32; seg_w]; h as usize];
+    for c in 0..seg_w {
+        cost_fwd[0][c] = energy[0][base + c];
+    }
+    for r in 1..h as usize {
+        for c in 0..seg_w {
+            let up = cost_fwd[r - 1][c];
+            let ul = if c > 0 { cost_fwd[r - 1][c - 1] } else { f32::INFINITY };
+            let ur = if c + 1 < seg_w { cost_fwd[r - 1][c + 1] } else { f32::INFINITY };
+            cost_fwd[r][c] = energy[r][base + c] + up.min(ul).min(ur);
+        }
+    }
+
+    // Reverse DP: bottom → top
+    let last_r = (h - 1) as usize;
+    let mut cost_rev = vec![vec![0.0f32; seg_w]; h as usize];
+    for c in 0..seg_w {
+        cost_rev[last_r][c] = energy[last_r][base + c];
+    }
+    for r in (0..last_r).rev() {
+        for c in 0..seg_w {
+            let dn = cost_rev[r + 1][c];
+            let dl = if c > 0 { cost_rev[r + 1][c - 1] } else { f32::INFINITY };
+            let dr = if c + 1 < seg_w { cost_rev[r + 1][c + 1] } else { f32::INFINITY };
+            cost_rev[r][c] = energy[r][base + c] + dn.min(dl).min(dr);
+        }
+    }
+
+    let mut path = vec![0u32; h as usize];
+    path[mid_r] = target_col;
+
+    // Top half: backtrace upward from (mid_r, tc) through cost_fwd
+    {
+        let mut c = tc;
+        for r in (1..=mid_r).rev() {
+            let up = cost_fwd[r - 1][c];
+            let ul = if c > 0 { cost_fwd[r - 1][c - 1] } else { f32::INFINITY };
+            let ur = if c + 1 < seg_w { cost_fwd[r - 1][c + 1] } else { f32::INFINITY };
+            let best = up.min(ul).min(ur);
+            if c > 0 && cost_fwd[r - 1][c - 1] == best {
+                c -= 1;
+            } else if c + 1 < seg_w && cost_fwd[r - 1][c + 1] == best {
+                c += 1;
+            }
+            path[r - 1] = seg_start + c as u32;
+        }
+    }
+
+    // Bottom half: backtrace downward from (mid_r, tc) through cost_rev
+    {
+        let mut c = tc;
+        for r in mid_r..last_r {
+            let dn = cost_rev[r + 1][c];
+            let dl = if c > 0 { cost_rev[r + 1][c - 1] } else { f32::INFINITY };
+            let dr = if c + 1 < seg_w { cost_rev[r + 1][c + 1] } else { f32::INFINITY };
+            let best = dn.min(dl).min(dr);
+            if c > 0 && cost_rev[r + 1][c - 1] == best {
+                c -= 1;
+            } else if c + 1 < seg_w && cost_rev[r + 1][c + 1] == best {
+                c += 1;
+            }
+            path[r + 1] = seg_start + c as u32;
+        }
+    }
+
+    path
+}
+
+/// Exhaustive (col, cost) candidates via dual-DP: for every interior column
+/// at mid-row, compute the cost of the cheapest seam path that passes
+/// through that column.  All candidates go on the heap so the greedy loop
+/// sees every possible split point, not just bottom-row local minima
+/// (which can miss clean inter-character gaps that backtrack to a
+/// different mid-row column).
+fn candidate_seams(
+    energy: &[Vec<f32>],
+    seg_start: u32,
+    seg_end: u32,
+    h: u32,
+) -> Vec<(u32, f32)> {
+    let seg_w = (seg_end - seg_start) as usize;
+    if seg_w < 3 || h < 1 {
+        return Vec::new();
+    }
+    let base = seg_start as usize;
+    let mid_r = (h / 2) as usize;
+
+    // Forward DP: cost_fwd[r][c] = cheapest path from any top-row column
+    // down to (r, c).
+    let mut cost_fwd = vec![vec![0.0f32; seg_w]; h as usize];
+    for c in 0..seg_w {
+        cost_fwd[0][c] = energy[0][base + c];
+    }
+    for r in 1..h as usize {
+        for c in 0..seg_w {
+            let up = cost_fwd[r - 1][c];
+            let ul = if c > 0 { cost_fwd[r - 1][c - 1] } else { f32::INFINITY };
+            let ur = if c + 1 < seg_w { cost_fwd[r - 1][c + 1] } else { f32::INFINITY };
+            cost_fwd[r][c] = energy[r][base + c] + up.min(ul).min(ur);
+        }
+    }
+
+    // Reverse DP: cost_rev[r][c] = cheapest path from any bottom-row column
+    // up to (r, c).
+    let last_r = (h - 1) as usize;
+    let mut cost_rev = vec![vec![0.0f32; seg_w]; h as usize];
+    for c in 0..seg_w {
+        cost_rev[last_r][c] = energy[last_r][base + c];
+    }
+    for r in (0..last_r).rev() {
+        for c in 0..seg_w {
+            let dn = cost_rev[r + 1][c];
+            let dl = if c > 0 { cost_rev[r + 1][c - 1] } else { f32::INFINITY };
+            let dr = if c + 1 < seg_w { cost_rev[r + 1][c + 1] } else { f32::INFINITY };
+            cost_rev[r][c] = energy[r][base + c] + dn.min(dl).min(dr);
+        }
+    }
+
+    // For each interior column at mid-row, the cheapest path through it
+    // costs cost_fwd[mid][c] + cost_rev[mid][c] - energy[mid][c]
+    // (subtract once to avoid double-counting the mid-row pixel).
+    let mut candidates: Vec<(u32, f32)> = Vec::with_capacity(seg_w.saturating_sub(2));
+    for c in 1..seg_w - 1 {
+        let combined = cost_fwd[mid_r][c] + cost_rev[mid_r][c]
+            - energy[mid_r][base + c];
+        let split_col = seg_start + c as u32;
+        candidates.push((split_col, combined));
+    }
+
+    candidates
 }
 
 /// Uniform character boundaries.
@@ -2814,29 +3271,16 @@ pub fn search_candidates(
 
     scores.retain(|(_, s)| s.is_finite());
 
-    // ── Dedup OT variants: merge scores for same base font path ──────
-    // Font entries like "NotoSans.ttf|salt" and "NotoSans.ttf|onum" have
-    // identical Latin glyphs, producing identical feature vectors and scores.
-    // Without dedup, one physical font occupies N slots (one per OT variant),
-    // crowding out genuinely different fonts after the σ cutoff.
-    // Keep only the best-scoring variant per base path.
-    {
-        let mut best_by_base: HashMap<String, (String, f32)> = HashMap::new();
-        for (name, score) in &scores {
-            let base = name.split('|').next().unwrap_or(name).to_string();
-            let entry = best_by_base.entry(base).or_insert_with(|| (name.clone(), *score));
-            if *score > entry.1 {
-                *entry = (name.clone(), *score);
-            }
-        }
-        scores = best_by_base.into_values().collect();
-    }
+    // OT variants (smcp, onum, salt, etc.) are treated as first-class fonts.
+    // They produce genuinely different glyphs and should compete on merit.
 
     // Sort descending (higher = better = closer match)
+    // Tiebreaker: prefer base (untagged) font over OT variants when scores
+    // are equal — avoids random variant wins from floating-point noise.
     scores.sort_by(|a, b| {
         b.1.partial_cmp(&a.1)
             .unwrap_or(std::cmp::Ordering::Equal)
-            .then_with(|| a.0.contains('[').cmp(&b.0.contains('[')))
+            .then_with(|| a.0.contains('|').cmp(&b.0.contains('|')))
     });
 
     // ── Cross-family Latin clone dedup ───────────────────────────────
@@ -2971,6 +3415,46 @@ pub fn search_candidates(
     }
 
     CiSearchResult { scores, char_detail }
+}
+
+/// Compute per-character squared Euclidean distances from crop features to a
+/// specific font's reference glyphs.  Used after the winner is determined so
+/// the audit log can include per-char scores for the chosen font.
+///
+/// Returns `(char, crop_index, dist_sq)` for each crop that has features and
+/// a matching reference glyph in the index.  Crops with no features or no
+/// reference for that font are omitted.
+pub fn per_char_distances(
+    index: &CharIndex,
+    font_key: &str,
+    char_crops: &[(char, GrayImage)],
+) -> Vec<(char, usize, f32)> {
+    // Find the font_id for the requested key
+    let font_id = match index.font_names_table.iter().position(|n| n == font_key) {
+        Some(id) => id,
+        None => return Vec::new(),
+    };
+
+    let mut result = Vec::with_capacity(char_crops.len());
+    for (crop_idx, (ch, crop)) in char_crops.iter().enumerate() {
+        let feats = match compute_features(crop) {
+            Some(f) => f,
+            None => continue,
+        };
+        let query = feats.weighted();
+
+        // Find this font's weighted vector for this character
+        if let Some(points) = index.flat_vecs.get(ch) {
+            for (fid, ref_vec) in points {
+                if *fid == font_id {
+                    let d2 = squared_distance(&query, ref_vec);
+                    result.push((*ch, crop_idx, d2));
+                    break;
+                }
+            }
+        }
+    }
+    result
 }
 
 /// Search the index for a single character and return detailed results.
