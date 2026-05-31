@@ -107,6 +107,19 @@ const SCALAR_V3: usize = 1 + 1 + 1 + 2 + 1 + 4;
 /// Feature vector length: col_profile + row_profile + original scalars + v2 + v3.
 pub const FEAT_LEN: usize = PROFILE_BINS + ROW_PROFILE_BINS + SCALAR_V1 + SCALAR_V2 + SCALAR_V3;
 
+/// Entry penalty weight for seam carving.  When the seam path moves into
+/// a darker pixel than the previous one, the darkness increase is
+/// multiplied by this weight and added as extra cost.  This penalizes
+/// seams that drift from whitespace into glyph strokes.
+const ENTRY_PENALTY_WEIGHT: f32 = 4.0;
+
+/// Minimum total column-ink on each side of a split for it to be
+/// accepted.  Each side must contain at least this much ink to be
+/// considered a real symbol — roughly the ink of a period (~12 fully-
+/// black pixel rows = 12 × 255 = 3060).  Used by both VP and seam
+/// passes.
+const MIN_INK_FOR_SYMBOL: u32 = 16 * 255;
+
 /// Minimum word length (characters) for extraction.
 const MIN_WORD_LEN: usize = 3;
 
@@ -2122,20 +2135,32 @@ fn extract_chars_from_boundaries<F: ab_glyph::Font>(
     }
 }
 
-/// Segment a word image into N characters.
-///
-/// Pass 1 — Vertical whitespace: find contiguous runs of zero-ink columns
-///          (threshold 200). Each interior run gives one split at its midpoint.
-///          If that yields ≥ N-1 splits, pick the N-1 widest runs.
-///
-/// Pass 2 — Seam carving: if whitespace splits aren't enough, find the cheapest
-///          vertical seam in each existing segment, pick the globally cheapest
-///          one, split there, and repeat until we have N-1 splits.
 /// Segment a word image into N character cells.
 ///
+/// Three-pass cascade:
+///
+/// **Pass 1 — Vertical Profile (VP):** find contiguous runs of zero-ink
+/// columns (threshold 200).  Each interior run gives one split at its
+/// midpoint.  If that yields ≥ N-1 splits, pick the N-1 widest runs.
+/// Both sides of every VP split must have at least `MIN_INK_FOR_SYMBOL`
+/// total column-ink or the split is rejected.
+///
+/// **Pass 2 — Seam carving:** for remaining splits, find the cheapest
+/// vertical seam in each existing segment via DP, pick the globally
+/// cheapest, split there, and repeat.  Energy is ink-based: each pixel's
+/// cost is its darkness (0 white, 255 black) plus an entry penalty
+/// (`ENTRY_PENALTY_WEIGHT × darkness_increase`) when the path moves into
+/// a darker pixel — directly encoding "stay in whitespace, don't wander
+/// into ink."  The same `MIN_INK_FOR_SYMBOL` threshold applies: both
+/// children of every accepted seam split must contain meaningful ink.
+///
+/// **Pass 3 — Charbox fallback:** if Tesseract charbox boundaries are
+/// available, use them to further split any segment that is wider than
+/// `avg_char_width × 3` and contains ≥ 1 charbox boundary.
+///
 /// `charbox_splits` are Tesseract charbox boundary x-positions (word-relative),
-/// used as fallback when seam carving can't produce enough splits.  Each value
-/// is the x-coordinate of a boundary between adjacent charboxes.
+/// used by Pass 3.  Each value is the x-coordinate of a boundary between
+/// adjacent charboxes.
 pub fn segment_characters(img: &GrayImage, n_chars: usize, charbox_splits: &[u32]) -> (Vec<u32>, HashMap<u32, Vec<u32>>) {
     segment_characters_inner(img, n_chars, charbox_splits, None, None)
 }
@@ -2168,10 +2193,9 @@ fn segment_characters_inner(
 
     let need = n_chars - 1; // number of splits needed
 
-    // Three-pass segmentation cascade:
+    // Two-pass segmentation cascade:
     //   Pass 1 — VP strict zero-ink: split at columns with truly zero ink
-    //   Pass 2 — VP 5% ink: split at columns ≤ 5% of peak ink
-    //   Pass 3 — Seam carving: cheapest vertical path for remaining splits
+    //   Pass 2 — Seam carving: cheapest vertical path for remaining splits
     //
     // VP midpoints give geometrically centered boundaries.  Seam carving is
     // last resort for genuinely connected characters (e.g. serif bridges
@@ -2192,8 +2216,6 @@ fn segment_characters_inner(
         .collect();
 
     let max_ink = col_ink.iter().copied().max().unwrap_or(0);
-    // (5% ink cutoff for VP pass 2b.)
-    let ink_cutoff_5pct = max_ink / 17; // ~5.9% of peak
 
     // --- VP splitting: iterative, ink-trimmed ---
     //
@@ -2203,14 +2225,8 @@ fn segment_characters_inner(
     // the split are excluded from future searches.  This prevents
     // near-duplicate splits (e.g. 173 and 174) from consuming slots
     // that should go to real inter-character gaps.
-    //
-    // VP finds zero-ink columns (strict whitespace).
-    // 5% VP pass handles near-whitespace after seam carving.
-    // Seam carving handles diagonal zero-ink paths between those passes.
 
     let col_has_ink: Vec<bool> = col_ink.iter().map(|&v| v > 0).collect();
-    // (col_has_ink_5 for the 5% VP pass.)
-    let col_has_ink_5: Vec<bool> = col_ink.iter().map(|&v| v > ink_cutoff_5pct).collect();
 
     let mut splits: Vec<u32> = Vec::with_capacity(need);
 
@@ -2276,7 +2292,7 @@ fn segment_characters_inner(
     // roughly 12 fully-black pixels worth of ink.  At small font sizes
     // the crops get scaled up so real characters always have substantial
     // ink, while anti-aliasing bleed scales down proportionally.
-    let min_ink_for_symbol: u32 = 12 * 255;
+
 
     // --- Pass 1: VP strict zero-ink only ---
     while splits.len() < need {
@@ -2291,7 +2307,7 @@ fn segment_characters_inner(
                 // a period (~6 fully-black pixels = 6×255 = 1530 ink).
                 let ink_left_sum: u32 = (seg.left..split).map(|c| col_ink[c as usize]).sum();
                 let ink_right_sum: u32 = (split + 1..seg.right).map(|c| col_ink[c as usize]).sum();
-                if ink_left_sum < min_ink_for_symbol || ink_right_sum < min_ink_for_symbol {
+                if ink_left_sum < MIN_INK_FOR_SYMBOL || ink_right_sum < MIN_INK_FOR_SYMBOL {
                     continue;
                 }
 
@@ -2332,7 +2348,7 @@ fn segment_characters_inner(
         );
     }
 
-    // --- Pass 3: greedy seam carving ---
+    // --- Pass 2: greedy seam carving ---
     //
     // For remaining splits, find the cheapest vertical seam in each segment.
     // Greedy: pop cheapest, split, recompute children, repeat.
@@ -2341,45 +2357,35 @@ fn segment_characters_inner(
         use std::cmp::Ordering;
         use std::collections::BinaryHeap;
 
-        // Precompute energy map based on Avidan & Shamir's seam carving
-        // gradient magnitude (SIGGRAPH 2007, "Seam Carving for Content-Aware
-        // Image Resizing"). Base energy e1 = |∂I/∂x| + |∂I/∂y| using central
-        // differences — seams should pass through uniform gaps between
-        // characters (low gradient), not cross character edges (high gradient).
+        // Ink-based energy for seam carving.  Each pixel's base cost is
+        // its darkness (0 for white, 255 for black).  The DP adds an
+        // "entry penalty" when the path moves into a darker pixel than
+        // the previous one — this penalizes seams that drift from
+        // whitespace into a glyph stroke, directly encoding "stay in
+        // the gap, don't wander into ink."
         //
-        // We square the gradient magnitude: E = e1². This penalizes
-        // concentrated ink (a few rows of solid stroke) far more than
-        // diffuse anti-aliasing (many rows of gentle gradients). Without
-        // squaring, a serif font's anti-aliased inter-character gap (14 rows
-        // of mild gradients summing to ~409) costs more than a seam through
-        // a narrow ink stroke (4 rows of sharp spikes summing to ~332).
-        // Squaring inverts this: the spike rows dominate (94²≈8930) while
-        // the mild rows stay cheap, correctly preferring the whitespace gap.
-        let energy: Vec<Vec<f32>> = (0..h)
+        // The entry penalty is proportional to the darkness increase:
+        //   penalty = ENTRY_PENALTY_WEIGHT * max(0, darkness[r] - darkness[r-1])
+        //
+        // This replaces the Avidan & Shamir gradient-based energy, which
+        // couldn't distinguish between the interior of a dark stroke
+        // (zero gradient) and a white gap (also zero gradient).
+
+        // Per-pixel darkness: 0.0 for white, 255.0 for black.
+        let darkness: Vec<Vec<f32>> = (0..h)
             .map(|y| {
                 (0..w)
                     .map(|x| {
-                        let px = |xx: u32, yy: u32| img.get_pixel(xx, yy).0[0] as f32;
-                        let dx = if x == 0 {
-                            px(1, y) - px(0, y)
-                        } else if x == w - 1 {
-                            px(w - 1, y) - px(w - 2, y)
-                        } else {
-                            (px(x + 1, y) - px(x - 1, y)) / 2.0
-                        };
-                        let dy = if y == 0 {
-                            px(x, 1) - px(x, 0)
-                        } else if y == h - 1 {
-                            px(x, h - 1) - px(x, h - 2)
-                        } else {
-                            (px(x, y + 1) - px(x, y - 1)) / 2.0
-                        };
-                        let g = dx.abs() + dy.abs();
-                        g * g
+                        255.0 - img.get_pixel(x, y).0[0] as f32
                     })
                     .collect()
             })
             .collect();
+
+        // The energy map is just darkness — used for the base per-pixel
+        // cost in the DP.  The entry penalty is applied during the DP
+        // transition, not stored in the energy map.
+        let energy = &darkness;
 
         // Min-heap entry: (cost, split_col, seg_start, seg_end).
         // BinaryHeap is a max-heap, so wrap cost in Reverse-style ordering.
@@ -2389,6 +2395,7 @@ fn segment_characters_inner(
             col: u32,
             seg_start: u32,
             seg_end: u32,
+            seg_id: u32,
         }
         impl Eq for SeamEntry {}
         impl PartialOrd for SeamEntry {
@@ -2404,6 +2411,19 @@ fn segment_characters_inner(
         }
 
         let mut heap: BinaryHeap<SeamEntry> = BinaryHeap::new();
+        // Cache DP matrices by segment ID so we can trace paths
+        // from the same matrices that computed candidate costs.
+        let mut dp_cache: std::collections::HashMap<u32, SeamDp> = std::collections::HashMap::new();
+        // Diagonal bounds per segment: seam paths that bound each side.
+        // Pixels at or beyond these paths are unusable in the DP.
+        // left_path[r] = seam col; pixels with col <= left_path[r] are masked.
+        // right_path[r] = seam col; pixels with col >= right_path[r] are masked.
+        struct SegBounds {
+            left_path: Option<Vec<u32>>,
+            right_path: Option<Vec<u32>>,
+        }
+        let mut seg_bounds: std::collections::HashMap<u32, SegBounds> = std::collections::HashMap::new();
+        let mut next_seg_id: u32 = 0;
 
         // Build initial segments from VP splits and seed the heap.
         // Use ink_extent to trim whitespace so seam carving searches
@@ -2424,16 +2444,19 @@ fn segment_characters_inner(
         for &(seg_start, seg_end) in &initial_segs {
             let (ink_l, ink_r) = ink_extent(&col_has_ink, seg_start, seg_end);
             if ink_r > ink_l + 2 {
-                let cands = candidate_seams(&energy, ink_l, ink_r, h);
+                let sid = next_seg_id; next_seg_id += 1;
+                let (cands, dp) = candidate_seams(&energy, ink_l, ink_r, h, None, None);
                 if word_text.map_or(false, |w| w.starts_with("tradition")) {
-                    eprintln!("  SEED seg=[{},{}) ink=[{},{}) {} candidates", seg_start, seg_end, ink_l, ink_r, cands.len());
+                    eprintln!("  SEED seg=[{},{}) ink=[{},{}) {} candidates sid={}", seg_start, seg_end, ink_l, ink_r, cands.len(), sid);
                     for (col, cost) in &cands {
                         eprintln!("    candidate col={} cost={:.1}", col, cost);
                     }
                 }
-                for (col, cost) in cands {
-                    heap.push(SeamEntry { cost, col, seg_start: ink_l, seg_end: ink_r });
+                for (col, cost) in &cands {
+                    heap.push(SeamEntry { cost: *cost, col: *col, seg_start: ink_l, seg_end: ink_r, seg_id: sid });
                 }
+                seg_bounds.insert(sid, SegBounds { left_path: None, right_path: None });
+                dp_cache.insert(sid, dp);
             } else if word_text.map_or(false, |w| w.starts_with("tradition")) {
                 eprintln!("  SKIP NARROW seg=[{},{}) ink=[{},{})", seg_start, seg_end, ink_l, ink_r);
             }
@@ -2447,36 +2470,8 @@ fn segment_characters_inner(
             };
 
             if word_text.map_or(false, |w| w.starts_with("tradition")) {
-                eprintln!("  SEAM POP [{}]: col={} cost={:.1} seg=[{},{}) | accepted={:?}", word_text.unwrap_or("?"), entry.col, entry.cost, entry.seg_start, entry.seg_end, &splits);
+                eprintln!("  SEAM POP [{}]: col={} cost={:.1} seg=[{},{}) sid={} | accepted={:?}", word_text.unwrap_or("?"), entry.col, entry.cost, entry.seg_start, entry.seg_end, entry.seg_id, &splits);
             }
-
-            // Only accept zero-ink paths.
-            // if entry.cost > 0.0 {
-            //     continue;
-            // }
-
-            // Cost ceiling: reject seam paths where the split column has
-            // more than 5% of peak column ink.  The seam DP finds cheap
-            // diagonal routes through internal glyph whitespace (e.g.
-            // between E's serif and crossbar), but a valid inter-character
-            // gap always has low column ink at the split point itself.
-            //
-            // DISABLED — col_ink ceiling kills valid seam splits like I|J
-            // (col 209 has col_ink=1145, 16.6% of peak) where the diagonal
-            // path threads cleanly through touching serifs at cost 0.
-            // Path cost alone can't distinguish inter-char gaps from
-            // intra-glyph whitespace — both can be zero.  Need the 5% VP
-            // pass as a separate mechanism.
-            //
-            // let col_ink_at_split = col_ink[entry.col as usize] as f32;
-            // let col_ink_ceiling = (max_ink as f32) * 0.05;
-            // if col_ink_at_split > col_ink_ceiling {
-            //     continue;
-            // }
-
-            // Seam cost now includes all pixel darkness (no threshold).
-            // Accept the cheapest path — the DP naturally prefers gaps
-            // over glyph interiors.
 
             // Skip if this exact split column was already accepted.
             if splits.contains(&entry.col) {
@@ -2484,20 +2479,7 @@ fn segment_characters_inner(
                 continue;
             }
 
-            // Skip candidates whose split column is no longer valid because
-            // a previously accepted seam already divided this segment at a
-            // different point.  Check if any accepted split falls between
-            // this candidate's seg_start and seg_end — if so, the DP cost
-            // was computed over a range that no longer exists as one piece.
-            let stale = splits.iter().any(|&s| s > entry.seg_start && s < entry.seg_end && s != entry.col);
-            if stale {
-                if word_text.map_or(false, |w| w.starts_with("tradition")) { eprintln!("    SKIP STALE col={} seg=[{},{})", entry.col, entry.seg_start, entry.seg_end); }
-                continue;
-            }
-
             // Validate: both children must have meaningful ink.
-            // A split that leaves one side empty is carving whitespace,
-            // not separating two characters.
             let left_ink = ink_extent(&col_has_ink, entry.seg_start, entry.col);
             let right_ink = ink_extent(&col_has_ink, entry.col + 1, entry.seg_end);
             let left_ok = left_ink.1 > left_ink.0 + 2;
@@ -2505,61 +2487,102 @@ fn segment_characters_inner(
 
             if !left_ok || !right_ok {
                 if word_text.map_or(false, |w| w.starts_with("tradition")) { eprintln!("    SKIP INK col={} left_ok={} right_ok={}", entry.col, left_ok, right_ok); }
-                // Seam hugged an edge → retry with narrowed range that
-                // excludes the failing side.
+                // Seam hugged an edge → retry with narrowed range.
                 if !right_ok && left_ok {
                     let new_end = entry.col;
                     if new_end > entry.seg_start + 2 {
-                        if let Some((col, cost)) = cheapest_seam(&energy, entry.seg_start, new_end, h) {
-                            heap.push(SeamEntry { cost, col, seg_start: entry.seg_start, seg_end: new_end });
+                        let sid = next_seg_id; next_seg_id += 1;
+                        let parent_bounds = seg_bounds.get(&entry.seg_id);
+                        let lp = parent_bounds.and_then(|b| b.left_path.clone());
+                        let rp = parent_bounds.and_then(|b| b.right_path.clone());
+                        let (cands, dp) = candidate_seams(&energy, entry.seg_start, new_end, h, lp.as_deref(), rp.as_deref());
+                        for (col, cost) in &cands {
+                            heap.push(SeamEntry { cost: *cost, col: *col, seg_start: entry.seg_start, seg_end: new_end, seg_id: sid });
                         }
+                        seg_bounds.insert(sid, SegBounds { left_path: lp, right_path: rp });
+                        dp_cache.insert(sid, dp);
                     }
                 } else if !left_ok && right_ok {
                     let new_start = entry.col + 1;
                     if entry.seg_end > new_start + 2 {
-                        if let Some((col, cost)) = cheapest_seam(&energy, new_start, entry.seg_end, h) {
-                            heap.push(SeamEntry { cost, col, seg_start: new_start, seg_end: entry.seg_end });
+                        let sid = next_seg_id; next_seg_id += 1;
+                        let parent_bounds = seg_bounds.get(&entry.seg_id);
+                        let lp = parent_bounds.and_then(|b| b.left_path.clone());
+                        let rp = parent_bounds.and_then(|b| b.right_path.clone());
+                        let (cands, dp) = candidate_seams(&energy, new_start, entry.seg_end, h, lp.as_deref(), rp.as_deref());
+                        for (col, cost) in &cands {
+                            heap.push(SeamEntry { cost: *cost, col: *col, seg_start: new_start, seg_end: entry.seg_end, seg_id: sid });
                         }
+                        seg_bounds.insert(sid, SegBounds { left_path: lp, right_path: rp });
+                        dp_cache.insert(sid, dp);
                     }
                 }
                 continue;
             }
 
-            // Reject seam splits without substantial ink on both sides
-            // (same minimum as VP — at least a period's worth of ink).
+            // Reject seam splits without substantial ink on both sides.
             let seam_ink_left: u32 = (entry.seg_start..entry.col).map(|c| col_ink[c as usize]).sum();
             let seam_ink_right: u32 = (entry.col + 1..entry.seg_end).map(|c| col_ink[c as usize]).sum();
-            if seam_ink_left < min_ink_for_symbol || seam_ink_right < min_ink_for_symbol {
-                if word_text.map_or(false, |w| w.starts_with("tradition")) { eprintln!("    SKIP MIN_INK col={} left={} right={} min={}", entry.col, seam_ink_left, seam_ink_right, min_ink_for_symbol); }
+            if seam_ink_left < MIN_INK_FOR_SYMBOL || seam_ink_right < MIN_INK_FOR_SYMBOL {
+                if word_text.map_or(false, |w| w.starts_with("tradition")) { eprintln!("    SKIP MIN_INK col={} left={} right={} min={}", entry.col, seam_ink_left, seam_ink_right, MIN_INK_FOR_SYMBOL); }
                 continue;
             }
 
             if word_text.map_or(false, |w| w.starts_with("tradition")) { eprintln!("    ACCEPT col={}", entry.col); }
+            if word_text.map_or(false, |w| w.starts_with("abcdefgh")) { eprintln!("    ACCEPT col={} cost={:.1} seg=[{},{}) sid={}", entry.col, entry.cost, entry.seg_start, entry.seg_end, entry.seg_id); }
             splits.push(entry.col);
 
-            // Record the full seam path for this split — needed for
-            // character crop masking (diagonal boundaries).
-            // Path must pass through entry.col at mid-row (the split point).
-            let path = seam_path_through(&energy, entry.seg_start, entry.seg_end, h, entry.col);
-            seam_paths.insert(entry.col, path);
+            // Trace the path from the pre-computed DP matrices.
+            let path = dp_cache.get(&entry.seg_id)
+                .map(|dp| dp.trace_path_through(&energy, entry.col))
+                .unwrap_or_else(|| {
+                    let (_, dp) = candidate_seams(&energy, entry.seg_start, entry.seg_end, h, None, None);
+                    dp.trace_path_through(&energy, entry.col)
+                });
+            seam_paths.insert(entry.col, path.clone());
 
-            // Left child
+            // Capture parent's diagonal bounds before removing.
+            let parent_lp = seg_bounds.get(&entry.seg_id).and_then(|b| b.left_path.clone());
+            let parent_rp = seg_bounds.get(&entry.seg_id).and_then(|b| b.right_path.clone());
+
+            // Remove all candidates from the old segment from the heap.
+            let old_sid = entry.seg_id;
+            let remaining: Vec<SeamEntry> = heap.into_iter()
+                .filter(|e| e.seg_id != old_sid)
+                .collect();
+            heap = BinaryHeap::from(remaining);
+            dp_cache.remove(&old_sid);
+            seg_bounds.remove(&old_sid);
+
+            // Left child: inherits parent's left boundary, seam path as right boundary.
             {
                 let (ink_l, ink_r) = left_ink;
                 if ink_r > ink_l + 2 {
-                    for (col, cost) in candidate_seams(&energy, ink_l, ink_r, h) {
-                        heap.push(SeamEntry { cost, col, seg_start: ink_l, seg_end: ink_r });
+                    let sid = next_seg_id; next_seg_id += 1;
+                    let lp = parent_lp.clone();
+                    let rp: Option<Vec<u32>> = Some(path.clone());
+                    let (cands, dp) = candidate_seams(&energy, ink_l, ink_r, h, lp.as_deref(), rp.as_deref());
+                    for (col, cost) in &cands {
+                        heap.push(SeamEntry { cost: *cost, col: *col, seg_start: ink_l, seg_end: ink_r, seg_id: sid });
                     }
+                    seg_bounds.insert(sid, SegBounds { left_path: lp, right_path: rp });
+                    dp_cache.insert(sid, dp);
                 }
             }
 
-            // Right child (col+1 so ink_extent skips past the split column)
+            // Right child: seam path as left boundary, inherits parent's right boundary.
             {
                 let (ink_l, ink_r) = right_ink;
                 if ink_r > ink_l + 2 {
-                    for (col, cost) in candidate_seams(&energy, ink_l, ink_r, h) {
-                        heap.push(SeamEntry { cost, col, seg_start: ink_l, seg_end: ink_r });
+                    let sid = next_seg_id; next_seg_id += 1;
+                    let lp: Option<Vec<u32>> = Some(path.clone());
+                    let rp = parent_rp.clone();
+                    let (cands, dp) = candidate_seams(&energy, ink_l, ink_r, h, lp.as_deref(), rp.as_deref());
+                    for (col, cost) in &cands {
+                        heap.push(SeamEntry { cost: *cost, col: *col, seg_start: ink_l, seg_end: ink_r, seg_id: sid });
                     }
+                    seg_bounds.insert(sid, SegBounds { left_path: lp, right_path: rp });
+                    dp_cache.insert(sid, dp);
                 }
             }
         }
@@ -2579,77 +2602,6 @@ fn segment_characters_inner(
         eprintln!(
             "  DIAG-SEG SEAM: {} seam splits added (total now {})",
             seam_splits.len(), splits.len(),
-        );
-    }
-
-    // --- Pass 2b: VP 5%-ink valleys ---
-    //
-    // After seam carving, sweep for columns with ≤5% of peak ink.
-    // These catch near-whitespace gaps (e.g. Y-Z anti-aliased serif
-    // bridges) that the zero-ink VP pass missed and where the seam's
-    // zero-cost constraint prevented a diagonal path.
-    if splits.len() < need {
-        // Rebuild segments from current splits.
-        let mut seg5: Vec<Segment> = Vec::new();
-        {
-            let mut sorted_splits = splits.clone();
-            sorted_splits.sort();
-            sorted_splits.dedup();
-            let mut prev = 0u32;
-            for &s in &sorted_splits {
-                if s > prev {
-                    let ink = ink_extent(&col_has_ink, prev, s);
-                    seg5.push(Segment { left: prev, right: s, ink_left: ink.0, ink_right: ink.1 });
-                }
-                prev = s;
-            }
-            if prev < w {
-                let ink = ink_extent(&col_has_ink, prev, w);
-                seg5.push(Segment { left: prev, right: w, ink_left: ink.0, ink_right: ink.1 });
-            }
-        }
-
-        while splits.len() < need {
-            let mut best_valley: Option<(u32, u32, usize)> = None;
-
-            for (si, seg) in seg5.iter().enumerate() {
-                if seg.ink_right <= seg.ink_left + 2 { continue; }
-                if let Some((_s, _e, split)) = best_low_ink_valley(&col_has_ink_5, &col_ink, seg.ink_left, seg.ink_right) {
-                    let min_ink = col_ink[split as usize];
-                    if best_valley.map_or(true, |b: (u32, u32, usize)| min_ink < b.0) {
-                        best_valley = Some((min_ink, split, si));
-                    }
-                }
-            }
-
-            let (_min_ink, mid, si) = match best_valley {
-                Some(v) => v,
-                None => break,
-            };
-
-            splits.push(mid);
-
-            let old = &seg5[si];
-            let left_ink = ink_extent(&col_has_ink, old.left, mid);
-            let right_ink = ink_extent(&col_has_ink, mid, old.right);
-            let left_seg = Segment { left: old.left, right: mid, ink_left: left_ink.0, ink_right: left_ink.1 };
-            let right_seg = Segment { left: mid, right: old.right, ink_left: right_ink.0, ink_right: right_ink.1 };
-            seg5.splice(si..=si, [left_seg, right_seg]);
-        }
-
-        splits.sort();
-        splits.dedup();
-    }
-
-    let fivepct_splits: Vec<u32> = splits.iter()
-        .filter(|s| !vp_splits.contains(s) && !seam_splits.contains(s))
-        .copied().collect();
-
-    // Diag: dump 5% pass
-    if let Some(_ddir) = diag_dir {
-        eprintln!(
-            "  DIAG-SEG 5%: {} fivepct splits added (total now {})",
-            fivepct_splits.len(), splits.len(),
         );
     }
 
@@ -2764,240 +2716,234 @@ fn segment_characters_inner(
     (bounds, seam_paths)
 }
 
-/// Find the cheapest vertical seam through columns [seg_start, seg_end) of
-/// the energy map. Returns (split_column, total_cost).
-///
-/// Uses Avidan & Shamir DP: M(r,c) = energy(r,c) + min(M(r-1, c-1), M(r-1, c), M(r-1, c+1)).
-/// The split column is where the seam crosses the vertical midpoint row.
-fn cheapest_seam(
-    energy: &[Vec<f32>],
-    seg_start: u32,
-    seg_end: u32,
-    h: u32,
-) -> Option<(u32, f32)> {
-    let (col, cost, _path) = cheapest_seam_full(energy, seg_start, seg_end, h)?;
-    Some((col, cost))
-}
-
-/// Like cheapest_seam but also returns the full seam path (one x per row, in
-/// absolute image coordinates).
-fn cheapest_seam_full(
-    energy: &[Vec<f32>],
-    seg_start: u32,
-    seg_end: u32,
-    h: u32,
-) -> Option<(u32, f32, Vec<u32>)> {
-    let seg_w = (seg_end - seg_start) as usize;
-    // Need at least 3 columns so there's an interior column to split on.
-    if seg_w < 3 || h < 1 {
-        return None;
-    }
-
-    // DP cost matrix: cost[row][col_within_segment]
-    let mut cost = vec![vec![0.0f32; seg_w]; h as usize];
-
-    // First row
-    for c in 0..seg_w {
-        cost[0][c] = energy[0][(seg_start as usize) + c];
-    }
-
-    // Fill DP
-    for r in 1..h as usize {
-        for c in 0..seg_w {
-            let up = cost[r - 1][c];
-            let up_left = if c > 0 { cost[r - 1][c - 1] } else { f32::INFINITY };
-            let up_right = if c + 1 < seg_w { cost[r - 1][c + 1] } else { f32::INFINITY };
-            cost[r][c] = energy[r][(seg_start as usize) + c] + up.min(up_left).min(up_right);
-        }
-    }
-
-    // Find minimum cost in last row — interior columns only (exclude edges)
-    let last_row = &cost[(h - 1) as usize];
-    let (min_c, &min_cost) = last_row
-        .iter()
-        .enumerate()
-        .filter(|&(c, _)| c > 0 && c + 1 < seg_w)
-        .min_by(|a, b| a.1.partial_cmp(b.1).unwrap_or(std::cmp::Ordering::Equal))?;
-
-    // Full backtrace: build path from bottom row to top
-    let mut path_local = vec![0usize; h as usize];
-    path_local[(h - 1) as usize] = min_c;
-    for r in (1..h as usize).rev() {
-        let c = path_local[r];
-        let up = cost[r - 1][c];
-        let up_left = if c > 1 { cost[r - 1][c - 1] } else { f32::INFINITY };
-        let up_right = if c + 2 < seg_w { cost[r - 1][c + 1] } else { f32::INFINITY };
-        let best = up.min(up_left).min(up_right);
-        if c > 1 && cost[r - 1][c - 1] == best {
-            path_local[r - 1] = c - 1;
-        } else if c + 2 < seg_w && cost[r - 1][c + 1] == best {
-            path_local[r - 1] = c + 1;
-        } else {
-            path_local[r - 1] = c;
-        }
-    }
-
-    // Convert to absolute coordinates
-    let path: Vec<u32> = path_local.iter().map(|&c| seg_start + c as u32).collect();
-
-    // Split column = where seam crosses midpoint row
-    let mid_row = (h / 2) as usize;
-    let split_col = path[mid_row];
-
-    Some((split_col, min_cost, path))
-}
-
-/// Build the cheapest seam path constrained to pass through `target_col`
-/// (absolute image coordinate) at the vertical midpoint.  Returns one x
-/// per row in absolute coordinates.
-///
-/// Uses the same dual-DP as `candidate_seams`: forward DP gives the
-/// optimal top-half, reverse DP gives the optimal bottom-half.
-/// Backtracing each half from the target column at mid-row yields the
-/// cheapest path that is guaranteed to cross the split point.
-fn seam_path_through(
-    energy: &[Vec<f32>],
-    seg_start: u32,
-    seg_end: u32,
-    h: u32,
-    target_col: u32,
-) -> Vec<u32> {
-    let seg_w = (seg_end - seg_start) as usize;
-    let base = seg_start as usize;
-    let mid_r = (h / 2) as usize;
-    let tc = (target_col - seg_start) as usize;
-
-    // Forward DP: top → bottom
-    let mut cost_fwd = vec![vec![0.0f32; seg_w]; h as usize];
-    for c in 0..seg_w {
-        cost_fwd[0][c] = energy[0][base + c];
-    }
-    for r in 1..h as usize {
-        for c in 0..seg_w {
-            let up = cost_fwd[r - 1][c];
-            let ul = if c > 0 { cost_fwd[r - 1][c - 1] } else { f32::INFINITY };
-            let ur = if c + 1 < seg_w { cost_fwd[r - 1][c + 1] } else { f32::INFINITY };
-            cost_fwd[r][c] = energy[r][base + c] + up.min(ul).min(ur);
-        }
-    }
-
-    // Reverse DP: bottom → top
-    let last_r = (h - 1) as usize;
-    let mut cost_rev = vec![vec![0.0f32; seg_w]; h as usize];
-    for c in 0..seg_w {
-        cost_rev[last_r][c] = energy[last_r][base + c];
-    }
-    for r in (0..last_r).rev() {
-        for c in 0..seg_w {
-            let dn = cost_rev[r + 1][c];
-            let dl = if c > 0 { cost_rev[r + 1][c - 1] } else { f32::INFINITY };
-            let dr = if c + 1 < seg_w { cost_rev[r + 1][c + 1] } else { f32::INFINITY };
-            cost_rev[r][c] = energy[r][base + c] + dn.min(dl).min(dr);
-        }
-    }
-
-    let mut path = vec![0u32; h as usize];
-    path[mid_r] = target_col;
-
-    // Top half: backtrace upward from (mid_r, tc) through cost_fwd
-    {
-        let mut c = tc;
-        for r in (1..=mid_r).rev() {
-            let up = cost_fwd[r - 1][c];
-            let ul = if c > 0 { cost_fwd[r - 1][c - 1] } else { f32::INFINITY };
-            let ur = if c + 1 < seg_w { cost_fwd[r - 1][c + 1] } else { f32::INFINITY };
-            let best = up.min(ul).min(ur);
-            if c > 0 && cost_fwd[r - 1][c - 1] == best {
-                c -= 1;
-            } else if c + 1 < seg_w && cost_fwd[r - 1][c + 1] == best {
-                c += 1;
-            }
-            path[r - 1] = seg_start + c as u32;
-        }
-    }
-
-    // Bottom half: backtrace downward from (mid_r, tc) through cost_rev
-    {
-        let mut c = tc;
-        for r in mid_r..last_r {
-            let dn = cost_rev[r + 1][c];
-            let dl = if c > 0 { cost_rev[r + 1][c - 1] } else { f32::INFINITY };
-            let dr = if c + 1 < seg_w { cost_rev[r + 1][c + 1] } else { f32::INFINITY };
-            let best = dn.min(dl).min(dr);
-            if c > 0 && cost_rev[r + 1][c - 1] == best {
-                c -= 1;
-            } else if c + 1 < seg_w && cost_rev[r + 1][c + 1] == best {
-                c += 1;
-            }
-            path[r + 1] = seg_start + c as u32;
-        }
-    }
-
-    path
-}
-
 /// Exhaustive (col, cost) candidates via dual-DP: for every interior column
 /// at mid-row, compute the cost of the cheapest seam path that passes
 /// through that column.  All candidates go on the heap so the greedy loop
 /// sees every possible split point, not just bottom-row local minima
 /// (which can miss clean inter-character gaps that backtrack to a
 /// different mid-row column).
+/// DP matrices from a seam candidate search.  Retaining these lets us
+/// trace the optimal path through any mid-row column without recomputing.
+struct SeamDp {
+    cost_fwd: Vec<Vec<f32>>,
+    cost_rev: Vec<Vec<f32>>,
+    seg_start: u32,
+    seg_end: u32,
+    h: u32,
+}
+
+impl SeamDp {
+    /// Backtrace the cheapest path through `target_col` at mid-row,
+    /// using the pre-computed forward and reverse DP matrices.
+    fn trace_path(&self, energy: &[Vec<f32>]) -> Vec<u32> {
+        // When there's only one candidate column, return a vertical seam.
+        let seg_w = (self.seg_end - self.seg_start) as usize;
+        let base = self.seg_start as usize;
+        let mid_r = (self.h / 2) as usize;
+        let last_r = (self.h - 1) as usize;
+
+        // Find the cheapest mid-row column from the combined costs
+        let mut best_c = 0usize;
+        let mut best_cost = f32::INFINITY;
+        for c in 0..seg_w {
+            let combined = self.cost_fwd[mid_r][c] + self.cost_rev[mid_r][c]
+                - energy[mid_r][base + c];
+            if combined < best_cost {
+                best_cost = combined;
+                best_c = c;
+            }
+        }
+
+        self.trace_path_through(energy, self.seg_start + best_c as u32)
+    }
+
+    /// Backtrace the cheapest path constrained to pass through
+    /// `target_col` at mid-row.
+    fn trace_path_through(&self, energy: &[Vec<f32>], target_col: u32) -> Vec<u32> {
+        let seg_w = (self.seg_end - self.seg_start) as usize;
+        let base = self.seg_start as usize;
+        let mid_r = (self.h / 2) as usize;
+        let last_r = (self.h - 1) as usize;
+        let tc = (target_col - self.seg_start) as usize;
+
+        let mut path = vec![0u32; self.h as usize];
+        path[mid_r] = target_col;
+
+        // Top half: backtrace upward from (mid_r, tc) through cost_fwd
+        {
+            let mut c = tc;
+            for r in (1..=mid_r).rev() {
+                let cur_dark = energy[r][base + c];
+                let mut best_cost = f32::INFINITY;
+                let mut best_c = c;
+                for &pc in &[c, c.wrapping_sub(1), c + 1] {
+                    if pc < seg_w {
+                        let prev_dark = energy[r - 1][base + pc];
+                        let entry = if cur_dark > prev_dark {
+                            (cur_dark - prev_dark) * ENTRY_PENALTY_WEIGHT
+                        } else {
+                            0.0
+                        };
+                        let cand = self.cost_fwd[r - 1][pc] + entry;
+                        if cand < best_cost {
+                            best_cost = cand;
+                            best_c = pc;
+                        }
+                    }
+                }
+                c = best_c;
+                path[r - 1] = self.seg_start + c as u32;
+            }
+        }
+
+        // Bottom half: backtrace downward from (mid_r, tc) through cost_rev
+        {
+            let mut c = tc;
+            for r in mid_r..last_r {
+                let cur_dark = energy[r][base + c];
+                let mut best_cost = f32::INFINITY;
+                let mut best_c = c;
+                for &pc in &[c, c.wrapping_sub(1), c + 1] {
+                    if pc < seg_w {
+                        let child_dark = energy[r + 1][base + pc];
+                        let entry = if child_dark > cur_dark {
+                            (child_dark - cur_dark) * ENTRY_PENALTY_WEIGHT
+                        } else {
+                            0.0
+                        };
+                        let cand = self.cost_rev[r + 1][pc] + entry;
+                        if cand < best_cost {
+                            best_cost = cand;
+                            best_c = pc;
+                        }
+                    }
+                }
+                c = best_c;
+                path[r + 1] = self.seg_start + c as u32;
+            }
+        }
+
+        path
+    }
+}
+
 fn candidate_seams(
     energy: &[Vec<f32>],
     seg_start: u32,
     seg_end: u32,
     h: u32,
-) -> Vec<(u32, f32)> {
+    left_path: Option<&[u32]>,   // pixels with col <= left_path[r] are masked
+    right_path: Option<&[u32]>,  // pixels with col >= right_path[r] are masked
+) -> (Vec<(u32, f32)>, SeamDp) {
     let seg_w = (seg_end - seg_start) as usize;
     if seg_w < 3 || h < 1 {
-        return Vec::new();
+        let dp = SeamDp { cost_fwd: Vec::new(), cost_rev: Vec::new(), seg_start, seg_end, h };
+        return (Vec::new(), dp);
     }
     let base = seg_start as usize;
     let mid_r = (h / 2) as usize;
 
+    // Masked energy: pixels outside diagonal boundaries are impassable.
+    let masked_energy = |r: usize, c: usize| -> f32 {
+        let abs_col = base + c;
+        if let Some(lp) = left_path {
+            if abs_col <= lp[r] as usize { return f32::INFINITY; }
+        }
+        if let Some(rp) = right_path {
+            if abs_col >= rp[r] as usize { return f32::INFINITY; }
+        }
+        energy[r][abs_col]
+    };
+
     // Forward DP: cost_fwd[r][c] = cheapest path from any top-row column
-    // down to (r, c).
+    // down to (r, c).  Cost = sum of ink darkness along the path, plus
+    // an entry penalty each time the path moves into a darker pixel.
     let mut cost_fwd = vec![vec![0.0f32; seg_w]; h as usize];
     for c in 0..seg_w {
-        cost_fwd[0][c] = energy[0][base + c];
+        cost_fwd[0][c] = masked_energy(0, c);
     }
     for r in 1..h as usize {
         for c in 0..seg_w {
-            let up = cost_fwd[r - 1][c];
-            let ul = if c > 0 { cost_fwd[r - 1][c - 1] } else { f32::INFINITY };
-            let ur = if c + 1 < seg_w { cost_fwd[r - 1][c + 1] } else { f32::INFINITY };
-            cost_fwd[r][c] = energy[r][base + c] + up.min(ul).min(ur);
+            let cur_dark = masked_energy(r, c);
+            let mut best = f32::INFINITY;
+            for &pc in &[c, c.wrapping_sub(1), c + 1] {
+                if pc < seg_w {
+                    let prev_dark = masked_energy(r - 1, pc);
+                    let entry = if cur_dark > prev_dark {
+                        (cur_dark - prev_dark) * ENTRY_PENALTY_WEIGHT
+                    } else {
+                        0.0
+                    };
+                    let candidate = cost_fwd[r - 1][pc] + entry;
+                    if candidate < best {
+                        best = candidate;
+                    }
+                }
+            }
+            cost_fwd[r][c] = cur_dark + best;
         }
     }
 
-    // Reverse DP: cost_rev[r][c] = cheapest path from any bottom-row column
-    // up to (r, c).
+    // Reverse DP: models downward continuation from (r, c) to bottom.
     let last_r = (h - 1) as usize;
     let mut cost_rev = vec![vec![0.0f32; seg_w]; h as usize];
     for c in 0..seg_w {
-        cost_rev[last_r][c] = energy[last_r][base + c];
+        cost_rev[last_r][c] = masked_energy(last_r, c);
     }
     for r in (0..last_r).rev() {
         for c in 0..seg_w {
-            let dn = cost_rev[r + 1][c];
-            let dl = if c > 0 { cost_rev[r + 1][c - 1] } else { f32::INFINITY };
-            let dr = if c + 1 < seg_w { cost_rev[r + 1][c + 1] } else { f32::INFINITY };
-            cost_rev[r][c] = energy[r][base + c] + dn.min(dl).min(dr);
+            let cur_dark = masked_energy(r, c);
+            let mut best = f32::INFINITY;
+            for &pc in &[c, c.wrapping_sub(1), c + 1] {
+                if pc < seg_w {
+                    let child_dark = masked_energy(r + 1, pc);
+                    let entry = if child_dark > cur_dark {
+                        (child_dark - cur_dark) * ENTRY_PENALTY_WEIGHT
+                    } else {
+                        0.0
+                    };
+                    let candidate = cost_rev[r + 1][pc] + entry;
+                    if candidate < best {
+                        best = candidate;
+                    }
+                }
+            }
+            cost_rev[r][c] = cur_dark + best;
         }
     }
 
     // For each interior column at mid-row, the cheapest path through it
     // costs cost_fwd[mid][c] + cost_rev[mid][c] - energy[mid][c]
     // (subtract once to avoid double-counting the mid-row pixel).
-    let mut candidates: Vec<(u32, f32)> = Vec::with_capacity(seg_w.saturating_sub(2));
+    let mut raw_candidates: Vec<(u32, f32)> = Vec::with_capacity(seg_w.saturating_sub(2));
     for c in 1..seg_w - 1 {
-        let combined = cost_fwd[mid_r][c] + cost_rev[mid_r][c]
-            - energy[mid_r][base + c];
+        let me = masked_energy(mid_r, c);
+        if me >= f32::INFINITY { continue; } // masked pixel, skip
+        let combined = cost_fwd[mid_r][c] + cost_rev[mid_r][c] - me;
         let split_col = seg_start + c as u32;
-        candidates.push((split_col, combined));
+        raw_candidates.push((split_col, combined));
     }
 
-    candidates
+    // Collapse runs of consecutive columns with equal cost into a
+    // single candidate at the run's midpoint.  This picks the center
+    // of a zero-cost band, maximizing distance from ink on both sides.
+    let mut candidates: Vec<(u32, f32)> = Vec::with_capacity(raw_candidates.len());
+    let mut i = 0;
+    while i < raw_candidates.len() {
+        let cost = raw_candidates[i].1;
+        let run_start = i;
+        while i < raw_candidates.len()
+            && raw_candidates[i].1 == cost
+            && (i == run_start || raw_candidates[i].0 == raw_candidates[i - 1].0 + 1)
+        {
+            i += 1;
+        }
+        let mid_idx = (run_start + i - 1) / 2;
+        candidates.push(raw_candidates[mid_idx]);
+    }
+
+    let dp = SeamDp { cost_fwd, cost_rev, seg_start, seg_end, h };
+    (candidates, dp)
 }
 
 /// Uniform character boundaries.
@@ -3076,6 +3022,10 @@ pub struct CharCiDetail {
     pub passed_gate: bool,
     /// Top-3 nearest fonts (name, dist_sq).
     pub nearest: Vec<(String, f32)>,
+    /// When the OCR correction gate fires, the original OCR character
+    /// that was replaced.  `ch` then holds the corrected character,
+    /// and `nearest`/`min_dist_sq` reflect the corrected char's CI.
+    pub ocr_corrected_from: Option<char>,
 }
 
 /// Result of `search_candidates`: ranked font scores + per-character CI detail.
@@ -3142,6 +3092,7 @@ pub fn search_candidates(
         // not style confusion (e vs c at 2-5×).
         let mut effective_hits = hits;
         let mut effective_min = min_dist_sq;
+        let mut effective_ch: Option<char> = None;
 
         if min_dist_sq > 0.1 {
             // Only check alternatives when OCR match is already poor.
@@ -3172,6 +3123,7 @@ pub fn search_candidates(
                     if alt_min < effective_min && min_dist_sq > alt_min * 10.0 {
                         effective_hits = alt_hits;
                         effective_min = alt_min;
+                        effective_ch = Some(*alt_c);
                     }
                 }
             }
@@ -3199,11 +3151,12 @@ pub fn search_candidates(
             })
             .collect();
         char_detail.push(CharCiDetail {
-            ch: *c,
+            ch: effective_ch.unwrap_or(*c),
             crop_index: *crop_idx,
             min_dist_sq,
             passed_gate,
             nearest,
+            ocr_corrected_from: effective_ch.map(|_| *c),
         });
 
         if !passed_gate {

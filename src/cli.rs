@@ -1,5 +1,5 @@
 use clap::Parser;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 #[derive(Parser, Debug)]
 #[command(
@@ -33,12 +33,6 @@ pub struct Args {
     #[arg(long, default_value = "0.10")]
     pub min_font_confidence: f32,
 
-    /// Minimum SSIM score for the verification pass (0.0–1.0).
-    /// After rendering vector text, compare with original. Below this → revert to raster.
-    /// Disabled by default (0.0) — word-level SSIM in the matching stage handles quality.
-    #[arg(long, default_value = "0.0")]
-    pub min_verify_ssim: f32,
-
     /// DPI for PDF page rasterization
     #[arg(long, default_value = "300")]
     pub dpi: u32,
@@ -46,10 +40,6 @@ pub struct Args {
     /// Skip geometry vectorization (lines, rectangles, fills)
     #[arg(long)]
     pub no_geometry: bool,
-
-    /// Skip SSIM verification pass
-    #[arg(long)]
-    pub no_verify: bool,
 
     /// Debug overlay mode: keep original raster in place and render vector
     /// text on top in semitransparent red. Useful for visually checking
@@ -63,9 +53,11 @@ pub struct Args {
     #[arg(long)]
     pub smooth: bool,
 
-    /// Path for the audit-log JSON file (default: <output>.audit.json)
-    #[arg(long)]
-    pub audit_log: Option<PathBuf>,
+    /// Audit directory.  Writes audit.json and per-word segmentation
+    /// diagnostics (crops, seams, char overlays) into the given directory.
+    /// Also used by tools/char-misses.py to generate the visual miss report.
+    #[arg(long, value_name = "DIR")]
+    pub audit: Option<PathBuf>,
 
     // ── Character index flags ──────────────────────────────────────
     /// Scan available fonts, update the cached character index if needed,
@@ -88,37 +80,36 @@ pub struct Args {
     #[arg(long)]
     pub compare: bool,
 
-    /// Include a font in word-level SSIM reranking for every line, even if CI
-    /// didn't select it. Substring match against font name (case-insensitive).
-    /// Useful for diagnosing why a known-correct font scores poorly in the audit.
+    /// Include a font in CI candidate evaluation for every line, even if the
+    /// character index didn't rank it highly. Substring match against font name
+    /// (case-insensitive). Useful for diagnosing why a known-correct font
+    /// scores poorly in the audit.
     #[arg(long, value_name = "NAME")]
     pub include_font: Option<String>,
 
     /// Thoroughness factor for font matching. Default 1.0.
     /// Higher values relax all CI thresholds (quorum, quality gate, kd-tree
-    /// search radius) so more candidate fonts survive to word-level SSIM.
+    /// search radius) so more candidate fonts survive to evaluation.
     /// Useful for diagnosing why a known font isn't being matched.
     #[arg(long, default_value_t = 1.0)]
     pub thoroughness: f32,
 
-    /// Dump per-word segmentation diagnostics: OCR bboxes, VP splits,
-    /// seam splits, charbox fallback, final char crops, and images for
-    /// each pass.  Writes to the specified directory.
-    /// Use with a small test PDF to inspect the full segmentation pipeline.
-    #[arg(long, value_name = "DIR")]
-    pub diag_seg: Option<PathBuf>,
-
-    /// When used with --diag-seg, also render each extracted character from
+    /// When used with --audit, also render each extracted character from
     /// this font file using the index-time render_char_normalised() code path.
     /// Saves as NN_c_ref.png next to the scan crop NN_c.png for side-by-side
     /// comparison using identical normalization.
-    #[arg(long, value_name = "FONT", requires = "diag_seg")]
+    #[arg(long, value_name = "FONT", requires = "audit")]
     pub diag_ref_font: Option<PathBuf>,
 }
 
 impl Args {
+    /// Resolve the audit JSON path.
+    /// With --audit DIR, it's DIR/audit.json.
+    /// Without --audit, falls back to <output>.audit.json.
     pub fn audit_log_path(&self) -> PathBuf {
-        self.audit_log.clone().unwrap_or_else(|| {
+        if let Some(ref dir) = self.audit {
+            dir.join("audit.json")
+        } else {
             let out = self.output.as_ref().expect("output required for audit log");
             let mut p = out.clone();
             let stem = p
@@ -128,7 +119,12 @@ impl Args {
                 .to_string();
             p.set_file_name(format!("{stem}.audit.json"));
             p
-        })
+        }
+    }
+
+    /// Resolve the diag-seg directory (same as --audit DIR when set).
+    pub fn diag_seg_dir(&self) -> Option<&Path> {
+        self.audit.as_deref()
     }
 
     /// Resolve the character index path.

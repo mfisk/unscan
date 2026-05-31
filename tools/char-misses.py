@@ -7,13 +7,13 @@ with its font and bbox, then spatially matches against unscan's audit log
 to find genuine misses. No JSON metadata involved.
 
 Usage:
-    # 1. Run unscan with audit + diag-seg:
-    ./target/release/unscan RASTERIZED.pdf \
-        -o /dev/null --audit-log /tmp/audit.json --diag-seg /tmp/diag-seg
+    # 1. Run unscan with --audit:
+    ./target/debug/unscan RASTERIZED.pdf \
+        -o /dev/null --audit /tmp/audit-out
 
     # 2. Generate the report against the vector PDF:
-    python3 tools/char-misses.py /tmp/audit.json VECTOR.pdf \
-        --diag-seg /tmp/diag-seg -o /tmp/misses.html
+    python3 tools/char-misses.py /tmp/audit-out VECTOR.pdf \
+        -o /tmp/misses.html
 """
 
 import argparse
@@ -518,6 +518,14 @@ def build_miss_html(entry, chars_to_show, crop_dir, crop_files,
 
         ref_img = render_char(ch, correct_font_path, NORM_H) if correct_font_path else None
 
+        # Find the CI distance for this character against the correct font
+        correct_char_dist = None
+        if correct_font_path:
+            for nf, nd in cv.get("nearest", []):
+                if fonts_match(nf, correct_font_name):
+                    correct_char_dist = nd
+                    break
+
         # Use actual CI reference image from diag-seg if available (exact data
         # the character index compared against), fall back to PIL re-render.
         chosen_img = None
@@ -539,14 +547,14 @@ def build_miss_html(entry, chars_to_show, crop_dir, crop_files,
             ocr_font = ocr_near[0][0].rsplit("/", 1)[-1] if ocr_near else "?"
             ocr_d = ocr_near[0][1] if ocr_near else 0
             ocr_dc = dist_class(ocr_d)
-            ocr_cell = f"<span class='char-label'>'{original_ocr}'</span><br><span class='font-mini'>{ocr_font}</span><br><span class='num {ocr_dc}'>{ocr_d:.4f}</span>"
+            ocr_cell = f"<span class='char-label'>'{original_ocr}'</span><br><span class='font-mini'>{ocr_font}</span><br><span class='num {ocr_dc}'>{ocr_d:.6f}</span>"
         elif not ocr_from:
             near = cv.get("nearest", [])
             if near:
                 ocr_font = near[0][0].rsplit("/", 1)[-1]
                 ocr_d = near[0][1]
                 ocr_dc = dist_class(ocr_d)
-                ocr_cell = f"<span class='char-label'>'{ch}'</span><br><span class='font-mini'>{ocr_font}</span><br><span class='num {ocr_dc}'>{ocr_d:.4f}</span>"
+                ocr_cell = f"<span class='char-label'>'{ch}'</span><br><span class='font-mini'>{ocr_font}</span><br><span class='num {ocr_dc}'>{ocr_d:.6f}</span>"
             else:
                 ocr_cell = "—"
         else:
@@ -561,7 +569,7 @@ def build_miss_html(entry, chars_to_show, crop_dir, crop_files,
             else:
                 alt_font = ""
             alt_dc = dist_class(alt_dist)
-            alt_cell = f"<span class='char-label'>'{alt_ch}'</span><br><span class='font-mini'>{alt_font}</span><br><span class='num {alt_dc}'>{alt_dist:.4f}</span>"
+            alt_cell = f"<span class='char-label'>'{alt_ch}'</span><br><span class='font-mini'>{alt_font}</span><br><span class='num {alt_dc}'>{alt_dist:.6f}</span>"
         elif cv.get("min_dist_sq", 1.0) <= 0.1:
             alt_cell = "<span class='dimmed'>—</span>"
         else:
@@ -577,13 +585,20 @@ def build_miss_html(entry, chars_to_show, crop_dir, crop_files,
         chosen_d2 = cv.get("chosen_dist_sq")
         if chosen_d2 is not None:
             chosen_dc = dist_class(chosen_d2)
-            chosen_score_label = f"<div class='sub'><span class='num {chosen_dc}'>{chosen_d2:.4f}</span></div>"
+            chosen_score_label = f"<div class='sub'><span class='num {chosen_dc}'>{chosen_d2:.6f}</span></div>"
         else:
             chosen_score_label = ""
 
+        # Per-char distance label for correct font
+        if correct_char_dist is not None:
+            cc_dc = dist_class(correct_char_dist)
+            correct_score_label = f"<div class='sub'><span class='num {cc_dc}'>{correct_char_dist:.6f}</span></div>"
+        else:
+            correct_score_label = ""
+
         rows.append(f"""<tr>
   <td class="img-td">{img_td(crop_img)}<div class="sub">OCR: {ocr_label}</div></td>
-  <td class="img-td">{img_td(ref_img)}</td>
+  <td class="img-td">{img_td(ref_img)}{correct_score_label}</td>
   <td class="img-td">{img_td(chosen_img)}{chosen_score_label}</td>
   <td class="ocr-col">{ocr_cell}</td>
   <td class="alt-col">{alt_cell}</td>
@@ -592,7 +607,17 @@ def build_miss_html(entry, chars_to_show, crop_dir, crop_files,
 
     text_preview = entry["text"][:60]
     matched = entry.get("font_matched", "?")
-    rank_str = f"CI #{ci_rank}, score {ci_score:.3f}" if ci_rank else "not in CI"
+    rank_str = f"CI #{ci_rank}, score {ci_score:.4f}" if ci_rank else "not in CI"
+
+    # SSIM verification info
+    ssim_val = entry.get("ssim_score")
+    ssim_pass = entry.get("ssim_pass")
+    if ssim_val is not None:
+        ssim_cls = "ssim-pass" if ssim_pass else "ssim-fail"
+        ssim_label = "pass" if ssim_pass else "FAIL"
+        ssim_html = f' <span class="{ssim_cls}">SSIM {ssim_val:.4f} ({ssim_label})</span>'
+    else:
+        ssim_html = ""
 
     chosen_score = None
     for c in entry.get("ci_candidates", []):
@@ -601,7 +626,7 @@ def build_miss_html(entry, chars_to_show, crop_dir, crop_files,
             break
 
     correct_col_hdr = f"{correct_font_name}<br><span class='score'>{rank_str}</span>"
-    chosen_score_str = f"score {chosen_score:.3f}" if chosen_score else ""
+    chosen_score_str = f"score {chosen_score:.4f}" if chosen_score else ""
     chosen_col_hdr = f"{matched}<br><span class='score'>{chosen_score_str}</span>"
 
     # Segmentation picture
@@ -622,7 +647,7 @@ def build_miss_html(entry, chars_to_show, crop_dir, crop_files,
 </div>"""
 
     return f"""<div class="miss">
-<h3>p{entry['page']}:L{entry['line_index']} — "{text_preview}"</h3>
+<h3>p{entry['page']}:L{entry['line_index']} — "{text_preview}"{ssim_html}</h3>
 {seg_html}
 <table>
 <tr>
@@ -640,6 +665,8 @@ def build_miss_html(entry, chars_to_show, crop_dir, crop_files,
 
 CSS = """<style>
 * { box-sizing: border-box; margin: 0; padding: 0; }
+.ssim-pass { font-size: 11px; padding: 1px 6px; border-radius: 3px; background: #d4edda; color: #155724; margin-left: 8px; }
+.ssim-fail { font-size: 11px; padding: 1px 6px; border-radius: 3px; background: #f8d7da; color: #721c24; margin-left: 8px; font-weight: bold; }
 body {
   font-family: -apple-system, system-ui, sans-serif;
   font-size: 13px;
@@ -702,17 +729,26 @@ img.ci {
 
 def main():
     parser = argparse.ArgumentParser(description="Visual miss report for unscan")
-    parser.add_argument("audit", help="Path to audit JSON from --audit-log")
+    parser.add_argument("audit_dir", help="Path to --audit directory (contains audit.json and diag images)")
     parser.add_argument("vector_pdf", help="Path to the original vector PDF")
-    parser.add_argument("--crops", default=None,
-                        help="Legacy: path to UNSCAN_DUMP_CROPS output dir (not needed when --diag-seg is set)")
-    parser.add_argument("--diag-seg", default="/tmp/diag-seg",
-                        help="Path to --diag-seg output dir for segmentation images")
     parser.add_argument("-o", "--output", default="/tmp/misses.html",
                         help="Output HTML file path")
     args = parser.parse_args()
 
-    with open(args.audit) as f:
+    # audit_dir contains both audit.json and diag-seg images
+    audit_json = os.path.join(args.audit_dir, "audit.json")
+    if not os.path.exists(audit_json):
+        # Backward compat: if the argument is a JSON file itself, use it
+        if args.audit_dir.endswith(".json") and os.path.exists(args.audit_dir):
+            audit_json = args.audit_dir
+            diag_seg_root = os.path.dirname(audit_json)
+        else:
+            print(f"ERROR: {audit_json} not found", file=sys.stderr)
+            sys.exit(1)
+    else:
+        diag_seg_root = args.audit_dir
+
+    with open(audit_json) as f:
         audit = json.load(f)
 
     doc = fitz.open(args.vector_pdf)
@@ -725,6 +761,7 @@ def main():
     misses = []
     hits = 0
     skipped = 0
+    ssim_fail_count = 0
 
     for e in entries:
         matched = e.get("font_matched", "")
@@ -737,6 +774,9 @@ def main():
         if actual_font is None:
             skipped += 1
             continue
+
+        if e.get("ssim_pass") is False:
+            ssim_fail_count += 1
 
         if fonts_match(matched, actual_font):
             hits += 1
@@ -768,8 +808,8 @@ def main():
     # Build HTML
     miss_blocks = []
     for entry, actual_font, gt_key, gt_score, gt_rank in misses:
-        crop_dir, crop_files = find_crop_dir(args.crops, entry["page"], entry["line_index"],
-                                              diag_seg_root=args.diag_seg,
+        crop_dir, crop_files = find_crop_dir(None, entry["page"], entry["line_index"],
+                                              diag_seg_root=diag_seg_root,
                                               line_text=entry.get("text", ""))
 
         chars = entry.get("ci_char_votes", [])
@@ -789,10 +829,11 @@ def main():
             entry, interesting, crop_dir, crop_files,
             correct_font_path, correct_font_name, gt_rank, gt_score,
             chosen_font_path, matched,
-            diag_seg_root=args.diag_seg,
+            diag_seg_root=diag_seg_root,
         )
         miss_blocks.append(block)
 
+    ssim_fail_str = f" | {ssim_fail_count} SSIM failures" if ssim_fail_count else ""
     compared = hits + len(misses)
     pct = hits / compared * 100 if compared else 0
     html = f"""<!DOCTYPE html>
@@ -804,7 +845,7 @@ def main():
 <body style="background: white; color: #222;">
 {CSS}
 <h2>unscan Miss Report</h2>
-<div class="summary">{hits}/{compared} correct ({pct:.1f}%) — {len(misses)} misses shown below</div>
+<div class="summary">{hits}/{compared} correct ({pct:.1f}%) — {len(misses)} misses shown below{ssim_fail_str}</div>
 {"".join(miss_blocks)}
 </body>
 </html>"""

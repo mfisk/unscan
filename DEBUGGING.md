@@ -25,7 +25,7 @@ producing different effective images. Key symptoms:
   vector index renders, systematically biasing CI toward heavier-weight fonts.
 
 **Debugging procedure for CI misses:**
-1. Run `--diag-seg` to get the actual char crops CI receives.
+1. Run `--audit` to get the actual char crops CI receives.
 2. From the audit JSON `ci_char_votes`, identify which characters of the correct
    font score worst. Show the crop images for those characters. Narrow glyphs
    (I, l, t, i) are the canary — they're most sensitive to geometry mismatches.
@@ -147,18 +147,18 @@ unscan input.pdf -o /dev/null --diagnostic /tmp/diag
 open /tmp/diag/index.html
 ```
 
-### `UNSCAN_DUMP_CROPS=1`
+### `--audit DIR` segmentation images
 
-Dumps the **character-level** crops that CI actually scores — the raw inputs to
-stage 2. These are the individual character images extracted from the scan, 
+The `--audit DIR` flag dumps **character-level** crops that CI actually scores — the raw inputs to
+the character index. These are the individual character images extracted from the scan,
 normalized to `NORM_H` pixels tall.
 
-Output: `/tmp/unscan-crops/p{page}_line_{text}/crop_{idx}_{char}.png`
+Output: `DIR/p{page}_{text_slug}/word_{idx}_{text}/chars/NN_c.png`
 
 ```bash
-UNSCAN_DUMP_CROPS=1 unscan input.pdf -o /dev/null
-ls /tmp/unscan-crops/p2_line_1931__Times_New_Roman/
-# crop_00_1.png  crop_04_T.png  crop_06_m.png ...
+unscan input.pdf -o /dev/null --audit /tmp/audit-out
+ls /tmp/audit-out/p2_Times_New_Roman/word_000_1931/chars/
+# 00_1.png  04_T.png  06_m.png ...
 ```
 
 These are the actual images being turned into 99-dimensional feature vectors and
@@ -172,7 +172,7 @@ When a line has too many or too few crops, segmentation is the culprit. Compare
 crop count against expected character count (OCR text length minus spaces):
 
 ```bash
-UNSCAN_DUMP_CROPS=1 unscan input.pdf -o /dev/null
+unscan input.pdf -o /dev/null
 ls /tmp/unscan-crops/p4_line_ABCDEFGHIJKLMNOPQRSTUVWXYZ_abcdefghijklm/ | wc -l
 # 99 crops for 52 expected chars = over-segmentation
 ```
@@ -305,7 +305,7 @@ This is the first step. Always.
 
 ```bash
 rm -rf /tmp/unscan-crops
-UNSCAN_DUMP_CROPS=1 RUST_LOG=info \
+RUST_LOG=info \
   unscan input.pdf -o /dev/null --diagnostic /tmp/diag 2>&1 | tee /tmp/unscan-stderr.log
 ```
 
@@ -350,7 +350,7 @@ the inputs are clean.
 ### Step 1b: Show the Worst-Scoring Characters of the Correct Font
 
 After confirming crops are visually clean, identify which characters of the
-**correct font** score worst in CI. Use `--diag-seg` output — never
+**correct font** score worst in CI. Use `--audit` output — never
 reimplement feature computation in Python or another language. The Rust code
 is the source of truth; any reimplementation will have subtle differences
 (thresholds, rounding, padding, resize filter) that produce misleading
@@ -358,7 +358,7 @@ comparisons.
 
 **Use actual tool output only:**
 
-1. Run with `--diag-seg` to get the per-char crop PNGs that CI actually scored
+1. Run with `--audit` to get the per-char crop PNGs that CI actually scored
    (these are in `word_NNN_text/chars/NN_c.png`).
 2. Use the audit JSON `ci_char_votes` to find which characters of the correct
    font have the worst (largest) distances. If the correct font doesn't appear
@@ -503,7 +503,7 @@ below the image group. Do NOT put OCR values as text in a table cell next to
 
 | Image | What it shows | Source |
 |-------|--------------|--------|
-| **Scan Crop** | The actual crop CI scored | `UNSCAN_DUMP_CROPS=1` output PNGs |
+| **Scan Crop** | The actual crop CI scored | `--audit` output PNGs |
 | **OCR Char** | What Tesseract said, rendered at 48px in a neutral sans font (DejaVu Sans) | PIL render of the original OCR character |
 | **Correct Font** | The same character rendered from the ground-truth font | PIL render from the system font file at NORM_H |
 
@@ -555,14 +555,13 @@ clones), picks interesting characters, renders all three columns, and produces
 a self-contained HTML report.
 
 ```bash
-# 1. Run unscan with crops + audit
-rm -rf /tmp/unscan-crops
-UNSCAN_DUMP_CROPS=1 ./target/release/unscan INPUT.pdf \
-    -o /dev/null --audit-log /tmp/audit.json
+# 1. Run unscan with --audit
+./target/debug/unscan INPUT.pdf \
+    -o /dev/null --audit /tmp/audit-out
 
 # 2. Generate the visual report
-python3 tools/char-misses.py /tmp/audit.json test-docs/font-timeline-specimen.json \
-    --crops /tmp/unscan-crops -o /tmp/char-misses.html
+python3 tools/char-misses.py /tmp/audit-out test-docs/font-timeline-specimen.pdf \
+    -o /tmp/char-misses.html
 
 # 3. Present as widget card (present_now: true)
 ```
@@ -613,44 +612,39 @@ match is wrong, the bug is in word SSIM reranking.
 
 ```bash
 ./target/release/unscan test-docs/font-timeline-specimen-rasterized.pdf \
-    -o /dev/null --audit-log /tmp/audit.json
+    -o /dev/null --audit /tmp/audit-out
 ```
 
 ### Step 2: Cross-reference CI top vs matched font
 
 The audit log `text_entries[].ci_top` is a ranked list of `[font_path, score]` pairs.
-`text_entries[].font_matched` is the final winner (after word SSIM rerank).
-`text_entries[].word_rerank_winner` shows what the word-level SSIM picked.
+`text_entries[].font_matched` is the final winner (CI #1).
+`text_entries[].ssim_score` shows the SSIM verification score.
 
-To find lines where word reranking flipped away from CI #1:
+To find lines where CI #1 might be wrong, check low SSIM scores:
 
 ```python
 import json
 
-with open('/tmp/audit.json') as f:
+with open('/tmp/audit-out/audit.json') as f:
     entries = json.load(f)['text_entries']
 
 for e in entries:
-    ci = e.get('ci_top', [])
-    matched = e.get('font_matched', '')
-    if not ci: continue
-    ci1 = ci[0][0].rsplit('/', 1)[-1].split('.')[0].split('|')[0]
-    ci1 = ci1.lower().replace('-','').replace('_','')
-    mn = matched.lower().replace('-','').replace('_','').replace(' ','')
-    if ci1 not in mn and mn not in ci1:
-        print(f"p{e['page']}:l{e['line_index']} CI#1={ci[0][0].rsplit('/',1)[-1]} → matched={matched}")
+    ssim = e.get('ssim_score')
+    if ssim is not None and ssim < 0.4:
+        print(f"p{e['page']}:l{e['line_index']} ssim={ssim:.3f} font={e.get('font_matched', '?')}")
 ```
 
-### Step 3: Use --diag-seg for deep inspection
+### Step 3: Use --audit for deep inspection
 
 ```bash
-./target/release/unscan INPUT.pdf -o /dev/null --diag-seg /tmp/diag-seg
+./target/release/unscan INPUT.pdf -o /dev/null --audit /tmp/audit-out
 ```
 
 Produces per-line directories, each containing per-word subdirectories:
 
 ```
-/tmp/diag-seg/
+/tmp/audit-out/
   p1_The_quick_brown_fox/
     word_000_quick/
       word_crop.png          # raw word image from Tesseract bbox
@@ -659,7 +653,7 @@ Produces per-line directories, each containing per-word subdirectories:
       final_overlay.png      # all passes: VP red, seam blue, charbox green
       summary.json           # vp_splits, seam_splits, charbox_added_splits, boundaries
       chars/                 # individual char crop PNGs: 00_A.png, 01_B.png, ...
-    line_summary.json        # CI top 5, font_matched, ssim_score, word_rerank_winner
+    line_summary.json        # CI top 5, font_matched, ssim_score
 ```
 
 ### Diagnosis decision tree

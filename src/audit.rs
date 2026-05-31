@@ -15,6 +15,8 @@ pub struct AuditEntry {
     pub font_matched: Option<String>,
     pub font_confidence: Option<f32>,
     pub ssim_score: Option<f32>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub ssim_pass: Option<bool>,
     pub decision: Decision,
     pub reason: String,
     pub bbox: BBox,
@@ -22,10 +24,6 @@ pub struct AuditEntry {
     pub ci_candidates: Vec<CiCandidate>,
     #[serde(skip_serializing_if = "Vec::is_empty")]
     pub ci_char_votes: Vec<CharCiVote>,
-    #[serde(skip_serializing_if = "Vec::is_empty")]
-    pub words: Vec<WordAudit>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub word_rerank_winner: Option<String>,
 }
 
 /// CI candidate font score.
@@ -50,28 +48,10 @@ pub struct CharCiVote {
     /// per-character match quality for the unscan pick.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub chosen_dist_sq: Option<f32>,
-}
-
-/// Per-word SSIM rerank detail.
-#[derive(Debug, Serialize, Clone)]
-pub struct WordAudit {
-    pub text: String,
-    pub bbox: [u32; 4],
-    #[serde(skip_serializing_if = "String::is_empty")]
-    pub crop_path: String,
-    pub candidates: Vec<WordCandidateAudit>,
+    /// When the OCR correction gate fires, the original OCR character.
+    /// `ch` holds the corrected (better-matching) character.
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub winner: Option<String>,
-}
-
-/// Per-candidate SSIM score for a word.
-#[derive(Debug, Serialize, Clone)]
-pub struct WordCandidateAudit {
-    pub font_key: String,
-    pub ssim: f32,
-    pub dy: i32,
-    #[serde(skip_serializing_if = "String::is_empty")]
-    pub render_path: String,
+    pub ocr_corrected_from: Option<char>,
 }
 
 #[derive(Debug, Serialize, Clone)]

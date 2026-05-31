@@ -14,6 +14,17 @@ the main binary skips that.
 
 Use `cargo build --release` only for final accuracy runs where runtime performance matters.
 
+### Typical test cycle
+
+```bash
+cargo build --bin unscan                      # ~30s debug build
+./target/debug/unscan test-docs/font-timeline-specimen.pdf \
+    --audit /tmp/audit-out -o /tmp/out.pdf    # run with audit
+python3 tools/char-misses.py /tmp/audit-out \
+    test-docs/font-timeline-specimen.pdf \
+    -o ~/workspace/your_files/misses-report/index.html
+```
+
 ## Measured Build Times (2026-05-25)
 
 | Scenario | Command | Time |

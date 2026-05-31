@@ -96,31 +96,28 @@ unscan input.pdf -o output.pdf
 # Override confidence thresholds
 unscan input.pdf -o output.pdf \
   --min-ocr-confidence 85 \
-  --min-font-confidence 0.65 \
-  --min-verify-ssim 0.75
+  --min-font-confidence 0.65
 
 # Supply extra fonts
 unscan input.pdf -o output.pdf --font-dir ~/my-fonts --font-dir /mnt/win/Windows/Fonts
 
-# Skip geometry detection / verification
-unscan input.pdf -o output.pdf --no-geometry --no-verify
+# Skip geometry detection
+unscan input.pdf -o output.pdf --no-geometry
 
-# Custom audit log location
-unscan input.pdf -o output.pdf --audit-log results.json
+# Audit + diagnostics (writes audit.json and segmentation images to DIR)
+unscan input.pdf -o output.pdf --audit /tmp/audit-out
 ```
 
 ### Flags
 
 | Flag | Default | Description |
 |------|---------|-------------|
-| `--min-ocr-confidence` | 90 | Minimum Tesseract confidence (0–100) to attempt vectorisation |
-| `--min-font-confidence` | 0.7 | Minimum NCC score (0.0–1.0) to accept a font match |
-| `--min-verify-ssim` | 0.80 | Minimum SSIM between rendered vector and original raster |
+| `--min-ocr-confidence` | 0 | Minimum Tesseract confidence (0–100) to attempt vectorisation |
+| `--min-font-confidence` | 0.10 | Minimum CI score (0.0–1.0) to accept a font match |
 | `--dpi` | 300 | DPI for rasterising PDF pages |
 | `--font-dir` | *(system defaults)* | Extra font search directory (repeatable) |
 | `--no-geometry` | off | Skip line / rectangle / fill vectorisation |
-| `--no-verify` | off | Skip SSIM verification pass |
-| `--audit-log` | `<output>.audit.json` | Path for the audit log |
+| `--audit` | *(none)* | Write audit JSON + segmentation diagnostics to DIR |
 
 ## Working with Microsoft Word Documents
 
@@ -285,7 +282,12 @@ the OCR text content for reference.
 
 ## Audit log
 
-Every run produces a JSON file (`<output>.audit.json` by default) with:
+When `--audit DIR` is set, unscan writes `DIR/audit.json` with full pipeline
+decisions plus per-word segmentation diagnostics (crops, seams, overlays) into
+the same directory. Use `tools/char-misses.py DIR VECTOR.pdf` to generate a
+visual miss report.
+
+Without `--audit`, a default audit JSON is still written as `<output>.audit.json`.
 
 ```json
 {
