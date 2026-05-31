@@ -14,6 +14,7 @@ pub mod seg_diag;
 mod ocr;
 mod page_cache;
 mod pdf_out;
+mod segment;
 mod smooth;
 // mod word_match; // disabled: CI ranking used directly, word-level SSIM rerank removed
 pub(crate) mod verify;

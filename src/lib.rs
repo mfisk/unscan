@@ -8,6 +8,7 @@ pub mod ocr;
 pub mod verify;
 pub mod char_index;
 pub mod layout;
+pub mod segment;
 pub mod font_cache;
 pub mod font_scan;
 pub mod font_match;
