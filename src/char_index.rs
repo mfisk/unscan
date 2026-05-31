@@ -31,7 +31,6 @@ use std::collections::HashMap;
 use std::io;
 use std::path::Path;
 
-use crate::ocr::CharBox;
 use crate::verify::WordPlacement;
 
 // ---------------------------------------------------------------------------
@@ -1631,7 +1630,6 @@ pub fn extract_line_chars<F: ab_glyph::Font>(
     page: &GrayImage,
     words: &[WordPlacement],
     line_height: u32,
-    page_char_boxes: &[CharBox],
     diag_seg_dir: Option<&std::path::Path>,
     diag_ref_font: Option<&F>,
 ) -> Vec<(char, GrayImage)> {
@@ -1639,10 +1637,8 @@ pub fn extract_line_chars<F: ab_glyph::Font>(
         return Vec::new();
     }
 
-    // Always use word-crop + seam-carving segmentation.
-    // Tesseract charboxes have unreliable boundaries (shifted, bleed into
-    // neighbors) so we crop whole words (reliable bboxes) and split them
-    // ourselves using vertical whitespace + seam carving.
+    // Crop whole words (reliable bboxes from Tesseract) and split them
+    // into individual characters using VP + seam carving.
 
     let mut sorted: Vec<&WordPlacement> = words
         .iter()
@@ -1698,46 +1694,13 @@ pub fn extract_line_chars<F: ab_glyph::Font>(
         let (_word_w, word_h) = word_img.dimensions();
         let all_chars: Vec<char> = word.text.chars().collect();
 
-        // Compute Tesseract charbox boundary positions (word-relative) for
-        // fallback splitting.  Each boundary is the midpoint between the
-        // right edge of one charbox and the left edge of the next.
-        let charbox_splits: Vec<u32> = {
-            let v_tol = line_height / 4;
-            let mut word_cbs: Vec<&CharBox> = page_char_boxes
-                .iter()
-                .filter(|cb| {
-                    if cb.width < 2 || cb.height < 2 { return false; }
-                    let cb_cx = cb.x + cb.width / 2;
-                    let cb_cy = cb.y + cb.height / 2;
-                    // Charbox center must be inside this word's bbox
-                    cb_cx >= wx && cb_cx < wx + crop_w
-                        && cb_cy + v_tol >= wy && cb_cy.saturating_sub(v_tol) < wy + crop_h
-                })
-                .collect();
-            word_cbs.sort_by_key(|cb| cb.x);
-            // Boundaries between adjacent charboxes, in word-relative coords
-            let mut splits = Vec::new();
-            for pair in word_cbs.windows(2) {
-                let right_of_prev = pair[0].x + pair[0].width;
-                let left_of_next = pair[1].x;
-                // Midpoint between them, relative to word origin
-                let mid = ((right_of_prev + left_of_next) / 2).saturating_sub(wx);
-                if mid > 0 && mid < crop_w {
-                    splits.push(mid);
-                }
-            }
-            splits.sort();
-            splits.dedup();
-            splits
-        };
-
         let ((boundaries, seam_path_map), word_diag_dir) = if let Some(ddir) = diag_seg_dir {
             let word_slug = crate::seg_diag::sanitize_text(&word.text);
             let word_dir = ddir.join(format!("word_{:03}_{}", word_idx, word_slug));
-            (segment_characters_diag(&word_img, all_chars.len(), &charbox_splits, &word_dir, &word.text),
+            (segment_characters_diag(&word_img, all_chars.len(), &word_dir, &word.text),
              Some(word_dir))
         } else {
-            (segment_characters(&word_img, all_chars.len(), &charbox_splits), None)
+            (segment_characters(&word_img, all_chars.len()), None)
         };
 
         extract_chars_from_boundaries(
@@ -1875,33 +1838,23 @@ fn extract_chars_from_boundaries<F: ab_glyph::Font>(
 /// a darker pixel — directly encoding "stay in whitespace, don't wander
 /// into ink."  The same `MIN_INK_FOR_SYMBOL` threshold applies: both
 /// children of every accepted seam split must contain meaningful ink.
-///
-/// **Pass 3 — Charbox fallback:** if Tesseract charbox boundaries are
-/// available, use them to further split any segment that is wider than
-/// `avg_char_width × 3` and contains ≥ 1 charbox boundary.
-///
-/// `charbox_splits` are Tesseract charbox boundary x-positions (word-relative),
-/// used by Pass 3.  Each value is the x-coordinate of a boundary between
-/// adjacent charboxes.
-pub fn segment_characters(img: &GrayImage, n_chars: usize, charbox_splits: &[u32]) -> (Vec<u32>, HashMap<u32, Vec<u32>>) {
-    segment_characters_inner(img, n_chars, charbox_splits, None, None)
+pub fn segment_characters(img: &GrayImage, n_chars: usize) -> (Vec<u32>, HashMap<u32, Vec<u32>>) {
+    segment_characters_inner(img, n_chars, None, None)
 }
 
 /// Same as `segment_characters` but dumps per-pass diagnostics when `diag_dir` is Some.
 pub fn segment_characters_diag(
     img: &GrayImage,
     n_chars: usize,
-    charbox_splits: &[u32],
     diag_dir: &std::path::Path,
     word_text: &str,
 ) -> (Vec<u32>, HashMap<u32, Vec<u32>>) {
-    segment_characters_inner(img, n_chars, charbox_splits, Some(diag_dir), Some(word_text))
+    segment_characters_inner(img, n_chars, Some(diag_dir), Some(word_text))
 }
 
 fn segment_characters_inner(
     img: &GrayImage,
     n_chars: usize,
-    charbox_splits: &[u32],
     diag_dir: Option<&std::path::Path>,
     word_text: Option<&str>,
 ) -> (Vec<u32>, HashMap<u32, Vec<u32>>) {
@@ -2327,68 +2280,6 @@ fn segment_characters_inner(
         );
     }
 
-    // --- Pass 3: charbox fallback ---
-    //
-    // Even when we have enough splits globally, they may be unevenly
-    // distributed — some segments get over-split while others contain
-    // multiple characters.  Use Tesseract charbox boundaries to further
-    // split only segments that contain 2+ charboxes AND are wider than
-    // expected for a single character (wider than avg_char_width * 1.8).
-    if !charbox_splits.is_empty() {
-        let avg_char_w = w / n_chars as u32;
-
-        // Build current segments from splits.
-        let mut seg_bounds: Vec<(u32, u32)> = Vec::new();
-        {
-            let mut prev = 0u32;
-            for &s in &splits {
-                if s > prev {
-                    seg_bounds.push((prev, s));
-                }
-                prev = s;
-            }
-            if prev < w {
-                seg_bounds.push((prev, w));
-            }
-        }
-
-        // For each segment, find charbox boundaries that fall inside it.
-        // Only add them if the segment has 2+ charboxes and is clearly
-        // wider than a single character.
-        let mut cb_fallback_splits: Vec<u32> = Vec::new();
-        for &(seg_start, seg_end) in &seg_bounds {
-            let seg_w = seg_end - seg_start;
-            if w == 492 && n_chars == 10 {
-            }
-            if seg_w <= avg_char_w * 3 {
-                continue; // narrow enough to be a single char
-            }
-            let cb_inside: Vec<u32> = charbox_splits
-                .iter()
-                .copied()
-                .filter(|&x| x > seg_start + 2 && x + 2 < seg_end)
-                .collect();
-            if cb_inside.len() >= 1 {
-                // This segment contains multiple characters per Tesseract
-                // and is too wide for a single glyph.
-                cb_fallback_splits.extend(cb_inside);
-            }
-        }
-
-        if !cb_fallback_splits.is_empty() {
-            for s in cb_fallback_splits {
-                if !splits.contains(&s) {
-                    splits.push(s);
-                }
-            }
-            splits.sort();
-        }
-    }
-
-    let cb_splits: Vec<u32> = splits.iter()
-        .filter(|s| !vp_splits.contains(s) && !seam_splits.contains(s))
-        .copied().collect();
-
     // Build final boundaries: [0, split1, split2, ..., w]
     let mut bounds = Vec::with_capacity(n_chars + 1);
     bounds.push(0);
@@ -2400,18 +2291,19 @@ fn segment_characters_inner(
     bounds.push(w);
     bounds.dedup();
 
-    // Diag: dump charbox + final
+    // Diag: dump final overlay
     if let (Some(ddir), Some(wtext)) = (diag_dir, word_text) {
         let vp_mids: Vec<u32> = vp_splits.clone();
-        crate::seg_diag::save_split_overlay_with_paths(img, &vp_mids, &seam_splits, &cb_splits, &seam_paths, &ddir.join("final_overlay.png"));
+        let empty: Vec<u32> = Vec::new();
+        crate::seg_diag::save_split_overlay_with_paths(img, &vp_mids, &seam_splits, &empty, &seam_paths, &ddir.join("final_overlay.png"));
 
         // NOTE: char crops are saved by extract_chars_from_boundaries
         // (the actual CI code path), not here — so diag shows exact CI inputs.
 
         let n_segs = bounds.len().saturating_sub(1);
         eprintln!(
-            "  DIAG-SEG FINAL: {} charbox splits added — {} total splits, {} boundaries, {} segments (expected {})",
-            cb_splits.len(), splits.len(), bounds.len(), n_segs, n_chars,
+            "  DIAG-SEG FINAL: {} total splits, {} boundaries, {} segments (expected {})",
+            splits.len(), bounds.len(), n_segs, n_chars,
         );
         if n_segs != n_chars {
             eprintln!("  *** MISMATCH: {} segments vs {} expected chars", n_segs, n_chars);
@@ -2426,8 +2318,6 @@ fn segment_characters_inner(
             "n_segments_produced": n_segs,
             "vp_splits": vp_splits,
             "seam_splits": seam_splits,
-            "charbox_input_splits": charbox_splits,
-            "charbox_added_splits": cb_splits,
             "final_boundaries": bounds,
             "seam_paths": seam_paths,
             "mismatch": n_segs != n_chars,

@@ -296,7 +296,7 @@ def render_seg_picture(diag_line_dir, word_text=None):
     """Render a labelled segmentation image for a word in diag-seg output.
 
     Returns a PIL Image with the word crop scaled up, split lines drawn in
-    colour (red=VP, blue=seam, green=charbox), and column numbers along the
+    colour (red=VP, blue=seam), and column numbers along the
     top.  Returns None if data is missing.
     """
     if not diag_line_dir or not os.path.isdir(diag_line_dir):
@@ -351,9 +351,8 @@ def render_seg_picture(diag_line_dir, word_text=None):
             seam_paths = list(seam_paths_raw.values())
         else:
             seam_paths = seam_paths_raw
-        charbox_splits = summary.get("charbox_added_splits", [])
 
-        # Draw split lines: VP=red, seam=blue (diagonal path), charbox=green
+        # Draw split lines: VP=red, seam=blue (diagonal path)
         for s in vp_splits:
             sx = s * scale + scale // 2 + 1
             draw.line([(sx, margin_top), (sx, margin_top + bh)], fill=(220, 40, 40), width=2)
@@ -381,18 +380,13 @@ def render_seg_picture(diag_line_dir, word_text=None):
             sx = s * scale + scale // 2 + 1
             draw.text((sx - 3, margin_top + bh + 2), str(s), fill=(0, 80, 255))
 
-        for s in charbox_splits:
-            sx = s * scale + scale // 2 + 1
-            draw.line([(sx, margin_top), (sx, margin_top + bh)], fill=(40, 180, 40), width=2)
-            draw.text((sx - 3, margin_top + bh + 2), str(s), fill=(40, 180, 40))
-
         wtext = summary.get("word_text", wd)
         n_exp = summary.get("n_chars_expected", "?")
         n_got = summary.get("n_segments_produced", "?")
         mismatch = summary.get("mismatch", False)
 
         results.append((canvas, wtext, n_exp, n_got, mismatch,
-                         len(vp_splits), len(seam_splits), len(charbox_splits)))
+                         len(vp_splits), len(seam_splits)))
 
     if not results:
         return None
@@ -411,14 +405,13 @@ def render_seg_picture(diag_line_dir, word_text=None):
 
     # Build a caption
     parts = []
-    for _, wtext, n_exp, n_got, mismatch, nvp, nseam, ncb in results:
+    for _, wtext, n_exp, n_got, mismatch, nvp, nseam in results:
         info = f'"{wtext}" {n_got}/{n_exp}'
         if mismatch:
             info += " ⚠"
         tags = []
         if nvp: tags.append(f"{nvp} VP")
         if nseam: tags.append(f"{nseam} seam")
-        if ncb: tags.append(f"{ncb} cb")
         if tags:
             info += f" ({', '.join(tags)})"
         parts.append(info)
@@ -640,7 +633,6 @@ def build_miss_html(entry, chars_to_show, crop_dir, crop_files,
 <div class="seg-legend">
   <span class="leg-vp">■ VP split</span>
   <span class="leg-seam">■ seam split</span>
-  <span class="leg-cb">■ charbox split</span>
 </div>
 <img src="{img_to_b64(seg_img)}" class="seg-img">
 <div class="seg-caption">{seg_caption}</div>
@@ -723,7 +715,6 @@ img.ci {
 .seg-legend span { margin-right: 12px; }
 .leg-vp { color: #dc2828; }
 .leg-seam { color: #1e64ff; }
-.leg-cb { color: #28b428; }
 </style>"""
 
 
