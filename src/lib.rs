@@ -13,6 +13,6 @@ pub mod font_scan;
 pub mod font_match;
 pub mod pdf_out;
 pub mod smooth;
-pub mod word_match;
+// pub mod word_match; // disabled: CI ranking used directly, word-level SSIM rerank removed
 pub mod audit;
 pub mod seg_diag;

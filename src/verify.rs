@@ -50,6 +50,8 @@ pub fn verify_text_region(
 
     let original_crop = image::imageops::crop_imm(original_gray, x, y, w, h).to_image();
 
+    // Page-level Hough deskew already corrected the full page before we get
+    // here, so no per-line rotation needed.
     let placements: Vec<WordPlacement> = words
         .iter()
         .map(|wr| WordPlacement {
@@ -62,13 +64,6 @@ pub fn verify_text_region(
         })
         .collect();
 
-    let skew_angle = detect_skew_from_words(&placements);
-    let deskewed = if skew_angle.abs() > 0.001 {
-        rotate_gray(&original_crop, -skew_angle)
-    } else {
-        original_crop.clone()
-    };
-
     // Try multiple render scales and pick the best SSIM.
     // The optimal scale depends on the scan's original render resolution (unknown).
     // Scale 2 matches typical 2:1 downsample; scale 4 handles higher downsample ratios.
@@ -78,7 +73,7 @@ pub fn verify_text_region(
         vec![2, 4]
     };
 
-    let deskewed_blur = gaussian_blur_3x3(&deskewed);
+    let original_crop_blur = gaussian_blur_3x3(&original_crop);
     let mut best_score = 0.0f32;
     let mut best_dy = 0i32;
 
@@ -90,14 +85,14 @@ pub fn verify_text_region(
 
         // Debug: dump both sides of the SSIM comparison (last scale wins for files)
         if std::env::var("UNSCAN_DUMP_SSIM").is_ok() {
-            let _ = deskewed.save("/tmp/ssim_scan_crop.png");
+            let _ = original_crop.save("/tmp/ssim_scan_crop.png");
             let _ = rendered.save("/tmp/ssim_rendered.png");
             log::info!("SSIM debug: dumped scan crop ({}x{}) and rendered ({}x{}) to /tmp/",
-                deskewed.width(), deskewed.height(), rendered.width(), rendered.height());
+                original_crop.width(), original_crop.height(), rendered.width(), rendered.height());
         }
 
         let rendered_blur = gaussian_blur_3x3(&rendered);
-        let (score, dy) = ssim_windowed_best_vshift(&deskewed_blur, &rendered_blur, 12);
+        let (score, dy) = ssim_windowed_best_vshift(&original_crop_blur, &rendered_blur, 12);
 
         if std::env::var("UNSCAN_DUMP_SSIM").is_ok() {
             log::info!("SSIM scale={}: dy={} score={:.4}", scale, dy, score);
@@ -640,63 +635,6 @@ fn ssim_global(a: &GrayImage, b: &GrayImage) -> f32 {
     let den = (mu_a * mu_a + mu_b * mu_b + c1) * (sig_a2 + sig_b2 + c2);
     if den < 1e-10 { return 0.0; }
     (num / den).clamp(0.0, 1.0) as f32
-}
-
-// ---------------------------------------------------------------------------
-// Skew detection & correction
-// ---------------------------------------------------------------------------
-
-pub fn detect_skew_from_words(words: &[WordPlacement]) -> f32 {
-    let centres: Vec<(f32, f32)> = words
-        .iter()
-        .filter(|w| !w.text.is_empty() && w.width > 0 && w.height > 0)
-        .map(|w| {
-            let cx = w.x_off as f32 + w.width as f32 / 2.0;
-            let cy = w.y_off as f32 + w.height as f32 / 2.0;
-            (cx, cy)
-        })
-        .collect();
-    if centres.len() < 3 { return 0.0; }
-
-    let n = centres.len() as f32;
-    let sx: f32 = centres.iter().map(|(x, _)| x).sum();
-    let sy: f32 = centres.iter().map(|(_, y)| y).sum();
-    let sxy: f32 = centres.iter().map(|(x, y)| x * y).sum();
-    let sx2: f32 = centres.iter().map(|(x, _)| x * x).sum();
-    let denom = n * sx2 - sx * sx;
-    if denom.abs() < 1e-6 { return 0.0; }
-    let slope = (n * sxy - sx * sy) / denom;
-    slope.atan().clamp(-5.0_f32.to_radians(), 5.0_f32.to_radians())
-}
-
-pub fn rotate_gray(img: &GrayImage, angle: f32) -> GrayImage {
-    let (w, h) = img.dimensions();
-    let mut out = GrayImage::from_pixel(w, h, Luma([255u8]));
-    let cx = w as f32 / 2.0;
-    let cy = h as f32 / 2.0;
-    let (cos_a, sin_a) = (angle.cos(), angle.sin());
-
-    for oy in 0..h {
-        for ox in 0..w {
-            let dx = ox as f32 - cx;
-            let dy = oy as f32 - cy;
-            let sx = cos_a * dx + sin_a * dy + cx;
-            let sy = -sin_a * dx + cos_a * dy + cy;
-            let x0 = sx.floor() as i32;
-            let y0 = sy.floor() as i32;
-            let fx = sx - x0 as f32;
-            let fy = sy - y0 as f32;
-            let s = |px: i32, py: i32| -> f32 {
-                if px >= 0 && py >= 0 && (px as u32) < w && (py as u32) < h {
-                    img.get_pixel(px as u32, py as u32).0[0] as f32
-                } else { 255.0 }
-            };
-            let val = s(x0,y0)*(1.0-fx)*(1.0-fy) + s(x0+1,y0)*fx*(1.0-fy)
-                + s(x0,y0+1)*(1.0-fx)*fy + s(x0+1,y0+1)*fx*fy;
-            out.put_pixel(ox, oy, Luma([val.clamp(0.0, 255.0) as u8]));
-        }
-    }
-    out
 }
 
 // ---------------------------------------------------------------------------
