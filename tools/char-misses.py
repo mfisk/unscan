@@ -7,14 +7,13 @@ with its font and bbox, then spatially matches against unscan's audit log
 to find genuine misses. No JSON metadata involved.
 
 Usage:
-    # 1. Run unscan with crops + audit:
-    rm -rf /tmp/unscan-crops
-    UNSCAN_DUMP_CROPS=1 ./target/release/unscan RASTERIZED.pdf \
-        -o /dev/null --audit-log /tmp/audit.json
+    # 1. Run unscan with audit + diag-seg:
+    ./target/release/unscan RASTERIZED.pdf \
+        -o /dev/null --audit-log /tmp/audit.json --diag-seg /tmp/diag-seg
 
     # 2. Generate the report against the vector PDF:
     python3 tools/char-misses.py /tmp/audit.json VECTOR.pdf \
-        --crops /tmp/unscan-crops -o /tmp/misses.html
+        --diag-seg /tmp/diag-seg -o /tmp/misses.html
 """
 
 import argparse
@@ -169,14 +168,20 @@ def lookup_actual_font(page_spans, page, bbox_px):
     px1 = (bbox_px["x"] + bbox_px["width"]) / SCALE
     py1 = (bbox_px["y"] + bbox_px["height"]) / SCALE
 
-    font_count = Counter()
+    # Weight by overlap area, not text length — avoids a long adjacent-line
+    # span dominating when the audit bbox slightly overshoots vertically.
+    font_area = Counter()
     for sx0, sy0, sx1, sy1, sfont, stext in page_spans.get(page, []):
-        if sx1 > px0 and sx0 < px1 and sy1 > py0 and sy0 < py1:
-            font_count[sfont] += len(stext)
+        ox0 = max(sx0, px0)
+        oy0 = max(sy0, py0)
+        ox1 = min(sx1, px1)
+        oy1 = min(sy1, py1)
+        if ox0 < ox1 and oy0 < oy1:
+            font_area[sfont] += (ox1 - ox0) * (oy1 - oy0)
 
-    if not font_count:
+    if not font_area:
         return None
-    return font_count.most_common(1)[0][0]
+    return font_area.most_common(1)[0][0]
 
 
 # ---------------------------------------------------------------------------
@@ -185,7 +190,11 @@ def lookup_actual_font(page_spans, page, bbox_px):
 
 def find_font_file(font_name):
     """Resolve a font name to a .ttf/.otf path on disk."""
-    fn = clean(font_name)
+    # Strip OT variant suffix [smcp], [lnum], etc. before matching filenames
+    n = font_name
+    if "[" in n:
+        n = n[:n.index("[")]
+    fn = clean(n)
     for fontdir in ["/usr/share/fonts/truetype", "/usr/share/fonts/opentype",
                     "/usr/share/fonts"]:
         if not os.path.isdir(fontdir):
@@ -250,6 +259,174 @@ def img_to_b64(img_or_path):
     return f"data:image/png;base64,{base64.b64encode(data).decode()}"
 
 
+# ---------------------------------------------------------------------------
+# Segmentation visualisation
+# ---------------------------------------------------------------------------
+
+def find_diag_seg_dir(diag_seg_root, page, text):
+    """Find the diag-seg line directory matching a page and line text."""
+    if not diag_seg_root or not os.path.isdir(diag_seg_root):
+        return None
+    prefix = f"p{page}_"
+    # Sanitise text the same way seg_diag.rs does (replace non-alnum with _)
+    slug = re.sub(r'[^A-Za-z0-9]', '_', text)[:30]
+    best = None
+    for d in os.listdir(diag_seg_root):
+        if not d.startswith(prefix):
+            continue
+        # Match by slug substring — diag dirs also truncate
+        dsuf = d[len(prefix):]
+        if slug and slug[:15] in dsuf:
+            best = os.path.join(diag_seg_root, d)
+            break
+    if best is None:
+        # Fallback: try matching by line number embedded in dir name
+        for d in sorted(os.listdir(diag_seg_root)):
+            if d.startswith(prefix):
+                dsuf = d[len(prefix):]
+                # Accept if first word of text appears in dir name
+                first_word = re.sub(r'[^A-Za-z0-9]', '', text.split()[0]) if text.strip() else ""
+                if first_word and first_word in dsuf:
+                    best = os.path.join(diag_seg_root, d)
+                    break
+    return best
+
+
+def render_seg_picture(diag_line_dir, word_text=None):
+    """Render a labelled segmentation image for a word in diag-seg output.
+
+    Returns a PIL Image with the word crop scaled up, split lines drawn in
+    colour (red=VP, blue=seam, green=charbox), and column numbers along the
+    top.  Returns None if data is missing.
+    """
+    if not diag_line_dir or not os.path.isdir(diag_line_dir):
+        return None
+
+    # Find matching word directory
+    word_dirs = sorted(
+        d for d in os.listdir(diag_line_dir)
+        if d.startswith("word_") and os.path.isdir(os.path.join(diag_line_dir, d))
+    )
+
+    results = []
+    for wd in word_dirs:
+        wpath = os.path.join(diag_line_dir, wd)
+        crop_path = os.path.join(wpath, "word_crop.png")
+        summary_path = os.path.join(wpath, "summary.json")
+        if not os.path.exists(crop_path) or not os.path.exists(summary_path):
+            continue
+
+        with open(summary_path) as f:
+            summary = json.load(f)
+
+        crop = Image.open(crop_path).convert("RGBA")
+        w, h = crop.size
+
+        scale = max(3, min(6, 400 // max(w, 1)))
+        big = crop.resize((w * scale, h * scale), Image.NEAREST)
+        bw, bh = big.size
+
+        margin_top = 28
+        margin_bottom = 22
+        canvas = Image.new("RGBA", (bw + 2, bh + margin_top + margin_bottom), (255, 255, 255, 255))
+        canvas.paste(big, (1, margin_top))
+        draw = ImageDraw.Draw(canvas)
+
+        # Column numbers every 10
+        for x in range(0, w, 10):
+            sx = x * scale + scale // 2 + 1
+            draw.line([(sx, margin_top - 4), (sx, margin_top)], fill=(180, 180, 180), width=1)
+            draw.text((sx - 6, 1), str(x), fill=(120, 120, 120))
+
+        # Tick marks every 5
+        for x in range(5, w, 10):
+            sx = x * scale + scale // 2 + 1
+            draw.line([(sx, margin_top - 2), (sx, margin_top)], fill=(210, 210, 210), width=1)
+
+        vp_splits = summary.get("vp_splits", [])
+        seam_splits = summary.get("seam_splits", [])
+        seam_paths_raw = summary.get("seam_paths", {})
+        # Support both old format (list of paths) and new (dict col→path)
+        if isinstance(seam_paths_raw, dict):
+            seam_paths = list(seam_paths_raw.values())
+        else:
+            seam_paths = seam_paths_raw
+        charbox_splits = summary.get("charbox_added_splits", [])
+
+        # Draw split lines: VP=red, seam=blue (diagonal path), charbox=green
+        for s in vp_splits:
+            sx = s * scale + scale // 2 + 1
+            draw.line([(sx, margin_top), (sx, margin_top + bh)], fill=(220, 40, 40), width=2)
+            draw.text((sx - 3, margin_top + bh + 2), str(s), fill=(220, 40, 40))
+
+        # Draw actual seam paths as bright, thick diagonal overlays
+        seam_colors = [(0, 80, 255, 220), (30, 120, 255, 220), (60, 150, 255, 220)]
+        overlay = Image.new("RGBA", canvas.size, (0, 0, 0, 0))
+        odraw = ImageDraw.Draw(overlay)
+        pad = max(1, scale // 3)  # expand each pixel by pad on each side
+        for pi, path in enumerate(seam_paths):
+            color = seam_colors[pi % len(seam_colors)]
+            for r in range(len(path)):
+                sx = path[r] * scale + 1
+                sy = margin_top + r * scale
+                odraw.rectangle(
+                    [(sx - pad, sy), (sx + scale - 1 + pad, sy + scale - 1)],
+                    fill=color,
+                )
+        canvas = Image.alpha_composite(canvas, overlay)
+        draw = ImageDraw.Draw(canvas)
+
+        # Label seam split columns at bottom
+        for s in seam_splits:
+            sx = s * scale + scale // 2 + 1
+            draw.text((sx - 3, margin_top + bh + 2), str(s), fill=(0, 80, 255))
+
+        for s in charbox_splits:
+            sx = s * scale + scale // 2 + 1
+            draw.line([(sx, margin_top), (sx, margin_top + bh)], fill=(40, 180, 40), width=2)
+            draw.text((sx - 3, margin_top + bh + 2), str(s), fill=(40, 180, 40))
+
+        wtext = summary.get("word_text", wd)
+        n_exp = summary.get("n_chars_expected", "?")
+        n_got = summary.get("n_segments_produced", "?")
+        mismatch = summary.get("mismatch", False)
+
+        results.append((canvas, wtext, n_exp, n_got, mismatch,
+                         len(vp_splits), len(seam_splits), len(charbox_splits)))
+
+    if not results:
+        return None
+
+    # Combine all word images horizontally with gap
+    gap = 8
+    total_w = sum(c.width for c, *_ in results) + gap * (len(results) - 1)
+    max_h = max(c.height for c, *_ in results)
+    combined = Image.new("RGBA", (total_w, max_h), (255, 255, 255, 255))
+    x_off = 0
+    for canvas, *_ in results:
+        combined.paste(canvas, (x_off, 0))
+        x_off += canvas.width + gap
+
+    combined = combined.convert("RGB")
+
+    # Build a caption
+    parts = []
+    for _, wtext, n_exp, n_got, mismatch, nvp, nseam, ncb in results:
+        info = f'"{wtext}" {n_got}/{n_exp}'
+        if mismatch:
+            info += " ⚠"
+        tags = []
+        if nvp: tags.append(f"{nvp} VP")
+        if nseam: tags.append(f"{nseam} seam")
+        if ncb: tags.append(f"{ncb} cb")
+        if tags:
+            info += f" ({', '.join(tags)})"
+        parts.append(info)
+
+    caption = " | ".join(parts)
+    return combined, caption
+
+
 def img_td(img_or_path, fallback="—"):
     if img_or_path is None:
         return fallback
@@ -277,15 +454,30 @@ def pick_interesting_chars(chars, n_worst=4, n_normal=2):
 # Crop directory matching
 # ---------------------------------------------------------------------------
 
-def find_crop_dir(crops_root, page, line_index):
-    """Find crop directory by page and line index (deterministic)."""
-    if not os.path.isdir(crops_root):
-        return None, []
-    prefix = f"p{page}_L{line_index:03d}_"
-    for d in sorted(os.listdir(crops_root)):
-        if d.startswith(prefix):
-            path = os.path.join(crops_root, d)
-            return path, sorted(os.listdir(path))
+def find_crop_dir(crops_root, page, line_index, diag_seg_root=None, line_text=None):
+    """Find crop directory by page and line index.
+
+    Checks the diag-seg line directory first (crops/ subdir created
+    automatically by --diag-seg), then falls back to the legacy
+    UNSCAN_DUMP_CROPS directory.
+    """
+    # Try diag-seg crops/ subdir first (matched by text slug)
+    if diag_seg_root and line_text:
+        diag_line = find_diag_seg_dir(diag_seg_root, page, line_text)
+        if diag_line:
+            crop_subdir = os.path.join(diag_line, "crops")
+            if os.path.isdir(crop_subdir):
+                files = sorted(os.listdir(crop_subdir))
+                if files:
+                    return crop_subdir, files
+
+    # Fall back to legacy UNSCAN_DUMP_CROPS dir
+    if crops_root and os.path.isdir(crops_root):
+        prefix = f"p{page}_L{line_index:03d}_"
+        for d in sorted(os.listdir(crops_root)):
+            if d.startswith(prefix):
+                path = os.path.join(crops_root, d)
+                return path, sorted(os.listdir(path))
     return None, []
 
 
@@ -303,7 +495,8 @@ def dist_class(d2):
 
 def build_miss_html(entry, chars_to_show, crop_dir, crop_files,
                     correct_font_path, correct_font_name, ci_rank, ci_score,
-                    chosen_font_path, chosen_font_name):
+                    chosen_font_path, chosen_font_name,
+                    diag_seg_root=None):
     rows = []
     for idx, cv in chars_to_show:
         ch = cv["ch"]
@@ -324,7 +517,20 @@ def build_miss_html(entry, chars_to_show, crop_dir, crop_files,
             ocr_label = f"<span class='ocr-fix'>'{ocr_from}' → '{ch}'</span>"
 
         ref_img = render_char(ch, correct_font_path, NORM_H) if correct_font_path else None
-        chosen_img = render_char(ch, chosen_font_path, NORM_H) if chosen_font_path else None
+
+        # Use actual CI reference image from diag-seg if available (exact data
+        # the character index compared against), fall back to PIL re-render.
+        chosen_img = None
+        if crop_dir:
+            refs_dir = os.path.join(crop_dir, "..", "refs")
+            if os.path.isdir(refs_dir):
+                prefix = f"ref_{crop_idx:02d}_"
+                for rf in sorted(os.listdir(refs_dir)):
+                    if rf.startswith(prefix):
+                        chosen_img = os.path.join(refs_dir, rf)
+                        break
+        if chosen_img is None:
+            chosen_img = render_char(ch, chosen_font_path, NORM_H) if chosen_font_path else None
         dc = dist_class(d2)
 
         ocr_best_dist = cv.get("ocr_char_best_dist")
@@ -367,10 +573,18 @@ def build_miss_html(entry, chars_to_show, crop_dir, crop_files,
         else:
             ratio_str = ""
 
+        # Per-char distance for the chosen (unscan pick) font
+        chosen_d2 = cv.get("chosen_dist_sq")
+        if chosen_d2 is not None:
+            chosen_dc = dist_class(chosen_d2)
+            chosen_score_label = f"<div class='sub'><span class='num {chosen_dc}'>{chosen_d2:.4f}</span></div>"
+        else:
+            chosen_score_label = ""
+
         rows.append(f"""<tr>
   <td class="img-td">{img_td(crop_img)}<div class="sub">OCR: {ocr_label}</div></td>
   <td class="img-td">{img_td(ref_img)}</td>
-  <td class="img-td">{img_td(chosen_img)}</td>
+  <td class="img-td">{img_td(chosen_img)}{chosen_score_label}</td>
   <td class="ocr-col">{ocr_cell}</td>
   <td class="alt-col">{alt_cell}</td>
   <td class="num ratio">{ratio_str}</td>
@@ -390,13 +604,31 @@ def build_miss_html(entry, chars_to_show, crop_dir, crop_files,
     chosen_score_str = f"score {chosen_score:.3f}" if chosen_score else ""
     chosen_col_hdr = f"{matched}<br><span class='score'>{chosen_score_str}</span>"
 
+    # Segmentation picture
+    seg_html = ""
+    diag_line_dir = find_diag_seg_dir(diag_seg_root, entry["page"], entry.get("text", ""))
+    if diag_line_dir:
+        seg_result = render_seg_picture(diag_line_dir)
+        if seg_result:
+            seg_img, seg_caption = seg_result
+            seg_html = f"""<div class="seg-block">
+<div class="seg-legend">
+  <span class="leg-vp">■ VP split</span>
+  <span class="leg-seam">■ seam split</span>
+  <span class="leg-cb">■ charbox split</span>
+</div>
+<img src="{img_to_b64(seg_img)}" class="seg-img">
+<div class="seg-caption">{seg_caption}</div>
+</div>"""
+
     return f"""<div class="miss">
 <h3>p{entry['page']}:L{entry['line_index']} — "{text_preview}"</h3>
+{seg_html}
 <table>
 <tr>
   <th>Scan + OCR</th>
-  <th class="correct">{correct_col_hdr}</th>
-  <th class="chosen">{chosen_col_hdr}</th>
+  <th class="correct">Correct: {correct_col_hdr}</th>
+  <th class="chosen">Unscan pick: {chosen_col_hdr}</th>
   <th>OCR char</th>
   <th>Alt char</th>
   <th>Ratio</th>
@@ -451,6 +683,20 @@ img.ci {
 .font-mini { font-size: 9px; color: #888; word-break: break-all; max-width: 100px; display: inline-block; }
 .dimmed { color: #bbb; font-size: 10px; }
 .ratio { font-size: 11px; color: #888; }
+.seg-block {
+  margin: 6px 0 10px 0; padding: 8px; background: #f9f9f9;
+  border: 1px solid #e0e0e0; border-radius: 4px;
+}
+.seg-img {
+  max-width: 100%; image-rendering: pixelated;
+  border: 1px solid #ddd; display: block; margin: 4px 0;
+}
+.seg-caption { font-size: 10px; color: #666; margin-top: 2px; }
+.seg-legend { font-size: 10px; margin-bottom: 4px; }
+.seg-legend span { margin-right: 12px; }
+.leg-vp { color: #dc2828; }
+.leg-seam { color: #1e64ff; }
+.leg-cb { color: #28b428; }
 </style>"""
 
 
@@ -458,8 +704,10 @@ def main():
     parser = argparse.ArgumentParser(description="Visual miss report for unscan")
     parser.add_argument("audit", help="Path to audit JSON from --audit-log")
     parser.add_argument("vector_pdf", help="Path to the original vector PDF")
-    parser.add_argument("--crops", default="/tmp/unscan-crops",
-                        help="Path to UNSCAN_DUMP_CROPS output dir")
+    parser.add_argument("--crops", default=None,
+                        help="Legacy: path to UNSCAN_DUMP_CROPS output dir (not needed when --diag-seg is set)")
+    parser.add_argument("--diag-seg", default="/tmp/diag-seg",
+                        help="Path to --diag-seg output dir for segmentation images")
     parser.add_argument("-o", "--output", default="/tmp/misses.html",
                         help="Output HTML file path")
     args = parser.parse_args()
@@ -520,7 +768,9 @@ def main():
     # Build HTML
     miss_blocks = []
     for entry, actual_font, gt_key, gt_score, gt_rank in misses:
-        crop_dir, crop_files = find_crop_dir(args.crops, entry["page"], entry["line_index"])
+        crop_dir, crop_files = find_crop_dir(args.crops, entry["page"], entry["line_index"],
+                                              diag_seg_root=args.diag_seg,
+                                              line_text=entry.get("text", ""))
 
         chars = entry.get("ci_char_votes", [])
         interesting = pick_interesting_chars(chars)
@@ -539,6 +789,7 @@ def main():
             entry, interesting, crop_dir, crop_files,
             correct_font_path, correct_font_name, gt_rank, gt_score,
             chosen_font_path, matched,
+            diag_seg_root=args.diag_seg,
         )
         miss_blocks.append(block)
 
