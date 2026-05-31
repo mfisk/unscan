@@ -13,7 +13,7 @@ use lopdf::content::{Content, Operation};
 use lopdf::{dictionary, Document, Object, Stream};
 use log::debug;
 use std::collections::{HashMap, HashSet};
-use std::path::{Path, PathBuf};
+use std::path::Path;
 
 // ---------------------------------------------------------------------------
 // Types

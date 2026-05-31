@@ -114,11 +114,9 @@ impl AuditLog {
 
 // ── Image directory for audit artifacts ─────────────────────────────────
 
-/// Manages saving crop and render images alongside the audit JSON.
+/// Manages the audit image directory alongside the audit JSON.
 pub struct AuditImageDir {
     pub dir: PathBuf,
-    crops_dir: PathBuf,
-    renders_dir: PathBuf,
 }
 
 impl AuditImageDir {
@@ -137,11 +135,8 @@ impl AuditImageDir {
             .parent()
             .unwrap_or(Path::new("."))
             .join(format!("{}.audit", base));
-        let crops_dir = dir.join("crops");
-        let renders_dir = dir.join("renders");
-        std::fs::create_dir_all(&crops_dir)?;
-        std::fs::create_dir_all(&renders_dir)?;
-        Ok(Self { dir, crops_dir, renders_dir })
+        std::fs::create_dir_all(&dir)?;
+        Ok(Self { dir })
     }
 
     /// Relative path from the audit dir to use in JSON references.
@@ -150,40 +145,5 @@ impl AuditImageDir {
             .unwrap_or_default()
             .to_string_lossy()
             .to_string()
-    }
-
-    /// Save a word crop image, return path relative to the audit dir.
-    pub fn save_crop(
-        &self,
-        page: usize,
-        line: usize,
-        word_idx: usize,
-        text: &str,
-        img: &image::GrayImage,
-    ) -> String {
-        let safe: String = text.chars().take(15)
-            .map(|c| if c.is_alphanumeric() { c } else { '_' })
-            .collect();
-        let rel = format!("crops/p{}_l{}_w{}_{}.png", page, line, word_idx, safe);
-        let _ = img.save(self.dir.join(&rel));
-        rel
-    }
-
-    /// Save a rendered word image, return path relative to the audit dir.
-    pub fn save_render(
-        &self,
-        page: usize,
-        line: usize,
-        word_idx: usize,
-        font_key: &str,
-        img: &image::GrayImage,
-    ) -> String {
-        let font_base = font_key.rsplit('/').next().unwrap_or(font_key);
-        let safe_font: String = font_base.chars()
-            .map(|c| if c.is_alphanumeric() || c == '-' || c == '_' || c == '.' { c } else { '_' })
-            .collect();
-        let rel = format!("renders/p{}_l{}_w{}_{}.png", page, line, word_idx, safe_font);
-        let _ = img.save(self.dir.join(&rel));
-        rel
     }
 }

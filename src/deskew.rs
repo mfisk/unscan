@@ -6,30 +6,8 @@
 
 use image::{GrayImage, Luma};
 
-/// Minimum absolute skew angle (degrees) that triggers correction.
-/// Below this threshold the image is returned unchanged to avoid
-/// unnecessary resampling artifacts that can degrade font matching.
-const MIN_ANGLE_DEG: f32 = 0.5;
 
-/// Maximum absolute skew angle (degrees) we'll correct.
-/// Larger rotations are likely intentional (e.g. rotated pages).
-const MAX_ANGLE_DEG: f32 = 5.0;
 
-/// Deskew a grayscale page image.
-///
-/// Returns `(corrected_image, detected_angle_degrees)`.
-/// If the detected angle is below `MIN_ANGLE_DEG`, the original image
-/// is returned unchanged (angle will still be reported).
-pub fn deskew(img: &GrayImage) -> (GrayImage, f32) {
-    let angle = detect_skew(img);
-
-    if angle.abs() < MIN_ANGLE_DEG || angle.abs() > MAX_ANGLE_DEG {
-        return (img.clone(), angle);
-    }
-
-    let corrected = rotate_gray(img, -angle);
-    (corrected, angle)
-}
 
 /// Detect the dominant skew angle of text lines using a simplified
 /// Hough line transform focused on near-horizontal lines.
@@ -206,63 +184,3 @@ pub fn rotate_gray(img: &GrayImage, angle_deg: f32) -> GrayImage {
     out
 }
 
-/// Rotate a full-colour `DynamicImage` by `angle_deg` degrees around its
-/// centre with bilinear interpolation and white fill.
-pub fn rotate_color(img: &image::DynamicImage, angle_deg: f32) -> image::DynamicImage {
-    let rgb = img.to_rgb8();
-    let (w, h) = (rgb.width(), rgb.height());
-    let mut out = image::RgbImage::from_pixel(w, h, image::Rgb([255, 255, 255]));
-
-    let cx = w as f32 / 2.0;
-    let cy = h as f32 / 2.0;
-
-    let rad = angle_deg.to_radians();
-    let cos_a = rad.cos();
-    let sin_a = rad.sin();
-
-    let src = rgb.as_raw();
-    let dst = out.as_mut();
-    let stride = w as usize * 3;
-
-    for oy in 0..h {
-        let dy = oy as f32 - cy;
-        let base_sx = sin_a * dy + cx;
-        let base_sy = cos_a * dy + cy;
-
-        for ox in 0..w {
-            let dx = ox as f32 - cx;
-            let sx = cos_a * dx + base_sx;
-            let sy = -sin_a * dx + base_sy;
-
-            let x0 = sx.floor() as i32;
-            let y0 = sy.floor() as i32;
-
-            if x0 < 0 || y0 < 0 || x0 + 1 >= w as i32 || y0 + 1 >= h as i32 {
-                continue;
-            }
-
-            let fx = sx - x0 as f32;
-            let fy = sy - y0 as f32;
-            let w00 = (1.0 - fx) * (1.0 - fy);
-            let w10 = fx * (1.0 - fy);
-            let w01 = (1.0 - fx) * fy;
-            let w11 = fx * fy;
-
-            let i00 = y0 as usize * stride + x0 as usize * 3;
-            let i10 = i00 + 3;
-            let i01 = i00 + stride;
-            let i11 = i01 + 3;
-
-            let out_idx = oy as usize * stride + ox as usize * 3;
-            for c in 0..3 {
-                let v = src[i00 + c] as f32 * w00
-                    + src[i10 + c] as f32 * w10
-                    + src[i01 + c] as f32 * w01
-                    + src[i11 + c] as f32 * w11;
-                dst[out_idx + c] = v.round() as u8;
-            }
-        }
-    }
-
-    image::DynamicImage::ImageRgb8(out)
-}

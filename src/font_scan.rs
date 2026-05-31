@@ -149,7 +149,7 @@ pub fn scan_fonts(dirs: &[PathBuf]) -> Vec<FontEntry> {
                 // Probe all OT features — emit a variant entry for each that changes glyphs
                 let variants = detect_ot_variants(&fe.data);
                 for (tag, overrides) in &variants {
-                    let mut var_entry = FontEntry {
+                    let var_entry = FontEntry {
                         path: fe.path.clone(),
                         family_name: format!("{} [{}]", fe.family_name, tag),
                         is_bold: fe.is_bold,

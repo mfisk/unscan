@@ -523,7 +523,7 @@ fn run(args: &cli::Args) -> Result<(), ScanTextError> {
         }
 
         let fontmatch_start = std::time::Instant::now();
-        let mut line_matches: Vec<LineMatch> = lines.par_iter().enumerate().map(|(li, line)| {
+        let line_matches: Vec<LineMatch> = lines.par_iter().enumerate().map(|(li, line)| {
             let line_start = std::time::Instant::now();
             let text_color = color::detect_text_color(
                 page_img,
@@ -536,8 +536,8 @@ fn run(args: &cli::Args) -> Result<(), ScanTextError> {
                     level: 5, block_num: 0, par_num: 0, line_num: 0, word_num: 0,
                 },
             );
-            let mut ci_top_for_audit: Vec<(String, f32)> = Vec::new();
-            let mut ci_char_detail: Vec<char_index::CharCiDetail> = Vec::new();
+            let ci_top_for_audit: Vec<(String, f32)>;
+            let ci_char_detail: Vec<char_index::CharCiDetail>;
             let diag_seg_dir: Option<std::path::PathBuf> = args.diag_seg_dir().map(|d| {
                 let line_slug: String = line.text.chars().take(30)
                     .map(|c| if c.is_alphanumeric() { c } else { '_' })
@@ -624,7 +624,6 @@ fn run(args: &cli::Args) -> Result<(), ScanTextError> {
                             glyph_overrides: fe.glyph_overrides.clone(),
                             score: *top_score,
                             best_dy: 0,
-                            ssim_verified: false,
                         })
                 } else {
                     None
@@ -742,7 +741,7 @@ fn run(args: &cli::Args) -> Result<(), ScanTextError> {
                     }
                 }
                 // Find majority font
-                if let Some((majority_name, (majority_count, majority_path))) = font_freq.iter()
+                if let Some((majority_name, (majority_count, _majority_path))) = font_freq.iter()
                     .max_by_key(|(_, (count, _))| *count)
                 {
                     let total_body: u32 = font_freq.values().map(|(c, _)| c).sum();
@@ -767,7 +766,7 @@ fn run(args: &cli::Args) -> Result<(), ScanTextError> {
                 .map(|f| f.score >= args.min_font_confidence)
                 .unwrap_or(false);
 
-            let (mut keep_raster, mut reason) = if !ocr_ok {
+            let (keep_raster, reason) = if !ocr_ok {
                 (true, format!("OCR confidence too low ({:.0}%)", line.confidence))
             } else if !font_ok {
                 let best = font_result
