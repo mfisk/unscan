@@ -89,6 +89,11 @@ sudo apt install fonts-lmodern texlive-fonts-recommended
 sudo apt install fonts-noto
 ```
 
+> **Automated installer:** For a one-shot setup (including EULA display for MS Core Fonts, typewriter fonts, and specimen fonts), run:
+> ```bash
+> sudo bash scripts/install-all-fonts.sh
+> ```
+
 ## Usage
 
 ```bash
