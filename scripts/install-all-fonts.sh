@@ -5,9 +5,16 @@ set -euo pipefail
 # typewriter/vintage fonts, and specimen fonts.
 # Run as root or with sudo.
 
+export DEBIAN_FRONTEND=noninteractive
+
+# Pre-accept MS Core Fonts EULA for non-interactive installs
+if command -v debconf-set-selections >/dev/null 2>&1; then
+  echo "ttf-mscorefonts-installer msttcorefonts/accepted-mscorefonts-eula select true" | debconf-set-selections
+fi
+
 echo "=== Installing apt font packages ==="
 apt-get update -qq
-apt-get install -y \
+apt-get install -y -o Dpkg::Options::="--force-confdef" -o Dpkg::Options::="--force-confold" \
   ttf-mscorefonts-installer \
   fonts-crosextra-carlito \
   fonts-crosextra-caladea \

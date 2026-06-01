@@ -89,10 +89,25 @@ sudo apt install fonts-lmodern texlive-fonts-recommended
 sudo apt install fonts-noto
 ```
 
-> **Automated installer:** For a one-shot setup (including EULA display for MS Core Fonts, typewriter fonts, and specimen fonts), run:
+> **Automated installer:** For a one-shot, non-interactive setup (pre-accepts the MS Core Fonts EULA, installs typewriter fonts and all specimen families), run:
 > ```bash
 > sudo bash scripts/install-all-fonts.sh
 > ```
+> The script sets `DEBIAN_FRONTEND=noninteractive` and pre-seeds `debconf` so it can run unattended in CI.
+
+## Font ground-truth map
+
+When generating the specimen PDF, `test-docs/gen-specimen.py` can emit a
+`font-timeline-specimen-fontmap.json` mapping ReportLab font names to the
+exact TTF/OTF files used. Pass this to the miss-report tool for accurate
+rendering:
+
+```bash
+python3 tools/char-misses.py /tmp/audit-out \
+  test-docs/font-timeline-specimen.pdf \
+  -o /tmp/misses.html \
+  --fontmap test-docs/font-timeline-specimen-fontmap.json
+```
 
 ## Usage
 
