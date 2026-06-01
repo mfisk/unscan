@@ -5,7 +5,7 @@ Generate "A Timeline of Typography" — a multi-page vector PDF specimen.
 Output:
   font-timeline-specimen.pdf       — native vector PDF with embedded fonts + SVG logos
   font-timeline-specimen-scanned.pdf — rasterized with scan artifacts (skew, noise, blur)
-  font-timeline-specimen.json      — machine-readable ground truth
+  font-timeline-specimen-fontmap.json — font name → file path map for char-misses.py
 
 All text is real PDF text (not raster). SVG logos are placed as vector drawings.
 The "scanned" version rasterizes entire pages then re-assembles as a raster PDF.
@@ -961,30 +961,6 @@ def scan_pdf(clean_pdf, scanned_pdf, dpi=300):
 # ---------------------------------------------------------------------------
 # Ground truth
 # ---------------------------------------------------------------------------
-def build_ground_truth(sections, out_json):
-    truth = {
-        "description": "Ground truth for font-timeline-specimen.pdf",
-        "note": "Vector PDF with embedded TTF fonts + SVG logos. Scanned version is raster.",
-        "sections": []
-    }
-    for idx, s in enumerate(sections):
-        truth["sections"].append({
-            "index": idx,
-            "era": s["era"],
-            "font_family": s["font_family"],
-            "rl_font": s["rl_font"],
-            "source": s.get("source", ""),
-            "has_logo_svg": bool(s.get("logo_svg")),
-            "has_headshot": bool(s.get("headshot")),
-            "styles_demonstrated": ["regular", "bold", "italic"],
-        })
-    with open(str(out_json), "w") as f:
-        json.dump(truth, f, indent=2)
-
-
-# ---------------------------------------------------------------------------
-# Main
-# ---------------------------------------------------------------------------
 def main():
     print("Registering fonts...")
     registered, font_file_map = register_all_fonts()
@@ -993,10 +969,6 @@ def main():
     out_pdf = OUT_DIR / "font-timeline-specimen.pdf"
     print(f"Building vector specimen: {out_pdf}")
     build_specimen(out_pdf)
-
-    out_json = OUT_DIR / "font-timeline-specimen.json"
-    print(f"Writing ground truth: {out_json}")
-    build_ground_truth(SECTIONS, out_json)
 
     out_fontmap = OUT_DIR / "font-timeline-specimen-fontmap.json"
     print(f"Writing font file map: {out_fontmap}")
