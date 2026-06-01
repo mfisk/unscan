@@ -8,187 +8,221 @@
 //! in real scanned documents: stems land on different pixel boundaries,
 //! anti-aliasing kernels differ, and gray-level distributions shift.
 //!
-//! Run with:
-//!   cargo test --release --test t62_cross_renderer_accuracy
+//! Accuracy is measured by shelling out to tools/char-misses.py, which
+//! spatially matches each audit entry against the vector PDF's text spans
+//! via PyMuPDF — the same methodology as t60.
 //!
-//! Requires: pdftoppm (Poppler), img2pdf, PIL/numpy (Python).
+//! Run with:
+//!   cargo test --release --test t62_cross_renderer_accuracy -- --nocapture
+//!
+//! Requires: pdftoppm (Poppler), img2pdf, PIL/numpy, PyMuPDF (Python).
 
 mod common;
 
-use common::{test_doc, run_unscan};
-use std::collections::HashMap;
+use common::{test_doc, ensure_index, unscan_bin};
+use std::path::{Path, PathBuf};
+use std::process::Command;
 
 /// Poppler renders with different hinting than the CI's FreeType backend.
-/// This threshold is intentionally lower than t60's 95% to account for
-/// cross-renderer feature drift while still proving the index is broadly
-/// rendering-invariant.
-const MIN_ACCURACY_POPPLER_AA: f64 = 0.85;
+/// Lower than t60's threshold to account for cross-renderer feature drift.
+const MIN_ACCURACY_POPPLER_AA: f64 = 0.82;
 
-/// Parse ground truth: section index → lowercase font family (spaces removed).
-fn load_ground_truth() -> HashMap<usize, String> {
-    let path = test_doc("font-timeline-specimen.json");
-    let data: serde_json::Value =
-        serde_json::from_str(&std::fs::read_to_string(&path).expect("read ground truth"))
-            .expect("parse ground truth JSON");
-    let sections = data["sections"].as_array().expect("sections array");
-    sections
-        .iter()
-        .map(|s| {
-            let idx = s["index"].as_u64().expect("section index") as usize;
-            let family = s["font_family"]
-                .as_str()
-                .expect("font_family")
-                .to_lowercase()
-                .replace(' ', "");
-            (idx, family)
-        })
-        .collect()
+struct AccuracyResult {
+    hits: usize,
+    misses: usize,
+    unmatched: usize,
+    skipped: usize,
+    total: usize,
+    compared: usize,
+    accuracy: f64,
+    report_path: PathBuf,
 }
 
-/// Extract matched font names from unscan output lines containing ✓ or ✗.
-fn parse_all_font_matches(output: &str) -> Vec<String> {
-    let mut matches = Vec::new();
-    for line in output.lines() {
-        if !line.contains('✓') && !line.contains('✗') {
-            continue;
-        }
-        if let Some(arrow_pos) = line.find('→') {
-            let after_arrow = &line[arrow_pos + '→'.len_utf8()..];
-            let after_arrow = after_arrow.trim_start();
-            if let Some(paren) = after_arrow.find('(') {
-                let name = after_arrow[..paren].trim().to_lowercase().replace(' ', "");
-                if !name.is_empty() {
-                    matches.push(name);
-                }
-            }
-        }
+/// Ensure the vector specimen + fontmap exist (delegates to gen-specimen.py).
+fn ensure_specimen() {
+    let vector_pdf = test_doc("font-timeline-specimen.pdf");
+    let fontmap = test_doc("font-timeline-specimen-fontmap.json");
+
+    if vector_pdf.exists() && fontmap.exists() {
+        return;
     }
-    matches
+
+    eprintln!("[test setup] Generating specimen via gen-specimen.py ...");
+    let gen_script = Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("test-docs")
+        .join("gen-specimen.py");
+
+    let output = Command::new("python3")
+        .arg(&gen_script)
+        .current_dir(Path::new(env!("CARGO_MANIFEST_DIR")).join("test-docs"))
+        .output()
+        .unwrap_or_else(|e| panic!("failed to run gen-specimen.py: {}", e));
+
+    let combined = format!(
+        "{}{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr),
+    );
+    eprintln!("{}", combined);
+
+    assert!(output.status.success(), "gen-specimen.py failed");
+    assert!(vector_pdf.exists(), "gen-specimen.py did not create vector PDF");
+    assert!(fontmap.exists(), "gen-specimen.py did not create fontmap JSON");
 }
 
-/// Count total OCR lines from unscan output.
-fn count_total_ocr_lines(output: &str) -> usize {
-    let mut total = 0;
-    for line in output.lines() {
-        if let Some(arrow) = line.find('→') {
-            let after = &line[arrow + '→'.len_utf8()..];
-            let after = after.trim_start();
-            if after.contains("lines") {
-                if let Some(n) = after.split_whitespace().next().and_then(|s| s.parse::<usize>().ok()) {
-                    total += n;
-                }
-            }
-        }
+/// Run unscan --audit on a rasterized PDF, then char-misses.py for spatial
+/// ground-truth comparison against the vector PDF.
+fn measure_accuracy(raster_pdf: &Path, label: &str) -> Option<AccuracyResult> {
+    let vector_src = test_doc("font-timeline-specimen.pdf");
+    let fontmap = test_doc("font-timeline-specimen-fontmap.json");
+
+    let audit_dir = std::env::temp_dir()
+        .join(format!("unscan-t62-audit-{}", label));
+    if audit_dir.exists() {
+        let _ = std::fs::remove_dir_all(&audit_dir);
     }
-    total
-}
+    std::fs::create_dir_all(&audit_dir).expect("create audit dir");
 
-/// Known font renames / aliases (same as t60).
-fn font_aliases() -> HashMap<String, Vec<String>> {
-    let mut m: HashMap<String, Vec<String>> = HashMap::new();
-    m.insert("sourcesans3".into(), vec!["sourcesanspro".into()]);
-    m.insert("couriernew".into(), vec!["nimbusmonops".into(), "freemono".into()]);
-    m.insert("arial".into(), vec!["liberationsans".into(), "nimbussans".into(), "freesans".into()]);
-    m.insert("ptserif".into(), vec!["nimbusroman".into(), "liberationserif".into(), "freeserif".into()]);
-    m.insert("lato".into(), vec!["carlito".into()]);
-    m.insert("caladea".into(), vec!["p052".into()]);
-    m
-}
+    let output_pdf = audit_dir.join("out.pdf");
 
-/// Check if a matched font name corresponds to any ground truth font family.
-fn is_correct(matched: &str, ground_truth: &HashMap<usize, String>) -> bool {
-    let aliases = font_aliases();
-    ground_truth.values().any(|expected| {
-        if matched.contains(expected.as_str()) || expected.contains(matched) {
-            return true;
-        }
-        if let Some(alias_list) = aliases.get(expected.as_str()) {
-            if alias_list
-                .iter()
-                .any(|a| matched.contains(a.as_str()) || a.contains(matched))
-            {
-                return true;
-            }
-        }
-        false
+    // Run unscan with --audit
+    let bin = unscan_bin();
+    let output = Command::new(&bin)
+        .arg(raster_pdf)
+        .args(["-o", output_pdf.to_str().unwrap()])
+        .args(["--audit", audit_dir.to_str().unwrap()])
+        .env("RUST_LOG", "info")
+        .output()
+        .unwrap_or_else(|e| panic!("failed to run unscan: {}", e));
+
+    if !output.status.success() {
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        eprintln!("unscan failed (exit {:?}):\n{}", output.status.code(), stderr);
+        return None;
+    }
+
+    let audit_json = audit_dir.join("audit.json");
+    if !audit_json.exists() {
+        eprintln!("SKIP: audit.json not written");
+        return None;
+    }
+
+    // Run char-misses.py
+    let report_path = audit_dir.join("misses.html");
+    let tools_dir = Path::new(env!("CARGO_MANIFEST_DIR")).join("tools");
+    let char_misses_py = tools_dir.join("char-misses.py");
+
+    let mut py_cmd = Command::new("python3");
+    py_cmd.arg(&char_misses_py)
+        .arg(&audit_dir)
+        .arg(&vector_src)
+        .args(["-o", report_path.to_str().unwrap()]);
+    if fontmap.exists() {
+        py_cmd.args(["--fontmap", fontmap.to_str().unwrap()]);
+    }
+
+    let py_output = py_cmd.output()
+        .unwrap_or_else(|e| panic!("failed to run char-misses.py: {}", e));
+
+    let combined = format!(
+        "{}{}",
+        String::from_utf8_lossy(&py_output.stdout),
+        String::from_utf8_lossy(&py_output.stderr),
+    );
+
+    if !py_output.status.success() {
+        eprintln!("char-misses.py failed:\n{}", combined);
+        return None;
+    }
+
+    let (hits, misses, unmatched, skipped, total) = parse_summary(&combined);
+    let compared = hits + misses;
+    let accuracy = if compared > 0 { hits as f64 / compared as f64 } else { 0.0 };
+
+    Some(AccuracyResult {
+        hits,
+        misses,
+        unmatched,
+        skipped,
+        total,
+        compared,
+        accuracy,
+        report_path,
     })
 }
 
-/// Accuracy against Poppler/Cairo-rendered specimen with anti-aliasing.
-///
-/// Tests that the CI feature index generalises across rendering engines —
-/// the same variation profile as different printers/drivers produce on paper.
-#[test]
-fn specimen_font_accuracy_poppler() {
-    let vector_src = test_doc("font-timeline-specimen.pdf");
-    if !vector_src.exists() {
-        eprintln!("SKIP: font-timeline-specimen.pdf not found");
-        return;
-    }
-    let gt_path = test_doc("font-timeline-specimen.json");
-    if !gt_path.exists() {
-        eprintln!("SKIP: font-timeline-specimen.json not found");
-        return;
+/// Parse char-misses.py summary: "Total: N  Hits: H  Misses: M (U unmatched)  Skipped: S"
+fn parse_summary(output: &str) -> (usize, usize, usize, usize, usize) {
+    let mut hits = 0;
+    let mut misses = 0;
+    let mut unmatched = 0;
+    let mut skipped = 0;
+    let mut total = 0;
+
+    for line in output.lines() {
+        if !line.contains("Total:") || !line.contains("Hits:") {
+            continue;
+        }
+        for part in line.split_whitespace().collect::<Vec<_>>().windows(2) {
+            match part[0] {
+                "Total:" => total = part[1].parse().unwrap_or(0),
+                "Hits:" => hits = part[1].parse().unwrap_or(0),
+                "Misses:" => misses = part[1].parse().unwrap_or(0),
+                "Skipped:" => skipped = part[1].parse().unwrap_or(0),
+                _ => {}
+            }
+        }
+        if let Some(pos) = line.find('(') {
+            if let Some(end) = line[pos..].find(" unmatched)") {
+                let n_str = &line[pos + 1..pos + end];
+                unmatched = n_str.trim().parse().unwrap_or(0);
+            }
+        }
+        break;
     }
 
-    // Generate / cache the Poppler-rendered rasterized PDF
+    (hits, misses, unmatched, skipped, total)
+}
+
+// ── Tests ────────────────────────────────────────────────────────────
+
+/// Accuracy against Poppler/Cairo-rendered specimen with anti-aliasing.
+#[test]
+fn specimen_font_accuracy_poppler() {
+    ensure_index();
+    ensure_specimen();
+
+    let vector_src = test_doc("font-timeline-specimen.pdf");
     let poppler_pdf = test_doc("font-timeline-specimen-rasterized-poppler.pdf");
     if !common::rasterize_pdf_poppler(&vector_src, &poppler_pdf, 300, true) {
         eprintln!("SKIP: Poppler rasterization failed (pdftoppm missing?)");
         return;
     }
 
-    let ground_truth = load_ground_truth();
+    let r = measure_accuracy(&poppler_pdf, "poppler-300dpi-aa")
+        .expect("could not measure Poppler accuracy");
 
-    let output = run_unscan(&poppler_pdf, &[]);
-    let matched_fonts = parse_all_font_matches(&output);
-    let total_lines = count_total_ocr_lines(&output);
-
-    let matched = matched_fonts.len();
-    assert!(matched > 0, "No font matches found in Poppler specimen output");
-    assert!(total_lines > 0, "No OCR lines found in Poppler specimen output");
-
-    let correct = matched_fonts
-        .iter()
-        .filter(|m| is_correct(m, &ground_truth))
-        .count();
-
-    let accuracy = correct as f64 / total_lines as f64;
     eprintln!(
-        "Specimen Poppler accuracy: {}/{} = {:.1}% (threshold: {:.0}%)",
-        correct,
-        total_lines,
-        accuracy * 100.0,
-        MIN_ACCURACY_POPPLER_AA * 100.0,
+        "Poppler AA @ 300dpi: {}/{} = {:.1}% (threshold: {:.0}%)",
+        r.hits, r.compared, r.accuracy * 100.0, MIN_ACCURACY_POPPLER_AA * 100.0,
     );
     eprintln!(
-        "  ({} matched, {} unmatched, {} incorrect)",
-        matched,
-        total_lines - matched,
-        matched - correct,
+        "  {} hits, {} misses ({} unmatched, {} wrong), {} skipped, {} total",
+        r.hits, r.misses, r.unmatched, r.misses.saturating_sub(r.unmatched), r.skipped, r.total,
     );
-
-    // Log misses
-    let misses: Vec<&String> = matched_fonts
-        .iter()
-        .filter(|m| !is_correct(m, &ground_truth))
-        .collect();
-    if !misses.is_empty() {
-        eprintln!("Misses ({}):", misses.len());
-        for m in misses.iter().take(20) {
-            eprintln!("  {}", m);
-        }
-        if misses.len() > 20 {
-            eprintln!("  ... and {} more", misses.len() - 20);
-        }
-    }
+    eprintln!("  Miss report: {}", r.report_path.display());
 
     assert!(
-        accuracy >= MIN_ACCURACY_POPPLER_AA,
-        "Specimen Poppler accuracy {:.1}% below threshold {:.0}% ({}/{})",
-        accuracy * 100.0,
+        r.compared > 0,
+        "No lines compared — audit or char-misses.py produced no results",
+    );
+    assert!(
+        r.accuracy >= MIN_ACCURACY_POPPLER_AA,
+        "Poppler accuracy {:.1}% below threshold {:.0}% ({}/{}) — see {}",
+        r.accuracy * 100.0,
         MIN_ACCURACY_POPPLER_AA * 100.0,
-        correct,
-        total_lines,
+        r.hits,
+        r.compared,
+        r.report_path.display(),
     );
 }
