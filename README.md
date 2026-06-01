@@ -50,50 +50,28 @@ cargo build --release
 |------|---------|---------|
 | `tesseract` | `apt install tesseract-ocr` | OCR engine |
 | `pdftoppm` | `apt install poppler-utils` | PDF → raster |
-| `cabextract` | `apt install cabextract` | MS core font extraction |
-
 ### Install all recommended fonts
 
 ```bash
-# MS Core Fonts (Arial, Times New Roman, Courier New, Georgia, Verdana, etc.)
-sudo apt install ttf-mscorefonts-installer
-
-# If SourceForge is blocked by proxy, download manually:
-sudo apt install cabextract
-mkdir -p /tmp/msfonts
-for f in andale32 arial32 arialb32 comic32 courie32 georgi32 impact32 \
-         times32 trebuc32 verdan32 webdin32; do
-    wget "https://downloads.sourceforge.net/corefonts/\${f}.exe" -O /tmp/\${f}.exe
-    cabextract -q -d /tmp/msfonts /tmp/\${f}.exe
-done
-sudo mkdir -p /usr/share/fonts/truetype/msttcorefonts
-sudo cp /tmp/msfonts/*.ttf /tmp/msfonts/*.TTF /usr/share/fonts/truetype/msttcorefonts/
-sudo fc-cache -f
-
-# Calibri/Cambria metric-compatible replacements
-sudo apt install fonts-crosextra-carlito fonts-crosextra-caladea
-
-# Liberation fonts (metric-compatible Arial/Times/Courier replacements)
-sudo apt install fonts-liberation
-
-# IBM typewriter fonts (for scanned legal/govt documents)
-sudo mkdir -p /usr/local/share/fonts/typewriter
-# Copy OGCourier*.ttf and "IBM Selectric Light"*.ttf here -- see
-# "Working with Typewriter & Vintage Documents" section below
-sudo fc-cache -f /usr/local/share/fonts/typewriter/
-
-# LaTeX fonts
-sudo apt install fonts-lmodern texlive-fonts-recommended
-
-# Wide Unicode coverage
-sudo apt install fonts-noto
+bash scripts/install-all-fonts.sh
 ```
 
-> **Automated installer:** For a one-shot, non-interactive setup (pre-accepts the MS Core Fonts EULA, installs typewriter fonts and all specimen families), run:
-> ```bash
-> sudo bash scripts/install-all-fonts.sh
-> ```
-> The script sets `DEBIAN_FRONTEND=noninteractive` and pre-seeds `debconf` so it can run unattended in CI.
+The script installs fonts from three sources:
+
+1. **apt** — MS Core Fonts (via `ttf-mscorefonts-installer` with pre-seeded EULA),
+   EB Garamond, IBM Plex, Inter, Lato, Open Sans, Roboto, Noto, Liberation,
+   Carlito, Caladea, Courier Prime, and LaTeX fonts.
+2. **Google Fonts (curl)** — families not packaged by apt: Libre Baskerville,
+   Libre Bodoni, Libre Caslon Text, Zilla Slab, Jost, Playfair Display,
+   Merriweather, Source Sans 3, Noto Serif, PT Serif, Source Serif 4, and
+   Special Elite. Downloaded to `~/.local/share/fonts/` preserving the upstream
+   `ofl/`/`apache/` directory structure. Existing files are skipped.
+3. **Typewriter fonts (curl + unzip)** — Prestige Elite, Letter Gothic.
+   Downloaded to `~/.local/share/fonts/typewriter/`.
+
+The script is idempotent — rerunning it skips already-installed fonts.
+It sets `DEBIAN_FRONTEND=noninteractive` and pre-seeds `debconf` so it
+runs unattended in CI.
 
 ## Font ground-truth map
 
