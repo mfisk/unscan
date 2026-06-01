@@ -140,6 +140,127 @@ mkdir -p /usr/share/fonts/truetype/msttcorefonts
 cp /tmp/msfonts/*.ttf /tmp/msfonts/*.TTF /usr/share/fonts/truetype/msttcorefonts/ 2>/dev/null || true
 fc-cache -f /usr/share/fonts/truetype/msttcorefonts/
 
+echo "=== Installing Google Fonts specimen families ==="
+mkdir -p /usr/share/fonts/truetype/specimen-fonts
+mkdir -p /usr/share/fonts/truetype/extra
+SPEC_DIR="/usr/share/fonts/truetype/specimen-fonts"
+EXTRA_DIR="/usr/share/fonts/truetype/extra"
+TMP_FONT_DIR="/tmp/google-fonts"
+mkdir -p "$TMP_FONT_DIR"
+cd "$TMP_FONT_DIR"
+
+# Helper to download a file if not present
+dl() {
+  url="$1"
+  out="$2"
+  if [ ! -f "$out" ]; then
+    echo "Downloading $(basename "$out") ..."
+    wget -q -O "$out" "$url" || echo "WARN: Failed to download $url"
+  fi
+}
+
+# EB Garamond (variable)
+dl "https://raw.githubusercontent.com/google/fonts/main/ofl/ebgaramond/EBGaramond%5Bwght%5D.ttf" "EBGaramond[wght].ttf"
+dl "https://raw.githubusercontent.com/google/fonts/main/ofl/ebgaramond/EBGaramond-Italic%5Bwght%5D.ttf" "EBGaramond-Italic[wght].ttf"
+cp "EBGaramond[wght].ttf" "$SPEC_DIR/eb-garamond-400.ttf" 2>/dev/null || true
+cp "EBGaramond[wght].ttf" "$SPEC_DIR/eb-garamond-700.ttf" 2>/dev/null || true
+cp "EBGaramond-Italic[wght].ttf" "$SPEC_DIR/eb-garamond-400i.ttf" 2>/dev/null || true
+
+# Libre Baskerville
+dl "https://raw.githubusercontent.com/google/fonts/main/ofl/librebaskerville/LibreBaskerville%5Bwght%5D.ttf" "LibreBaskerville[wght].ttf"
+dl "https://raw.githubusercontent.com/google/fonts/main/ofl/librebaskerville/LibreBaskerville-Italic%5Bwght%5D.ttf" "LibreBaskerville-Italic[wght].ttf"
+cp "LibreBaskerville[wght].ttf" "$SPEC_DIR/libre-baskerville-400.ttf" 2>/dev/null || true
+cp "LibreBaskerville[wght].ttf" "$SPEC_DIR/libre-baskerville-700.ttf" 2>/dev/null || true
+cp "LibreBaskerville-Italic[wght].ttf" "$SPEC_DIR/libre-baskerville-400i.ttf" 2>/dev/null || true
+
+# Libre Bodoni
+dl "https://raw.githubusercontent.com/google/fonts/main/ofl/librebodoni/LibreBodoni%5Bwght%5D.ttf" "LibreBodoni[wght].ttf"
+dl "https://raw.githubusercontent.com/google/fonts/main/ofl/librebodoni/LibreBodoni-Italic%5Bwght%5D.ttf" "LibreBodoni-Italic[wght].ttf"
+cp "LibreBodoni[wght].ttf" "$SPEC_DIR/libre-bodoni-400.ttf" 2>/dev/null || true
+cp "LibreBodoni[wght].ttf" "$SPEC_DIR/libre-bodoni-700.ttf" 2>/dev/null || true
+cp "LibreBodoni-Italic[wght].ttf" "$SPEC_DIR/libre-bodoni-400i.ttf" 2>/dev/null || true
+
+# Libre Caslon Text
+dl "https://raw.githubusercontent.com/google/fonts/main/ofl/librecaslontext/LibreCaslonText%5Bwght%5D.ttf" "LibreCaslonText[wght].ttf"
+dl "https://raw.githubusercontent.com/google/fonts/main/ofl/librecaslontext/LibreCaslonText-Italic%5Bwght%5D.ttf" "LibreCaslonText-Italic[wght].ttf"
+cp "LibreCaslonText[wght].ttf" "$SPEC_DIR/libre-caslon-text-400.ttf" 2>/dev/null || true
+cp "LibreCaslonText[wght].ttf" "$SPEC_DIR/libre-caslon-text-700.ttf" 2>/dev/null || true
+cp "LibreCaslonText-Italic[wght].ttf" "$SPEC_DIR/libre-caslon-text-400i.ttf" 2>/dev/null || true
+
+# Zilla Slab
+dl "https://raw.githubusercontent.com/google/fonts/main/ofl/zillaslab/ZillaSlab-Regular.ttf" "ZillaSlab-Regular.ttf"
+dl "https://raw.githubusercontent.com/google/fonts/main/ofl/zillaslab/ZillaSlab-Bold.ttf" "ZillaSlab-Bold.ttf"
+cp "ZillaSlab-Regular.ttf" "$SPEC_DIR/zilla-slab-400.ttf" 2>/dev/null || true
+cp "ZillaSlab-Bold.ttf" "$SPEC_DIR/zilla-slab-700.ttf" 2>/dev/null || true
+
+# Jost
+dl "https://raw.githubusercontent.com/google/fonts/main/ofl/jost/Jost%5Bwght%5D.ttf" "Jost[wght].ttf"
+cp "Jost[wght].ttf" "$SPEC_DIR/jost-400.ttf" 2>/dev/null || true
+cp "Jost[wght].ttf" "$SPEC_DIR/jost-700.ttf" 2>/dev/null || true
+
+# Playfair Display
+dl "https://raw.githubusercontent.com/google/fonts/main/ofl/playfairdisplay/PlayfairDisplay%5Bwght%5D.ttf" "PlayfairDisplay[wght].ttf"
+dl "https://raw.githubusercontent.com/google/fonts/main/ofl/playfairdisplay/PlayfairDisplay-Italic%5Bwght%5D.ttf" "PlayfairDisplay-Italic[wght].ttf"
+cp "PlayfairDisplay[wght].ttf" "$SPEC_DIR/playfair-display-400.ttf" 2>/dev/null || true
+cp "PlayfairDisplay-Italic[wght].ttf" "$SPEC_DIR/playfair-display-400i.ttf" 2>/dev/null || true
+
+# Roboto
+dl "https://raw.githubusercontent.com/google/fonts/main/ofl/roboto/Roboto%5Bwdth,wght%5D.ttf" "Roboto[wdth,wght].ttf"
+cp "Roboto[wdth,wght].ttf" "$SPEC_DIR/roboto-400.ttf" 2>/dev/null || true
+
+# Open Sans
+dl "https://raw.githubusercontent.com/google/fonts/main/ofl/opensans/OpenSans%5Bwdth,wght%5D.ttf" "OpenSans[wdth,wght].ttf"
+cp "OpenSans[wdth,wght].ttf" "$SPEC_DIR/open-sans-400.ttf" 2>/dev/null || true
+
+# Lato
+dl "https://raw.githubusercontent.com/google/fonts/main/ofl/lato/Lato-Regular.ttf" "Lato-Regular.ttf"
+cp "Lato-Regular.ttf" "$SPEC_DIR/lato-400.ttf" 2>/dev/null || true
+
+# Merriweather
+dl "https://raw.githubusercontent.com/google/fonts/main/ofl/merriweather/Merriweather%5Bopsz,wdth,wght%5D.ttf" "Merriweather[opsz,wdth,wght].ttf"
+dl "https://raw.githubusercontent.com/google/fonts/main/ofl/merriweather/Merriweather-Italic%5Bopsz,wdth,wght%5D.ttf" "Merriweather-Italic[opsz,wdth,wght].ttf"
+cp "Merriweather[opsz,wdth,wght].ttf" "$SPEC_DIR/merriweather-400.ttf" 2>/dev/null || true
+cp "Merriweather-Italic[opsz,wdth,wght].ttf" "$SPEC_DIR/merriweather-400i.ttf" 2>/dev/null || true
+
+# Source Sans 3 (used as Source Sans Pro)
+dl "https://raw.githubusercontent.com/google/fonts/main/ofl/sourcesans3/SourceSans3%5Bwght%5D.ttf" "SourceSans3[wght].ttf"
+cp "SourceSans3[wght].ttf" "$SPEC_DIR/source-sans-pro-400.ttf" 2>/dev/null || true
+
+# Noto Serif
+dl "https://raw.githubusercontent.com/google/fonts/main/ofl/notoserif/NotoSerif%5Bwdth,wght%5D.ttf" "NotoSerif[wdth,wght].ttf"
+cp "NotoSerif[wdth,wght].ttf" "$SPEC_DIR/noto-serif-400.ttf" 2>/dev/null || true
+
+# PT Serif
+dl "https://raw.githubusercontent.com/google/fonts/main/ofl/ptserif/PT_Serif-Web-Regular.ttf" "PT_Serif-Web-Regular.ttf"
+dl "https://raw.githubusercontent.com/google/fonts/main/ofl/ptserif/PT_Serif-Web-Italic.ttf" "PT_Serif-Web-Italic.ttf"
+cp "PT_Serif-Web-Regular.ttf" "$SPEC_DIR/pt-serif-400.ttf" 2>/dev/null || true
+cp "PT_Serif-Web-Italic.ttf" "$SPEC_DIR/pt-serif-400i.ttf" 2>/dev/null || true
+
+# IBM Plex Sans / Serif / Mono
+dl "https://raw.githubusercontent.com/google/fonts/main/ofl/ibmplexsans/IBMPlexSans%5Bwdth,wght%5D.ttf" "IBMPlexSans[wdth,wght].ttf"
+dl "https://raw.githubusercontent.com/google/fonts/main/ofl/ibmplexserif/IBMPlexSerif-Regular.ttf" "IBMPlexSerif-Regular.ttf"
+dl "https://raw.githubusercontent.com/google/fonts/main/ofl/ibmplexmono/IBMPlexMono-Regular.ttf" "IBMPlexMono-Regular.ttf"
+cp "IBMPlexSans[wdth,wght].ttf" "$SPEC_DIR/ibm-plex-sans-400.ttf" 2>/dev/null || true
+cp "IBMPlexSerif-Regular.ttf" "$SPEC_DIR/ibm-plex-serif-400.ttf" 2>/dev/null || true
+cp "IBMPlexMono-Regular.ttf" "$SPEC_DIR/ibm-plex-mono-400.ttf" 2>/dev/null || true
+
+# Inter
+dl "https://raw.githubusercontent.com/google/fonts/main/ofl/inter/Inter%5Bopsz,wght%5D.ttf" "Inter[opsz,wght].ttf"
+cp "Inter[opsz,wght].ttf" "$SPEC_DIR/inter-400.ttf" 2>/dev/null || true
+
+# Source Serif 4
+dl "https://raw.githubusercontent.com/google/fonts/main/ofl/sourceserif4/SourceSerif4%5Bopsz,wght%5D.ttf" "SourceSerif4[opsz,wght].ttf"
+dl "https://raw.githubusercontent.com/google/fonts/main/ofl/sourceserif4/SourceSerif4-Italic%5Bopsz,wght%5D.ttf" "SourceSerif4-Italic[opsz,wght].ttf"
+cp "SourceSerif4[opsz,wght].ttf" "$EXTRA_DIR/SourceSerif4-Regular.ttf" 2>/dev/null || true
+cp "SourceSerif4[opsz,wght].ttf" "$EXTRA_DIR/SourceSerif4-Bold.ttf" 2>/dev/null || true
+cp "SourceSerif4-Italic[opsz,wght].ttf" "$EXTRA_DIR/SourceSerif4-It.ttf" 2>/dev/null || true
+
+# Special Elite (Apache)
+dl "https://raw.githubusercontent.com/google/fonts/main/apache/specialelite/SpecialElite-Regular.ttf" "SpecialElite-Regular.ttf"
+cp "SpecialElite-Regular.ttf" "/usr/local/share/fonts/typewriter/SpecialElite-Regular.ttf" 2>/dev/null || true
+
+fc-cache -f "$SPEC_DIR" "$EXTRA_DIR" /usr/local/share/fonts/typewriter/
+
 echo "=== Generating specimen fonts (EB Garamond, Libre families) ==="
 # Find repo root (script is in scripts/)
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"

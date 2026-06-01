@@ -38,14 +38,8 @@ LOGO_DIR = SCRIPT_DIR / "logos"
 PAGE_W, PAGE_H = letter  # 612 × 792 points (8.5 × 11 in)
 
 # ---------------------------------------------------------------------------
-# Font registration — map each specimen font to TTF files for reportlab
+# Font registration — fonts are resolved via fontconfig
 # ---------------------------------------------------------------------------
-SPEC_FONT_DIR = Path("/usr/share/fonts/truetype/specimen-fonts")
-MS_FONT_DIR = Path("/usr/share/fonts/truetype/msttcorefonts")
-CROSEXTRA = Path("/usr/share/fonts/truetype/crosextra")
-TYPEWRITER = Path("/usr/local/share/fonts/typewriter")
-NIMBUS = None  # will resolve via fc-list
-
 def fc_find(family, style="Regular"):
     """Find a TTF path via fontconfig."""
     r = subprocess.run(
@@ -69,183 +63,73 @@ def register_font(rl_name, ttf_path):
 
 # Font spec: (rl_base_name, regular_path, bold_path, italic_path)
 # We'll register {base}, {base}-Bold, {base}-Italic
-FONT_REGISTRY = {
-    "EBGaramond": (
-        SPEC_FONT_DIR / "eb-garamond-400.ttf",
-        SPEC_FONT_DIR / "eb-garamond-700.ttf",
-        SPEC_FONT_DIR / "eb-garamond-400i.ttf",
-    ),
-    "LibreCaslonText": (
-        SPEC_FONT_DIR / "libre-caslon-text-400.ttf",
-        SPEC_FONT_DIR / "libre-caslon-text-700.ttf",
-        SPEC_FONT_DIR / "libre-caslon-text-400i.ttf",
-    ),
-    "LibreBaskerville": (
-        SPEC_FONT_DIR / "libre-baskerville-400.ttf",
-        SPEC_FONT_DIR / "libre-baskerville-700.ttf",
-        SPEC_FONT_DIR / "libre-baskerville-400i.ttf",
-    ),
-    "LibreBodoni": (
-        SPEC_FONT_DIR / "libre-bodoni-400.ttf",
-        SPEC_FONT_DIR / "libre-bodoni-700.ttf",
-        SPEC_FONT_DIR / "libre-bodoni-400i.ttf",
-    ),
-    "ZillaSlab": (
-        SPEC_FONT_DIR / "zilla-slab-400.ttf",
-        SPEC_FONT_DIR / "zilla-slab-700.ttf",
-        None,
-    ),
-    "Jost": (
-        SPEC_FONT_DIR / "jost-400.ttf",
-        SPEC_FONT_DIR / "jost-700.ttf",
-        None,
-    ),
-    "TimesNewRoman": (
-        MS_FONT_DIR / "Times_New_Roman.ttf",
-        MS_FONT_DIR / "Times_New_Roman_Bold.ttf",
-        MS_FONT_DIR / "Times_New_Roman_Italic.ttf",
-    ),
-    "CourierNew": (
-        MS_FONT_DIR / "Courier_New.ttf",
-        MS_FONT_DIR / "Courier_New_Bold.ttf",
-        MS_FONT_DIR / "Courier_New_Italic.ttf",
-    ),
-    "NimbusSans": (
-        MS_FONT_DIR / "Arial.TTF",  # Use Arial as Helvetica stand-in (Nimbus Sans is OTF only)
-        MS_FONT_DIR / "Arial_Bold.ttf",
-        MS_FONT_DIR / "Arial_Italic.ttf",
-    ),
-    "Arial": (
-        MS_FONT_DIR / "Arial.TTF",
-        MS_FONT_DIR / "Arial_Bold.ttf",
-        MS_FONT_DIR / "Arial_Italic.ttf",
-    ),
-    "Georgia": (
-        MS_FONT_DIR / "Georgia.TTF",
-        MS_FONT_DIR / "Georgia_Bold.ttf",
-        MS_FONT_DIR / "Georgia_Italic.ttf",
-    ),
-    "Verdana": (
-        MS_FONT_DIR / "Verdana.TTF",
-        MS_FONT_DIR / "Verdana_Bold.ttf",
-        MS_FONT_DIR / "Verdana_Italic.ttf",
-    ),
-    "ComicSansMS": (
-        MS_FONT_DIR / "Comic_Sans_MS.ttf",
-        MS_FONT_DIR / "Comic_Sans_MS_Bold.ttf",
-        None,
-    ),
-    "TrebuchetMS": (
-        MS_FONT_DIR / "Trebuchet_MS.ttf",
-        MS_FONT_DIR / "Trebuchet_MS_Bold.ttf",
-        MS_FONT_DIR / "Trebuchet_MS_Italic.ttf",
-    ),
-    "Caladea": (
-        CROSEXTRA / "Caladea-Regular.ttf",
-        CROSEXTRA / "Caladea-Bold.ttf",
-        CROSEXTRA / "Caladea-Italic.ttf",
-    ),
-    "Roboto": (
-        SPEC_FONT_DIR / "roboto-400.ttf",
-        None,
-        None,
-    ),
-    "OpenSans": (
-        SPEC_FONT_DIR / "open-sans-400.ttf",
-        None,
-        None,
-    ),
-    "Lato": (
-        SPEC_FONT_DIR / "lato-400.ttf",
-        None,
-        None,
-    ),
-    "Merriweather": (
-        SPEC_FONT_DIR / "merriweather-400.ttf",
-        None,
-        SPEC_FONT_DIR / "merriweather-400i.ttf",
-    ),
-    "SourceSans3": (
-        SPEC_FONT_DIR / "source-sans-pro-400.ttf",
-        None,
-        None,
-    ),
-    "SourceSerif4": (
-        Path("/usr/share/fonts/truetype/extra/SourceSerif4-Regular.ttf"),
-        Path("/usr/share/fonts/truetype/extra/SourceSerif4-Bold.ttf"),
-        Path("/usr/share/fonts/truetype/extra/SourceSerif4-It.ttf"),
-    ),
-    "NotoSerif": (
-        SPEC_FONT_DIR / "noto-serif-400.ttf",
-        None,
-        None,
-    ),
-    "PTSerif": (
-        SPEC_FONT_DIR / "pt-serif-400.ttf",
-        None,
-        SPEC_FONT_DIR / "pt-serif-400i.ttf",
-    ),
-    "PlayfairDisplay": (
-        SPEC_FONT_DIR / "playfair-display-400.ttf",
-        None,
-        SPEC_FONT_DIR / "playfair-display-400i.ttf",
-    ),
-    "IBMPlexSans": (
-        SPEC_FONT_DIR / "ibm-plex-sans-400.ttf",
-        None,
-        None,
-    ),
-    "IBMPlexSerif": (
-        SPEC_FONT_DIR / "ibm-plex-serif-400.ttf",
-        None,
-        None,
-    ),
-    "IBMPlexMono": (
-        SPEC_FONT_DIR / "ibm-plex-mono-400.ttf",
-        None,
-        None,
-    ),
-    "Inter": (
-        SPEC_FONT_DIR / "inter-400.ttf",
-        None,
-        None,
-    ),
-    "SpecialElite": (
-        TYPEWRITER / "SpecialElite-Regular.ttf",
-        None,  # no bold
-        None,  # no italic
-    ),
-    "PrestigeElite": (
-        TYPEWRITER / "PrestigeElite-Regular.ttf",
-        None,  # no bold
-        None,  # no italic
-    ),
-}
-
 
 def register_all_fonts():
     """Register all specimen fonts with reportlab."""
     from reportlab.lib.fonts import addMapping
 
+    # All fonts are resolved via fontconfig by family name.
+    # This is the normal way fonts are installed on Linux — no hard-coded paths.
+    FAMILIES = {
+        # Google Fonts
+        "EBGaramond": "EB Garamond",
+        "LibreCaslonText": "Libre Caslon Text",
+        "LibreBaskerville": "Libre Baskerville",
+        "LibreBodoni": "Libre Bodoni",
+        "ZillaSlab": "Zilla Slab",
+        "Jost": "Jost",
+        "PlayfairDisplay": "Playfair Display",
+        "Roboto": "Roboto",
+        "OpenSans": "Open Sans",
+        "Lato": "Lato",
+        "Merriweather": "Merriweather",
+        "SourceSans3": "Source Sans 3",
+        "SourceSerif4": "Source Serif 4",
+        "NotoSerif": "Noto Serif",
+        "PTSerif": "PT Serif",
+        "IBMPlexSans": "IBM Plex Sans",
+        "IBMPlexSerif": "IBM Plex Serif",
+        "IBMPlexMono": "IBM Plex Mono",
+        "Inter": "Inter",
+        "SpecialElite": "Special Elite",
+        # System / MS Core Fonts
+        "TimesNewRoman": "Times New Roman",
+        "CourierNew": "Courier New",
+        "NimbusSans": "Arial",
+        "Arial": "Arial",
+        "Georgia": "Georgia",
+        "Verdana": "Verdana",
+        "ComicSansMS": "Comic Sans MS",
+        "TrebuchetMS": "Trebuchet MS",
+        "Caladea": "Caladea",
+        "PrestigeElite": "Prestige Elite",
+    }
+
     registered = {}
-    for base, (reg, bold, ital) in FONT_REGISTRY.items():
+
+    for base, family in FAMILIES.items():
+        reg = fc_find(family, "Regular") or fc_find(family)
+        bold = fc_find(family, "Bold") or reg
+        italic = fc_find(family, "Italic") or reg
+
         ok = register_font(base, reg)
         if ok:
             registered[base] = True
         ok_b = register_font(f"{base}-Bold", bold)
-        ok_i = register_font(f"{base}-Italic", ital)
+        ok_i = register_font(f"{base}-Italic", italic)
         if not ok_b:
             register_font(f"{base}-Bold", reg)
         if not ok_i:
             register_font(f"{base}-Italic", reg)
 
-        # Register the font family mapping so <b>/<i> in Paragraph work
-        addMapping(base, 0, 0, base)            # regular
-        addMapping(base, 1, 0, f"{base}-Bold")  # bold
-        addMapping(base, 0, 1, f"{base}-Italic")  # italic
-        addMapping(base, 1, 1, f"{base}-Bold")  # bold+italic fallback to bold
+        addMapping(base, 0, 0, base)
+        addMapping(base, 1, 0, f"{base}-Bold")
+        addMapping(base, 0, 1, f"{base}-Italic")
+        addMapping(base, 1, 1, f"{base}-Bold")
 
     return registered
+
+
 
 
 # ---------------------------------------------------------------------------
