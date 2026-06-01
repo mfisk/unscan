@@ -786,16 +786,24 @@ def main():
     skipped = 0
     ssim_fail_count = 0
 
+    unmatched = 0
+
     for e in entries:
         matched = e.get("font_matched", "")
         bbox = e.get("bbox")
-        if not matched or not bbox:
+        if not bbox:
             skipped += 1
             continue
 
         actual_font = lookup_actual_font(page_spans, e["page"], bbox)
         if actual_font is None:
             skipped += 1
+            continue
+
+        if not matched:
+            # Unmatched line — unscan found no font at all.  Count as a miss.
+            unmatched += 1
+            misses.append((e, actual_font, None, None, None))
             continue
 
         if e.get("ssim_pass") is False:
@@ -810,7 +818,8 @@ def main():
 
     doc.close()
 
-    print(f"Total: {total}  Hits: {hits}  Misses: {len(misses)}  Skipped: {skipped}",
+    unmatched_str = f" ({unmatched} unmatched)" if unmatched else ""
+    print(f"Total: {total}  Hits: {hits}  Misses: {len(misses)}{unmatched_str}  Skipped: {skipped}",
           file=sys.stderr)
 
     if not misses:
@@ -863,6 +872,7 @@ def main():
         miss_blocks.append(block)
 
     ssim_fail_str = f" | {ssim_fail_count} SSIM failures" if ssim_fail_count else ""
+    unmatched_html = f" | {unmatched} unmatched" if unmatched else ""
     compared = hits + len(misses)
     pct = hits / compared * 100 if compared else 0
     html = f"""<!DOCTYPE html>
@@ -874,7 +884,7 @@ def main():
 <body style="background: white; color: #222;">
 {CSS}
 <h2>unscan Miss Report</h2>
-<div class="summary">{hits}/{compared} correct ({pct:.1f}%) — {len(misses)} misses shown below{ssim_fail_str}</div>
+<div class="summary">{hits}/{compared} correct ({pct:.1f}%) — {len(misses)} misses shown below{unmatched_html}{ssim_fail_str}</div>
 {"".join(miss_blocks)}
 </body>
 </html>"""

@@ -41,16 +41,20 @@ PAGE_W, PAGE_H = letter  # 612 × 792 points (8.5 × 11 in)
 # Font registration — fonts are resolved via fontconfig
 # ---------------------------------------------------------------------------
 def fc_find(family, style="Regular"):
-    """Find a TTF path via fontconfig."""
-    r = subprocess.run(
-        ["fc-list", f"{family}:style={style}", "--format=%{file}\n"],
-        capture_output=True, text=True
-    )
-    for line in r.stdout.strip().split('\n'):
-        if line.endswith('.ttf') or line.endswith('.TTF'):
-            return line
+    """Find a font file via fontconfig. Prefers .ttf over .otf (ReportLab needs TrueType outlines)."""
+    for query in [f"{family}:style={style}", family]:
+        r = subprocess.run(
+            ["fc-list", query, "--format=%{file}\n"],
+            capture_output=True, text=True
+        )
+        candidates = [l for l in r.stdout.strip().split('\n') if l.lower().endswith(('.ttf', '.otf'))]
+        # Prefer .ttf — ReportLab can't handle PostScript-outline .otf
+        ttf = [c for c in candidates if c.lower().endswith('.ttf')]
+        if ttf:
+            return ttf[0]
+        if candidates:
+            return candidates[0]
     return None
-
 def register_font(rl_name, ttf_path):
     """Register a TTF with reportlab. Returns True on success."""
     if ttf_path and os.path.exists(ttf_path):
@@ -106,6 +110,7 @@ def register_all_fonts():
     }
 
     registered = {}
+    font_file_map = {}
 
     for base, family in FAMILIES.items():
         reg = fc_find(family, "Regular") or fc_find(family)
@@ -115,19 +120,25 @@ def register_all_fonts():
         ok = register_font(base, reg)
         if ok:
             registered[base] = True
+            if reg:
+                font_file_map[base] = reg
         ok_b = register_font(f"{base}-Bold", bold)
         ok_i = register_font(f"{base}-Italic", italic)
         if not ok_b:
             register_font(f"{base}-Bold", reg)
         if not ok_i:
             register_font(f"{base}-Italic", reg)
+        if ok_b and bold:
+            font_file_map[f"{base}-Bold"] = bold
+        if ok_i and italic:
+            font_file_map[f"{base}-Italic"] = italic
 
         addMapping(base, 0, 0, base)
         addMapping(base, 1, 0, f"{base}-Bold")
         addMapping(base, 0, 1, f"{base}-Italic")
         addMapping(base, 1, 1, f"{base}-Bold")
 
-    return registered
+    return registered, font_file_map
 
 
 
@@ -976,7 +987,7 @@ def build_ground_truth(sections, out_json):
 # ---------------------------------------------------------------------------
 def main():
     print("Registering fonts...")
-    registered = register_all_fonts()
+    registered, font_file_map = register_all_fonts()
     print(f"  {len(registered)} font families registered")
 
     out_pdf = OUT_DIR / "font-timeline-specimen.pdf"
@@ -986,6 +997,11 @@ def main():
     out_json = OUT_DIR / "font-timeline-specimen.json"
     print(f"Writing ground truth: {out_json}")
     build_ground_truth(SECTIONS, out_json)
+
+    out_fontmap = OUT_DIR / "font-timeline-specimen-fontmap.json"
+    print(f"Writing font file map: {out_fontmap}")
+    with open(str(out_fontmap), "w") as f:
+        json.dump(font_file_map, f, indent=2)
 
     scanned_pdf = OUT_DIR / "font-timeline-specimen-scanned.pdf"
     print(f"Creating scanned version...")
