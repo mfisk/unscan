@@ -743,6 +743,42 @@ fn candidate_seams(
         raw_candidates.push((split_col, combined));
     }
 
+    // Vertical-only candidates: score each column as a straight vertical
+    // cut, discounting ink in the top and bottom serif bands (~15% of
+    // height each).  Serifs bridge adjacent characters horizontally, so
+    // ink there shouldn't penalise an otherwise clean vertical split.
+    let serif_rows = (h as f32 * 0.15).ceil() as usize;
+    for c in 1..seg_w - 1 {
+        let abs_col = base + c;
+        let mut cost = 0.0f32;
+        let mut masked = false;
+        for r in 0..h as usize {
+            let e = masked_energy(r, c);
+            if e >= f32::INFINITY { masked = true; break; }
+            let weight = if r < serif_rows || r >= (h as usize - serif_rows) {
+                0.25  // discount serif-band ink
+            } else {
+                1.0
+            };
+            cost += e * weight;
+        }
+        if !masked {
+            raw_candidates.push((seg_start + c as u32, cost));
+        }
+    }
+
+    // Deduplicate: for each column keep only the cheapest candidate
+    // (DP path or vertical cut, whichever wins).
+    {
+        let mut best: HashMap<u32, f32> = HashMap::new();
+        for &(col, cost) in &raw_candidates {
+            let entry = best.entry(col).or_insert(f32::INFINITY);
+            if cost < *entry { *entry = cost; }
+        }
+        raw_candidates = best.into_iter().collect();
+        raw_candidates.sort_by(|a, b| a.0.cmp(&b.0));
+    }
+
     // Collapse runs of consecutive columns with equal cost into a
     // single candidate at the run's midpoint.  This picks the center
     // of a zero-cost band, maximizing distance from ink on both sides.
