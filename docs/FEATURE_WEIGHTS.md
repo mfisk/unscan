@@ -308,5 +308,5 @@ target/release/learn_weights --dpis 300,200,150,100
 ./target/release/feat_diff scan_crop.png ref_render.png
 
 # Run accuracy tests
-cargo test --release --test t60_specimen_accuracy -- --nocapture
+cargo test --release --test t60_specimen_accuracy_aa -- --nocapture
 ```

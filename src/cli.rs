@@ -87,6 +87,12 @@ pub struct Args {
     #[arg(long, value_name = "NAME")]
     pub include_font: Option<String>,
 
+    /// Path to a fontmap JSON ({"FontName": "/path/to/font.ttf", ...}).
+    /// All fonts referenced in the map are injected into the CI audit
+    /// candidate list, like --include-font but in bulk.
+    #[arg(long = "include-fontmap", value_name = "FILE")]
+    pub include_fontmap: Option<std::path::PathBuf>,
+
     /// Thoroughness factor for font matching. Default 1.0.
     /// Higher values relax all CI thresholds (quorum, quality gate, kd-tree
     /// search radius) so more candidate fonts survive to evaluation.

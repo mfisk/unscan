@@ -105,7 +105,7 @@ const MIN_WORD_LEN: usize = 3;
 /// Returns the full set of characters we index.
 pub fn indexed_chars() -> &'static [char] {
     static CHARS: std::sync::LazyLock<Vec<char>> = std::sync::LazyLock::new(|| {
-        let mut v: Vec<char> = Vec::with_capacity(128);
+        let mut v: Vec<char> = Vec::with_capacity(140);
         for c in 'a'..='z' { v.push(c); }
         for c in 'A'..='Z' { v.push(c); }
         for c in '0'..='9' { v.push(c); }
@@ -123,6 +123,12 @@ pub fn indexed_chars() -> &'static [char] {
         v.push('\u{201C}'); // left double quote
         v.push('\u{201D}'); // right double quote
         v.push('\u{2026}'); // ellipsis
+        // Standard and discretionary ligatures
+        v.push('\u{FB00}'); // ff ligature
+        v.push('\u{FB01}'); // fi ligature
+        v.push('\u{FB02}'); // fl ligature
+        v.push('\u{FB03}'); // ffi ligature
+        v.push('\u{FB04}'); // ffl ligature
         v
     });
     &CHARS
@@ -459,6 +465,8 @@ fn char_weight(c: char) -> f32 {
         'I' | 'l' | '1' | '|' | '!' | '.' | ',' | ':' | ';' | '-' => 0.5,
         'b' | 'd' | 'p' | 'q' | 'n' | 'u' | 'o' | 'c' | 'O' | 'C' | 'D' => 0.8,
         'k' | 'w' | 'x' | 'z' | 'A' | 'B' | 'E' | 'F' | 'K' | 'M' | 'N' | 'W' => 1.2,
+        // Ligatures — highly discriminative (font either has the glyph or doesn't)
+        '\u{FB00}' | '\u{FB01}' | '\u{FB02}' | '\u{FB03}' | '\u{FB04}' => 2.0,
         _ => 1.0,
     }
 }
@@ -1614,15 +1622,22 @@ pub fn normalize_to_ink_bounds(img: &GrayImage) -> Option<GrayImage> {
 // ---------------------------------------------------------------------------
 
 /// Extract individual character crops from a scan line.
+/// Result of `extract_line_chars`: always contains `plain` crops,
+/// and `ligature` crops when ligature-eligible sequences exist.
+pub struct LineCharCrops {
+    pub plain: Vec<(char, GrayImage)>,
+    pub ligature: Option<Vec<(char, GrayImage)>>,
+}
+
 pub fn extract_line_chars<F: ab_glyph::Font>(
     page: &GrayImage,
     words: &[WordPlacement],
     line_height: u32,
     diag_seg_dir: Option<&std::path::Path>,
     diag_ref_font: Option<&F>,
-) -> Vec<(char, GrayImage)> {
+) -> LineCharCrops {
     if words.is_empty() || line_height == 0 {
-        return Vec::new();
+        return LineCharCrops { plain: Vec::new(), ligature: None };
     }
 
     // Crop whole words (reliable bboxes from Tesseract) and split them
@@ -1635,7 +1650,10 @@ pub fn extract_line_chars<F: ab_glyph::Font>(
     sorted.sort_by(|a, b| b.text.chars().count().cmp(&a.text.chars().count()));
 
     let mut char_counts: HashMap<char, usize> = HashMap::new();
+    let mut char_counts_lig: HashMap<char, usize> = HashMap::new();
     let mut results: Vec<(char, GrayImage)> = Vec::new();
+    let mut results_lig_all: Vec<(char, GrayImage)> = Vec::new();
+    let mut any_ligatures = false;
 
     for (word_idx, word) in sorted.iter().enumerate() {
         let chars_in_word: Vec<char> = word.text.chars().filter(|c| is_indexed(*c)).collect();
@@ -1682,25 +1700,96 @@ pub fn extract_line_chars<F: ab_glyph::Font>(
         let (_word_w, word_h) = word_img.dimensions();
         let all_chars: Vec<char> = word.text.chars().collect();
 
-        let ((boundaries, seam_path_map), word_diag_dir) = if let Some(ddir) = diag_seg_dir {
-            let word_slug = crate::seg_diag::sanitize_text(&word.text);
-            let word_dir = ddir.join(format!("word_{:03}_{}", word_idx, word_slug));
-            (segment_characters_diag(&word_img, all_chars.len(), &word_dir, &word.text),
-             Some(word_dir))
-        } else {
-            (segment_characters(&word_img, all_chars.len()), None)
-        };
+        // Build ligature-collapsed char array: replace sequences like
+        // ['f','f','l'] with ['\u{FB04}'] so "affluent" becomes
+        // ['a','\u{FB04}','u','e','n','t'] with n_chars=6.
+        let lig_chars = collapse_ligature_chars(&all_chars);
+        let has_ligatures = lig_chars.len() < all_chars.len();
 
+        let word_diag_dir = diag_seg_dir.map(|ddir| {
+            let word_slug = crate::seg_diag::sanitize_text(&word.text);
+            ddir.join(format!("word_{:03}_{}", word_idx, word_slug))
+        });
+
+        // ── Path A: plain segmentation (OCR chars as-is) ────────────
+        let (bounds_plain, seams_plain) = if let Some(ref wdir) = word_diag_dir {
+            let pdir = wdir.join("seg_plain");
+            segment_characters_diag(&word_img, all_chars.len(), &pdir, &word.text)
+        } else {
+            segment_characters(&word_img, all_chars.len())
+        };
+        let mut results_plain: Vec<(char, GrayImage)> = Vec::new();
+        let mut counts_plain = char_counts.clone();
         extract_chars_from_boundaries(
-            &word_img, &all_chars, &boundaries, &seam_path_map, word_h,
-            &mut char_counts, &mut results,
-            word_diag_dir.as_deref(),
+            &word_img, &all_chars, &bounds_plain, &seams_plain, word_h,
+            &mut counts_plain, &mut results_plain,
+            word_diag_dir.as_ref().map(|d| d.join("seg_plain")).as_deref(),
             diag_ref_font,
         );
+        results.extend(results_plain);
+        char_counts = counts_plain;
+
+        if has_ligatures {
+            any_ligatures = true;
+            // ── Path B: ligature segmentation (reduced n_chars) ─────
+            let (bounds_lig, seams_lig) = if let Some(ref wdir) = word_diag_dir {
+                let ldir = wdir.join("seg_lig");
+                segment_characters_diag(&word_img, lig_chars.len(), &ldir, &word.text)
+            } else {
+                segment_characters(&word_img, lig_chars.len())
+            };
+            let mut results_lig: Vec<(char, GrayImage)> = Vec::new();
+            let mut counts_lig = char_counts_lig.clone();
+            extract_chars_from_boundaries(
+                &word_img, &lig_chars, &bounds_lig, &seams_lig, word_h,
+                &mut counts_lig, &mut results_lig,
+                word_diag_dir.as_ref().map(|d| d.join("seg_lig")).as_deref(),
+                diag_ref_font,
+            );
+            results_lig_all.extend(results_lig);
+            char_counts_lig = counts_lig;
+        }
     }
 
-    results
+    LineCharCrops {
+        plain: results,
+        ligature: if any_ligatures { Some(results_lig_all) } else { None },
+    }
 }
+
+/// Collapse ligature sequences into single Unicode ligature codepoints.
+/// e.g. ['a','f','f','l','u','e','n','t'] → ['a','\u{FB04}','u','e','n','t']
+/// Greedy longest-first matching (ffi/ffl before ff/fi/fl).
+fn collapse_ligature_chars(chars: &[char]) -> Vec<char> {
+    let mut out = Vec::with_capacity(chars.len());
+    let mut i = 0;
+    while i < chars.len() {
+        let mut matched = false;
+        for &(seq, lig_char) in LIGATURE_SEQUENCES {
+            if i + seq.len() <= chars.len() && chars[i..i + seq.len()] == *seq {
+                out.push(lig_char);
+                i += seq.len();
+                matched = true;
+                break;
+            }
+        }
+        if !matched {
+            out.push(chars[i]);
+            i += 1;
+        }
+    }
+    out
+}
+
+/// Ligature sequences: (char_sequence, unicode_ligature_char).
+/// Longer sequences first so ffi/ffl match before ff/fi/fl.
+const LIGATURE_SEQUENCES: &[(&[char], char)] = &[
+    (&['f', 'f', 'i'], '\u{FB03}'),  // ffi
+    (&['f', 'f', 'l'], '\u{FB04}'),  // ffl
+    (&['f', 'f'],      '\u{FB00}'),  // ff
+    (&['f', 'i'],      '\u{FB01}'),  // fi
+    (&['f', 'l'],      '\u{FB02}'),  // fl
+];
 
 fn extract_chars_from_boundaries<F: ab_glyph::Font>(
     word_img: &GrayImage,
@@ -1806,6 +1895,14 @@ fn extract_chars_from_boundaries<F: ab_glyph::Font>(
         results.push((c, scaled));
         *char_counts.entry(c).or_insert(0) += 1;
     }
+
+    // NOTE: Ligature crops used to be appended here (merging adjacent
+    // char segments into a single ﬁ/ﬂ/ﬀ/ﬃ/ﬄ crop within the same
+    // results vec).  This predates the separate plain/ligature
+    // segmentation paths in extract_line_chars.  Now the ligature path
+    // uses collapse_ligature_chars to produce the correct n_chars and
+    // segments directly, so injecting ligature crops here would
+    // contaminate the plain path with ligature characters.
 }
 
 // ---------------------------------------------------------------------------
@@ -2285,7 +2382,7 @@ pub fn per_char_distances(
 
 /// Bump this whenever the feature vector, normalization, or serialization
 /// layout changes. Stale caches auto-rebuild on mismatch.
-const INDEX_VERSION: u32 = 7;
+const INDEX_VERSION: u32 = 8;
 const INDEX_MAGIC: &[u8; 4] = b"UCIX";
 
 /// Save the character index to a binary file.

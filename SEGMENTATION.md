@@ -1,4 +1,4 @@
-# Segmentation Algorithm: VP Split + Dual-DP Seam Carving
+# Segmentation Algorithm: VP Split + Greedy Seam Carving
 
 Reference: Seam carving DP from Avidan & Shamir, SIGGRAPH 2007.
 
@@ -13,18 +13,41 @@ Zero-ink columns are definitive inter-character gaps — no ambiguity.
 
 If this yields ≥ N-1 splits: pick the N-1 widest runs, done.
 
-## Pass 2: Greedy Seam Selection
+Both sides of every VP split must have at least `min_ink_for_symbol` total
+column-ink or the split is rejected.  This threshold scales with the word
+crop height: `(MIN_SYMBOL_FRAC × h)² × 255`, where `MIN_SYMBOL_FRAC = 0.07`
+(a period is roughly 7% of line height).  The squared scaling tracks the
+fact that ink area grows with the square of font size.
 
-For any VP segment that still needs more splits, seam carving takes over.
+## Pass 2: Greedy Seam Carving
+
+For any segments that still need more splits after VP, seam carving takes over.
 
 ### Energy Function
 
 ```
-energy(r, c) = 255 - pixel_value
+darkness(r, c) = 255.0 - pixel_value
 ```
 
-White pixels have zero energy; black pixels have 255. This is "darkness" —
-seams seek paths through whitespace (zero cost) and avoid ink.
+White pixels have zero darkness; solid black pixels have 255. This is the
+base per-pixel cost — seams seek paths through whitespace (zero cost) and
+avoid ink.
+
+### Entry Penalty
+
+On top of the base darkness cost, the DP adds an **entry penalty** when the
+path moves into a darker pixel than its predecessor:
+
+```
+entry_penalty = ENTRY_PENALTY_WEIGHT × max(0, darkness[r,c] - darkness[r-1,pc])
+```
+
+This directly encodes "stay in whitespace, don't wander into ink." A path
+through the interior of a uniformly dark stroke pays the base darkness cost
+but no entry penalty (the darkness isn't increasing). A path crossing from
+a white gap into a stroke edge pays a heavy penalty.
+
+`ENTRY_PENALTY_WEIGHT = 4.0`.
 
 ### Dual DP: Forward + Reverse
 
@@ -32,24 +55,17 @@ For each segment, two DP passes run simultaneously:
 
 **Forward** (top → bottom):
 ```
-cost_fwd[0][c] = energy(0, c)
-cost_fwd[r][c] = energy(r, c) + min over pc ∈ {c, c-1, c+1} of:
+cost_fwd[0][c] = darkness(0, c)
+cost_fwd[r][c] = darkness(r, c) + min over pc ∈ {c, c-1, c+1} of:
     cost_fwd[r-1][pc] + entry_penalty(r, c, pc)
 ```
 
 **Reverse** (bottom → top):
 ```
-cost_rev[H-1][c] = energy(H-1, c)
-cost_rev[r][c]   = energy(r, c) + min over pc ∈ {c, c-1, c+1} of:
+cost_rev[H-1][c] = darkness(H-1, c)
+cost_rev[r][c]   = darkness(r, c) + min over pc ∈ {c, c-1, c+1} of:
     cost_rev[r+1][pc] + entry_penalty(r, c, pc)
 ```
-
-**Entry penalty** discourages paths that jump from light into dark pixels:
-```
-entry_penalty = max(0, current_darkness - neighbor_darkness) × ENTRY_PENALTY_WEIGHT
-```
-With `ENTRY_PENALTY_WEIGHT = 4.0`. This penalizes transitions from whitespace
-into ink far more than traversal through already-dark areas.
 
 ### Candidate Generation
 
@@ -57,10 +73,11 @@ For each interior column `c` at the vertical midpoint (`mid_r = H/2`),
 the combined cost of the best seam passing through `(mid_r, c)` is:
 
 ```
-combined(c) = cost_fwd[mid_r][c] + cost_rev[mid_r][c] - energy(mid_r, c)
+combined(c) = cost_fwd[mid_r][c] + cost_rev[mid_r][c] - darkness(mid_r, c)
 ```
 
-Subtracting the mid-row energy avoids double-counting.
+Subtracting the mid-row darkness avoids double-counting. Multiple candidate
+seams are generated per segment — all go onto the min-heap.
 
 ### Midpoint Tie-Breaking
 
@@ -107,7 +124,8 @@ Each child inherits up to two boundaries via `SegBounds`:
    All candidates go onto a min-heap keyed by combined cost.
 2. Pop the cheapest candidate. Validate:
    - **Ink on both sides**: the proposed left and right sub-segments must
-     each have at least `MIN_INK_FOR_SYMBOL` total ink (16 × 255 = 4080).
+     each have at least `min_ink_for_symbol` total ink (height-scaled;
+     see Key Constants).
      Rejects splits that would create empty fragments.
 3. Accept the split. Record its midpoint column and full seam path.
 4. Drain all remaining candidates from the old segment (heap cleanup —
@@ -141,10 +159,4 @@ infinite cost or fail ink validation), fall back to
 |----------|-------|---------|
 | `VP_THRESHOLD` | 200 | Grayscale values ≥ 200 are treated as white (no ink) |
 | `ENTRY_PENALTY_WEIGHT` | 4.0 | Multiplier for dark-entry penalty in seam DP |
-| `MIN_INK_FOR_SYMBOL` | 4080 (16×255) | Minimum ink in a sub-segment to count as a character |
-
-## Accuracy
-
-**473/486 (97.3%)** on `font-timeline-specimen.pdf` — 30 fonts spanning
-500 years, including full uppercase/lowercase alphabet lines, serif fonts
-with bridging serifs, and display-size anti-aliased text.
+| `MIN_SYMBOL_FRAC` | 0.07 | Fraction of crop height for the smallest symbol (a period).  Minimum ink threshold = `(0.07 × h)² × 255`, scaling with DPI and font size. |

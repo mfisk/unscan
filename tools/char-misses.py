@@ -48,14 +48,17 @@ FONT_ALIASES = {
     "arial": "helvetica", "arialmt": "helvetica",
     "nimbussans": "helvetica", "helvetica": "helvetica",
     "freesans": "helvetica",
+    "texgyreheros": "helvetica", "texgyreheroscn": "helvetica",
     "timesnewroman": "times", "timesnewromanps": "times",
     "timesroman": "times", "nimbusroman": "times",
     "tinos": "times", "freeserif": "times",
+    "texgyretermes": "times",
     "freeserifitalic": "times", "freeserifbold": "times",
     "freeserifbolditalic": "times",
     "p052": "times", "c059": "times",
     "couriernew": "courier", "couriernewps": "courier",
     "nimbusmonops": "courier", "freemono": "courier",
+    "texgyrecursor": "courier",
     "carlito": "calibri", "caladea": "cambria",
     "sourcesanspro": "sourcesans", "sourcesans3": "sourcesans",
     "sourcesans": "sourcesans",
@@ -128,6 +131,7 @@ def canon(name):
 
 
 def fonts_match(a, b):
+    """Strict font match for hit/miss classification."""
     na = re.sub(r'[^a-z0-9]', '', a.lower())
     nb = re.sub(r'[^a-z0-9]', '', b.lower())
     if na == nb:
@@ -137,7 +141,31 @@ def fonts_match(a, b):
         return True
     if ba in bb or bb in ba:
         return True
+    # Also compare with spaces stripped (e.g. "eb garamond" vs "ebgaramond")
+    sa, sb = ba.replace(' ', ''), bb.replace(' ', '')
+    if sa == sb:
+        return True
+    if sa and sb and (sa in sb or sb in sa):
+        return True
     return canon(a) == canon(b)
+
+
+def fonts_match_broad(a, b):
+    """Broader font match for CI candidate lookup — also handles path-based
+    font keys and alias resolution through normalize_font_name."""
+    if fonts_match(a, b):
+        return True
+    # Compare via normalize (handles path-based font keys)
+    nna, nnb = normalize_font_name(a), normalize_font_name(b)
+    if nna and nnb and (nna == nnb or nna in nnb or nnb in nna):
+        return True
+    # Compare via canon on normalized names (path key → stem → alias)
+    ca, cb = canon(a), canon(b)
+    cna = canon(nna) if nna else ca
+    cnb = canon(nnb) if nnb else cb
+    if cna == cnb:
+        return True
+    return False
 
 
 # ---------------------------------------------------------------------------
@@ -161,8 +189,12 @@ def extract_vector_spans(doc):
     return page_spans
 
 
-def lookup_actual_font(page_spans, page, bbox_px):
-    """Find the dominant font in the vector PDF at the given pixel bbox."""
+def lookup_actual_font(page_spans, page, bbox_px, text=None):
+    """Find the dominant font in the vector PDF at the given pixel bbox.
+    
+    When bbox overlap is ambiguous or empty, falls back to text-content
+    matching against nearby spans (OCR bboxes can be off by a few points).
+    """
     px0 = bbox_px["x"] / SCALE
     py0 = bbox_px["y"] / SCALE
     px1 = (bbox_px["x"] + bbox_px["width"]) / SCALE
@@ -179,9 +211,33 @@ def lookup_actual_font(page_spans, page, bbox_px):
         if ox0 < ox1 and oy0 < oy1:
             font_area[sfont] += (ox1 - ox0) * (oy1 - oy0)
 
-    if not font_area:
-        return None
-    return font_area.most_common(1)[0][0]
+    # If bbox overlap found a clear winner, use it — it's the most reliable
+    # signal since it's position-based, not content-based.
+    if font_area:
+        return font_area.most_common(1)[0][0]
+
+    # Text-content fallback: only when bbox overlap found nothing (OCR bboxes
+    # can be off by a few points).  Use Euclidean distance from bbox center
+    # to span center so column layouts don't confuse the match.
+    if text and len(text) >= 5:
+        audit_prefix = re.sub(r'\s+', '', text[:20].lower())
+        bbox_cx = (px0 + px1) / 2
+        bbox_cy = (py0 + py1) / 2
+        best_text_font = None
+        best_text_dist = 999
+        for sx0, sy0, sx1, sy1, sfont, stext in page_spans.get(page, []):
+            span_prefix = re.sub(r'\s+', '', stext[:20].lower())
+            if audit_prefix[:10] == span_prefix[:10]:
+                span_cx = (sx0 + sx1) / 2
+                span_cy = (sy0 + sy1) / 2
+                dist = ((bbox_cx - span_cx)**2 + (bbox_cy - span_cy)**2) ** 0.5
+                if dist < best_text_dist:
+                    best_text_dist = dist
+                    best_text_font = sfont
+        if best_text_font:
+            return best_text_font
+
+    return None
 
 
 # ---------------------------------------------------------------------------
@@ -248,8 +304,10 @@ def find_correct_ci_candidate(entry, actual_font):
 
     Returns (font_key, score, rank) or (None, None, None).
     """
+    if not actual_font:
+        return None, None, None
     for i, c in enumerate(entry.get("ci_candidates", [])):
-        if fonts_match(c["font_key"], actual_font):
+        if fonts_match_broad(c["font_key"], actual_font):
             return c["font_key"], c["score"], i + 1
     return None, None, None
 
@@ -340,12 +398,16 @@ def find_diag_seg_dir(diag_seg_root, page, text, line_index=None):
     return best
 
 
-def render_seg_picture(diag_line_dir, word_text=None):
+def render_seg_picture(diag_line_dir, word_text=None, seg_subdir=None):
     """Render a labelled segmentation image for a word in diag-seg output.
 
     Returns a PIL Image with the word crop scaled up, split lines drawn in
     colour (red=VP, blue=seam), and column numbers along the
     top.  Returns None if data is missing.
+
+    seg_subdir: if set (e.g. "seg_plain" or "seg_lig"), look for word_crop.png
+    and summary.json inside that subdirectory of each word dir.  If None,
+    auto-detect: prefer seg_plain/seg_lig structure, fall back to flat layout.
     """
     if not diag_line_dir or not os.path.isdir(diag_line_dir):
         return None
@@ -359,8 +421,17 @@ def render_seg_picture(diag_line_dir, word_text=None):
     results = []
     for wd in word_dirs:
         wpath = os.path.join(diag_line_dir, wd)
-        crop_path = os.path.join(wpath, "word_crop.png")
-        summary_path = os.path.join(wpath, "summary.json")
+
+        # Resolve the actual data directory (supports seg_plain/seg_lig structure)
+        if seg_subdir:
+            data_path = os.path.join(wpath, seg_subdir)
+        elif os.path.isdir(os.path.join(wpath, "seg_plain")):
+            data_path = os.path.join(wpath, "seg_plain")
+        else:
+            data_path = wpath
+
+        crop_path = os.path.join(data_path, "word_crop.png")
+        summary_path = os.path.join(data_path, "summary.json")
         if not os.path.exists(crop_path) or not os.path.exists(summary_path):
             continue
 
@@ -642,7 +713,7 @@ def build_miss_html(entry, chars_to_show, crop_dir, crop_files,
     chosen_score = None
     chosen_rank = None
     for i, c in enumerate(entry.get("ci_candidates", []), 1):
-        if fonts_match(c["font_key"], matched):
+        if fonts_match_broad(c["font_key"], matched):
             chosen_score = c["score"]
             chosen_rank = i
             break
@@ -651,15 +722,52 @@ def build_miss_html(entry, chars_to_show, crop_dir, crop_files,
     chosen_rank_str = f"CI #{chosen_rank}, score {chosen_score:.4f}" if chosen_rank and chosen_score else ""
     chosen_col_hdr = f"{matched}<br><span class='score'>{chosen_rank_str}</span>"
 
-    # Segmentation picture
+    # Segmentation picture — show both plain and ligature when available
     seg_html = ""
     diag_line_dir = find_diag_seg_dir(diag_seg_root, entry["page"], entry.get("text", ""),
                                        line_index=entry.get("line_index"))
     if diag_line_dir:
-        seg_result = render_seg_picture(diag_line_dir)
-        if seg_result:
-            seg_img, seg_caption = seg_result
-            seg_html = f"""<div class="seg-block">
+        seg_winner = entry.get("seg_winner")
+        has_lig_path = any(
+            os.path.isdir(os.path.join(diag_line_dir, d, "seg_lig"))
+            for d in os.listdir(diag_line_dir)
+            if d.startswith("word_") and os.path.isdir(os.path.join(diag_line_dir, d))
+        )
+
+        if has_lig_path:
+            # Show both paths side by side
+            seg_plain_result = render_seg_picture(diag_line_dir, seg_subdir="seg_plain")
+            seg_lig_result = render_seg_picture(diag_line_dir, seg_subdir="seg_lig")
+
+            parts = []
+            for label, result, is_winner in [
+                ("Plain", seg_plain_result, seg_winner == "plain"),
+                ("Ligature", seg_lig_result, seg_winner == "ligature"),
+            ]:
+                if result:
+                    seg_img, seg_caption = result
+                    winner_badge = ' <span style="color:#2e7d32;font-weight:bold">★ winner</span>' if is_winner else ''
+                    parts.append(f"""<div style="flex:1;min-width:0">
+<div style="font-weight:600;margin-bottom:4px">{label} segmentation{winner_badge}</div>
+<img src="{img_to_b64(seg_img)}" class="seg-img" style="max-width:100%">
+<div class="seg-caption">{seg_caption}</div>
+</div>""")
+
+            if parts:
+                seg_html = f"""<div class="seg-block">
+<div class="seg-legend">
+  <span class="leg-vp">■ VP split</span>
+  <span class="leg-seam">■ seam split</span>
+</div>
+<div style="display:flex;gap:16px;flex-wrap:wrap">
+{"".join(parts)}
+</div>
+</div>"""
+        else:
+            seg_result = render_seg_picture(diag_line_dir)
+            if seg_result:
+                seg_img, seg_caption = seg_result
+                seg_html = f"""<div class="seg-block">
 <div class="seg-legend">
   <span class="leg-vp">■ VP split</span>
   <span class="leg-seam">■ seam split</span>
@@ -668,6 +776,7 @@ def build_miss_html(entry, chars_to_show, crop_dir, crop_files,
 <div class="seg-caption">{seg_caption}</div>
 </div>"""
 
+    # Show alternate (lig) CI candidates when available
     return f"""<div class="miss">
 <h3>p{entry['page']}:L{entry['line_index']} — "{text_preview}"{ssim_html}</h3>
 {seg_html}
@@ -807,7 +916,7 @@ def main():
             skipped += 1
             continue
 
-        actual_font = lookup_actual_font(page_spans, e["page"], bbox)
+        actual_font = lookup_actual_font(page_spans, e["page"], bbox, text=e.get("text"))
         if actual_font is None:
             skipped += 1
             continue

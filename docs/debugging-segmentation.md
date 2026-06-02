@@ -11,13 +11,14 @@ identification misses in unscan.
 
 ## Diagnostic Tools
 
-### `--audit-log <path>` — Pipeline Audit JSON
+### `--audit <DIR>` — Pipeline Audit
 
-Produces a single JSON file with every pipeline decision. This is the
+Produces an audit directory with `audit.json` (pipeline decisions) plus
+per-line directories with per-word segmentation diagnostics. This is the
 primary data source for diagnosing font identification failures.
 
 ```bash
-./target/release/unscan INPUT.pdf -o /dev/null --audit-log /tmp/audit.json
+./target/release/unscan INPUT.pdf -o /dev/null --audit /tmp/audit-out
 ```
 
 **Top-level structure** (`AuditLog`):
@@ -50,6 +51,9 @@ primary data source for diagnosing font identification failures.
 | `bbox` | {x, y, width, height} | Pixel bounding box at render DPI |
 | `ci_candidates` | CiCandidate[] | CI candidate fonts with scores |
 | `ci_char_votes` | CharCiVote[] | Per-character CI voting detail |
+| `seg_winner` | string? | Which segmentation path won: `"plain"` or `"ligature"` |
+| `ci_candidates_lig` | CiCandidate[]? | CI candidates from the alternate (non-winning) path |
+| `ci_char_votes_lig` | CharCiVote[]? | Per-character CI votes from the alternate path |
 | `words` | WordAudit[] | Per-word SSIM reranking detail |
 | `word_rerank_winner` | string? | Font chosen by word-level SSIM |
 
@@ -188,8 +192,8 @@ before investigating scoring.
 
 | Tool | Purpose | Usage |
 |------|---------|-------|
-| `tools/verify-accuracy.py` | Span-level accuracy vs vector PDF ground truth | `python3 tools/verify-accuracy.py /tmp/audit.json VECTOR.pdf [--verbose]` |
-| `tools/char-misses.py` | Visual HTML report of line-level misses with inline crop images | `python3 tools/char-misses.py /tmp/audit.json VECTOR.pdf --crops /tmp/unscan-crops -o /tmp/misses.html` |
+| `tools/verify-accuracy.py` | Span-level accuracy vs vector PDF ground truth | `python3 tools/verify-accuracy.py /tmp/audit-out/audit.json VECTOR.pdf [--verbose]` |
+| `tools/char-misses.py` | Visual HTML report of line-level misses with inline crop images | `python3 tools/char-misses.py /tmp/audit-out/audit.json VECTOR.pdf --crops /tmp/unscan-crops -o /tmp/misses.html` |
 
 **After any accuracy test that is not 100%:** run `tools/verify-accuracy.py`
 with `--misses-only` first. Understand every miss before proposing fixes.
@@ -201,6 +205,7 @@ with `--misses-only` first. Understand every miss before proposing fixes.
 | Flag | Description |
 |------|-------------|
 | `--include-font <NAME>` | Force a font (case-insensitive substring) into word SSIM reranking for all lines, even if CI pruned it. Score shows as -999 in audit. |
+| `--include-fontmap <FILE>` | Inject all fonts from a fontmap JSON (`{"Name": "/path/to/font.ttf", ...}`) into CI audit candidate list. Like `--include-font` but in bulk. |
 | `--thoroughness <FLOAT>` | Scale CI thresholds (default 1.0). Higher = more candidates survive CI, slower. Useful for testing if a correct font is being over-pruned. |
 | `--compare` | Generate side-by-side scan/render overlay images in `<output>-compare/` |
 | `--overlay` | Debug render mode: original raster kept, vector text overlaid in semitransparent red |
@@ -233,65 +238,37 @@ Key derived values:
 
 ### Pass 1: Zero-Ink VP (Vertical Projection)
 
-Iterative, ink-trimmed splitting at the deepest ink valley.
+Find contiguous runs of zero-ink columns (interior only, not touching edges).
+Split at each run's midpoint. Both sides must have at least
+`min_ink_for_symbol` total column-ink or the split is rejected.  This
+threshold scales with the word crop height: `(0.07 × h)² × 255`.
 
-**Each iteration:**
-1. For each segment, find the best run of consecutive zero-ink columns
-   (interior only — not touching segment edges)
-2. **Rank runs by minimum `col_ink` within the run** (lower = deeper
-   valley = better split). Width breaks ties (wider preferred).
-3. Split at the column with minimum ink in the winning run
-4. After splitting, trim each child segment to its ink extent (columns
-   where `col_has_ink` is true), so whitespace margins don't participate
-   in future searches
+If this yields ≥ N-1 splits, pick the N-1 widest runs and stop.
 
-**Why ink-trimmed?** Without trimming, adjacent zero-ink columns near a
-split point appear in both children, causing near-duplicate splits (e.g.,
-cols 173 and 174) that waste split slots.
+### Pass 2: Greedy Seam Carving
 
-**Repeat** until `n_chars - 1` splits found or no more zero-ink runs exist.
+If Pass 1 didn't find enough splits, seam carving takes over for the
+remaining splits.
 
-### Pass 2: ≤5% Ink VP
+**Energy function:** each pixel's base cost is its darkness
+(`255.0 - pixel_value`). White pixels are zero cost; black pixels are 255.
+The DP adds an **entry penalty** when the path moves into a darker pixel:
+`ENTRY_PENALTY_WEIGHT (4.0) × max(0, darkness_increase)`. This encodes
+"stay in whitespace, don't wander into ink" — a path through a uniformly
+dark stroke interior pays base cost but no entry penalty, while a path
+crossing from a white gap into a stroke edge pays heavily.
 
-If Pass 1 didn't find enough splits, relax: a column counts as "whitespace"
-if `col_ink[x] ≤ max_ink / 17` (~5.9% of peak ink).
+**Dual DP (forward + reverse)** computes cost matrices from both top and
+bottom. For each interior column at the midpoint row, the combined cost
+gives a candidate seam score. Multiple candidates per segment are generated
+and placed on a global min-heap.
 
-Same valley-ranking logic: **minimum ink wins**, not widest run. This is
-critical for high-contrast fonts (Didone/Bodoni) where hairline serifs
-create wide low-ink regions within a single character. The actual inter-
-character gap has even less ink than the hairline, so minimum-ink ranking
-correctly prefers it.
+**Greedy loop:** pop cheapest candidate, validate ink on both sides
+(min_ink_for_symbol), accept the split, compute diagonal-masked candidates
+for the two child segments, repeat.
 
-**Example — PlayfairDisplay "Typography":**
-The T's hairline serifs (cols 7–17) have col_ink ≈ 580–1049. The h-y gap
-(cols 439–449) has col_ink ≈ 64–763. Both are ≤ 5% of peak. Both runs are
-11 columns wide. But the h-y gap has min ink = 64 vs the T hairline's
-min ink = 580, so the h-y gap wins — the correct split.
-
-### Pass 3: Greedy Seam Carving
-
-For remaining splits that VP couldn't find, use dynamic-programming seam
-carving to find the cheapest vertical path through each under-split segment.
-
-```
-energy(r,c) = (255 - pixel) if pixel < 200, else 0
-M(0, c) = energy(0, c)
-M(r, c) = energy(r, c) + min(M(r-1, c-1), M(r-1, c), M(r-1, c+1))
-```
-
-All segments' cheapest seams go into a min-heap. Pop cheapest, split,
-recompute children, repeat until enough splits.
-
-### Pass 4: Charbox Fallback
-
-After VP + seam, check for segments wider than `avg_char_width × 3`. For
-those, inject Tesseract's charbox boundaries to split them. This handles
-cases where VP and seam both fail (e.g., truly overlapping characters).
-
-**Caution:** The charbox fallback adds splits without reducing the total
-count. This can produce more segments than characters, causing a mismatch
-between character labels and crop images (character N gets the wrong crop).
-The `summary.json` `mismatch` field flags this.
+See `SEGMENTATION.md` for the full algorithm description including diagonal
+masking, midpoint tie-breaking, and straight-path preference.
 
 ### normalize_to_ink_bounds
 
@@ -387,11 +364,11 @@ Compare against `vp_overlay.png` to see if VP missed a genuine gap.
 
 ```bash
 # Run with audit
-./target/release/unscan test-docs/font-timeline-specimen-rasterized.pdf \
-    -o /dev/null --audit-log /tmp/audit.json
+./target/release/unscan test-docs/font-timeline-specimen-scanned.pdf \
+    -o /dev/null --audit /tmp/audit-out
 
 # Check accuracy
-python3 tools/verify-accuracy.py /tmp/audit.json \
+python3 tools/verify-accuracy.py /tmp/audit-out/audit.json \
     test-docs/font-timeline-specimen.pdf --misses-only
 ```
 
@@ -410,28 +387,28 @@ that before investigating CI scoring.
 
 ```bash
 # Find a specific line
-jq '.text_entries[] | select(.text | contains("Typography"))' /tmp/audit.json
+jq '.text_entries[] | select(.text | contains("Typography"))' /tmp/audit-out/audit.json
 
 # Show CI candidates for that line
-jq '.text_entries[] | select(.text | contains("Typography")) | .ci_candidates' /tmp/audit.json
+jq '.text_entries[] | select(.text | contains("Typography")) | .ci_candidates' /tmp/audit-out/audit.json
 
 # Show per-character votes
-jq '.text_entries[] | select(.text | contains("Typography")) | .ci_char_votes[]' /tmp/audit.json
+jq '.text_entries[] | select(.text | contains("Typography")) | .ci_char_votes[]' /tmp/audit-out/audit.json
 
 # Find characters that failed the quality gate
-jq '.text_entries[] | select(.text | contains("Typography")) | .ci_char_votes[] | select(.passed_gate == false)' /tmp/audit.json
+jq '.text_entries[] | select(.text | contains("Typography")) | .ci_char_votes[] | select(.passed_gate == false)' /tmp/audit-out/audit.json
 
 # Find the worst-scoring characters (highest distance)
-jq '.text_entries[] | select(.text | contains("Typography")) | .ci_char_votes | sort_by(-.min_dist_sq) | .[0:3]' /tmp/audit.json
+jq '.text_entries[] | select(.text | contains("Typography")) | .ci_char_votes | sort_by(-.min_dist_sq) | .[0:3]' /tmp/audit-out/audit.json
 
 # Show word SSIM scores
-jq '.text_entries[] | select(.text | contains("Typography")) | .words[].candidates | sort_by(-.ssim) | .[0:3]' /tmp/audit.json
+jq '.text_entries[] | select(.text | contains("Typography")) | .words[].candidates | sort_by(-.ssim) | .[0:3]' /tmp/audit-out/audit.json
 
 # Find all lines where CI and final match disagree
-jq '.text_entries[] | select(.word_rerank_winner != null and .word_rerank_winner != .font_matched)' /tmp/audit.json
+jq '.text_entries[] | select(.word_rerank_winner != null and .word_rerank_winner != .font_matched)' /tmp/audit-out/audit.json
 
 # List all fonts matched, with counts
-jq '[.text_entries[] | .font_matched] | group_by(.) | map({font: .[0], count: length}) | sort_by(-.count)' /tmp/audit.json
+jq '[.text_entries[] | .font_matched] | group_by(.) | map({font: .[0], count: length}) | sort_by(-.count)' /tmp/audit-out/audit.json
 ```
 
 ### Step 4: Inspect Segmentation
@@ -497,11 +474,11 @@ If segmentation is correct but CI picks the wrong font:
 ```bash
 # Which characters of the correct font have worst distances?
 jq '.text_entries[] | select(.text | contains("Typography")) |
-  .ci_char_votes[] | {ch, min_dist_sq, top_match: .nearest[0]}' /tmp/audit.json
+  .ci_char_votes[] | {ch, min_dist_sq, top_match: .nearest[0]}' /tmp/audit-out/audit.json
 
 # Is the correct font in the candidate list at all?
 jq '.text_entries[] | select(.text | contains("Typography")) |
-  .ci_candidates[] | select(.font_key | test("Playfair"; "i"))' /tmp/audit.json
+  .ci_candidates[] | select(.font_key | test("Playfair"; "i"))' /tmp/audit-out/audit.json
 ```
 
 If the correct font isn't in `ci_candidates`, it was pruned by CI's σ cutoff.
@@ -531,38 +508,37 @@ force it into word SSIM reranking.
 | Span-level accuracy | `tools/verify-accuracy.py` | — |
 | Line-level miss report | `tools/char-misses.py` | — |
 | Test ground truth | `test-docs/font-timeline-specimen.pdf` | Vector PDF |
-| Test raster input | `test-docs/font-timeline-specimen-rasterized.pdf` | 300 DPI raster |
+| Test raster input | `test-docs/font-timeline-specimen-scanned.pdf` | 6-page simulated scan |
 
 ---
 
 ## Quick Reference: Full Diagnostic Run
 
 ```bash
-# Full diagnostic run: audit + crops + diag-seg
-rm -rf /tmp/unscan-crops /tmp/diag-seg
+# Full diagnostic run: audit + crops
+rm -rf /tmp/unscan-crops
 UNSCAN_DUMP_CROPS=1 RUST_LOG=info \
-  ./target/release/unscan test-docs/font-timeline-specimen-rasterized.pdf \
+  ./target/release/unscan test-docs/font-timeline-specimen-scanned.pdf \
     -o /dev/null \
-    --audit-log /tmp/audit.json \
-    --diag-seg /tmp/diag-seg \
+    --audit /tmp/audit-out \
     2>&1 | tee /tmp/unscan.log
 
 # Accuracy check
-python3 tools/verify-accuracy.py /tmp/audit.json \
+python3 tools/verify-accuracy.py /tmp/audit-out/audit.json \
     test-docs/font-timeline-specimen.pdf --misses-only
 
 # Visual miss report
-python3 tools/char-misses.py /tmp/audit.json \
+python3 tools/char-misses.py /tmp/audit-out/audit.json \
     test-docs/font-timeline-specimen.pdf \
-    --crops /tmp/unscan-crops \
+    --fontmap test-docs/font-timeline-specimen-fontmap.json \
     -o ~/workspace/your_files/char-misses/index.html
 
 # Find segmentation mismatches
-find /tmp/diag-seg -name summary.json | xargs jq -r \
+find /tmp/audit-out -name summary.json | xargs jq -r \
   'select(.mismatch) | .word_text'
 
 # Dump all CI failures (correct font not #1)
 jq '.text_entries[] | select(.ci_candidates | length > 0) |
   {text, matched: .font_matched, ci_top: .ci_candidates[0].font_key,
-   ci_score: .ci_candidates[0].score}' /tmp/audit.json
+   ci_score: .ci_candidates[0].score}' /tmp/audit-out/audit.json
 ```

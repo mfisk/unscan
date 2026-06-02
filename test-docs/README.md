@@ -89,11 +89,15 @@ python3 gen-specimen.py
 ```
 
 This produces:
-- `font-timeline-specimen.pdf` — 3-page vector PDF, 28 font sections spanning
+- `font-timeline-specimen.pdf` — 6-page vector PDF, 30 font sections spanning
   1530–2020, each rendered in the actual font described. Includes OT variant
   demos (onum, smcp, ss01–ss03, titl) where available.
 - `font-timeline-specimen-scanned.pdf` — same content with simulated scan
   artifacts: ~2° skew, Gaussian blur, speckle noise, off-white paper.
+  **This is the canonical rasterized input** for accuracy testing (6 pages).
+- `font-timeline-specimen-fontmap.json` — maps font names to the exact
+  TTF/OTF font file paths on disk. Used by `char-misses.py` for ground-truth
+  rendering and by `unscan --include-fontmap` for CI audit injection.
 - `font-timeline-specimen.json` — machine-readable ground truth mapping each
   section index to its font family, pango font name, source URL, and which
   OpenType features are demonstrated.
@@ -186,7 +190,7 @@ See `historical/ground-truth.json` for expected fonts and confidence levels.
 
 ## Font Coverage
 
-The specimen includes **28 typefaces** from these sources:
+The specimen includes **30 typefaces** from these sources:
 
 | Source | Fonts | License | How to install |
 |--------|-------|---------|----------------|
