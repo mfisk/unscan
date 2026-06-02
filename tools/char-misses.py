@@ -277,13 +277,15 @@ def find_font_file_by_key(font_key):
 def resolve_font_from_map(font_name, font_map):
     """Resolve a font name to a file path using the ground-truth font map.
 
-    The map keys are ReportLab names like 'PlayfairDisplay' or 'PlayfairDisplay-Bold'.
-    PyMuPDF font names are like 'PlayfairDisplay-Regular'. We match by cleaned prefix.
+    The map is keyed by PostScript names extracted from the vector PDF (e.g.
+    'PlayfairDisplay-Regular', 'EBGaramond-Bold', 'SourceSerif4-It').
+    PyMuPDF span font names use the same PostScript names, so direct match
+    is the common case.  Prefix match handles minor naming discrepancies.
     """
     if not font_map or not font_name:
         return None
     target = clean(font_name)
-    # Direct key match
+    # Direct key match (common case with PS-name-keyed fontmap)
     for key, path in font_map.items():
         if clean(key) == target:
             return path
