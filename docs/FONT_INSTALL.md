@@ -37,15 +37,11 @@ Real fonts are installed to:
 - `/usr/local/share/fonts/typewriter/` — Special Elite, Prestige Elite, Letter Gothic
 - `/usr/share/fonts/truetype/msttcorefonts/` — Microsoft Core Fonts
 
-## Verification
-
-Check installation:
+## Installation
 
 ```bash
-bash scripts/check-fonts.sh
+./scripts/install-all-fonts.sh
 ```
-
-Expected output: `✓ All required fonts are installed.`
 
 ## Why this matters
 
