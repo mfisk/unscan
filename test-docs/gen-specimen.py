@@ -678,7 +678,7 @@ class StackedFlowables(Flowable):
 # ---------------------------------------------------------------------------
 # Build the specimen PDF
 # ---------------------------------------------------------------------------
-def build_specimen(out_pdf):
+def build_specimen(out_pdf, registered):
     """Build a proper vector PDF with embedded fonts and SVG logos."""
 
     # Two-column layout
@@ -744,6 +744,11 @@ def build_specimen(out_pdf):
 
     for section in SECTIONS:
         rl = section["rl_font"]
+        if rl not in registered:
+            raise RuntimeError(
+                f"Font '{rl}' (family '{section['font_family']}') not registered — "
+                f"run scripts/install-all-fonts.sh to install missing fonts"
+            )
         text_items = []  # left column: all text flowables
         img_items = []   # right column: headshot + logo stacked
 
@@ -863,98 +868,26 @@ def build_specimen(out_pdf):
 
 
 # ---------------------------------------------------------------------------
-# "Scan" a PDF — rasterize + degrade
+# "Scan" a PDF — rasterize via tools/rasterize.py
 # ---------------------------------------------------------------------------
 def scan_pdf(clean_pdf, scanned_pdf, dpi=300):
-    """Rasterize a vector PDF and repackage with scan artifacts."""
-    import numpy as np
-    from PIL import Image, ImageFilter
+    """Rasterize a vector PDF.  Clean by default — no skew, noise, or blur.
 
-    tmpdir = "/tmp/specimen-scan"
-    os.makedirs(tmpdir, exist_ok=True)
-
-    # Count pages
-    result = subprocess.run(
-        ["pdfinfo", str(clean_pdf)], capture_output=True, text=True
-    )
-    num_pages = 1
-    for line in result.stdout.split('\n'):
-        if line.startswith('Pages:'):
-            num_pages = int(line.split(':')[1].strip())
-            break
-
-    # Consistent skew for all pages (like a real scanner placement)
-    skew_deg = random.uniform(1.5, 3.0)
-    if random.random() < 0.5:
-        skew_deg = -skew_deg
-    print(f"  Skew: {skew_deg:.1f}°")
-
-    scanned_pages = []
-    for i in range(num_pages):
-        page_num = i + 1
-        # Rasterize this page with pdftoppm
-        prefix = f"{tmpdir}/page_{i:03d}"
-        subprocess.run([
-            "pdftoppm", "-r", str(dpi), "-f", str(page_num), "-l", str(page_num),
-            "-gray", str(clean_pdf), prefix
-        ], capture_output=True)
-
-        # Find the output file
-        png_path = None
-        for ext in [f"-{page_num}.pgm", f"-{page_num:02d}.pgm", f"-{page_num:03d}.pgm"]:
-            candidate = prefix + ext
-            if os.path.exists(candidate):
-                png_path = candidate
-                break
-        if not png_path:
-            # Try globbing
-            import glob
-            matches = glob.glob(f"{prefix}*")
-            if matches:
-                png_path = matches[0]
-
-        if not png_path:
-            print(f"  WARN: rasterization failed for page {page_num}")
-            continue
-
-        im = Image.open(png_path).convert("L")
-        orig_w, orig_h = im.size
-
-        # 1. Rotate (skew)
-        im = im.rotate(skew_deg, resample=Image.BICUBIC, expand=True, fillcolor=245)
-
-        # Crop back to original size (centered)
-        cx, cy = im.width // 2, im.height // 2
-        left = cx - orig_w // 2
-        top = cy - orig_h // 2
-        im = im.crop((left, top, left + orig_w, top + orig_h))
-
-        # 2. Paper texture + noise
-        arr = np.array(im, dtype=np.float32)
-        paper_noise = np.random.normal(0, 1.5, arr.shape).astype(np.float32)
-        arr = np.clip(arr + paper_noise, 0, 255)
-        arr = arr * 0.96 + 8  # darken slightly (scanner doesn't produce pure white)
-
-        # 3. Speckle noise (dust on scanner glass)
-        speckle = np.random.random(arr.shape)
-        arr[speckle < 0.0003] = np.random.randint(40, 120, size=np.sum(speckle < 0.0003))
-
-        # 4. Light Gaussian blur (scanner optics)
-        im = Image.fromarray(np.clip(arr, 0, 255).astype(np.uint8), mode="L")
-        im = im.filter(ImageFilter.GaussianBlur(radius=0.7))
-
-        out_path = f"{tmpdir}/scanned_{i:03d}.png"
-        im.save(out_path, dpi=(dpi, dpi))
-        scanned_pages.append(out_path)
-
-    # Reassemble as PDF
-    import img2pdf
-    with open(str(scanned_pdf), "wb") as f:
-        layout = img2pdf.get_layout_fun(
-            pagesize=(img2pdf.in_to_pt(8.5), img2pdf.in_to_pt(11))
-        )
-        f.write(img2pdf.convert(scanned_pages, layout_fun=layout))
-
+    All artifact options live in tools/rasterize.py; pass --scan there
+    for the full scanner-artifact experience.
+    """
+    rasterize_py = os.path.join(os.path.dirname(__file__), "..", "tools", "rasterize.py")
+    cmd = [
+        "python3", rasterize_py,
+        str(clean_pdf), str(scanned_pdf),
+        "--dpi", str(dpi),
+        "--backend", "poppler",
+    ]
+    result = subprocess.run(cmd, capture_output=True, text=True)
+    if result.returncode != 0:
+        print(f"  ERROR: rasterize.py failed:\n{result.stderr}\n{result.stdout}")
+        raise RuntimeError("rasterize.py failed")
+    print(f"  {result.stdout.strip()}")
     return scanned_pdf
 
 
@@ -968,7 +901,7 @@ def main():
 
     out_pdf = OUT_DIR / "font-timeline-specimen.pdf"
     print(f"Building vector specimen: {out_pdf}")
-    build_specimen(out_pdf)
+    build_specimen(out_pdf, registered)
 
     out_fontmap = OUT_DIR / "font-timeline-specimen-fontmap.json"
     print(f"Writing font file map: {out_fontmap}")
