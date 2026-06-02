@@ -564,6 +564,9 @@ fn run(args: &cli::Args) -> Result<(), ScanTextError> {
             text_color: (u8, u8, u8),
             ci_top_for_audit: Vec<(String, f32)>,
             ci_char_detail: Vec<char_index::CharCiDetail>,
+            ci_top_for_audit_lig: Vec<(String, f32)>,
+            ci_char_detail_lig: Vec<char_index::CharCiDetail>,
+            seg_winner: Option<String>,
             diag_seg_dir: Option<std::path::PathBuf>,
             /// Per-char distances to the chosen font, keyed by crop_index.
             chosen_char_dists: std::collections::HashMap<usize, f32>,
@@ -571,7 +574,12 @@ fn run(args: &cli::Args) -> Result<(), ScanTextError> {
 
         let fontmatch_start = std::time::Instant::now();
         let line_matches: Vec<LineMatch> = lines.par_iter().enumerate().map(|(li, line)| {
-            eprintln!("  MEM line {} start: {} (\"{}\")", li, mem_info(), &line.text[..line.text.len().min(30)]);
+            let preview_end = {
+                let mut end = line.text.len().min(30);
+                while end > 0 && !line.text.is_char_boundary(end) { end -= 1; }
+                end
+            };
+            eprintln!("  MEM line {} start: {} (\"{}\")", li, mem_info(), &line.text[..preview_end]);
             // Dump total mapped size from /proc/self/maps
             if li == 2 || li == 45 {
                 if let Ok(maps) = std::fs::read_to_string("/proc/self/maps") {
@@ -602,6 +610,9 @@ fn run(args: &cli::Args) -> Result<(), ScanTextError> {
             );
             let mut ci_top_for_audit: Vec<(String, f32)>;
             let ci_char_detail: Vec<char_index::CharCiDetail>;
+            let mut ci_top_for_audit_lig: Vec<(String, f32)>;
+            let ci_char_detail_lig: Vec<char_index::CharCiDetail>;
+            let seg_winner: Option<String>;
             let diag_seg_dir: Option<std::path::PathBuf> = args.diag_seg_dir().map(|d| {
                 let line_slug: String = line.text.chars().take(30)
                     .map(|c| if c.is_alphanumeric() { c } else { '_' })
@@ -622,12 +633,15 @@ fn run(args: &cli::Args) -> Result<(), ScanTextError> {
                 })
                 .collect();
             let line_height = line.words.iter().map(|w| w.height).max().unwrap_or(0);
-            let char_crops = char_index::extract_line_chars(
+            let line_crops = char_index::extract_line_chars(
                 &gray_page, &word_placements, line_height,
                 diag_seg_dir.as_deref(),
                 diag_ref_font.as_ref(),
             );
-            eprintln!("  MEM line {} after segmentation: {} ({} crops)", li, mem_info(), char_crops.len());
+            let char_crops = &line_crops.plain;
+            eprintln!("  MEM line {} after segmentation: {} ({} plain crops, {} lig crops)",
+                li, mem_info(), char_crops.len(),
+                line_crops.ligature.as_ref().map_or(0, |v| v.len()));
 
             let font_result = {
 
@@ -649,6 +663,8 @@ fn run(args: &cli::Args) -> Result<(), ScanTextError> {
 
                 // Also dump per-line crops into diag-seg dir when --diag-seg is set.
                 // This makes the miss report work without UNSCAN_DUMP_CROPS.
+                // NOTE: We dump plain crops here before scoring; after the winner
+                // is decided we overwrite with winning crops if different (see below).
                 if let Some(ref ddir) = diag_seg_dir {
                     if !char_crops.is_empty() {
                         let crop_dir = ddir.join("crops");
@@ -662,11 +678,77 @@ fn run(args: &cli::Args) -> Result<(), ScanTextError> {
                     }
                 }
 
-                let ci_result = char_index::search_candidates(&char_index, &char_crops, args.thoroughness, args.audit.is_some());
-                eprintln!("  MEM line {} after CI search: {}", li, mem_info());
+                // ── Score plain path ─────────────────────────────────
+                let ci_result_plain = char_index::search_candidates(&char_index, char_crops, args.thoroughness, args.audit.is_some());
+
+                // ── Score ligature path (if present) ─────────────────
+                let ci_result_lig = line_crops.ligature.as_ref().map(|lig_crops| {
+                    char_index::search_candidates(&char_index, lig_crops, args.thoroughness, args.audit.is_some())
+                });
+
+                // ── Pick the winner: higher top score wins ───────────
+                let plain_top = ci_result_plain.scores.first().map(|(_, s)| *s).unwrap_or(f32::MIN);
+                let lig_top = ci_result_lig.as_ref()
+                    .and_then(|r| r.scores.first().map(|(_, s)| *s))
+                    .unwrap_or(f32::MIN);
+                let use_lig = ci_result_lig.is_some() && lig_top > plain_top;
+
+                let (ci_result, _winning_crops) = if use_lig {
+                    (ci_result_lig.as_ref().unwrap(), line_crops.ligature.as_ref().unwrap().as_slice())
+                } else {
+                    (&ci_result_plain, char_crops.as_slice())
+                };
+
+                // Store both paths for audit
                 ci_top_for_audit = ci_result.scores.iter()
                     .map(|(name, score)| (name.clone(), *score)).collect();
-                ci_char_detail = ci_result.char_detail;
+                ci_char_detail = ci_result.char_detail.clone();
+
+                // Store the alternate path for audit
+                let (ci_top_lig_audit, ci_char_lig_audit) = if let Some(ref lig_result) = ci_result_lig {
+                    (lig_result.scores.iter().map(|(n, s)| (n.clone(), *s)).collect(),
+                     lig_result.char_detail.clone())
+                } else {
+                    (Vec::new(), Vec::new())
+                };
+                let (ci_top_plain_audit, ci_char_plain_audit) = (
+                    ci_result_plain.scores.iter().map(|(n, s)| (n.clone(), *s)).collect::<Vec<_>>(),
+                    ci_result_plain.char_detail.clone(),
+                );
+
+                // Store both in the LineMatch for audit output
+                ci_top_for_audit_lig = if use_lig { ci_top_plain_audit } else { ci_top_lig_audit };
+                ci_char_detail_lig = if use_lig { ci_char_plain_audit } else { ci_char_lig_audit };
+                seg_winner = if ci_result_lig.is_some() {
+                    Some(if use_lig { "ligature".to_string() } else { "plain".to_string() })
+                } else {
+                    None
+                };
+
+                eprintln!("  MEM line {} after CI search: {}{}", li, mem_info(),
+                    if let Some(ref w) = seg_winner { format!(" [seg: {}]", w) } else { String::new() });
+
+                // Overwrite diag-seg crops/ and refs/ with winning path's data
+                // (initial dump above used plain; if ligature won, replace).
+                if use_lig {
+                    if let Some(ref ddir) = diag_seg_dir {
+                        let lig_crops = line_crops.ligature.as_ref().unwrap();
+                        if !lig_crops.is_empty() {
+                            let crop_dir = ddir.join("crops");
+                            // Remove old plain crops
+                            if crop_dir.is_dir() {
+                                let _ = std::fs::remove_dir_all(&crop_dir);
+                            }
+                            let _ = std::fs::create_dir_all(&crop_dir);
+                            for (i, (ch, img)) in lig_crops.iter().enumerate() {
+                                let path = crop_dir.join(format!("crop_{:02}_{}.png", i,
+                                    if ch.is_alphanumeric() { format!("{}", ch) }
+                                    else { format!("U{:04X}", *ch as u32) }));
+                                let _ = img.save(&path);
+                            }
+                        }
+                    }
+                }
 
                 // --include-font: inject into CI audit list so it shows in audit
                 if let Some(ref include) = args.include_font {
@@ -675,6 +757,25 @@ fn run(args: &cli::Args) -> Result<(), ScanTextError> {
                         let key = fe.font_key();
                         if key.to_lowercase().contains(&include_lc) && !ci_top_for_audit.iter().any(|(n, _)| n == &key) {
                             ci_top_for_audit.push((key, -999.0)); // sentinel score = included
+                        }
+                    }
+                }
+
+                // --include-fontmap: inject all fonts from a fontmap JSON into CI audit list
+                if let Some(ref fontmap_path) = args.include_fontmap {
+                    if let Ok(data) = std::fs::read_to_string(fontmap_path) {
+                        if let Ok(map) = serde_json::from_str::<std::collections::HashMap<String, String>>(&data) {
+                            for font_path_str in map.values() {
+                                let fp = std::path::Path::new(font_path_str);
+                                for fe in &font_catalog {
+                                    if fe.path == fp {
+                                        let key = fe.font_key();
+                                        if !ci_top_for_audit.iter().any(|(n, _)| n == &key) {
+                                            ci_top_for_audit.push((key, -999.0));
+                                        }
+                                    }
+                                }
+                            }
                         }
                     }
                 }
@@ -702,7 +803,13 @@ fn run(args: &cli::Args) -> Result<(), ScanTextError> {
             }
             // Compute per-char distances for the chosen font.
             // Use corrected characters when the OCR correction gate fired.
-            let corrected_char_crops: Vec<(char, image::GrayImage)> = char_crops.iter()
+            // Use winning path's crops (plain or ligature).
+            let effective_crops: &[(char, image::GrayImage)] = if seg_winner.as_deref() == Some("ligature") {
+                line_crops.ligature.as_ref().map(|v| v.as_slice()).unwrap_or(char_crops)
+            } else {
+                char_crops
+            };
+            let corrected_char_crops: Vec<(char, image::GrayImage)> = effective_crops.iter()
                 .enumerate()
                 .map(|(i, (ch, img))| {
                     let effective_ch = ci_char_detail.iter()
@@ -757,7 +864,7 @@ fn run(args: &cli::Args) -> Result<(), ScanTextError> {
                     }
                 }
             }
-            LineMatch { font_result, text_color, ci_top_for_audit, ci_char_detail, diag_seg_dir, chosen_char_dists }
+            LineMatch { font_result, text_color, ci_top_for_audit, ci_char_detail, ci_top_for_audit_lig, ci_char_detail_lig, seg_winner, diag_seg_dir, chosen_char_dists }
         }).collect();
         let fontmatch_elapsed = fontmatch_start.elapsed();
         eprintln!("  Font matching: {:.1}s ({} lines)", fontmatch_elapsed.as_secs_f32(), lines.len());
@@ -964,6 +1071,26 @@ fn run(args: &cli::Args) -> Result<(), ScanTextError> {
                         }
                     })
                     .collect(),
+                ci_candidates_lig: lm.ci_top_for_audit_lig.iter()
+                    .map(|(k, s)| audit::CiCandidate { font_key: k.clone(), score: *s })
+                    .collect(),
+                ci_char_votes_lig: lm.ci_char_detail_lig.iter()
+                    .map(|d| {
+                        audit::CharCiVote {
+                            ch: d.ch,
+                            crop_index: d.crop_index,
+                            min_dist_sq: d.min_dist_sq,
+                            passed_gate: d.passed_gate,
+                            nearest: d.nearest.clone(),
+                            crop_path: None,
+                            chosen_dist_sq: None,
+                            ocr_corrected_from: d.ocr_corrected_from,
+                            best_alt_char: d.best_alt_char,
+                            best_alt_dist: d.best_alt_dist,
+                        }
+                    })
+                    .collect(),
+                seg_winner: lm.seg_winner.clone(),
             });
 
             placed_texts.push(pdf_out::PlacedText {

@@ -17,7 +17,7 @@ use std::path::{Path, PathBuf};
 use std::process::Command;
 
 /// Minimum acceptable accuracy (hits / compared).
-const MIN_ACCURACY: f64 = 0.86;
+const MIN_ACCURACY: f64 = 0.90;
 
 // ── Specimen setup ───────────────────────────────────────────────────
 
@@ -79,13 +79,17 @@ fn measure_accuracy() -> AccuracyResult {
 
     let output_pdf = audit_dir.join("out.pdf");
 
-    // Run unscan with --audit
+    // Run unscan with --audit and --fontmap
     let bin = unscan_bin();
-    let output = Command::new(&bin)
-        .arg(&raster)
+    let mut cmd = Command::new(&bin);
+    cmd.arg(&raster)
         .args(["-o", output_pdf.to_str().unwrap()])
         .args(["--audit", audit_dir.to_str().unwrap()])
-        .env("RUST_LOG", "info")
+        .env("RUST_LOG", "info");
+    if fontmap.exists() {
+        cmd.args(["--include-fontmap", fontmap.to_str().unwrap()]);
+    }
+    let output = cmd
         .output()
         .unwrap_or_else(|e| panic!("failed to run unscan: {}", e));
 

@@ -12,12 +12,12 @@ use std::collections::{HashMap, HashSet};
 /// seams that drift from whitespace into glyph strokes.
 const ENTRY_PENALTY_WEIGHT: f32 = 4.0;
 
-/// Minimum total column-ink on each side of a split for it to be
-/// accepted.  Each side must contain at least this much ink to be
-/// considered a real symbol — roughly the ink of a period (~12 fully-
-/// black pixel rows = 12 × 255 = 3060).  Used by both VP and seam
-/// passes.
-pub(crate) const MIN_INK_FOR_SYMBOL: u32 = 16 * 255;
+/// Fraction of the crop height that represents the smallest symbol
+/// (a period).  A period is roughly 8% of line height.  The minimum
+/// ink threshold is `(MIN_SYMBOL_FRAC * h)² × 255`, making it scale
+/// with DPI and font size.  This may be on the low side — if
+/// anti-aliasing bleed starts producing false splits, raise it.
+const MIN_SYMBOL_FRAC: f32 = 0.07;
 
 
 /// Segment a word image into N character cells.
@@ -27,7 +27,7 @@ pub(crate) const MIN_INK_FOR_SYMBOL: u32 = 16 * 255;
 /// **Pass 1 — Vertical Profile (VP):** find contiguous runs of zero-ink
 /// columns (threshold 200).  Each interior run gives one split at its
 /// midpoint.  If that yields ≥ N-1 splits, pick the N-1 widest runs.
-/// Both sides of every VP split must have at least `MIN_INK_FOR_SYMBOL`
+/// Both sides of every VP split must have at least `min_ink_for_symbol`
 /// total column-ink or the split is rejected.
 ///
 /// **Pass 2 — Seam carving:** for remaining splits, find the cheapest
@@ -36,7 +36,7 @@ pub(crate) const MIN_INK_FOR_SYMBOL: u32 = 16 * 255;
 /// cost is its darkness (0 white, 255 black) plus an entry penalty
 /// (`ENTRY_PENALTY_WEIGHT × darkness_increase`) when the path moves into
 /// a darker pixel — directly encoding "stay in whitespace, don't wander
-/// into ink."  The same `MIN_INK_FOR_SYMBOL` threshold applies: both
+/// into ink."  The same `min_ink_for_symbol` threshold applies: both
 /// children of every accepted seam split must contain meaningful ink.
 pub fn segment_characters(img: &GrayImage, n_chars: usize) -> (Vec<u32>, HashMap<u32, Vec<u32>>) {
     segment_characters_inner(img, n_chars, None, None)
@@ -67,6 +67,11 @@ fn segment_characters_inner(
     }
 
     let need = n_chars - 1; // number of splits needed
+
+    // Minimum ink for a real symbol, scaled to crop height.
+    // (0.08 * h)² * 255 — see MIN_SYMBOL_FRAC.
+    let min_side = MIN_SYMBOL_FRAC * h as f32;
+    let min_ink_for_symbol = (min_side * min_side * 255.0) as u32;
 
     // Two-pass segmentation cascade:
     //   Pass 1 — VP strict zero-ink: split at columns with truly zero ink
@@ -179,10 +184,10 @@ fn segment_characters_inner(
             if let Some((_s, _e, split)) = best_low_ink_valley(&col_has_ink, &col_ink, seg.ink_left, seg.ink_right) {
                 // Reject splits that don't have substantial ink on both
                 // sides — each side should have at least as much ink as
-                // a period (~6 fully-black pixels = 6×255 = 1530 ink).
+                // a period (~12 fully-black pixels = 12×255 = 3060 ink).
                 let ink_left_sum: u32 = (seg.left..split).map(|c| col_ink[c as usize]).sum();
                 let ink_right_sum: u32 = (split + 1..seg.right).map(|c| col_ink[c as usize]).sum();
-                if ink_left_sum < MIN_INK_FOR_SYMBOL || ink_right_sum < MIN_INK_FOR_SYMBOL {
+                if ink_left_sum < min_ink_for_symbol || ink_right_sum < min_ink_for_symbol {
                     continue;
                 }
 
@@ -439,8 +444,8 @@ fn segment_characters_inner(
                     if px < 200 { seam_ink_right += (255 - px) as u32; }
                 }
             }
-            if seam_ink_left < MIN_INK_FOR_SYMBOL || seam_ink_right < MIN_INK_FOR_SYMBOL {
-                if word_text.map_or(false, |w| w.starts_with("tradition")) { eprintln!("    SKIP MIN_INK col={} left={} right={} min={}", entry.col, seam_ink_left, seam_ink_right, MIN_INK_FOR_SYMBOL); }
+            if seam_ink_left < min_ink_for_symbol || seam_ink_right < min_ink_for_symbol {
+                if word_text.map_or(false, |w| w.starts_with("tradition")) { eprintln!("    SKIP MIN_INK col={} left={} right={} min={}", entry.col, seam_ink_left, seam_ink_right, min_ink_for_symbol); }
                 continue;
             }
 

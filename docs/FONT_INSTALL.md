@@ -4,7 +4,7 @@
 
 ## Never stub fonts
 
-Do **not** copy DejaVu or other placeholder fonts to satisfy missing font files. The project is about getting fonts correct. Stubbing was previously done to unblock fixture generation, but it caused `t60_specimen_accuracy` to fail with "No font matches found" and invalid vectorization counts.
+Do **not** copy DejaVu or other placeholder fonts to satisfy missing font files. The project is about getting fonts correct. Stubbing was previously done to unblock fixture generation, but it caused `t60_specimen_accuracy_aa` to fail with "No font matches found" and invalid vectorization counts.
 
 If a font is missing, install the real font from Google Fonts or the upstream distributor.
 
@@ -47,7 +47,7 @@ Real fonts are installed to:
 
 The test suite includes:
 - `t30_regression_ssim` — SSIM comparison against ground truth renders
-- `t60_specimen_accuracy` — multi-DPI font accuracy and vectorization counts
+- `t60_specimen_accuracy_aa` — multi-DPI font accuracy and vectorization counts
 
 Both tests compare OCR output against known font names and metrics. If fonts are stubbed, the visual features don't match and tests fail with:
 - `No font matches found in specimen output`

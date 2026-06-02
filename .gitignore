@@ -14,3 +14,5 @@ test-docs/berkeley-output*.pdf
 test-docs/diag-images/
 test-docs/font-timeline-specimen-rasterized.pdf.old
 test-docs/font-timeline-specimen-fontmap.json
+test-docs/ligature-test-fontmap.json
+__pycache__/

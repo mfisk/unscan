@@ -17,11 +17,17 @@ dramatic file-size reduction and quality improvement while maintaining
 1. **OCR** — Tesseract extracts word-level bounding boxes and confidence scores.
 2. **Font matching** — each word is segmented into individual character crops
    (VP split + seam carving DP — see [`SEGMENTATION.md`](SEGMENTATION.md)),
-   then each crop is compared against every candidate font via per-character
-   SSIM. The font with the best aggregate word-level SSIM wins. OpenType
-   feature variants (old-style figures, small caps, stylistic sets, etc.) are
-   matched as separate candidates — the SSIM comparison naturally picks the
-   correct variant without heuristics.
+   then each crop is converted to a 99-dimensional feature vector
+   (see [`FEATURES.md`](FEATURES.md)). Per-character kd-tree nearest-neighbor
+   search against a pre-built font index produces a ranked candidate list
+   (the CI — Character Index). The top CI candidates are reranked using
+   word-level SSIM: each candidate font renders the word, and SSIM against
+   the scan crop picks the best visual match. OpenType feature variants
+   (old-style figures, small caps, stylistic sets, etc.) are matched as
+   separate candidates — the SSIM comparison naturally picks the correct
+   variant without heuristics. Common Latin ligatures (ff, fi, fl, ffi, ffl)
+   are handled via dual-path segmentation: plain OCR characters vs.
+   ligature-collapsed characters, with the higher-scoring path winning.
 3. **Decision matrix** —
    | OCR confidence | Font match | Action |
    |----------------|-----------|--------|
@@ -75,13 +81,25 @@ runs unattended in CI.
 
 ## Font ground-truth map
 
-When generating the specimen PDF, `test-docs/gen-specimen.py` can emit a
-`font-timeline-specimen-fontmap.json` mapping ReportLab font names to the
-exact TTF/OTF files used. Pass this to the miss-report tool for accurate
-rendering:
+When generating the specimen PDF, `test-docs/gen-specimen.py` emits a
+`font-timeline-specimen-fontmap.json` mapping font names to the exact
+TTF/OTF files used. This fontmap serves two purposes:
+
+1. **Miss report rendering:** pass it to `tools/char-misses.py` so the report
+   can render ground-truth characters from the correct font files.
+
+2. **Audit inclusion:** pass it to unscan via `--include-fontmap` to ensure
+   all ground-truth fonts appear in the CI candidate list for every line,
+   even if CI would normally prune them.
 
 ```bash
-python3 tools/char-misses.py /tmp/audit-out \
+# Run unscan with fontmap-injected candidates
+unscan test-docs/specimen-clean-raster.pdf \
+  -o /tmp/out.pdf --audit /tmp/audit-out \
+  --include-fontmap test-docs/font-timeline-specimen-fontmap.json
+
+# Generate the visual miss report
+python3 tools/char-misses.py /tmp/audit-out/audit.json \
   test-docs/font-timeline-specimen.pdf \
   -o /tmp/misses.html \
   --fontmap test-docs/font-timeline-specimen-fontmap.json
@@ -116,7 +134,10 @@ unscan input.pdf -o output.pdf --audit /tmp/audit-out
 | `--dpi` | 300 | DPI for rasterising PDF pages |
 | `--font-dir` | *(system defaults)* | Extra font search directory (repeatable) |
 | `--no-geometry` | off | Skip line / rectangle / fill vectorisation |
-| `--audit` | *(none)* | Write audit JSON + segmentation diagnostics to DIR |
+| `--audit` | *(none)* | Write audit JSON + per-line segmentation diagnostics to DIR |
+| `--include-font` | *(none)* | Force a font (case-insensitive substring) into CI audit candidate list |
+| `--include-fontmap` | *(none)* | Inject all fonts from a fontmap JSON into CI audit candidate list |
+| `--thoroughness` | 1.0 | Scale CI thresholds — higher = more candidates survive, slower |
 
 ## Working with Microsoft Word Documents
 
@@ -279,12 +300,35 @@ the OCR text content for reference.
 
 **Custom:** `--font-dir <path>` (repeatable)
 
+### Font name aliasing
+
+Font files often have cryptic filenames (`arialbd.ttf`, `nimbussans-regular.otf`).
+An alias table maps these to canonical family names with bold/italic metadata.
+Notably, URW Nimbus clones (NimbusSans, NimbusRoman, NimbusMonoPS) are mapped
+to the PDF Base-14 canonical names (Helvetica, Times-Roman, Courier) so output
+PDFs reference standard names all viewers understand. See
+[`docs/font-aliasing.md`](docs/font-aliasing.md) for details.
+
 ## Audit log
 
 When `--audit DIR` is set, unscan writes `DIR/audit.json` with full pipeline
-decisions plus per-word segmentation diagnostics (crops, seams, overlays) into
-the same directory. Use `tools/char-misses.py DIR VECTOR.pdf` to generate a
-visual miss report.
+decisions, plus per-line directories containing per-word subdirectories with
+segmentation overlays, character crops, and summary JSONs. Use
+`tools/char-misses.py DIR/audit.json VECTOR.pdf` to generate a visual miss report.
+
+```
+DIR/
+  audit.json                              # Top-level pipeline decisions
+  p1_L000_A_Timeline_of/                  # Per-line directory
+    word_000_Timeline/                    # Per-word directory
+      seg_plain/                          # Plain segmentation path
+        overlay.png                       # VP + seam split visualization
+        00_T.png, 01_i.png, ...          # Character crops (48px normalized)
+      seg_lig/                            # Ligature segmentation path (if applicable)
+        overlay.png
+        00_T.png, ...
+    line_summary.json                     # CI top candidates, font match
+```
 
 Without `--audit`, a default audit JSON is still written as `<output>.audit.json`.
 
@@ -359,9 +403,12 @@ These install into `/usr/share/fonts/truetype/specimen-fonts/`.
 
 | Test | Input | Ground truth | What it tests |
 |------|-------|-------------|---------------|
+| **t40_ligature.sh** | `ligature-test.pdf` | — | 21 ligature lines (3 fonts × with/without ligatures), asserts 21/21 hits |
+| **t60_specimen_accuracy_aa** | AA-rasterized specimen | `font-timeline-specimen.pdf` | 30 fonts, 6 pages — anti-aliased accuracy baseline |
+| **t61_specimen_accuracy_noaa** | No-AA rasterized specimen | `font-timeline-specimen.pdf` | Same content without anti-aliasing |
+| **t62_cross_renderer_accuracy** | Multiple rasterizers | `font-timeline-specimen.pdf` | Cross-renderer stability |
 | **Font timeline specimen** | `font-timeline-specimen-scanned.pdf` | `font-timeline-specimen.json` | 30 fonts across 500 years — the full ground truth |
 | **Bodoni sentence** | `bodoni-sentence-raster.pdf` | `bodoni-sentence.json` | Single-font smoke test (Libre Bodoni 400, one sentence) |
-| **Bodoni only** | `bodoni-only.pdf` | — | Multi-style Bodoni (regular/bold/italic) |
 | **Mixed-font specimen** | `mixed-font-specimen-raster.pdf` | `mixed-font-ground-truth.json` | Intra-line font switching (sans/serif/mono/bold/italic) |
 
 ### Quick start
@@ -387,7 +434,8 @@ cargo run --release -- test-docs/resolution-series/specimen-300dpi.pdf \
 
 | Tier | Source | What it tests |
 |------|--------|---------------|
-| **Clean specimen** | `font-timeline-specimen.pdf` | 30 fonts, 500 years, OT variants — the vector ground truth |
+| **Clean specimen** | `font-timeline-specimen.pdf` | 30 fonts, 6 pages, 500 years, OT variants — the vector ground truth |
+| **Ligature test** | `ligature-test.pdf` | 3 fonts × 7 ligature lines — dual-path CI validation |
 | **Bodoni sentence** | `bodoni-sentence-raster.pdf` | Single-font smoke test — must match Libre Bodoni 400 |
 | **Resolution series** | `resolution-series/specimen-*.pdf` | Same content at 600→fax dpi — measures degradation tolerance |
 | **Historical scans** | `historical/*.pdf` | Real documents from archives — Baskerville's 1757 Virgil, CIA memos, NASA standards |
@@ -431,6 +479,8 @@ no figure-style detection heuristic needed.
 | `titl` | Titling alternates | Capitals optimized for large sizes |
 | `hist` | Historical forms | Archaic letterforms (e.g. long s) |
 | `ss01`–`ss20` | Stylistic sets | Font-specific named alternate sets |
+| `liga` | Standard ligatures | ff, fi, fl → single glyphs (probed for ligature detection) |
+| `dlig` | Discretionary ligatures | ffi, ffl → single glyphs (probed for ligature detection) |
 
 ### Adding this to your font pipeline
 

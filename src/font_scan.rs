@@ -146,9 +146,23 @@ pub fn scan_fonts(dirs: &[PathBuf]) -> Vec<FontEntry> {
             if let Some(fe) = load_font_entry(path, &aliases) {
                 let fig_label = if fe.oldstyle_figures { "OLDSTYLE" } else { "lining" };
                 debug!("  Font: {} [{}] [{}] {}", fe.family_name, class_label(fe.class), fig_label, fe.path.display());
+
+                // Detect ligature glyphs (liga + dlig)
+                let ligatures = detect_ligature_glyphs(&fe.data);
+                if !ligatures.is_empty() {
+                    debug!("    + {} ligature glyphs", ligatures.len());
+                }
+
                 // Probe all OT features — emit a variant entry for each that changes glyphs
                 let variants = detect_ot_variants(&fe.data);
                 for (tag, overrides) in &variants {
+                    // Merge ligature overrides into each variant
+                    let mut combined = overrides.clone();
+                    for &(lig_c, gid) in &ligatures {
+                        if !combined.iter().any(|(c, _)| *c == lig_c) {
+                            combined.push((lig_c, gid));
+                        }
+                    }
                     let var_entry = FontEntry {
                         path: fe.path.clone(),
                         family_name: format!("{} [{}]", fe.family_name, tag),
@@ -158,7 +172,7 @@ pub fn scan_fonts(dirs: &[PathBuf]) -> Vec<FontEntry> {
                         data: Vec::new(), // bytes not retained
                         oldstyle_figures: fe.oldstyle_figures,
                         variant_tag: tag.clone(),
-                        glyph_overrides: Some(overrides.clone()),
+                        glyph_overrides: Some(combined),
                     };
                     debug!("    + variant [{}]: {} glyph overrides", tag, overrides.len());
                     fonts.push(var_entry);
@@ -167,6 +181,12 @@ pub fn scan_fonts(dirs: &[PathBuf]) -> Vec<FontEntry> {
                 // Index build and matching load from path on demand.
                 let mut fe = fe;
                 fe.data = Vec::new();
+                // Add ligature overrides to base entry
+                if !ligatures.is_empty() {
+                    let mut base_overrides = fe.glyph_overrides.take().unwrap_or_default();
+                    base_overrides.extend(ligatures);
+                    fe.glyph_overrides = Some(base_overrides);
+                }
                 fonts.push(fe);
             }
         }
@@ -306,6 +326,24 @@ fn build_alias_table() -> HashMap<String, Alias> {
     a!("texgyrebonum-regular",   "TeX Gyre Bonum",   false, false);
     a!("texgyreschola-regular",  "TeX Gyre Schola",  false, false);
     a!("texgyreadventor-regular","TeX Gyre Adventor", false, false);
+
+    // ── PDF Base-14 (URW Nimbus clones → PDF canonical names) ────────
+    a!("nimbussans-regular",       "Helvetica",    false, false);
+    a!("nimbussans-bold",          "Helvetica",    true,  false);
+    a!("nimbussans-italic",        "Helvetica",    false, true);
+    a!("nimbussans-bolditalic",    "Helvetica",    true,  true);
+    a!("nimbussansnarrow-regular", "Helvetica Narrow", false, false);
+    a!("nimbussansnarrow-bold",    "Helvetica Narrow", true,  false);
+    a!("nimbussansnarrow-oblique", "Helvetica Narrow", false, true);
+    a!("nimbussansnarrow-boldoblique", "Helvetica Narrow", true, true);
+    a!("nimbusroman-regular",      "Times-Roman",  false, false);
+    a!("nimbusroman-bold",         "Times-Roman",  true,  false);
+    a!("nimbusroman-italic",       "Times-Roman",  false, true);
+    a!("nimbusroman-bolditalic",   "Times-Roman",  true,  true);
+    a!("nimbusmonops-regular",     "Courier",      false, false);
+    a!("nimbusmonops-bold",        "Courier",      true,  false);
+    a!("nimbusmonops-italic",      "Courier",      false, true);
+    a!("nimbusmonops-bolditalic",  "Courier",      true,  true);
 
     // Libertinus
     a!("libertinusserif-regular",  "Libertinus Serif", false, false);
@@ -534,6 +572,56 @@ fn detect_ot_variants(data: &[u8]) -> Vec<(String, Vec<(char, u16)>)> {
     }
 
     variants
+}
+
+/// Ligature probe sequences: (input_chars, unicode_ligature_char).
+/// We shape the input chars with liga/dlig features and check if the
+/// shaper produces a single glyph (i.e. a ligature substitution fired).
+const LIGATURE_PROBES: &[(&str, char)] = &[
+    ("ff",  '\u{FB00}'),
+    ("fi",  '\u{FB01}'),
+    ("fl",  '\u{FB02}'),
+    ("ffi", '\u{FB03}'),
+    ("ffl", '\u{FB04}'),
+];
+
+/// Detect ligature glyph IDs by shaping probe strings with liga and dlig
+/// features. Returns a vec of (unicode_ligature_char, glyph_id) for each
+/// ligature the font supports.
+fn detect_ligature_glyphs(data: &[u8]) -> Vec<(char, u16)> {
+    let face = match rustybuzz::Face::from_slice(data, 0) {
+        Some(f) => f,
+        None => return Vec::new(),
+    };
+
+    let mut result = Vec::new();
+
+    for &(probe, lig_char) in LIGATURE_PROBES {
+        let input_len = probe.chars().count();
+
+        // Try with both liga and dlig enabled
+        let liga_tag = rustybuzz::ttf_parser::Tag::from_bytes(b"liga");
+        let dlig_tag = rustybuzz::ttf_parser::Tag::from_bytes(b"dlig");
+        let features = [
+            rustybuzz::Feature::new(liga_tag, 1, ..),
+            rustybuzz::Feature::new(dlig_tag, 1, ..),
+        ];
+
+        let mut buf = rustybuzz::UnicodeBuffer::new();
+        buf.push_str(probe);
+        let out = rustybuzz::shape(&face, &features, buf);
+        let infos = out.glyph_infos();
+
+        // If shaping produced exactly 1 glyph from N input chars, it's a ligature
+        if infos.len() == 1 && input_len > 1 {
+            let gid = infos[0].glyph_id as u16;
+            if gid != 0 {
+                result.push((lig_char, gid));
+            }
+        }
+    }
+
+    result
 }
 
 fn load_font_entry(path: &Path, aliases: &HashMap<String, Alias>) -> Option<FontEntry> {

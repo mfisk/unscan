@@ -87,11 +87,15 @@ fn measure_accuracy(raster_pdf: &Path, label: &str) -> Option<AccuracyResult> {
 
     // Run unscan with --audit
     let bin = unscan_bin();
-    let output = Command::new(&bin)
-        .arg(raster_pdf)
+    let mut cmd = Command::new(&bin);
+    cmd.arg(raster_pdf)
         .args(["-o", output_pdf.to_str().unwrap()])
         .args(["--audit", audit_dir.to_str().unwrap()])
-        .env("RUST_LOG", "info")
+        .env("RUST_LOG", "info");
+    if fontmap.exists() {
+        cmd.args(["--include-fontmap", fontmap.to_str().unwrap()]);
+    }
+    let output = cmd
         .output()
         .unwrap_or_else(|e| panic!("failed to run unscan: {}", e));
 

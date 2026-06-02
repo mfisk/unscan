@@ -117,7 +117,7 @@ discrimination signal, not an error).
 
 ## Index Version
 
-INDEX_VERSION = 7. Changing FEAT_LEN or feature computation requires bumping
+INDEX_VERSION = 8. Changing FEAT_LEN or feature computation requires bumping
 this to force a full index rebuild. The index stores pre-computed feature
 vectors; stale vectors from a prior version produce meaningless distances.
 

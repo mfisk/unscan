@@ -67,7 +67,7 @@ can be lost:
       │  Winner font for the line
       ▼
   ┌──────────────────────────────────┐
-  │ 4. Paragraph Grouping            │  Majority-vote body font replaces
+  │ 4. Paragraph Grouping (DISABLED) │  Majority-vote body font replaces
   │    (main.rs ~L651)               │  outlier matches in same-size runs
   └──────────────────────────────────┘
       │  Final font assignment
@@ -85,46 +85,29 @@ then segment word crops into individual characters ourselves.
 **Input:** Word crop image (trimmed to ink bounds via `ink_vertical_extent`),
 known text from Tesseract (gives us the target character count N).
 
-**Algorithm (three-pass cascade — see SEGMENTATION.md):**
+**Algorithm (two-pass cascade — see SEGMENTATION.md):**
 
-1. **Pass 1 — Vertical whitespace splits.**
+1. **Pass 1 — Vertical whitespace splits (VP).**
    Compute column ink profile (sum of dark pixels per column, threshold < 200).
    Find contiguous runs of zero-ink columns. Each run is a definite character
    boundary — split at the midpoint. If we find N−1 gaps for N characters,
-   we're done.
+   we're done. Both sides of each split must have `min_ink_for_symbol` ink
+   (height-scaled: `(0.07 × h)² × 255`).
 
-2. **Pass 2 — Whitespace path splits** (only for segments still containing
+2. **Pass 2 — Greedy seam carving** (only for segments still containing
    multiple characters after Pass 1).
 
-   For each under-split segment:
-
-   a. Build a white-pixel reachability map: DP from top row to bottom row,
-      8-connected, propagating only through white pixels (≥ ink threshold).
-      A column in the bottom row is "reachable" if an all-white connected
-      path exists from some top-row pixel down to it.
-
-   b. Group reachable bottom-row columns into contiguous runs. Each run is
-      a candidate split — a diagonal (or vertical) whitespace corridor
-      between characters. This handles italic fonts where the inter-glyph
-      gap slants rather than running straight down.
-
-   c. Among the candidate paths, pick the one with the shortest (narrowest)
-      corridor — this is the tightest character boundary, i.e. the split
-      between the two closest characters in the segment.
-
-   d. Split at that path's midpoint column. Recurse on the resulting
-      sub-segments until all characters are separated or no more white
-      paths exist.
+   Dual-DP seam carving finds the cheapest vertical paths through each
+   segment. Energy is ink darkness (0 for white, 255 for black) with an
+   entry penalty (`ENTRY_PENALTY_WEIGHT × darkness_increase`) when the
+   path moves into darker pixels — directly encoding "stay in whitespace,
+   don't wander into ink." All candidate seams go on a min-heap; the
+   globally cheapest is accepted, child segments get diagonal masking from
+   the accepted seam path, and new candidates are computed. Repeat until
+   enough splits.
 
 3. **Fallback:** If neither pass produces enough splits (truly touching
-   characters with no white path), fall back to uniform boundaries.
-
-**Reference:** The whitespace-path concept is adapted from seam carving
-(Avidan & Shamir, "Seam Carving for Content-Aware Image Resizing",
-SIGGRAPH 2007), restricted to all-white connected paths rather than
-minimum-energy seams that can cut through ink.
-
-**Implementation:** `segment_characters()` in `src/char_index.rs`.
+   characters with no separable seam), fall back to uniform boundaries.
 
 ## Debug Tooling Reference
 
@@ -271,7 +254,7 @@ Generates side-by-side overlay images (scan crop vs rendered winner) in
 
 ```bash
 # Accuracy regression on clean raster specimen (30 fonts, 444 lines)
-cargo test --release --test t60_specimen_accuracy
+cargo test --release --test t60_specimen_accuracy_aa
 
 # Output quality + file size regression
 cargo test --release --test t50_output_quality
@@ -456,11 +439,11 @@ The `data.json` word entries have `candidates[].ssim` and `candidates[].dy`
 (vertical shift). If the correct font has good SSIM on all words but one, that
 one word's crop may have an extraction issue.
 
-### Step 5: Check Paragraph Grouping (Stage 4)
+### Step 5: Check Paragraph Grouping (Stage 4 — currently disabled)
 
-Paragraph grouping only overrides a line match when a different font has
-majority vote among same-size lines in a paragraph run. Check `RUST_LOG=debug`
-output for `paragraph regroup` messages.
+Paragraph grouping is currently disabled. When active, it overrides a line
+match when a different font has majority vote among same-size lines in a
+paragraph run. Check `RUST_LOG=debug` output for `paragraph regroup` messages.
 
 This stage should be transparent on a specimen (each section has its own font,
 no majority vote applies). If it's interfering, the bug is upstream — the
@@ -565,7 +548,7 @@ python3 tools/char-misses.py /tmp/audit-out test-docs/font-timeline-specimen.pdf
 # 3. Present as widget card (present_now: true)
 ```
 
-The script mirrors the clone/alias map from `t60_specimen_accuracy.rs` so its
+The script mirrors the clone/alias map from `t60_specimen_accuracy_aa.rs` so its
 miss count matches the test. Output is a single HTML file with all base64
 images inlined.
 
@@ -585,16 +568,16 @@ images inlined.
 | Paragraph grouping | `src/main.rs` ~L651 |
 | Diagnostic report | `src/diagnostic.rs` |
 | Ground truth | `test-docs/font-timeline-specimen.json` |
-| Clean raster specimen | `test-docs/font-timeline-specimen-rasterized.pdf` |
+| Clean raster specimen | `test-docs/font-timeline-specimen-scanned.pdf` |
 | Skewed scan specimen | `test-docs/font-timeline-specimen-scanned.pdf` |
-| Accuracy test | `tests/t60_specimen_accuracy.rs` |
+| Accuracy test | `tests/t60_specimen_accuracy_aa.rs` |
 
 ## Build and Run
 
 ```bash
 export PATH="$HOME/.cargo/bin:/usr/local/cargo/bin:$PATH"
 cargo build --release
-cargo test --release --test t60_specimen_accuracy
+cargo test --release --test t60_specimen_accuracy_aa
 ```
 
 Cached specimen run: ~45s. Uncached (index rebuild): ~3min.
@@ -610,7 +593,7 @@ match is wrong, the bug is in word SSIM reranking.
 ### Step 1: Run with audit log
 
 ```bash
-./target/release/unscan test-docs/font-timeline-specimen-rasterized.pdf \
+./target/release/unscan test-docs/font-timeline-specimen-scanned.pdf \
     -o /dev/null --audit /tmp/audit-out
 ```
 

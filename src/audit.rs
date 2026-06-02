@@ -24,6 +24,15 @@ pub struct AuditEntry {
     pub ci_candidates: Vec<CiCandidate>,
     #[serde(skip_serializing_if = "Vec::is_empty")]
     pub ci_char_votes: Vec<CharCiVote>,
+    /// Ligature-segmented CI candidates (when ligature sequences are present).
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub ci_candidates_lig: Vec<CiCandidate>,
+    /// Ligature-segmented per-char CI votes.
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub ci_char_votes_lig: Vec<CharCiVote>,
+    /// Which segmentation path won: "plain" or "ligature".
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub seg_winner: Option<String>,
 }
 
 /// CI candidate font score.
