@@ -2064,10 +2064,10 @@ pub fn search_candidates(
         .into_iter()
         .filter_map(|(font_id, log_dists)| {
             let matched = log_dists.len();
-            // Quorum gate: must appear in enough character neighborhoods
-            if matched < quorum {
-                return None;
-            }
+            // Quorum gate disabled — the penalty mechanism for missing
+            // characters already handles sparse matches, and quorum
+            // causes vote-splitting across font-family variants
+            // (e.g. NotoSerif Regular vs SemiCondensed vs Condensed).
             let name = index.font_names_table.get(font_id)?.clone();
 
             // Weighted mean of log-distances.
