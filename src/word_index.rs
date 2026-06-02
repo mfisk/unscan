@@ -13,8 +13,8 @@
 
 use std::collections::HashMap;
 
-use ab_glyph::{point, Font, FontRef, PxScale, ScaleFont};
-use image::{GrayImage, Luma};
+use ab_glyph::{Font, FontRef};
+use image::GrayImage;
 use log::{debug, info};
 
 use crate::font_scan::FontEntry;
@@ -67,7 +67,7 @@ const MIN_WORD_LEN: usize = 3;
 /// 3. Normalize pixel values to [0, 1] range
 /// 4. Return as flat f32 array
 fn compute_word_features(img: &GrayImage) -> Option<[f32; WORD_FEAT_LEN]> {
-    let trimmed = trim_whitespace_simple(img);
+    let trimmed = crate::ssim::trim_whitespace_simple(img);
     let (w, h) = trimmed.dimensions();
     if w < 3 || h < 3 {
         return None;
@@ -266,73 +266,12 @@ pub fn search_word_index(
 
 /// Render a word in the given font at the target height.
 fn render_word_for_index(font: &FontRef, text: &str, target_h: u32) -> Option<GrayImage> {
-    if text.is_empty() {
-        return None;
-    }
-
-    let em_px = target_h as f32;
-    let scale = PxScale::from(em_px);
-    let sf = font.as_scaled(scale);
-
-    let ink_h = sf.ascent() - sf.descent();
-    if ink_h <= 0.0 {
-        return None;
-    }
-
-    let baseline = (target_h as f32 - ink_h) / 2.0 + sf.ascent();
-
-    // Compute total advance width and min pixel extent
-    let mut min_px_x = 0i32;
-    let mut prev: Option<ab_glyph::GlyphId> = None;
-    let mut cx = 0.0f32;
-
-    for c in text.chars() {
-        let gid = font.glyph_id(c);
-        if let Some(p) = prev {
-            cx += sf.kern(p, gid);
-        }
-        let glyph = gid.with_scale_and_position(scale, point(cx, baseline));
-        if let Some(og) = font.outline_glyph(glyph) {
-            min_px_x = min_px_x.min(og.px_bounds().min.x as i32);
-        }
-        cx += sf.h_advance(gid);
-        prev = Some(gid);
-    }
-    let total_advance = cx;
-
-    let x_offset = if min_px_x < 0 { -min_px_x } else { 0 };
-    let canvas_w = (total_advance as i32 + x_offset + 2).max(4) as u32;
-    let mut canvas = GrayImage::from_pixel(canvas_w, target_h, Luma([255u8]));
-
-    let mut cx = 0.0f32;
-    let mut prev: Option<ab_glyph::GlyphId> = None;
-    let (cw, ch) = canvas.dimensions();
-
-    for c in text.chars() {
-        let gid = font.glyph_id(c);
-        if let Some(p) = prev {
-            cx += sf.kern(p, gid);
-        }
-        let glyph = gid.with_scale_and_position(scale, point(cx, baseline));
-        if let Some(og) = font.outline_glyph(glyph) {
-            let bounds = og.px_bounds();
-            let bx = bounds.min.x as i32 + x_offset;
-            let by = bounds.min.y as i32;
-            og.draw(|gx, gy, cov| {
-                let px = gx as i32 + bx;
-                let py = gy as i32 + by;
-                if px >= 0 && py >= 0 && (px as u32) < cw && (py as u32) < ch {
-                    let val = (255.0 * (1.0 - cov)) as u8;
-                    let cur = canvas.get_pixel(px as u32, py as u32).0[0];
-                    canvas.put_pixel(px as u32, py as u32, Luma([cur.min(val)]));
-                }
-            });
-        }
-        cx += sf.h_advance(gid);
-        prev = Some(gid);
-    }
-
-    Some(trim_whitespace_simple(&canvas))
+    let canvas = crate::layout::render_word_ab_glyph(
+        font, text, target_h as f32,
+        None, Some(target_h),
+        |f, c| f.glyph_id(c),
+    )?;
+    Some(crate::ssim::trim_whitespace_simple(&canvas))
 }
 
 /// Squared Euclidean distance between two feature vectors.
@@ -343,36 +282,4 @@ fn squared_distance(a: &[f32; WORD_FEAT_LEN], b: &[f32; WORD_FEAT_LEN]) -> f32 {
         sum += d * d;
     }
     sum
-}
-
-/// Simple whitespace trimming (all 4 edges, threshold 240).
-fn trim_whitespace_simple(img: &GrayImage) -> GrayImage {
-    let (w, h) = img.dimensions();
-    if w == 0 || h == 0 {
-        return img.clone();
-    }
-
-    let thresh = 240u8;
-    let mut min_x = w;
-    let mut max_x = 0u32;
-    let mut min_y = h;
-    let mut max_y = 0u32;
-
-    for y in 0..h {
-        for x in 0..w {
-            if img.get_pixel(x, y).0[0] < thresh {
-                min_x = min_x.min(x);
-                max_x = max_x.max(x);
-                min_y = min_y.min(y);
-                max_y = max_y.max(y);
-            }
-        }
-    }
-
-    if min_x > max_x || min_y > max_y {
-        return img.clone();
-    }
-
-    image::imageops::crop_imm(img, min_x, min_y, max_x - min_x + 1, max_y - min_y + 1)
-        .to_image()
 }

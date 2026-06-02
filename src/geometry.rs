@@ -74,7 +74,8 @@ pub fn detect_geometry(
     };
 
     // Binarise with Otsu
-    let threshold = otsu_threshold(&gray);
+    let vals: Vec<u8> = gray.pixels().map(|p| p.0[0]).collect();
+    let threshold = crate::color::otsu_threshold(&vals);
 
     // ── Horizontal lines ─────────────────────────────────────────────
     let mut h_lines: Vec<DetectedLine> = Vec::new();
@@ -386,37 +387,3 @@ fn detect_fills(
     fills
 }
 
-// ---------------------------------------------------------------------------
-// Otsu threshold
-// ---------------------------------------------------------------------------
-
-fn otsu_threshold(gray: &image::GrayImage) -> u8 {
-    let mut hist = [0u32; 256];
-    for p in gray.pixels() {
-        hist[p.0[0] as usize] += 1;
-    }
-    let total = gray.width() * gray.height();
-    let mut sum_total = 0.0f64;
-    for (i, &c) in hist.iter().enumerate() {
-        sum_total += i as f64 * c as f64;
-    }
-    let mut sum_bg = 0.0f64;
-    let mut w_bg = 0u32;
-    let mut max_var = 0.0f64;
-    let mut thr = 128u8;
-    for (t, &c) in hist.iter().enumerate() {
-        w_bg += c;
-        if w_bg == 0 { continue; }
-        let w_fg = total - w_bg;
-        if w_fg == 0 { break; }
-        sum_bg += t as f64 * c as f64;
-        let m_bg = sum_bg / w_bg as f64;
-        let m_fg = (sum_total - sum_bg) / w_fg as f64;
-        let var = w_bg as f64 * w_fg as f64 * (m_bg - m_fg).powi(2);
-        if var > max_var {
-            max_var = var;
-            thr = t as u8;
-        }
-    }
-    thr
-}

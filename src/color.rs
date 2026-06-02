@@ -65,7 +65,7 @@ pub fn detect_text_color(page_img: &DynamicImage, region: &TextRegion) -> Rgb {
 }
 
 /// Otsu's method: find threshold that maximises between-class variance.
-fn otsu_threshold(vals: &[u8]) -> u8 {
+pub fn otsu_threshold(vals: &[u8]) -> u8 {
     let mut hist = [0u32; 256];
     for &v in vals {
         hist[v as usize] += 1;

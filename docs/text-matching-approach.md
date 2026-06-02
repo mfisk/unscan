@@ -19,7 +19,7 @@ Scanned PDF
 
 Each installed font (~4000+) is rendered at a reference size for ~70 printable characters. A 59-dimensional feature vector is extracted per glyph capturing stroke widths, serif presence, x-height ratio, stress angle, and other geometric properties.
 
-At query time, each OCR'd character's crop is feature-extracted and compared against the index via brute-force linear scan (flat `Vec` per character, not a KD-tree — at 59 dims KD-trees provide no pruning benefit). All fonts within `factor²` of the nearest distance are returned as candidates.
+At query time, each OCR'd character's crop is feature-extracted and compared against the index via brute-force linear scan (flat `Vec` per character — at 59 dims, tree-based structures provide no pruning benefit). All fonts within `factor²` of the nearest distance are returned as candidates.
 
 **Role:** The char index is the *recall* stage — it must not miss the true font. It examines individual character shapes without considering letter spacing, word spacing, or kerning. This gives it high recall but low precision: many visually similar fonts pass through. Precision comes from word-level SSIM in the next stage.
 

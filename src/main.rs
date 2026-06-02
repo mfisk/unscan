@@ -11,6 +11,7 @@ pub mod char_index;
 pub mod layout;
 mod compare;
 pub mod seg_diag;
+pub mod ssim;
 mod ocr;
 mod page_cache;
 mod pdf_out;

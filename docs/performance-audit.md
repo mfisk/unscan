@@ -238,7 +238,7 @@ Sorts ~40 elements when the vec exceeds 40 entries. With ~50 candidates per line
 
 Three full-image passes (contrast stretch, blur, sharpen) on the page image before OCR. At 2550×3300 = 8.4M pixels × 3 passes = 25.2M pixel operations. Done once per page, not per line, so relatively minor.
 
-### L6. k-d tree leaf sort on every insertion
+### L6. Brute-force leaf sort on every insertion
 
 **File:** `src/char_index.rs` `knn_recursive()` line 404
 
@@ -250,16 +250,16 @@ if best.len() > k { best.truncate(k); }
 
 For k=1 (the common case in `nearest_within_factor`), this is trivially cheap. For larger k, a BinaryHeap would be better, but since k is always 1 here, no real impact.
 
-### L7. `CharIndex` entries duplicate feature data between `entries` HashMap and `kd_trees`
+### L7. `CharIndex` entries duplicate feature data between `entries` HashMap and flat vectors
 
 **File:** `src/char_index.rs`
 
-The `entries` HashMap stores `FontCharEntry` (with `CharFeatures`), and the `kd_trees` store `KdPoint` (with `coords: [f32; FEAT_LEN]`). These are two copies of the feature vectors in memory:
+The `entries` HashMap stores `FontCharEntry` (with `CharFeatures`), and the flat search vectors store `(usize, [f32; FEAT_LEN])`. These are two copies of the feature vectors in memory:
 - entries: 4,965 × 101 × 57 × 4 bytes ≈ 109MB
-- kd_trees: same ≈ 109MB
+- flat vectors: same ≈ 109MB
 - Total: ~218MB RAM for feature data alone
 
-**Fix:** Have kd_tree nodes store indices into the entries Vec instead of owning coordinate copies. Or drop the entries HashMap after building trees (if no longer needed for merge/save operations).
+**Fix:** Have the search vectors store indices into the entries Vec instead of owning coordinate copies. Or drop the entries HashMap after building search structures (if no longer needed for merge/save operations).
 
 ### L8. `ssim_windowed` clones image `b` even when dimensions match
 
@@ -313,7 +313,7 @@ Clones ~32K pixels (800×40) needlessly in the common case. Called 66,750 times 
 |---|---|
 | Font catalog (`Vec<FontEntry>`) | ~1GB (5,000 fonts × 200KB avg data) |
 | Char index entries | ~109MB (feature vectors) |
-| k-d trees | ~109MB (duplicate feature vectors) |
+| Flat search vectors | ~109MB (duplicate feature vectors) |
 | Page image (DynamicImage) | ~32MB (2550×3300 RGBA) |
 | Grayscale page (GrayImage) | ~8MB per copy, ×3-4 copies |
 | Coarse scoring working set | ~50KB per candidate (small images) |

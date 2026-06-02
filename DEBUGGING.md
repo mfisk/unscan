@@ -221,7 +221,7 @@ Default `1.0`. Scales CI thresholds:
 
 | Threshold | Formula | Default (t=1.0) |
 |-----------|---------|-----------------|
-| kd-tree search radius | `2.5 × t` | 2.5× nearest |
+| CI search radius | `2.5 × t` | 2.5× nearest |
 | Quality gate | `0.5 × t` | 0.5 |
 | Quorum divisor | `÷ t` | ÷ 1.0 |
 | σ cutoff k | `0.5 × t` | 0.5 |

@@ -9,14 +9,14 @@ Codebase: 8,526 lines across 16 `.rs` files + 1 test file
 
 ### 1. Remove dead `radius_search` infrastructure
 **Files:** `src/char_index.rs`  
-**What:** The k-d tree was switched from radius search to kNN. The following are now unused:
+**What:** The search was switched from radius search to kNN. The following are now unused:
 - `KdTree::radius_search()` (line 337) and `radius_search_recursive()` (line 346) — **0 callers** outside the impl
 - `CharIndex::search_radii: HashMap<char, f32>` field (line 1049) — populated but never read from the main path
 - `CharIndex::get_search_radius()` accessor (line 1951) — **0 callers**
 - The radius computation in `rebuild_trees()` (line 1134-1140): `sigma_mean * sqrt(FEAT_LEN) * 1.5`
 - All `search_radii.clear()` / `search_radii.insert()` calls
 
-**Keep:** `dim_sigmas` is still used by the test diagnostic (`kd_tree_single_char_diagnostics`) and by serialization. Could be pruned later if sigmas aren't needed.
+**Keep:** `dim_sigmas` is still used by the test diagnostic (`ci_single_char_diagnostics`) and by serialization. Could be pruned later if sigmas aren't needed.
 
 **Effort:** 15 min. Delete ~60 lines.
 
@@ -56,7 +56,7 @@ Codebase: 8,526 lines across 16 `.rs` files + 1 test file
 **Files:** `src/char_index.rs`  
 **What:** `FontCharEntry` stores `font_name: String` per entry. With ~101 indexed chars × 4714 fonts = 476K entries, each storing a ~25-byte font name string. That's **~11 MB** of duplicated name strings in memory and on disk.
 
-The `font_names_table: Vec<String>` already exists as a dedup table for the k-d tree. The entries could store a `font_id: usize` instead and look up names from the table.
+The `font_names_table: Vec<String>` already exists as a dedup table for the character index. The entries could store a `font_id: usize` instead and look up names from the table.
 
 **Savings:** ~9.5 MB in memory, ~10 MB on disk (97 MB → ~87 MB index file).
 
@@ -88,7 +88,7 @@ Each does its own glyph layout and rasterization. They're different enough that 
 - `radius: f32` — now hardcoded to `0.0` after kNN switch
 - `n_within_radius: usize` — now just equals `hits.len()` (always 50 from kNN)
 
-These are meaningless in kNN mode. The test (`kd_tree_single_char_diagnostics`) prints them but they no longer convey useful information.
+These are meaningless in kNN mode. The test (`ci_single_char_diagnostics`) prints them but they no longer convey useful information.
 
 **Effort:** 30 min. Remove fields, update test to not print them or replace with `k` and `n_candidates`.
 
@@ -100,18 +100,17 @@ These are meaningless in kNN mode. The test (`kd_tree_single_char_diagnostics`) 
 **File:** `src/char_index.rs`  
 **What:** This single file contains:
 - Feature computation (~400 lines): `compute_features`, counter/terminal/boundary/crossings
-- K-d tree implementation (~160 lines): `KdTree`, `KdNode`, `KdPoint`
+- Brute-force nearest-neighbor search (~160 lines): flat vector scan
 - Font rendering (~60 lines): `render_char_normalised`
 - Index building (~100 lines): `build_char_index`
 - Index querying (~120 lines): `search_candidates`, `search_single_char`, `match_line_chars`
 - Serialization (~200 lines): `save_index`, `load_index`, `peek_header`
 - Character extraction (~200 lines): `extract_line_chars`, `segment_characters`
-- `CharIndex` struct + `rebuild_trees` (~100 lines)
+- `CharIndex` struct (~100 lines)
 - Helper functions (~100 lines): weights, median, cosine, etc.
 
 Could split into:
 - `char_features.rs` — `CharFeatures` struct + `compute_features` + sub-functions
-- `kd_tree.rs` — standalone k-d tree implementation
 - `char_index.rs` — `CharIndex` struct, build, query, serialize
 
 **Effort:** Half day. Lots of cross-references to untangle.

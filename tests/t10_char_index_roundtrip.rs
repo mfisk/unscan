@@ -198,7 +198,7 @@ fn char_index_identifies_dejavu_sans() {
 }
 
 #[test]
-fn kd_tree_single_char_diagnostics() {
+fn ci_single_char_diagnostics() {
     let (index, unique_crops, _target_data) = setup();
 
     // Exercise search_single_char for 'e' and 'g' — show diagnostics
@@ -207,7 +207,7 @@ fn kd_tree_single_char_diagnostics() {
             let result = search_single_char(&index, test_char, crop);
 
             if let Some(r) = result {
-                eprintln!("\n=== K-d tree search: '{}' ===", r.ch);
+                eprintln!("\n=== CI search: '{}' ===", r.ch);
                 eprintln!("  Search radius: {:.4}", r.radius);
                 eprintln!("  Fonts within tolerance radius: {}", r.n_within_radius);
                 eprintln!("  Tree size: {} fonts", index.tree_size(test_char));

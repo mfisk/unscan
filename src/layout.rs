@@ -8,7 +8,8 @@
 // Having a single source of truth prevents alignment drift between the
 // overlay preview and the final output.
 
-use ab_glyph::{Font, PxScale, ScaleFont};
+use ab_glyph::{point, Font, FontRef, GlyphId, PxScale, ScaleFont};
+use image::{GrayImage, Luma};
 
 /// Reference height used for measuring advance widths before rescaling.
 const REF_H: f32 = 100.0;
@@ -184,4 +185,96 @@ pub fn width_matched_em_px_shaped(font_data: &[u8], text: &str, target_width_px:
     // em_px such that total_advance_fu / units_per_em * em_px = target_width_px
     let em_px = (target_width_px as f64 * units_per_em / total_advance_fu) as f32;
     Some(em_px.clamp(4.0, 500.0))
+}
+
+// ---------------------------------------------------------------------------
+// Shared ab_glyph word rendering
+// ---------------------------------------------------------------------------
+
+
+/// Render a word into a grayscale canvas at a given em size.
+///
+/// `resolve` maps each char to a glyph ID — pass `char_index::resolve_glyph`
+/// for override-aware matching, or `|f, c| f.glyph_id(c)` for plain lookup.
+///
+/// If `canvas_h` is None, height is auto-sized from font ascent/descent.
+/// If `canvas_w` is None, width is auto-sized from total advance + padding.
+///
+/// Returns the rendered canvas (white background, black ink).
+pub fn render_word_ab_glyph(
+    font: &FontRef,
+    text: &str,
+    em_px: f32,
+    canvas_w: Option<u32>,
+    canvas_h: Option<u32>,
+    resolve: impl Fn(&FontRef, char) -> GlyphId,
+) -> Option<GrayImage> {
+    if text.is_empty() || em_px < 1.0 {
+        return None;
+    }
+
+    let scale = PxScale::from(em_px);
+    let sf = font.as_scaled(scale);
+
+    let ink_h = sf.ascent() - sf.descent();
+    if ink_h <= 0.0 {
+        return None;
+    }
+
+    let h = canvas_h.unwrap_or_else(|| (ink_h + 4.0) as u32).max(4);
+    let baseline = (h as f32 - ink_h) / 2.0 + sf.ascent();
+
+    // First pass: find min pixel X and total advance
+    let mut min_px_x = 0i32;
+    let mut cx = 0.0f32;
+    let mut prev: Option<GlyphId> = None;
+    for c in text.chars() {
+        let gid = resolve(font, c);
+        if let Some(p) = prev {
+            cx += sf.kern(p, gid);
+        }
+        let glyph = gid.with_scale_and_position(scale, point(cx, baseline));
+        if let Some(og) = font.outline_glyph(glyph) {
+            min_px_x = min_px_x.min(og.px_bounds().min.x as i32);
+        }
+        cx += sf.h_advance(gid);
+        prev = Some(gid);
+    }
+    let total_advance = cx;
+
+    let x_offset = if min_px_x < 0 { -min_px_x } else { 0 };
+    let w = canvas_w.unwrap_or_else(|| (total_advance as i32 + x_offset + 2).max(4) as u32);
+    let padded_w = (w as i32 + x_offset) as u32;
+
+    let mut canvas = GrayImage::from_pixel(padded_w, h, Luma([255u8]));
+    let (cw, ch) = canvas.dimensions();
+
+    // Second pass: draw
+    let mut cx = 0.0f32;
+    let mut prev: Option<GlyphId> = None;
+    for c in text.chars() {
+        let gid = resolve(font, c);
+        if let Some(p) = prev {
+            cx += sf.kern(p, gid);
+        }
+        let glyph = gid.with_scale_and_position(scale, point(cx, baseline));
+        if let Some(og) = font.outline_glyph(glyph) {
+            let bounds = og.px_bounds();
+            let bx = bounds.min.x as i32 + x_offset;
+            let by = bounds.min.y as i32;
+            og.draw(|gx, gy, cov| {
+                let px = gx as i32 + bx;
+                let py = gy as i32 + by;
+                if px >= 0 && py >= 0 && (px as u32) < cw && (py as u32) < ch {
+                    let val = (255.0 * (1.0 - cov)) as u8;
+                    let cur = canvas.get_pixel(px as u32, py as u32).0[0];
+                    canvas.put_pixel(px as u32, py as u32, Luma([cur.min(val)]));
+                }
+            });
+        }
+        cx += sf.h_advance(gid);
+        prev = Some(gid);
+    }
+
+    Some(canvas)
 }

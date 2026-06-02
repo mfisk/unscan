@@ -18,8 +18,8 @@ dramatic file-size reduction and quality improvement while maintaining
 2. **Font matching** — each word is segmented into individual character crops
    (VP split + seam carving DP — see [`SEGMENTATION.md`](SEGMENTATION.md)),
    then each crop is converted to a 99-dimensional feature vector
-   (see [`FEATURES.md`](FEATURES.md)). Per-character kd-tree nearest-neighbor
-   search against a pre-built font index produces a ranked candidate list
+   (see [`FEATURES.md`](FEATURES.md)). Per-character nearest-neighbor
+   search against a pre-built character index produces a ranked candidate list
    (the CI — Character Index). The top CI candidates are reranked using
    word-level SSIM: each candidate font renders the word, and SSIM against
    the scan crop picks the best visual match. OpenType feature variants
