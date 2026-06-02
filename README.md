@@ -28,14 +28,13 @@ dramatic file-size reduction and quality improvement while maintaining
    variant without heuristics. Common Latin ligatures (ff, fi, fl, ffi, ffl)
    are handled via dual-path segmentation: plain OCR characters vs.
    ligature-collapsed characters, with the higher-scoring path winning.
-3. **Decision matrix** —
-   | OCR confidence | Font match | Action |
-   |----------------|-----------|--------|
-   | High (≥ 90 %)  | High (≥ 0.7) | Vectorise |
-   | High           | Low        | **Keep raster** — log warning |
-   | Low            | any        | **Keep raster** — log warning |
+3. **Decision matrix** — OCR confidence and font-match score are checked
+   against user-configurable thresholds (`--min-ocr-confidence`,
+   `--min-font-confidence`). Lines passing both thresholds are vectorised;
+   all others keep the original raster.
 4. **SSIM verification** — vector text is rendered back to raster and compared
-   with the original region. If SSIM < threshold, the region reverts to raster.
+   with the original region (ink-cropped to actual glyph extent). If
+   SSIM < 0.3, the region reverts to raster.
 5. **Geometry vectorisation** — horizontal/vertical lines, solid-colour fills,
    and rectangles are replaced with native PDF paths.
 6. **PDF generation** — vector text + vector geometry + lossless raster fragments,
@@ -84,7 +83,7 @@ TTF/OTF files used. This fontmap serves two purposes:
 
 ```bash
 # Run unscan with fontmap-injected candidates
-unscan test-docs/specimen-clean-raster.pdf \
+unscan test-docs/font-timeline-specimen-rasterized.pdf \
   -o /tmp/out.pdf --audit /tmp/audit-out \
   --include-fontmap test-docs/font-timeline-specimen-fontmap.json
 
@@ -113,21 +112,35 @@ unscan input.pdf -o output.pdf --no-geometry
 
 # Audit + diagnostics (writes audit.json and segmentation images to DIR)
 unscan input.pdf -o output.pdf --audit /tmp/audit-out
+
+# Debug overlay (semitransparent red vector text over original raster)
+unscan input.pdf -o output.pdf --overlay
+
+# Image input (PNG, JPEG, TIFF, BMP, GIF, WebP)
+unscan scan.png -o output.pdf
 ```
 
 ### Flags
 
 | Flag | Default | Description |
 |------|---------|-------------|
+| `-o`, `--output` | *(required)* | Output PDF path |
 | `--min-ocr-confidence` | 0 | Minimum Tesseract confidence (0–100) to attempt vectorisation |
 | `--min-font-confidence` | 0.10 | Minimum CI score (0.0–1.0) to accept a font match |
 | `--dpi` | 300 | DPI for rasterising PDF pages |
 | `--font-dir` | *(system defaults)* | Extra font search directory (repeatable) |
 | `--no-geometry` | off | Skip line / rectangle / fill vectorisation |
+| `--overlay` | off | Debug mode: render vector text in semitransparent red over original raster |
+| `--smooth` | off | Unify per-word font sizes within consecutive same-font runs to their median |
 | `--audit` | *(none)* | Write audit JSON + per-line segmentation diagnostics to DIR |
-| `--include-font` | *(none)* | Force a font (case-insensitive substring) into CI audit candidate list |
-| `--include-fontmap` | *(none)* | Inject all fonts from a fontmap JSON into CI audit candidate list |
+| `--compare` | off | Generate side-by-side scan vs. render comparison images |
+| `--include-font` | *(none)* | Force a font (case-insensitive substring) into CI candidate list for every line |
+| `--include-fontmap` | *(none)* | Inject all fonts from a fontmap JSON into CI candidate list |
 | `--thoroughness` | 1.0 | Scale CI thresholds — higher = more candidates survive, slower |
+| `--index` | off | Scan fonts, update the character index cache, and exit |
+| `--index-path` | `~/.cache/unscan/char-index.bin` | Path to the character index cache file |
+| `--rebuild-index` | off | Force a full rebuild of the character index, ignoring cache |
+| `--diag-ref-font` | *(none)* | Render each extracted character from this font file for comparison (requires `--audit`) |
 
 ## Font search paths
 
@@ -139,6 +152,8 @@ unscan input.pdf -o output.pdf --audit /tmp/audit-out
 - `/usr/share/fonts/truetype/msttcorefonts/`
 - `/usr/share/texlive/texmf-dist/fonts/opentype/`
 - `/usr/share/texlive/texmf-dist/fonts/truetype/`
+- `/usr/share/texmf/fonts/opentype/`
+- `/usr/share/texmf/fonts/truetype/`
 - `~/.fonts/`, `~/.local/share/fonts/`
 - `~/texmf/fonts/`
 
@@ -160,6 +175,18 @@ to the PDF Base-14 canonical names (Helvetica, Times-Roman, Courier) so output
 PDFs reference standard names all viewers understand. See
 [`docs/font-aliasing.md`](docs/font-aliasing.md) for details.
 
+## Tools
+
+| Script | Purpose |
+|--------|---------|
+| `tools/char-misses.py` | Generate visual HTML miss report from audit JSON + vector PDF ground truth |
+| `tools/rasterize.py` | Rasterize a vector PDF to grayscale raster PDF (clean or with scan artifacts) |
+| `scripts/install-all-fonts.sh` | Install all recommended fonts (MS Core, Google Fonts, typewriter, LaTeX) |
+| `test-docs/gen-specimen.py` | Generate the 6-page font timeline specimen PDF + fontmap |
+| `test-docs/gen-resolution-series.py` | Generate resolution degradation series (600→fax DPI) |
+| `test-docs/gen-ligature-test.py` | Generate the ligature test PDF |
+| `test-docs/gen-mixed-font-specimen.py` | Generate the mixed-font (intra-line switching) specimen |
+
 ## Audit log
 
 When `--audit DIR` is set, unscan writes `DIR/audit.json` with full pipeline
@@ -171,6 +198,9 @@ segmentation overlays, character crops, and summary JSONs. Use
 DIR/
   audit.json                              # Top-level pipeline decisions
   p1_L000_A_Timeline_of/                  # Per-line directory
+    ssim_scan.png                         # Scan crop used for SSIM (word-union bbox)
+    ssim_render.png                       # Render crop used for SSIM (ink-cropped)
+    ssim_diff.png                         # Absolute difference
     word_000_Timeline/                    # Per-word directory
       seg_plain/                          # Plain segmentation path
         overlay.png                       # VP + seam split visualization
@@ -222,79 +252,44 @@ for full documentation.
 ### Test font prerequisites
 
 The test suite requires **Microsoft core TTF fonts** and the **specimen fonts**
-(Google Fonts / OFL) to be installed. These are hard prerequisites — without
-them, the ground truth sections for Times New Roman, Arial, Courier New,
-Georgia, Verdana, Trebuchet MS, and Comic Sans MS cannot be scored.
+(Google Fonts / OFL) to be installed.
 
 ```bash
 # Install required fonts (requires sudo)
 ./scripts/install-all-fonts.sh
 ```
 
-**MS Core Fonts** (required for ground truth sections 7, 9, 11–15):
+### Tests
 
-```bash
-sudo apt install ttf-mscorefonts-installer
-```
+Tests live in the `tests/` directory:
 
-This installs Arial, Times New Roman, Courier New, Georgia, Verdana,
-Trebuchet MS, Comic Sans MS, and others into
-`/usr/share/fonts/truetype/msttcorefonts/`.
-
-**Specimen fonts** (required for ground truth sections 0–6, 16–29):
-
-```bash
-# Downloaded automatically by gen-specimen.py on first run
-cd test-docs && python3 gen-specimen.py
-```
-
-These install into `/usr/share/fonts/truetype/specimen-fonts/`.
-
-### Test cases
-
-| Test | Input | Ground truth | What it tests |
-|------|-------|-------------|---------------|
-| **t40_ligature.sh** | `ligature-test.pdf` | — | 21 ligature lines (3 fonts × with/without ligatures), asserts 21/21 hits |
-| **t60_specimen_accuracy_aa** | AA-rasterized specimen | `font-timeline-specimen.pdf` | 30 fonts, 6 pages — anti-aliased accuracy baseline |
-| **t61_specimen_accuracy_noaa** | No-AA rasterized specimen | `font-timeline-specimen.pdf` | Same content without anti-aliasing |
-| **t62_cross_renderer_accuracy** | Multiple rasterizers | `font-timeline-specimen.pdf` | Cross-renderer stability |
-| **Font timeline specimen** | `font-timeline-specimen-scanned.pdf` | `font-timeline-specimen.json` | 30 fonts across 500 years — the full ground truth |
-| **Bodoni sentence** | `bodoni-sentence-raster.pdf` | `bodoni-sentence.json` | Single-font smoke test (Libre Bodoni 400, one sentence) |
-| **Mixed-font specimen** | `mixed-font-specimen-raster.pdf` | `mixed-font-ground-truth.json` | Intra-line font switching (sans/serif/mono/bold/italic) |
-
-### Quick start
-
-```bash
-# Generate the font specimen (downloads fonts on first run)
-cd test-docs/
-python3 gen-specimen.py
-
-# Generate the resolution degradation series
-python3 gen-resolution-series.py
-
-# Run unscan against the standard 300dpi scan
-cd ..
-cargo run --release -- test-docs/resolution-series/specimen-300dpi.pdf \
-    -o /tmp/reconstructed.pdf
-
-# Compare the audit log against ground truth
-# (font-timeline-specimen.json has the expected font for each section)
-```
+| Test | What it tests |
+|------|---------------|
+| `t10_char_index_roundtrip.rs` | Character index build + query roundtrip |
+| `t20_distance_analysis.rs` | Feature-space distance analysis |
+| `t30_regression_ssim.rs` | SSIM regression checks |
+| `t40_bodoni_sentence.rs` | Single-font smoke test (Libre Bodoni 400) |
+| `t40_ligature.sh` | 21 ligature lines (3 fonts × with/without ligatures), asserts 21/21 hits |
+| `t50_output_quality.rs` | Output PDF quality validation |
+| `t55_specimen_gen.rs` | Specimen generation test |
+| `t58_word_segmentation.rs` | Word-level segmentation validation |
+| `t60_specimen_accuracy_aa.rs` | 30 fonts, 6 pages — anti-aliased accuracy baseline |
+| `t61_specimen_accuracy_noaa.rs` | Same content without anti-aliasing |
+| `t62_cross_renderer_accuracy.rs` | Cross-renderer stability |
 
 ### Test tiers
 
 | Tier | Source | What it tests |
 |------|--------|---------------|
-| **Clean specimen** | `font-timeline-specimen.pdf` | 30 fonts, 6 pages, 500 years, OT variants — the vector ground truth |
-| **Ligature test** | `ligature-test.pdf` | 3 fonts × 7 ligature lines — dual-path CI validation |
-| **Bodoni sentence** | `bodoni-sentence-raster.pdf` | Single-font smoke test — must match Libre Bodoni 400 |
-| **Resolution series** | `resolution-series/specimen-*.pdf` | Same content at 600→fax dpi — measures degradation tolerance |
-| **Historical scans** | `historical/*.pdf` | Real documents from archives — Baskerville's 1757 Virgil, CIA memos, NASA standards |
-| **Existing test docs** | `berkeley-acceptance.pdf`, `irs-w4.pdf` | Real-world documents with known fonts |
+| **Font timeline specimen** | `test-docs/font-timeline-specimen.pdf` | 30 fonts, 6 pages, 500 years, OT variants — the vector ground truth |
+| **Ligature test** | `test-docs/ligature-test.pdf` | 3 fonts × 7 ligature lines — dual-path CI validation |
+| **Bodoni sentence** | `test-docs/bodoni-sentence-raster.pdf` | Single-font smoke test — must match Libre Bodoni 400 |
+| **Mixed-font specimen** | `test-docs/mixed-font-specimen-raster.pdf` | Intra-line font switching (sans/serif/mono/bold/italic) |
+| **Resolution series** | `test-docs/resolution-series/specimen-*.pdf` | Same content at 600→fax DPI — measures degradation tolerance |
 
 ## OpenType Feature Variant Detection
 
-Scantext's font catalog doesn't just match base fonts — it matches specific
+The font catalog doesn't just match base fonts — it matches specific
 OpenType feature configurations. During font scanning, `rustybuzz` (a pure-Rust
 harfbuzz port) probes each font for 25+ OT features and creates a separate
 catalog entry for any feature that changes glyph shapes.
@@ -333,9 +328,9 @@ no figure-style detection heuristic needed.
 | `liga` | Standard ligatures | ff, fi, fl → single glyphs (probed for ligature detection) |
 | `dlig` | Discretionary ligatures | ffi, ffl → single glyphs (probed for ligature detection) |
 
-### Adding this to your font pipeline
+### Key code
 
-The key code is in `src/font_scan.rs`:
+OT variant detection is in `src/font_scan.rs`:
 
 ```rust
 // detect_ot_variants() shapes a Latin probe string with each feature
@@ -351,13 +346,13 @@ for (tag, overrides) in &variants {
 }
 ```
 
-And in `src/font_match.rs`:
+Glyph override resolution is in `src/char_index.rs`:
 
 ```rust
 // resolve_glyph() checks the override map before falling back to cmap
-fn resolve_glyph(font: &FontRef, ch: char, overrides: Option<&[(char, u16)]>)
-    -> ab_glyph::GlyphId
-{
+pub fn resolve_glyph<F: ab_glyph::Font>(
+    font: &F, ch: char, overrides: Option<&[(char, u16)]>
+) -> ab_glyph::GlyphId {
     if let Some(map) = overrides {
         if let Some(&(_, gid)) = map.iter().find(|(c, _)| *c == ch) {
             return ab_glyph::GlyphId(gid);
