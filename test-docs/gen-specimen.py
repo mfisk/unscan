@@ -945,37 +945,12 @@ def build_specimen(out_pdf, registered):
 
 
 # ---------------------------------------------------------------------------
-# "Scan" a PDF — rasterize via tools/rasterize.py
+# Rasterization + fontmap — all logic lives in tools/rasterize.py.
+# gen-specimen.py only builds the vector PDF; rasterize.py does the rest.
 # ---------------------------------------------------------------------------
-def scan_pdf(clean_pdf, scanned_pdf, dpi=300):
-    """Rasterize a vector PDF.  Clean by default — no skew, noise, or blur.
-
-    All artifact options live in tools/rasterize.py; pass --scan there
-    for the full scanner-artifact experience.
-    """
-    rasterize_py = os.path.join(os.path.dirname(__file__), "..", "tools", "rasterize.py")
-    cmd = [
-        "python3", rasterize_py,
-        str(clean_pdf), str(scanned_pdf),
-        "--dpi", str(dpi),
-        "--backend", "poppler",
-    ]
-    result = subprocess.run(cmd, capture_output=True, text=True)
-    if result.returncode != 0:
-        print(f"  ERROR: rasterize.py failed:\n{result.stderr}\n{result.stdout}")
-        raise RuntimeError("rasterize.py failed")
-    print(f"  {result.stdout.strip()}")
-    return scanned_pdf
-
-
-# ---------------------------------------------------------------------------
-# Ground truth — fontmap built by introspecting the finished PDF
-# ---------------------------------------------------------------------------
-# The standalone script is tools/build-fontmap.py; we import its logic here.
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "tools"))
 from importlib import import_module as _imp
-_build_fontmap_mod = _imp("build-fontmap")
-build_fontmap_from_pdf = lambda pdf_path: _build_fontmap_mod.build_fontmap(pdf_path)[0]
+_rasterize_mod = _imp("rasterize")
 
 
 def main():
@@ -989,16 +964,18 @@ def main():
 
     # Build fontmap by introspecting what's actually in the PDF
     print("Introspecting PDF for font map...")
-    fontmap = build_fontmap_from_pdf(out_pdf)
+    resolved, unresolved = _rasterize_mod.build_fontmap(str(out_pdf))
     out_fontmap = OUT_DIR / "font-timeline-specimen-fontmap.json"
-    print(f"Writing font file map: {out_fontmap} ({len(fontmap)} fonts)")
-    with open(str(out_fontmap), "w") as f:
-        json.dump(fontmap, f, indent=2, sort_keys=True)
+    _rasterize_mod.write_fontmap(resolved, out_fontmap)
+    print(f"  {len(resolved)} fonts → {out_fontmap}")
+    if unresolved:
+        print(f"  {len(unresolved)} unresolved (builtins): {', '.join(unresolved)}")
 
+    # Rasterize
     scanned_pdf = OUT_DIR / "font-timeline-specimen-scanned.pdf"
-    print(f"Creating scanned version...")
-    scan_pdf(out_pdf, scanned_pdf)
-    print(f"Scanned PDF: {scanned_pdf}")
+    print("Creating scanned version...")
+    _rasterize_mod.rasterize(out_pdf, scanned_pdf)
+    print(f"  → {scanned_pdf}")
 
     print("Done!")
 
