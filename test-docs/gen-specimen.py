@@ -969,21 +969,31 @@ def scan_pdf(clean_pdf, scanned_pdf, dpi=300):
 
 
 # ---------------------------------------------------------------------------
-# Ground truth
+# Ground truth — fontmap built by introspecting the finished PDF
 # ---------------------------------------------------------------------------
+# The standalone script is tools/build-fontmap.py; we import its logic here.
+sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "tools"))
+from importlib import import_module as _imp
+_build_fontmap_mod = _imp("build-fontmap")
+build_fontmap_from_pdf = lambda pdf_path: _build_fontmap_mod.build_fontmap(pdf_path)[0]
+
+
 def main():
     print("Registering fonts...")
-    registered, font_file_map = register_all_fonts()
+    registered, _font_file_map = register_all_fonts()
     print(f"  {len(registered)} font families registered")
 
     out_pdf = OUT_DIR / "font-timeline-specimen.pdf"
     print(f"Building vector specimen: {out_pdf}")
     build_specimen(out_pdf, registered)
 
+    # Build fontmap by introspecting what's actually in the PDF
+    print("Introspecting PDF for font map...")
+    fontmap = build_fontmap_from_pdf(out_pdf)
     out_fontmap = OUT_DIR / "font-timeline-specimen-fontmap.json"
-    print(f"Writing font file map: {out_fontmap}")
+    print(f"Writing font file map: {out_fontmap} ({len(fontmap)} fonts)")
     with open(str(out_fontmap), "w") as f:
-        json.dump(font_file_map, f, indent=2)
+        json.dump(fontmap, f, indent=2, sort_keys=True)
 
     scanned_pdf = OUT_DIR / "font-timeline-specimen-scanned.pdf"
     print(f"Creating scanned version...")

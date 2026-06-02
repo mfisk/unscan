@@ -23,31 +23,41 @@ char-misses.py ─── audit.json + vector PDF + fontmap.json → HTML miss re
 
 ## The Fontmap
 
+### How It's Built
+
+The fontmap is derived by **introspecting the finished PDF**, not by recording what inputs were given to the PDF generator. After `gen-specimen.py` builds the vector PDF:
+
+1. Open the finished PDF with PyMuPDF
+2. Enumerate every embedded font across all pages via `page.get_fonts(full=True)`
+3. Extract the PostScript name (stripping the `AAAAAA+` subset prefix)
+4. Reverse-resolve each PS name to a file path: `fc-list :postscriptname=X`
+
+This guarantees the fontmap matches the PDF by construction. If `fc_find` has a bug and registers the wrong font file, the fontmap will correctly record *that wrong file* — because it's reading what ReportLab actually embedded, not what we intended. The ground truth accurately reflects reality.
+
+Built-in PDF fonts (Helvetica, Times-Roman) have no file on disk and are omitted.
+
 ### Format
 
 ```json
 {
-  "EBGaramond": "/usr/share/fonts/truetype/specimen-fonts/eb-garamond-400.ttf",
+  "ArialMT": "/usr/share/fonts/truetype/msttcorefonts/Arial.TTF",
   "EBGaramond-Bold": "/usr/share/fonts/truetype/specimen-fonts/eb-garamond-700.ttf",
   "EBGaramond-Italic": "/usr/share/fonts/truetype/specimen-fonts/eb-garamond-400i.ttf",
-  "SourceSerif4": "/usr/share/fonts/truetype/extra/SourceSerif4[opsz,wght].ttf",
+  "EBGaramond-Regular": "/usr/share/fonts/truetype/specimen-fonts/eb-garamond-400.ttf",
+  "SourceSerif4-Regular": "/usr/share/fonts/truetype/extra/SourceSerif4[opsz,wght].ttf",
   ...
 }
 ```
 
-Keys are ReportLab registration names (`{Family}`, `{Family}-Bold`, `{Family}-Italic`). Values are absolute filesystem paths to the font files used to generate the PDF.
+**Keys are PostScript names** as they appear in the PDF (e.g., `ArialMT`, `EBGaramond-Bold`, `SourceSerif4-It`). These match what PyMuPDF reports in `span['font']` when reading the vector PDF — so downstream tools can look up the expected file for any font name they encounter with a direct key match.
 
-### How Tools Use It
+**Values are absolute file paths** to the font files that were actually embedded. File paths are unambiguous — a single font file can declare multiple names (PostScript name, full name, family, preferred family), but its path is unique.
 
-**`unscan --include-fontmap`**: Injects the fontmap into the audit JSON under `font_file_map`. This gives downstream tools the file-level ground truth without needing to re-derive it from the vector PDF.
+### Why Introspection, Not Registration Tracking
 
-**`char-misses.py --fontmap`**: Uses the fontmap to resolve the "expected" font for each line. The vector PDF embeds font *names* (e.g., `SourceSerif4-SemiboldIt`); the fontmap maps the registration name to a *file*. The report compares unscan's matched file against the expected file.
+The previous approach recorded what `fc_find()` returned and what `register_font()` was given. This created a dependency chain: if `fc_find` had a bug (returning the wrong weight, wrong width, wrong variant), the fontmap was wrong *and we couldn't tell*. We'd measure accuracy against corrupted ground truth.
 
-**`gen-specimen.py`**: Generates the fontmap as a side effect of font registration. Every `register_font()` call records the family→file mapping.
-
-### Why File Paths, Not Names
-
-Font names are unreliable. A single font file can declare multiple names (PostScript name, full name, family name, preferred family). The 4-font-family naming model means a font's `subfamily` field might say "Regular" even when its weight is 600. File paths are unambiguous — either unscan found the same file or it didn't.
+With introspection, `fc_find` bugs still affect the PDF (it'll contain the wrong font), but the fontmap will correctly identify *which wrong font is in there*. The miss report then accurately shows where unscan disagrees with what the specimen actually contains — which is the right question to answer.
 
 ## Font Resolution via Fontconfig (`fc_find`)
 
@@ -145,7 +155,26 @@ Last resort: highest-scoring candidate regardless of width.
 
 ## Running Tests
 
-### Full Pipeline
+### Any Vector PDF (End-to-End)
+
+The tools work on any vector PDF, not just the specimen. Three commands:
+
+```bash
+# 1. Build fontmap from the vector PDF
+python3 tools/build-fontmap.py original.pdf -o fontmap.json -v
+
+# 2. Run unscan on a rasterized version with the fontmap
+./target/release/unscan rasterized.pdf -o output.pdf --audit /tmp/audit --include-fontmap fontmap.json
+
+# 3. Generate miss report comparing unscan's results against ground truth
+python3 tools/char-misses.py /tmp/audit/audit.json original.pdf --fontmap fontmap.json -o /tmp/misses.html
+```
+
+The fontmap is built from the *original* vector PDF (step 1). unscan processes the *rasterized* version (step 2). The miss report compares unscan's font matches against the fonts embedded in the original (step 3).
+
+**Requirements**: The fonts embedded in the vector PDF must be installed on the system. `build-fontmap.py` resolves PostScript names via fontconfig — if a font isn't installed, it will be listed as unresolved. Built-in PDF fonts (Helvetica, Courier, Times) are expected unresolved entries.
+
+### Specimen Pipeline (Full Regeneration)
 
 ```bash
 # 1. Regenerate specimen (if fonts or gen-specimen.py changed)
