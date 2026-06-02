@@ -970,6 +970,7 @@ fn run(args: &cli::Args) -> Result<(), ScanTextError> {
                             &line.words,
                             fm.glyph_overrides.as_deref(),
                             &fm.variant_tag,
+                            lm.diag_seg_dir.as_deref(),
                         );
                         let pass = score >= MIN_VERIFY_SSIM;
                         (Some(score), Some(pass))
