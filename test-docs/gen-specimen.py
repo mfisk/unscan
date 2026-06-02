@@ -41,12 +41,20 @@ PAGE_W, PAGE_H = letter  # 612 × 792 points (8.5 × 11 in)
 # Font registration — fonts are resolved via fontconfig
 # ---------------------------------------------------------------------------
 def fc_find(family, style="Regular"):
-    """Find a font file via fontconfig. Prefers .ttf over .otf (ReportLab needs TrueType outlines).
+    """Find a font file via fontconfig, validated against OS/2 metrics.
 
-    Validates OS/2 weight class when style is weight-specific, because many fonts
-    use the 4-font-family naming model where e.g. SemiBold declares subfamily
-    "Regular" under a different family name — fontconfig's style=Regular filter
-    matches all of them.
+    Fontconfig's style matching is unreliable for two reasons:
+    1. **4-font-family naming model**: SemiBold, Light, etc. declare subfamily
+       "Regular" under an alternate family name. fc-list style=Regular matches them.
+    2. **Large superfamilies**: Noto Serif has ~50 width/weight combos. fc-list
+       returns Condensed/ExtraCondensed variants for "Noto Serif:style=Regular".
+
+    We validate every candidate against OS/2.usWeightClass and OS/2.usWidthClass.
+    Variable fonts whose OS/2 weight reflects the axis default (not the style we
+    want) are deprioritized — static instances are preferred when available, since
+    ReportLab doesn't support variable font instances anyway.
+
+    Prefers .ttf over .otf (ReportLab needs TrueType outlines).
     """
     from fontTools.ttLib import TTFont as FTFont
 
@@ -55,8 +63,11 @@ def fc_find(family, style="Regular"):
         "Bold": 700,
         "Light": 300,
         "Medium": 500,
+        "Italic": 400,
+        "Bold Italic": 700,
     }
     expected_weight = STYLE_WEIGHTS.get(style)
+    expected_width = 5  # usWidthClass: 5 = normal (not condensed/expanded)
 
     for query in [f"{family}:style={style}", family]:
         r = subprocess.run(
@@ -70,31 +81,56 @@ def fc_find(family, style="Regular"):
         if not pool:
             continue
 
-        # If we know what weight to expect, verify via OS/2 table
-        if expected_weight:
-            for path in pool:
-                try:
-                    tt = FTFont(path)
-                    wt = tt['OS/2'].usWeightClass
-                    tt.close()
-                    if wt == expected_weight:
-                        return path
-                except Exception:
-                    continue
-            # Fallback: allow ±50 tolerance (e.g. 450 for "Regular")
-            for path in pool:
-                try:
-                    tt = FTFont(path)
-                    wt = tt['OS/2'].usWeightClass
-                    tt.close()
-                    if abs(wt - expected_weight) <= 50:
-                        return path
-                except Exception:
-                    continue
+        def _check(path):
+            """Return (weight_ok, width_ok, is_variable, weight, width)."""
+            try:
+                tt = FTFont(path)
+                wt = tt['OS/2'].usWeightClass
+                wd = tt['OS/2'].usWidthClass
+                is_var = tt.get('fvar') is not None
+                tt.close()
+                return (wt, wd, is_var)
+            except Exception:
+                return None
 
-        # No weight constraint or nothing matched — return first candidate
-        if pool:
-            return pool[0]
+        # Score and rank candidates
+        scored = []
+        for path in pool:
+            info = _check(path)
+            if info is None:
+                continue
+            wt, wd, is_var = info
+            width_ok = (wd == expected_width)
+            weight_ok = (wt == expected_weight) if expected_weight else True
+            weight_close = (abs(wt - expected_weight) <= 50) if expected_weight else True
+            # Priority: exact weight + normal width + static > variable
+            # Condensed/expanded fonts are almost never what we want for specimen
+            score = 0
+            if width_ok:       score += 100
+            if weight_ok:      score += 50
+            elif weight_close: score += 25
+            if not is_var:     score += 10  # prefer static over variable
+            scored.append((score, path, wt, wd, is_var))
+
+        if not scored:
+            continue
+
+        scored.sort(key=lambda x: -x[0])
+        best_score, best_path, best_wt, best_wd, best_var = scored[0]
+
+        # Accept if width is normal and weight is at least close
+        if best_wd == expected_width:
+            if not expected_weight or best_wt == expected_weight or abs(best_wt - expected_weight) <= 50:
+                return best_path
+
+        # Fallback: accept anything with normal width regardless of weight
+        for s, path, wt, wd, is_var in scored:
+            if wd == expected_width:
+                return path
+
+        # Last resort: return highest-scored candidate even if condensed
+        return scored[0][1]
+
     return None
 def register_font(rl_name, ttf_path):
     """Register a TTF with reportlab. Returns True on success."""
