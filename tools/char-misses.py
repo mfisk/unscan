@@ -288,22 +288,45 @@ def img_to_b64(img_or_path):
 # Segmentation visualisation
 # ---------------------------------------------------------------------------
 
-def find_diag_seg_dir(diag_seg_root, page, text):
+def find_diag_seg_dir(diag_seg_root, page, text, line_index=None):
     """Find the diag-seg line directory matching a page and line text."""
     if not diag_seg_root or not os.path.isdir(diag_seg_root):
         return None
     prefix = f"p{page}_"
     # Sanitise text the same way seg_diag.rs does (replace non-alnum with _)
     slug = re.sub(r'[^A-Za-z0-9]', '_', text)[:30]
-    best = None
+
+    # New format: p{page}_L{line_index:03}_{slug} — exact match by line_index
+    if line_index is not None:
+        exact_prefix = f"p{page}_L{line_index:03d}_"
+        for d in os.listdir(diag_seg_root):
+            if d.startswith(exact_prefix):
+                return os.path.join(diag_seg_root, d)
+
+    # Legacy format: p{page}_{slug} — match by text slug, verify via line_summary.json
+    candidates = []
     for d in os.listdir(diag_seg_root):
         if not d.startswith(prefix):
             continue
-        # Match by slug substring — diag dirs also truncate
         dsuf = d[len(prefix):]
-        if slug and slug[:15] in dsuf:
-            best = os.path.join(diag_seg_root, d)
-            break
+        if slug and slug in dsuf:
+            candidates.append(os.path.join(diag_seg_root, d))
+
+    # If we have a line_index, verify via line_summary.json
+    if line_index is not None and candidates:
+        for cpath in candidates:
+            summary_path = os.path.join(cpath, "line_summary.json")
+            if os.path.exists(summary_path):
+                try:
+                    with open(summary_path) as sf:
+                        summary = json.load(sf)
+                    if summary.get("line_index") == line_index:
+                        return cpath
+                except (json.JSONDecodeError, KeyError):
+                    pass
+        return None
+
+    best = candidates[0] if candidates else None
     if best is None:
         # Fallback: try matching by line number embedded in dir name
         for d in sorted(os.listdir(diag_seg_root)):
@@ -481,7 +504,7 @@ def find_crop_dir(crops_root, page, line_index, diag_seg_root=None, line_text=No
     """
     # Try diag-seg crops/ subdir first (matched by text slug)
     if diag_seg_root and line_text:
-        diag_line = find_diag_seg_dir(diag_seg_root, page, line_text)
+        diag_line = find_diag_seg_dir(diag_seg_root, page, line_text, line_index=line_index)
         if diag_line:
             crop_subdir = os.path.join(diag_line, "crops")
             if os.path.isdir(crop_subdir):
@@ -559,45 +582,26 @@ def build_miss_html(entry, chars_to_show, crop_dir, crop_files,
             chosen_img = render_char(ch, chosen_font_path, NORM_H) if chosen_font_path else None
         dc = dist_class(d2)
 
-        ocr_best_dist = cv.get("ocr_char_best_dist")
-        ocr_near = cv.get("ocr_char_nearest", cv.get("nearest", []))
-        if ocr_from and ocr_near:
-            ocr_font = ocr_near[0][0].rsplit("/", 1)[-1] if ocr_near else "?"
-            ocr_d = ocr_near[0][1] if ocr_near else 0
-            ocr_dc = dist_class(ocr_d)
-            ocr_cell = f"<span class='char-label'>'{original_ocr}'</span><br><span class='font-mini'>{ocr_font}</span><br><span class='num {ocr_dc}'>{ocr_d:.6f}</span>"
-        elif not ocr_from:
-            near = cv.get("nearest", [])
-            if near:
-                ocr_font = near[0][0].rsplit("/", 1)[-1]
-                ocr_d = near[0][1]
-                ocr_dc = dist_class(ocr_d)
-                ocr_cell = f"<span class='char-label'>'{ch}'</span><br><span class='font-mini'>{ocr_font}</span><br><span class='num {ocr_dc}'>{ocr_d:.6f}</span>"
-            else:
-                ocr_cell = "—"
-        else:
-            ocr_cell = "—"
+        # OCR column: OCR char, best alt char + score on separate line
+        near = cv.get("nearest", [])
+        best_alt_ch = cv.get("best_alt_char")
+        best_alt_dist = cv.get("best_alt_dist")
 
-        alt_ch = cv.get("alt_char")
-        alt_dist = cv.get("alt_char_best_dist")
-        if alt_ch and alt_dist is not None:
-            if ocr_from:
-                near = cv.get("nearest", [])
-                alt_font = near[0][0].rsplit("/", 1)[-1] if near else "?"
-            else:
-                alt_font = ""
-            alt_dc = dist_class(alt_dist)
-            alt_cell = f"<span class='char-label'>'{alt_ch}'</span><br><span class='font-mini'>{alt_font}</span><br><span class='num {alt_dc}'>{alt_dist:.6f}</span>"
-        elif cv.get("min_dist_sq", 1.0) <= 0.1:
-            alt_cell = "<span class='dimmed'>—</span>"
-        else:
-            alt_cell = "<span class='dimmed'>same</span>"
+        ocr_parts = [f"OCR: <b>'{original_ocr}'</b>"]
 
-        if ocr_best_dist and alt_dist and alt_dist > 0:
-            ratio = ocr_best_dist / alt_dist
-            ratio_str = f"{ratio:.1f}×"
-        else:
-            ratio_str = ""
+        # Show best-scoring font for the OCR char
+        if near:
+            ocr_font = near[0][0].rsplit("/", 1)[-1]
+            ocr_dist = near[0][1]
+            ocr_dc = dist_class(ocr_dist)
+            ocr_parts.append(f"<span class='font-mini'>{ocr_font}</span><br><span class='num {ocr_dc}'>{ocr_dist:.6f}</span>")
+
+        # Show best alt char on a separate line (even if correction didn't fire)
+        if best_alt_ch and best_alt_dist is not None:
+            alt_dc = dist_class(best_alt_dist)
+            ocr_parts.append(f"Alt: <b>'{best_alt_ch}'</b> <span class='num {alt_dc}'>{best_alt_dist:.6f}</span>")
+
+        ocr_cell = "<br>".join(ocr_parts)
 
         # Per-char distance for the chosen (unscan pick) font
         chosen_d2 = cv.get("chosen_dist_sq")
@@ -615,12 +619,10 @@ def build_miss_html(entry, chars_to_show, crop_dir, crop_files,
             correct_score_label = ""
 
         rows.append(f"""<tr>
-  <td class="img-td">{img_td(crop_img)}<div class="sub">OCR: {ocr_label}</div></td>
+  <td class="img-td">{img_td(crop_img)}</td>
   <td class="img-td">{img_td(ref_img)}{correct_score_label}</td>
   <td class="img-td">{img_td(chosen_img)}{chosen_score_label}</td>
   <td class="ocr-col">{ocr_cell}</td>
-  <td class="alt-col">{alt_cell}</td>
-  <td class="num ratio">{ratio_str}</td>
 </tr>""")
 
     text_preview = entry["text"][:60]
@@ -638,18 +640,21 @@ def build_miss_html(entry, chars_to_show, crop_dir, crop_files,
         ssim_html = ""
 
     chosen_score = None
-    for c in entry.get("ci_candidates", []):
+    chosen_rank = None
+    for i, c in enumerate(entry.get("ci_candidates", []), 1):
         if fonts_match(c["font_key"], matched):
             chosen_score = c["score"]
+            chosen_rank = i
             break
 
     correct_col_hdr = f"{correct_font_name}<br><span class='score'>{rank_str}</span>"
-    chosen_score_str = f"score {chosen_score:.4f}" if chosen_score else ""
-    chosen_col_hdr = f"{matched}<br><span class='score'>{chosen_score_str}</span>"
+    chosen_rank_str = f"CI #{chosen_rank}, score {chosen_score:.4f}" if chosen_rank and chosen_score else ""
+    chosen_col_hdr = f"{matched}<br><span class='score'>{chosen_rank_str}</span>"
 
     # Segmentation picture
     seg_html = ""
-    diag_line_dir = find_diag_seg_dir(diag_seg_root, entry["page"], entry.get("text", ""))
+    diag_line_dir = find_diag_seg_dir(diag_seg_root, entry["page"], entry.get("text", ""),
+                                       line_index=entry.get("line_index"))
     if diag_line_dir:
         seg_result = render_seg_picture(diag_line_dir)
         if seg_result:
@@ -668,12 +673,10 @@ def build_miss_html(entry, chars_to_show, crop_dir, crop_files,
 {seg_html}
 <table>
 <tr>
-  <th>Scan + OCR</th>
+  <th>Scan</th>
   <th class="correct">Correct: {correct_col_hdr}</th>
   <th class="chosen">Unscan pick: {chosen_col_hdr}</th>
-  <th>OCR char</th>
-  <th>Alt char</th>
-  <th>Ratio</th>
+  <th>OCR</th>
 </tr>
 {"".join(rows)}
 </table>
@@ -722,7 +725,7 @@ img.ci {
 .num.bad { color: #c62828; font-weight: bold; }
 .num.warn { color: #e65100; }
 .num.ok { color: #2e7d32; }
-.ocr-col, .alt-col { text-align: center; font-size: 11px; vertical-align: middle; padding: 4px; }
+.ocr-col { text-align: center; font-size: 11px; vertical-align: middle; padding: 4px; }
 .char-label { font-size: 14px; font-weight: 600; }
 .font-mini { font-size: 9px; color: #888; word-break: break-all; max-width: 100px; display: inline-block; }
 .dimmed { color: #bbb; font-size: 10px; }
@@ -782,13 +785,22 @@ def main():
 
     # Classify each audit line against vector PDF ground truth
     misses = []
+    ssim_failures = []
     hits = 0
     skipped = 0
     ssim_fail_count = 0
+    total_chars = 0
+    corrected_chars = 0
 
     unmatched = 0
 
     for e in entries:
+        # Count OCR corrections across all entries
+        for cv in e.get("ci_char_votes", []):
+            total_chars += 1
+            if cv.get("ocr_corrected_from"):
+                corrected_chars += 1
+
         matched = e.get("font_matched", "")
         bbox = e.get("bbox")
         if not bbox:
@@ -811,6 +823,10 @@ def main():
 
         if fonts_match(matched, actual_font):
             hits += 1
+            # Still track SSIM failures even when font is correct
+            if e.get("ssim_pass") is False:
+                gt_key, gt_score, gt_rank = find_correct_ci_candidate(e, actual_font)
+                ssim_failures.append((e, actual_font, gt_key, gt_score, gt_rank))
         else:
             # Find correct font's CI candidate for rendering
             gt_key, gt_score, gt_rank = find_correct_ci_candidate(e, actual_font)
@@ -819,17 +835,19 @@ def main():
     doc.close()
 
     unmatched_str = f" ({unmatched} unmatched)" if unmatched else ""
-    print(f"Total: {total}  Hits: {hits}  Misses: {len(misses)}{unmatched_str}  Skipped: {skipped}",
+    ocr_corr_str = f" | OCR corrections: {corrected_chars}/{total_chars}" if total_chars else ""
+    print(f"Total: {total}  Hits: {hits}  Misses: {len(misses)}{unmatched_str}  Skipped: {skipped}  OCR corrections: {corrected_chars}/{total_chars}",
           file=sys.stderr)
 
-    if not misses:
+    if not misses and not ssim_failures:
+        ssim_fail_str_early = f" | {ssim_fail_count} SSIM failures" if ssim_fail_count else ""
         html = f"""<!DOCTYPE html>
 <html>
 <head><meta charset="utf-8"><title>unscan char-misses — 100%</title></head>
 <body style="background: white; color: #222;">
 {CSS}
 <h2>unscan Miss Report</h2>
-<div class="summary">{hits}/{hits + len(misses)} correct (100.0%) — no misses 🎉</div>
+<div class="summary">{hits}/{hits + len(misses)} correct (100.0%) — no misses 🎉{ssim_fail_str_early}{ocr_corr_str}</div>
 </body>
 </html>"""
         with open(args.output, "w") as f:
@@ -871,10 +889,47 @@ def main():
         )
         miss_blocks.append(block)
 
+    # Build SSIM failure blocks (correct font but SSIM failed)
+    ssim_blocks = []
+    for entry, actual_font, gt_key, gt_score, gt_rank in ssim_failures:
+        crop_dir, crop_files = find_crop_dir(None, entry["page"], entry["line_index"],
+                                              diag_seg_root=diag_seg_root,
+                                              line_text=entry.get("text", ""))
+
+        chars = entry.get("ci_char_votes", [])
+        interesting = pick_interesting_chars(chars)
+
+        correct_font_path = find_font_file_by_key(gt_key)
+        if not correct_font_path and font_map:
+            correct_font_path = resolve_font_from_map(actual_font, font_map)
+        if not correct_font_path:
+            correct_font_path = find_font_file(actual_font)
+        correct_font_name = actual_font
+
+        matched = entry.get("font_matched", "")
+        chosen_font_path = None
+        if font_map:
+            chosen_font_path = resolve_font_from_map(matched, font_map)
+        if not chosen_font_path:
+            chosen_font_path = find_font_file(matched)
+
+        block = build_miss_html(
+            entry, interesting, crop_dir, crop_files,
+            correct_font_path, correct_font_name, gt_rank, gt_score,
+            chosen_font_path, matched,
+            diag_seg_root=diag_seg_root,
+        )
+        ssim_blocks.append(block)
+
     ssim_fail_str = f" | {ssim_fail_count} SSIM failures" if ssim_fail_count else ""
     unmatched_html = f" | {unmatched} unmatched" if unmatched else ""
     compared = hits + len(misses)
     pct = hits / compared * 100 if compared else 0
+    ssim_section = ""
+    if ssim_blocks:
+        ssim_section = f"""<h2 style="margin-top:2em; color:#c55;">SSIM Failures (correct font, SSIM rejected)</h2>
+{"".join(ssim_blocks)}"""
+
     html = f"""<!DOCTYPE html>
 <html>
 <head>
@@ -884,8 +939,9 @@ def main():
 <body style="background: white; color: #222;">
 {CSS}
 <h2>unscan Miss Report</h2>
-<div class="summary">{hits}/{compared} correct ({pct:.1f}%) — {len(misses)} misses shown below{unmatched_html}{ssim_fail_str}</div>
+<div class="summary">{hits}/{compared} correct ({pct:.1f}%) — {len(misses)} misses shown below{unmatched_html}{ssim_fail_str}{ocr_corr_str}</div>
 {"".join(miss_blocks)}
+{ssim_section}
 </body>
 </html>"""
 

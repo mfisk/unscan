@@ -62,36 +62,53 @@ pub fn detect_skew(img: &GrayImage) -> f32 {
         }
     }
 
-    // 4. Find peak angle via vote-weighted average of strong bins
+    // 4. Find peak angle by selecting the θ with maximum total votes,
+    //    then refine with parabolic interpolation for sub-step accuracy.
+    //    (Previous weighted-average approach was biased toward 0° by noise.)
     let max_votes = accum.iter().copied().max().unwrap_or(0);
     if max_votes < 10 {
         return 0.0;
     }
-
     let threshold = (max_votes as f32 * 0.3) as u32;
-    let mut weighted_sum: f64 = 0.0;
-    let mut total_weight: u64 = 0;
 
+    let mut theta_sums: Vec<u64> = vec![0; n_theta];
     for ti in 0..n_theta {
-        let mut bin_total: u64 = 0;
         for ri in 0..n_rho {
             let votes = accum[ti * n_rho + ri];
             if votes >= threshold {
-                bin_total += votes as u64;
+                theta_sums[ti] += votes as u64;
             }
-        }
-        if bin_total > 0 {
-            let skew = (thetas[ti].2 - theta_center) as f64;
-            weighted_sum += skew * bin_total as f64;
-            total_weight += bin_total;
         }
     }
 
-    if total_weight == 0 {
+    let (best_ti, best_sum) = theta_sums
+        .iter()
+        .enumerate()
+        .max_by_key(|(_, s)| *s)
+        .map(|(i, &s)| (i, s))
+        .unwrap_or((n_theta / 2, 0));
+
+    if best_sum == 0 {
         return 0.0;
     }
 
-    (weighted_sum / total_weight as f64) as f32
+    // Parabolic interpolation around peak for sub-step accuracy
+    let skew = if best_ti > 0 && best_ti < n_theta - 1 {
+        let left = theta_sums[best_ti - 1] as f64;
+        let center = best_sum as f64;
+        let right = theta_sums[best_ti + 1] as f64;
+        let denom = 2.0 * center - left - right;
+        if denom > 0.0 {
+            let delta = (right - left) / (2.0 * denom);
+            (thetas[best_ti].2 - theta_center) as f64 + delta * theta_step as f64
+        } else {
+            (thetas[best_ti].2 - theta_center) as f64
+        }
+    } else {
+        (thetas[best_ti].2 - theta_center) as f64
+    };
+
+    skew as f32
 }
 
 /// Compute a binary edge map at the target resolution.

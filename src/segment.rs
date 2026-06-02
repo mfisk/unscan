@@ -395,9 +395,36 @@ fn segment_characters_inner(
                 continue;
             }
 
+            // Trace the seam path early — needed for diagonal ink check.
+            let path = match dp_cache.get(&entry.seg_id) {
+                Some(dp) => dp.trace_path_through(&energy, entry.col),
+                None => {
+                    // Segment was already consumed; skip stale candidate.
+                    continue;
+                }
+            };
+
             // Reject seam splits without substantial ink on both sides.
-            let seam_ink_left: u32 = (entry.seg_start..entry.col).map(|c| col_ink[c as usize]).sum();
-            let seam_ink_right: u32 = (entry.col + 1..entry.seg_end).map(|c| col_ink[c as usize]).sum();
+            // Use the actual diagonal seam path and diagonal segment
+            // boundaries — not vertical column positions.
+            let bounds = seg_bounds.get(&entry.seg_id);
+            let left_bound = bounds.and_then(|b| b.left_path.as_deref());
+            let right_bound = bounds.and_then(|b| b.right_path.as_deref());
+            let mut seam_ink_left: u32 = 0;
+            let mut seam_ink_right: u32 = 0;
+            for row in 0..h {
+                let seam_col = path[row as usize];
+                let lb = left_bound.map_or(entry.seg_start, |lp| lp[row as usize]);
+                let rb = right_bound.map_or(entry.seg_end, |rp| rp[row as usize]);
+                for c in lb..seam_col {
+                    let px = img.get_pixel(c, row).0[0];
+                    if px < 200 { seam_ink_left += (255 - px) as u32; }
+                }
+                for c in (seam_col + 1)..rb {
+                    let px = img.get_pixel(c, row).0[0];
+                    if px < 200 { seam_ink_right += (255 - px) as u32; }
+                }
+            }
             if seam_ink_left < MIN_INK_FOR_SYMBOL || seam_ink_right < MIN_INK_FOR_SYMBOL {
                 if word_text.map_or(false, |w| w.starts_with("tradition")) { eprintln!("    SKIP MIN_INK col={} left={} right={} min={}", entry.col, seam_ink_left, seam_ink_right, MIN_INK_FOR_SYMBOL); }
                 continue;
@@ -406,14 +433,6 @@ fn segment_characters_inner(
             if word_text.map_or(false, |w| w.starts_with("tradition")) { eprintln!("    ACCEPT col={}", entry.col); }
             if word_text.map_or(false, |w| w.starts_with("abcdefgh")) { eprintln!("    ACCEPT col={} cost={:.1} seg=[{},{}) sid={}", entry.col, entry.cost, entry.seg_start, entry.seg_end, entry.seg_id); }
             splits.push(entry.col);
-
-            // Trace the path from the pre-computed DP matrices.
-            let path = dp_cache.get(&entry.seg_id)
-                .map(|dp| dp.trace_path_through(&energy, entry.col))
-                .unwrap_or_else(|| {
-                    let (_, dp) = candidate_seams(&energy, entry.seg_start, entry.seg_end, h, None, None);
-                    dp.trace_path_through(&energy, entry.col)
-                });
             seam_paths.insert(entry.col, path.clone());
 
             // Capture parent's diagonal bounds before removing.

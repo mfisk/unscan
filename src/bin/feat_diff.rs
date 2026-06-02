@@ -3,7 +3,7 @@
 /// Both images must be normalized char crops (output of normalize_to_ink_bounds
 /// or render_char_normalised).
 
-use image::io::Reader as ImageReader;
+use image::ImageReader;
 use unscan::char_index::{compute_features, FEAT_LEN};
 
 const NAMES: &[&str] = &[
@@ -37,8 +37,8 @@ fn main() {
     let scan_feats = compute_features(&scan_img).expect("scan features failed");
     let ref_feats = compute_features(&ref_img).expect("ref features failed");
 
-    let scan_w = scan_feats.as_weighted_slice();
-    let ref_w = ref_feats.as_weighted_slice();
+    let scan_w = scan_feats.weighted();
+    let ref_w = ref_feats.weighted();
     let scan_raw = scan_feats.as_slice();
     let ref_raw = ref_feats.as_slice();
 

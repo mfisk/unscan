@@ -1878,6 +1878,12 @@ pub struct CharCiDetail {
     /// that was replaced.  `ch` then holds the corrected character,
     /// and `nearest`/`min_dist_sq` reflect the corrected char's CI.
     pub ocr_corrected_from: Option<char>,
+    /// Best alternative character considered (even if correction gate
+    /// didn't fire).  Always the char with the lowest distance among
+    /// all confusables/alternatives tested, if any were tested.
+    pub best_alt_char: Option<char>,
+    /// Distance of the best alternative character.
+    pub best_alt_dist: Option<f32>,
 }
 
 /// Result of `search_candidates`: ranked font scores + per-character CI detail.
@@ -1945,6 +1951,8 @@ pub fn search_candidates(
         let mut effective_hits = hits;
         let mut effective_min = min_dist_sq;
         let mut effective_ch: Option<char> = None;
+        let mut best_alt_char: Option<char> = None;
+        let mut best_alt_dist: Option<f32> = None;
 
         if min_dist_sq > 0.1 {
             // Only check alternatives when OCR match is already poor.
@@ -1968,10 +1976,16 @@ pub fn search_candidates(
                 confusables.iter().filter(|&&alt| alt != *c).copied().collect()
             };
 
+
             for alt_c in &chars_to_check {
                 if let Some(alt_points) = index.flat_vecs.get(alt_c) {
                     let alt_hits = nearest_within_factor_brute(alt_points, query_feat, 2.5 * thoroughness);
                     let alt_min = alt_hits.iter().map(|(_, d)| *d).fold(f32::INFINITY, f32::min);
+                    // Track best alt regardless of correction gate
+                    if best_alt_dist.map_or(true, |d| alt_min < d) {
+                        best_alt_char = Some(*alt_c);
+                        best_alt_dist = Some(alt_min);
+                    }
                     if alt_min < effective_min && min_dist_sq > alt_min * 10.0 {
                         effective_hits = alt_hits;
                         effective_min = alt_min;
@@ -2009,6 +2023,8 @@ pub fn search_candidates(
             passed_gate,
             nearest,
             ocr_corrected_from: effective_ch.map(|_| *c),
+            best_alt_char,
+            best_alt_dist,
         });
 
         if !passed_gate {
