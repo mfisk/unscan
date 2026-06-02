@@ -1897,6 +1897,7 @@ pub fn search_candidates(
     index: &CharIndex,
     char_crops: &[(char, GrayImage)],
     thoroughness: f32,
+    audit: bool,
 ) -> CiSearchResult {
     if char_crops.is_empty() {
         return CiSearchResult { scores: Vec::new(), char_detail: Vec::new() };
@@ -1981,8 +1982,8 @@ pub fn search_candidates(
                 if let Some(alt_points) = index.flat_vecs.get(alt_c) {
                     let alt_hits = nearest_within_factor_brute(alt_points, query_feat, 2.5 * thoroughness);
                     let alt_min = alt_hits.iter().map(|(_, d)| *d).fold(f32::INFINITY, f32::min);
-                    // Track best alt regardless of correction gate
-                    if best_alt_dist.map_or(true, |d| alt_min < d) {
+                    // Track best alt regardless of correction gate (audit only)
+                    if audit && best_alt_dist.map_or(true, |d| alt_min < d) {
                         best_alt_char = Some(*alt_c);
                         best_alt_dist = Some(alt_min);
                     }

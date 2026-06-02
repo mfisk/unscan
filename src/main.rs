@@ -662,7 +662,7 @@ fn run(args: &cli::Args) -> Result<(), ScanTextError> {
                     }
                 }
 
-                let ci_result = char_index::search_candidates(&char_index, &char_crops, args.thoroughness);
+                let ci_result = char_index::search_candidates(&char_index, &char_crops, args.thoroughness, args.audit.is_some());
                 eprintln!("  MEM line {} after CI search: {}", li, mem_info());
                 ci_top_for_audit = ci_result.scores.iter()
                     .map(|(name, score)| (name.clone(), *score)).collect();
