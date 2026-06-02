@@ -12,6 +12,8 @@
 //! spatially matches each audit entry against the vector PDF's text spans
 //! via PyMuPDF — the same methodology as t60.
 //!
+//! Prerequisites: run t55_specimen_gen first to generate base fixtures.
+//!
 //! Run with:
 //!   cargo test --release --test t62_cross_renderer_accuracy -- --nocapture
 //!
@@ -38,43 +40,18 @@ struct AccuracyResult {
     report_path: PathBuf,
 }
 
-/// Ensure the vector specimen + fontmap exist (delegates to gen-specimen.py).
-fn ensure_specimen() {
-    let vector_pdf = test_doc("font-timeline-specimen.pdf");
-    let fontmap = test_doc("font-timeline-specimen-fontmap.json");
-
-    if vector_pdf.exists() && fontmap.exists() {
-        return;
-    }
-
-    eprintln!("[test setup] Generating specimen via gen-specimen.py ...");
-    let gen_script = Path::new(env!("CARGO_MANIFEST_DIR"))
-        .join("test-docs")
-        .join("gen-specimen.py");
-
-    let output = Command::new("python3")
-        .arg(&gen_script)
-        .current_dir(Path::new(env!("CARGO_MANIFEST_DIR")).join("test-docs"))
-        .output()
-        .unwrap_or_else(|e| panic!("failed to run gen-specimen.py: {}", e));
-
-    let combined = format!(
-        "{}{}",
-        String::from_utf8_lossy(&output.stdout),
-        String::from_utf8_lossy(&output.stderr),
-    );
-    eprintln!("{}", combined);
-
-    assert!(output.status.success(), "gen-specimen.py failed");
-    assert!(vector_pdf.exists(), "gen-specimen.py did not create vector PDF");
-    assert!(fontmap.exists(), "gen-specimen.py did not create fontmap JSON");
-}
-
 /// Run unscan --audit on a rasterized PDF, then char-misses.py for spatial
 /// ground-truth comparison against the vector PDF.
-fn measure_accuracy(raster_pdf: &Path, label: &str) -> Option<AccuracyResult> {
+fn measure_accuracy(raster_pdf: &Path, label: &str) -> AccuracyResult {
     let vector_src = test_doc("font-timeline-specimen.pdf");
     let fontmap = test_doc("font-timeline-specimen-fontmap.json");
+
+    assert!(vector_src.exists(),
+        "Vector specimen missing — run t55_specimen_gen first: {}",
+        vector_src.display());
+    assert!(fontmap.exists(),
+        "Fontmap missing — run t55_specimen_gen first: {}",
+        fontmap.display());
 
     let audit_dir = std::env::temp_dir()
         .join(format!("unscan-t62-audit-{}", label));
@@ -87,45 +64,35 @@ fn measure_accuracy(raster_pdf: &Path, label: &str) -> Option<AccuracyResult> {
 
     // Run unscan with --audit
     let bin = unscan_bin();
-    let mut cmd = Command::new(&bin);
-    cmd.arg(raster_pdf)
+    let output = Command::new(&bin)
+        .arg(raster_pdf)
         .args(["-o", output_pdf.to_str().unwrap()])
         .args(["--audit", audit_dir.to_str().unwrap()])
-        .env("RUST_LOG", "info");
-    if fontmap.exists() {
-        cmd.args(["--include-fontmap", fontmap.to_str().unwrap()]);
-    }
-    let output = cmd
+        .args(["--include-fontmap", fontmap.to_str().unwrap()])
+        .env("RUST_LOG", "info")
         .output()
         .unwrap_or_else(|e| panic!("failed to run unscan: {}", e));
 
-    if !output.status.success() {
-        let stderr = String::from_utf8_lossy(&output.stderr);
-        eprintln!("unscan failed (exit {:?}):\n{}", output.status.code(), stderr);
-        return None;
-    }
+    assert!(output.status.success(), "unscan failed (exit {:?}):\n{}",
+        output.status.code(),
+        String::from_utf8_lossy(&output.stderr));
 
-    let audit_json = audit_dir.join("audit.json");
-    if !audit_json.exists() {
-        eprintln!("SKIP: audit.json not written");
-        return None;
-    }
+    assert!(audit_dir.join("audit.json").exists(),
+        "audit.json not written");
 
     // Run char-misses.py
     let report_path = audit_dir.join("misses.html");
-    let tools_dir = Path::new(env!("CARGO_MANIFEST_DIR")).join("tools");
-    let char_misses_py = tools_dir.join("char-misses.py");
+    let char_misses_py = Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("tools")
+        .join("char-misses.py");
 
-    let mut py_cmd = Command::new("python3");
-    py_cmd.arg(&char_misses_py)
+    let py_output = Command::new("python3")
+        .arg(&char_misses_py)
         .arg(&audit_dir)
         .arg(&vector_src)
-        .args(["-o", report_path.to_str().unwrap()]);
-    if fontmap.exists() {
-        py_cmd.args(["--fontmap", fontmap.to_str().unwrap()]);
-    }
-
-    let py_output = py_cmd.output()
+        .args(["-o", report_path.to_str().unwrap()])
+        .args(["--fontmap", fontmap.to_str().unwrap()])
+        .output()
         .unwrap_or_else(|e| panic!("failed to run char-misses.py: {}", e));
 
     let combined = format!(
@@ -133,26 +100,13 @@ fn measure_accuracy(raster_pdf: &Path, label: &str) -> Option<AccuracyResult> {
         String::from_utf8_lossy(&py_output.stdout),
         String::from_utf8_lossy(&py_output.stderr),
     );
-
-    if !py_output.status.success() {
-        eprintln!("char-misses.py failed:\n{}", combined);
-        return None;
-    }
+    assert!(py_output.status.success(), "char-misses.py failed:\n{}", combined);
 
     let (hits, misses, unmatched, skipped, total) = parse_summary(&combined);
     let compared = hits + misses;
     let accuracy = if compared > 0 { hits as f64 / compared as f64 } else { 0.0 };
 
-    Some(AccuracyResult {
-        hits,
-        misses,
-        unmatched,
-        skipped,
-        total,
-        compared,
-        accuracy,
-        report_path,
-    })
+    AccuracyResult { hits, misses, unmatched, skipped, total, compared, accuracy, report_path }
 }
 
 /// Parse char-misses.py summary: "Total: N  Hits: H  Misses: M (U unmatched)  Skipped: S"
@@ -194,17 +148,20 @@ fn parse_summary(output: &str) -> (usize, usize, usize, usize, usize) {
 #[test]
 fn specimen_font_accuracy_poppler() {
     ensure_index();
-    ensure_specimen();
 
     let vector_src = test_doc("font-timeline-specimen.pdf");
-    let poppler_pdf = test_doc("font-timeline-specimen-rasterized-poppler.pdf");
-    if !common::rasterize_pdf_poppler(&vector_src, &poppler_pdf, 300, true) {
-        eprintln!("SKIP: Poppler rasterization failed (pdftoppm missing?)");
-        return;
-    }
+    assert!(vector_src.exists(),
+        "Vector specimen missing — run t55_specimen_gen first: {}",
+        vector_src.display());
 
-    let r = measure_accuracy(&poppler_pdf, "poppler-300dpi-aa")
-        .expect("could not measure Poppler accuracy");
+    // Rasterize with Poppler — this is the cross-renderer variant, not pre-generated by t55.
+    let poppler_pdf = test_doc("font-timeline-specimen-rasterized-poppler.pdf");
+    assert!(
+        common::rasterize_pdf_poppler(&vector_src, &poppler_pdf, 300, true),
+        "Poppler rasterization failed (pdftoppm missing?)",
+    );
+
+    let r = measure_accuracy(&poppler_pdf, "poppler-300dpi-aa");
 
     eprintln!(
         "Poppler AA @ 300dpi: {}/{} = {:.1}% (threshold: {:.0}%)",

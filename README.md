@@ -180,7 +180,7 @@ PDFs reference standard names all viewers understand. See
 | Script | Purpose |
 |--------|---------|
 | `tools/char-misses.py` | Generate visual HTML miss report from audit JSON + vector PDF ground truth |
-| `tools/rasterize.py` | Rasterize a vector PDF to grayscale raster PDF (clean or with scan artifacts) |
+| `tools/rasterize.py` | Rasterize vector PDFs, build fontmaps, or both (`rasterize`, `fontmap`, `prepare` subcommands) |
 | `scripts/install-all-fonts.sh` | Install all recommended fonts (MS Core, Google Fonts, typewriter, LaTeX) |
 | `test-docs/gen-specimen.py` | Generate the 6-page font timeline specimen PDF + fontmap |
 | `test-docs/gen-resolution-series.py` | Generate resolution degradation series (600→fax DPI) |

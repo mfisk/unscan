@@ -1,14 +1,18 @@
 #!/usr/bin/env python3
 """
-rasterize.py — Single rasterization entry point for unscan.
+rasterize.py — Rasterize vector PDFs and build ground-truth fontmaps for unscan.
 
-Rasterizes a vector PDF to a grayscale raster PDF.  All scan artifacts
-(skew, noise, blur, speckle) are **off by default** and opt-in via flags.
+Subcommands:
+    rasterize   Rasterize a vector PDF to a grayscale raster PDF.
+    fontmap     Build a PS-name → file-path font map from a vector PDF.
+    prepare     Do both: rasterize + fontmap in one shot, print next-step commands.
 
 Usage:
-    python3 tools/rasterize.py INPUT.pdf OUTPUT.pdf [OPTIONS]
+    python3 tools/rasterize.py rasterize INPUT.pdf OUTPUT.pdf [OPTIONS]
+    python3 tools/rasterize.py fontmap INPUT.pdf [-o MAP.json]
+    python3 tools/rasterize.py prepare INPUT.pdf [OPTIONS]
 
-Options:
+Rasterize options:
     --dpi N          Resolution (default: 300)
     --no-aa          Disable anti-aliasing (binary threshold)
     --backend STR    'mupdf' (default) or 'poppler'
@@ -18,33 +22,45 @@ Options:
     --blur R         Gaussian blur radius (default: 0, off)
     --scan           Shorthand for --skew 2.0 --noise --speckle --blur 0.7
 
+Prepare options:
+    --dpi, --no-aa, --backend  (same as rasterize)
+    -d / --output-dir          Output directory (default: same as input)
+    -o / --output              Explicit rasterized PDF path
+    --fontmap-only             Only build fontmap, skip rasterization
+    --rasterize-only           Only rasterize, skip fontmap
+
 All artifact flags are off by default, producing a clean raster.
 """
 
 import argparse
 import glob
+import json
 import os
 import subprocess
 import sys
 import tempfile
+from pathlib import Path
 
+
+# ── Rasterization ────────────────────────────────────────────────────
 
 def rasterize(
-    src: str,
-    out: str,
-    dpi: int = 300,
-    aa: bool = True,
-    backend: str = "mupdf",
-    skew_deg: float = 0.0,
-    noise: bool = False,
-    speckle: bool = False,
-    blur_radius: float = 0.0,
+    src,
+    out,
+    dpi=300,
+    aa=True,
+    backend="mupdf",
+    skew_deg=0.0,
+    noise=False,
+    speckle=False,
+    blur_radius=0.0,
 ):
     """Rasterize *src* vector PDF → *out* raster PDF."""
     import img2pdf
     import numpy as np
     from PIL import Image, ImageFilter
 
+    src, out = str(src), str(out)
     tmpdir = tempfile.mkdtemp(prefix="unscan-raster-")
 
     if backend == "mupdf":
@@ -112,7 +128,7 @@ def rasterize(
     return out
 
 
-# ── Backend: PyMuPDF ──────────────────────────────────────────────────
+# ── Backend: PyMuPDF ─────────────────────────────────────────────────
 
 def _rasterize_mupdf(src, tmpdir, dpi, aa):
     import fitz
@@ -169,23 +185,60 @@ def _rasterize_poppler(src, tmpdir, dpi, aa):
     return pngs
 
 
-# ── CLI ──────────────────────────────────────────────────────────────
+# ── Fontmap ──────────────────────────────────────────────────────────
 
-def main():
-    p = argparse.ArgumentParser(description="Rasterize a vector PDF")
-    p.add_argument("input", help="Input vector PDF")
-    p.add_argument("output", help="Output raster PDF")
-    p.add_argument("--dpi", type=int, default=300)
-    p.add_argument("--no-aa", action="store_true", help="Disable anti-aliasing")
-    p.add_argument("--backend", choices=["mupdf", "poppler"], default="mupdf")
-    p.add_argument("--skew", type=float, default=0.0, help="Skew degrees")
-    p.add_argument("--noise", action="store_true", help="Paper noise + darkening")
-    p.add_argument("--speckle", action="store_true", help="Dust speckle noise")
-    p.add_argument("--blur", type=float, default=0.0, help="Gaussian blur radius")
-    p.add_argument("--scan", action="store_true",
-                   help="Shorthand: --skew 2.0 --noise --speckle --blur 0.7")
-    args = p.parse_args()
+def build_fontmap(pdf_path):
+    """Extract font file map by introspecting a vector PDF.
 
+    Returns (resolved, unresolved) where resolved is a dict mapping
+    PostScript name → absolute file path, and unresolved is a list of
+    PS names that couldn't be resolved (built-in PDF fonts).
+    """
+    import fitz
+
+    doc = fitz.open(str(pdf_path))
+    fontmap = {}
+
+    for page_num in range(len(doc)):
+        for font_entry in doc[page_num].get_fonts(full=True):
+            basefont = font_entry[3]
+            # Strip subset prefix (AAAAAA+FontName → FontName)
+            if '+' in basefont:
+                basefont = basefont.split('+', 1)[1]
+            if basefont in fontmap:
+                continue
+
+            # Reverse-resolve: PS name → file path via fontconfig
+            r = subprocess.run(
+                ['fc-list', f':postscriptname={basefont}', '--format=%{file}\n'],
+                capture_output=True, text=True
+            )
+            files = [l for l in r.stdout.strip().split('\n') if l]
+            if files:
+                # Prefer .ttf (TrueType outlines)
+                ttf = [f for f in files if f.lower().endswith('.ttf')]
+                fontmap[basefont] = ttf[0] if ttf else files[0]
+            else:
+                fontmap[basefont] = None
+
+    doc.close()
+
+    resolved = {k: v for k, v in sorted(fontmap.items()) if v is not None}
+    unresolved = [k for k, v in fontmap.items() if v is None]
+
+    return resolved, unresolved
+
+
+def write_fontmap(resolved, output_path):
+    """Write a fontmap dict to a JSON file."""
+    with open(str(output_path), 'w') as f:
+        json.dump(resolved, f, indent=2, sort_keys=True)
+        f.write('\n')
+
+
+# ── CLI: rasterize subcommand ────────────────────────────────────────
+
+def cmd_rasterize(args):
     if args.scan:
         if args.skew == 0.0:
             args.skew = 2.0
@@ -206,6 +259,148 @@ def main():
         blur_radius=args.blur,
     )
     print(f"Rasterized: {args.output}")
+
+
+# ── CLI: fontmap subcommand ──────────────────────────────────────────
+
+def cmd_fontmap(args):
+    resolved, unresolved = build_fontmap(args.pdf)
+
+    if args.verbose or not args.output:
+        print(f"{len(resolved)} fonts resolved, {len(unresolved)} unresolved",
+              file=sys.stderr)
+        if unresolved:
+            for name in unresolved:
+                print(f"  unresolved (builtin?): {name}", file=sys.stderr)
+
+    output = json.dumps(resolved, indent=2, sort_keys=True)
+
+    if args.output:
+        write_fontmap(resolved, args.output)
+        if args.verbose:
+            print(f"Wrote {args.output}", file=sys.stderr)
+    else:
+        print(output)
+
+
+# ── CLI: prepare subcommand ──────────────────────────────────────────
+
+def cmd_prepare(args):
+    pdf_path = Path(args.pdf).resolve()
+    if not pdf_path.exists():
+        print(f"Error: {pdf_path} not found", file=sys.stderr)
+        sys.exit(1)
+
+    stem = pdf_path.stem
+    out_dir = Path(args.output_dir) if args.output_dir else pdf_path.parent
+    out_dir.mkdir(parents=True, exist_ok=True)
+
+    # Output paths
+    if args.output:
+        rasterized_path = Path(args.output)
+    else:
+        suffix = "-noaa" if args.no_aa else ""
+        rasterized_path = out_dir / f"{stem}-rasterized{suffix}.pdf"
+    fontmap_path = out_dir / f"{stem}-fontmap.json"
+
+    # --- Fontmap ---
+    if not args.rasterize_only:
+        print(f"Building fontmap from {pdf_path.name}...")
+        resolved, unresolved = build_fontmap(str(pdf_path))
+        write_fontmap(resolved, fontmap_path)
+        print(f"  {len(resolved)} fonts resolved → {fontmap_path}")
+        if unresolved:
+            print(f"  {len(unresolved)} unresolved (builtins): {', '.join(unresolved)}")
+
+    # --- Rasterize ---
+    if not args.fontmap_only:
+        aa_label = "no-AA" if args.no_aa else "AA"
+        print(f"Rasterizing at {args.dpi} DPI, {aa_label} ({args.backend})...")
+        rasterize(pdf_path, rasterized_path,
+                  dpi=args.dpi, backend=args.backend, aa=not args.no_aa)
+        print(f"  Rasterized: {rasterized_path}")
+
+    # --- Summary ---
+    print()
+    print("Next steps:")
+    if not args.rasterize_only and not args.fontmap_only:
+        print(f"  # Run unscan")
+        print(f"  ./target/release/unscan {rasterized_path} \\")
+        print(f"    -o /tmp/out.pdf --audit /tmp/audit \\")
+        print(f"    --include-fontmap {fontmap_path}")
+        print()
+        print(f"  # Generate miss report")
+        print(f"  python3 tools/char-misses.py /tmp/audit/audit.json \\")
+        print(f"    {pdf_path} --fontmap {fontmap_path}")
+
+
+# ── Shared argument helpers ──────────────────────────────────────────
+
+def _add_raster_args(p):
+    """Add common rasterization arguments to a subparser."""
+    p.add_argument("--dpi", type=int, default=300)
+    p.add_argument("--no-aa", action="store_true", help="Disable anti-aliasing")
+    p.add_argument("--backend", choices=["mupdf", "poppler"], default="mupdf")
+
+
+def _add_artifact_args(p):
+    """Add scan-artifact arguments to a subparser."""
+    p.add_argument("--skew", type=float, default=0.0, help="Skew degrees")
+    p.add_argument("--noise", action="store_true", help="Paper noise + darkening")
+    p.add_argument("--speckle", action="store_true", help="Dust speckle noise")
+    p.add_argument("--blur", type=float, default=0.0, help="Gaussian blur radius")
+    p.add_argument("--scan", action="store_true",
+                   help="Shorthand: --skew 2.0 --noise --speckle --blur 0.7")
+
+
+# ── Main CLI ─────────────────────────────────────────────────────────
+
+def main():
+    p = argparse.ArgumentParser(
+        description="Rasterize vector PDFs and build fontmaps for unscan.",
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+    )
+    sub = p.add_subparsers(dest="command")
+
+    # rasterize
+    r = sub.add_parser("rasterize", help="Rasterize a vector PDF")
+    r.add_argument("input", help="Input vector PDF")
+    r.add_argument("output", help="Output raster PDF")
+    _add_raster_args(r)
+    _add_artifact_args(r)
+
+    # fontmap
+    f = sub.add_parser("fontmap", help="Build font map from a vector PDF")
+    f.add_argument("pdf", help="Path to the vector PDF")
+    f.add_argument("-o", "--output", help="Output JSON file (default: stdout)")
+    f.add_argument("-v", "--verbose", action="store_true",
+                   help="Print summary to stderr")
+
+    # prepare
+    pr = sub.add_parser("prepare",
+                        help="Rasterize + fontmap in one shot")
+    pr.add_argument("pdf", help="Path to the vector PDF")
+    pr.add_argument("--output-dir", "-d",
+                    help="Output directory (default: same as input PDF)")
+    pr.add_argument("-o", "--output",
+                    help="Explicit output path for rasterized PDF")
+    _add_raster_args(pr)
+    pr.add_argument("--fontmap-only", action="store_true",
+                    help="Only build the fontmap, skip rasterization")
+    pr.add_argument("--rasterize-only", action="store_true",
+                    help="Only rasterize, skip fontmap generation")
+
+    args = p.parse_args()
+
+    if args.command == "rasterize":
+        cmd_rasterize(args)
+    elif args.command == "fontmap":
+        cmd_fontmap(args)
+    elif args.command == "prepare":
+        cmd_prepare(args)
+    else:
+        p.print_help()
+        sys.exit(1)
 
 
 if __name__ == "__main__":
