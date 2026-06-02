@@ -284,70 +284,48 @@ pub fn parse_vectorized_count(output: &str) -> Option<u32> {
 }
 
 // ── Rasterization helpers ────────────────────────────────────────────
+//
+// All rasterization goes through tools/rasterize.py — one place for
+// rasterization logic, artifacts (skew/noise/blur/speckle) opt-in,
+// clean output by default.
 
-/// Rasterize a vector PDF to a grayscale raster PDF at the given DPI.
-/// `aa` controls anti-aliasing: true = default AA, false = hard pixel edges.
-/// Uses PyMuPDF (fitz) for rasterization and img2pdf for reassembly.
-/// Result is cached at `out_path`; regenerated only if the source is newer.
-pub fn rasterize_pdf(src: &Path, out_path: &Path, dpi: u32, aa: bool) -> bool {
-    // Check cache: skip if output exists and is newer than source
+fn rasterize_py() -> PathBuf {
+    Path::new(env!("CARGO_MANIFEST_DIR")).join("tools").join("rasterize.py")
+}
+
+fn raster_cache_ok(src: &Path, out_path: &Path) -> bool {
     if out_path.exists() {
-        if let (Ok(src_meta), Ok(out_meta)) = (src.metadata(), out_path.metadata()) {
-            if let (Ok(src_mtime), Ok(out_mtime)) = (src_meta.modified(), out_meta.modified()) {
-                if out_mtime >= src_mtime {
+        if let (Ok(sm), Ok(om)) = (src.metadata(), out_path.metadata()) {
+            if let (Ok(st), Ok(ot)) = (sm.modified(), om.modified()) {
+                if ot >= st {
                     eprintln!("  Using cached {:?}", out_path.file_name().unwrap());
                     return true;
                 }
             }
         }
     }
+    false
+}
+
+/// Rasterize a vector PDF to a grayscale raster PDF at the given DPI.
+/// `aa` controls anti-aliasing: true = default AA, false = hard pixel edges.
+/// Uses PyMuPDF (mupdf) backend by default.
+/// Result is cached at `out_path`; regenerated only if the source is newer.
+pub fn rasterize_pdf(src: &Path, out_path: &Path, dpi: u32, aa: bool) -> bool {
+    if raster_cache_ok(src, out_path) { return true; }
 
     eprintln!("  Rasterizing {:?} → {:?} (dpi={}, aa={})",
         src.file_name().unwrap(), out_path.file_name().unwrap(), dpi, aa);
 
-    // Use PyMuPDF for rasterization — same FreeType backend as the CI font index
-    let aa_flag = if aa { "True" } else { "False" };
-    let py_code = format!(
-        r#"
-import fitz, img2pdf, os, tempfile
-doc = fitz.open('{src}')
-dpi = {dpi}
-aa = {aa_flag}
-mat = fitz.Matrix(dpi/72, dpi/72)
-tmpdir = tempfile.mkdtemp(prefix='unscan-raster-')
-pngs = []
-for i, page in enumerate(doc):
-    if not aa:
-        pix = page.get_pixmap(matrix=mat, colorspace=fitz.csGRAY, alpha=False,
-                              annots=False)
-        # Force no-AA by thresholding to binary then back to gray
-        import numpy as np
-        from PIL import Image
-        arr = np.frombuffer(pix.samples, dtype=np.uint8).reshape(pix.height, pix.width)
-        arr = ((arr > 128) * 255).astype(np.uint8)
-        img = Image.fromarray(arr, mode='L')
-        path = os.path.join(tmpdir, f'page_{{i:03d}}.png')
-        img.save(path, dpi=(dpi, dpi))
-    else:
-        pix = page.get_pixmap(matrix=mat, colorspace=fitz.csGRAY, alpha=False)
-        path = os.path.join(tmpdir, f'page_{{i:03d}}.png')
-        pix.save(path)
-    pngs.append(path)
-layout = img2pdf.get_layout_fun(pagesize=(img2pdf.in_to_pt(8.5), img2pdf.in_to_pt(11)))
-with open('{out}', 'wb') as f:
-    f.write(img2pdf.convert(pngs, layout_fun=layout))
-for p in pngs:
-    os.remove(p)
-os.rmdir(tmpdir)
-"#,
-        src = src.display(),
-        dpi = dpi,
-        aa_flag = aa_flag,
-        out = out_path.display(),
-    );
+    let mut cmd = Command::new("python3");
+    cmd.arg(rasterize_py())
+        .arg(src)
+        .arg(out_path)
+        .args(["--dpi", &dpi.to_string()])
+        .args(["--backend", "mupdf"]);
+    if !aa { cmd.arg("--no-aa"); }
 
-    let status = Command::new("python3").arg("-c").arg(&py_code).status();
-    let ok = status.map(|s| s.success()).unwrap_or(false);
+    let ok = cmd.status().map(|s| s.success()).unwrap_or(false);
     if ok {
         eprintln!("  Generated {:?}", out_path.file_name().unwrap());
     } else {
@@ -361,75 +339,20 @@ os.rmdir(tmpdir)
 /// so accuracy against Poppler rasters tests rendering invariance.
 /// Result is cached at `out_path`; regenerated only if the source is newer.
 pub fn rasterize_pdf_poppler(src: &Path, out_path: &Path, dpi: u32, aa: bool) -> bool {
-    // Check cache: skip if output exists and is newer than source
-    if out_path.exists() {
-        if let (Ok(src_meta), Ok(out_meta)) = (src.metadata(), out_path.metadata()) {
-            if let (Ok(src_mtime), Ok(out_mtime)) = (src_meta.modified(), out_meta.modified()) {
-                if out_mtime >= src_mtime {
-                    eprintln!("  Using cached {:?}", out_path.file_name().unwrap());
-                    return true;
-                }
-            }
-        }
-    }
+    if raster_cache_ok(src, out_path) { return true; }
 
     eprintln!("  Rasterizing (Poppler) {:?} → {:?} (dpi={}, aa={})",
         src.file_name().unwrap(), out_path.file_name().unwrap(), dpi, aa);
 
-    // pdftoppm renders to PGM/PNG pages, then img2pdf reassembles into a PDF.
-    // Poppler uses Cairo+FreeType with its own hinting — different from MuPDF.
-    let aa_flag = if aa { "True" } else { "False" };
-    let py_code = format!(
-        r#"
-import subprocess, img2pdf, os, tempfile, glob
-dpi = {dpi}
-aa = {aa}
-tmpdir = tempfile.mkdtemp(prefix='unscan-raster-poppler-')
-prefix = os.path.join(tmpdir, 'page')
+    let mut cmd = Command::new("python3");
+    cmd.arg(rasterize_py())
+        .arg(src)
+        .arg(out_path)
+        .args(["--dpi", &dpi.to_string()])
+        .args(["--backend", "poppler"]);
+    if !aa { cmd.arg("--no-aa"); }
 
-# pdftoppm renders each page as a separate PGM file
-cmd = ['pdftoppm', '-r', str(dpi), '-gray', '{src}', prefix]
-subprocess.run(cmd, check=True)
-
-pgms = sorted(glob.glob(os.path.join(tmpdir, 'page-*.pgm')))
-assert pgms, f'pdftoppm produced no output in {{tmpdir}}'
-
-# Convert PGMs to PNGs (img2pdf prefers PNG), optionally binarizing for no-AA
-pngs = []
-if not aa:
-    import numpy as np
-    from PIL import Image
-for pgm in pgms:
-    if not aa:
-        img = Image.open(pgm).convert('L')
-        arr = np.array(img)
-        arr = ((arr > 128) * 255).astype(np.uint8)
-        img = Image.fromarray(arr, mode='L')
-        png = pgm.replace('.pgm', '.png')
-        img.save(png, dpi=(dpi, dpi))
-    else:
-        from PIL import Image
-        img = Image.open(pgm).convert('L')
-        png = pgm.replace('.pgm', '.png')
-        img.save(png, dpi=(dpi, dpi))
-    pngs.append(png)
-
-layout = img2pdf.get_layout_fun(pagesize=(img2pdf.in_to_pt(8.5), img2pdf.in_to_pt(11)))
-with open('{out}', 'wb') as f:
-    f.write(img2pdf.convert(pngs, layout_fun=layout))
-
-for p in pngs + pgms:
-    os.remove(p)
-os.rmdir(tmpdir)
-"#,
-        src = src.display(),
-        dpi = dpi,
-        aa = aa_flag,
-        out = out_path.display(),
-    );
-
-    let status = Command::new("python3").arg("-c").arg(&py_code).status();
-    let ok = status.map(|s| s.success()).unwrap_or(false);
+    let ok = cmd.status().map(|s| s.success()).unwrap_or(false);
     if ok {
         eprintln!("  Generated {:?}", out_path.file_name().unwrap());
     } else {
