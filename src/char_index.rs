@@ -22,8 +22,8 @@
 //! `NORM_H`, return `(char, image)` pairs.
 //!
 //! ## Lookup
-//! Uses a per-character k-d tree for O(D·log N) spatial lookup with
-//! tolerance-band radius queries instead of brute-force cosine scan.
+//! Uses per-character brute-force nearest-neighbor search over feature
+//! vectors (at 59+ dimensions, linear scan outperforms tree structures).
 
 use ab_glyph::{Font, FontRef, PxScale, ScaleFont, point};
 use image::{GrayImage, Luma};
@@ -262,11 +262,11 @@ impl CharFeatures {
 // ---------------------------------------------------------------------------
 // Brute-force nearest-neighbor search
 // ---------------------------------------------------------------------------
-// At 59 dimensions the KD-tree degrades to near-linear scan anyway (the
-// single-axis pruning test checks 1/59th of total distance — far branch is
-// almost always explored). A flat vector with linear scan is simpler, faster
-// (cache-friendly + LLVM auto-vectorizes the distance loop), and trivially
-// correct.
+// At 59+ dimensions, tree-based structures (e.g. k-d trees) degrade to
+// near-linear scan anyway — the single-axis pruning test checks 1/59th of
+// total distance, so the far branch is almost always explored. A flat vector
+// with linear scan is simpler, faster (cache-friendly + LLVM auto-vectorizes
+// the distance loop), and trivially correct.
 
 /// Find the nearest neighbor, then return ALL points within `factor`× that
 /// distance. Returns `(font_id, squared_distance)` pairs sorted by distance.
@@ -1906,10 +1906,10 @@ fn extract_chars_from_boundaries<F: ab_glyph::Font>(
 }
 
 // ---------------------------------------------------------------------------
-// Matching — k-d tree based
+// Matching — brute-force nearest-neighbor
 // ---------------------------------------------------------------------------
 
-/// Search result from the k-d tree for a single character.
+/// Search result from the character index for a single character.
 /// Contains font candidates within the tolerance radius.
 #[derive(Debug, Clone)]
 pub struct CharSearchResult {
@@ -1927,9 +1927,9 @@ pub struct CharSearchResult {
 ///
 /// This is the single shared search function used by both the pipeline and tests.
 ///
-/// # Scoring: geometric mean of k-d tree distances
+/// # Scoring: geometric mean of per-character distances
 ///
-/// Each character's k-d tree gives us a squared Euclidean distance d²ᵢ for
+/// Each character's nearest-neighbor search gives us a squared Euclidean distance d²ᵢ for
 /// font F in the 57-dimensional weighted feature space.  Under the null
 /// hypothesis (random font), these distances follow a scaled χ² distribution
 /// — fonts that are genuinely similar will have consistently small distances

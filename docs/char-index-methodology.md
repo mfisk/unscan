@@ -167,8 +167,8 @@ Character crops are resized to `NORM_H` (48px) tall using Lanczos3 interpolation
 
 For a font F and extracted characters {c₁, c₂, ..., cₖ}:
 
-The CI computes per-character distances via kd-tree nearest-neighbor search
-(not brute-force), then aggregates using a weighted geometric mean of
+The CI computes per-character distances via brute-force nearest-neighbor search,
+then aggregates using a weighted geometric mean of
 log-distances. Characters are weighted by `char_weight()` — highly
 discriminative characters (ligatures at 2.0, structural letters at 1.5)
 contribute more than simple/narrow ones (0.5).
@@ -182,9 +182,10 @@ doesn't help the font, but it doesn't penalize it either. This padding
 mechanism handles the common case where a font lacks ligature glyphs or
 obscure punctuation without unfairly punishing it.
 
-**Nearest-neighbor search:** Per-character lookup uses a kd-tree built over
-the 99-dimensional feature space for O(log N) retrieval, replacing the original
-O(N) brute-force scan.
+**Nearest-neighbor search:** Per-character lookup uses brute-force linear scan
+over the feature vectors. At 59+ dimensions, tree-based structures provide no
+pruning benefit, so flat linear scan is both simpler and faster (cache-friendly,
+LLVM auto-vectorizes the distance loop).
 
 ---
 
@@ -241,7 +242,7 @@ Uses glyph outline similarity (Bézier curve matching) rather than raster compar
 | Issue | Severity | Status |
 |-------|----------|--------|
 | ~~Feature weighting imbalance~~ | ~~High~~ | **Fixed** — per-group L2 normalization + weights |
-| ~~O(n²) lookup construction~~ | ~~High~~ | **Fixed** — kd-tree nearest-neighbor search |
+| ~~O(n²) lookup construction~~ | ~~High~~ | **Fixed** — brute-force nearest-neighbor search (linear scan) |
 | ~~No index versioning~~ | ~~Medium~~ | **Fixed** — INDEX_VERSION = 8 with auto-rebuild |
 | **Font name repetition** — name stored 106× per font in binary | Medium | String table with integer indices would reduce size |
 | ~~Missing ligatures~~ | ~~Low~~ | **Fixed** — ff, fi, fl, ffi, ffl indexed with weight 2.0 |
@@ -252,8 +253,9 @@ Uses glyph outline similarity (Bézier curve matching) rather than raster compar
 
 The per-character index is a **sound pre-filter architecture** with a **correct
 rendering/normalization pipeline** and a **rich 99-dimensional feature set**
-with proper per-group weighting. The kd-tree provides efficient O(log N)
-nearest-neighbor lookup, and INDEX_VERSION guards against stale index files.
+with proper per-group weighting. Brute-force linear scan provides efficient
+nearest-neighbor lookup at 59+ dimensions, and INDEX_VERSION guards against
+stale index files.
 
 The feature set reliably separates font *classes* (serif vs. sans, thin vs.
 bold, condensed vs. regular) and does a reasonable job within classes. It

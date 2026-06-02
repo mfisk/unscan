@@ -94,8 +94,8 @@ pub struct Args {
     pub include_fontmap: Option<std::path::PathBuf>,
 
     /// Thoroughness factor for font matching. Default 1.0.
-    /// Higher values relax all CI thresholds (quorum, quality gate, kd-tree
-    /// search radius) so more candidate fonts survive to evaluation.
+    /// Higher values relax all CI thresholds (quorum, quality gate, search
+    /// radius) so more candidate fonts survive to evaluation.
     /// Useful for diagnosing why a known font isn't being matched.
     #[arg(long, default_value_t = 1.0)]
     pub thoroughness: f32,

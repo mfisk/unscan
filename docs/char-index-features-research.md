@@ -1,7 +1,7 @@
 # Char Index Feature Research: Discriminating Close Serif Cousins
 
 **Date:** 2026-05-11
-**Problem:** The KD-tree char index (57 features) only surfaces the correct specimen font in
+**Problem:** The char index (57 features) only surfaces the correct specimen font in
 ~26% of lines (top-50 candidates). The remaining 74% of lines never get a chance at correct
 identification because the correct font isn't even in the candidate pool.
 
@@ -38,7 +38,7 @@ identification because the correct font isn't even in the candidate pool.
 
 ### Current Weighting
 Three-group L2-normalize-then-scale: profile 40%, scalars 30%, v2 30%.
-All 57 dimensions live in the same KD-tree with squared Euclidean distance.
+All 57 dimensions live in the same CI with squared Euclidean distance.
 
 ---
 
@@ -193,7 +193,7 @@ Exactly like the existing column profile, but scanning row-by-row:
 
 **Why it matters for the index:** The existing `aspect` feature measures ink bbox width / height, which is close but not identical. Advance width includes side bearings, which vary between fonts. Garamond is narrower-set than Georgia. Times is narrower than Baskerville.
 
-**Current situation:** Width ratio is already used as a **pre-filter** in font_match.rs, comparing rendered line width against OCR bbox width. Moving it into the index would let it contribute to KD-tree distance rather than just being a binary pass/fail gate.
+**Current situation:** Width ratio is already used as a **pre-filter** in font_match.rs, comparing rendered line width against OCR bbox width. Moving it into the index would let it contribute to CI distance rather than just being a binary pass/fail gate.
 
 **Which pairs it separates:**
 - **Georgia (wide set) vs Times (narrow set)** for the same character
@@ -302,7 +302,7 @@ Using the `rustdct` crate or manual DCT implementation (straightforward for smal
 
 **Implementation complexity:** Medium. DCT is standard but adds a dependency. For 8×8 blocks, a hand-written DCT is ~40 lines.
 
-**Gotchas:** DCT coefficients are scale-sensitive — must normalize the glyph to a fixed size first (already do this: NORM_H=48). The number of useful coefficients needs tuning. Too many = noise in KD-tree (curse of dimensionality).
+**Gotchas:** DCT coefficients are scale-sensitive — must normalize the glyph to a fixed size first (already do this: NORM_H=48). The number of useful coefficients needs tuning. Too many = noise in CI (curse of dimensionality).
 
 **Recommendation: Add 8-16 DCT coefficients from an 8×8 block DCT of the normalized glyph.**
 
@@ -325,7 +325,7 @@ Using the `rustdct` crate or manual DCT implementation (straightforward for smal
    - Positive: glyph 'a' in Garamond (different rendering/augmentation)
    - Negative: glyph 'a' in Georgia
 3. Output: 16-32 dimensional embedding per glyph
-4. Use these embeddings as features in the KD-tree (replacing or supplementing handcrafted features)
+4. Use these embeddings as features in the CI (replacing or supplementing handcrafted features)
 
 **Why it could be transformative:**
 The model would learn exactly what distinguishes close serif cousins at the pixel level — subtle curve shapes, thickness transitions, ink traps, etc. that no handcrafted feature captures.
@@ -376,7 +376,7 @@ Possible new groupings:
 - **Shape features** (4 counter + 4 terminal + 2 boundary + 8 crossings + 4 stroke histogram + 2 diagonal = ~24 dims): weight 0.25
 - **DCT/frequency** (8-16 dims, if added): weight 0.10
 
-The KD-tree with Euclidean distance in 85+ dimensions will suffer more from the curse
+The CI with Euclidean distance in 85+ dimensions will suffer more from the curse
 of dimensionality. Consider:
 - **PCA reduction** to ~40 dimensions before building the tree
 - **Per-dimension variance weighting** (already have σ per dimension — could use 1/σ weighting)
@@ -384,29 +384,25 @@ of dimensionality. Consider:
 
 ---
 
-## 6. Fundamental Bottleneck: The KD-Tree at 57+ Dimensions
+## 6. Resolved: Brute-Force Replaced Tree-Based Search
 
-The bigger question: **is a KD-tree even appropriate for 57+ dimensional feature vectors?**
+The project now uses brute-force linear scan for nearest-neighbor search.
+At 59+ dimensions, tree-based structures (k-d trees, ball trees) degrade to
+near-linear scan anyway. The flat vector approach is simpler, cache-friendly,
+and LLVM auto-vectorizes the distance loop.
 
-KD-trees degrade to linear scan when dimensionality exceeds ~20-30. At 57 dimensions with
-~384K points, the tree is likely exploring most branches anyway. At 85+ dimensions it'll be
-even worse.
+**Previous alternatives considered** (no longer needed):
+1. Ball trees — tighter bounding volumes than k-d trees
+2. VP-trees — designed for metric spaces
+3. Annoy — random projection forests
+4. Product Quantization — compressed approximate search
+5. PCA dimensionality reduction — reduce to 20-30 dims first
 
-**Alternatives:**
-1. **Ball trees** — better in high dimensions than KD-trees (tighter bounding volumes)
-2. **VP-trees (Vantage Point trees)** — designed for metric spaces, work well in high-D
-3. **Annoy (Approximate Nearest Neighbors Oh Yeah)** — random projection forests, fast approximate NN
-4. **Product Quantization** — compress vectors, fast approximate search
-5. **Dimensionality reduction first** — PCA to 20-30 dims, then KD-tree
+At the current scale (~4900 fonts × 101 chars = ~495K vectors), brute-force
+with SIMD scans ~495K vectors in ~2ms. The investment is better spent on
+feature quality than search structure optimization.
 
-For the current scale (~4900 fonts × 101 chars = ~495K vectors, query ~15 chars per line),
-brute-force cosine similarity might actually be competitive. At 57 floats × 495K vectors,
-that's ~113 MB — fits in cache. A SIMD-optimized brute-force scan over 495K vectors takes
-~2ms on modern hardware.
-
-**Recommendation:** Before adding features, benchmark KD-tree kNN vs brute-force at
-current scale. If brute-force is fast enough, skip the tree entirely and invest in
-better features instead of tree optimization.
+**Status:** Resolved. Brute-force linear scan is the production search method.
 
 ---
 
@@ -421,7 +417,7 @@ But scan crops have:
 - Sub-pixel alignment differences
 
 This means the feature vectors from scan crops are systematically offset from rendered
-reference vectors. The KD-tree search finds the nearest neighbor in *feature space*, but
+reference vectors. The CI search finds the nearest neighbor in *feature space*, but
 the nearest neighbor might be the rendered version of a different font that happens to
 have similar anti-aliasing artifacts rather than the correct font with slightly different
 rendering.
@@ -468,7 +464,7 @@ rendering.
 4. Measure accuracy delta per feature
 
 ### Phase 3: Structural improvements (est. 8-16 hours)
-1. Benchmark brute-force vs KD-tree at current scale
+1. Benchmark brute-force vs CI at current scale
 2. If needed, switch to ball tree or approximate NN
 3. Consider PCA dimensionality reduction
 4. Test augmented index (render with blur/shift variants)

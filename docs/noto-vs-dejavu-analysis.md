@@ -11,7 +11,7 @@ However, the investigation still revealed important architectural findings about
 With 4714 fonts:
 - **Overall #1**: DejaVuSans [salt] (0.9937)
 - **Overall #2**: DejaVuSans (0.9937)
-- DejaVuSans is #1-#4 on every individual character except 's' (where it doesn't appear — likely excluded by the k-d tree radius)
+- DejaVuSans is #1-#4 on every individual character except 's' (where it doesn't appear — likely excluded by the CI search radius)
 
 ### Per-character breakdown (DejaVu Sans vs NotoSansSymbols)
 
@@ -33,7 +33,7 @@ With 4714 fonts:
 | i | #2 | 0.9966 | not in top results | — |
 | v | #1 | 0.9889 | not in top results | — |
 
-**NotoSansSymbols only appeared once** (rank #3 on 'u' at 0.9951). The k-d tree search with tolerance bands correctly excludes it for most characters.
+**NotoSansSymbols only appeared once** (rank #3 on 'u' at 0.9951). The CI search with tolerance bands correctly excludes it for most characters.
 
 ## Glyph-Level Comparison
 
@@ -72,12 +72,12 @@ This confirms the Rust renderer produces more consistent feature vectors between
 
 ## Remaining Score Compression Problem
 
-Even with the k-d tree, scores are extremely compressed:
+Even with the CI, scores are extremely compressed:
 - DejaVuSans: 0.9937 (winner)
 - lato 400: 0.9948 on 'e' (beats DejaVu on that char)
 - 50+ fonts score above 0.99 on individual chars
 
-### Most Discriminating Features (from k-d tree diagnostics)
+### Most Discriminating Features (from CI diagnostics)
 
 For **'e'**:
 1. serif_score (dim 36): σ = 0.0494 ← **most useful**

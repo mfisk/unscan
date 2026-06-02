@@ -1,5 +1,5 @@
 //! Distance analysis: for each specimen font, check how far the correct font
-//! is from the nearest neighbor in the k-d tree, per character.
+//! is from the nearest neighbor in the character index, per character.
 //!
 //! This tells us whether the 2× adaptive cutoff is sufficient.
 

@@ -2,12 +2,12 @@
 
 **Date:** 2025-07-05
 **Status:** Implemented + benchmarked
-**Replaces:** KD-tree per-character lookup in `char_index.rs`
+**Replaces:** per-character lookup in `char_index.rs`
 
 ## Problem
 
-The current KD-tree char index uses `nearest_within_factor(1.5)` per-character
-range search in 59 dimensions. At 59 dims the KD-tree degrades to near-linear
+The char index previously used `nearest_within_factor(1.5)` per-character
+range search in 59 dimensions. At 59 dims tree structures degrade to near-linear
 scan with branch-misprediction overhead. The correct font fails to reach the
 top-50 candidates on ~12% of lines.
 
@@ -15,7 +15,7 @@ top-50 candidates on ~12% of lines.
 
 1. **Pure Rust, no Python.** Different users have different fonts installed.
    The index trains at runtime during the indexing step.
-2. **Fast build.** The current KD-tree + BF build takes **1.54s** for 373K entries.
+2. **Fast build.** The current index build takes **1.54s** for 373K entries.
 3. **Fast inference.** Must return top-N font candidates per character quickly
    enough that the total char-index phase stays under ~200ms per document.
 4. **No external files.** Index is built in-memory during construction.
@@ -37,7 +37,7 @@ problem. The right tool is nearest-neighbor with a good distance metric.
 
 ### Two-part approach
 
-#### 1. SIMD Brute-Force Scan (replaces KD-tree)
+#### 1. SIMD Brute-Force Scan (now the production method)
 
 Flat array of pre-weighted feature vectors scanned linearly per character.
 LLVM auto-vectorizes the distance kernel to AVX2/SSE instructions.
@@ -68,7 +68,7 @@ distance is plain squared Euclidean — no per-dimension multiply in the hot loo
 
 ## Benchmark Results (real data, `target-cpu=native`)
 
-| Metric | KD-tree | Brute-Force |
+| Metric | Tree-based | Brute-Force |
 |---|---|---|
 | Build time (373K entries) | — | **1.54s** (combined KD+BF) |
 | Per-char query (self-lookup) | **12.8 µs** | **75.5 µs** |
@@ -77,8 +77,8 @@ distance is plain squared Euclidean — no per-dimension multiply in the hot loo
 | Est. per-doc overhead (94 lines × 15 chars) | ~18ms | ~106ms |
 
 **Note:** Self-lookup queries (font against itself) show worst-case BF/KD ratio
-because the KD-tree's factor-based pruning is maximally effective at zero distance.
-On real scan queries with noise, the KD-tree explores more subtrees, narrowing
+because tree-based factor-based pruning is maximally effective at zero distance.
+On real scan queries with noise, tree search explores more subtrees, narrowing
 the gap. The real payoff is accuracy: BF guarantees exact NN (no pruning misses).
 
 ## Implementation
@@ -88,7 +88,7 @@ the gap. The real payoff is accuracy: BF guarantees exact NN (no pruning misses)
 1. **`src/brute_force.rs`** — `BruteForceIndex` struct with `build()`,
    `query_topk()`, `query_within_factor()`, feature weighting
 2. **`src/char_index.rs`** — `CharIndex` now holds `bf_index: Option<BruteForceIndex>`,
-   built alongside KD-trees in `rebuild_trees()`.
+   built alongside search vectors in `rebuild_trees()`.
    New `search_candidates_bf()` function mirrors `search_candidates()` using BF.
 3. **`src/lib.rs`** + **`src/main.rs`** — `mod brute_force` declarations
 4. **`tests/bf_vs_kd.rs`** — A/B benchmark comparing both backends
@@ -111,11 +111,11 @@ impl BruteForceIndex {
 }
 ```
 
-### Integration (to switch from KD-tree to BF)
+### Integration (to switch from tree-based to brute-force)
 
 In `src/main.rs`, line ~404, change:
 ```rust
-// Before (KD-tree):
+// Before (tree-based):
 let ci_results = char_index::search_candidates(&char_index, &char_crops, 500);
 
 // After (BF):
@@ -133,12 +133,12 @@ No change to the UCIX binary format. The BF index is rebuilt from the same
 ## Next Steps
 
 1. **A/B test on specimen PDF:** Run full pipeline with `search_candidates_bf()`
-   and compare line-level accuracy vs KD-tree baseline (currently 42%)
+   and compare line-level accuracy vs tree-based baseline (currently 42%)
 2. **Tune factor threshold:** BF's exact NN enables using a tighter factor
    (e.g., 1.3 instead of 1.5) since no pruning misses to compensate for
 3. **Remove quality gate:** The 0.5 distance quality gate was tuned for the
    weighted feature space; may need recalibration for BF's data-driven weights
 4. **Profile and optimize:** If 75µs/query is too slow, add inverted-index
    prefilter to reduce scan from 3,700 to ~500 candidates per character
-5. **Eventually remove KD-tree code:** Once BF is validated, delete the
-   `KdTree` struct and `kd_trees` field to simplify the codebase
+5. **Resolved — brute-force is now the production search method.
+   

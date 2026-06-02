@@ -1,0 +1,404 @@
+//! Shared SSIM (Structural Similarity Index) implementations for grayscale images.
+//!
+//! Provides both a simple global SSIM and a Gaussian-windowed ink-aware SSIM
+//! with vertical shift search (used for font verification).
+
+use image::{GrayImage, Luma};
+
+// ---------------------------------------------------------------------------
+// Global SSIM
+// ---------------------------------------------------------------------------
+
+/// Global SSIM between two grayscale images.
+/// If sizes differ, the smaller is padded with white (255).
+pub fn ssim_global(a: &GrayImage, b: &GrayImage) -> f32 {
+    let w = a.width().max(b.width());
+    let h = a.height().max(b.height());
+    if w == 0 || h == 0 {
+        return 0.0;
+    }
+
+    let c1: f64 = (0.01 * 255.0_f64).powi(2);
+    let c2: f64 = (0.03 * 255.0_f64).powi(2);
+    let n = (w as u64 * h as u64) as f64;
+    if n == 0.0 {
+        return 0.0;
+    }
+
+    let get_a = |x: u32, y: u32| -> f64 {
+        if x < a.width() && y < a.height() {
+            a.get_pixel(x, y).0[0] as f64
+        } else {
+            255.0
+        }
+    };
+    let get_b = |x: u32, y: u32| -> f64 {
+        if x < b.width() && y < b.height() {
+            b.get_pixel(x, y).0[0] as f64
+        } else {
+            255.0
+        }
+    };
+
+    let (mut sa, mut sb, mut sa2, mut sb2, mut sab) = (0f64, 0f64, 0f64, 0f64, 0f64);
+    for y in 0..h {
+        for x in 0..w {
+            let va = get_a(x, y);
+            let vb = get_b(x, y);
+            sa += va;
+            sb += vb;
+            sa2 += va * va;
+            sb2 += vb * vb;
+            sab += va * vb;
+        }
+    }
+
+    let mu_a = sa / n;
+    let mu_b = sb / n;
+    let sig_a2 = (sa2 / n) - mu_a * mu_a;
+    let sig_b2 = (sb2 / n) - mu_b * mu_b;
+    let sig_ab = (sab / n) - mu_a * mu_b;
+
+    let num = (2.0 * mu_a * mu_b + c1) * (2.0 * sig_ab + c2);
+    let den = (mu_a * mu_a + mu_b * mu_b + c1) * (sig_a2 + sig_b2 + c2);
+    if den < 1e-10 {
+        return 0.0;
+    }
+    (num / den).clamp(0.0, 1.0) as f32
+}
+
+// ---------------------------------------------------------------------------
+// Gaussian blur (3×3, σ≈0.7)
+// ---------------------------------------------------------------------------
+
+/// 3×3 Gaussian blur with σ≈0.7 (kernel [1,2,1]/4 separable).
+pub fn gaussian_blur_3x3(img: &GrayImage) -> GrayImage {
+    let (w, h) = img.dimensions();
+    if w < 3 || h < 3 {
+        return img.clone();
+    }
+    let mut tmp = GrayImage::new(w, h);
+    for y in 0..h {
+        for x in 0..w {
+            let p = |dx: i32| -> u32 {
+                let xx = (x as i32 + dx).clamp(0, w as i32 - 1) as u32;
+                img.get_pixel(xx, y).0[0] as u32
+            };
+            let v = p(-1) + 2 * p(0) + p(1);
+            tmp.put_pixel(x, y, Luma([((v + 2) / 4) as u8]));
+        }
+    }
+    let mut out = GrayImage::new(w, h);
+    for y in 0..h {
+        for x in 0..w {
+            let p = |dy: i32| -> u32 {
+                let yy = (y as i32 + dy).clamp(0, h as i32 - 1) as u32;
+                tmp.get_pixel(x, yy).0[0] as u32
+            };
+            let v = p(-1) + 2 * p(0) + p(1);
+            out.put_pixel(x, y, Luma([((v + 2) / 4) as u8]));
+        }
+    }
+    out
+}
+
+// ---------------------------------------------------------------------------
+// Windowed SSIM with vertical shift search
+// ---------------------------------------------------------------------------
+
+/// Precomputed 11×11 Gaussian kernel with sigma ≈ 1.5.
+/// Values sum to 1.0.
+fn gaussian_kernel_11x11() -> [[f64; 11]; 11] {
+    const SIGMA: f64 = 1.5;
+    let mut kernel = [[0.0f64; 11]; 11];
+    let mut sum = 0.0f64;
+    for iy in 0..11 {
+        for ix in 0..11 {
+            let dx = ix as f64 - 5.0;
+            let dy = iy as f64 - 5.0;
+            let v = (-0.5 * (dx * dx + dy * dy) / (SIGMA * SIGMA)).exp();
+            kernel[iy][ix] = v;
+            sum += v;
+        }
+    }
+    // Normalise
+    for row in &mut kernel {
+        for v in row.iter_mut() {
+            *v /= sum;
+        }
+    }
+    kernel
+}
+
+/// Try vertical shifts of the rendered image from -max_shift to +max_shift
+/// pixels and return the best (highest) SSIM and the shift that produced it.
+/// Positive dy = rendered image moved DOWN.
+/// Searches from center outward (0, -1, 1, -2, 2, …) and exits early if SSIM ≥ 0.92.
+pub fn ssim_windowed_best_vshift(a: &GrayImage, b: &GrayImage, max_shift: i32) -> (f32, i32) {
+    const EARLY_EXIT_THRESHOLD: f32 = 0.92;
+    let mut best = 0.0f32;
+    let mut best_dy = 0i32;
+
+    // Search center-outward: 0, -1, 1, -2, 2, …
+    let mut shifts = Vec::with_capacity((2 * max_shift + 1) as usize);
+    shifts.push(0i32);
+    for d in 1..=max_shift {
+        shifts.push(-d);
+        shifts.push(d);
+    }
+
+    for dy in shifts {
+        let score = ssim_windowed(a, b, dy);
+        if score > best {
+            best = score;
+            best_dy = dy;
+            if best >= EARLY_EXIT_THRESHOLD {
+                break;
+            }
+        }
+    }
+    (best, best_dy)
+}
+
+/// Windowed SSIM on grayscale images with a vertical shift applied to image b.
+///
+/// - 11×11 Gaussian-weighted windows, stepped by 4 pixels
+/// - Only windows containing ink (pixels < 240 in either image) contribute
+/// - Falls back to global SSIM for images smaller than 11×11
+pub fn ssim_windowed(a: &GrayImage, b: &GrayImage, b_dy: i32) -> f32 {
+    let (w, h) = a.dimensions();
+    if w < 11 || h < 11 {
+        // Fallback to global for tiny images (shift not applied in global path)
+        return ssim_global(a, b);
+    }
+
+    let kernel = gaussian_kernel_11x11();
+    let c1: f64 = (0.01 * 255.0_f64).powi(2);
+    let c2: f64 = (0.03 * 255.0_f64).powi(2);
+
+    // Ink threshold: a pixel is "ink" if its value < 240
+    const INK_THRESHOLD: u8 = 240;
+    // Minimum number of ink pixels in a window to count it
+    const MIN_INK_PIXELS: u32 = 3;
+
+    let half = 5i32; // 11/2
+    let bw = b.width() as i32;
+    let bh = b.height() as i32;
+
+    let mut ssim_sum = 0.0f64;
+    let mut window_count = 0u64;
+
+    // Step by 4 pixels for speed (still plenty of overlap at 11×11)
+    let step = 4u32;
+
+    let mut cy = half as u32;
+    while cy + (half as u32) < h {
+        let mut cx = half as u32;
+        while cx + (half as u32) < w {
+            // Single pass: accumulate ink count, weighted means, and weighted
+            // squared/cross terms simultaneously.
+            let mut ink_count = 0u32;
+            let mut mu_a = 0.0f64;
+            let mut mu_b = 0.0f64;
+            let mut sum_wa2 = 0.0f64;
+            let mut sum_wb2 = 0.0f64;
+            let mut sum_wab = 0.0f64;
+
+            for ky in 0..11u32 {
+                let py = (cy as i32 - half + ky as i32) as u32;
+                // b pixel y with shift
+                let by = py as i32 + b_dy;
+                for kx in 0..11u32 {
+                    let px = (cx as i32 - half + kx as i32) as u32;
+                    let va_u8 = a.get_pixel(px, py).0[0];
+                    // Read b with offset; out-of-bounds → 255 (white background)
+                    let vb_u8 = if by >= 0 && by < bh && (px as i32) < bw {
+                        b.get_pixel(px, by as u32).0[0]
+                    } else {
+                        255u8
+                    };
+
+                    if va_u8 < INK_THRESHOLD || vb_u8 < INK_THRESHOLD {
+                        ink_count += 1;
+                    }
+
+                    let wt = kernel[ky as usize][kx as usize];
+                    let va = va_u8 as f64;
+                    let vb = vb_u8 as f64;
+                    mu_a += wt * va;
+                    mu_b += wt * vb;
+                    sum_wa2 += wt * va * va;
+                    sum_wb2 += wt * vb * vb;
+                    sum_wab += wt * va * vb;
+                }
+            }
+
+            if ink_count >= MIN_INK_PIXELS {
+                // One-pass variance: sig2 = E[x²] - (E[x])²
+                let sig_a2 = sum_wa2 - mu_a * mu_a;
+                let sig_b2 = sum_wb2 - mu_b * mu_b;
+                let sig_ab = sum_wab - mu_a * mu_b;
+
+                let num = (2.0 * mu_a * mu_b + c1) * (2.0 * sig_ab + c2);
+                let den = (mu_a * mu_a + mu_b * mu_b + c1) * (sig_a2 + sig_b2 + c2);
+                let local_ssim = if den < 1e-10 { 1.0 } else { num / den };
+
+                ssim_sum += local_ssim;
+                window_count += 1;
+            }
+
+            cx += step;
+        }
+        cy += step;
+    }
+
+    if window_count == 0 {
+        // No ink windows found — fall back to global
+        return ssim_global(a, b);
+    }
+
+    (ssim_sum / window_count as f64).clamp(0.0, 1.0) as f32
+}
+
+// ---------------------------------------------------------------------------
+// Image trimming
+// ---------------------------------------------------------------------------
+
+/// Trim whitespace using ink-density ratios. Rows/columns with less than 1%
+/// ink pixels are considered empty. Preserves dots on j/i, diacritics, and
+/// descenders.
+pub fn trim_whitespace(img: &GrayImage) -> GrayImage {
+    let (w, h) = img.dimensions();
+    if w == 0 || h < 6 {
+        return img.clone();
+    }
+
+    const INK_THRESH: u8 = 230;
+    const MIN_INK_ROW: f32 = 0.01;
+    const MIN_INK_COL: f32 = 0.01;
+
+    // Vertical: find first/last ink rows
+    let row_ink: Vec<f32> = (0..h).map(|y| {
+        let dark: u32 = (0..w).map(|x| {
+            if img.get_pixel(x, y).0[0] < INK_THRESH { 1u32 } else { 0 }
+        }).sum();
+        dark as f32 / w as f32
+    }).collect();
+
+    let first_row = match row_ink.iter().position(|&d| d > MIN_INK_ROW) {
+        Some(y) => y as u32,
+        None => return img.clone(),
+    };
+    let last_row = match row_ink.iter().rposition(|&d| d > MIN_INK_ROW) {
+        Some(y) => y as u32,
+        None => return img.clone(),
+    };
+
+    // Horizontal: find first/last ink columns
+    let col_ink: Vec<f32> = (0..w).map(|x| {
+        let dark: u32 = (0..h).map(|y| {
+            if img.get_pixel(x, y).0[0] < INK_THRESH { 1u32 } else { 0 }
+        }).sum();
+        dark as f32 / h as f32
+    }).collect();
+
+    let first_col = match col_ink.iter().position(|&d| d > MIN_INK_COL) {
+        Some(x) => x as u32,
+        None => 0,
+    };
+    let last_col = match col_ink.iter().rposition(|&d| d > MIN_INK_COL) {
+        Some(x) => x as u32,
+        None => w - 1,
+    };
+
+    let band_h = last_row - first_row + 1;
+    let band_w = last_col - first_col + 1;
+    if band_h < 4 || band_w < 4 {
+        return img.clone();
+    }
+
+    image::imageops::crop_imm(img, first_col, first_row, band_w, band_h).to_image()
+}
+
+/// Simple whitespace trim: crop to the tight bounding box of all pixels below
+/// threshold 240. No density filtering — any single dark pixel extends the box.
+pub fn trim_whitespace_simple(img: &GrayImage) -> GrayImage {
+    let (w, h) = img.dimensions();
+    if w == 0 || h == 0 {
+        return img.clone();
+    }
+
+    let thresh = 240u8;
+    let mut min_x = w;
+    let mut max_x = 0u32;
+    let mut min_y = h;
+    let mut max_y = 0u32;
+
+    for y in 0..h {
+        for x in 0..w {
+            if img.get_pixel(x, y).0[0] < thresh {
+                min_x = min_x.min(x);
+                max_x = max_x.max(x);
+                min_y = min_y.min(y);
+                max_y = max_y.max(y);
+            }
+        }
+    }
+
+    if min_x > max_x || min_y > max_y {
+        return img.clone();
+    }
+
+    image::imageops::crop_imm(img, min_x, min_y, max_x - min_x + 1, max_y - min_y + 1)
+        .to_image()
+}
+
+// ---------------------------------------------------------------------------
+// SSIM compare (trim + resize + global SSIM)
+// ---------------------------------------------------------------------------
+
+/// Result from SSIM comparison including the actual processed images.
+pub struct SsimResult {
+    pub score: f32,
+    pub dy: i32,
+    /// The crop image as actually compared (trimmed + resized).
+    pub crop_compared: GrayImage,
+    /// The render image as actually compared (trimmed + resized).
+    pub render_compared: GrayImage,
+}
+
+/// SSIM with ink-band normalization: trim both images to their ink content,
+/// resize to the same height, then compare.
+pub fn ssim_compare(crop: &GrayImage, render: &GrayImage) -> SsimResult {
+    let a_trimmed = trim_whitespace(crop);
+    let b_trimmed = trim_whitespace(render);
+
+    if a_trimmed.width() == 0 || a_trimmed.height() == 0
+        || b_trimmed.width() == 0 || b_trimmed.height() == 0
+    {
+        return SsimResult {
+            score: 0.0, dy: 0,
+            crop_compared: a_trimmed.clone(),
+            render_compared: b_trimmed.clone(),
+        };
+    }
+
+    // Use the larger dimensions so neither gets upscaled much
+    let target_w = a_trimmed.width().max(b_trimmed.width());
+    let target_h = a_trimmed.height().max(b_trimmed.height());
+
+    let a_resized = image::imageops::resize(
+        &a_trimmed, target_w, target_h, image::imageops::FilterType::Lanczos3,
+    );
+    let b_resized = image::imageops::resize(
+        &b_trimmed, target_w, target_h, image::imageops::FilterType::Lanczos3,
+    );
+
+    let score = ssim_global(&a_resized, &b_resized);
+    SsimResult {
+        score,
+        dy: 0,
+        crop_compared: a_resized,
+        render_compared: b_resized,
+    }
+}
