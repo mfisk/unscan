@@ -776,10 +776,58 @@ def build_miss_html(entry, chars_to_show, crop_dir, crop_files,
 <div class="seg-caption">{seg_caption}</div>
 </div>"""
 
+    # SSIM comparison block: scan crop vs rendered, with diff image
+    ssim_compare_html = ""
+    if diag_line_dir:
+        ssim_scan_path = os.path.join(diag_line_dir, "ssim_scan.png")
+        ssim_render_path = os.path.join(diag_line_dir, "ssim_render.png")
+        ssim_diff_path = os.path.join(diag_line_dir, "ssim_diff.png")
+        if os.path.exists(ssim_scan_path) and os.path.exists(ssim_render_path):
+            scan_b64 = img_to_b64(ssim_scan_path)
+            render_b64 = img_to_b64(ssim_render_path)
+            diff_b64 = img_to_b64(ssim_diff_path) if os.path.exists(ssim_diff_path) else None
+
+            ssim_val_str = f"{ssim_val:.4f}" if ssim_val is not None else "—"
+            diff_row = ""
+            if diff_b64:
+                diff_row = f"""<tr>
+  <td class="ssim-label">Diff</td>
+  <td colspan="2"><img src="{diff_b64}" class="ssim-compare-img"></td>
+</tr>"""
+
+            ssim_compare_html = f"""<div class="ssim-compare-block">
+<table class="ssim-compare-table">
+<tr>
+  <th></th>
+  <th>Correct</th>
+  <th>Picked (SSIM verified)</th>
+</tr>
+<tr>
+  <td class="ssim-label">Font</td>
+  <td class="correct">{correct_font_name}</td>
+  <td class="chosen">{matched}</td>
+</tr>
+<tr>
+  <td class="ssim-label">Scan</td>
+  <td colspan="2"><img src="{scan_b64}" class="ssim-compare-img"></td>
+</tr>
+<tr>
+  <td class="ssim-label">Render</td>
+  <td colspan="2"><img src="{render_b64}" class="ssim-compare-img"></td>
+</tr>
+{diff_row}
+<tr>
+  <td class="ssim-label">SSIM</td>
+  <td colspan="2">{ssim_val_str}</td>
+</tr>
+</table>
+</div>"""
+
     # Show alternate (lig) CI candidates when available
     return f"""<div class="miss">
 <h3>p{entry['page']}:L{entry['line_index']} — "{text_preview}"{ssim_html}</h3>
 {seg_html}
+{ssim_compare_html}
 <table>
 <tr>
   <th>Scan</th>
@@ -850,6 +898,25 @@ img.ci {
 .seg-caption { font-size: 10px; color: #666; margin-top: 2px; }
 .seg-legend { font-size: 10px; margin-bottom: 4px; }
 .seg-legend span { margin-right: 12px; }
+.ssim-compare-block {
+  margin: 8px 0 10px 0; padding: 8px; background: #f5f8ff;
+  border: 1px solid #ccd; border-radius: 4px;
+}
+.ssim-compare-table { border-collapse: collapse; width: 100%; }
+.ssim-compare-table th {
+  text-align: center; font-size: 11px; font-weight: 600;
+  padding: 4px 6px; border-bottom: 2px solid #ccc;
+}
+.ssim-compare-table td {
+  padding: 4px 6px; border-bottom: 1px solid #dde; vertical-align: middle;
+}
+.ssim-compare-table .ssim-label {
+  font-size: 10px; font-weight: 600; color: #555; width: 50px; text-align: right;
+}
+.ssim-compare-img {
+  max-width: 100%; image-rendering: pixelated;
+  border: 1px solid #ddd; display: block; margin: 2px 0;
+}
 .leg-vp { color: #dc2828; }
 .leg-seam { color: #1e64ff; }
 </style>"""

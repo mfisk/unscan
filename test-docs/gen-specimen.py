@@ -41,7 +41,23 @@ PAGE_W, PAGE_H = letter  # 612 × 792 points (8.5 × 11 in)
 # Font registration — fonts are resolved via fontconfig
 # ---------------------------------------------------------------------------
 def fc_find(family, style="Regular"):
-    """Find a font file via fontconfig. Prefers .ttf over .otf (ReportLab needs TrueType outlines)."""
+    """Find a font file via fontconfig. Prefers .ttf over .otf (ReportLab needs TrueType outlines).
+
+    Validates OS/2 weight class when style is weight-specific, because many fonts
+    use the 4-font-family naming model where e.g. SemiBold declares subfamily
+    "Regular" under a different family name — fontconfig's style=Regular filter
+    matches all of them.
+    """
+    from fontTools.ttLib import TTFont as FTFont
+
+    STYLE_WEIGHTS = {
+        "Regular": 400,
+        "Bold": 700,
+        "Light": 300,
+        "Medium": 500,
+    }
+    expected_weight = STYLE_WEIGHTS.get(style)
+
     for query in [f"{family}:style={style}", family]:
         r = subprocess.run(
             ["fc-list", query, "--format=%{file}\n"],
@@ -50,10 +66,35 @@ def fc_find(family, style="Regular"):
         candidates = [l for l in r.stdout.strip().split('\n') if l.lower().endswith(('.ttf', '.otf'))]
         # Prefer .ttf — ReportLab can't handle PostScript-outline .otf
         ttf = [c for c in candidates if c.lower().endswith('.ttf')]
-        if ttf:
-            return ttf[0]
-        if candidates:
-            return candidates[0]
+        pool = ttf if ttf else candidates
+        if not pool:
+            continue
+
+        # If we know what weight to expect, verify via OS/2 table
+        if expected_weight:
+            for path in pool:
+                try:
+                    tt = FTFont(path)
+                    wt = tt['OS/2'].usWeightClass
+                    tt.close()
+                    if wt == expected_weight:
+                        return path
+                except Exception:
+                    continue
+            # Fallback: allow ±50 tolerance (e.g. 450 for "Regular")
+            for path in pool:
+                try:
+                    tt = FTFont(path)
+                    wt = tt['OS/2'].usWeightClass
+                    tt.close()
+                    if abs(wt - expected_weight) <= 50:
+                        return path
+                except Exception:
+                    continue
+
+        # No weight constraint or nothing matched — return first candidate
+        if pool:
+            return pool[0]
     return None
 def register_font(rl_name, ttf_path):
     """Register a TTF with reportlab. Returns True on success."""

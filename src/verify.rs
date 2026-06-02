@@ -37,6 +37,7 @@ pub fn verify_text_region(
     words: &[TextRegion],
     overrides: Option<&[(char, u16)]>,
     variant_tag: &str,
+    audit_dir: Option<&std::path::Path>,
 ) -> (f32, i32) {
     let (iw, ih) = original_gray.dimensions();
     let x = x.min(iw.saturating_sub(1));
@@ -48,7 +49,7 @@ pub fn verify_text_region(
         return (0.0, 0);
     }
 
-    let original_crop = image::imageops::crop_imm(original_gray, x, y, w, h).to_image();
+    let full_scan = image::imageops::crop_imm(original_gray, x, y, w, h).to_image();
 
     // Page-level Hough deskew already corrected the full page before we get
     // here, so no per-line rotation needed.
@@ -65,46 +66,116 @@ pub fn verify_text_region(
         .collect();
 
     // Try multiple render scales and pick the best SSIM.
-    // The optimal scale depends on the scan's original render resolution (unknown).
-    // Scale 2 matches typical 2:1 downsample; scale 4 handles higher downsample ratios.
     let scales = if let Ok(s) = std::env::var("UNSCAN_RENDER_SCALE") {
         vec![s.parse::<u32>().unwrap_or(2)]
     } else {
         vec![2, 4]
     };
 
-    let original_crop_blur = gaussian_blur_3x3(&original_crop);
+    // Ink-crop the render to where the glyphs actually are; crop the scan to
+    // the word-union bbox (tight to OCR word bounds, no adjacent-line bleed).
+    // SSIM scores word-union crops of both (vshift handles baseline offset);
+    // audit render image uses the tighter ink crop for visual clarity.
+    let word_top = placements.iter().map(|p| p.y_off).min().unwrap_or(0);
+    let word_bot = placements.iter().map(|p| p.y_off + p.height).max().unwrap_or(h);
+    let word_h = word_bot.saturating_sub(word_top).min(h - word_top);
+
     let mut best_score = 0.0f32;
     let mut best_dy = 0i32;
+    let mut best_scan_crop: Option<GrayImage> = None;
+    let mut best_render_ink: Option<GrayImage> = None;
+    let mut best_diff: Option<GrayImage> = None;
 
     for &scale in &scales {
-        let rendered = match render_via_freetype_scaled(font_data, &placements, w, h, scale, overrides, variant_tag) {
+        // Render into the full line bbox canvas (word placements are relative to it)
+        let full_render = match render_via_freetype_scaled(font_data, &placements, w, h, scale, overrides, variant_tag) {
             Some(r) => r,
             None => continue,
         };
 
-        // Debug: dump both sides of the SSIM comparison (last scale wins for files)
-        if std::env::var("UNSCAN_DUMP_SSIM").is_ok() {
-            let _ = original_crop.save("/tmp/ssim_scan_crop.png");
-            let _ = rendered.save("/tmp/ssim_rendered.png");
-            log::info!("SSIM debug: dumped scan crop ({}x{}) and rendered ({}x{}) to /tmp/",
-                original_crop.width(), original_crop.height(), rendered.width(), rendered.height());
-        }
+        // Scan: word-union bbox crop (no adjacent-line bleed)
+        let scan_crop = if word_h >= 3 && word_h < h {
+            image::imageops::crop_imm(&full_scan, 0, word_top, w, word_h).to_image()
+        } else {
+            full_scan.clone()
+        };
 
-        let rendered_blur = gaussian_blur_3x3(&rendered);
-        let (score, dy) = ssim_windowed_best_vshift(&original_crop_blur, &rendered_blur, 12);
+        // Render for SSIM: same word-union region (vshift handles baseline offset)
+        let render_for_ssim = if word_h >= 3 && word_h < h {
+            image::imageops::crop_imm(&full_render, 0, word_top, w, word_h).to_image()
+        } else {
+            full_render.clone()
+        };
+
+        let scan_blur = gaussian_blur_3x3(&scan_crop);
+        let render_blur = gaussian_blur_3x3(&render_for_ssim);
+        let (score, dy) = ssim_windowed_best_vshift(&scan_blur, &render_blur, 12);
 
         if std::env::var("UNSCAN_DUMP_SSIM").is_ok() {
-            log::info!("SSIM scale={}: dy={} score={:.4}", scale, dy, score);
+            log::info!("SSIM debug: scan ({}x{}) render ({}x{}) scale={} dy={} score={:.4}",
+                scan_crop.width(), scan_crop.height(),
+                render_for_ssim.width(), render_for_ssim.height(),
+                scale, dy, score);
         }
 
         if score > best_score {
             best_score = score;
             best_dy = dy;
+            best_scan_crop = Some(scan_crop);
+
+            // Render for audit: ink-crop for clean display
+            let ink_threshold = 240u8;
+            let (rw, rh) = full_render.dimensions();
+            let (r_top, r_bot) = crate::ocr::ink_vertical_extent(&full_render, 0, rw, 0, rh, ink_threshold);
+            let ink_h = r_bot.saturating_sub(r_top);
+            let render_ink = if ink_h >= 3 {
+                image::imageops::crop_imm(&full_render, 0, r_top, rw, ink_h).to_image()
+            } else {
+                render_for_ssim
+            };
+
+            // Diff the displayed pair (compute_abs_diff resizes if heights differ)
+            best_diff = Some(compute_abs_diff(
+                best_scan_crop.as_ref().unwrap(), &render_ink,
+            ));
+            best_render_ink = Some(render_ink);
+        }
+    }
+
+    // Save SSIM audit images.
+    if let Some(audit_path) = audit_dir {
+        if let Some(ref sc) = best_scan_crop {
+            let _ = sc.save(audit_path.join("ssim_scan.png"));
+        }
+        if let Some(ref ri) = best_render_ink {
+            let _ = ri.save(audit_path.join("ssim_render.png"));
+        }
+        if let Some(ref d) = best_diff {
+            let _ = d.save(audit_path.join("ssim_diff.png"));
         }
     }
 
     (best_score, best_dy)
+}
+
+/// Compute absolute pixel difference between two grayscale images.
+/// Images are resized to match dimensions if needed (using the scan crop size).
+fn compute_abs_diff(a: &GrayImage, b: &GrayImage) -> GrayImage {
+    let (aw, ah) = a.dimensions();
+    let b_resized = if b.dimensions() != (aw, ah) {
+        image::imageops::resize(b, aw, ah, image::imageops::FilterType::Lanczos3)
+    } else {
+        b.clone()
+    };
+    let mut diff = GrayImage::new(aw, ah);
+    for y in 0..ah {
+        for x in 0..aw {
+            let pa = a.get_pixel(x, y).0[0] as i16;
+            let pb = b_resized.get_pixel(x, y).0[0] as i16;
+            diff.put_pixel(x, y, Luma([(pa - pb).unsigned_abs() as u8]));
+        }
+    }
+    diff
 }
 
 // ---------------------------------------------------------------------------
