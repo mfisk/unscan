@@ -4,7 +4,7 @@
 //! boundaries that partition the image into N cells.
 
 use image::GrayImage;
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 
 /// Entry penalty weight for seam carving.  When the seam path moves into
 /// a darker pixel than the previous one, the darkness increase is
@@ -338,11 +338,17 @@ fn segment_characters_inner(
         }
 
         // Greedy loop: pop cheapest, split, recompute children.
+        // Lazy deletion: stale seg_ids are skipped on pop instead of
+        // draining and rebuilding the heap on every accepted seam.
+        let mut dead_sids: HashSet<u32> = HashSet::new();
         while splits.len() < need {
             let entry = match heap.pop() {
                 Some(e) => e,
                 None => break, // no valid seams remain
             };
+
+            // Skip candidates from dead segments (replaced or consumed).
+            if dead_sids.contains(&entry.seg_id) { continue; }
 
             if word_text.map_or(false, |w| w.starts_with("tradition")) {
                 eprintln!("  SEAM POP [{}]: col={} cost={:.1} seg=[{},{}) sid={} | accepted={:?}", word_text.unwrap_or("?"), entry.col, entry.cost, entry.seg_start, entry.seg_end, entry.seg_id, &splits);
@@ -376,6 +382,10 @@ fn segment_characters_inner(
                         }
                         seg_bounds.insert(sid, SegBounds { left_path: lp, right_path: rp });
                         dp_cache.insert(sid, dp);
+                        // Kill old segment — retry replacement covers valid columns
+                        dead_sids.insert(entry.seg_id);
+                        dp_cache.remove(&entry.seg_id);
+                        seg_bounds.remove(&entry.seg_id);
                     }
                 } else if !left_ok && right_ok {
                     let new_start = entry.col + 1;
@@ -390,6 +400,10 @@ fn segment_characters_inner(
                         }
                         seg_bounds.insert(sid, SegBounds { left_path: lp, right_path: rp });
                         dp_cache.insert(sid, dp);
+                        // Kill old segment — retry replacement covers valid columns
+                        dead_sids.insert(entry.seg_id);
+                        dp_cache.remove(&entry.seg_id);
+                        seg_bounds.remove(&entry.seg_id);
                     }
                 }
                 continue;
@@ -439,12 +453,9 @@ fn segment_characters_inner(
             let parent_lp = seg_bounds.get(&entry.seg_id).and_then(|b| b.left_path.clone());
             let parent_rp = seg_bounds.get(&entry.seg_id).and_then(|b| b.right_path.clone());
 
-            // Remove all candidates from the old segment from the heap.
+            // Mark old segment as dead — stale entries skipped on pop.
             let old_sid = entry.seg_id;
-            let remaining: Vec<SeamEntry> = heap.into_iter()
-                .filter(|e| e.seg_id != old_sid)
-                .collect();
-            heap = BinaryHeap::from(remaining);
+            dead_sids.insert(old_sid);
             dp_cache.remove(&old_sid);
             seg_bounds.remove(&old_sid);
 
