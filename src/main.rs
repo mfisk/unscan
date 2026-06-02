@@ -20,6 +20,49 @@ mod smooth;
 pub(crate) mod verify;
 
 use crate::audit::{AuditEntry, AuditLog, BBox, Decision, GeometryEntry, PageSummary};
+
+fn mem_info() -> String {
+    let s = std::fs::read_to_string("/proc/self/status").unwrap_or_default();
+    let mut rss = 0u64;
+    let mut vsz = 0u64;
+    for l in s.lines() {
+        if l.starts_with("VmRSS:") {
+            rss = l.split_whitespace().nth(1).and_then(|v| v.parse().ok()).unwrap_or(0);
+        }
+        if l.starts_with("VmSize:") {
+            vsz = l.split_whitespace().nth(1).and_then(|v| v.parse().ok()).unwrap_or(0);
+        }
+    }
+    format!("RSS={}MB VSZ={}MB", rss / 1024, vsz / 1024)
+}
+
+fn dump_limits() {
+    if let Ok(s) = std::fs::read_to_string("/proc/self/limits") {
+        for l in s.lines() {
+            if l.contains("address space") || l.contains("data size") || l.contains("stack size") {
+                eprintln!("  LIMIT: {}", l);
+            }
+        }
+    }
+    // Check overcommit and committed memory
+    if let Ok(s) = std::fs::read_to_string("/proc/meminfo") {
+        for l in s.lines() {
+            if l.starts_with("CommitLimit:") || l.starts_with("Committed_AS:") || l.starts_with("MemAvailable:") {
+                eprintln!("  MEMINFO: {}", l.trim());
+            }
+        }
+    }
+    if let Ok(s) = std::fs::read_to_string("/proc/sys/vm/overcommit_memory") {
+        eprintln!("  OVERCOMMIT: {}", s.trim());
+    }
+    // cgroup memory limit
+    for path in &["/sys/fs/cgroup/memory/memory.limit_in_bytes",
+                   "/sys/fs/cgroup/memory.max"] {
+        if let Ok(s) = std::fs::read_to_string(path) {
+            eprintln!("  CGROUP: {} = {}", path, s.trim());
+        }
+    }
+}
 use crate::error::ScanTextError;
 use crate::ocr::TextRegion;
 use image::DynamicImage;
@@ -260,6 +303,7 @@ fn load_or_build_index(
             Ok(mut index) => {
                 let n_entries: usize = index.n_entries();
                 index.compact(); // free raw entries — only flat_vecs needed for search
+                eprintln!("  MEM after compact: {}", mem_info());
                 info!(
                     "  Loaded {} chars × {} entries in {:.1}s",
                     index.n_chars(),
@@ -330,6 +374,7 @@ fn load_or_build_index(
 }
 
 fn run(args: &cli::Args) -> Result<(), ScanTextError> {
+    dump_limits();
     let input = args.input.as_ref().expect("input validated");
     let output = args.output.as_ref().expect("output validated");
 
@@ -422,6 +467,7 @@ fn run(args: &cli::Args) -> Result<(), ScanTextError> {
         raster_elapsed.as_secs_f32(),
         if raster_cached { ", cached" } else { "" },
     );
+    eprintln!("  MEM after page load: {}", mem_info());
 
     // ── 2b. Extract source image data for pass-through ───────────────
     let source_images = if input.extension().and_then(|e| e.to_str()) == Some("pdf") {
@@ -460,7 +506,7 @@ fn run(args: &cli::Args) -> Result<(), ScanTextError> {
             (orig_gray.clone(), false)
         } else if skew_angle.abs() > 0.5 {
             info!("  Deskew: {:.2}° rotation corrected", skew_angle);
-            (deskew::rotate_gray(&orig_gray, -skew_angle), true)
+            (deskew::rotate_gray(&orig_gray, skew_angle), true)
         } else {
             (orig_gray, false)
         };
@@ -525,6 +571,23 @@ fn run(args: &cli::Args) -> Result<(), ScanTextError> {
 
         let fontmatch_start = std::time::Instant::now();
         let line_matches: Vec<LineMatch> = lines.par_iter().enumerate().map(|(li, line)| {
+            eprintln!("  MEM line {} start: {} (\"{}\")", li, mem_info(), &line.text[..line.text.len().min(30)]);
+            // Dump total mapped size from /proc/self/maps
+            if li == 2 || li == 45 {
+                if let Ok(maps) = std::fs::read_to_string("/proc/self/maps") {
+                    let mut total: u64 = 0;
+                    for l in maps.lines() {
+                        if let Some(range) = l.split_whitespace().next() {
+                            if let Some((start_s, end_s)) = range.split_once('-') {
+                                if let (Ok(s), Ok(e)) = (u64::from_str_radix(start_s, 16), u64::from_str_radix(end_s, 16)) {
+                                    total += e - s;
+                                }
+                            }
+                        }
+                    }
+                    eprintln!("  MEM line {} maps total: {}MB, {} mappings", li, total / (1024*1024), maps.lines().count());
+                }
+            }
             let line_start = std::time::Instant::now();
             let text_color = color::detect_text_color(
                 page_img,
@@ -543,7 +606,7 @@ fn run(args: &cli::Args) -> Result<(), ScanTextError> {
                 let line_slug: String = line.text.chars().take(30)
                     .map(|c| if c.is_alphanumeric() { c } else { '_' })
                     .collect();
-                let p = d.join(format!("p{}_{}", page_idx + 1, line_slug));
+                let p = d.join(format!("p{}_L{:03}_{}", page_idx + 1, li, line_slug));
                 let _ = std::fs::create_dir_all(&p);
                 p
             });
@@ -564,6 +627,7 @@ fn run(args: &cli::Args) -> Result<(), ScanTextError> {
                 diag_seg_dir.as_deref(),
                 diag_ref_font.as_ref(),
             );
+            eprintln!("  MEM line {} after segmentation: {} ({} crops)", li, mem_info(), char_crops.len());
 
             let font_result = {
 
@@ -599,6 +663,7 @@ fn run(args: &cli::Args) -> Result<(), ScanTextError> {
                 }
 
                 let ci_result = char_index::search_candidates(&char_index, &char_crops, args.thoroughness);
+                eprintln!("  MEM line {} after CI search: {}", li, mem_info());
                 ci_top_for_audit = ci_result.scores.iter()
                     .map(|(name, score)| (name.clone(), *score)).collect();
                 ci_char_detail = ci_result.char_detail;
@@ -894,6 +959,8 @@ fn run(args: &cli::Args) -> Result<(), ScanTextError> {
                             crop_path: None,
                             chosen_dist_sq: chosen_d2,
                             ocr_corrected_from: d.ocr_corrected_from,
+                            best_alt_char: d.best_alt_char,
+                            best_alt_dist: d.best_alt_dist,
                         }
                     })
                     .collect(),

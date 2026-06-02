@@ -52,6 +52,12 @@ pub struct CharCiVote {
     /// `ch` holds the corrected (better-matching) character.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub ocr_corrected_from: Option<char>,
+    /// Best alternative character considered (even if correction didn't fire).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub best_alt_char: Option<char>,
+    /// Distance of the best alternative character.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub best_alt_dist: Option<f32>,
 }
 
 #[derive(Debug, Serialize, Clone)]
