@@ -332,11 +332,8 @@ them, the ground truth sections for Times New Roman, Arial, Courier New,
 Georgia, Verdana, Trebuchet MS, and Comic Sans MS cannot be scored.
 
 ```bash
-# Check whether required fonts are installed
-./scripts/check-fonts.sh
-
-# Install missing fonts automatically (requires sudo)
-./scripts/check-fonts.sh --install
+# Install required fonts (requires sudo)
+./scripts/install-all-fonts.sh
 ```
 
 **MS Core Fonts** (required for ground truth sections 7, 9, 11–15):
