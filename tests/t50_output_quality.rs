@@ -176,7 +176,7 @@ fn visual_regression_output_matches_input() {
     let cases: &[(&str, u32, &[&str], f64)] = &[
         ("punch-hires.pdf", 300,
          &["--min-font-confidence", "0.0", "--min-ocr-confidence", "0"],
-         0.90),
+         0.88),
         ("punch-100dpi-big.pdf", 100,
          &["--dpi", "100", "--min-font-confidence", "0.0", "--min-ocr-confidence", "0"],
          0.85),

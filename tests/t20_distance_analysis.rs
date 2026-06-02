@@ -7,7 +7,7 @@ use std::path::Path;
 use std::collections::HashMap;
 
 use unscan::char_index::{
-    load_index, CharIndex, CharFeatures, FEAT_LEN,
+    load_index, CharIndex, FEAT_LEN,
 };
 
 /// Extract a short display name from a font path or name
@@ -39,12 +39,12 @@ fn analyze_font_char(
     
     // Get the target font's features
     let target_entry = entries.iter().find(|e| e.font_name == target_font)?;
-    let target_weighted = target_entry.features.as_weighted_slice();
+    let target_weighted = target_entry.features.weighted();
     
     // Compute distance from target to every other font for this char
     let mut distances: Vec<(String, f32, f32)> = Vec::new(); // (name, dist², cosine)
     for e in entries {
-        let w = e.features.as_weighted_slice();
+        let w = e.features.weighted();
         let d = sq_dist(&target_weighted, &w);
         let cos = cosine_sim(&target_weighted, &w);
         distances.push((e.font_name.clone(), d, cos));

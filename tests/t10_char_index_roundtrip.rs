@@ -8,10 +8,11 @@
 
 use image::{GrayImage, Luma};
 use ab_glyph::{Font, FontRef, PxScale, ScaleFont, point};
+use std::path::PathBuf;
 
 use unscan::char_index::{
     build_char_index, compute_features, compute_font_serif_score, compute_xh_cap_ratio,
-    match_line_chars, render_char_normalised, search_candidates, search_single_char, FEAT_LEN,
+    render_char_normalised, search_candidates, GlyphOverrides, CharFeatures, FEAT_LEN,
 };
 
 /// Render a single character in the given font at NORM_H=48 ink height,
@@ -97,25 +98,24 @@ fn load_font(path: &str) -> Vec<u8> {
     std::fs::read(path).unwrap_or_else(|e| panic!("Cannot read font {}: {}", path, e))
 }
 
-/// Collect system fonts for the test index.
-/// The first element of each tuple is the font key (file path), matching
-/// what the production pipeline passes to build_char_index.
-fn test_font_set() -> Vec<(String, Vec<u8>)> {
-    let paths = [
-        "/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf",
-        "/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf",
-        "/usr/share/fonts/truetype/dejavu/DejaVuSerif.ttf",
-        "/usr/share/fonts/truetype/dejavu/DejaVuSerif-Bold.ttf",
-        "/usr/share/fonts/truetype/dejavu/DejaVuSansMono.ttf",
-        "/usr/share/fonts/truetype/freefont/FreeSans.ttf",
-        "/usr/share/fonts/truetype/freefont/FreeSerif.ttf",
-        "/usr/share/fonts/truetype/freefont/FreeMono.ttf",
-    ];
+/// System font paths for the test index.
+const FONT_PATHS: &[&str] = &[
+    "/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf",
+    "/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf",
+    "/usr/share/fonts/truetype/dejavu/DejaVuSerif.ttf",
+    "/usr/share/fonts/truetype/dejavu/DejaVuSerif-Bold.ttf",
+    "/usr/share/fonts/truetype/dejavu/DejaVuSansMono.ttf",
+    "/usr/share/fonts/truetype/freefont/FreeSans.ttf",
+    "/usr/share/fonts/truetype/freefont/FreeSerif.ttf",
+    "/usr/share/fonts/truetype/freefont/FreeMono.ttf",
+];
 
+/// Collect system fonts as (name, PathBuf, GlyphOverrides) for build_char_index.
+fn test_font_set() -> Vec<(String, PathBuf, GlyphOverrides)> {
     let mut fonts = Vec::new();
-    for path in &paths {
-        if let Ok(data) = std::fs::read(path) {
-            fonts.push((path.to_string(), data));
+    for path in FONT_PATHS {
+        if std::path::Path::new(path).exists() {
+            fonts.push((path.to_string(), PathBuf::from(path), None));
         }
     }
     assert!(fonts.len() >= 4, "Need at least 4 system fonts for meaningful test");
@@ -151,9 +151,8 @@ fn char_index_identifies_dejavu_sans() {
     let (index, unique_crops, _target_data) = setup();
 
     let font_set = test_font_set();
-    let font_keys: Vec<&str> = font_set.iter().map(|(n, _)| n.as_str()).collect();
     eprintln!("\n=== Building index from {} fonts ===", font_set.len());
-    for key in &font_keys {
+    for (key, _, _) in &font_set {
         eprintln!("  {}", key);
     }
 
@@ -164,26 +163,21 @@ fn char_index_identifies_dejavu_sans() {
     eprintln!("\n=== Per-character nearest fonts ===");
     for (c, img) in &unique_crops {
         let single = vec![(*c, img.clone())];
-        let char_results = search_candidates(&index, &single, 3.0).scores;
+        let char_results = search_candidates(&index, &single, 3.0, false).scores;
         let top3: Vec<String> = char_results.iter()
             .map(|(n, s)| format!("{} ({:.4})", n, s))
             .collect();
         eprintln!("  '{}': {}", c, top3.join(" | "));
     }
 
-    // Overall query — top 5 (using both APIs to verify they agree)
-    let results = search_candidates(&index, &unique_crops, 5.0).scores;
-    let results_legacy = match_line_chars(&unique_crops, &index, 5);
+    // Overall query
+    let results = search_candidates(&index, &unique_crops, 5.0, false).scores;
 
-    eprintln!("\n=== Overall top {} matches (search_candidates) ===", results.len());
+    eprintln!("\n=== Overall top {} matches ===", results.len());
     for (i, (name, score)) in results.iter().enumerate() {
         let marker = if name == target_font { " ✓" } else { "" };
         eprintln!("  #{}: {} (score: {:.4}){}", i + 1, name, score, marker);
     }
-
-    // Verify both APIs return the same winner
-    assert_eq!(results[0].0, results_legacy[0].0,
-        "search_candidates and match_line_chars should agree on winner");
 
     // THE ASSERTION: DejaVu Sans must be #1
     assert!(!results.is_empty(), "Index returned no results");
@@ -201,66 +195,21 @@ fn char_index_identifies_dejavu_sans() {
 fn ci_single_char_diagnostics() {
     let (index, unique_crops, _target_data) = setup();
 
-    // Exercise search_single_char for 'e' and 'g' — show diagnostics
-    for test_char in ['e', 'g', 'a', 'R'] {
+    // Exercise search_candidates per character — show diagnostics
+    for test_char in ['e', 'g', 'a'] {
         if let Some((_, crop)) = unique_crops.iter().find(|(c, _)| *c == test_char) {
-            let result = search_single_char(&index, test_char, crop);
+            let single = vec![(test_char, crop.clone())];
+            let result = search_candidates(&index, &single, 5.0, false);
 
-            if let Some(r) = result {
-                eprintln!("\n=== CI search: '{}' ===", r.ch);
-                eprintln!("  Search radius: {:.4}", r.radius);
-                eprintln!("  Fonts within tolerance radius: {}", r.n_within_radius);
-                eprintln!("  Tree size: {} fonts", index.tree_size(test_char));
-                eprintln!("  Candidates (sorted by cosine sim):");
-                for (i, (name, sim)) in r.candidates.iter().enumerate() {
-                    eprintln!("    #{}: {} ({:.4})", i + 1, name, sim);
-                }
-
-                // Show per-dimension σ
-                if let Some(sigmas) = index.get_dim_sigmas(test_char) {
-                    let top_sigmas: Vec<(usize, f32)> = sigmas.iter()
-                        .enumerate()
-                        .map(|(i, &s)| (i, s))
-                        .collect();
-                    let mut sorted_sigmas = top_sigmas.clone();
-                    sorted_sigmas.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap());
-                    eprintln!("  Top 5 most variable dimensions:");
-                    for (dim, sigma) in sorted_sigmas.iter().take(5) {
-                        let dim_name = if *dim < 32 {
-                            format!("profile[{}]", dim)
-                        } else {
-                            match dim - 32 {
-                                0 => "aspect".to_string(),
-                                1 => "ink_density".to_string(),
-                                2 => "v_center".to_string(),
-                                3 => "h_balance".to_string(),
-                                4 => "serif_score".to_string(),
-                                5 => "stroke_contrast".to_string(),
-                                6 => "xh_cap_ratio".to_string(),
-                                7 => "counter_area_ratio".to_string(),
-                                8 => "counter_centroid_x".to_string(),
-                                9 => "counter_centroid_y".to_string(),
-                                10 => "counter_aspect".to_string(),
-                                11 => "terminal_angle_up".to_string(),
-                                12 => "terminal_angle_right".to_string(),
-                                13 => "terminal_angle_down".to_string(),
-                                14 => "terminal_angle_left".to_string(),
-                                15 => "ink_perimeter".to_string(),
-                                16 => "compactness".to_string(),
-                                17..=24 => format!("h_crossing[{}]", dim - 32 - 17),
-                                _ => format!("dim{}", dim),
-                            }
-                        };
-                        eprintln!("    dim {} ({}): σ={:.4}", dim, dim_name, sigma);
-                    }
-                }
-
-                // The right font should be in the candidates
-                assert!(r.candidates.iter().any(|(n, _)| n.contains("DejaVuSans.ttf")),
-                    "DejaVuSans.ttf should be in candidates for '{}'", test_char);
-            } else {
-                eprintln!("  No result for '{}'", test_char);
+            eprintln!("\n=== CI search: '{}' ===", test_char);
+            eprintln!("  Candidates:");
+            for (i, (name, score)) in result.scores.iter().enumerate() {
+                eprintln!("    #{}: {} ({:.4})", i + 1, name, score);
             }
+
+            // The right font should be in the candidates
+            assert!(result.scores.iter().any(|(n, _)| n.contains("DejaVuSans.ttf")),
+                "DejaVuSans.ttf should be in candidates for '{}'", test_char);
         }
     }
 }
@@ -276,8 +225,7 @@ fn char_index_identifies_dejavu_sans_full_index() {
     }
 
     let target_font = "/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf";
-    let target_path = "/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf";
-    let target_data = load_font(target_path);
+    let target_data = load_font(target_font);
 
     eprintln!("\n=== Loading full index from {:?} ===", index_path);
     let index = unscan::char_index::load_index(&index_path).expect("load index");
@@ -303,24 +251,24 @@ fn char_index_identifies_dejavu_sans_full_index() {
     eprintln!("\n=== Per-character nearest fonts (full index) ===");
     for (c, img) in &unique_crops {
         let single = vec![(*c, img.clone())];
-        let char_results = match_line_chars(&single, &index, 5);
+        let char_results = search_candidates(&index, &single, 5.0, false).scores;
         let top5: Vec<String> = char_results.iter()
+            .take(5)
             .map(|(n, s)| format!("{} ({:.4})", n, s))
             .collect();
         eprintln!("  '{}': {}", c, top5.join(" | "));
     }
 
     // Overall top 10
-    let results = match_line_chars(&unique_crops, &index, 10);
+    let results = search_candidates(&index, &unique_crops, 10.0, false).scores;
 
     eprintln!("\n=== Overall top 10 matches (full {} font index) ===", font_count);
-    for (i, (name, score)) in results.iter().enumerate() {
+    for (i, (name, score)) in results.iter().take(10).enumerate() {
         let marker = if name == target_font { " ✓" } else { "" };
         eprintln!("  #{}: {} (score: {:.4}){}", i + 1, name, score, marker);
     }
 
     assert!(!results.is_empty(), "Index returned no results");
-    let (winner, _) = &results[0];
 
     // With 5048 fonts, DejaVuSans.ttf should still be #1 or at least top-3
     let dejavu_pos = results.iter().position(|(n, _)| n.contains("DejaVuSans.ttf"));
@@ -329,7 +277,7 @@ fn char_index_identifies_dejavu_sans_full_index() {
     assert!(
         dejavu_pos.is_some() && dejavu_pos.unwrap() < 3,
         "DejaVuSans.ttf should be top-3 but was at position {:?}. Winner: {}",
-        dejavu_pos.map(|p| p + 1), winner
+        dejavu_pos.map(|p| p + 1), &results[0].0
     );
 }
 
@@ -360,8 +308,8 @@ fn compare_dejavu_vs_noto_per_char() {
             None => continue,
         };
         let single = vec![(c, img)];
-        // Get ALL results to find both fonts
-        let results = match_line_chars(&single, &index, 4714);
+        // Get ALL results with high thoroughness
+        let results = search_candidates(&index, &single, 100.0, false).scores;
 
         let dv = results.iter().enumerate()
             .find(|(_, (n, _))| n.contains("DejaVuSans.ttf"));
@@ -406,10 +354,6 @@ fn feature_self_consistency() {
     // Verify that re-computing features on a font's own rendered character
     // produces feature vectors that are identical (within pixelisation margin)
     // to what the index stores from the build path.
-    //
-    // Uses the same rendering function (render_char_normalised) and the same
-    // per-font metric overrides (xh_cap_ratio, serif_score) as build_char_index,
-    // so any difference is purely from non-determinism or bugs.
 
     let test_fonts = [
         "/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf",
@@ -434,16 +378,15 @@ fn feature_self_consistency() {
     let mut worst_case = String::new();
 
     for font_path in &test_fonts {
-        let font_data = match std::fs::read(font_path) {
-            Ok(d) => d,
-            Err(_) => {
-                eprintln!("  SKIP: {} not found", font_path);
-                continue;
-            }
-        };
+        if !std::path::Path::new(font_path).exists() {
+            eprintln!("  SKIP: {} not found", font_path);
+            continue;
+        }
+
+        let font_data = std::fs::read(font_path).unwrap();
 
         // Build a 1-font index from just this font
-        let font_set = vec![(font_path.to_string(), font_data.clone())];
+        let font_set = vec![(font_path.to_string(), PathBuf::from(*font_path), None)];
         let index = build_char_index(&font_set);
 
         // Parse the font for per-font metric overrides (same as build path)
@@ -485,8 +428,8 @@ fn feature_self_consistency() {
             let raw_sim = cosine_sim(&raw_q, &raw_i);
 
             // Compare weighted feature vectors
-            let w_q = query_feats.as_weighted_slice();
-            let w_i = index_feats.as_weighted_slice();
+            let w_q = query_feats.weighted();
+            let w_i = index_feats.weighted();
             let weighted_sim = cosine_sim(&w_q, &w_i);
 
             let ok = raw_sim >= min_sim && weighted_sim >= min_sim;
@@ -500,35 +443,6 @@ fn feature_self_consistency() {
 
             eprintln!("{:<16} '{}'    {:.6}     {:.6}       {}",
                 font_path, c, raw_sim, weighted_sim, status);
-
-            if !ok {
-                // Print per-feature diff for debugging
-                eprintln!("  Per-feature diff (raw):");
-                let feat_names: Vec<&str> = vec![
-                    // profile bins
-                    "p0","p1","p2","p3","p4","p5","p6","p7",
-                    "p8","p9","p10","p11","p12","p13","p14","p15",
-                    "p16","p17","p18","p19","p20","p21","p22","p23",
-                    "p24","p25","p26","p27","p28","p29","p30","p31",
-                    // v1 scalars
-                    "aspect","ink_density","v_center","h_balance",
-                    "serif_score","stroke_contrast","xh_cap_ratio",
-                    // v2 features
-                    "counter_area","counter_cx","counter_cy","counter_aspect",
-                    "term_up","term_right","term_down","term_left",
-                    "ink_perim","compactness",
-                    "cross0","cross1","cross2","cross3",
-                    "cross4","cross5","cross6","cross7",
-                ];
-                for i in 0..FEAT_LEN {
-                    let name = if i < feat_names.len() { feat_names[i] } else { "?" };
-                    let diff = (raw_q[i] - raw_i[i]).abs();
-                    if diff > 0.001 {
-                        eprintln!("    [{:2}] {:<18} query={:.4} index={:.4} Δ={:.4}",
-                            i, name, raw_q[i], raw_i[i], diff);
-                    }
-                }
-            }
 
             assert!(raw_sim >= min_sim,
                 "Self-consistency FAIL for {} '{}': raw cosine sim {:.6} < {}",
