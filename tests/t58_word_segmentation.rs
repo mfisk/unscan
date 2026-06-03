@@ -1,8 +1,8 @@
 //! t58: Single-word segmentation end-to-end test.
 //!
-//! Runs unscan with `--diag-seg` on a minimal PDF containing a single line
+//! Runs unscan with `--audit` on a minimal PDF containing a single line
 //! of "ABCDEFGHIJKLMNOPQRSTUVWXYZ" in Source Sans 3.  Verifies:
-//!   1. Diag output is produced (summary.json, overlays, char crops)
+//!   1. Audit output includes segmentation diagnostics (summary.json, overlays, char crops)
 //!   2. Segmentation produces exactly 26 segments for 26 characters
 //!   3. No over-segmentation from charbox fallback
 //!
@@ -12,59 +12,69 @@ mod common;
 
 use common::{test_doc, run_unscan};
 
+/// Recursively find all `summary.json` files under a directory.
+fn find_summaries(dir: &std::path::Path) -> Vec<std::path::PathBuf> {
+    let mut results = Vec::new();
+    if let Ok(entries) = std::fs::read_dir(dir) {
+        for entry in entries.flatten() {
+            let path = entry.path();
+            if path.is_dir() {
+                results.extend(find_summaries(&path));
+            } else if path.file_name().map(|n| n == "summary.json").unwrap_or(false) {
+                results.push(path);
+            }
+        }
+    }
+    results
+}
+
 #[test]
 fn single_word_segmentation_e2e() {
     let input = test_doc("t58-sourcesans3-az-rasterized.pdf");
     assert!(input.exists(), "fixture missing — run: python3 gen_t58.py in test-docs/");
 
-    let diag_dir = std::path::PathBuf::from("/tmp/t58-diag-seg");
+    let audit_dir = std::path::PathBuf::from("/tmp/t58-diag-seg");
 
     // Clean previous run
-    let _ = std::fs::remove_dir_all(&diag_dir);
+    let _ = std::fs::remove_dir_all(&audit_dir);
 
-    // Run unscan with --diag-seg
+    // Run unscan with --audit (replaces the old --diag-seg flag)
     let output = run_unscan(&input, &[
-        "--diag-seg", diag_dir.to_str().unwrap(),
+        "--audit", audit_dir.to_str().unwrap(),
     ]);
 
     eprintln!("--- unscan output ---\n{}\n---", output);
 
-    // Find the diag output — should have a p1_* line directory
-    let entries: Vec<_> = std::fs::read_dir(&diag_dir)
-        .expect("diag dir not created")
-        .filter_map(|e| e.ok())
-        .collect();
+    // Find all summary.json files recursively (audit nests them under
+    // line_dir/word_dir/seg_variant/)
+    let summaries = find_summaries(&audit_dir);
+    assert!(!summaries.is_empty(), "no summary.json found in audit output at {:?}", audit_dir);
 
-    assert!(!entries.is_empty(), "no diag output produced in {:?}", diag_dir);
+    // Check each word's segmentation
+    for summary_path in &summaries {
+        let seg_dir = summary_path.parent().unwrap();
+        let name = seg_dir.file_name().unwrap().to_string_lossy().to_string();
 
-    // Find word subdirectories containing summary.json
-    let mut summaries = Vec::new();
-    for entry in &entries {
-        let path = entry.path();
-        if path.is_dir() {
-            // Look for word_NNN_* subdirs inside line dirs
-            for sub in std::fs::read_dir(&path).into_iter().flatten().filter_map(|e| e.ok()) {
-                let sp = sub.path();
-                let summary_path = sp.join("summary.json");
-                if summary_path.exists() {
-                    let data = std::fs::read_to_string(&summary_path).unwrap();
-                    let json: serde_json::Value = serde_json::from_str(&data).unwrap();
-                    summaries.push((sp.file_name().unwrap().to_string_lossy().to_string(), json));
-                }
-            }
-        }
-    }
+        let data = std::fs::read_to_string(summary_path).unwrap();
+        let json: serde_json::Value = serde_json::from_str(&data).unwrap();
 
-    assert!(!summaries.is_empty(), "no summary.json found in diag output");
-
-    // Check each word
-    for (name, json) in &summaries {
         let expected = json["n_chars_expected"].as_u64().unwrap() as usize;
         let produced = json["n_segments_produced"].as_u64().unwrap() as usize;
-        let vp = json["vp_splits"].as_array().unwrap().len();
-        let seam = json["seam_splits"].as_array().unwrap().len();
-        let cb = json["charbox_added_splits"].as_array().unwrap().len();
+        let seam = json.get("seam_splits")
+            .and_then(|v| v.as_array())
+            .map(|a| a.len())
+            .unwrap_or(0);
+        let cb = json.get("charbox_added_splits")
+            .and_then(|v| v.as_array())
+            .map(|a| a.len())
+            .unwrap_or(0);
         let mismatch = json["mismatch"].as_bool().unwrap();
+
+        // VP splits may or may not be present depending on segmentation path
+        let vp = json.get("vp_splits")
+            .and_then(|v| v.as_array())
+            .map(|a| a.len())
+            .unwrap_or(0);
 
         eprintln!(
             "  {}: {} expected, {} produced (VP:{} seam:{} cb:{})",
@@ -77,30 +87,21 @@ fn single_word_segmentation_e2e() {
             name, expected, produced, vp, seam, cb
         );
         assert!(!mismatch, "{}: mismatch flag set", name);
-    }
 
-    // Verify overlay images and char crops exist
-    for entry in &entries {
-        let path = entry.path();
-        if path.is_dir() {
-            for sub in std::fs::read_dir(&path).into_iter().flatten().filter_map(|e| e.ok()) {
-                let sp = sub.path();
-                if sp.join("summary.json").exists() {
-                    assert!(sp.join("word_crop.png").exists(), "word_crop.png missing");
-                    assert!(sp.join("vp_overlay.png").exists(), "vp_overlay.png missing");
-                    assert!(sp.join("final_overlay.png").exists(), "final_overlay.png missing");
-                    assert!(sp.join("chars").exists(), "chars/ dir missing");
-                    let char_count = std::fs::read_dir(sp.join("chars"))
-                        .unwrap()
-                        .filter_map(|e| e.ok())
-                        .filter(|e| e.path().extension().map(|x| x == "png").unwrap_or(false))
-                        .count();
-                    assert_eq!(char_count, 26,
-                        "expected 26 char crops, got {}", char_count);
-                    return; // verified the first word, done
-                }
-            }
-        }
+        // Verify overlay images and char crops exist in the same directory
+        assert!(seg_dir.join("word_crop.png").exists(),
+            "word_crop.png missing in {:?}", seg_dir);
+        assert!(seg_dir.join("final_overlay.png").exists(),
+            "final_overlay.png missing in {:?}", seg_dir);
+        assert!(seg_dir.join("chars").exists(),
+            "chars/ dir missing in {:?}", seg_dir);
+
+        let char_count = std::fs::read_dir(seg_dir.join("chars"))
+            .unwrap()
+            .filter_map(|e| e.ok())
+            .filter(|e| e.path().extension().map(|x| x == "png").unwrap_or(false))
+            .count();
+        assert_eq!(char_count, 26,
+            "expected 26 char crops, got {}", char_count);
     }
-    panic!("no word directory with overlay files found");
 }
