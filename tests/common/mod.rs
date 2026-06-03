@@ -41,20 +41,7 @@ pub fn ensure_index() {
 
 /// Locate the built `unscan` binary (release or debug).
 pub fn unscan_bin() -> PathBuf {
-    let manifest = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
-    let release = manifest.join("target/release/unscan");
-    if release.exists() {
-        return release;
-    }
-    let debug = manifest.join("target/debug/unscan");
-    if debug.exists() {
-        return debug;
-    }
-    panic!(
-        "unscan binary not found. Run `cargo build --release` first.\n\
-         Checked: {:?} and {:?}",
-        release, debug
-    );
+    PathBuf::from(env!("CARGO_BIN_EXE_unscan"))
 }
 
 /// Path into the test-docs directory.
