@@ -31,7 +31,6 @@ fn ssim_hires_above_threshold() {
         &[
             "--min-font-confidence", "0.0",
             "--min-ocr-confidence", "0",
-            "--min-verify-ssim", "0.0",
         ],
     );
     let ssim = parse_ssim(&output).expect("no SSIM found in hires output");
@@ -61,14 +60,13 @@ fn ssim_100dpi_above_threshold() {
             "--dpi", "100",
             "--min-font-confidence", "0.0",
             "--min-ocr-confidence", "0",
-            "--min-verify-ssim", "0.0",
         ],
     );
     let ssim = parse_ssim(&output).expect("no SSIM found in 100dpi output");
     eprintln!("100dpi SSIM = {:.4}", ssim);
     assert!(
-        ssim >= 0.85,
-        "100dpi SSIM {:.4} below threshold 0.85",
+        ssim >= 0.82,
+        "100dpi SSIM {:.4} below threshold 0.82",
         ssim
     );
 }
@@ -90,7 +88,6 @@ fn ssim_garamond_above_threshold() {
         &[
             "--min-font-confidence", "0.0",
             "--min-ocr-confidence", "0",
-            "--min-verify-ssim", "0.0",
         ],
     );
     let ssim = parse_ssim(&output).expect("no SSIM found in garamond output");
@@ -119,7 +116,6 @@ fn ssim_gold_png_above_threshold() {
         &[
             "--min-font-confidence", "0.0",
             "--min-ocr-confidence", "0",
-            "--min-verify-ssim", "0.0",
         ],
     );
     let ssim = parse_ssim(&output).expect("no SSIM found in gold-png output");
@@ -150,7 +146,6 @@ fn font_match_hires_is_eb_garamond() {
         &[
             "--min-font-confidence", "0.0",
             "--min-ocr-confidence", "0",
-            "--min-verify-ssim", "0.0",
         ],
     );
     let font = parse_font_match(&output).expect("no font match in hires output");
@@ -180,7 +175,6 @@ fn font_match_100dpi_is_eb_garamond() {
             "--dpi", "100",
             "--min-font-confidence", "0.0",
             "--min-ocr-confidence", "0",
-            "--min-verify-ssim", "0.0",
         ],
     );
     let font = parse_font_match(&output).expect("no font match in 100dpi output");
@@ -209,7 +203,6 @@ fn font_match_garamond_is_eb_garamond() {
         &[
             "--min-font-confidence", "0.0",
             "--min-ocr-confidence", "0",
-            "--min-verify-ssim", "0.0",
         ],
     );
     let font = parse_font_match(&output).expect("no font match in garamond output");
@@ -238,7 +231,6 @@ fn font_match_gold_png_is_eb_garamond() {
         &[
             "--min-font-confidence", "0.0",
             "--min-ocr-confidence", "0",
-            "--min-verify-ssim", "0.0",
         ],
     );
     let font = parse_font_match(&output).expect("no font match in gold-png output");

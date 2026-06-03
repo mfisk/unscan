@@ -27,7 +27,6 @@ fn bodoni_sentence_identifies_libre_bodoni() {
         &[
             "--min-font-confidence", "0.0",
             "--min-ocr-confidence", "0",
-            "--min-verify-ssim", "0.0",
         ],
     );
     eprintln!("Output:\n{}", output);
@@ -56,7 +55,6 @@ fn bodoni_sentence_vectorizes_one_line() {
         &[
             "--min-font-confidence", "0.0",
             "--min-ocr-confidence", "0",
-            "--min-verify-ssim", "0.0",
         ],
     );
 
@@ -84,7 +82,6 @@ fn bodoni_sentence_ssim_above_threshold() {
         &[
             "--min-font-confidence", "0.0",
             "--min-ocr-confidence", "0",
-            "--min-verify-ssim", "0.0",
         ],
     );
 
