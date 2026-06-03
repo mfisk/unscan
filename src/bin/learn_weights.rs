@@ -182,25 +182,17 @@ fn main() {
         eprintln!("  CSV written ({} rows)", all_results.len());
     }
 
-    // ── 3. Dedup per (char, dpi): collapse identical feature vectors ─
-    // OT variants that render identical glyphs produce identical features.
-    eprintln!("Deduplicating...");
-    let mut deduped_count = 0usize;
-    let mut total_count = all_results.len();
+    // ── 3. Collect per-character feature vectors across all DPIs ──────
+    eprintln!("Collecting feature vectors...");
 
-    // Group by (char, dpi) for dedup
+    // Group by (char, dpi)
     let mut by_char_dpi: HashMap<(char, u32), Vec<&RenderResult>> = HashMap::new();
     for r in &all_results {
         by_char_dpi.entry((r.ch, r.dpi)).or_default().push(r);
     }
 
-    // For signal computation: group by char (across all DPIs), deduped
-    // For noise computation: group by (font_name, char), need all DPIs
-    // Keep: unique feature vectors per (char, dpi) for signal
-    //        all (font, char) across DPIs for noise
-
     // ── 4. Compute signal: between-font variance per feature ────────
-    // For each character, pool unique feature vectors across all DPIs,
+    // For each character, pool all feature vectors across all DPIs,
     // compute variance across fonts.
     eprintln!("Computing between-font variance (signal)...");
     let unique_chars: Vec<char> = {
@@ -212,33 +204,22 @@ fn main() {
     let mut signal = [0.0f64; FEAT_LEN];
     let mut signal_n = 0usize;
     for &ch in &unique_chars {
-        // Collect all unique feature vectors for this char across all DPIs
-        let mut seen: HashSet<[u32; FEAT_LEN]> = HashSet::new();
-        let mut unique_feats: Vec<[f32; FEAT_LEN]> = Vec::new();
+        // Collect all feature vectors for this char across all DPIs
+        let mut all_feats: Vec<[f32; FEAT_LEN]> = Vec::new();
         for &dpi in &dpis {
             if let Some(entries) = by_char_dpi.get(&(ch, dpi)) {
                 for r in entries {
-                    let key: [u32; FEAT_LEN] = {
-                        let mut k = [0u32; FEAT_LEN];
-                        for (i, &v) in r.features.iter().enumerate() {
-                            k[i] = (v * 10000.0).round().to_bits();
-                        }
-                        k
-                    };
-                    if seen.insert(key) {
-                        unique_feats.push(r.features);
-                    }
+                    all_feats.push(r.features);
                 }
             }
         }
-        deduped_count += unique_feats.len();
-        if unique_feats.len() < 10 {
+        if all_feats.len() < 10 {
             continue;
         }
         // Variance across fonts
-        let n = unique_feats.len() as f64;
+        let n = all_feats.len() as f64;
         let mut means = [0.0f64; FEAT_LEN];
-        for f in &unique_feats {
+        for f in &all_feats {
             for d in 0..FEAT_LEN {
                 means[d] += f[d] as f64;
             }
@@ -247,7 +228,7 @@ fn main() {
             means[d] /= n;
         }
         let mut var = [0.0f64; FEAT_LEN];
-        for f in &unique_feats {
+        for f in &all_feats {
             for d in 0..FEAT_LEN {
                 let diff = f[d] as f64 - means[d];
                 var[d] += diff * diff;
@@ -261,8 +242,7 @@ fn main() {
     for d in 0..FEAT_LEN {
         signal[d] /= signal_n.max(1) as f64;
     }
-    eprintln!("  {} chars with >=10 unique vectors (deduped {} → {})",
-        signal_n, total_count, deduped_count);
+    eprintln!("  {} chars with >=10 vectors", signal_n);
 
     // ── 5. Compute noise: within-font across-DPI variance ───────────
     // For each (font, char), compute variance of features across DPIs.
