@@ -532,6 +532,7 @@ fn run(args: &cli::Args) -> Result<(), ScanTextError> {
                 (wr, cb, false)
             };
         let mut lines = ocr::assemble_lines(&word_regions);
+        ocr::clip_word_overlaps(&mut lines);
         let ocr_elapsed = ocr_start.elapsed();
         info!(
             "  OCR: {} words → {} lines ({:.1}s{})",
@@ -571,7 +572,32 @@ fn run(args: &cli::Args) -> Result<(), ScanTextError> {
             diag_seg_dir: Option<std::path::PathBuf>,
             /// Per-char distances to the chosen font, keyed by crop_index.
             chosen_char_dists: std::collections::HashMap<usize, f32>,
+            /// Per-char distances to all fontmap fonts, keyed by crop_index.
+            fontmap_char_dists: std::collections::HashMap<usize, Vec<(String, f32)>>,
         }
+
+        // Pre-load fontmap font_keys once for per-char ground truth distances.
+        let fontmap_keys: Vec<String> = if args.audit.is_some() && args.include_fontmap.is_some() {
+            if let Some(ref fontmap_path) = args.include_fontmap {
+                if let Ok(data) = std::fs::read_to_string(fontmap_path) {
+                    if let Ok(map) = serde_json::from_str::<std::collections::HashMap<String, String>>(&data) {
+                        let mut keys = Vec::new();
+                        for font_path_str in map.values() {
+                            let fp = std::path::Path::new(font_path_str);
+                            for fe in &font_catalog {
+                                if fe.path == fp {
+                                    let key = fe.font_key();
+                                    if !keys.contains(&key) {
+                                        keys.push(key);
+                                    }
+                                }
+                            }
+                        }
+                        keys
+                    } else { Vec::new() }
+                } else { Vec::new() }
+            } else { Vec::new() }
+        } else { Vec::new() };
 
         let fontmatch_start = std::time::Instant::now();
         let line_matches: Vec<LineMatch> = lines.par_iter().enumerate().map(|(li, line)| {
@@ -833,6 +859,19 @@ fn run(args: &cli::Args) -> Result<(), ScanTextError> {
                 std::collections::HashMap::new()
             };
 
+            // Per-char distances to all fontmap fonts (ground truth coverage for audit)
+            let fontmap_char_dists: std::collections::HashMap<usize, Vec<(String, f32)>> = if !fontmap_keys.is_empty() {
+                let mut result: std::collections::HashMap<usize, Vec<(String, f32)>> = std::collections::HashMap::new();
+                for fk in &fontmap_keys {
+                    for (_, crop_idx, d2) in char_index::per_char_distances(&char_index, fk, &corrected_char_crops) {
+                        result.entry(crop_idx).or_default().push((fk.clone(), d2));
+                    }
+                }
+                result
+            } else {
+                std::collections::HashMap::new()
+            };
+
             // Dump CI reference images for the chosen font into diag-seg
             if let (Some(ref ddir), Some(ref fr)) = (&diag_seg_dir, &font_result) {
                 let refs_dir = ddir.join("refs");
@@ -865,7 +904,7 @@ fn run(args: &cli::Args) -> Result<(), ScanTextError> {
                     }
                 }
             }
-            LineMatch { font_result, text_color, ci_top_for_audit, ci_char_detail, ci_top_for_audit_lig, ci_char_detail_lig, seg_winner, diag_seg_dir, chosen_char_dists }
+            LineMatch { font_result, text_color, ci_top_for_audit, ci_char_detail, ci_top_for_audit_lig, ci_char_detail_lig, seg_winner, diag_seg_dir, chosen_char_dists, fontmap_char_dists }
         }).collect();
         let fontmatch_elapsed = fontmatch_start.elapsed();
         eprintln!("  Font matching: {:.1}s ({} lines)", fontmatch_elapsed.as_secs_f32(), lines.len());
@@ -1052,6 +1091,8 @@ fn run(args: &cli::Args) -> Result<(), ScanTextError> {
                 ci_char_votes: lm.ci_char_detail.iter()
                     .map(|d| {
                         let chosen_d2 = lm.chosen_char_dists.get(&d.crop_index).copied();
+                        let fm_dists = lm.fontmap_char_dists.get(&d.crop_index)
+                            .cloned().unwrap_or_default();
                         audit::CharCiVote {
                             ch: d.ch,
                             crop_index: d.crop_index,
@@ -1063,6 +1104,7 @@ fn run(args: &cli::Args) -> Result<(), ScanTextError> {
                             ocr_corrected_from: d.ocr_corrected_from,
                             best_alt_char: d.best_alt_char,
                             best_alt_dist: d.best_alt_dist,
+                            fontmap_dists: fm_dists,
                         }
                     })
                     .collect(),
@@ -1082,6 +1124,7 @@ fn run(args: &cli::Args) -> Result<(), ScanTextError> {
                             ocr_corrected_from: d.ocr_corrected_from,
                             best_alt_char: d.best_alt_char,
                             best_alt_dist: d.best_alt_dist,
+                            fontmap_dists: Vec::new(),
                         }
                     })
                     .collect(),

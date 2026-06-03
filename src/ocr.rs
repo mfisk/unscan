@@ -197,8 +197,42 @@ pub fn assemble_lines(words: &[TextRegion]) -> Vec<TextLine> {
     lines
 }
 
-// ---------------------------------------------------------------------------
-// Ink-extent expansion: Tesseract bboxes often clip descenders.
+/// Clip overlapping word bboxes within each line.
+///
+/// Tesseract occasionally returns word bboxes that extend into the next word's
+/// space, especially after contrast enhancement / sharpening.  When word A's
+/// right edge crosses word B's left edge, clip A's width so it stops at B's
+/// left edge (with a 1px gap).  Words must already be sorted by x within each
+/// line (assemble_lines does this).
+pub fn clip_word_overlaps(lines: &mut [TextLine]) {
+    let mut clipped = 0u32;
+    for line in lines.iter_mut() {
+        let n = line.words.len();
+        if n < 2 {
+            continue;
+        }
+        // Words are already sorted by x from assemble_lines.
+        for i in 0..n - 1 {
+            let a_right = line.words[i].x + line.words[i].width;
+            let b_left = line.words[i + 1].x;
+            if a_right > b_left {
+                let new_width = b_left.saturating_sub(line.words[i].x);
+                if new_width > 0 {
+                    debug!(
+                        "  word overlap clip: '{}' width {}→{} (was overlapping '{}')",
+                        line.words[i].text, line.words[i].width, new_width,
+                        line.words[i + 1].text,
+                    );
+                    line.words[i].width = new_width;
+                    clipped += 1;
+                }
+            }
+        }
+    }
+    if clipped > 0 {
+        info!("  Clipped {} overlapping word bbox(es)", clipped);
+    }
+}
 // Scan the actual grayscale pixels to find true ink boundaries.
 // ---------------------------------------------------------------------------
 
