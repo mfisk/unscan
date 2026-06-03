@@ -900,14 +900,7 @@ fn run(args: &cli::Args) -> Result<(), ScanTextError> {
                     if (sz - body_size).abs() <= 1 {
                         if let Some(ref fm) = lm.font_result {
                             if fm.score >= args.min_font_confidence {
-                                // Strip variant suffix "[tag]" so base and
-                                // variant contribute to the same majority count.
-                                let base_name = if let Some(idx) = fm.font_name.rfind('[') {
-                                    fm.font_name[..idx].trim_end().to_string()
-                                } else {
-                                    fm.font_name.clone()
-                                };
-                                let entry = font_freq.entry(base_name)
+                                let entry = font_freq.entry(fm.font_name.clone())
                                     .or_insert_with(|| (0, fm.font_path.clone()));
                                 entry.0 += 1;
                             }

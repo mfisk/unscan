@@ -1332,27 +1332,12 @@ impl CharIndex {
                 continue;
             }
 
-            // Build flat vec of (font_id, weighted_features), deduplicating
-            // identical weighted vectors.  OT variants that render the same glyph
-            // produce identical features; keeping them wastes memory and dilutes
-            // between-font variance.  Variants that genuinely differ are preserved.
             let mut points: Vec<(usize, [f32; FEAT_LEN])> = Vec::with_capacity(char_entries.len());
-            let mut seen: std::collections::HashSet<[u32; FEAT_LEN]> = std::collections::HashSet::new();
 
             for e in char_entries {
                 let weighted = e.features.weighted();
-                // Round to f32 bit pattern for dedup (exact match)
-                let key: [u32; FEAT_LEN] = {
-                    let mut k = [0u32; FEAT_LEN];
-                    for (i, &v) in weighted.iter().enumerate() {
-                        k[i] = v.to_bits();
-                    }
-                    k
-                };
-                if seen.insert(key) {
-                    if let Some(&font_id) = name_to_id.get(e.font_name.as_str()) {
-                        points.push((font_id, weighted));
-                    }
+                if let Some(&font_id) = name_to_id.get(e.font_name.as_str()) {
+                    points.push((font_id, weighted));
                 }
             }
 

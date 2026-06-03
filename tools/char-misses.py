@@ -700,7 +700,7 @@ def build_miss_html(entry, chars_to_show, crop_dir, crop_files,
 
     text_preview = entry["text"][:60]
     matched = entry.get("font_matched", "?")
-    rank_str = f"CI #{ci_rank}, score {ci_score:.4f}" if ci_rank else "not in CI"
+    rank_str = f"CI #{ci_rank}, score {ci_score:.10f}" if ci_rank else "not in CI"
 
     # SSIM verification info
     ssim_val = entry.get("ssim_score")
@@ -708,7 +708,7 @@ def build_miss_html(entry, chars_to_show, crop_dir, crop_files,
     if ssim_val is not None:
         ssim_cls = "ssim-pass" if ssim_pass else "ssim-fail"
         ssim_label = "pass" if ssim_pass else "FAIL"
-        ssim_html = f' <span class="{ssim_cls}">SSIM {ssim_val:.4f} ({ssim_label})</span>'
+        ssim_html = f' <span class="{ssim_cls}">SSIM {ssim_val:.10f} ({ssim_label})</span>'
     else:
         ssim_html = ""
 
@@ -721,7 +721,7 @@ def build_miss_html(entry, chars_to_show, crop_dir, crop_files,
             break
 
     correct_col_hdr = f"{correct_font_name}<br><span class='score'>{rank_str}</span>"
-    chosen_rank_str = f"CI #{chosen_rank}, score {chosen_score:.4f}" if chosen_rank and chosen_score else ""
+    chosen_rank_str = f"CI #{chosen_rank}, score {chosen_score:.10f}" if chosen_rank and chosen_score else ""
     chosen_col_hdr = f"{matched}<br><span class='score'>{chosen_rank_str}</span>"
 
     # Segmentation picture — show both plain and ligature when available
@@ -789,7 +789,7 @@ def build_miss_html(entry, chars_to_show, crop_dir, crop_files,
             render_b64 = img_to_b64(ssim_render_path)
             diff_b64 = img_to_b64(ssim_diff_path) if os.path.exists(ssim_diff_path) else None
 
-            ssim_val_str = f"{ssim_val:.4f}" if ssim_val is not None else "—"
+            ssim_val_str = f"{ssim_val:.10f}" if ssim_val is not None else "—"
             diff_row = ""
             if diff_b64:
                 diff_row = f"""<tr>
