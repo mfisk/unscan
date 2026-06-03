@@ -246,6 +246,8 @@ def lookup_actual_font(page_spans, page, bbox_px, text=None):
 
 def find_font_file(font_name):
     """Resolve a font name to a .ttf/.otf path on disk."""
+    if not font_name:
+        return None
     # Strip OT variant suffix [smcp], [lnum], etc. before matching filenames
     n = font_name
     if "[" in n:
@@ -699,7 +701,7 @@ def build_miss_html(entry, chars_to_show, crop_dir, crop_files,
 </tr>""")
 
     text_preview = entry["text"][:60]
-    matched = entry.get("font_matched", "?")
+    matched = entry.get("font_matched") or "?"
     rank_str = f"CI #{ci_rank}, score {ci_score:.10f}" if ci_rank else "not in CI"
 
     # SSIM verification info
@@ -979,7 +981,7 @@ def main():
             if cv.get("ocr_corrected_from"):
                 corrected_chars += 1
 
-        matched = e.get("font_matched", "")
+        matched = e.get("font_matched") or ""
         bbox = e.get("bbox")
         if not bbox:
             skipped += 1
@@ -1052,7 +1054,7 @@ def main():
         correct_font_name = actual_font
 
         # Chosen (wrong) font
-        matched = entry.get("font_matched", "")
+        matched = entry.get("font_matched") or ""
         chosen_font_path = None
         if font_map:
             chosen_font_path = resolve_font_from_map(matched, font_map)
@@ -1084,7 +1086,7 @@ def main():
             correct_font_path = find_font_file(actual_font)
         correct_font_name = actual_font
 
-        matched = entry.get("font_matched", "")
+        matched = entry.get("font_matched") or ""
         chosen_font_path = None
         if font_map:
             chosen_font_path = resolve_font_from_map(matched, font_map)
