@@ -67,6 +67,10 @@ pub struct CharCiVote {
     /// Distance of the best alternative character.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub best_alt_dist: Option<f32>,
+    /// Per-char squared distances to each fontmap font (ground truth coverage).
+    /// Only populated when --include-fontmap is provided and --audit is active.
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub fontmap_dists: Vec<(String, f32)>,
 }
 
 #[derive(Debug, Serialize, Clone)]

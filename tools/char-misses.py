@@ -634,13 +634,22 @@ def build_miss_html(entry, chars_to_show, crop_dir, crop_files,
 
         ref_img = render_char(ch, correct_font_path, NORM_H) if correct_font_path else None
 
-        # Find the CI distance for this character against the correct font
+        # Find the CI distance for this character against the correct font.
+        # Prefer fontmap_dists (computed for all fontmap fonts, always present
+        # when --include-fontmap is used), fall back to nearest (top 3 only).
         correct_char_dist = None
         if correct_font_path:
-            for nf, nd in cv.get("nearest", []):
-                if fonts_match(nf, correct_font_name):
-                    correct_char_dist = nd
+            # First: check fontmap_dists by exact path match
+            for fk, fd in cv.get("fontmap_dists", []):
+                if fk == correct_font_path or fonts_match_broad(fk, correct_font_name):
+                    correct_char_dist = fd
                     break
+            # Fallback: check nearest (top 3 from global search)
+            if correct_char_dist is None:
+                for nf, nd in cv.get("nearest", []):
+                    if fonts_match(nf, correct_font_name):
+                        correct_char_dist = nd
+                        break
 
         # Use actual CI reference image from diag-seg if available (exact data
         # the character index compared against), fall back to PIL re-render.
@@ -856,7 +865,8 @@ body {
   max-width: 800px;
 }
 h2 { font-size: 16px; margin-bottom: 12px; color: #111; }
-.summary { color: #555; font-size: 12px; margin-bottom: 16px; }
+.summary { color: #555; font-size: 12px; margin-bottom: 8px; }
+.score-legend { color: #666; font-size: 11px; margin-bottom: 16px; line-height: 1.6; }
 .miss { margin-bottom: 28px; }
 .miss h3 { font-size: 13px; margin-bottom: 6px; color: #111; }
 table { border-collapse: collapse; width: 100%; margin-bottom: 8px; }
@@ -1028,6 +1038,12 @@ def main():
 {CSS}
 <h2>unscan Miss Report</h2>
 <div class="summary">{hits}/{hits + len(misses)} correct (100.0%) — no misses 🎉{ssim_fail_str_early}{ocr_corr_str}</div>
+<div class="score-legend">
+<b>Score key:</b>
+<b>CI score</b> (per-line) = −mean(log(dist²)) across characters; <b>higher = better match</b>.
+<b>CI dist²</b> (per-character) = squared Euclidean distance in normalized feature space between scan crop and rendered glyph; <b>lower = better</b> (good: &lt;1e-4, suspect: &gt;1e-3).
+<b>SSIM</b> (per-line) = structural similarity between scanned line and re-render; <b>0–1, higher = more similar</b>.
+</div>
 </body>
 </html>"""
         with open(args.output, "w") as f:
@@ -1120,6 +1136,12 @@ def main():
 {CSS}
 <h2>unscan Miss Report</h2>
 <div class="summary">{hits}/{compared} correct ({pct:.1f}%) — {len(misses)} misses shown below{unmatched_html}{ssim_fail_str}{ocr_corr_str}</div>
+<div class="score-legend">
+<b>Score key:</b>
+<b>CI score</b> (per-line) = −mean(log(dist²)) across characters; <b>higher = better match</b>.
+<b>CI dist²</b> (per-character) = squared Euclidean distance in normalized feature space between scan crop and rendered glyph; <b>lower = better</b> (good: &lt;1e-4, suspect: &gt;1e-3).
+<b>SSIM</b> (per-line) = structural similarity between scanned line and re-render; <b>0–1, higher = more similar</b>.
+</div>
 {"".join(miss_blocks)}
 {ssim_section}
 </body>
