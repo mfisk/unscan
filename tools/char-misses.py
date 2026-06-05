@@ -41,6 +41,266 @@ except ImportError:
 NORM_H = 48
 SCALE = 300.0 / 72.0  # pixels per PDF point (300 DPI)
 
+# Cache for raster PDF page images (page_num → PIL Image)
+_raster_page_cache = {}
+_raster_doc = None
+
+
+def get_raster_page_image(raster_pdf_path, page_num):
+    """Render a page from the raster PDF as a PIL Image, cached."""
+    global _raster_doc
+    if raster_pdf_path is None:
+        return None
+    if _raster_doc is None:
+        if not os.path.exists(raster_pdf_path):
+            return None
+        _raster_doc = fitz.open(raster_pdf_path)
+    if page_num not in _raster_page_cache:
+        if page_num < 1 or page_num > len(_raster_doc):
+            return None
+        page = _raster_doc[page_num - 1]
+        # Render at 300 DPI (same as unscan's rasterization)
+        mat = fitz.Matrix(300.0 / 72.0, 300.0 / 72.0)
+        pix = page.get_pixmap(matrix=mat)
+        img = Image.frombytes("RGB", [pix.width, pix.height], pix.samples)
+        _raster_page_cache[page_num] = img
+    return _raster_page_cache[page_num]
+
+
+def render_scan_line_with_word_boxes(raster_pdf_path, entry, diag_seg_root=None):
+    """Crop the scanned line from the raster PDF and overlay word bounding boxes
+    and character segmentation paths.
+
+    The image is upscaled for crisp labels.  Draws:
+    - Raw Tesseract word bboxes as dotted orange outlines
+    - Final post-processed word bboxes as dashed cyan outlines
+    - VP splits as thin blue vertical lines with column labels
+    - Seam paths as magenta diagonal paths with column labels
+    - A pixel-scale ruler at the top of each word box
+
+    Returns a base64 data URI string for the image, or None if unavailable.
+    """
+    bbox = entry.get("bbox")
+    word_bboxes = entry.get("word_bboxes", [])
+    word_bboxes_raw = entry.get("word_bboxes_raw", [])
+    if not bbox:
+        return None
+
+    page_img = get_raster_page_image(raster_pdf_path, entry["page"])
+    if page_img is None:
+        return None
+
+    # Line bbox with padding for context (extra bottom for column labels)
+    # Use the union of word bboxes for vertical extent when available —
+    # the line-level bbox from Tesseract can be overly tall and include
+    # adjacent lines.
+    pad = 8
+    pad_bottom = 20
+    lx = max(0, bbox["x"] - pad)
+    lr = min(page_img.width, bbox["x"] + bbox["width"] + pad)
+
+    all_word_boxes = list(word_bboxes) + list(word_bboxes_raw)
+    if all_word_boxes:
+        wy_top = min(wb["y"] for wb in all_word_boxes)
+        wy_bot = max(wb["y"] + wb["height"] for wb in all_word_boxes)
+        ly = max(0, wy_top - pad)
+        lb = min(page_img.height, wy_bot + pad_bottom)
+    else:
+        ly = max(0, bbox["y"] - pad)
+        lb = min(page_img.height, bbox["y"] + bbox["height"] + pad_bottom)
+
+    crop = page_img.crop((lx, ly, lr, lb)).convert("RGBA")
+    cw, ch = crop.size
+
+    # Upscale for crisp labels — 3× gives readable text at small font sizes
+    SCALE = 3
+    big = crop.resize((cw * SCALE, ch * SCALE), Image.NEAREST)
+
+    # Add margin at top for the ruler and bottom for column labels
+    margin_top = 18 * SCALE
+    margin_bot = 14 * SCALE
+    canvas = Image.new("RGBA", (big.width, big.height + margin_top + margin_bot), (255, 255, 255, 0))
+    canvas.paste(big, (0, margin_top))
+
+    overlay = Image.new("RGBA", canvas.size, (0, 0, 0, 0))
+    draw = ImageDraw.Draw(overlay)
+
+    try:
+        label_font = ImageFont.load_default(size=10)
+    except TypeError:
+        label_font = ImageFont.load_default()
+    try:
+        ruler_font = ImageFont.load_default(size=9)
+    except TypeError:
+        ruler_font = ImageFont.load_default()
+
+    # Raw Tesseract boxes — dotted orange
+    raw_color = (255, 160, 0, 200)
+    for wb in word_bboxes_raw:
+        wx = (wb["x"] - lx) * SCALE
+        wy = (wb["y"] - ly) * SCALE + margin_top
+        wr = wx + wb["width"] * SCALE
+        wbot = wy + wb["height"] * SCALE
+        _draw_patterned_rect(draw, wx, wy, wr, wbot, raw_color, dash=2, gap=4, width=1)
+
+    # Final post-processed boxes — dashed cyan
+    final_color = (0, 200, 220, 220)
+    for wb in word_bboxes:
+        wx = (wb["x"] - lx) * SCALE
+        wy = (wb["y"] - ly) * SCALE + margin_top
+        wr = wx + wb["width"] * SCALE
+        wbot = wy + wb["height"] * SCALE
+        _draw_patterned_rect(draw, wx, wy, wr, wbot, final_color, dash=6, gap=3, width=1)
+
+    # Draw pixel-scale ruler at top of each final word box
+    for wb in word_bboxes:
+        wx = (wb["x"] - lx) * SCALE
+        wy = (wb["y"] - ly) * SCALE + margin_top
+        wb_w = wb["width"]
+
+        # Column numbers every 10, ticks every 5
+        for col in range(0, wb_w + 1, 5):
+            sx = wx + col * SCALE + SCALE // 2
+            if col % 10 == 0:
+                draw.line([(sx, wy - 6), (sx, wy)], fill=(140, 140, 140, 180), width=1)
+                draw.text((sx - 8, wy - 18), str(col), fill=(120, 120, 120, 200),
+                          font=ruler_font)
+            else:
+                draw.line([(sx, wy - 3), (sx, wy)], fill=(180, 180, 180, 140), width=1)
+
+    # Load segmentation data from diag-seg and draw splits inside word boxes
+    if diag_seg_root:
+        diag_line_dir = find_diag_seg_dir(
+            diag_seg_root, entry["page"], entry.get("text", ""),
+            line_index=entry.get("line_index"))
+        if diag_line_dir and os.path.isdir(diag_line_dir):
+            _draw_seg_paths_on_scan(draw, diag_line_dir, word_bboxes, lx, ly,
+                                    SCALE, margin_top, label_font)
+
+    result = Image.alpha_composite(canvas, overlay).convert("RGB")
+
+    buf = io.BytesIO()
+    result.save(buf, format="PNG")
+    data = buf.getvalue()
+    return f"data:image/png;base64,{base64.b64encode(data).decode()}"
+
+
+def _draw_patterned_rect(draw, x0, y0, x1, y1, color, dash=4, gap=3, width=1):
+    """Draw a rectangle outline with a dash/gap pattern."""
+    for side in [
+        ((x0, y0), (x1, y0)),       # top
+        ((x1, y0), (x1, y1)),       # right
+        ((x1, y1), (x0, y1)),       # bottom
+        ((x0, y1), (x0, y0)),       # left
+    ]:
+        sx, sy = side[0]
+        ex, ey = side[1]
+        dx = ex - sx
+        dy = ey - sy
+        length = max(abs(dx), abs(dy))
+        if length == 0:
+            continue
+        step = dash + gap
+        for i in range(0, length, step):
+            px0 = sx + dx * i // length
+            py0 = sy + dy * i // length
+            px1 = sx + dx * min(i + dash, length) // length
+            py1 = sy + dy * min(i + dash, length) // length
+            draw.line([(px0, py0), (px1, py1)], fill=color, width=width)
+
+
+def _draw_seg_paths_on_scan(draw, diag_line_dir, word_bboxes, crop_lx, crop_ly,
+                            scale, margin_top, label_font):
+    """Draw VP splits and seam paths from diag-seg summary.json files
+    inside the word bounding boxes on the scan line overlay.
+    Labels each split with its column number below the word box."""
+    word_dirs = sorted(
+        d for d in os.listdir(diag_line_dir)
+        if d.startswith("word_") and os.path.isdir(os.path.join(diag_line_dir, d))
+    )
+
+    for wd in word_dirs:
+        wpath = os.path.join(diag_line_dir, wd)
+        # Prefer seg_plain
+        data_path = os.path.join(wpath, "seg_plain")
+        if not os.path.isdir(data_path):
+            data_path = wpath
+        summary_path = os.path.join(data_path, "summary.json")
+        if not os.path.exists(summary_path):
+            continue
+
+        with open(summary_path) as f:
+            summary = json.load(f)
+
+        word_text = summary.get("word_text", "")
+        img_w = summary.get("image_w", 0)
+        img_h = summary.get("image_h", 0)
+        if img_w == 0 or img_h == 0:
+            continue
+
+        # Find the matching word bbox by text
+        matching_wb = None
+        for wb in word_bboxes:
+            if wb["text"] == word_text:
+                matching_wb = wb
+                break
+        if matching_wb is None:
+            continue
+
+        # Word bbox position in the scaled canvas coordinate system
+        wx = (matching_wb["x"] - crop_lx) * scale
+        wy = (matching_wb["y"] - crop_ly) * scale + margin_top
+        wb_w = matching_wb["width"] * scale
+        wb_h = matching_wb["height"] * scale
+
+        # Scale factor: seg boundaries are in word image pixels,
+        # word image was cropped at the word bbox dimensions
+        sx = (matching_wb["width"] / img_w * scale) if img_w else scale
+        sy = (matching_wb["height"] / img_h * scale) if img_h else scale
+
+        vp_splits = summary.get("vp_splits", [])
+        seam_splits = summary.get("seam_splits", [])
+        seam_paths_raw = summary.get("seam_paths", {})
+
+        label_y = wy + wb_h + 2  # just below the word box
+
+        # VP splits — blue vertical lines + column label
+        for col in vp_splits:
+            cx = wx + int(col * sx)
+            draw.line([(cx, wy), (cx, wy + wb_h)],
+                      fill=(40, 100, 220, 200), width=1)
+            draw.text((cx - 6, label_y), str(col), fill=(40, 100, 220, 240),
+                      font=label_font)
+
+        # Seam paths — magenta diagonal paths (one x per row) + column label
+        seam_paths = {}
+        if isinstance(seam_paths_raw, dict):
+            seam_paths = seam_paths_raw
+        for col_key, path in seam_paths.items():
+            for row_idx in range(len(path)):
+                px_x = wx + int(path[row_idx] * sx)
+                px_y = wy + int(row_idx * sy)
+                # Draw a small rect for visibility at scale
+                pad = max(1, scale // 3)
+                draw.rectangle(
+                    [(px_x - pad, px_y), (px_x + pad, px_y + max(1, scale - 1))],
+                    fill=(255, 0, 200, 200))
+            # Label with the nominal column
+            col_val = col_key if isinstance(col_key, int) else col_key
+            cx = wx + int(int(col_val) * sx) if str(col_val).isdigit() else wx
+            draw.text((cx - 6, label_y), str(col_val), fill=(255, 0, 200, 240),
+                      font=label_font)
+
+        # Seam splits that don't have paths — fall back to vertical lines + label
+        seam_cols_with_paths = set(seam_paths.keys()) | set(str(c) for c in seam_paths.keys())
+        for col in seam_splits:
+            if str(col) not in seam_cols_with_paths and col not in seam_paths:
+                cx = wx + int(col * sx)
+                draw.line([(cx, wy), (cx, wy + wb_h)],
+                          fill=(255, 0, 200, 180), width=1)
+                draw.text((cx - 6, label_y), str(col), fill=(255, 0, 200, 240),
+                          font=label_font)
+
 # ---------------------------------------------------------------------------
 # Font alias / clone map
 # ---------------------------------------------------------------------------
@@ -574,8 +834,7 @@ def find_crop_dir(crops_root, page, line_index, diag_seg_root=None, line_text=No
     """Find crop directory by page and line index.
 
     Checks the diag-seg line directory first (crops/ subdir created
-    automatically by --diag-seg), then falls back to the legacy
-    UNSCAN_DUMP_CROPS directory.
+    automatically by --audit).
     """
     # Try diag-seg crops/ subdir first (matched by text slug)
     if diag_seg_root and line_text:
@@ -587,7 +846,7 @@ def find_crop_dir(crops_root, page, line_index, diag_seg_root=None, line_text=No
                 if files:
                     return crop_subdir, files
 
-    # Fall back to legacy UNSCAN_DUMP_CROPS dir
+    # Fall back to legacy crops dir
     if crops_root and os.path.isdir(crops_root):
         prefix = f"p{page}_L{line_index:03d}_"
         for d in sorted(os.listdir(crops_root)):
@@ -612,7 +871,7 @@ def dist_class(d2):
 def build_miss_html(entry, chars_to_show, crop_dir, crop_files,
                     correct_font_path, correct_font_name, ci_rank, ci_score,
                     chosen_font_path, chosen_font_name,
-                    diag_seg_root=None):
+                    diag_seg_root=None, raster_pdf_path=None):
     rows = []
     for idx, cv in chars_to_show:
         ch = cv["ch"]
@@ -711,6 +970,11 @@ def build_miss_html(entry, chars_to_show, crop_dir, crop_files,
 
     text_preview = entry["text"][:60]
     matched = entry.get("font_matched") or "?"
+    # Normalize display name: when the pick is the same font family as the
+    # correct answer (just a different filename variant), show the ground-truth
+    # name for both so the report doesn't look like a mismatch.
+    if correct_font_name and matched and matched != "?" and fonts_match(matched, correct_font_name):
+        matched = correct_font_name
     rank_str = f"CI #{ci_rank}, score {ci_score:.10f}" if ci_rank else "not in CI"
 
     # SSIM verification info
@@ -735,59 +999,52 @@ def build_miss_html(entry, chars_to_show, crop_dir, crop_files,
     chosen_rank_str = f"CI #{chosen_rank}, score {chosen_score:.10f}" if chosen_rank and chosen_score else ""
     chosen_col_hdr = f"{matched}<br><span class='score'>{chosen_rank_str}</span>"
 
-    # Segmentation picture — show both plain and ligature when available
-    seg_html = ""
+    # Gather segmentation stats from diag-seg data for the scan line label
+    seg_stats_html = ""
     diag_line_dir = find_diag_seg_dir(diag_seg_root, entry["page"], entry.get("text", ""),
                                        line_index=entry.get("line_index"))
     if diag_line_dir:
-        seg_winner = entry.get("seg_winner")
-        has_lig_path = any(
-            os.path.isdir(os.path.join(diag_line_dir, d, "seg_lig"))
-            for d in os.listdir(diag_line_dir)
+        word_dirs = sorted(
+            d for d in os.listdir(diag_line_dir)
             if d.startswith("word_") and os.path.isdir(os.path.join(diag_line_dir, d))
         )
-
-        if has_lig_path:
-            # Show both paths side by side
-            seg_plain_result = render_seg_picture(diag_line_dir, seg_subdir="seg_plain")
-            seg_lig_result = render_seg_picture(diag_line_dir, seg_subdir="seg_lig")
-
-            parts = []
-            for label, result, is_winner in [
-                ("Plain", seg_plain_result, seg_winner == "plain"),
-                ("Ligature", seg_lig_result, seg_winner == "ligature"),
-            ]:
-                if result:
-                    seg_img, seg_caption = result
-                    winner_badge = ' <span style="color:#2e7d32;font-weight:bold">★ winner</span>' if is_winner else ''
-                    parts.append(f"""<div style="flex:1;min-width:0">
-<div style="font-weight:600;margin-bottom:4px">{label} segmentation{winner_badge}</div>
-<img src="{img_to_b64(seg_img)}" class="seg-img" style="max-width:100%">
-<div class="seg-caption">{seg_caption}</div>
-</div>""")
-
-            if parts:
-                seg_html = f"""<div class="seg-block">
-<div class="seg-legend">
-  <span class="leg-vp">■ VP split</span>
-  <span class="leg-seam">■ seam split</span>
-</div>
-<div style="display:flex;gap:16px;flex-wrap:wrap">
-{"".join(parts)}
-</div>
-</div>"""
-        else:
-            seg_result = render_seg_picture(diag_line_dir)
-            if seg_result:
-                seg_img, seg_caption = seg_result
-                seg_html = f"""<div class="seg-block">
-<div class="seg-legend">
-  <span class="leg-vp">■ VP split</span>
-  <span class="leg-seam">■ seam split</span>
-</div>
-<img src="{img_to_b64(seg_img)}" class="seg-img">
-<div class="seg-caption">{seg_caption}</div>
-</div>"""
+        # Build word text → x position map from the entry's word bboxes
+        # so we can sort seg stats in left-to-right reading order.
+        word_x_map = {}
+        for wb in entry.get("word_bboxes", []):
+            word_x_map[wb["text"]] = wb["x"]
+        seg_parts = []
+        for wd in word_dirs:
+            wpath = os.path.join(diag_line_dir, wd)
+            # Prefer seg_plain subdirectory, fall back to flat layout
+            if os.path.isdir(os.path.join(wpath, "seg_plain")):
+                data_path = os.path.join(wpath, "seg_plain")
+            else:
+                data_path = wpath
+            summary_path = os.path.join(data_path, "summary.json")
+            if not os.path.exists(summary_path):
+                continue
+            with open(summary_path) as f:
+                summary = json.load(f)
+            wtext = summary.get("word_text", wd)
+            n_exp = summary.get("n_chars_expected", "?")
+            n_got = summary.get("n_segments_produced", "?")
+            mismatch = summary.get("mismatch", False)
+            nvp = len(summary.get("vp_splits", []))
+            nseam = len(summary.get("seam_splits", []))
+            word_x = word_x_map.get(wtext, 999999)
+            info = f'"{wtext}" {n_got}/{n_exp}'
+            if mismatch:
+                info += " ⚠"
+            tags = []
+            if nvp: tags.append(f"{nvp} vert")
+            if nseam: tags.append(f"{nseam} seam")
+            if tags:
+                info += f" ({', '.join(tags)})"
+            seg_parts.append((word_x, info))
+        if seg_parts:
+            seg_parts.sort(key=lambda t: t[0])
+            seg_stats_html = f'Segmentation: {" | ".join(info for _, info in seg_parts)}'
 
     # SSIM comparison block: scan crop vs rendered, with diff image
     ssim_compare_html = ""
@@ -837,9 +1094,19 @@ def build_miss_html(entry, chars_to_show, crop_dir, crop_files,
 </div>"""
 
     # Show alternate (lig) CI candidates when available
+    # Scan line image with word boxes
+    scan_line_html = ""
+    scan_line_b64 = render_scan_line_with_word_boxes(raster_pdf_path, entry, diag_seg_root=diag_seg_root)
+    if scan_line_b64:
+        scan_line_html = f"""<div class="scan-line-block">
+<div class="scan-line-label">Scan line: <span style="color:#ffa000">···</span> raw box · <span style="color:#00c8dc">- -</span> final box · <span style="color:#2864dc">│</span> v-whitespace · <span style="color:#ff00c8">╲</span> seam</div>
+<img src="{scan_line_b64}" class="scan-line-img">
+{f'<div class="scan-line-label">{seg_stats_html}</div>' if seg_stats_html else ''}
+</div>"""
+
     return f"""<div class="miss">
 <h3>p{entry['page']}:L{entry['line_index']} — "{text_preview}"{ssim_html}</h3>
-{seg_html}
+{scan_line_html}
 {ssim_compare_html}
 <table>
 <tr>
@@ -901,17 +1168,6 @@ img.ci {
 .font-mini { font-size: 9px; color: #888; word-break: break-all; max-width: 100px; display: inline-block; }
 .dimmed { color: #bbb; font-size: 10px; }
 .ratio { font-size: 11px; color: #888; }
-.seg-block {
-  margin: 6px 0 10px 0; padding: 8px; background: #f9f9f9;
-  border: 1px solid #e0e0e0; border-radius: 4px;
-}
-.seg-img {
-  max-width: 100%; image-rendering: pixelated;
-  border: 1px solid #ddd; display: block; margin: 4px 0;
-}
-.seg-caption { font-size: 10px; color: #666; margin-top: 2px; }
-.seg-legend { font-size: 10px; margin-bottom: 4px; }
-.seg-legend span { margin-right: 12px; }
 .ssim-compare-block {
   margin: 8px 0 10px 0; padding: 8px; background: #f5f8ff;
   border: 1px solid #ccd; border-radius: 4px;
@@ -931,8 +1187,16 @@ img.ci {
   max-width: 100%; image-rendering: pixelated;
   border: 1px solid #ddd; display: block; margin: 2px 0;
 }
-.leg-vp { color: #dc2828; }
-.leg-seam { color: #1e64ff; }
+.scan-line-block {
+  margin: 6px 0 10px 0; padding: 8px; background: #f0f4f0;
+  border: 1px solid #c0c8c0; border-radius: 4px; overflow-x: auto;
+  width: 100vw; position: relative; left: 50%; margin-left: -50vw; box-sizing: border-box;
+}
+.scan-line-label { font-size: 10px; font-weight: 600; color: #555; margin-bottom: 4px; }
+.scan-line-img {
+  image-rendering: pixelated;
+  border: 1px solid #ddd; display: block; margin: 2px 0;
+}
 </style>"""
 
 
@@ -966,6 +1230,17 @@ def main():
 
     with open(audit_json) as f:
         audit = json.load(f)
+
+    # Get raster PDF path from audit metadata for scan line rendering
+    raster_pdf_path = audit.get("input_file")
+    if raster_pdf_path and not os.path.isabs(raster_pdf_path):
+        # Try relative to audit dir
+        candidate = os.path.join(os.path.dirname(audit_json), raster_pdf_path)
+        if os.path.exists(candidate):
+            raster_pdf_path = candidate
+    if raster_pdf_path and not os.path.exists(raster_pdf_path):
+        print(f"WARNING: raster PDF not found: {raster_pdf_path}", file=sys.stderr)
+        raster_pdf_path = None
 
     doc = fitz.open(args.vector_pdf)
     page_spans = extract_vector_spans(doc)
@@ -1082,6 +1357,7 @@ def main():
             correct_font_path, correct_font_name, gt_rank, gt_score,
             chosen_font_path, matched,
             diag_seg_root=diag_seg_root,
+            raster_pdf_path=raster_pdf_path,
         )
         miss_blocks.append(block)
 
@@ -1114,6 +1390,7 @@ def main():
             correct_font_path, correct_font_name, gt_rank, gt_score,
             chosen_font_path, matched,
             diag_seg_root=diag_seg_root,
+            raster_pdf_path=raster_pdf_path,
         )
         ssim_blocks.append(block)
 
