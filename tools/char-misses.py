@@ -513,15 +513,42 @@ def find_font_file(font_name):
     if "[" in n:
         n = n[:n.index("[")]
     fn = clean(n)
+    bf = base_family(n)  # stripped of weight/style suffixes (MT, Bold, etc.)
+    # Detect requested weight/style from the input name
+    nl = n.lower()
+    want_bold = "bold" in nl or "bd" in nl
+    want_italic = "italic" in nl or "oblique" in nl or nl.endswith("it")
+    want_black = "black" in nl and "bold" not in nl
+    candidates = []
     for fontdir in ["/usr/share/fonts/truetype", "/usr/share/fonts/opentype",
                     "/usr/share/fonts"]:
         if not os.path.isdir(fontdir):
             continue
         for root, _, files in os.walk(fontdir):
             for f in files:
-                if f.endswith((".ttf", ".otf")) and fn in clean(f):
-                    return os.path.join(root, f)
-    return None
+                if not f.endswith((".ttf", ".otf")):
+                    continue
+                cf = clean(f)
+                cf_base = base_family(f)
+                # Match on full cleaned name OR base family
+                if fn in cf or bf in cf or bf == cf_base:
+                    candidates.append(os.path.join(root, f))
+    if not candidates:
+        return None
+    # Prefer files matching the requested weight/style
+    def score(path):
+        cf = clean(os.path.basename(path))
+        cf_base = base_family(os.path.basename(path))
+        family_match = (cf_base == bf)
+        # Weight/style match
+        has_bold = "bold" in cf or "bd" in cf
+        has_italic = "italic" in cf or "oblique" in cf
+        has_black = "black" in cf
+        style_match = (has_bold == want_bold and has_italic == want_italic
+                       and has_black == want_black)
+        return (family_match, style_match)
+    candidates.sort(key=score, reverse=True)
+    return candidates[0]
 
 
 def find_font_file_by_key(font_key):
@@ -577,22 +604,68 @@ def find_correct_ci_candidate(entry, actual_font):
 
 
 # ---------------------------------------------------------------------------
-# Image rendering
+# Image rendering — ab_glyph only via unscan --render-ref-chars
 # ---------------------------------------------------------------------------
 
-def render_char(char, font_path, height=NORM_H):
-    try:
-        font = ImageFont.truetype(font_path, height)
-    except Exception:
-        return None
-    bbox = font.getbbox(char)
-    if not bbox:
-        return None
-    w = bbox[2] - bbox[0] + 4
-    h = bbox[3] - bbox[1] + 4
-    img = Image.new("L", (w, h), 255)
-    ImageDraw.Draw(img).text((-bbox[0] + 2, -bbox[1] + 2), char, font=font, fill=0)
-    return img
+import subprocess
+import tempfile
+
+# Cache: font_path -> {char -> PIL.Image}
+_unscan_ref_cache: dict[str, dict[str, "Image.Image"]] = {}
+
+def _find_unscan_binary():
+    """Find the unscan binary, preferring debug build."""
+    script_dir = Path(__file__).resolve().parent.parent
+    for candidate in [
+        script_dir / "target" / "debug" / "unscan",
+        script_dir / "target" / "release" / "unscan",
+    ]:
+        if candidate.exists() and os.access(candidate, os.X_OK):
+            return str(candidate)
+    return None
+
+def render_ref_chars_unscan(font_path: str, chars: set[str]) -> dict[str, "Image.Image"]:
+    """Render characters using unscan's ab_glyph-based render_char_normalised().
+
+    Returns a dict mapping each character to its PIL Image (grayscale, NORM_H tall).
+    Results are cached per font_path so subsequent calls are instant.
+    """
+    font_path = str(font_path)
+    if font_path not in _unscan_ref_cache:
+        _unscan_ref_cache[font_path] = {}
+
+    # Find chars we haven't rendered yet
+    needed = chars - set(_unscan_ref_cache[font_path].keys())
+    if not needed:
+        return _unscan_ref_cache[font_path]
+
+    unscan_bin = _find_unscan_binary()
+    if not unscan_bin:
+        print("WARNING: unscan binary not found, ref chars unavailable", file=sys.stderr)
+        return _unscan_ref_cache[font_path]
+
+    with tempfile.TemporaryDirectory(prefix="unscan-ref-") as tmpdir:
+        req = json.dumps({
+            "font": font_path,
+            "chars": "".join(sorted(needed)),
+            "output_dir": tmpdir,
+        })
+        try:
+            subprocess.run(
+                [unscan_bin, "--render-ref-chars", req],
+                capture_output=True, timeout=30,
+            )
+        except Exception:
+            return _unscan_ref_cache[font_path]
+
+        # Load rendered PNGs: U+XXXX.png
+        for c in needed:
+            fname = f"U+{ord(c):04X}.png"
+            fpath = os.path.join(tmpdir, fname)
+            if os.path.exists(fpath):
+                _unscan_ref_cache[font_path][c] = Image.open(fpath).convert("L").copy()
+
+    return _unscan_ref_cache[font_path]
 
 
 def img_to_b64(img_or_path):
@@ -891,7 +964,10 @@ def build_miss_html(entry, chars_to_show, crop_dir, crop_files,
         if ocr_from:
             ocr_label = f"<span class='ocr-fix'>'{ocr_from}' → '{ch}'</span>"
 
-        ref_img = render_char(ch, correct_font_path, NORM_H) if correct_font_path else None
+        ref_img = None
+        if correct_font_path:
+            refs = render_ref_chars_unscan(correct_font_path, {ch})
+            ref_img = refs.get(ch)
 
         # Find the CI distance for this character against the correct font.
         # Prefer fontmap_dists (computed for all fontmap fonts, always present
@@ -910,19 +986,11 @@ def build_miss_html(entry, chars_to_show, crop_dir, crop_files,
                         correct_char_dist = nd
                         break
 
-        # Use actual CI reference image from diag-seg if available (exact data
-        # the character index compared against), fall back to PIL re-render.
+        # Render chosen (wrong) font's reference via unscan --render-ref-chars.
         chosen_img = None
-        if crop_dir:
-            refs_dir = os.path.join(crop_dir, "..", "refs")
-            if os.path.isdir(refs_dir):
-                prefix = f"ref_{crop_idx:02d}_"
-                for rf in sorted(os.listdir(refs_dir)):
-                    if rf.startswith(prefix):
-                        chosen_img = os.path.join(refs_dir, rf)
-                        break
-        if chosen_img is None:
-            chosen_img = render_char(ch, chosen_font_path, NORM_H) if chosen_font_path else None
+        if chosen_font_path:
+            refs = render_ref_chars_unscan(chosen_font_path, {ch})
+            chosen_img = refs.get(ch)
         dc = dist_class(d2)
 
         # OCR column: OCR char, best alt char + score on separate line
@@ -1104,11 +1172,10 @@ def build_miss_html(entry, chars_to_show, crop_dir, crop_files,
 {f'<div class="scan-line-label">{seg_stats_html}</div>' if seg_stats_html else ''}
 </div>"""
 
-    return f"""<div class="miss">
-<h3>p{entry['page']}:L{entry['line_index']} — "{text_preview}"{ssim_html}</h3>
-{scan_line_html}
-{ssim_compare_html}
-<table>
+    # Skip the per-character comparison table when the font pick is correct
+    # (i.e. SSIM-only failures) — the char table is only useful for real misses.
+    font_is_correct = (matched == correct_font_name)
+    char_table_html = "" if font_is_correct else f"""<table>
 <tr>
   <th>Scan</th>
   <th class="correct">Correct: {correct_col_hdr}</th>
@@ -1116,7 +1183,13 @@ def build_miss_html(entry, chars_to_show, crop_dir, crop_files,
   <th>OCR</th>
 </tr>
 {"".join(rows)}
-</table>
+</table>"""
+
+    return f"""<div class="miss">
+<h3>p{entry['page']}:L{entry['line_index']} — "{text_preview}"{ssim_html}</h3>
+{scan_line_html}
+{ssim_compare_html}
+{char_table_html}
 </div>"""
 
 
@@ -1129,7 +1202,6 @@ body {
   font-size: 13px;
   color: #222;
   padding: 16px;
-  max-width: 800px;
 }
 h2 { font-size: 16px; margin-bottom: 12px; color: #111; }
 .summary { color: #555; font-size: 12px; margin-bottom: 8px; }
@@ -1190,7 +1262,7 @@ img.ci {
 .scan-line-block {
   margin: 6px 0 10px 0; padding: 8px; background: #f0f4f0;
   border: 1px solid #c0c8c0; border-radius: 4px; overflow-x: auto;
-  width: 100vw; position: relative; left: 50%; margin-left: -50vw; box-sizing: border-box;
+  box-sizing: border-box;
 }
 .scan-line-label { font-size: 10px; font-weight: 600; color: #555; margin-bottom: 4px; }
 .scan-line-img {
@@ -1337,9 +1409,11 @@ def main():
         interesting = pick_interesting_chars(chars)
 
         # Correct font: prefer ground-truth fontmap, then CI candidate, then system search
-        correct_font_path = find_font_file_by_key(gt_key)
-        if not correct_font_path and font_map:
+        correct_font_path = None
+        if font_map:
             correct_font_path = resolve_font_from_map(actual_font, font_map)
+        if not correct_font_path:
+            correct_font_path = find_font_file_by_key(gt_key)
         if not correct_font_path:
             correct_font_path = find_font_file(actual_font)
         correct_font_name = actual_font
@@ -1371,9 +1445,11 @@ def main():
         chars = entry.get("ci_char_votes", [])
         interesting = pick_interesting_chars(chars)
 
-        correct_font_path = find_font_file_by_key(gt_key)
-        if not correct_font_path and font_map:
+        correct_font_path = None
+        if font_map:
             correct_font_path = resolve_font_from_map(actual_font, font_map)
+        if not correct_font_path:
+            correct_font_path = find_font_file_by_key(gt_key)
         if not correct_font_path:
             correct_font_path = find_font_file(actual_font)
         correct_font_name = actual_font
