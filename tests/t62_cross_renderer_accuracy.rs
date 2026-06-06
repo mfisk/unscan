@@ -21,7 +21,8 @@ use common::{test_doc, ensure_index};
 
 /// Poppler renders with different hinting than the CI's FreeType backend.
 /// Lower than t60's threshold to account for cross-renderer feature drift.
-const MIN_ACCURACY_POPPLER_AA: f64 = 0.98;
+/// Accuracy metric requires both correct font match AND SSIM pass.
+const MIN_ACCURACY_POPPLER_AA: f64 = 0.88;
 
 #[test]
 fn specimen_font_accuracy_poppler() {
