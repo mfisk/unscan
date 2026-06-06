@@ -33,6 +33,23 @@ pub struct AuditEntry {
     /// Which segmentation path won: "plain" or "ligature".
     #[serde(skip_serializing_if = "Option::is_none")]
     pub seg_winner: Option<String>,
+    /// Word-level bounding boxes for this line (for miss-report visualisation).
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub word_bboxes: Vec<WordBBox>,
+    /// Raw Tesseract word bboxes before post-processing (clip/drop/expand).
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub word_bboxes_raw: Vec<WordBBox>,
+}
+
+/// Word-level bounding box with OCR text.
+#[derive(Debug, Serialize, Clone)]
+pub struct WordBBox {
+    pub text: String,
+    pub x: u32,
+    pub y: u32,
+    pub width: u32,
+    pub height: u32,
+    pub confidence: f32,
 }
 
 /// CI candidate font score.
