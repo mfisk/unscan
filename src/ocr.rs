@@ -750,6 +750,179 @@ pub fn expand_words_to_ink(lines: &mut [TextLine], gray: &GrayImage, ink_thresho
     }
 }
 
+/// Split words that contain wide internal bands of whitespace into separate
+/// words.  Tesseract sometimes merges spaced-out characters (e.g. "0 1 2 3")
+/// into a single word bbox with text "0123456789".  This function scans each
+/// word's image for zero-ink column runs wider than a threshold and splits
+/// the word at each gap.
+///
+/// Must run AFTER `expand_words_to_ink` so bboxes are ink-tight.
+pub fn split_wide_whitespace_words(lines: &mut [TextLine], gray: &GrayImage, ink_threshold: u8) {
+    let (page_w, page_h) = gray.dimensions();
+    let mut total_splits = 0u32;
+
+    for line in lines.iter_mut() {
+        let mut new_words: Vec<TextRegion> = Vec::new();
+        let line_h = line.height;
+        // Split at gaps ≥ 15% of the line height.
+        let min_gap = (line_h * 18 / 100).max(4);
+
+        for word in line.words.drain(..) {
+            let wx = word.x.min(page_w.saturating_sub(1));
+            let wy = word.y.min(page_h.saturating_sub(1));
+            let ww = word.width.min(page_w - wx);
+            let wh = word.height.min(page_h - wy);
+
+            let chars: Vec<char> = word.text.chars().collect();
+            let n_chars = chars.len();
+
+            if ww < 4 || wh < 2 || n_chars < 2 {
+                new_words.push(word);
+                continue;
+            }
+
+            // Crop the word image and run CI segmentation to get per-char boundaries
+            let word_img = image::imageops::crop_imm(gray, wx, wy, ww, wh).to_image();
+            let (boundaries, _seams) = crate::segment::segment_characters(&word_img, n_chars);
+
+            // boundaries: [0, b1, b2, ..., ww] — n_chars+1 entries
+            // Character i occupies columns [boundaries[i] .. boundaries[i+1])
+            if boundaries.len() != n_chars + 1 {
+                new_words.push(word);
+                continue;
+            }
+
+            // For each adjacent pair of characters, measure the zero-ink gap
+            // between the rightmost ink of char i and the leftmost ink of char i+1.
+            let mut wide_gap_indices: Vec<usize> = Vec::new(); // indices into chars where a word break occurs AFTER char[i]
+
+            for i in 0..n_chars - 1 {
+                let seg_end = boundaries[i + 1] as usize; // right edge of char i's segment
+                let seg_next_start = boundaries[i + 1] as usize; // left edge of char i+1's segment
+
+                // Find rightmost ink column in char i's segment
+                let seg_i_left = boundaries[i] as usize;
+                let seg_i_right = boundaries[i + 1] as usize;
+                let mut right_ink = seg_i_left; // fallback
+                for col in (seg_i_left..seg_i_right).rev() {
+                    if col < ww as usize {
+                        let has_ink = (0..wh).any(|row| {
+                            word_img.get_pixel(col as u32, row).0[0] < ink_threshold
+                        });
+                        if has_ink {
+                            right_ink = col;
+                            break;
+                        }
+                    }
+                }
+
+                // Find leftmost ink column in char i+1's segment
+                let seg_j_left = boundaries[i + 1] as usize;
+                let seg_j_right = boundaries[i + 2] as usize;
+                let mut left_ink = seg_j_right; // fallback
+                for col in seg_j_left..seg_j_right {
+                    if col < ww as usize {
+                        let has_ink = (0..wh).any(|row| {
+                            word_img.get_pixel(col as u32, row).0[0] < ink_threshold
+                        });
+                        if has_ink {
+                            left_ink = col;
+                            break;
+                        }
+                    }
+                }
+
+                let gap = if left_ink > right_ink {
+                    (left_ink - right_ink) as u32
+                } else {
+                    0
+                };
+
+                if gap >= min_gap {
+                    wide_gap_indices.push(i);
+                }
+            }
+
+            if wide_gap_indices.is_empty() {
+                new_words.push(word);
+                continue;
+            }
+
+            // Group characters into new words, splitting at wide gaps.
+            // Word breaks occur AFTER chars at wide_gap_indices.
+            let mut groups: Vec<std::ops::Range<usize>> = Vec::new();
+            let mut start = 0usize;
+            for &gap_after in &wide_gap_indices {
+                groups.push(start..gap_after + 1);
+                start = gap_after + 1;
+            }
+            groups.push(start..n_chars);
+
+            for group in &groups {
+                let seg_text: String = chars[group.clone()].iter().collect();
+
+                // Bbox spans from the left edge of the first char's segment
+                // to the right edge of the last char's segment.
+                let seg_x_start = boundaries[group.start];
+                let seg_x_end = boundaries[group.end];
+                let seg_w = seg_x_end - seg_x_start;
+
+                // Trim horizontally to ink within this segment
+                let abs_x = wx + seg_x_start;
+                let mut ink_left = seg_w;
+                let mut ink_right = 0u32;
+                for col_off in 0..seg_w {
+                    let col = abs_x + col_off;
+                    if col < page_w {
+                        let has_ink = (wy..wy + wh).any(|row| {
+                            gray.get_pixel(col, row).0[0] < ink_threshold
+                        });
+                        if has_ink {
+                            ink_left = ink_left.min(col_off);
+                            ink_right = col_off;
+                        }
+                    }
+                }
+
+                let (trimmed_x, trimmed_w) = if ink_right >= ink_left {
+                    (abs_x + ink_left, ink_right - ink_left + 1)
+                } else {
+                    (abs_x, seg_w) // no ink found, keep original
+                };
+
+                new_words.push(TextRegion {
+                    text: seg_text,
+                    x: trimmed_x,
+                    y: wy,
+                    width: trimmed_w,
+                    height: wh,
+                    font_size_pt: word.font_size_pt,
+                    confidence: word.confidence,
+                    level: word.level,
+                    block_num: word.block_num,
+                    par_num: word.par_num,
+                    line_num: word.line_num,
+                    word_num: word.word_num,
+                });
+            }
+
+            total_splits += wide_gap_indices.len() as u32;
+            debug!(
+                "  split word '{}' into {} pieces at {} gap(s) (min_gap={}px, line_h={}px)",
+                word.text, groups.len(), wide_gap_indices.len(), min_gap, line_h
+            );
+        }
+
+        // Replace words and rebuild line text
+        line.words = new_words;
+        line.text = line.words.iter().map(|w| w.text.as_str()).collect::<Vec<_>>().join(" ");
+    }
+
+    if total_splits > 0 {
+        info!("split_wide_whitespace_words: {} splits across all lines", total_splits);
+    }
+}
+
 /// Scan a horizontal strip of the grayscale image for the topmost and
 /// bottommost rows that contain ink (pixel value < `threshold`).
 /// Returns (ink_top_row, ink_bottom_row) — both inclusive pixel rows.
