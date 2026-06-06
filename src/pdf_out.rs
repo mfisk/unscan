@@ -329,7 +329,7 @@ for tr in &page.text_regions {
             // width-matched independently. This avoids em-dash / special char
             // width differences stealing space from regular letters.
             log::debug!("pdf_out: '{}...' — {} words, font_match={}", 
-                &tr.text[..tr.text.len().min(30)], tr.words.len(), tr.font_match.is_some());
+                &tr.text.chars().take(30).collect::<String>(), tr.words.len(), tr.font_match.is_some());
             if !tr.words.is_empty() && tr.font_match.is_some() {
                 let fm = tr.font_match.as_ref().unwrap();
                 let font_bytes = font_cache.load(&fm.font_path).ok();

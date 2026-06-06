@@ -76,6 +76,53 @@ use std::path::{Path, PathBuf};
 /// score much lower. 0.3 catches garbage without false-rejecting legitimate matches.
 const MIN_VERIFY_SSIM: f32 = 0.3;
 
+/// Standalone char rendering: render characters using the index-time
+/// render_char_normalised() pipeline and save as PNGs.
+fn render_ref_chars_and_exit(json_str: &str) -> ! {
+    use ab_glyph::{Font, FontVec};
+
+    #[derive(serde::Deserialize)]
+    struct Req {
+        font: String,
+        chars: String,
+        output_dir: String,
+    }
+
+    let req: Req = serde_json::from_str(json_str).unwrap_or_else(|e| {
+        eprintln!("Invalid --render-ref-chars JSON: {e}");
+        std::process::exit(1);
+    });
+
+    let font_data = std::fs::read(&req.font).unwrap_or_else(|e| {
+        eprintln!("Cannot read font {:?}: {e}", req.font);
+        std::process::exit(1);
+    });
+    let font = FontVec::try_from_vec(font_data).unwrap_or_else(|e| {
+        eprintln!("Cannot parse font {:?}: {e}", req.font);
+        std::process::exit(1);
+    });
+
+    let out = std::path::Path::new(&req.output_dir);
+    std::fs::create_dir_all(out).unwrap_or_else(|e| {
+        eprintln!("Cannot create output dir {:?}: {e}", req.output_dir);
+        std::process::exit(1);
+    });
+
+    let mut rendered = 0u32;
+    for c in req.chars.chars() {
+        if font.glyph_id(c).0 == 0 {
+            continue; // no glyph for this char
+        }
+        if let Some(img) = char_index::render_char_normalised(&font, c) {
+            let fname = format!("U+{:04X}.png", c as u32);
+            let _ = img.save(out.join(&fname));
+            rendered += 1;
+        }
+    }
+    eprintln!("Rendered {rendered} chars to {:?}", req.output_dir);
+    std::process::exit(0);
+}
+
 fn main() {
     env_logger::Builder::from_env(env_logger::Env::default().default_filter_or("info"))
         .format_timestamp(None)
@@ -85,6 +132,11 @@ fn main() {
     if let Err(msg) = args.validate() {
         eprintln!("Error: {msg}");
         std::process::exit(1);
+    }
+
+    // ── render-ref-chars: standalone char rendering, no PDF needed ───
+    if let Some(ref json_str) = args.render_ref_chars {
+        render_ref_chars_and_exit(json_str);
     }
 
     if args.index {
@@ -417,12 +469,6 @@ fn run(args: &cli::Args) -> Result<(), ScanTextError> {
     // ── 1b''. Shared font cache for all post-index font access ──────
     let font_cache = font_cache::FontCache::new(font_cache::DEFAULT_CAPACITY);
 
-    // ── 1c. Load diagnostic reference font (if --diag-ref-font) ─────
-    let diag_ref_font: Option<ab_glyph::FontVec> = args.diag_ref_font.as_ref().map(|p| {
-        let data = std::fs::read(p).unwrap_or_else(|e| panic!("Cannot read --diag-ref-font {:?}: {}", p, e));
-        ab_glyph::FontVec::try_from_vec(data).unwrap_or_else(|e| panic!("Cannot parse --diag-ref-font {:?}: {}", p, e))
-    });
-
     // ── 2. Load input pages (with raster cache) ──────────────────────
     let cache_dir = page_cache::cache_key(input, args.dpi)
         .and_then(|key| page_cache::cache_dir(&key));
@@ -532,7 +578,20 @@ fn run(args: &cli::Args) -> Result<(), ScanTextError> {
                 (wr, cb, false)
             };
         let mut lines = ocr::assemble_lines(&word_regions);
+        // Snapshot raw Tesseract word bboxes before post-processing
+        let raw_word_bboxes: Vec<Vec<audit::WordBBox>> = lines.iter().map(|line| {
+            line.words.iter().map(|w| audit::WordBBox {
+                text: w.text.clone(),
+                x: w.x,
+                y: w.y,
+                width: w.width,
+                height: w.height,
+                confidence: w.confidence,
+            }).collect()
+        }).collect();
+        ocr::merge_overlapping_lines(&mut lines);
         ocr::clip_word_overlaps(&mut lines);
+        ocr::drop_outlier_words(&mut lines);
         let ocr_elapsed = ocr_start.elapsed();
         info!(
             "  OCR: {} words → {} lines ({:.1}s{})",
@@ -556,6 +615,7 @@ fn run(args: &cli::Args) -> Result<(), ScanTextError> {
         // (bg - 56) counts as ink (works for both light and dark backgrounds).
         let ink_thresh = bg_color.0.saturating_sub(56);
         ocr::expand_bbox_to_ink(&mut lines, &gray_page, ink_thresh);
+        ocr::expand_words_to_ink(&mut lines, &gray_page, ink_thresh);
         let mut placed_texts: Vec<pdf_out::PlacedText> = Vec::new();
         let mut pg_vec = 0u32;
         let mut pg_raster = 0u32;
@@ -663,7 +723,6 @@ fn run(args: &cli::Args) -> Result<(), ScanTextError> {
             let line_crops = char_index::extract_line_chars(
                 &gray_page, &word_placements, line_height,
                 diag_seg_dir.as_deref(),
-                diag_ref_font.as_ref(),
             );
             let char_crops = &line_crops.plain;
             eprintln!("  MEM line {} after segmentation: {} ({} plain crops, {} lig crops)",
@@ -672,24 +731,7 @@ fn run(args: &cli::Args) -> Result<(), ScanTextError> {
 
             let font_result = {
 
-                // Dump character crops when UNSCAN_DUMP_CROPS is set
-                if std::env::var("UNSCAN_DUMP_CROPS").is_ok() && !char_crops.is_empty() {
-                    let text_slug: String = line.text.chars().take(40)
-                        .filter(|c| c.is_alphanumeric() || *c == ' ')
-                        .collect::<String>()
-                        .replace(' ', "_");
-                    let dump_dir = format!("/tmp/unscan-crops/p{}_L{:03}_{}", page_idx + 1, li, text_slug);
-                    let _ = std::fs::create_dir_all(&dump_dir);
-                    for (i, (ch, img)) in char_crops.iter().enumerate() {
-                        let path = format!("{}/crop_{:02}_{}.png", dump_dir, i,
-                            if ch.is_alphanumeric() { format!("{}", ch) }
-                            else { format!("U{:04X}", *ch as u32) });
-                        let _ = img.save(&path);
-                    }
-                }
-
-                // Also dump per-line crops into diag-seg dir when --diag-seg is set.
-                // This makes the miss report work without UNSCAN_DUMP_CROPS.
+                // Dump per-line crops into the audit dir.
                 // NOTE: We dump plain crops here before scoring; after the winner
                 // is decided we overwrite with winning crops if different (see below).
                 if let Some(ref ddir) = diag_seg_dir {
@@ -872,12 +914,28 @@ fn run(args: &cli::Args) -> Result<(), ScanTextError> {
                 std::collections::HashMap::new()
             };
 
-            // Dump CI reference images for the chosen font into diag-seg
-            if let (Some(ref ddir), Some(ref fr)) = (&diag_seg_dir, &font_result) {
-                let refs_dir = ddir.join("refs");
-                let _ = std::fs::create_dir_all(&refs_dir);
-                // Find the FontEntry for glyph overrides — use font_key for exact match
+            // Dump CI reference images into shared font_refs/<label>/U+XXXX.png
+            // One copy per font/variant, shared across all lines.
+            if let (Some(ref audit_root), Some(ref fr)) = (&args.audit, &font_result) {
                 let fe_opt = font_catalog.iter().find(|e| e.font_key() == fr.font_key);
+                let label = fe_opt.map(|fe| {
+                    let mut s = fe.family_name.replace(' ', "");
+                    if fe.is_bold { s.push_str("-Bold"); }
+                    if fe.is_italic { s.push_str("-Italic"); }
+                    if !fe.variant_tag.is_empty() {
+                        s.push('_');
+                        s.push_str(&fe.variant_tag);
+                    }
+                    s
+                }).unwrap_or_else(|| {
+                    fr.font_path.file_stem()
+                        .and_then(|s| s.to_str())
+                        .unwrap_or("unknown")
+                        .to_string()
+                });
+                let font_ref_dir = audit_root.join("font_refs").join(&label);
+                let _ = std::fs::create_dir_all(&font_ref_dir);
+
                 let override_map: std::collections::HashMap<char, u16> = fe_opt
                     .and_then(|fe| fe.glyph_overrides.as_ref())
                     .map(|v| v.iter().cloned().collect())
@@ -885,19 +943,16 @@ fn run(args: &cli::Args) -> Result<(), ScanTextError> {
                 let font_data = font_cache.load(&fr.font_path).ok();
                 if let Some(ref fdata) = font_data {
                     if let Ok(font) = ab_glyph::FontRef::try_from_slice(fdata) {
-                        for (i, (ch, _crop)) in corrected_char_crops.iter().enumerate() {
+                        for (ch, _crop) in corrected_char_crops.iter() {
+                            let fname = format!("U+{:04X}.png", *ch as u32);
+                            let path = font_ref_dir.join(&fname);
+                            if path.exists() { continue; } // already rendered
                             let ref_img = if let Some(&gid) = override_map.get(ch) {
                                 char_index::render_glyph_normalised(&font, ab_glyph::GlyphId(gid))
                             } else {
                                 char_index::render_char_normalised(&font, *ch)
                             };
                             if let Some(img) = ref_img {
-                                let safe_ch: String = if ch.is_alphanumeric() {
-                                    ch.to_string()
-                                } else {
-                                    format!("u{:04X}", *ch as u32)
-                                };
-                                let path = refs_dir.join(format!("ref_{:02}_{}.png", i, safe_ch));
                                 let _ = img.save(&path);
                             }
                         }
@@ -1129,6 +1184,19 @@ fn run(args: &cli::Args) -> Result<(), ScanTextError> {
                     })
                     .collect(),
                 seg_winner: lm.seg_winner.clone(),
+                word_bboxes: line.words.iter().map(|w| audit::WordBBox {
+                    text: w.text.clone(),
+                    x: w.x,
+                    y: w.y,
+                    width: w.width,
+                    height: w.height,
+                    confidence: w.confidence,
+                }).collect(),
+                word_bboxes_raw: if li < raw_word_bboxes.len() {
+                    raw_word_bboxes[li].clone()
+                } else {
+                    Vec::new()
+                },
             });
 
             placed_texts.push(pdf_out::PlacedText {

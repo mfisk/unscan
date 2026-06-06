@@ -66,11 +66,7 @@ pub fn verify_text_region(
         .collect();
 
     // Try multiple render scales and pick the best SSIM.
-    let scales = if let Ok(s) = std::env::var("UNSCAN_RENDER_SCALE") {
-        vec![s.parse::<u32>().unwrap_or(2)]
-    } else {
-        vec![2, 4]
-    };
+    let scales = vec![2, 4];
 
     // Ink-crop the render to where the glyphs actually are; crop the scan to
     // the word-union bbox (tight to OCR word bounds, no adjacent-line bleed).
@@ -110,13 +106,6 @@ pub fn verify_text_region(
         let scan_blur = crate::ssim::gaussian_blur_3x3(&scan_crop);
         let render_blur = crate::ssim::gaussian_blur_3x3(&render_for_ssim);
         let (score, dy) = crate::ssim::ssim_windowed_best_vshift(&scan_blur, &render_blur, 12);
-
-        if std::env::var("UNSCAN_DUMP_SSIM").is_ok() {
-            log::info!("SSIM debug: scan ({}x{}) render ({}x{}) scale={} dy={} score={:.4}",
-                scan_crop.width(), scan_crop.height(),
-                render_for_ssim.width(), render_for_ssim.height(),
-                scale, dy, score);
-        }
 
         if score > best_score {
             best_score = score;
@@ -240,9 +229,6 @@ fn render_via_freetype(
     }
     all_em.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
     let line_em_px = all_em[all_em.len() / 2];
-    if std::env::var("UNSCAN_DUMP_SSIM").is_ok() {
-        log::info!("render: line_em_px={:.2}, canvas={}x{}, scale={}", line_em_px, canvas_w, canvas_h, render_scale);
-    }
 
     let render_w = canvas_w * render_scale;
     let render_h = canvas_h * render_scale;

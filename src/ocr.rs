@@ -49,8 +49,8 @@ pub struct TextLine {
 
 /// Run Tesseract on a page image and return word-level regions plus
 /// character-level bounding boxes (from makebox output).
-/// Applies contrast enhancement and sharpening before OCR to improve
-/// recognition on scanned documents.
+/// Tesseract handles its own binarization and preprocessing internally
+/// via Leptonica — we just convert to grayscale and pass it through.
 pub fn extract_text_regions(
     page_img: &DynamicImage,
     dpi: u32,
@@ -60,43 +60,9 @@ pub fn extract_text_regions(
         .tempfile()
         .map_err(ScanTextError::Io)?;
 
-    // Pre-process: convert to grayscale, then enhance contrast via
-    // adaptive normalisation.  This helps Tesseract on noisy scans.
     let gray = page_img.to_luma8();
-    let (w, h) = gray.dimensions();
-    let mut enhanced = gray.clone();
 
-    // Simple global contrast stretch: map [min, max] → [0, 255]
-    let mut lo = 255u8;
-    let mut hi = 0u8;
-    for p in gray.pixels() {
-        lo = lo.min(p.0[0]);
-        hi = hi.max(p.0[0]);
-    }
-    if hi > lo {
-        let range = (hi - lo) as f32;
-        for y_px in 0..h {
-            for x_px in 0..w {
-                let v = gray.get_pixel(x_px, y_px).0[0];
-                let stretched = ((v as f32 - lo as f32) / range * 255.0) as u8;
-                enhanced.put_pixel(x_px, y_px, image::Luma([stretched]));
-            }
-        }
-    }
-
-    // Sharpen via unsharp mask: out = 1.5*original - 0.5*blurred
-    let blurred = image::imageops::blur(&enhanced, 1.0);
-    let mut sharpened = enhanced.clone();
-    for y_px in 0..h {
-        for x_px in 0..w {
-            let orig = enhanced.get_pixel(x_px, y_px).0[0] as f32;
-            let blur_v = blurred.get_pixel(x_px, y_px).0[0] as f32;
-            let sharp = (1.5 * orig - 0.5 * blur_v).clamp(0.0, 255.0) as u8;
-            sharpened.put_pixel(x_px, y_px, image::Luma([sharp]));
-        }
-    }
-
-    DynamicImage::ImageLuma8(sharpened)
+    DynamicImage::ImageLuma8(gray)
         .save(tmp.path())
         .map_err(|e| ScanTextError::Ocr(format!("Failed to save temp image: {e}")))?;
 
@@ -197,6 +163,151 @@ pub fn assemble_lines(words: &[TextRegion]) -> Vec<TextLine> {
     lines
 }
 
+/// Merge lines that Tesseract split from a single physical line.
+///
+/// Tesseract's layout analysis sometimes assigns blobs from one physical line
+/// to two different `line_num` values (e.g. when a nearby image blob shifts
+/// the row geometry, or when italic serifs extend outside the row band).
+/// This produces two `TextLine`s with heavily overlapping y-ranges and
+/// overlapping x-ranges.  We detect these and merge them into one line,
+/// then merge overlapping or abutting word boxes within the result.
+///
+/// Must run immediately after `assemble_lines()`, before any other
+/// post-processing.
+pub fn merge_overlapping_lines(lines: &mut Vec<TextLine>) {
+    if lines.len() < 2 {
+        return;
+    }
+
+    let mut merged_count = 0u32;
+    let mut i = 0;
+    while i < lines.len() {
+        let mut j = i + 1;
+        while j < lines.len() {
+            if lines_overlap(&lines[i], &lines[j]) {
+                // Merge line j into line i
+                debug!(
+                    "  merge overlapping lines: '{}' + '{}'",
+                    &lines[i].text.chars().take(40).collect::<String>(),
+                    &lines[j].text.chars().take(40).collect::<String>(),
+                );
+                let donor = lines.remove(j);
+                merge_line_into(&mut lines[i], donor);
+                merged_count += 1;
+                // Don't increment j — the next candidate shifted into position
+            } else {
+                j += 1;
+            }
+        }
+        i += 1;
+    }
+
+    if merged_count > 0 {
+        info!("  Merged {} overlapping line pair(s)", merged_count);
+    }
+}
+
+/// Two lines "overlap" if their vertical ranges overlap by ≥ 50% of the
+/// shorter line's height AND their horizontal ranges overlap at all.
+fn lines_overlap(a: &TextLine, b: &TextLine) -> bool {
+    // Vertical overlap
+    let a_top = a.y;
+    let a_bot = a.y + a.height;
+    let b_top = b.y;
+    let b_bot = b.y + b.height;
+    let v_overlap_start = a_top.max(b_top);
+    let v_overlap_end = a_bot.min(b_bot);
+    if v_overlap_start >= v_overlap_end {
+        return false; // no vertical overlap
+    }
+    let v_overlap = v_overlap_end - v_overlap_start;
+    let min_height = a.height.min(b.height);
+    if min_height == 0 || (v_overlap as f64) < min_height as f64 * 0.5 {
+        return false; // less than 50% vertical overlap
+    }
+
+    // Horizontal overlap — any overlap at all means same physical line
+    let a_left = a.x;
+    let a_right = a.x + a.width;
+    let b_left = b.x;
+    let b_right = b.x + b.width;
+    a_left < b_right && b_left < a_right
+}
+
+/// Merge donor line into target: combine word lists, merge overlapping/abutting
+/// words, then recompute line-level fields.
+fn merge_line_into(target: &mut TextLine, donor: TextLine) {
+    target.words.extend(donor.words);
+    // Sort all words by x position
+    target.words.sort_by_key(|w| w.x);
+    // Merge overlapping or abutting words
+    merge_overlapping_words(&mut target.words);
+    // Recompute line fields
+    target.text = target.words.iter()
+        .map(|w| w.text.as_str()).collect::<Vec<_>>().join(" ");
+    target.x = target.words.iter().map(|w| w.x).min().unwrap_or(0);
+    target.y = target.words.iter().map(|w| w.y).min().unwrap_or(0);
+    let x_max = target.words.iter().map(|w| w.x + w.width).max().unwrap_or(0);
+    let y_max = target.words.iter().map(|w| w.y + w.height).max().unwrap_or(0);
+    target.width = x_max.saturating_sub(target.x);
+    target.height = y_max.saturating_sub(target.y);
+    target.confidence = target.words.iter().map(|w| w.confidence).sum::<f32>()
+        / target.words.len() as f32;
+    target.font_size_pt = target.words.first()
+        .map(|w| w.font_size_pt).unwrap_or(12.0);
+}
+
+/// Merge word boxes that overlap or abut horizontally within a sorted word list.
+///
+/// Two words are candidates for merging when the gap between them is ≤ 2px
+/// (abutting) or they overlap. When merged, keep the word with higher confidence
+/// if their texts cover the same span, otherwise concatenate.
+fn merge_overlapping_words(words: &mut Vec<TextRegion>) {
+    if words.len() < 2 {
+        return;
+    }
+    let mut i = 0;
+    while i + 1 < words.len() {
+        let a_right = words[i].x + words[i].width;
+        let b_left = words[i + 1].x;
+
+        // Gap ≤ 2px or overlapping → merge candidate
+        if a_right + 2 >= b_left {
+            let b = words.remove(i + 1);
+            let a = &mut words[i];
+
+            // Union the bounding boxes
+            let new_x = a.x.min(b.x);
+            let new_y = a.y.min(b.y);
+            let new_right = (a.x + a.width).max(b.x + b.width);
+            let new_bot = (a.y + a.height).max(b.y + b.height);
+
+            // If the words overlap significantly, pick the longer/higher-confidence one;
+            // otherwise concatenate texts
+            let overlap_amount = a_right.saturating_sub(b_left);
+            if overlap_amount > a.width / 2 || overlap_amount > b.width / 2 {
+                // Substantial overlap — pick the better word
+                if b.confidence > a.confidence && b.text.len() >= a.text.len() {
+                    a.text = b.text;
+                }
+                a.confidence = a.confidence.max(b.confidence);
+            } else {
+                // Abutting or minor overlap — concatenate
+                a.text = format!("{}{}", a.text, b.text);
+                a.confidence = (a.confidence + b.confidence) / 2.0;
+            }
+
+            a.x = new_x;
+            a.y = new_y;
+            a.width = new_right - new_x;
+            a.height = new_bot - new_y;
+            // Don't increment — check if the merged word now overlaps the next one
+        } else {
+            i += 1;
+        }
+    }
+}
+
 /// Clip overlapping word bboxes within each line.
 ///
 /// Tesseract occasionally returns word bboxes that extend into the next word's
@@ -233,6 +344,75 @@ pub fn clip_word_overlaps(lines: &mut [TextLine]) {
         info!("  Clipped {} overlapping word bbox(es)", clipped);
     }
 }
+
+/// Remove outlier words that are likely OCR artifacts from images.
+///
+/// When a line contains words with very different heights and some have low OCR
+/// confidence, the tall low-confidence words are probably image artifacts (e.g.
+/// a logo that Tesseract tried to read as text).  Dropping them prevents the
+/// line bbox from ballooning and contaminating font matching / ground-truth
+/// spatial lookups.
+///
+/// Heuristic: if a word's height is ≥ 1.8× the median word height in the line
+/// AND its confidence is below 70, drop it.  After dropping, recompute the
+/// line's text and bbox from the surviving words.
+pub fn drop_outlier_words(lines: &mut Vec<TextLine>) {
+    let mut dropped_total = 0u32;
+    lines.retain_mut(|line| {
+        if line.words.len() < 2 {
+            return true;
+        }
+
+        // Use the median word height as baseline — min_h is too fragile
+        // (a 1px em-dash makes everything look like an outlier).
+        let mut heights: Vec<u32> = line.words.iter().map(|w| w.height).collect();
+        heights.sort_unstable();
+        let median_h = heights[heights.len() / 2];
+
+        if median_h == 0 {
+            return true;
+        }
+
+        let before = line.words.len();
+        line.words.retain(|w| {
+            let height_outlier = w.height as f64 >= median_h as f64 * 1.8;
+            let low_conf = w.confidence < 70.0;
+            if height_outlier && low_conf {
+                debug!(
+                    "  drop outlier word '{}' (h={}, median_h={}, conf={:.1})",
+                    w.text, w.height, median_h, w.confidence
+                );
+                false
+            } else {
+                true
+            }
+        });
+
+        let dropped = before - line.words.len();
+        if dropped > 0 {
+            dropped_total += dropped as u32;
+            if line.words.is_empty() {
+                return false; // entire line was artifacts
+            }
+            // Recompute line text and bbox from surviving words.
+            line.text = line.words.iter()
+                .map(|w| w.text.as_str()).collect::<Vec<_>>().join(" ");
+            line.x = line.words.iter().map(|w| w.x).min().unwrap_or(0);
+            line.y = line.words.iter().map(|w| w.y).min().unwrap_or(0);
+            let x_max = line.words.iter().map(|w| w.x + w.width).max().unwrap_or(0);
+            let y_max = line.words.iter().map(|w| w.y + w.height).max().unwrap_or(0);
+            line.width = x_max.saturating_sub(line.x);
+            line.height = y_max.saturating_sub(line.y);
+            line.confidence = line.words.iter().map(|w| w.confidence).sum::<f32>()
+                / line.words.len() as f32;
+        }
+        true
+    });
+    if dropped_total > 0 {
+        info!("  Dropped {} outlier word(s) (image artifacts)", dropped_total);
+    }
+}
+
 // Scan the actual grayscale pixels to find true ink boundaries.
 // ---------------------------------------------------------------------------
 
@@ -244,11 +424,11 @@ pub fn clip_word_overlaps(lines: &mut [TextLine]) {
 /// Only **expands** — never shrinks a bbox.  Horizontal bounds are untouched.
 pub fn expand_bbox_to_ink(lines: &mut [TextLine], gray: &GrayImage, ink_threshold: u8) {
     let (page_w, page_h) = gray.dimensions();
-    let margin: u32 = 20; // search this many px above/below the OCR bbox
+    let margin: u32 = 20; // search this many px beyond the OCR bbox
     let mut expanded_count = 0u32;
 
     for line in lines.iter_mut() {
-        // ── expand the line bbox ────────────────────────────────────
+        // ── expand the line bbox vertically ─────────────────────────
         let lx = line.x.min(page_w.saturating_sub(1));
         let lw = line.width.min(page_w - lx);
         let search_top = line.y.saturating_sub(margin);
@@ -261,25 +441,312 @@ pub fn expand_bbox_to_ink(lines: &mut [TextLine], gray: &GrayImage, ink_threshol
         let new_bottom = ink_bot.max(line.y + line.height);
         let new_h = new_bottom.saturating_sub(new_y);
 
-        if new_h > line.height {
-            expanded_count += 1;
-            debug!(
-                "  bbox expand: '{}' y {}→{} h {}→{} (+{}px)",
-                &line.text[..line.text.len().min(40)],
-                line.y, new_y, line.height, new_h, new_h - line.height
-            );
-        }
+        let vert_grew = new_h > line.height;
         line.y = new_y;
         line.height = new_h;
 
-        // ── NOTE: word bboxes are NOT expanded ─────────────────────
-        // The line-level expansion above covers ascenders/descenders.
-        // Expanding individual word bboxes grabs adjacent-line text
-        // that corrupts character segmentation downstream.
+        // ── expand the line bbox horizontally ───────────────────────
+        // Check leftward: walk columns left from line.x within the
+        // vertical extent, looking for ink.
+        let y_top = line.y;
+        let y_bot = (line.y + line.height).min(page_h);
+        let search_left = line.x.saturating_sub(margin);
+        let mut new_x = line.x;
+        for col in (search_left..line.x).rev() {
+            let col_has_ink = (y_top..y_bot)
+                .any(|row| gray.get_pixel(col, row).0[0] < ink_threshold);
+            if col_has_ink {
+                new_x = col;
+            } else {
+                break;
+            }
+        }
+
+        // Check rightward
+        let old_right = line.x + line.width;
+        let search_right = (old_right + margin).min(page_w);
+        let mut new_right = old_right;
+        for col in old_right..search_right {
+            let col_has_ink = (y_top..y_bot)
+                .any(|row| gray.get_pixel(col, row).0[0] < ink_threshold);
+            if col_has_ink {
+                new_right = col + 1;
+            } else {
+                break;
+            }
+        }
+
+        let horiz_grew = new_x < line.x || new_right > old_right;
+        line.x = new_x;
+        line.width = new_right.saturating_sub(new_x);
+
+        if vert_grew || horiz_grew {
+            expanded_count += 1;
+            debug!(
+                "  bbox expand: '{}' x {}→{} y {}→{} w {}→{} h {}→{}",
+                &line.text.chars().take(40).collect::<String>(),
+                lx, line.x, search_top.max(ink_top), line.y,
+                lw, line.width, new_h.saturating_sub(new_h - line.height), line.height
+            );
+        }
+
+        // ── NOTE: word bboxes are NOT expanded here ────────────────
+        // expand_words_to_ink handles word-level expansion separately.
     }
 
     if expanded_count > 0 {
         info!("  Expanded {expanded_count}/{} line bboxes to ink extent", lines.len());
+    }
+}
+
+/// Expand word bboxes horizontally when ink is present at the edge and there
+/// is free space before the next word.  Italic glyphs frequently overshoot
+/// the OCR bbox to the right.  For each word, if the rightmost column of its
+/// crop contains ink, extend rightward column-by-column as long as (a) we
+/// find ink and (b) we haven't reached the next word's left edge.
+///
+/// Only **expands** — never shrinks.  Must run AFTER `clip_word_overlaps` so
+/// the word list is already gap-safe.
+pub fn expand_words_to_ink(lines: &mut [TextLine], gray: &GrayImage, ink_threshold: u8) {
+    let (page_w, page_h) = gray.dimensions();
+    let mut expanded = 0u32;
+
+    for line in lines.iter_mut() {
+        let n = line.words.len();
+        let line_top = line.y;
+        let line_bot = (line.y + line.height).min(page_h);
+
+        for i in 0..n {
+            let mut changed = false;
+
+            // ── Rightward expansion ─────────────────────────────────
+            {
+                let w = &line.words[i];
+                let right_edge = w.x + w.width;
+                let limit = if i + 1 < n {
+                    line.words[i + 1].x
+                } else {
+                    (line.x + line.width).min(page_w)
+                };
+
+                if right_edge < limit && right_edge < page_w {
+                    let check_col = right_edge.saturating_sub(1);
+                    let y_top = w.y;
+                    let y_bot = w.y + w.height;
+                    let has_edge_ink = (y_top..y_bot)
+                        .any(|row| gray.get_pixel(check_col.min(page_w - 1), row).0[0] < ink_threshold);
+
+                    if has_edge_ink {
+                        let mut new_right = right_edge;
+                        for col in right_edge..limit.min(page_w) {
+                            let col_has_ink = (y_top..y_bot)
+                                .any(|row| gray.get_pixel(col, row).0[0] < ink_threshold);
+                            if col_has_ink {
+                                new_right = col + 1;
+                            } else {
+                                break;
+                            }
+                        }
+                        if new_right > right_edge {
+                            let growth = new_right - right_edge;
+                            debug!(
+                                "  word ink-expand right: '{}' width {}→{} (+{}px)",
+                                line.words[i].text, line.words[i].width, line.words[i].width + growth, growth
+                            );
+                            line.words[i].width += growth;
+                            changed = true;
+                        }
+                    }
+                }
+            }
+
+            // ── Leftward expansion ──────────────────────────────────
+            {
+                let left_edge = line.words[i].x;
+                let word_y = line.words[i].y;
+                let word_h = line.words[i].height;
+                let mut limit = if i > 0 {
+                    line.words[i - 1].x + line.words[i - 1].width
+                } else {
+                    line.x
+                };
+
+                // Trim the previous word's trailing empty columns so
+                // the boundary between adjacent words sits in actual
+                // whitespace, not inside dead space that Tesseract
+                // assigned to the wrong word.
+                //
+                // Two-phase approach:
+                // Phase 1 (legacy): walk backward from prev_right looking
+                //   for fully-empty columns.  Handles the common case.
+                // Phase 2 (rebalance): if phase 1 found nothing to trim
+                //   AND the words are flush, scan the boundary region for
+                //   a zero-ink column — the actual inter-word gap that
+                //   the previous word's rightward expansion overshot
+                //   (common with italic text where glyphs lean into the
+                //   next word's space).
+                if i > 0 {
+                    let prev_x = line.words[i - 1].x;
+                    let prev_right = prev_x + line.words[i - 1].width;
+                    let prev_y_top = line.words[i - 1].y;
+                    let prev_y_bot = prev_y_top + line.words[i - 1].height;
+
+                    // Phase 1: trim trailing empty columns.
+                    let mut shrink_to = prev_right;
+                    for col in (prev_x..prev_right).rev() {
+                        let col_has_ink = (prev_y_top..prev_y_bot)
+                            .any(|row| gray.get_pixel(col.min(page_w - 1), row).0[0] < ink_threshold);
+                        if col_has_ink {
+                            shrink_to = col + 1;
+                            break;
+                        }
+                        shrink_to = col;
+                    }
+                    if shrink_to < prev_right {
+                        let old_w = line.words[i - 1].width;
+                        line.words[i - 1].width = shrink_to.saturating_sub(prev_x);
+                        debug!(
+                            "  word ink-shrink trailing: '{}' width {}→{} (freed {}px for '{}')",
+                            line.words[i - 1].text, old_w, line.words[i - 1].width,
+                            prev_right - shrink_to, line.words[i].text
+                        );
+                        limit = shrink_to;
+                    } else if left_edge <= prev_right {
+                        // Phase 2: phase 1 found nothing (rightmost column
+                        // has ink) and the words are flush or overlapping.
+                        // The prev word's expansion likely overshot through
+                        // a narrow gap into the current word's glyph ink.
+                        // Scan backward from the boundary for a zero-ink
+                        // column — the actual inter-word whitespace gap.
+                        let prev_h = line.words[i - 1].height;
+                        let scan_y_top = prev_y_top.min(word_y);
+                        let scan_y_bot = prev_y_bot.max(word_y + word_h);
+                        // Only scan back at most one word-height (roughly
+                        // one character width) from the boundary.
+                        let scan_left = prev_right.saturating_sub(prev_h).max(prev_x);
+                        let mut gap_col: Option<u32> = None;
+                        for col in (scan_left..prev_right).rev() {
+                            let ink: u32 = (scan_y_top..scan_y_bot)
+                                .map(|row| {
+                                    let px = gray.get_pixel(col.min(page_w - 1), row).0[0];
+                                    if px < ink_threshold { 1 } else { 0 }
+                                })
+                                .sum();
+                            if ink == 0 {
+                                gap_col = Some(col);
+                                break;
+                            }
+                        }
+                        if let Some(gc) = gap_col {
+                            let old_w = line.words[i - 1].width;
+                            line.words[i - 1].width = gc.saturating_sub(prev_x);
+                            debug!(
+                                "  word boundary rebalance: '{}' width {}→{} (freed {}px for '{}')",
+                                line.words[i - 1].text, old_w, line.words[i - 1].width,
+                                prev_right - gc, line.words[i].text
+                            );
+                            limit = gc;
+                        }
+                    }
+                }
+
+                if left_edge > limit {
+                    let y_top = word_y;
+                    let y_bot = word_y + word_h;
+
+                    // Check for ink anywhere between limit and left_edge,
+                    // not just at the current edge — Tesseract may have
+                    // placed the box several pixels right of the glyph.
+                    let gap_has_ink = (limit..left_edge)
+                        .any(|col| (y_top..y_bot)
+                            .any(|row| gray.get_pixel(col.min(page_w - 1), row).0[0] < ink_threshold));
+
+                    let has_edge_ink = (y_top..y_bot)
+                        .any(|row| gray.get_pixel(left_edge.min(page_w - 1), row).0[0] < ink_threshold);
+
+                    if has_edge_ink || gap_has_ink {
+                        let mut new_left = left_edge;
+                        for col in (limit..left_edge).rev() {
+                            let col_has_ink = (y_top..y_bot)
+                                .any(|row| gray.get_pixel(col, row).0[0] < ink_threshold);
+                            if col_has_ink {
+                                new_left = col;
+                            } else {
+                                break;
+                            }
+                        }
+                        if new_left < left_edge {
+                            let growth = left_edge - new_left;
+                            debug!(
+                                "  word ink-expand left: '{}' x {}→{} (+{}px)",
+                                line.words[i].text, line.words[i].x, new_left, growth
+                            );
+                            line.words[i].x = new_left;
+                            line.words[i].width += growth;
+                            changed = true;
+                        }
+                    }
+                }
+            }
+
+            // ── Vertical expansion (bounded by line bbox) ───────────
+            {
+                let w = &line.words[i];
+                let wx = w.x;
+                let wr = (w.x + w.width).min(page_w);
+                let word_top = w.y;
+                let word_bot = w.y + w.height;
+
+                // Expand upward
+                let mut new_top = word_top;
+                for row in (line_top..word_top).rev() {
+                    let row_has_ink = (wx..wr)
+                        .any(|col| gray.get_pixel(col, row).0[0] < ink_threshold);
+                    if row_has_ink {
+                        new_top = row;
+                    } else {
+                        break;
+                    }
+                }
+
+                // Expand downward
+                let mut new_bot = word_bot;
+                for row in word_bot..line_bot {
+                    let row_has_ink = (wx..wr)
+                        .any(|col| gray.get_pixel(col, row).0[0] < ink_threshold);
+                    if row_has_ink {
+                        new_bot = row + 1;
+                    } else {
+                        break;
+                    }
+                }
+
+                // Add 1px anti-alias padding (bounded by line bbox).
+                // Rasterized text has sub-threshold anti-aliased edges
+                // that the ink walk misses; the padding captures them.
+                if new_top > line_top { new_top -= 1; }
+                if new_bot < line_bot { new_bot += 1; }
+
+                if new_top < word_top || new_bot > word_bot {
+                    let old_h = line.words[i].height;
+                    line.words[i].y = new_top;
+                    line.words[i].height = new_bot - new_top;
+                    debug!(
+                        "  word ink-expand vert: '{}' y {}→{} h {}→{}",
+                        line.words[i].text, word_top, new_top, old_h, line.words[i].height
+                    );
+                    changed = true;
+                }
+            }
+
+            if changed {
+                expanded += 1;
+            }
+        }
+    }
+
+    if expanded > 0 {
+        info!("  Expanded {} word bbox(es) to ink (horiz+vert)", expanded);
     }
 }
 

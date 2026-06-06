@@ -100,12 +100,12 @@ pub struct Args {
     #[arg(long, default_value_t = 1.0)]
     pub thoroughness: f32,
 
-    /// When used with --audit, also render each extracted character from
-    /// this font file using the index-time render_char_normalised() code path.
-    /// Saves as NN_c_ref.png next to the scan crop NN_c.png for side-by-side
-    /// comparison using identical normalization.
-    #[arg(long, value_name = "FONT", requires = "audit")]
-    pub diag_ref_font: Option<PathBuf>,
+    /// Render characters using the index-time render_char_normalised() pipeline
+    /// and save as PNGs.  Takes a JSON object: {"font": "/path/to/font.ttf",
+    /// "chars": "abc", "output_dir": "/tmp/refs"}.  Each character is saved as
+    /// U+XXXX.png (e.g. U+0048.png for 'H').  Exits after rendering.
+    #[arg(long, value_name = "JSON")]
+    pub render_ref_chars: Option<String>,
 }
 
 impl Args {
@@ -149,7 +149,7 @@ impl Args {
 
     /// Validate: if not --index, require input and output.
     pub fn validate(&self) -> Result<(), String> {
-        if self.index {
+        if self.index || self.render_ref_chars.is_some() {
             return Ok(());
         }
         if self.input.is_none() {

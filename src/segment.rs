@@ -14,9 +14,9 @@ const ENTRY_PENALTY_WEIGHT: f32 = 4.0;
 
 /// Fraction of the crop height that represents the smallest symbol
 /// (a period).  A period is roughly 8% of line height.  The minimum
-/// ink threshold is `(MIN_SYMBOL_FRAC * h)² × 255`, making it scale
-/// with DPI and font size.  This may be on the low side — if
-/// anti-aliasing bleed starts producing false splits, raise it.
+/// ink threshold is `(MIN_SYMBOL_FRAC * h)²` dark pixels (counted,
+/// not intensity-weighted), making it scale with DPI and font size
+/// without penalising grey/anti-aliased text vs solid black.
 const MIN_SYMBOL_FRAC: f32 = 0.07;
 
 
@@ -58,6 +58,9 @@ fn segment_characters_inner(
     diag_dir: Option<&std::path::Path>,
     word_text: Option<&str>,
 ) -> (Vec<u32>, HashMap<u32, Vec<u32>>) {
+    if word_text.map_or(false, |w| w.starts_with("abcdefg")) {
+        eprintln!("  SEGINNER ENTRY: n_chars={} diag={} wtext={:?}", n_chars, diag_dir.is_some(), word_text);
+    }
     let (w, h) = img.dimensions();
     if n_chars <= 1 {
         return (vec![0, w], HashMap::new());
@@ -69,9 +72,10 @@ fn segment_characters_inner(
     let need = n_chars - 1; // number of splits needed
 
     // Minimum ink for a real symbol, scaled to crop height.
-    // (0.08 * h)² * 255 — see MIN_SYMBOL_FRAC.
+    // Count of pixels above ink threshold — not weighted by intensity,
+    // so grey/anti-aliased text isn't penalised vs black text.
     let min_side = MIN_SYMBOL_FRAC * h as f32;
-    let min_ink_for_symbol = (min_side * min_side * 255.0) as u32;
+    let min_ink_for_symbol = (min_side * min_side) as u32;
 
     // Two-pass segmentation cascade:
     //   Pass 1 — VP strict zero-ink: split at columns with truly zero ink
@@ -83,13 +87,13 @@ fn segment_characters_inner(
 
     let threshold = 200u8;
 
-    // Compute total ink per column (sum of dark-pixel intensities).
+    // Compute total ink per column (count of pixels above ink threshold).
     let col_ink: Vec<u32> = (0..w)
         .map(|x| {
             (0..h)
                 .map(|y| {
                     let px = img.get_pixel(x, y).0[0];
-                    if px < threshold { (255 - px) as u32 } else { 0 }
+                    if px < threshold { 1u32 } else { 0 }
                 })
                 .sum()
         })
@@ -106,7 +110,14 @@ fn segment_characters_inner(
     // near-duplicate splits (e.g. 173 and 174) from consuming slots
     // that should go to real inter-character gaps.
 
-    let col_has_ink: Vec<bool> = col_ink.iter().map(|&v| v > 0).collect();
+    // VP valleys: strict zero-ink only.  Relaxed thresholds cause too many
+    // false VP splits through genuine thin strokes (at h=42, even 2-pixel
+    // columns can be real ink).  Low-ink-but-nonzero columns are handled by
+    // the seam pass below with a VP-preference bias: when a seam's nominal
+    // column is near a low-ink valley, the seam is snapped to the valley's
+    // vertical line instead of its diagonal path.
+    let col_has_ink_strict: Vec<bool> = col_ink.iter().map(|&v| v > 0).collect();
+    let col_has_ink: Vec<bool> = col_has_ink_strict.clone();
 
     let mut splits: Vec<u32> = Vec::with_capacity(need);
 
@@ -161,7 +172,7 @@ fn segment_characters_inner(
     // Initially: one segment spanning the whole word.
     struct Segment { left: u32, right: u32, ink_left: u32, ink_right: u32 }
 
-    let initial_ink = ink_extent(&col_has_ink, 0, w);
+    let initial_ink = ink_extent(&col_has_ink_strict, 0, w);
     let mut segments: Vec<Segment> = vec![Segment {
         left: 0, right: w,
         ink_left: initial_ink.0, ink_right: initial_ink.1,
@@ -206,8 +217,8 @@ fn segment_characters_inner(
         splits.push(mid);
 
         let old = &segments[si];
-        let left_ink = ink_extent(&col_has_ink, old.left, mid);
-        let right_ink = ink_extent(&col_has_ink, mid, old.right);
+        let left_ink = ink_extent(&col_has_ink_strict, old.left, mid);
+        let right_ink = ink_extent(&col_has_ink_strict, mid, old.right);
         let left_seg = Segment { left: old.left, right: mid, ink_left: left_ink.0, ink_right: left_ink.1 };
         let right_seg = Segment { left: mid, right: old.right, ink_left: right_ink.0, ink_right: right_ink.1 };
         segments.splice(si..=si, [left_seg, right_seg]);
@@ -224,7 +235,7 @@ fn segment_characters_inner(
         let _ = img.save(ddir.join("word_crop.png"));
         eprintln!(
             "  DIAG-SEG VP: \"{}\" {}x{} — {} vp splits, need {} total",
-            &wtext[..wtext.len().min(30)], w, h, vp_splits.len(), need,
+            &wtext.chars().take(30).collect::<String>(), w, h, vp_splits.len(), need,
         );
     }
 
@@ -276,6 +287,7 @@ fn segment_characters_inner(
             seg_start: u32,
             seg_end: u32,
             seg_id: u32,
+            is_vertical: bool,
         }
         impl Eq for SeamEntry {}
         impl PartialOrd for SeamEntry {
@@ -322,10 +334,10 @@ fn segment_characters_inner(
             }
         }
         for &(seg_start, seg_end) in &initial_segs {
-            let (ink_l, ink_r) = ink_extent(&col_has_ink, seg_start, seg_end);
+            let (ink_l, ink_r) = ink_extent(&col_has_ink_strict, seg_start, seg_end);
             if ink_r > ink_l + 2 {
                 let sid = next_seg_id; next_seg_id += 1;
-                let (cands, dp) = candidate_seams(&energy, ink_l, ink_r, h, None, None);
+                let (cands, dp, vert_wins) = candidate_seams(&energy, ink_l, ink_r, h, None, None);
                 if word_text.map_or(false, |w| w.starts_with("tradition")) {
                     eprintln!("  SEED seg=[{},{}) ink=[{},{}) {} candidates sid={}", seg_start, seg_end, ink_l, ink_r, cands.len(), sid);
                     for (col, cost) in &cands {
@@ -333,7 +345,7 @@ fn segment_characters_inner(
                     }
                 }
                 for (col, cost) in &cands {
-                    heap.push(SeamEntry { cost: *cost, col: *col, seg_start: ink_l, seg_end: ink_r, seg_id: sid });
+                    heap.push(SeamEntry { cost: *cost, col: *col, seg_start: ink_l, seg_end: ink_r, seg_id: sid, is_vertical: vert_wins.contains(col) });
                 }
                 seg_bounds.insert(sid, SegBounds { left_path: None, right_path: None });
                 dp_cache.insert(sid, dp);
@@ -355,7 +367,7 @@ fn segment_characters_inner(
             // Skip candidates from dead segments (replaced or consumed).
             if dead_sids.contains(&entry.seg_id) { continue; }
 
-            if word_text.map_or(false, |w| w.starts_with("tradition")) {
+            if word_text.map_or(false, |w| w.starts_with("tradition") || w.starts_with("abcdefg")) {
                 eprintln!("  SEAM POP [{}]: col={} cost={:.1} seg=[{},{}) sid={} | accepted={:?}", word_text.unwrap_or("?"), entry.col, entry.cost, entry.seg_start, entry.seg_end, entry.seg_id, &splits);
             }
 
@@ -366,8 +378,8 @@ fn segment_characters_inner(
             }
 
             // Validate: both children must have meaningful ink.
-            let left_ink = ink_extent(&col_has_ink, entry.seg_start, entry.col);
-            let right_ink = ink_extent(&col_has_ink, entry.col + 1, entry.seg_end);
+            let left_ink = ink_extent(&col_has_ink_strict, entry.seg_start, entry.col);
+            let right_ink = ink_extent(&col_has_ink_strict, entry.col + 1, entry.seg_end);
             let left_ok = left_ink.1 > left_ink.0 + 2;
             let right_ok = right_ink.1 > right_ink.0 + 2;
 
@@ -381,9 +393,9 @@ fn segment_characters_inner(
                         let parent_bounds = seg_bounds.get(&entry.seg_id);
                         let lp = parent_bounds.and_then(|b| b.left_path.clone());
                         let rp = parent_bounds.and_then(|b| b.right_path.clone());
-                        let (cands, dp) = candidate_seams(&energy, entry.seg_start, new_end, h, lp.as_deref(), rp.as_deref());
+                        let (cands, dp, vert_wins) = candidate_seams(&energy, entry.seg_start, new_end, h, lp.as_deref(), rp.as_deref());
                         for (col, cost) in &cands {
-                            heap.push(SeamEntry { cost: *cost, col: *col, seg_start: entry.seg_start, seg_end: new_end, seg_id: sid });
+                            heap.push(SeamEntry { cost: *cost, col: *col, seg_start: entry.seg_start, seg_end: new_end, seg_id: sid, is_vertical: vert_wins.contains(col) });
                         }
                         seg_bounds.insert(sid, SegBounds { left_path: lp, right_path: rp });
                         dp_cache.insert(sid, dp);
@@ -399,9 +411,9 @@ fn segment_characters_inner(
                         let parent_bounds = seg_bounds.get(&entry.seg_id);
                         let lp = parent_bounds.and_then(|b| b.left_path.clone());
                         let rp = parent_bounds.and_then(|b| b.right_path.clone());
-                        let (cands, dp) = candidate_seams(&energy, new_start, entry.seg_end, h, lp.as_deref(), rp.as_deref());
+                        let (cands, dp, vert_wins) = candidate_seams(&energy, new_start, entry.seg_end, h, lp.as_deref(), rp.as_deref());
                         for (col, cost) in &cands {
-                            heap.push(SeamEntry { cost: *cost, col: *col, seg_start: new_start, seg_end: entry.seg_end, seg_id: sid });
+                            heap.push(SeamEntry { cost: *cost, col: *col, seg_start: new_start, seg_end: entry.seg_end, seg_id: sid, is_vertical: vert_wins.contains(col) });
                         }
                         seg_bounds.insert(sid, SegBounds { left_path: lp, right_path: rp });
                         dp_cache.insert(sid, dp);
@@ -415,11 +427,17 @@ fn segment_characters_inner(
             }
 
             // Trace the seam path early — needed for diagonal ink check.
-            let path = match dp_cache.get(&entry.seg_id) {
-                Some(dp) => dp.trace_path_through(&energy, entry.col),
-                None => {
-                    // Segment was already consumed; skip stale candidate.
-                    continue;
+            // Vertical-only winners get a straight vertical path; DP
+            // winners get the cheapest diagonal path through their column.
+            let path = if entry.is_vertical {
+                vec![entry.col; h as usize]
+            } else {
+                match dp_cache.get(&entry.seg_id) {
+                    Some(dp) => dp.trace_path_through(&energy, entry.col),
+                    None => {
+                        // Segment was already consumed; skip stale candidate.
+                        continue;
+                    }
                 }
             };
 
@@ -437,11 +455,11 @@ fn segment_characters_inner(
                 let rb = right_bound.map_or(entry.seg_end, |rp| rp[row as usize]);
                 for c in lb..seam_col {
                     let px = img.get_pixel(c, row).0[0];
-                    if px < 200 { seam_ink_left += (255 - px) as u32; }
+                    if px < 200 { seam_ink_left += 1; }
                 }
                 for c in (seam_col + 1)..rb {
                     let px = img.get_pixel(c, row).0[0];
-                    if px < 200 { seam_ink_right += (255 - px) as u32; }
+                    if px < 200 { seam_ink_right += 1; }
                 }
             }
             if seam_ink_left < min_ink_for_symbol || seam_ink_right < min_ink_for_symbol {
@@ -449,10 +467,10 @@ fn segment_characters_inner(
                 continue;
             }
 
-            if word_text.map_or(false, |w| w.starts_with("tradition")) { eprintln!("    ACCEPT col={}", entry.col); }
-            if word_text.map_or(false, |w| w.starts_with("abcdefgh")) { eprintln!("    ACCEPT col={} cost={:.1} seg=[{},{}) sid={}", entry.col, entry.cost, entry.seg_start, entry.seg_end, entry.seg_id); }
-            splits.push(entry.col);
-            seam_paths.insert(entry.col, path.clone());
+            let final_col = entry.col;
+
+            splits.push(final_col);
+            seam_paths.insert(final_col, path.clone());
 
             // Capture parent's diagonal bounds before removing.
             let parent_lp = seg_bounds.get(&entry.seg_id).and_then(|b| b.left_path.clone());
@@ -464,16 +482,20 @@ fn segment_characters_inner(
             dp_cache.remove(&old_sid);
             seg_bounds.remove(&old_sid);
 
+            // Recompute child ink extents using the final (possibly VP-snapped) column.
+            let child_left_ink = ink_extent(&col_has_ink_strict, entry.seg_start, final_col);
+            let child_right_ink = ink_extent(&col_has_ink_strict, final_col + 1, entry.seg_end);
+
             // Left child: inherits parent's left boundary, seam path as right boundary.
             {
-                let (ink_l, ink_r) = left_ink;
+                let (ink_l, ink_r) = child_left_ink;
                 if ink_r > ink_l + 2 {
                     let sid = next_seg_id; next_seg_id += 1;
                     let lp = parent_lp.clone();
                     let rp: Option<Vec<u32>> = Some(path.clone());
-                    let (cands, dp) = candidate_seams(&energy, ink_l, ink_r, h, lp.as_deref(), rp.as_deref());
+                    let (cands, dp, vert_wins) = candidate_seams(&energy, ink_l, ink_r, h, lp.as_deref(), rp.as_deref());
                     for (col, cost) in &cands {
-                        heap.push(SeamEntry { cost: *cost, col: *col, seg_start: ink_l, seg_end: ink_r, seg_id: sid });
+                        heap.push(SeamEntry { cost: *cost, col: *col, seg_start: ink_l, seg_end: ink_r, seg_id: sid, is_vertical: vert_wins.contains(col) });
                     }
                     seg_bounds.insert(sid, SegBounds { left_path: lp, right_path: rp });
                     dp_cache.insert(sid, dp);
@@ -482,14 +504,14 @@ fn segment_characters_inner(
 
             // Right child: seam path as left boundary, inherits parent's right boundary.
             {
-                let (ink_l, ink_r) = right_ink;
+                let (ink_l, ink_r) = child_right_ink;
                 if ink_r > ink_l + 2 {
                     let sid = next_seg_id; next_seg_id += 1;
                     let lp: Option<Vec<u32>> = Some(path.clone());
                     let rp = parent_rp.clone();
-                    let (cands, dp) = candidate_seams(&energy, ink_l, ink_r, h, lp.as_deref(), rp.as_deref());
+                    let (cands, dp, vert_wins) = candidate_seams(&energy, ink_l, ink_r, h, lp.as_deref(), rp.as_deref());
                     for (col, cost) in &cands {
-                        heap.push(SeamEntry { cost: *cost, col: *col, seg_start: ink_l, seg_end: ink_r, seg_id: sid });
+                        heap.push(SeamEntry { cost: *cost, col: *col, seg_start: ink_l, seg_end: ink_r, seg_id: sid, is_vertical: vert_wins.contains(col) });
                     }
                     seg_bounds.insert(sid, SegBounds { left_path: lp, right_path: rp });
                     dp_cache.insert(sid, dp);
@@ -658,11 +680,11 @@ fn candidate_seams(
     h: u32,
     left_path: Option<&[u32]>,   // pixels with col <= left_path[r] are masked
     right_path: Option<&[u32]>,  // pixels with col >= right_path[r] are masked
-) -> (Vec<(u32, f32)>, SeamDp) {
+) -> (Vec<(u32, f32)>, SeamDp, HashSet<u32>) {
     let seg_w = (seg_end - seg_start) as usize;
     if seg_w < 3 || h < 1 {
         let dp = SeamDp { cost_fwd: Vec::new(), cost_rev: Vec::new(), seg_start, seg_end, h };
-        return (Vec::new(), dp);
+        return (Vec::new(), dp, HashSet::new());
     }
     let base = seg_start as usize;
     let mid_r = (h / 2) as usize;
@@ -739,20 +761,22 @@ fn candidate_seams(
     // For each interior column at mid-row, the cheapest path through it
     // costs cost_fwd[mid][c] + cost_rev[mid][c] - energy[mid][c]
     // (subtract once to avoid double-counting the mid-row pixel).
-    let mut raw_candidates: Vec<(u32, f32)> = Vec::with_capacity(seg_w.saturating_sub(2));
+    let mut dp_candidates: Vec<(u32, f32)> = Vec::with_capacity(seg_w.saturating_sub(2));
     for c in 1..seg_w - 1 {
         let me = masked_energy(mid_r, c);
         if me >= f32::INFINITY { continue; } // masked pixel, skip
         let combined = cost_fwd[mid_r][c] + cost_rev[mid_r][c] - me;
         let split_col = seg_start + c as u32;
-        raw_candidates.push((split_col, combined));
+        dp_candidates.push((split_col, combined));
     }
 
     // Vertical-only candidates: score each column as a straight vertical
-    // cut, discounting ink in the top and bottom serif bands (~15% of
-    // height each).  Serifs bridge adjacent characters horizontally, so
-    // ink there shouldn't penalise an otherwise clean vertical split.
-    let serif_rows = (h as f32 * 0.15).ceil() as usize;
+    // cut, discounting ink where the horizontal dark run through the
+    // candidate column is short (serif bridges).  Unlike the fixed
+    // top/bottom band discount, this catches serifs at any height
+    // (lowercase x-height, baseline, cap-height, etc.).
+    let img_w = energy[0].len();
+    let mut vert_candidates: Vec<(u32, f32)> = Vec::with_capacity(seg_w.saturating_sub(2));
     for c in 1..seg_w - 1 {
         let abs_col = base + c;
         let mut cost = 0.0f32;
@@ -760,27 +784,62 @@ fn candidate_seams(
         for r in 0..h as usize {
             let e = masked_energy(r, c);
             if e >= f32::INFINITY { masked = true; break; }
-            let weight = if r < serif_rows || r >= (h as usize - serif_rows) {
-                0.25  // discount serif-band ink
+            // Measure horizontal dark run length through this column.
+            // Short runs (1-3 px) are likely serif bridges → heavy discount.
+            let mut run_len = 1u32;
+            // Extend left
+            {
+                let mut cx = abs_col.wrapping_sub(1);
+                while cx < img_w && energy[r][cx] > 0.0 {
+                    run_len += 1;
+                    if cx == 0 { break; }
+                    cx = cx.wrapping_sub(1);
+                }
+            }
+            // Extend right
+            {
+                let mut cx = abs_col + 1;
+                while cx < img_w && energy[r][cx] > 0.0 {
+                    run_len += 1;
+                    cx += 1;
+                }
+            }
+            let weight = if run_len <= 3 {
+                0.15  // thin serif bridge — heavy discount
+            } else if run_len <= 6 {
+                0.4   // moderate connection
             } else {
-                1.0
+                1.0   // real glyph stroke — full price
             };
             cost += e * weight;
         }
         if !masked {
-            raw_candidates.push((seg_start + c as u32, cost));
+            vert_candidates.push((seg_start + c as u32, cost));
         }
     }
 
     // Deduplicate: for each column keep only the cheapest candidate
-    // (DP path or vertical cut, whichever wins).
+    // (DP path or vertical cut, whichever wins).  Track which columns
+    // were won by the vertical-only candidate.
+    let mut vertical_winners: HashSet<u32> = HashSet::new();
+    let mut raw_candidates: Vec<(u32, f32)>;
     {
-        let mut best: HashMap<u32, f32> = HashMap::new();
-        for &(col, cost) in &raw_candidates {
-            let entry = best.entry(col).or_insert(f32::INFINITY);
-            if cost < *entry { *entry = cost; }
+        // Start with DP candidates as baseline
+        let mut best: HashMap<u32, (f32, bool)> = HashMap::new(); // col -> (cost, is_vertical)
+        for &(col, cost) in &dp_candidates {
+            best.insert(col, (cost, false));
         }
-        raw_candidates = best.into_iter().collect();
+        // Vertical candidates override if cheaper
+        for &(col, cost) in &vert_candidates {
+            let entry = best.entry(col).or_insert((f32::INFINITY, false));
+            if cost < entry.0 {
+                *entry = (cost, true);
+            }
+        }
+        for (&col, &(_cost, is_vert)) in &best {
+            if is_vert { vertical_winners.insert(col); }
+        }
+        raw_candidates = best.into_iter().map(|(col, (cost, _))| (col, cost)).collect();
         raw_candidates.sort_by(|a, b| a.0.cmp(&b.0));
     }
 
@@ -799,11 +858,15 @@ fn candidate_seams(
             i += 1;
         }
         let mid_idx = (run_start + i - 1) / 2;
+        let mid_col = raw_candidates[mid_idx].0;
+        // If any column in this run was a vertical winner, the midpoint inherits that.
+        let any_vert = (run_start..i).any(|j| vertical_winners.contains(&raw_candidates[j].0));
+        if any_vert { vertical_winners.insert(mid_col); }
         candidates.push(raw_candidates[mid_idx]);
     }
 
     let dp = SeamDp { cost_fwd, cost_rev, seg_start, seg_end, h };
-    (candidates, dp)
+    (candidates, dp, vertical_winners)
 }
 
 /// Uniform character boundaries.

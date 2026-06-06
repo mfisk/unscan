@@ -27,7 +27,7 @@
 
 use ab_glyph::{Font, FontRef, PxScale, ScaleFont, point};
 use image::{GrayImage, Luma};
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::io;
 use std::path::Path;
 
@@ -1614,12 +1614,11 @@ pub struct LineCharCrops {
     pub ligature: Option<Vec<(char, GrayImage)>>,
 }
 
-pub fn extract_line_chars<F: ab_glyph::Font>(
+pub fn extract_line_chars(
     page: &GrayImage,
     words: &[WordPlacement],
     line_height: u32,
     diag_seg_dir: Option<&std::path::Path>,
-    diag_ref_font: Option<&F>,
 ) -> LineCharCrops {
     if words.is_empty() || line_height == 0 {
         return LineCharCrops { plain: Vec::new(), ligature: None };
@@ -1669,18 +1668,10 @@ pub fn extract_line_chars<F: ab_glyph::Font>(
             continue;
         }
 
-        // Crop the word at Tesseract's bbox (reliable at word level).
-        // Don't ink-expand or ink-trim — the bbox is already tight and
-        // ink-trimming picks up stray text from adjacent lines.
+        // Crop the word at Tesseract's bbox (already horizontally ink-expanded
+        // by expand_words_to_ink in the OCR pass).
+        // Don't ink-trim — trimming picks up stray text from adjacent lines.
         let word_img = image::imageops::crop_imm(page, wx, wy, crop_w, crop_h).to_image();
-
-        // Debug: dump pre-segmentation word image
-        if std::env::var("UNSCAN_DUMP_CROPS").is_ok() {
-            let dump_dir = std::path::PathBuf::from("/tmp/unscan-crops");
-            std::fs::create_dir_all(&dump_dir).ok();
-            let fname = format!("word_{}.png", word.text.replace(' ', "_").replace('/', "_"));
-            word_img.save(dump_dir.join(&fname)).ok();
-        }
 
         let (_word_w, word_h) = word_img.dimensions();
         let all_chars: Vec<char> = word.text.chars().collect();
@@ -1709,7 +1700,7 @@ pub fn extract_line_chars<F: ab_glyph::Font>(
             &word_img, &all_chars, &bounds_plain, &seams_plain, word_h,
             &mut counts_plain, &mut results_plain,
             word_diag_dir.as_ref().map(|d| d.join("seg_plain")).as_deref(),
-            diag_ref_font,
+
         );
         results.extend(results_plain);
         char_counts = counts_plain;
@@ -1729,7 +1720,7 @@ pub fn extract_line_chars<F: ab_glyph::Font>(
                 &word_img, &lig_chars, &bounds_lig, &seams_lig, word_h,
                 &mut counts_lig, &mut results_lig,
                 word_diag_dir.as_ref().map(|d| d.join("seg_lig")).as_deref(),
-                diag_ref_font,
+
             );
             results_lig_all.extend(results_lig);
             char_counts_lig = counts_lig;
@@ -1776,7 +1767,7 @@ const LIGATURE_SEQUENCES: &[(&[char], char)] = &[
     (&['f', 'l'],      '\u{FB02}'),  // fl
 ];
 
-fn extract_chars_from_boundaries<F: ab_glyph::Font>(
+fn extract_chars_from_boundaries(
     word_img: &GrayImage,
     chars: &[char],
     boundaries: &[u32],
@@ -1785,7 +1776,6 @@ fn extract_chars_from_boundaries<F: ab_glyph::Font>(
     char_counts: &mut HashMap<char, usize>,
     results: &mut Vec<(char, GrayImage)>,
     diag_dir: Option<&std::path::Path>,
-    diag_ref_font: Option<&F>,
 ) {
     let (ww, _wh) = word_img.dimensions();
 
@@ -1867,14 +1857,6 @@ fn extract_chars_from_boundaries<F: ab_glyph::Font>(
             let label = crate::seg_diag::sanitize_char(c);
             let fname = format!("{:02}_{}.png", i, label);
             let _ = scaled.save(ddir.join("chars").join(fname));
-
-            // Also save index-time render from reference font for comparison
-            if let Some(ref_font) = diag_ref_font {
-                if let Some(ref_img) = render_char_normalised(ref_font, c) {
-                    let ref_fname = format!("{:02}_{}_ref.png", i, label);
-                    let _ = ref_img.save(ddir.join("chars").join(ref_fname));
-                }
-            }
         }
 
         results.push((c, scaled));
@@ -2007,6 +1989,10 @@ pub fn search_candidates(
     // For each character, find nearby fonts and record their distances.
     // font_id → Vec<(log_dist, weight)>
     let mut font_log_dists: HashMap<usize, Vec<(f32, f32)>> = HashMap::new();
+    // Track which gated crops each font appeared in (for second-pass real-distance lookup)
+    let mut font_gated_hits: HashMap<usize, HashSet<usize>> = HashMap::new();
+    // Collect crop info for gated crops so we can compute real distances in second pass
+    let mut gated_crops: Vec<(char, [f32; FEAT_LEN], f32)> = Vec::new(); // (score_ch, query_feat, weight)
     let mut quality_gate_pass = 0usize;
     let mut quality_gate_fail = 0usize;
     let mut no_tree = 0usize;
@@ -2114,12 +2100,45 @@ pub fn search_candidates(
             continue;
         }
 
-        for (font_id, dist_sq) in &hits {
+        let score_ch = effective_ch.unwrap_or(*c);
+        gated_crops.push((score_ch, *query_feat, weight));
+        let gated_idx = gated_crops.len() - 1;
 
-            // ε = 1e-10 avoids log(0) for self-matches / identical OT variants
+        for (font_id, dist_sq) in &hits {
             let log_d = (dist_sq + 1e-10_f32).ln();
             font_log_dists.entry(*font_id).or_default().push((log_d, weight));
+            font_gated_hits.entry(*font_id).or_default().insert(gated_idx);
         }
+    }
+
+    // ── Second pass: fill in real distances for candidate fonts that fell
+    //    outside the search radius on some characters. ──────────────────
+    //
+    // The radius filter in nearest_within_factor_brute can exclude the
+    // correct font when another font happens to land very close on that
+    // character (tightening the radius).  Rather than fabricating a harsh
+    // fixed penalty (log(1.0) = 0.0, ~100,000× worse than real distances),
+    // we look up the font's actual distance from flat_vecs.
+    let n_gated = gated_crops.len();
+    let mut backfill_count = 0usize;
+    for (font_id, hit_set) in &font_gated_hits {
+        if hit_set.len() < n_gated {
+            for (gi, (score_ch, qfeat, w)) in gated_crops.iter().enumerate() {
+                if !hit_set.contains(&gi) {
+                    if let Some(points) = index.flat_vecs.get(score_ch) {
+                        if let Some((_, ref_vec)) = points.iter().find(|(fid, _)| fid == font_id) {
+                            let dist_sq = squared_distance(qfeat, ref_vec);
+                            let log_d = (dist_sq + 1e-10_f32).ln();
+                            font_log_dists.entry(*font_id).or_default().push((log_d, *w));
+                            backfill_count += 1;
+                        }
+                    }
+                }
+            }
+        }
+    }
+    if backfill_count > 0 {
+        eprintln!("  CI: backfilled {} real distances for out-of-radius candidates", backfill_count);
     }
 
     eprintln!(
@@ -2131,36 +2150,35 @@ pub fn search_candidates(
         font_log_dists.len(),
     );
 
-    // Aggregate: geometric mean of distances per font.
+    // Aggregate: weighted geometric mean of distances per font.
     //
-    // For fonts missing from some characters, we penalize with a large
-    // distance (the penalty is the max log-distance seen across all fonts
-    // for that character slot).  But first we enforce the quorum — fonts
-    // appearing in fewer than ceil(n/2) characters are dropped entirely.
-    let penalty_log_dist = 0.0_f32; // log(1.0) = 0; i.e. d²=1.0, very far in normalized space
+    // After the second pass, candidate fonts have real distances for all
+    // characters they were within radius on PLUS actual distances for chars
+    // they fell outside the radius on.  The fixed penalty below now only
+    // fires for fonts that genuinely lack a glyph for a character (rare
+    // for Latin text).
+    let penalty_log_dist = 0.0_f32; // log(1.0); appropriate for genuinely missing glyphs
 
-    // Keep a backup for the "at least 1" fallback (quorum may drop everything)
+    // Keep a backup for the "at least 1" fallback
     let font_log_dists_backup: HashMap<usize, Vec<(f32, f32)>> = font_log_dists.clone();
 
     let mut scores: Vec<(String, f32)> = font_log_dists
         .into_iter()
         .filter_map(|(font_id, log_dists)| {
             let matched = log_dists.len();
-            // Quorum gate disabled — the penalty mechanism for missing
-            // characters already handles sparse matches, and quorum
-            // causes vote-splitting across font-family variants
-            // (e.g. NotoSerif Regular vs SemiCondensed vs Condensed).
             let name = index.font_names_table.get(font_id)?.clone();
 
             // Weighted mean of log-distances.
-            // Pad missing characters with the penalty distance.
             let mut total_weight = 0.0_f32;
             let mut weighted_sum = 0.0_f32;
             for (ld, w) in &log_dists {
                 weighted_sum += ld * w;
                 total_weight += w;
             }
-            // Penalty for missing characters
+
+            // Penalty for genuinely missing glyphs (font can't render char).
+            // After the second-pass backfill, this only fires when a font
+            // truly lacks a glyph — not when it fell outside the search radius.
             for _ in matched..n_chars {
                 weighted_sum += penalty_log_dist * 1.0;
                 total_weight += 1.0;

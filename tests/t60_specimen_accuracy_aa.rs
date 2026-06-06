@@ -14,7 +14,7 @@ mod common;
 use common::{test_doc, ensure_index};
 
 /// Minimum acceptable accuracy (hits / compared).
-const MIN_ACCURACY: f64 = 0.965;
+const MIN_ACCURACY: f64 = 0.98;
 
 #[test]
 fn specimen_font_accuracy_aa() {
