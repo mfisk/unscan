@@ -616,6 +616,7 @@ fn run(args: &cli::Args) -> Result<(), ScanTextError> {
         let ink_thresh = bg_color.0.saturating_sub(56);
         ocr::expand_bbox_to_ink(&mut lines, &gray_page, ink_thresh);
         ocr::expand_words_to_ink(&mut lines, &gray_page, ink_thresh);
+        ocr::split_wide_whitespace_words(&mut lines, &gray_page, ink_thresh);
         let mut placed_texts: Vec<pdf_out::PlacedText> = Vec::new();
         let mut pg_vec = 0u32;
         let mut pg_raster = 0u32;
