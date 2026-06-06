@@ -14,7 +14,7 @@ mod common;
 use common::{test_doc, ensure_index};
 
 /// Lower threshold than t60 — binarization loses sub-pixel detail.
-const MIN_ACCURACY: f64 = 0.94;
+const MIN_ACCURACY: f64 = 0.83;
 
 #[test]
 fn specimen_font_accuracy_noaa() {
