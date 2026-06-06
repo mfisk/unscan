@@ -1069,6 +1069,7 @@ def build_miss_html(entry, chars_to_show, crop_dir, crop_files,
 
     # Gather segmentation stats from diag-seg data for the scan line label
     seg_stats_html = ""
+    seg_html = ""
     diag_line_dir = find_diag_seg_dir(diag_seg_root, entry["page"], entry.get("text", ""),
                                        line_index=entry.get("line_index"))
     if diag_line_dir:
@@ -1113,6 +1114,56 @@ def build_miss_html(entry, chars_to_show, crop_dir, crop_files,
         if seg_parts:
             seg_parts.sort(key=lambda t: t[0])
             seg_stats_html = f'Segmentation: {" | ".join(info for _, info in seg_parts)}'
+
+        # Segmentation picture — show both plain and ligature when available
+        seg_winner = entry.get("seg_winner")
+        has_lig_path = any(
+            os.path.isdir(os.path.join(diag_line_dir, d, "seg_lig"))
+            for d in os.listdir(diag_line_dir)
+            if d.startswith("word_") and os.path.isdir(os.path.join(diag_line_dir, d))
+        )
+
+        if has_lig_path:
+            # Show both paths side by side
+            seg_plain_result = render_seg_picture(diag_line_dir, seg_subdir="seg_plain")
+            seg_lig_result = render_seg_picture(diag_line_dir, seg_subdir="seg_lig")
+
+            parts = []
+            for label, result, is_winner in [
+                ("Plain", seg_plain_result, seg_winner == "plain"),
+                ("Ligature", seg_lig_result, seg_winner == "ligature"),
+            ]:
+                if result:
+                    seg_img, seg_caption = result
+                    winner_badge = ' <span style="color:#2e7d32;font-weight:bold">★ winner</span>' if is_winner else ''
+                    parts.append(f"""<div style="flex:1;min-width:0">
+<div style="font-weight:600;margin-bottom:4px">{label} segmentation{winner_badge}</div>
+<img src="{img_to_b64(seg_img)}" class="seg-img" style="max-width:100%">
+<div class="seg-caption">{seg_caption}</div>
+</div>""")
+
+            if parts:
+                seg_html = f"""<div class="seg-block">
+<div class="seg-legend">
+  <span class="leg-vp">■ VP split</span>
+  <span class="leg-seam">■ seam split</span>
+</div>
+<div style="display:flex;gap:16px;flex-wrap:wrap">
+{"".join(parts)}
+</div>
+</div>"""
+        else:
+            seg_result = render_seg_picture(diag_line_dir)
+            if seg_result:
+                seg_img, seg_caption = seg_result
+                seg_html = f"""<div class="seg-block">
+<div class="seg-legend">
+  <span class="leg-vp">■ VP split</span>
+  <span class="leg-seam">■ seam split</span>
+</div>
+<img src="{img_to_b64(seg_img)}" class="seg-img">
+<div class="seg-caption">{seg_caption}</div>
+</div>"""
 
     # SSIM comparison block: scan crop vs rendered, with diff image
     ssim_compare_html = ""
@@ -1188,6 +1239,7 @@ def build_miss_html(entry, chars_to_show, crop_dir, crop_files,
     return f"""<div class="miss">
 <h3>p{entry['page']}:L{entry['line_index']} — "{text_preview}"{ssim_html}</h3>
 {scan_line_html}
+{seg_html}
 {ssim_compare_html}
 {char_table_html}
 </div>"""
@@ -1325,7 +1377,6 @@ def main():
     ssim_failures = []
     hits = 0
     skipped = 0
-    ssim_fail_count = 0
     total_chars = 0
     corrected_chars = 0
 
@@ -1355,15 +1406,13 @@ def main():
             misses.append((e, actual_font, None, None, None))
             continue
 
-        if e.get("ssim_pass") is False:
-            ssim_fail_count += 1
-
         if fonts_match(matched, actual_font):
-            hits += 1
-            # Still track SSIM failures even when font is correct
             if e.get("ssim_pass") is False:
+                # Font correct but SSIM failed — count as miss
                 gt_key, gt_score, gt_rank = find_correct_ci_candidate(e, actual_font)
                 ssim_failures.append((e, actual_font, gt_key, gt_score, gt_rank))
+            else:
+                hits += 1
         else:
             # Find correct font's CI candidate for rendering
             gt_key, gt_score, gt_rank = find_correct_ci_candidate(e, actual_font)
@@ -1371,20 +1420,21 @@ def main():
 
     doc.close()
 
+    all_misses = len(misses) + len(ssim_failures)
     unmatched_str = f" ({unmatched} unmatched)" if unmatched else ""
     ocr_corr_str = f" | OCR corrections: {corrected_chars}/{total_chars}" if total_chars else ""
-    print(f"Total: {total}  Hits: {hits}  Misses: {len(misses)}{unmatched_str}  Skipped: {skipped}  OCR corrections: {corrected_chars}/{total_chars}",
+    ssim_miss_str = f" ({len(ssim_failures)} SSIM)" if ssim_failures else ""
+    print(f"Total: {total}  Hits: {hits}  Misses: {all_misses}{ssim_miss_str}{unmatched_str}  Skipped: {skipped}  OCR corrections: {corrected_chars}/{total_chars}",
           file=sys.stderr)
 
     if not misses and not ssim_failures:
-        ssim_fail_str_early = f" | {ssim_fail_count} SSIM failures" if ssim_fail_count else ""
         html = f"""<!DOCTYPE html>
 <html>
 <head><meta charset="utf-8"><title>unscan char-misses — 100%</title></head>
 <body style="background: white; color: #222;">
 {CSS}
 <h2>unscan Miss Report</h2>
-<div class="summary">{hits}/{hits + len(misses)} correct (100.0%) — no misses 🎉{ssim_fail_str_early}{ocr_corr_str}</div>
+<div class="summary">{hits}/{hits} correct (100.0%) — no misses 🎉{ocr_corr_str}</div>
 <div class="score-legend">
 <b>Score key:</b>
 <b>CI score</b> (per-line) = −mean(log(dist²)) across characters; <b>higher = better match</b>.
@@ -1470,15 +1520,15 @@ def main():
         )
         ssim_blocks.append(block)
 
-    ssim_fail_str = f" | {ssim_fail_count} SSIM failures" if ssim_fail_count else ""
     unmatched_html = f" | {unmatched} unmatched" if unmatched else ""
-    compared = hits + len(misses)
+    compared = hits + all_misses
     pct = hits / compared * 100 if compared else 0
     ssim_section = ""
     if ssim_blocks:
         ssim_section = f"""<h2 style="margin-top:2em; color:#c55;">SSIM Failures (correct font, SSIM rejected)</h2>
 {"".join(ssim_blocks)}"""
 
+    ssim_miss_html = f" ({len(ssim_failures)} SSIM)" if ssim_failures else ""
     html = f"""<!DOCTYPE html>
 <html>
 <head>
@@ -1488,7 +1538,7 @@ def main():
 <body style="background: white; color: #222;">
 {CSS}
 <h2>unscan Miss Report</h2>
-<div class="summary">{hits}/{compared} correct ({pct:.1f}%) — {len(misses)} misses shown below{unmatched_html}{ssim_fail_str}{ocr_corr_str}</div>
+<div class="summary">{hits}/{compared} correct ({pct:.1f}%) — {all_misses} misses shown below{ssim_miss_html}{unmatched_html}{ocr_corr_str}</div>
 <div class="score-legend">
 <b>Score key:</b>
 <b>CI score</b> (per-line) = −mean(log(dist²)) across characters; <b>higher = better match</b>.
