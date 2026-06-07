@@ -90,22 +90,24 @@ def render_scan_line_with_word_boxes(raster_pdf_path, entry, diag_seg_root=None)
     if page_img is None:
         return None
 
-    # Line bbox with padding for context (extra bottom for column labels)
-    # Use the union of word bboxes for vertical extent when available —
-    # the line-level bbox from Tesseract can be overly tall and include
-    # adjacent lines.
-    pad = 8
-    pad_bottom = 20
-    lx = max(0, bbox["x"] - pad)
-    lr = min(page_img.width, bbox["x"] + bbox["width"] + pad)
+    # Crop to the union of word bboxes (both raw and final) with minimal
+    # padding — just enough for the ruler scales above and column labels below.
+    pad = 4
+    pad_bottom = 4
 
     all_word_boxes = list(word_bboxes) + list(word_bboxes_raw)
     if all_word_boxes:
+        wx_left = min(wb["x"] for wb in all_word_boxes)
+        wx_right = max(wb["x"] + wb["width"] for wb in all_word_boxes)
         wy_top = min(wb["y"] for wb in all_word_boxes)
         wy_bot = max(wb["y"] + wb["height"] for wb in all_word_boxes)
+        lx = max(0, wx_left - pad)
+        lr = min(page_img.width, wx_right + pad)
         ly = max(0, wy_top - pad)
         lb = min(page_img.height, wy_bot + pad_bottom)
     else:
+        lx = max(0, bbox["x"] - pad)
+        lr = min(page_img.width, bbox["x"] + bbox["width"] + pad)
         ly = max(0, bbox["y"] - pad)
         lb = min(page_img.height, bbox["y"] + bbox["height"] + pad_bottom)
 
@@ -734,148 +736,6 @@ def find_diag_seg_dir(diag_seg_root, page, text, line_index=None):
                     break
     return best
 
-
-def render_seg_picture(diag_line_dir, word_text=None, seg_subdir=None):
-    """Render a labelled segmentation image for a word in diag-seg output.
-
-    Returns a PIL Image with the word crop scaled up, split lines drawn in
-    colour (red=VP, blue=seam), and column numbers along the
-    top.  Returns None if data is missing.
-
-    seg_subdir: if set (e.g. "seg_plain" or "seg_lig"), look for word_crop.png
-    and summary.json inside that subdirectory of each word dir.  If None,
-    auto-detect: prefer seg_plain/seg_lig structure, fall back to flat layout.
-    """
-    if not diag_line_dir or not os.path.isdir(diag_line_dir):
-        return None
-
-    # Find matching word directory
-    word_dirs = sorted(
-        d for d in os.listdir(diag_line_dir)
-        if d.startswith("word_") and os.path.isdir(os.path.join(diag_line_dir, d))
-    )
-
-    results = []
-    for wd in word_dirs:
-        wpath = os.path.join(diag_line_dir, wd)
-
-        # Resolve the actual data directory (supports seg_plain/seg_lig structure)
-        if seg_subdir:
-            data_path = os.path.join(wpath, seg_subdir)
-        elif os.path.isdir(os.path.join(wpath, "seg_plain")):
-            data_path = os.path.join(wpath, "seg_plain")
-        else:
-            data_path = wpath
-
-        crop_path = os.path.join(data_path, "word_crop.png")
-        summary_path = os.path.join(data_path, "summary.json")
-        if not os.path.exists(crop_path) or not os.path.exists(summary_path):
-            continue
-
-        with open(summary_path) as f:
-            summary = json.load(f)
-
-        crop = Image.open(crop_path).convert("RGBA")
-        w, h = crop.size
-
-        scale = max(3, min(6, 400 // max(w, 1)))
-        big = crop.resize((w * scale, h * scale), Image.NEAREST)
-        bw, bh = big.size
-
-        margin_top = 28
-        margin_bottom = 22
-        canvas = Image.new("RGBA", (bw + 2, bh + margin_top + margin_bottom), (255, 255, 255, 255))
-        canvas.paste(big, (1, margin_top))
-        draw = ImageDraw.Draw(canvas)
-
-        # Column numbers every 10
-        for x in range(0, w, 10):
-            sx = x * scale + scale // 2 + 1
-            draw.line([(sx, margin_top - 4), (sx, margin_top)], fill=(180, 180, 180), width=1)
-            draw.text((sx - 6, 1), str(x), fill=(120, 120, 120))
-
-        # Tick marks every 5
-        for x in range(5, w, 10):
-            sx = x * scale + scale // 2 + 1
-            draw.line([(sx, margin_top - 2), (sx, margin_top)], fill=(210, 210, 210), width=1)
-
-        vp_splits = summary.get("vp_splits", [])
-        seam_splits = summary.get("seam_splits", [])
-        seam_paths_raw = summary.get("seam_paths", {})
-        # Support both old format (list of paths) and new (dict col→path)
-        if isinstance(seam_paths_raw, dict):
-            seam_paths = list(seam_paths_raw.values())
-        else:
-            seam_paths = seam_paths_raw
-
-        # Draw split lines: VP=red, seam=blue (diagonal path)
-        for s in vp_splits:
-            sx = s * scale + scale // 2 + 1
-            draw.line([(sx, margin_top), (sx, margin_top + bh)], fill=(220, 40, 40), width=2)
-            draw.text((sx - 3, margin_top + bh + 2), str(s), fill=(220, 40, 40))
-
-        # Draw actual seam paths as bright, thick diagonal overlays
-        seam_colors = [(0, 80, 255, 220), (30, 120, 255, 220), (60, 150, 255, 220)]
-        overlay = Image.new("RGBA", canvas.size, (0, 0, 0, 0))
-        odraw = ImageDraw.Draw(overlay)
-        pad = max(1, scale // 3)  # expand each pixel by pad on each side
-        for pi, path in enumerate(seam_paths):
-            color = seam_colors[pi % len(seam_colors)]
-            for r in range(len(path)):
-                sx = path[r] * scale + 1
-                sy = margin_top + r * scale
-                odraw.rectangle(
-                    [(sx - pad, sy), (sx + scale - 1 + pad, sy + scale - 1)],
-                    fill=color,
-                )
-        canvas = Image.alpha_composite(canvas, overlay)
-        draw = ImageDraw.Draw(canvas)
-
-        # Label seam split columns at bottom
-        for s in seam_splits:
-            sx = s * scale + scale // 2 + 1
-            draw.text((sx - 3, margin_top + bh + 2), str(s), fill=(0, 80, 255))
-
-        wtext = summary.get("word_text", wd)
-        n_exp = summary.get("n_chars_expected", "?")
-        n_got = summary.get("n_segments_produced", "?")
-        mismatch = summary.get("mismatch", False)
-
-        results.append((canvas, wtext, n_exp, n_got, mismatch,
-                         len(vp_splits), len(seam_splits)))
-
-    if not results:
-        return None
-
-    # Combine all word images horizontally with gap
-    gap = 8
-    total_w = sum(c.width for c, *_ in results) + gap * (len(results) - 1)
-    max_h = max(c.height for c, *_ in results)
-    combined = Image.new("RGBA", (total_w, max_h), (255, 255, 255, 255))
-    x_off = 0
-    for canvas, *_ in results:
-        combined.paste(canvas, (x_off, 0))
-        x_off += canvas.width + gap
-
-    combined = combined.convert("RGB")
-
-    # Build a caption
-    parts = []
-    for _, wtext, n_exp, n_got, mismatch, nvp, nseam in results:
-        info = f'"{wtext}" {n_got}/{n_exp}'
-        if mismatch:
-            info += " ⚠"
-        tags = []
-        if nvp: tags.append(f"{nvp} VP")
-        if nseam: tags.append(f"{nseam} seam")
-        if tags:
-            info += f" ({', '.join(tags)})"
-        parts.append(info)
-
-    caption = " | ".join(parts)
-    return combined, caption
-
-
 def img_td(img_or_path, fallback="—"):
     if img_or_path is None:
         return fallback
@@ -1069,7 +929,6 @@ def build_miss_html(entry, chars_to_show, crop_dir, crop_files,
 
     # Gather segmentation stats from diag-seg data for the scan line label
     seg_stats_html = ""
-    seg_html = ""
     diag_line_dir = find_diag_seg_dir(diag_seg_root, entry["page"], entry.get("text", ""),
                                        line_index=entry.get("line_index"))
     if diag_line_dir:
@@ -1114,56 +973,6 @@ def build_miss_html(entry, chars_to_show, crop_dir, crop_files,
         if seg_parts:
             seg_parts.sort(key=lambda t: t[0])
             seg_stats_html = f'Segmentation: {" | ".join(info for _, info in seg_parts)}'
-
-        # Segmentation picture — show both plain and ligature when available
-        seg_winner = entry.get("seg_winner")
-        has_lig_path = any(
-            os.path.isdir(os.path.join(diag_line_dir, d, "seg_lig"))
-            for d in os.listdir(diag_line_dir)
-            if d.startswith("word_") and os.path.isdir(os.path.join(diag_line_dir, d))
-        )
-
-        if has_lig_path:
-            # Show both paths side by side
-            seg_plain_result = render_seg_picture(diag_line_dir, seg_subdir="seg_plain")
-            seg_lig_result = render_seg_picture(diag_line_dir, seg_subdir="seg_lig")
-
-            parts = []
-            for label, result, is_winner in [
-                ("Plain", seg_plain_result, seg_winner == "plain"),
-                ("Ligature", seg_lig_result, seg_winner == "ligature"),
-            ]:
-                if result:
-                    seg_img, seg_caption = result
-                    winner_badge = ' <span style="color:#2e7d32;font-weight:bold">★ winner</span>' if is_winner else ''
-                    parts.append(f"""<div style="flex:1;min-width:0">
-<div style="font-weight:600;margin-bottom:4px">{label} segmentation{winner_badge}</div>
-<img src="{img_to_b64(seg_img)}" class="seg-img" style="max-width:100%">
-<div class="seg-caption">{seg_caption}</div>
-</div>""")
-
-            if parts:
-                seg_html = f"""<div class="seg-block">
-<div class="seg-legend">
-  <span class="leg-vp">■ VP split</span>
-  <span class="leg-seam">■ seam split</span>
-</div>
-<div style="display:flex;gap:16px;flex-wrap:wrap">
-{"".join(parts)}
-</div>
-</div>"""
-        else:
-            seg_result = render_seg_picture(diag_line_dir)
-            if seg_result:
-                seg_img, seg_caption = seg_result
-                seg_html = f"""<div class="seg-block">
-<div class="seg-legend">
-  <span class="leg-vp">■ VP split</span>
-  <span class="leg-seam">■ seam split</span>
-</div>
-<img src="{img_to_b64(seg_img)}" class="seg-img">
-<div class="seg-caption">{seg_caption}</div>
-</div>"""
 
     # SSIM comparison block: scan crop vs rendered, with diff image
     ssim_compare_html = ""
@@ -1239,7 +1048,6 @@ def build_miss_html(entry, chars_to_show, crop_dir, crop_files,
     return f"""<div class="miss">
 <h3>p{entry['page']}:L{entry['line_index']} — "{text_preview}"{ssim_html}</h3>
 {scan_line_html}
-{seg_html}
 {ssim_compare_html}
 {char_table_html}
 </div>"""

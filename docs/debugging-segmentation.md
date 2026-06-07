@@ -249,6 +249,73 @@ so feature vectors are comparable.
 
 ---
 
+## Ligature Path Selection
+
+Some fonts use ligature glyphs — a single glyph replacing multi-character
+sequences like "ff", "fi", "fl", "ffi", "ffl".  When OCR reads "affluent",
+the glyph on the page may actually be a single "ffl" ligature rather than
+three separate letters.  Segmenting for 8 characters ("a-f-f-l-u-e-n-t")
+will fail because the word image only has 6 visual units
+("a-[ffl]-u-e-n-t").
+
+### Dual-path approach
+
+`extract_line_chars()` in `src/char_index.rs` handles this by segmenting
+each word **twice** when ligature-eligible character sequences are present:
+
+1. **Plain path** (`seg_plain/`): segment targeting `n_chars = len(all_chars)`
+   — treats every character independently.
+2. **Ligature path** (`seg_lig/`): collapse ligature sequences into single
+   Unicode codepoints (e.g., `['f','f','l']` → `['\u{FB04}']`) via
+   `collapse_ligature_chars()`, then segment targeting
+   `n_chars = len(lig_chars)` (fewer segments).
+
+Collapse uses greedy longest-first matching: "ffi"/"ffl" (3→1) before
+"ff"/"fi"/"fl" (2→1).
+
+### Winner selection
+
+Both paths produce character crops.  Both are scored independently by
+`search_candidates()` in CI.  The winner is chosen in `src/main.rs` by
+comparing the top CI candidate score from each path:
+
+```
+plain_top = ci_result_plain.scores[0].score
+lig_top   = ci_result_lig.scores[0].score
+use_lig   = lig_top > plain_top
+```
+
+**Higher top score wins.**  If the font actually uses ligature glyphs,
+ligature-path segmentation will produce cleaner crops that match the
+index better, yielding a higher CI score.  If it doesn't (plain "ff"
+rendered as two separate glyphs), plain segmentation wins because the
+character boundaries align with actual glyph boundaries.
+
+### What happens after
+
+- `seg_winner` is recorded in the audit entry as `"plain"` or `"ligature"`
+  (or `null` if no ligature-eligible sequences existed in the line).
+- The winning path's crops are used for all downstream work: font matching,
+  SSIM verification, and per-char distance computation.
+- The losing path's CI results are stored in `ci_candidates_lig` /
+  `ci_char_votes_lig` in the audit JSON for diagnostic comparison.
+- The miss report shows `seg_winner` in the audit data but no longer
+  renders separate segmentation pictures for each path — the scan-line
+  overlay with word bounding boxes covers the same information.
+
+### Ligature probes
+
+The font index also detects ligature support at index time
+(`detect_ligature_glyphs()` in `src/font_scan.rs`).  It shapes probe
+strings like "ff", "fi", "fl", "ffi", "ffl" through HarfBuzz with
+`liga` and `dlig` features enabled.  If shaping produces a single glyph
+(i.e., the font's GSUB table fired a ligature substitution), that glyph
+ID is recorded and the ligature codepoint (e.g., U+FB00 for "ff") is
+added to the font's character map.  This means CI can score a ligature
+crop against the actual ligature glyph in fonts that have one.
+
+---
+
 ## OCR Post-Processing Pipeline
 
 Between Tesseract output and font matching, several post-processing steps

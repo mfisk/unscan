@@ -756,16 +756,27 @@ pub fn expand_words_to_ink(lines: &mut [TextLine], gray: &GrayImage, ink_thresho
 /// word's image for zero-ink column runs wider than a threshold and splits
 /// the word at each gap.
 ///
+/// When `char_index` is provided, we do a quick CI font lookup on each word
+/// and use the matched font's advance widths to determine the expected
+/// inter-character gap.  We only split where the observed ink-to-ink gap
+/// exceeds the font's natural spacing.  When no char_index is available,
+/// falls back to a fixed threshold of 18% of line height.
+///
 /// Must run AFTER `expand_words_to_ink` so bboxes are ink-tight.
-pub fn split_wide_whitespace_words(lines: &mut [TextLine], gray: &GrayImage, ink_threshold: u8) {
+pub fn split_wide_whitespace_words(
+    lines: &mut [TextLine],
+    gray: &GrayImage,
+    ink_threshold: u8,
+    char_index: Option<&crate::char_index::CharIndex>,
+) {
     let (page_w, page_h) = gray.dimensions();
     let mut total_splits = 0u32;
 
     for line in lines.iter_mut() {
         let mut new_words: Vec<TextRegion> = Vec::new();
         let line_h = line.height;
-        // Split at gaps ≥ 15% of the line height.
-        let min_gap = (line_h * 18 / 100).max(4);
+        // Fallback: split at gaps ≥ 18% of the line height.
+        let fallback_min_gap = (line_h * 18 / 100).max(4);
 
         for word in line.words.drain(..) {
             let wx = word.x.min(page_w.saturating_sub(1));
@@ -792,17 +803,64 @@ pub fn split_wide_whitespace_words(lines: &mut [TextLine], gray: &GrayImage, ink
                 continue;
             }
 
+            // --- Font identification for metric-based splitting ---
+            // If we have a char index, do a quick CI match on this word's char
+            // crops to identify the font.  We'll use the font's glyph outlines
+            // to compute per-pair expected gaps inline below.
+            let matched_font: Option<(Vec<u8>, String)> = char_index.and_then(|ci| {
+                // Build char crops from segmentation
+                let mut crops: Vec<(char, GrayImage)> = Vec::new();
+                for (ci_idx, &ch) in chars.iter().enumerate() {
+                    if !crate::char_index::is_indexed(ch) {
+                        continue;
+                    }
+                    let left = boundaries[ci_idx] as u32;
+                    let right = boundaries[ci_idx + 1] as u32;
+                    if right <= left { continue; }
+                    let crop = image::imageops::crop_imm(&word_img, left, 0, right - left, wh).to_image();
+                    if let Some(norm) = crate::char_index::normalize_to_ink_bounds(&crop) {
+                        crops.push((ch, norm));
+                    }
+                }
+                if crops.is_empty() { return None; }
+
+                // Quick CI search — just need the top font name
+                let result = crate::char_index::search_candidates(ci, &crops, 1.0, false);
+                let font_key = result.scores.first().map(|(name, _)| name.clone())?;
+
+                let font_path = if font_key.contains('|') {
+                    font_key.split('|').next().unwrap()
+                } else {
+                    &font_key
+                };
+                let font_data = std::fs::read(font_path).ok()?;
+                Some((font_data, font_key))
+            });
+            let matched_font_ref = matched_font.as_ref().and_then(|(data, _key)| {
+                ab_glyph::FontRef::try_from_slice(data).ok()
+            });
+
             // For each adjacent pair of characters, measure the zero-ink gap
             // between the rightmost ink of char i and the leftmost ink of char i+1.
             let mut wide_gap_indices: Vec<usize> = Vec::new(); // indices into chars where a word break occurs AFTER char[i]
 
             for i in 0..n_chars - 1 {
-                let seg_end = boundaries[i + 1] as usize; // right edge of char i's segment
-                let seg_next_start = boundaries[i + 1] as usize; // left edge of char i+1's segment
 
-                // Find rightmost ink column in char i's segment
+                // Find leftmost and rightmost ink columns in char i's segment
                 let seg_i_left = boundaries[i] as usize;
                 let seg_i_right = boundaries[i + 1] as usize;
+                let mut left_ink_i = seg_i_right; // fallback: no ink
+                for col in seg_i_left..seg_i_right {
+                    if col < ww as usize {
+                        let has_ink = (0..wh).any(|row| {
+                            word_img.get_pixel(col as u32, row).0[0] < ink_threshold
+                        });
+                        if has_ink {
+                            left_ink_i = col;
+                            break;
+                        }
+                    }
+                }
                 let mut right_ink = seg_i_left; // fallback
                 for col in (seg_i_left..seg_i_right).rev() {
                     if col < ww as usize {
@@ -838,7 +896,41 @@ pub fn split_wide_whitespace_words(lines: &mut [TextLine], gray: &GrayImage, ink
                     0
                 };
 
-                if gap >= min_gap {
+                // Font-metric expected gap: compute the expected inter-ink
+                // gap for this character pair at the derived scale, round it,
+                // and add 5px margin for AA/scan error.
+                let min_gap_for_pair = matched_font_ref.as_ref()
+                    .and_then(|font| {
+                        let observed_ink_w = if right_ink > left_ink_i {
+                            (right_ink - left_ink_i + 1) as f32
+                        } else {
+                            return None;
+                        };
+                        let ref_scale = 100.0_f32;
+                        let ref_px = ab_glyph::PxScale { x: ref_scale, y: ref_scale };
+                        let font_ink_w = crate::char_index::font_ink_width(font, ref_px, chars[i])?;
+                        if font_ink_w <= 0.0 { return None; }
+                        let s = observed_ink_w / font_ink_w * ref_scale;
+                        let scale = ab_glyph::PxScale { x: s, y: s };
+                        let expected = crate::char_index::font_pair_ink_gap(font, scale, chars[i], chars[i + 1]);
+                        let threshold = expected.round() as u32 + 5;
+                        if std::env::var("UNSCAN_DEBUG_GAPS").is_ok() {
+                            let word_text: String = chars.iter().collect();
+                            eprintln!("[gap-debug] '{}'→'{}' word=\"{}\" obs_ink={:.1} font_ink={:.1} scale={:.1} expected_gap={:.1} threshold={} scan_gap={} fallback={}",
+                                chars[i], chars[i+1], word_text, observed_ink_w, font_ink_w, s, expected, threshold, gap, fallback_min_gap);
+                        }
+                        Some(threshold)
+                    })
+                    .unwrap_or_else(|| {
+                        if std::env::var("UNSCAN_DEBUG_GAPS").is_ok() {
+                            let word_text: String = chars.iter().collect();
+                            eprintln!("[gap-debug] '{}'→'{}' word=\"{}\" FALLBACK (no font metric) scan_gap={} fallback={}",
+                                chars[i], chars[i+1], word_text, gap, fallback_min_gap);
+                        }
+                        fallback_min_gap
+                    });
+
+                if gap >= min_gap_for_pair {
                     wide_gap_indices.push(i);
                 }
             }
@@ -909,7 +1001,7 @@ pub fn split_wide_whitespace_words(lines: &mut [TextLine], gray: &GrayImage, ink
             total_splits += wide_gap_indices.len() as u32;
             debug!(
                 "  split word '{}' into {} pieces at {} gap(s) (min_gap={}px, line_h={}px)",
-                word.text, groups.len(), wide_gap_indices.len(), min_gap, line_h
+                word.text, groups.len(), wide_gap_indices.len(), fallback_min_gap, line_h
             );
         }
 
