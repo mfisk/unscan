@@ -135,7 +135,7 @@ pub fn indexed_chars() -> &'static [char] {
 }
 
 /// Quick membership test.
-fn is_indexed(c: char) -> bool {
+pub fn is_indexed(c: char) -> bool {
     indexed_chars().contains(&c)
 }
 
@@ -368,6 +368,46 @@ fn detect_serif(img: &GrayImage) -> f32 {
     let avg_ratio = (top_ratio + bot_ratio) / 2.0;
 
     ((avg_ratio - 1.0)).clamp(0.0, 1.0)
+}
+
+/// Compute the expected pixel gap between the ink of character `a` and the ink
+/// of character `b` when typeset adjacently at `scale`.  Returns RSB(a) + LSB(b)
+/// in pixels, i.e. the whitespace the font places between the two glyphs'
+/// ink bounding boxes.  Returns 0.0 when either glyph has no outline.
+
+/// Return the ink width of a glyph in pixels from outline bounds (no rasterization).
+pub fn font_ink_width<F: Font>(font: &F, scale: PxScale, ch: char) -> Option<f32> {
+    let gid = font.glyph_id(ch);
+    let glyph = gid.with_scale_and_position(scale, point(0.0, 0.0));
+    let outlined = font.outline_glyph(glyph)?;
+    let b = outlined.px_bounds();
+    Some(b.max.x - b.min.x)
+}
+
+/// Return the expected ink-to-ink gap between two adjacent glyphs from outline bounds.
+pub fn font_pair_ink_gap<F: Font>(font: &F, scale: PxScale, ch_a: char, ch_b: char) -> f32 {
+    let sf = font.as_scaled(scale);
+    let gid_a = font.glyph_id(ch_a);
+    let gid_b = font.glyph_id(ch_b);
+    let adv_a = sf.h_advance(gid_a);
+
+    let glyph_a = gid_a.with_scale_and_position(scale, point(0.0, 0.0));
+    let glyph_b = gid_b.with_scale_and_position(scale, point(0.0, 0.0));
+
+    let outlined_a = match font.outline_glyph(glyph_a) {
+        Some(o) => o,
+        None => return 0.0,
+    };
+    let outlined_b = match font.outline_glyph(glyph_b) {
+        Some(o) => o,
+        None => return 0.0,
+    };
+
+    let bounds_a = outlined_a.px_bounds();
+    let bounds_b = outlined_b.px_bounds();
+
+    // gap = advance_a - ink_right_a + ink_left_b
+    (adv_a - bounds_a.max.x + bounds_b.min.x).max(0.0)
 }
 
 /// Compute a per-font serif confidence score.

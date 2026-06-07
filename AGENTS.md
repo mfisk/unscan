@@ -45,9 +45,9 @@ cargo test specimen_font_accuracy --release -- --nocapture --test-threads=1 2>&1
 # Full t60 misses
 cargo test specimen_font_accuracy --release -- --nocapture --test-threads=1 2>&1 | grep -E "accuracy|Misses|  " 
 
-# Crop dump for specific line
-UNSCAN_DUMP_CROPS=1 ./target/release/unscan -o /tmp/out.pdf test-docs/font-timeline-specimen-rasterized.pdf 2>/dev/null
-ls /tmp/unscan-crops/<line_dir>/
+# Crop dump for specific line (via --audit)
+./target/release/unscan test-docs/font-timeline-specimen-rasterized.pdf -o /dev/null --audit /tmp/audit-out
+ls /tmp/audit-out/<line_dir>/crops/
 ```
 
 ## Current State
