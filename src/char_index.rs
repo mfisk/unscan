@@ -278,24 +278,22 @@ fn nearest_within_factor_brute(
     if points.is_empty() {
         return Vec::new();
     }
-    // Single pass: find min squared distance
+    // Single pass: compute all distances, track min, and collect all results.
+    // Then filter at the end, avoiding a second full scan.
+    let factor_sq = factor * factor;
     let mut best_dist_sq = f32::MAX;
-    for (_, coords) in points {
+    let mut all: Vec<(usize, f32)> = Vec::with_capacity(points.len());
+    for &(id, ref coords) in points {
         let d = squared_distance(coords, query);
+        all.push((id, d));
         if d < best_dist_sq {
             best_dist_sq = d;
         }
     }
-    let cutoff = factor * factor * best_dist_sq.max(1e-12);
-    // Second pass: collect everything within cutoff
-    let mut results: Vec<(usize, f32)> = points.iter()
-        .filter_map(|(id, coords)| {
-            let d = squared_distance(coords, query);
-            if d <= cutoff { Some((*id, d)) } else { None }
-        })
-        .collect();
-    results.sort_by(|a, b| a.1.partial_cmp(&b.1).unwrap_or(std::cmp::Ordering::Equal));
-    results
+    let cutoff = factor_sq * best_dist_sq.max(1e-12);
+    all.retain(|&(_, d)| d <= cutoff);
+    all.sort_by(|a, b| a.1.partial_cmp(&b.1).unwrap_or(std::cmp::Ordering::Equal));
+    all
 }
 
 /// Squared Euclidean distance between two feature vectors.
@@ -531,6 +529,11 @@ pub fn compute_features(img: &GrayImage) -> Option<CharFeatures> {
     let mut ink_pixels = 0u64;
     let mut wy_sum = 0.0f64;
 
+    // ── Single pass: accumulate bounds, ink totals, col/row sums ──
+    // We'll do a two-step approach: first pass gets bounds + totals,
+    // then a second restricted pass over the ink bbox builds col_ink,
+    // row_ink, left_ink, and ink_mask simultaneously.
+
     for y in 0..h {
         for x in 0..w {
             let px = img.get_pixel(x, y).0[0];
@@ -557,33 +560,35 @@ pub fn compute_features(img: &GrayImage) -> Option<CharFeatures> {
     let bbox_area = ink_w * ink_h;
     let ink_density = ink_pixels as f32 / bbox_area.max(1.0);
     let v_center = (wy_sum / total_ink as f64) as f32 / h as f32;
-
     let ink_mid_x = (min_x + max_x) / 2;
+
+    let ink_w_u = (max_x - min_x + 1) as usize;
+    let ink_h_u = (max_y - min_y + 1) as usize;
+
+    // Second pass over ink bbox only: col_ink, row_ink, left_ink, ink_mask
+    let mut col_ink = vec![0.0f32; ink_w_u];
+    let mut row_ink = vec![0.0f32; ink_h_u];
     let mut left_ink = 0u64;
-    for y in 0..h {
-        for x in 0..w {
+    let mut ink_mask = vec![false; ink_w_u * ink_h_u];
+
+    for y in min_y..=max_y {
+        for x in min_x..=max_x {
             let px = img.get_pixel(x, y).0[0];
             if px < threshold {
-                let ink_val = (255 - px) as u64;
+                let ink_val = (255 - px) as f32;
+                let lx = (x - min_x) as usize;
+                let ly = (y - min_y) as usize;
+                col_ink[lx] += ink_val;
+                row_ink[ly] += ink_val;
+                ink_mask[ly * ink_w_u + lx] = true;
                 if x <= ink_mid_x {
-                    left_ink += ink_val;
+                    left_ink += ink_val as u64;
                 }
             }
         }
     }
     let h_balance = left_ink as f32 / total_ink as f32;
 
-    let mut col_ink = vec![0.0f32; ink_w as usize];
-    for x in min_x..=max_x {
-        let mut col_sum = 0.0f32;
-        for y in min_y..=max_y {
-            let px = img.get_pixel(x, y).0[0];
-            if px < threshold {
-                col_sum += (255 - px) as f32;
-            }
-        }
-        col_ink[(x - min_x) as usize] = col_sum;
-    }
     let col_max = col_ink.iter().cloned().fold(0.0f32, f32::max);
     if col_max > 0.0 {
         for v in &mut col_ink {
@@ -592,18 +597,6 @@ pub fn compute_features(img: &GrayImage) -> Option<CharFeatures> {
     }
     let profile = resample(&col_ink, PROFILE_BINS);
 
-    // ── Row ink density profile (horizontal analog of column profile) ──
-    let mut row_ink = vec![0.0f32; ink_h as usize];
-    for y in min_y..=max_y {
-        let mut row_sum = 0.0f32;
-        for x in min_x..=max_x {
-            let px = img.get_pixel(x, y).0[0];
-            if px < threshold {
-                row_sum += (255 - px) as f32;
-            }
-        }
-        row_ink[(y - min_y) as usize] = row_sum;
-    }
     let row_max = row_ink.iter().cloned().fold(0.0f32, f32::max);
     if row_max > 0.0 {
         for v in &mut row_ink {
@@ -615,49 +608,30 @@ pub fn compute_features(img: &GrayImage) -> Option<CharFeatures> {
     let serif_score = detect_serif(img);
     let stroke_contrast_val = measure_stroke_contrast(img);
 
-    // ── v2 features ────────────────────────────────────────────────
+    // ── v2/v3 features (computed from ink_mask) ───────────────────
 
-    // Build a binary ink mask within ink bbox for reuse
-    let ink_w_u = (max_x - min_x + 1) as usize;
-    let ink_h_u = (max_y - min_y + 1) as usize;
-    let mut ink_mask = vec![false; ink_w_u * ink_h_u];
-    for y in min_y..=max_y {
-        for x in min_x..=max_x {
-            if img.get_pixel(x, y).0[0] < threshold {
-                ink_mask[(y - min_y) as usize * ink_w_u + (x - min_x) as usize] = true;
-            }
-        }
-    }
+    // Shared flood-fill: compute reachable from edges once, used by
+    // both counter-feature analysis and hole counting.
+    let reachable = flood_fill_from_edges(&ink_mask, ink_w_u, ink_h_u);
 
-    // Counter shape analysis: flood-fill from edges, remaining white = counter
     let (counter_area_ratio, counter_centroid_x, counter_centroid_y, counter_aspect) =
-        compute_counter_features(&ink_mask, ink_w_u, ink_h_u);
+        counter_features_from_reachable(&ink_mask, &reachable, ink_w_u, ink_h_u);
 
-    // Terminal / endpoint analysis
     let terminal_angles = compute_terminal_angles(&ink_mask, ink_w_u, ink_h_u);
 
-    // Boundary complexity
     let (ink_perimeter, compactness) =
         compute_boundary_features(&ink_mask, ink_w_u, ink_h_u, ink_pixels as f32);
 
-    // Horizontal crossings
     let h_crossings = compute_h_crossings(&ink_mask, ink_w_u, ink_h_u);
 
-    // ── v3 features ────────────────────────────────────────────────
+    let hole_count = hole_count_from_reachable(&ink_mask, &reachable, ink_w_u, ink_h_u);
 
-    // Hole count: enclosed white regions from flood-fill
-    let hole_count = compute_hole_count(&ink_mask, ink_w_u, ink_h_u);
-
-    // H/V symmetry scores
     let (h_symmetry, v_symmetry) = compute_symmetry(&ink_mask, ink_w_u, ink_h_u);
 
-    // Skeleton topology: branch points and endpoints from morphological thinning
     let (skeleton_branch_pts, skeleton_end_pts) = compute_skeleton_features(&ink_mask, ink_w_u, ink_h_u);
 
-    // Corner count: sharp direction changes on ink boundary
     let corner_count = compute_corner_count(&ink_mask, ink_w_u, ink_h_u);
 
-    // Quadrant density: ink density in each quadrant (TL, TR, BL, BR)
     let quadrant_density = compute_quadrant_density(&ink_mask, ink_w_u, ink_h_u);
 
     Some(CharFeatures {
@@ -696,58 +670,72 @@ pub fn compute_features(img: &GrayImage) -> Option<CharFeatures> {
 ///
 /// Flood-fills white pixels from edges of the ink bounding box. Any white pixels
 /// NOT reached are enclosed counters (e.g. the hole in 'o', 'a', 'e').
-fn compute_counter_features(ink_mask: &[bool], w: usize, h: usize) -> (f32, f32, f32, f32) {
-    if w == 0 || h == 0 {
-        return (0.0, 0.0, 0.0, 0.0);
-    }
-
+/// Edge flood-fill: marks all white pixels reachable from the image border.
+/// Shared by counter-feature analysis and hole counting.
+fn flood_fill_from_edges(ink_mask: &[bool], w: usize, h: usize) -> Vec<bool> {
     let total = w * h;
     let mut reachable = vec![false; total];
-    let mut queue = std::collections::VecDeque::new();
+    if w == 0 || h == 0 { return reachable; }
+
+    let mut queue = std::collections::VecDeque::with_capacity(w * 2 + h * 2);
 
     // Seed from all edge pixels that are NOT ink
     for x in 0..w {
         if !ink_mask[x] && !reachable[x] {
             reachable[x] = true;
-            queue.push_back((x, 0usize));
+            queue.push_back(x); // flat index
         }
         let idx = (h - 1) * w + x;
         if !ink_mask[idx] && !reachable[idx] {
             reachable[idx] = true;
-            queue.push_back((x, h - 1));
+            queue.push_back(idx);
         }
     }
-    for y in 0..h {
+    for y in 1..h.saturating_sub(1) {
         let idx = y * w;
         if !ink_mask[idx] && !reachable[idx] {
             reachable[idx] = true;
-            queue.push_back((0, y));
+            queue.push_back(idx);
         }
         let idx = y * w + (w - 1);
         if !ink_mask[idx] && !reachable[idx] {
             reachable[idx] = true;
-            queue.push_back((w - 1, y));
+            queue.push_back(idx);
         }
     }
 
-    // BFS flood fill
-    while let Some((x, y)) = queue.pop_front() {
-        let neighbors: [(i32, i32); 4] = [(-1, 0), (1, 0), (0, -1), (0, 1)];
-        for (dx, dy) in &neighbors {
-            let nx = x as i32 + dx;
-            let ny = y as i32 + dy;
-            if nx < 0 || ny < 0 || nx >= w as i32 || ny >= h as i32 {
-                continue;
-            }
-            let nidx = ny as usize * w + nx as usize;
-            if !ink_mask[nidx] && !reachable[nidx] {
-                reachable[nidx] = true;
-                queue.push_back((nx as usize, ny as usize));
-            }
+    // BFS flood fill using flat indices
+    while let Some(idx) = queue.pop_front() {
+        let x = idx % w;
+        let y = idx / w;
+        if x > 0 {
+            let ni = idx - 1;
+            if !ink_mask[ni] && !reachable[ni] { reachable[ni] = true; queue.push_back(ni); }
+        }
+        if x + 1 < w {
+            let ni = idx + 1;
+            if !ink_mask[ni] && !reachable[ni] { reachable[ni] = true; queue.push_back(ni); }
+        }
+        if y > 0 {
+            let ni = idx - w;
+            if !ink_mask[ni] && !reachable[ni] { reachable[ni] = true; queue.push_back(ni); }
+        }
+        if y + 1 < h {
+            let ni = idx + w;
+            if !ink_mask[ni] && !reachable[ni] { reachable[ni] = true; queue.push_back(ni); }
         }
     }
 
-    // Counter pixels: white (not ink) AND not reachable from edges
+    reachable
+}
+
+/// Counter shape features from pre-computed reachable mask.
+fn counter_features_from_reachable(ink_mask: &[bool], reachable: &[bool], w: usize, h: usize) -> (f32, f32, f32, f32) {
+    if w == 0 || h == 0 {
+        return (0.0, 0.0, 0.0, 0.0);
+    }
+
+    let total = w * h;
     let mut counter_area = 0u32;
     let mut cx_sum = 0.0f64;
     let mut cy_sum = 0.0f64;
@@ -783,6 +771,56 @@ fn compute_counter_features(ink_mask: &[bool], w: usize, h: usize) -> (f32, f32,
     let c_aspect = cw / ch.max(1.0);
 
     (area_ratio, centroid_x, centroid_y, c_aspect)
+}
+
+/// Hole count from pre-computed reachable mask (no duplicate BFS).
+fn hole_count_from_reachable(ink_mask: &[bool], reachable: &[bool], w: usize, h: usize) -> f32 {
+    if w == 0 || h == 0 {
+        return 0.0;
+    }
+    let total = w * h;
+    let mut visited = vec![false; total];
+    let mut hole_count = 0u32;
+
+    for idx in 0..total {
+        if !ink_mask[idx] && !reachable[idx] && !visited[idx] {
+            hole_count += 1;
+            // Flood-fill this hole to mark all its pixels
+            let mut q = std::collections::VecDeque::new();
+            visited[idx] = true;
+            q.push_back(idx);
+            while let Some(ci) = q.pop_front() {
+                let cx = ci % w;
+                let cy = ci / w;
+                if cx > 0 {
+                    let ni = ci - 1;
+                    if !ink_mask[ni] && !reachable[ni] && !visited[ni] {
+                        visited[ni] = true; q.push_back(ni);
+                    }
+                }
+                if cx + 1 < w {
+                    let ni = ci + 1;
+                    if !ink_mask[ni] && !reachable[ni] && !visited[ni] {
+                        visited[ni] = true; q.push_back(ni);
+                    }
+                }
+                if cy > 0 {
+                    let ni = ci - w;
+                    if !ink_mask[ni] && !reachable[ni] && !visited[ni] {
+                        visited[ni] = true; q.push_back(ni);
+                    }
+                }
+                if cy + 1 < h {
+                    let ni = ci + w;
+                    if !ink_mask[ni] && !reachable[ni] && !visited[ni] {
+                        visited[ni] = true; q.push_back(ni);
+                    }
+                }
+            }
+        }
+    }
+
+    (hole_count as f32 / 4.0).min(1.0)
 }
 
 /// Terminal / endpoint analysis.
@@ -939,85 +977,6 @@ fn compute_h_crossings(ink_mask: &[bool], w: usize, h: usize) -> [f32; CROSSING_
 // v3 discriminative feature helpers
 // ---------------------------------------------------------------------------
 
-/// Count enclosed white regions (holes) using flood-fill from edges.
-/// Returns normalised count: raw_count / 4.0 (most chars have 0–3 holes).
-fn compute_hole_count(ink_mask: &[bool], w: usize, h: usize) -> f32 {
-    if w == 0 || h == 0 {
-        return 0.0;
-    }
-    let total = w * h;
-    let mut reachable = vec![false; total];
-    let mut queue = std::collections::VecDeque::new();
-
-    // Seed from edges
-    for x in 0..w {
-        if !ink_mask[x] && !reachable[x] {
-            reachable[x] = true;
-            queue.push_back((x, 0usize));
-        }
-        let idx = (h - 1) * w + x;
-        if !ink_mask[idx] && !reachable[idx] {
-            reachable[idx] = true;
-            queue.push_back((x, h - 1));
-        }
-    }
-    for y in 0..h {
-        let idx = y * w;
-        if !ink_mask[idx] && !reachable[idx] {
-            reachable[idx] = true;
-            queue.push_back((0, y));
-        }
-        let idx = y * w + (w - 1);
-        if !ink_mask[idx] && !reachable[idx] {
-            reachable[idx] = true;
-            queue.push_back((w - 1, y));
-        }
-    }
-    while let Some((x, y)) = queue.pop_front() {
-        for (dx, dy) in &[(-1i32, 0i32), (1, 0), (0, -1), (0, 1)] {
-            let nx = x as i32 + dx;
-            let ny = y as i32 + dy;
-            if nx >= 0 && ny >= 0 && (nx as usize) < w && (ny as usize) < h {
-                let nidx = ny as usize * w + nx as usize;
-                if !ink_mask[nidx] && !reachable[nidx] {
-                    reachable[nidx] = true;
-                    queue.push_back((nx as usize, ny as usize));
-                }
-            }
-        }
-    }
-
-    // Count distinct enclosed white regions via another flood-fill
-    let mut visited = vec![false; total];
-    let mut hole_count = 0u32;
-    for y in 0..h {
-        for x in 0..w {
-            let idx = y * w + x;
-            if !ink_mask[idx] && !reachable[idx] && !visited[idx] {
-                // New hole — flood-fill to mark it
-                hole_count += 1;
-                let mut q2 = std::collections::VecDeque::new();
-                visited[idx] = true;
-                q2.push_back((x, y));
-                while let Some((cx, cy)) = q2.pop_front() {
-                    for (dx, dy) in &[(-1i32, 0i32), (1, 0), (0, -1), (0, 1)] {
-                        let nx = cx as i32 + dx;
-                        let ny = cy as i32 + dy;
-                        if nx >= 0 && ny >= 0 && (nx as usize) < w && (ny as usize) < h {
-                            let nidx = ny as usize * w + nx as usize;
-                            if !ink_mask[nidx] && !reachable[nidx] && !visited[nidx] {
-                                visited[nidx] = true;
-                                q2.push_back((nx as usize, ny as usize));
-                            }
-                        }
-                    }
-                }
-            }
-        }
-    }
-
-    (hole_count as f32 / 4.0).min(1.0)
-}
 
 /// Horizontal and vertical symmetry scores.
 /// Measures how similar the ink mask is to its mirror image.
@@ -1069,83 +1028,104 @@ fn compute_skeleton_features(ink_mask: &[bool], w: usize, h: usize) -> (f32, f32
     }
 
     // Copy mask to mutable binary image for thinning
+    let total = w * h;
     let mut img: Vec<u8> = ink_mask.iter().map(|&b| if b { 1u8 } else { 0u8 }).collect();
+
+    // Use a bitfield for marking pixels to remove (avoids Vec allocation per iteration)
+    let flag_len = (total + 63) / 64;
+    let mut to_remove = vec![0u64; flag_len];
+
+    // Precompute lookup table for transition count (8-bit neighborhood pattern → transitions)
+    let trans_lut: [u8; 256] = {
+        let mut lut = [0u8; 256];
+        for pattern in 0..256u16 {
+            let mut t = 0u8;
+            for i in 0..8 {
+                let curr = (pattern >> i) & 1;
+                let next = (pattern >> ((i + 1) % 8)) & 1;
+                if curr == 0 && next == 1 { t += 1; }
+            }
+            lut[pattern as usize] = t;
+        }
+        lut
+    };
 
     // Zhang-Suen thinning algorithm
     loop {
         let mut changed = false;
 
         // Step 1
-        let mut to_remove = Vec::new();
+        for w64 in to_remove.iter_mut() { *w64 = 0; }
         for y in 1..h - 1 {
+            let row = y * w;
+            let prev_row = (y - 1) * w;
+            let next_row = (y + 1) * w;
             for x in 1..w - 1 {
-                if img[y * w + x] == 0 { continue; }
-                let p2 = img[(y - 1) * w + x] as i32;
-                let p3 = img[(y - 1) * w + (x + 1)] as i32;
-                let p4 = img[y * w + (x + 1)] as i32;
-                let p5 = img[(y + 1) * w + (x + 1)] as i32;
-                let p6 = img[(y + 1) * w + x] as i32;
-                let p7 = img[(y + 1) * w + (x - 1)] as i32;
-                let p8 = img[y * w + (x - 1)] as i32;
-                let p9 = img[(y - 1) * w + (x - 1)] as i32;
+                let idx = row + x;
+                if img[idx] == 0 { continue; }
+                let p2 = img[prev_row + x];
+                let p3 = img[prev_row + x + 1];
+                let p4 = img[row + x + 1];
+                let p5 = img[next_row + x + 1];
+                let p6 = img[next_row + x];
+                let p7 = img[next_row + x - 1];
+                let p8 = img[row + x - 1];
+                let p9 = img[prev_row + x - 1];
 
-                let neighbors = p2 + p3 + p4 + p5 + p6 + p7 + p8 + p9;
+                let neighbors = p2 as i32 + p3 as i32 + p4 as i32 + p5 as i32
+                    + p6 as i32 + p7 as i32 + p8 as i32 + p9 as i32;
                 if neighbors < 2 || neighbors > 6 { continue; }
 
-                // Count 0→1 transitions in the ordered sequence p2..p9..p2
-                let seq = [p2, p3, p4, p5, p6, p7, p8, p9];
-                let mut transitions = 0;
-                for i in 0..8 {
-                    if seq[i] == 0 && seq[(i + 1) % 8] == 1 {
-                        transitions += 1;
-                    }
-                }
-                if transitions != 1 { continue; }
+                let pattern = (p2 as u16) | ((p3 as u16) << 1) | ((p4 as u16) << 2) | ((p5 as u16) << 3)
+                    | ((p6 as u16) << 4) | ((p7 as u16) << 5) | ((p8 as u16) << 6) | ((p9 as u16) << 7);
+                if trans_lut[pattern as usize] != 1 { continue; }
 
-                // Step 1 conditions: p2*p4*p6 == 0 && p4*p6*p8 == 0
                 if p2 * p4 * p6 != 0 || p4 * p6 * p8 != 0 { continue; }
-                to_remove.push(y * w + x);
+                to_remove[idx / 64] |= 1u64 << (idx % 64);
             }
         }
-        for idx in &to_remove {
-            img[*idx] = 0;
-            changed = true;
+        for idx in 0..total {
+            if to_remove[idx / 64] & (1u64 << (idx % 64)) != 0 {
+                img[idx] = 0;
+                changed = true;
+            }
         }
 
         // Step 2
-        let mut to_remove = Vec::new();
+        for w64 in to_remove.iter_mut() { *w64 = 0; }
         for y in 1..h - 1 {
+            let row = y * w;
+            let prev_row = (y - 1) * w;
+            let next_row = (y + 1) * w;
             for x in 1..w - 1 {
-                if img[y * w + x] == 0 { continue; }
-                let p2 = img[(y - 1) * w + x] as i32;
-                let p3 = img[(y - 1) * w + (x + 1)] as i32;
-                let p4 = img[y * w + (x + 1)] as i32;
-                let p5 = img[(y + 1) * w + (x + 1)] as i32;
-                let p6 = img[(y + 1) * w + x] as i32;
-                let p7 = img[(y + 1) * w + (x - 1)] as i32;
-                let p8 = img[y * w + (x - 1)] as i32;
-                let p9 = img[(y - 1) * w + (x - 1)] as i32;
+                let idx = row + x;
+                if img[idx] == 0 { continue; }
+                let p2 = img[prev_row + x];
+                let p3 = img[prev_row + x + 1];
+                let p4 = img[row + x + 1];
+                let p5 = img[next_row + x + 1];
+                let p6 = img[next_row + x];
+                let p7 = img[next_row + x - 1];
+                let p8 = img[row + x - 1];
+                let p9 = img[prev_row + x - 1];
 
-                let neighbors = p2 + p3 + p4 + p5 + p6 + p7 + p8 + p9;
+                let neighbors = p2 as i32 + p3 as i32 + p4 as i32 + p5 as i32
+                    + p6 as i32 + p7 as i32 + p8 as i32 + p9 as i32;
                 if neighbors < 2 || neighbors > 6 { continue; }
 
-                let seq = [p2, p3, p4, p5, p6, p7, p8, p9];
-                let mut transitions = 0;
-                for i in 0..8 {
-                    if seq[i] == 0 && seq[(i + 1) % 8] == 1 {
-                        transitions += 1;
-                    }
-                }
-                if transitions != 1 { continue; }
+                let pattern = (p2 as u16) | ((p3 as u16) << 1) | ((p4 as u16) << 2) | ((p5 as u16) << 3)
+                    | ((p6 as u16) << 4) | ((p7 as u16) << 5) | ((p8 as u16) << 6) | ((p9 as u16) << 7);
+                if trans_lut[pattern as usize] != 1 { continue; }
 
-                // Step 2 conditions: p2*p4*p8 == 0 && p2*p6*p8 == 0
                 if p2 * p4 * p8 != 0 || p2 * p6 * p8 != 0 { continue; }
-                to_remove.push(y * w + x);
+                to_remove[idx / 64] |= 1u64 << (idx % 64);
             }
         }
-        for idx in &to_remove {
-            img[*idx] = 0;
-            changed = true;
+        for idx in 0..total {
+            if to_remove[idx / 64] & (1u64 << (idx % 64)) != 0 {
+                img[idx] = 0;
+                changed = true;
+            }
         }
 
         if !changed { break; }
@@ -1349,14 +1329,15 @@ impl Clone for CharIndex {
 impl CharIndex {
     /// Build flat per-character vectors and compute per-dimension σ from entries.
     pub fn rebuild_vecs(&mut self) {
-        // Build font name → id mapping
-        let mut name_set: std::collections::HashSet<String> = std::collections::HashSet::new();
+        // Build font name → id mapping — collect unique names without
+        // cloning every entry's font_name first.
+        let mut name_set: std::collections::HashSet<&str> = std::collections::HashSet::new();
         for entries in self.entries.values() {
             for e in entries {
-                name_set.insert(e.font_name.clone());
+                name_set.insert(&e.font_name);
             }
         }
-        let mut names: Vec<String> = name_set.into_iter().collect();
+        let mut names: Vec<String> = name_set.into_iter().map(|s| s.to_string()).collect();
         names.sort();
         self.font_names_table = names;
         let name_to_id: HashMap<&str, usize> = self.font_names_table.iter()
@@ -2022,8 +2003,8 @@ pub fn search_candidates(
 
     let n_chars = crop_feats.len();
     // Quorum: font must appear in at least half the character neighborhoods.
-    let quorum = ((n_chars + 1) / 2).max(1) as f32 / thoroughness;
-    let quorum = (quorum.ceil() as usize).max(1);
+    let _quorum = ((n_chars + 1) / 2).max(1) as f32 / thoroughness;
+    let _quorum = (_quorum.ceil() as usize).max(1);
 
 
     // For each character, find nearby fonts and record their distances.
@@ -2389,7 +2370,7 @@ pub fn search_candidates(
 pub fn per_char_distances(
     index: &CharIndex,
     font_key: &str,
-    char_crops: &[(char, GrayImage)],
+    char_crops: &[(char, &GrayImage)],
 ) -> Vec<(char, usize, f32)> {
     // Find the font_id for the requested key
     let font_id = match index.font_names_table.iter().position(|n| n == font_key) {

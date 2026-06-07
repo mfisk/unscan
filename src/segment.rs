@@ -594,10 +594,11 @@ fn segment_characters_inner(
 /// DP matrices from a seam candidate search.  Retaining these lets us
 /// trace the optimal path through any mid-row column without recomputing.
 struct SeamDp {
-    cost_fwd: Vec<Vec<f32>>,
-    cost_rev: Vec<Vec<f32>>,
+    cost_fwd: Vec<f32>,   // flat [row * seg_w + col]
+    cost_rev: Vec<f32>,   // flat [row * seg_w + col]
     seg_start: u32,
     seg_end: u32,
+    seg_w: usize,
     h: u32,
 }
 
@@ -606,7 +607,7 @@ impl SeamDp {
     /// Backtrace the cheapest path constrained to pass through
     /// `target_col` at mid-row.
     fn trace_path_through(&self, energy: &[Vec<f32>], target_col: u32) -> Vec<u32> {
-        let seg_w = (self.seg_end - self.seg_start) as usize;
+        let seg_w = self.seg_w;
         let base = self.seg_start as usize;
         let mid_r = (self.h / 2) as usize;
         let last_r = (self.h - 1) as usize;
@@ -630,7 +631,7 @@ impl SeamDp {
                         } else {
                             0.0
                         };
-                        let cand = self.cost_fwd[r - 1][pc] + entry;
+                        let cand = self.cost_fwd[(r - 1) * seg_w + pc] + entry;
                         if cand < best_cost {
                             best_cost = cand;
                             best_c = pc;
@@ -657,7 +658,7 @@ impl SeamDp {
                         } else {
                             0.0
                         };
-                        let cand = self.cost_rev[r + 1][pc] + entry;
+                        let cand = self.cost_rev[(r + 1) * seg_w + pc] + entry;
                         if cand < best_cost {
                             best_cost = cand;
                             best_c = pc;
@@ -683,7 +684,7 @@ fn candidate_seams(
 ) -> (Vec<(u32, f32)>, SeamDp, HashSet<u32>) {
     let seg_w = (seg_end - seg_start) as usize;
     if seg_w < 3 || h < 1 {
-        let dp = SeamDp { cost_fwd: Vec::new(), cost_rev: Vec::new(), seg_start, seg_end, h };
+        let dp = SeamDp { cost_fwd: Vec::new(), cost_rev: Vec::new(), seg_start, seg_end, seg_w: 0, h };
         return (Vec::new(), dp, HashSet::new());
     }
     let base = seg_start as usize;
@@ -701,14 +702,17 @@ fn candidate_seams(
         energy[r][abs_col]
     };
 
-    // Forward DP: cost_fwd[r][c] = cheapest path from any top-row column
+    // Forward DP: cost_fwd[r * seg_w + c] = cheapest path from any top-row column
     // down to (r, c).  Cost = sum of ink darkness along the path, plus
     // an entry penalty each time the path moves into a darker pixel.
-    let mut cost_fwd = vec![vec![0.0f32; seg_w]; h as usize];
+    let n_cells = h as usize * seg_w;
+    let mut cost_fwd = vec![0.0f32; n_cells];
     for c in 0..seg_w {
-        cost_fwd[0][c] = masked_energy(0, c);
+        cost_fwd[c] = masked_energy(0, c);
     }
     for r in 1..h as usize {
+        let row_off = r * seg_w;
+        let prev_off = (r - 1) * seg_w;
         for c in 0..seg_w {
             let cur_dark = masked_energy(r, c);
             let mut best = f32::INFINITY;
@@ -720,23 +724,26 @@ fn candidate_seams(
                     } else {
                         0.0
                     };
-                    let candidate = cost_fwd[r - 1][pc] + entry;
+                    let candidate = cost_fwd[prev_off + pc] + entry;
                     if candidate < best {
                         best = candidate;
                     }
                 }
             }
-            cost_fwd[r][c] = cur_dark + best;
+            cost_fwd[row_off + c] = cur_dark + best;
         }
     }
 
     // Reverse DP: models downward continuation from (r, c) to bottom.
     let last_r = (h - 1) as usize;
-    let mut cost_rev = vec![vec![0.0f32; seg_w]; h as usize];
+    let mut cost_rev = vec![0.0f32; n_cells];
+    let last_off = last_r * seg_w;
     for c in 0..seg_w {
-        cost_rev[last_r][c] = masked_energy(last_r, c);
+        cost_rev[last_off + c] = masked_energy(last_r, c);
     }
     for r in (0..last_r).rev() {
+        let row_off = r * seg_w;
+        let next_off = (r + 1) * seg_w;
         for c in 0..seg_w {
             let cur_dark = masked_energy(r, c);
             let mut best = f32::INFINITY;
@@ -748,24 +755,25 @@ fn candidate_seams(
                     } else {
                         0.0
                     };
-                    let candidate = cost_rev[r + 1][pc] + entry;
+                    let candidate = cost_rev[next_off + pc] + entry;
                     if candidate < best {
                         best = candidate;
                     }
                 }
             }
-            cost_rev[r][c] = cur_dark + best;
+            cost_rev[row_off + c] = cur_dark + best;
         }
     }
 
     // For each interior column at mid-row, the cheapest path through it
     // costs cost_fwd[mid][c] + cost_rev[mid][c] - energy[mid][c]
     // (subtract once to avoid double-counting the mid-row pixel).
+    let mid_off = mid_r * seg_w;
     let mut dp_candidates: Vec<(u32, f32)> = Vec::with_capacity(seg_w.saturating_sub(2));
     for c in 1..seg_w - 1 {
         let me = masked_energy(mid_r, c);
         if me >= f32::INFINITY { continue; } // masked pixel, skip
-        let combined = cost_fwd[mid_r][c] + cost_rev[mid_r][c] - me;
+        let combined = cost_fwd[mid_off + c] + cost_rev[mid_off + c] - me;
         let split_col = seg_start + c as u32;
         dp_candidates.push((split_col, combined));
     }
@@ -865,7 +873,7 @@ fn candidate_seams(
         candidates.push(raw_candidates[mid_idx]);
     }
 
-    let dp = SeamDp { cost_fwd, cost_rev, seg_start, seg_end, h };
+    let dp = SeamDp { cost_fwd, cost_rev, seg_start, seg_end, seg_w, h };
     (candidates, dp, vertical_winners)
 }
 
