@@ -768,9 +768,11 @@ pub fn split_wide_whitespace_words(
     gray: &GrayImage,
     ink_threshold: u8,
     char_index: Option<&crate::char_index::CharIndex>,
+    font_cache: Option<&crate::font_cache::FontCache>,
 ) {
     let (page_w, page_h) = gray.dimensions();
     let mut total_splits = 0u32;
+    let debug_gaps = std::env::var("UNSCAN_DEBUG_GAPS").is_ok();
 
     for line in lines.iter_mut() {
         let mut new_words: Vec<TextRegion> = Vec::new();
@@ -807,7 +809,7 @@ pub fn split_wide_whitespace_words(
             // If we have a char index, do a quick CI match on this word's char
             // crops to identify the font.  We'll use the font's glyph outlines
             // to compute per-pair expected gaps inline below.
-            let matched_font: Option<(Vec<u8>, String)> = char_index.and_then(|ci| {
+            let matched_font: Option<(std::sync::Arc<Vec<u8>>, String)> = char_index.and_then(|ci| {
                 // Build char crops from segmentation
                 let mut crops: Vec<(char, GrayImage)> = Vec::new();
                 for (ci_idx, &ch) in chars.iter().enumerate() {
@@ -833,7 +835,11 @@ pub fn split_wide_whitespace_words(
                 } else {
                     &font_key
                 };
-                let font_data = std::fs::read(font_path).ok()?;
+                let font_data: std::sync::Arc<Vec<u8>> = if let Some(fc) = font_cache {
+                    fc.load(std::path::Path::new(font_path)).ok()?
+                } else {
+                    std::sync::Arc::new(std::fs::read(font_path).ok()?)
+                };
                 Some((font_data, font_key))
             });
             let matched_font_ref = matched_font.as_ref().and_then(|(data, _key)| {
@@ -914,7 +920,7 @@ pub fn split_wide_whitespace_words(
                         let scale = ab_glyph::PxScale { x: s, y: s };
                         let expected = crate::char_index::font_pair_ink_gap(font, scale, chars[i], chars[i + 1]);
                         let threshold = expected.round() as u32 + 5;
-                        if std::env::var("UNSCAN_DEBUG_GAPS").is_ok() {
+                        if debug_gaps {
                             let word_text: String = chars.iter().collect();
                             eprintln!("[gap-debug] '{}'→'{}' word=\"{}\" obs_ink={:.1} font_ink={:.1} scale={:.1} expected_gap={:.1} threshold={} scan_gap={} fallback={}",
                                 chars[i], chars[i+1], word_text, observed_ink_w, font_ink_w, s, expected, threshold, gap, fallback_min_gap);
@@ -922,7 +928,7 @@ pub fn split_wide_whitespace_words(
                         Some(threshold)
                     })
                     .unwrap_or_else(|| {
-                        if std::env::var("UNSCAN_DEBUG_GAPS").is_ok() {
+                        if debug_gaps {
                             let word_text: String = chars.iter().collect();
                             eprintln!("[gap-debug] '{}'→'{}' word=\"{}\" FALLBACK (no font metric) scan_gap={} fallback={}",
                                 chars[i], chars[i+1], word_text, gap, fallback_min_gap);

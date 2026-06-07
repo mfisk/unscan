@@ -3,7 +3,7 @@
 //! Provides both a simple global SSIM and a Gaussian-windowed ink-aware SSIM
 //! with vertical shift search (used for font verification).
 
-use image::{GrayImage, Luma};
+use image::GrayImage;
 
 // ---------------------------------------------------------------------------
 // Global SSIM
@@ -77,29 +77,51 @@ pub fn gaussian_blur_3x3(img: &GrayImage) -> GrayImage {
     if w < 3 || h < 3 {
         return img.clone();
     }
-    let mut tmp = GrayImage::new(w, h);
-    for y in 0..h {
-        for x in 0..w {
-            let p = |dx: i32| -> u32 {
-                let xx = (x as i32 + dx).clamp(0, w as i32 - 1) as u32;
-                img.get_pixel(xx, y).0[0] as u32
-            };
-            let v = p(-1) + 2 * p(0) + p(1);
-            tmp.put_pixel(x, y, Luma([((v + 2) / 4) as u8]));
+    let w_us = w as usize;
+    let raw = img.as_raw();
+
+    // Horizontal pass → tmp
+    let mut tmp_buf = vec![0u8; w_us * h as usize];
+    for y in 0..h as usize {
+        let row_off = y * w_us;
+        // Left edge
+        tmp_buf[row_off] = ((raw[row_off] as u32 * 3 + raw[row_off + 1] as u32 + 2) / 4) as u8;
+        // Interior (no bounds check)
+        for x in 1..w_us - 1 {
+            let v = raw[row_off + x - 1] as u32 + 2 * raw[row_off + x] as u32 + raw[row_off + x + 1] as u32;
+            tmp_buf[row_off + x] = ((v + 2) / 4) as u8;
+        }
+        // Right edge
+        let last = w_us - 1;
+        tmp_buf[row_off + last] = ((raw[row_off + last - 1] as u32 + raw[row_off + last] as u32 * 3 + 2) / 4) as u8;
+    }
+
+    // Vertical pass → out
+    let mut out_buf = vec![0u8; w_us * h as usize];
+    // Top edge row
+    for x in 0..w_us {
+        let v = tmp_buf[x] as u32 * 3 + tmp_buf[w_us + x] as u32;
+        out_buf[x] = ((v + 2) / 4) as u8;
+    }
+    // Interior rows (no bounds check)
+    for y in 1..h as usize - 1 {
+        let prev_off = (y - 1) * w_us;
+        let curr_off = y * w_us;
+        let next_off = (y + 1) * w_us;
+        for x in 0..w_us {
+            let v = tmp_buf[prev_off + x] as u32 + 2 * tmp_buf[curr_off + x] as u32 + tmp_buf[next_off + x] as u32;
+            out_buf[curr_off + x] = ((v + 2) / 4) as u8;
         }
     }
-    let mut out = GrayImage::new(w, h);
-    for y in 0..h {
-        for x in 0..w {
-            let p = |dy: i32| -> u32 {
-                let yy = (y as i32 + dy).clamp(0, h as i32 - 1) as u32;
-                tmp.get_pixel(x, yy).0[0] as u32
-            };
-            let v = p(-1) + 2 * p(0) + p(1);
-            out.put_pixel(x, y, Luma([((v + 2) / 4) as u8]));
-        }
+    // Bottom edge row
+    let last_row = (h as usize - 1) * w_us;
+    let prev_row = (h as usize - 2) * w_us;
+    for x in 0..w_us {
+        let v = tmp_buf[prev_row + x] as u32 + tmp_buf[last_row + x] as u32 * 3;
+        out_buf[last_row + x] = ((v + 2) / 4) as u8;
     }
-    out
+
+    GrayImage::from_raw(w, h, out_buf).expect("blur output size mismatch")
 }
 
 // ---------------------------------------------------------------------------
@@ -107,27 +129,30 @@ pub fn gaussian_blur_3x3(img: &GrayImage) -> GrayImage {
 // ---------------------------------------------------------------------------
 
 /// Precomputed 11×11 Gaussian kernel with sigma ≈ 1.5.
-/// Values sum to 1.0.
-fn gaussian_kernel_11x11() -> [[f64; 11]; 11] {
-    const SIGMA: f64 = 1.5;
-    let mut kernel = [[0.0f64; 11]; 11];
-    let mut sum = 0.0f64;
-    for iy in 0..11 {
-        for ix in 0..11 {
-            let dx = ix as f64 - 5.0;
-            let dy = iy as f64 - 5.0;
-            let v = (-0.5 * (dx * dx + dy * dy) / (SIGMA * SIGMA)).exp();
-            kernel[iy][ix] = v;
-            sum += v;
+/// Computed once on first access, then reused.
+fn gaussian_kernel_11x11() -> &'static [[f64; 11]; 11] {
+    use std::sync::OnceLock;
+    static KERNEL: OnceLock<[[f64; 11]; 11]> = OnceLock::new();
+    KERNEL.get_or_init(|| {
+        const SIGMA: f64 = 1.5;
+        let mut kernel = [[0.0f64; 11]; 11];
+        let mut sum = 0.0f64;
+        for iy in 0..11 {
+            for ix in 0..11 {
+                let dx = ix as f64 - 5.0;
+                let dy = iy as f64 - 5.0;
+                let v = (-0.5 * (dx * dx + dy * dy) / (SIGMA * SIGMA)).exp();
+                kernel[iy][ix] = v;
+                sum += v;
+            }
         }
-    }
-    // Normalise
-    for row in &mut kernel {
-        for v in row.iter_mut() {
-            *v /= sum;
+        for row in &mut kernel {
+            for v in row.iter_mut() {
+                *v /= sum;
+            }
         }
-    }
-    kernel
+        kernel
+    })
 }
 
 /// Try vertical shifts of the rendered image from -max_shift to +max_shift

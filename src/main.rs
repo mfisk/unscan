@@ -356,7 +356,9 @@ fn load_or_build_index(
             Ok(mut index) => {
                 let n_entries: usize = index.n_entries();
                 index.compact(); // free raw entries — only flat_vecs needed for search
-                eprintln!("  MEM after compact: {}", mem_info());
+                if std::env::var("UNSCAN_DEBUG_MEM").is_ok() {
+                    eprintln!("  MEM after compact: {}", mem_info());
+                }
                 info!(
                     "  Loaded {} chars × {} entries in {:.1}s",
                     index.n_chars(),
@@ -514,7 +516,9 @@ fn run(args: &cli::Args) -> Result<(), ScanTextError> {
         raster_elapsed.as_secs_f32(),
         if raster_cached { ", cached" } else { "" },
     );
-    eprintln!("  MEM after page load: {}", mem_info());
+    if std::env::var("UNSCAN_DEBUG_MEM").is_ok() {
+        eprintln!("  MEM after page load: {}", mem_info());
+    }
 
     // ── 2b. Extract source image data for pass-through ───────────────
     let source_images = if input.extension().and_then(|e| e.to_str()) == Some("pdf") {
@@ -616,7 +620,7 @@ fn run(args: &cli::Args) -> Result<(), ScanTextError> {
         let ink_thresh = bg_color.0.saturating_sub(56);
         ocr::expand_bbox_to_ink(&mut lines, &gray_page, ink_thresh);
         ocr::expand_words_to_ink(&mut lines, &gray_page, ink_thresh);
-        ocr::split_wide_whitespace_words(&mut lines, &gray_page, ink_thresh, Some(&char_index));
+        ocr::split_wide_whitespace_words(&mut lines, &gray_page, ink_thresh, Some(&char_index), Some(&font_cache));
         let mut placed_texts: Vec<pdf_out::PlacedText> = Vec::new();
         let mut pg_vec = 0u32;
         let mut pg_raster = 0u32;
@@ -667,9 +671,12 @@ fn run(args: &cli::Args) -> Result<(), ScanTextError> {
                 while end > 0 && !line.text.is_char_boundary(end) { end -= 1; }
                 end
             };
-            eprintln!("  MEM line {} start: {} (\"{}\")", li, mem_info(), &line.text[..preview_end]);
+            let debug_mem = std::env::var("UNSCAN_DEBUG_MEM").is_ok();
+            if debug_mem {
+                eprintln!("  MEM line {} start: {} (\"{}\")", li, mem_info(), &line.text[..preview_end]);
+            }
             // Dump total mapped size from /proc/self/maps
-            if li == 2 || li == 45 {
+            if debug_mem && (li == 2 || li == 45) {
                 if let Ok(maps) = std::fs::read_to_string("/proc/self/maps") {
                     let mut total: u64 = 0;
                     for l in maps.lines() {
@@ -726,9 +733,11 @@ fn run(args: &cli::Args) -> Result<(), ScanTextError> {
                 diag_seg_dir.as_deref(),
             );
             let char_crops = &line_crops.plain;
-            eprintln!("  MEM line {} after segmentation: {} ({} plain crops, {} lig crops)",
-                li, mem_info(), char_crops.len(),
-                line_crops.ligature.as_ref().map_or(0, |v| v.len()));
+            if debug_mem {
+                eprintln!("  MEM line {} after segmentation: {} ({} plain crops, {} lig crops)",
+                    li, mem_info(), char_crops.len(),
+                    line_crops.ligature.as_ref().map_or(0, |v| v.len()));
+            }
 
             let font_result = {
 
@@ -795,8 +804,10 @@ fn run(args: &cli::Args) -> Result<(), ScanTextError> {
                     None
                 };
 
-                eprintln!("  MEM line {} after CI search: {}{}", li, mem_info(),
-                    if let Some(ref w) = seg_winner { format!(" [seg: {}]", w) } else { String::new() });
+                if debug_mem {
+                    eprintln!("  MEM line {} after CI search: {}{}", li, mem_info(),
+                        if let Some(ref w) = seg_winner { format!(" [seg: {}]", w) } else { String::new() });
+                }
 
                 // Overwrite diag-seg crops/ and refs/ with winning path's data
                 // (initial dump above used plain; if ligature won, replace).
@@ -879,14 +890,15 @@ fn run(args: &cli::Args) -> Result<(), ScanTextError> {
             } else {
                 char_crops
             };
-            let corrected_char_crops: Vec<(char, image::GrayImage)> = effective_crops.iter()
+            // Build a correction map: crop_index → corrected char, without cloning images
+            let char_corrections: std::collections::HashMap<usize, char> = ci_char_detail.iter()
+                .filter_map(|d| d.ocr_corrected_from.as_ref().map(|_| (d.crop_index, d.ch)))
+                .collect();
+            let corrected_char_crops: Vec<(char, &image::GrayImage)> = effective_crops.iter()
                 .enumerate()
                 .map(|(i, (ch, img))| {
-                    let effective_ch = ci_char_detail.iter()
-                        .find(|d| d.crop_index == i && d.ocr_corrected_from.is_some())
-                        .map(|d| d.ch)
-                        .unwrap_or(*ch);
-                    (effective_ch, img.clone())
+                    let effective_ch = char_corrections.get(&i).copied().unwrap_or(*ch);
+                    (effective_ch, img)
                 })
                 .collect();
             let chosen_char_dists: std::collections::HashMap<usize, f32> = if let Some(ref fr) = font_result {

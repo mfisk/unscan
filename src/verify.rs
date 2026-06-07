@@ -129,6 +129,12 @@ pub fn verify_text_region(
             ));
             best_render_ink = Some(render_ink);
         }
+
+        // Early exit: if 2× already gives a strong match, skip the
+        // more expensive 4× render — the glyph shape is clearly right.
+        if best_score >= 0.75 {
+            break;
+        }
     }
 
     // Save SSIM audit images.
