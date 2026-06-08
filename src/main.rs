@@ -19,6 +19,7 @@ mod segment;
 mod smooth;
 // mod word_match; // disabled: CI ranking used directly, word-level SSIM rerank removed
 pub(crate) mod verify;
+pub mod ground_truth;
 
 use crate::audit::{AuditEntry, AuditLog, BBox, Decision, GeometryEntry, PageSummary};
 
@@ -542,6 +543,19 @@ fn run(args: &cli::Args) -> Result<(), ScanTextError> {
     // Dominant font candidate for fast-path SSIM, persists across pages.
     let mut dominant_font_candidate: Option<font_match::FontMatchResult> = None;
 
+    // Load ground truth from vector PDF for miss-only audit gating.
+    let ground_truth: Option<ground_truth::GroundTruth> = if let Some(ref vpath) = args.vector {
+        match ground_truth::GroundTruth::load(vpath) {
+            Ok(gt) => Some(gt),
+            Err(e) => {
+                eprintln!("[ground_truth] WARNING: {}", e);
+                None
+            }
+        }
+    } else {
+        None
+    };
+
     for (page_idx, page_img) in pages.iter().enumerate() {
         info!(
             "━━━ Page {} ({} × {} px) ━━━",
@@ -819,21 +833,8 @@ fn run(args: &cli::Args) -> Result<(), ScanTextError> {
 
             let font_result = {
 
-                // Dump per-line crops into the audit dir.
-                // NOTE: We dump plain crops here before scoring; after the winner
-                // is decided we overwrite with winning crops if different (see below).
-                if let Some(ref ddir) = diag_seg_dir {
-                    if !char_crops.is_empty() {
-                        let crop_dir = ddir.join("crops");
-                        let _ = std::fs::create_dir_all(&crop_dir);
-                        for (i, (ch, img)) in char_crops.iter().enumerate() {
-                            let path = crop_dir.join(format!("crop_{:02}_{}.png", i,
-                                if ch.is_alphanumeric() { format!("{}", ch) }
-                                else { format!("U{:04X}", *ch as u32) }));
-                            let _ = img.save(&path);
-                        }
-                    }
-                }
+                // Crop PNGs are saved after font matching, gated by ground-truth
+                // miss detection when --vector is set (see below).
 
                 // ── Score plain path ─────────────────────────────────
                 let ci_t0 = std::time::Instant::now();
@@ -888,27 +889,7 @@ fn run(args: &cli::Args) -> Result<(), ScanTextError> {
                         if let Some(ref w) = seg_winner { format!(" [seg: {}]", w) } else { String::new() });
                 }
 
-                // Overwrite diag-seg crops/ and refs/ with winning path's data
-                // (initial dump above used plain; if ligature won, replace).
-                if use_lig {
-                    if let Some(ref ddir) = diag_seg_dir {
-                        let lig_crops = line_crops.ligature.as_ref().unwrap();
-                        if !lig_crops.is_empty() {
-                            let crop_dir = ddir.join("crops");
-                            // Remove old plain crops
-                            if crop_dir.is_dir() {
-                                let _ = std::fs::remove_dir_all(&crop_dir);
-                            }
-                            let _ = std::fs::create_dir_all(&crop_dir);
-                            for (i, (ch, img)) in lig_crops.iter().enumerate() {
-                                let path = crop_dir.join(format!("crop_{:02}_{}.png", i,
-                                    if ch.is_alphanumeric() { format!("{}", ch) }
-                                    else { format!("U{:04X}", *ch as u32) }));
-                                let _ = img.save(&path);
-                            }
-                        }
-                    }
-                }
+                // Crop PNGs saved after font matching (see below).
 
                 // --include-font: inject into CI audit list so it shows in audit
                 if let Some(ref include) = args.include_font {
@@ -961,6 +942,22 @@ fn run(args: &cli::Args) -> Result<(), ScanTextError> {
                 eprintln!("  LINE {}: {:.1}s '{:.30}…'", li, line_elapsed.as_secs_f32(),
                     line.words.iter().map(|w| w.text.as_str()).collect::<Vec<_>>().join(" "));
             }
+            // ── Ground-truth gated audit detail ─────────────────────────
+            // When --vector is set, check if this line is a miss before doing
+            // expensive audit I/O.  Without --vector, all lines get full audit.
+            let is_miss = if let Some(ref gt) = ground_truth {
+                if let Some(ref fr) = font_result {
+                    let bbox_px = [line.x as f32, line.y as f32,
+                                   (line.x + line.width) as f32,
+                                   (line.y + line.height) as f32];
+                    !gt.is_hit(page_idx + 1, &bbox_px, args.dpi, &fr.font_name)
+                } else {
+                    true // no font matched → treat as miss
+                }
+            } else {
+                true // no ground truth → full audit for all lines
+            };
+
             // Compute per-char distances for the chosen font.
             // Use corrected characters when the OCR correction gate fired.
             // Use winning path's crops (plain or ligature).
@@ -980,82 +977,104 @@ fn run(args: &cli::Args) -> Result<(), ScanTextError> {
                     (effective_ch, img)
                 })
                 .collect();
-            let pcd_t0 = std::time::Instant::now();
-            // Precompute features once for all per-char distance lookups
-            let crop_feats = char_index::precompute_crop_features(&corrected_char_crops);
 
-            let chosen_char_dists: std::collections::HashMap<usize, f32> = if let Some(ref fr) = font_result {
-                if !fr.font_key.is_empty() {
-                    char_index::per_char_distances_precomputed(&char_index, &fr.font_key, &crop_feats)
-                        .into_iter()
-                        .map(|(_, crop_idx, d2)| (crop_idx, d2))
-                        .collect()
+            let pcd_t0 = std::time::Instant::now();
+
+            // Per-char distances and audit detail: only for miss lines (or all if no --vector)
+            let (chosen_char_dists, fontmap_char_dists) = if is_miss && args.audit.is_some() {
+                // Precompute features once for all per-char distance lookups
+                let crop_feats = char_index::precompute_crop_features(&corrected_char_crops);
+
+                let chosen: std::collections::HashMap<usize, f32> = if let Some(ref fr) = font_result {
+                    if !fr.font_key.is_empty() {
+                        char_index::per_char_distances_precomputed(&char_index, &fr.font_key, &crop_feats)
+                            .into_iter()
+                            .map(|(_, crop_idx, d2)| (crop_idx, d2))
+                            .collect()
+                    } else {
+                        std::collections::HashMap::new()
+                    }
                 } else {
                     std::collections::HashMap::new()
-                }
-            } else {
-                std::collections::HashMap::new()
-            };
+                };
 
-            // Per-char distances to all fontmap fonts (ground truth coverage for audit)
-            let fontmap_char_dists: std::collections::HashMap<usize, Vec<(String, f32)>> = if !fontmap_keys.is_empty() {
-                let mut result: std::collections::HashMap<usize, Vec<(String, f32)>> = std::collections::HashMap::new();
-                for fk in &fontmap_keys {
-                    for (_, crop_idx, d2) in char_index::per_char_distances_precomputed(&char_index, fk, &crop_feats) {
-                        result.entry(crop_idx).or_default().push((fk.clone(), d2));
+                // Per-char distances to all fontmap fonts
+                let fontmap: std::collections::HashMap<usize, Vec<(String, f32)>> = if !fontmap_keys.is_empty() {
+                    let mut result: std::collections::HashMap<usize, Vec<(String, f32)>> = std::collections::HashMap::new();
+                    for fk in &fontmap_keys {
+                        for (_, crop_idx, d2) in char_index::per_char_distances_precomputed(&char_index, fk, &crop_feats) {
+                            result.entry(crop_idx).or_default().push((fk.clone(), d2));
+                        }
+                    }
+                    result
+                } else {
+                    std::collections::HashMap::new()
+                };
+
+                // Save crop PNGs for miss lines
+                if let Some(ref ddir) = diag_seg_dir {
+                    if !effective_crops.is_empty() {
+                        let crop_dir = ddir.join("crops");
+                        let _ = std::fs::create_dir_all(&crop_dir);
+                        for (i, (ch, img)) in effective_crops.iter().enumerate() {
+                            let path = crop_dir.join(format!("crop_{:02}_{}.png", i,
+                                if ch.is_alphanumeric() { format!("{}", ch) }
+                                else { format!("U{:04X}", *ch as u32) }));
+                            let _ = img.save(&path);
+                        }
                     }
                 }
-                result
-            } else {
-                std::collections::HashMap::new()
-            };
-            prof_pcd_us.fetch_add(pcd_t0.elapsed().as_micros() as u64, std::sync::atomic::Ordering::Relaxed);
 
-            // Dump CI reference images into shared font_refs/<label>/U+XXXX.png
-            // One copy per font/variant, shared across all lines.
-            if let (Some(ref audit_root), Some(ref fr)) = (&args.audit, &font_result) {
-                let fe_opt = font_catalog.iter().find(|e| e.font_key() == fr.font_key);
-                let label = fe_opt.map(|fe| {
-                    let mut s = fe.family_name.replace(' ', "");
-                    if fe.is_bold { s.push_str("-Bold"); }
-                    if fe.is_italic { s.push_str("-Italic"); }
-                    if !fe.variant_tag.is_empty() {
-                        s.push('_');
-                        s.push_str(&fe.variant_tag);
-                    }
-                    s
-                }).unwrap_or_else(|| {
-                    fr.font_path.file_stem()
-                        .and_then(|s| s.to_str())
-                        .unwrap_or("unknown")
-                        .to_string()
-                });
-                let font_ref_dir = audit_root.join("font_refs").join(&label);
-                let _ = std::fs::create_dir_all(&font_ref_dir);
+                // Render font ref glyphs for miss lines
+                if let (Some(ref audit_root), Some(ref fr)) = (&args.audit, &font_result) {
+                    let fe_opt = font_catalog.iter().find(|e| e.font_key() == fr.font_key);
+                    let label = fe_opt.map(|fe| {
+                        let mut s = fe.family_name.replace(' ', "");
+                        if fe.is_bold { s.push_str("-Bold"); }
+                        if fe.is_italic { s.push_str("-Italic"); }
+                        if !fe.variant_tag.is_empty() {
+                            s.push('_');
+                            s.push_str(&fe.variant_tag);
+                        }
+                        s
+                    }).unwrap_or_else(|| {
+                        fr.font_path.file_stem()
+                            .and_then(|s| s.to_str())
+                            .unwrap_or("unknown")
+                            .to_string()
+                    });
+                    let font_ref_dir = audit_root.join("font_refs").join(&label);
+                    let _ = std::fs::create_dir_all(&font_ref_dir);
 
-                let override_map: std::collections::HashMap<char, u16> = fe_opt
-                    .and_then(|fe| fe.glyph_overrides.as_ref())
-                    .map(|v| v.iter().cloned().collect())
-                    .unwrap_or_default();
-                let font_data = font_cache.load(&fr.font_path).ok();
-                if let Some(ref fdata) = font_data {
-                    if let Ok(font) = ab_glyph::FontRef::try_from_slice(fdata) {
-                        for (ch, _crop) in corrected_char_crops.iter() {
-                            let fname = format!("U+{:04X}.png", *ch as u32);
-                            let path = font_ref_dir.join(&fname);
-                            if path.exists() { continue; } // already rendered
-                            let ref_img = if let Some(&gid) = override_map.get(ch) {
-                                char_index::render_glyph_normalised(&font, ab_glyph::GlyphId(gid))
-                            } else {
-                                char_index::render_char_normalised(&font, *ch)
-                            };
-                            if let Some(img) = ref_img {
-                                let _ = img.save(&path);
+                    let override_map: std::collections::HashMap<char, u16> = fe_opt
+                        .and_then(|fe| fe.glyph_overrides.as_ref())
+                        .map(|v| v.iter().cloned().collect())
+                        .unwrap_or_default();
+                    let font_data = font_cache.load(&fr.font_path).ok();
+                    if let Some(ref fdata) = font_data {
+                        if let Ok(font) = ab_glyph::FontRef::try_from_slice(fdata) {
+                            for (ch, _crop) in corrected_char_crops.iter() {
+                                let fname = format!("U+{:04X}.png", *ch as u32);
+                                let path = font_ref_dir.join(&fname);
+                                if path.exists() { continue; }
+                                let ref_img = if let Some(&gid) = override_map.get(ch) {
+                                    char_index::render_glyph_normalised(&font, ab_glyph::GlyphId(gid))
+                                } else {
+                                    char_index::render_char_normalised(&font, *ch)
+                                };
+                                if let Some(img) = ref_img {
+                                    let _ = img.save(&path);
+                                }
                             }
                         }
                     }
                 }
-            }
+
+                (chosen, fontmap)
+            } else {
+                (std::collections::HashMap::new(), std::collections::HashMap::new())
+            };
+            prof_pcd_us.fetch_add(pcd_t0.elapsed().as_micros() as u64, std::sync::atomic::Ordering::Relaxed);
 
             prof_full_us.fetch_add(line_start.elapsed().as_micros() as u64, std::sync::atomic::Ordering::Relaxed);
             LineMatch { font_result, text_color, ci_top_for_audit, ci_char_detail, ci_top_for_audit_lig, ci_char_detail_lig, seg_winner, diag_seg_dir, chosen_char_dists, fontmap_char_dists }
