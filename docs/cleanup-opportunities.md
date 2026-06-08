@@ -1,6 +1,11 @@
 # Code Cleanup Opportunities — unscan
 
 Audit date: 2026-05-10  
+**Status note (June 2026):** Some items below may be outdated due to subsequent
+refactoring. The architecture has changed: word-level SSIM reranking is disabled,
+CI #1 wins directly, and font data is no longer stored in FontMatchResult (lazy
+load via FontCache). Review against current source before acting on any item.
+
 Codebase: 8,526 lines across 16 `.rs` files + 1 test file
 
 ---

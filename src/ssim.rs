@@ -159,7 +159,7 @@ fn gaussian_kernel_11x11() -> &'static [[f64; 11]; 11] {
 /// pixels and return the best (highest) SSIM and the shift that produced it.
 /// Positive dy = rendered image moved DOWN.
 /// Searches from center outward (0, -1, 1, -2, 2, …) and exits early if SSIM ≥ 0.92.
-pub fn ssim_windowed_best_vshift(a: &GrayImage, b: &GrayImage, max_shift: i32) -> (f32, i32) {
+pub fn ssim_windowed_best_vshift(a: &GrayImage, b: &GrayImage, max_shift: i32, bail_below: Option<f32>) -> (f32, i32) {
     const EARLY_EXIT_THRESHOLD: f32 = 0.92;
     let mut best = 0.0f32;
     let mut best_dy = 0i32;
@@ -173,7 +173,7 @@ pub fn ssim_windowed_best_vshift(a: &GrayImage, b: &GrayImage, max_shift: i32) -
     }
 
     for dy in shifts {
-        let score = ssim_windowed(a, b, dy);
+        let score = ssim_windowed(a, b, dy, bail_below);
         if score > best {
             best = score;
             best_dy = dy;
@@ -190,7 +190,9 @@ pub fn ssim_windowed_best_vshift(a: &GrayImage, b: &GrayImage, max_shift: i32) -
 /// - 11×11 Gaussian-weighted windows, stepped by 4 pixels
 /// - Only windows containing ink (pixels < 240 in either image) contribute
 /// - Falls back to global SSIM for images smaller than 11×11
-pub fn ssim_windowed(a: &GrayImage, b: &GrayImage, b_dy: i32) -> f32 {
+/// - `bail_below`: if Some(threshold), bail early when the running average
+///   drops below threshold after processing each row of windows.
+pub fn ssim_windowed(a: &GrayImage, b: &GrayImage, b_dy: i32, bail_below: Option<f32>) -> f32 {
     let (w, h) = a.dimensions();
     if w < 11 || h < 11 {
         // Fallback to global for tiny images (shift not applied in global path)
@@ -274,6 +276,17 @@ pub fn ssim_windowed(a: &GrayImage, b: &GrayImage, b_dy: i32) -> f32 {
 
             cx += step;
         }
+
+        // Early bail: if running average is clearly below threshold, stop
+        if let Some(bail_thresh) = bail_below {
+            if window_count >= 8 {
+                let running = (ssim_sum / window_count as f64) as f32;
+                if running < bail_thresh {
+                    return running.clamp(0.0, 1.0);
+                }
+            }
+        }
+
         cy += step;
     }
 

@@ -1310,6 +1310,8 @@ pub struct CharIndex {
     flat_vecs: HashMap<char, Vec<(usize, [f32; FEAT_LEN])>>,
     /// Per-character per-dimension standard deviations (for diagnostics)
     dim_sigmas: HashMap<char, [f32; FEAT_LEN]>,
+    /// Per-character font_id → index into flat_vecs for O(1) backfill lookup
+    flat_vecs_font_idx: HashMap<char, HashMap<usize, usize>>,
 }
 
 impl Clone for CharIndex {
@@ -1320,6 +1322,7 @@ impl Clone for CharIndex {
             font_names_table: Vec::new(),
             flat_vecs: HashMap::new(),
             dim_sigmas: HashMap::new(),
+            flat_vecs_font_idx: HashMap::new(),
         };
         idx.rebuild_vecs();
         idx
@@ -1390,7 +1393,12 @@ impl CharIndex {
             }
 
             self.dim_sigmas.insert(*c, sigmas);
+            let font_idx: HashMap<usize, usize> = points.iter()
+                .enumerate()
+                .map(|(idx, (fid, _))| (*fid, idx))
+                .collect();
             self.flat_vecs.insert(*c, points);
+            self.flat_vecs_font_idx.insert(*c, font_idx);
         }
     }
 }
@@ -1501,6 +1509,7 @@ pub fn build_char_index(font_paths: &[(String, std::path::PathBuf, GlyphOverride
         font_names_table: Vec::new(),
         flat_vecs: HashMap::new(),
         dim_sigmas: HashMap::new(),
+        flat_vecs_font_idx: HashMap::new(),
     };
     index.rebuild_vecs();
     index
@@ -1989,6 +1998,7 @@ pub fn search_candidates(
     }
 
     // Pre-compute weighted feature vectors for all crops
+    let feat_t0 = std::time::Instant::now();
     let crop_feats: Vec<(usize, char, [f32; FEAT_LEN])> = char_crops
         .iter()
         .enumerate()
@@ -1996,6 +2006,7 @@ pub fn search_candidates(
             compute_features(img).map(|f| (i, *c, f.weighted()))
         })
         .collect();
+    let feat_us = feat_t0.elapsed().as_micros();
 
     if crop_feats.is_empty() {
         return CiSearchResult { scores: Vec::new(), char_detail: Vec::new() };
@@ -2019,16 +2030,21 @@ pub fn search_candidates(
     let mut no_tree = 0usize;
     let mut char_detail: Vec<CharCiDetail> = Vec::with_capacity(crop_feats.len());
 
+    let search_t0 = std::time::Instant::now();
+    let mut brute_us: u64 = 0;
+    let mut alt_us: u64 = 0;
     for (crop_idx, c, query_feat) in &crop_feats {
         let weight = char_weight(*c);
 
         // Find nearest neighbor + everything within (2.5 × thoroughness)× that distance.
+        let brute_t0 = std::time::Instant::now();
         let hits: Vec<(usize, f32)> = if let Some(points) = index.flat_vecs.get(c) {
             nearest_within_factor_brute(points, query_feat, 2.5 * thoroughness)
         } else {
             no_tree += 1;
             continue;
         };
+        brute_us += brute_t0.elapsed().as_micros() as u64;
 
         let min_dist_sq = hits.iter().map(|(_, d)| *d).fold(f32::INFINITY, f32::min);
 
@@ -2044,6 +2060,7 @@ pub fn search_candidates(
         let mut best_alt_char: Option<char> = None;
         let mut best_alt_dist: Option<f32> = None;
 
+        let alt_t0 = std::time::Instant::now();
         if min_dist_sq > 0.1 {
             // Only check alternatives when OCR match is already poor.
             // Test confusable characters that OCR commonly swaps.
@@ -2084,6 +2101,7 @@ pub fn search_candidates(
                 }
             }
         }
+        alt_us += alt_t0.elapsed().as_micros() as u64;
 
         let hits = effective_hits;
         let min_dist_sq = effective_min;
@@ -2131,6 +2149,7 @@ pub fn search_candidates(
             font_gated_hits.entry(*font_id).or_default().insert(gated_idx);
         }
     }
+    let search_us = search_t0.elapsed().as_micros();
 
     // ── Second pass: fill in real distances for candidate fonts that fell
     //    outside the search radius on some characters. ──────────────────
@@ -2147,7 +2166,11 @@ pub fn search_candidates(
             for (gi, (score_ch, qfeat, w)) in gated_crops.iter().enumerate() {
                 if !hit_set.contains(&gi) {
                     if let Some(points) = index.flat_vecs.get(score_ch) {
-                        if let Some((_, ref_vec)) = points.iter().find(|(fid, _)| fid == font_id) {
+                        // O(1) font_id lookup via prebuilt index (was linear scan)
+                        let ref_vec_opt = index.flat_vecs_font_idx.get(score_ch)
+                            .and_then(|idx_map| idx_map.get(font_id))
+                            .map(|&idx| &points[idx].1);
+                        if let Some(ref_vec) = ref_vec_opt {
                             let dist_sq = squared_distance(qfeat, ref_vec);
                             let log_d = (dist_sq + 1e-10_f32).ln();
                             font_log_dists.entry(*font_id).or_default().push((log_d, *w));
@@ -2163,12 +2186,17 @@ pub fn search_candidates(
     }
 
     eprintln!(
-        "  CI: {} crops, {} pass gate, {} fail gate, {} no_tree → {} fonts in voting",
+        "  CI: {} crops, {} pass gate, {} fail gate, {} no_tree → {} fonts in voting [feat={:.1}ms search={:.1}ms (brute={:.1}ms alt={:.1}ms) backfill={}]",
         crop_feats.len(),
         quality_gate_pass,
         quality_gate_fail,
         no_tree,
         font_log_dists.len(),
+        feat_us as f64 / 1000.0,
+        search_us as f64 / 1000.0,
+        brute_us as f64 / 1000.0,
+        alt_us as f64 / 1000.0,
+        backfill_count,
     );
 
     // Aggregate: weighted geometric mean of distances per font.
@@ -2372,32 +2400,59 @@ pub fn per_char_distances(
     font_key: &str,
     char_crops: &[(char, &GrayImage)],
 ) -> Vec<(char, usize, f32)> {
+    let precomputed: Vec<(usize, char, [f32; FEAT_LEN])> = char_crops
+        .iter()
+        .enumerate()
+        .filter_map(|(i, (c, img))| {
+            compute_features(img).map(|f| (i, *c, f.weighted()))
+        })
+        .collect();
+    per_char_distances_precomputed(index, font_key, &precomputed)
+}
+
+/// Like `per_char_distances` but takes precomputed weighted feature vectors.
+/// Use this when computing distances against multiple fonts for the same crops
+/// to avoid redundant `compute_features` calls.
+pub fn per_char_distances_precomputed(
+    index: &CharIndex,
+    font_key: &str,
+    crop_feats: &[(usize, char, [f32; FEAT_LEN])],
+) -> Vec<(char, usize, f32)> {
     // Find the font_id for the requested key
     let font_id = match index.font_names_table.iter().position(|n| n == font_key) {
         Some(id) => id,
         None => return Vec::new(),
     };
 
-    let mut result = Vec::with_capacity(char_crops.len());
-    for (crop_idx, (ch, crop)) in char_crops.iter().enumerate() {
-        let feats = match compute_features(crop) {
-            Some(f) => f,
-            None => continue,
-        };
-        let query = feats.weighted();
-
-        // Find this font's weighted vector for this character
-        if let Some(points) = index.flat_vecs.get(ch) {
-            for (fid, ref_vec) in points {
-                if *fid == font_id {
-                    let d2 = squared_distance(&query, ref_vec);
-                    result.push((*ch, crop_idx, d2));
-                    break;
-                }
+    let mut result = Vec::with_capacity(crop_feats.len());
+    for &(crop_idx, ch, ref query) in crop_feats {
+        // Find this font's weighted vector for this character (O(1) lookup)
+        if let Some(points) = index.flat_vecs.get(&ch) {
+            let ref_vec_opt = index.flat_vecs_font_idx.get(&ch)
+                .and_then(|idx_map| idx_map.get(&font_id))
+                .map(|&idx| &points[idx].1);
+            if let Some(ref_vec) = ref_vec_opt {
+                let d2 = squared_distance(query, ref_vec);
+                result.push((ch, crop_idx, d2));
             }
         }
     }
     result
+}
+
+/// Precompute weighted feature vectors for a set of character crops.
+/// Returns `(crop_index, char, weighted_features)` for each crop that
+/// produces valid features.
+pub fn precompute_crop_features(
+    char_crops: &[(char, &GrayImage)],
+) -> Vec<(usize, char, [f32; FEAT_LEN])> {
+    char_crops
+        .iter()
+        .enumerate()
+        .filter_map(|(i, (c, img))| {
+            compute_features(img).map(|f| (i, *c, f.weighted()))
+        })
+        .collect()
 }
 
 // ---------------------------------------------------------------------------
@@ -2646,6 +2701,7 @@ pub fn load_index(path: &Path) -> io::Result<CharIndex> {
         font_names_table: Vec::new(),
         flat_vecs: HashMap::new(),
         dim_sigmas,
+        flat_vecs_font_idx: HashMap::new(),
     };
     // Build flat vecs from loaded entries
     index.rebuild_vecs();

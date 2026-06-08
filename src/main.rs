@@ -456,7 +456,9 @@ fn run(args: &cli::Args) -> Result<(), ScanTextError> {
     // ── 1. Discover fonts ────────────────────────────────────────────
     let font_dirs = font_scan::default_font_dirs(&args.font_dir);
     info!("Scanning for fonts…");
+    let _t_scan = std::time::Instant::now();
     let font_catalog = font_scan::scan_fonts(&font_dirs);
+    eprintln!("  PROF font_scan: {:.2}s ({} fonts)", _t_scan.elapsed().as_secs_f64(), font_catalog.len());
     info!("Found {} candidate fonts", font_catalog.len());
     if font_catalog.is_empty() {
         return Err(ScanTextError::NoFonts);
@@ -537,6 +539,8 @@ fn run(args: &cli::Args) -> Result<(), ScanTextError> {
     let mut stat_lines_raster = 0u32;
     let mut stat_geo_elements = 0u32;
     let mut stat_raster_frags = 0u32;
+    // Dominant font candidate for fast-path SSIM, persists across pages.
+    let mut dominant_font_candidate: Option<font_match::FontMatchResult> = None;
 
     for (page_idx, page_img) in pages.iter().enumerate() {
         info!(
@@ -618,9 +622,13 @@ fn run(args: &cli::Args) -> Result<(), ScanTextError> {
         // Use a threshold relative to the background: anything darker than
         // (bg - 56) counts as ink (works for both light and dark backgrounds).
         let ink_thresh = bg_color.0.saturating_sub(56);
+        let _t_pre = std::time::Instant::now();
         ocr::expand_bbox_to_ink(&mut lines, &gray_page, ink_thresh);
         ocr::expand_words_to_ink(&mut lines, &gray_page, ink_thresh);
+        eprintln!("  PROF expand_bbox+words: {:.2}s", _t_pre.elapsed().as_secs_f64());
+        let _t_split = std::time::Instant::now();
         ocr::split_wide_whitespace_words(&mut lines, &gray_page, ink_thresh, Some(&char_index), Some(&font_cache));
+        eprintln!("  PROF split_wide_whitespace: {:.2}s", _t_split.elapsed().as_secs_f64());
         let mut placed_texts: Vec<pdf_out::PlacedText> = Vec::new();
         let mut pg_vec = 0u32;
         let mut pg_raster = 0u32;
@@ -665,7 +673,75 @@ fn run(args: &cli::Args) -> Result<(), ScanTextError> {
         } else { Vec::new() };
 
         let fontmatch_start = std::time::Instant::now();
+
+        // ── Parallel font matching with SSIM fast path ───────────────
+        // If we have a dominant font candidate (from a previous page or
+        // seeded from this page), each thread tries it via SSIM first.
+        // Lines that pass skip segmentation and CI entirely; misses fall
+        // through to the full pipeline.  Everything runs in parallel.
+        const FAST_PATH_MIN_SSIM: f32 = 0.90;
+        let fast_path_candidate: Option<&font_match::FontMatchResult> =
+            dominant_font_candidate.as_ref();
+        let fast_path_font_data: Option<std::sync::Arc<Vec<u8>>> = fast_path_candidate
+            .and_then(|fm| font_cache.load(&fm.font_path).ok());
+        let fast_path_hits = std::sync::atomic::AtomicU64::new(0);
+
+        // Profiling accumulators (microseconds, atomic for par_iter)
+        let prof_seg_us = std::sync::atomic::AtomicU64::new(0);
+        let prof_ci_us = std::sync::atomic::AtomicU64::new(0);
+        let prof_pcd_us = std::sync::atomic::AtomicU64::new(0);
+        let prof_fp_us = std::sync::atomic::AtomicU64::new(0);
+        let prof_full_us = std::sync::atomic::AtomicU64::new(0);
         let line_matches: Vec<LineMatch> = lines.par_iter().enumerate().map(|(li, line)| {
+            let line_start = std::time::Instant::now();
+            // ── Fast path: try dominant font via SSIM ────────────────
+            if let (Some(fm), Some(ref fd)) = (fast_path_candidate, &fast_path_font_data) {
+                let (score, _dy) = verify::verify_text_region(
+                    &gray_page,
+                    fd.as_slice(),
+                    &line.text,
+                    line.x, line.y,
+                    line.width, line.height,
+                    &line.words,
+                    fm.glyph_overrides.as_deref(),
+                    &fm.variant_tag,
+                    None,
+                    Some(FAST_PATH_MIN_SSIM),
+                );
+                if score >= FAST_PATH_MIN_SSIM {
+                    fast_path_hits.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                    prof_fp_us.fetch_add(line_start.elapsed().as_micros() as u64, std::sync::atomic::Ordering::Relaxed);
+                    let text_color = color::detect_text_color(
+                        page_img,
+                        &TextRegion {
+                            text: line.text.clone(),
+                            x: line.x, y: line.y,
+                            width: line.width, height: line.height,
+                            font_size_pt: line.font_size_pt,
+                            confidence: line.confidence,
+                            level: 5, block_num: 0, par_num: 0, line_num: 0, word_num: 0,
+                        },
+                    );
+                    let mut result = fm.clone();
+                    result.best_dy = _dy;
+                    return LineMatch {
+                        font_result: Some(result),
+                        text_color,
+                        ci_top_for_audit: Vec::new(),
+                        ci_char_detail: Vec::new(),
+                        ci_top_for_audit_lig: Vec::new(),
+                        ci_char_detail_lig: Vec::new(),
+                        seg_winner: None,
+                        diag_seg_dir: None,
+                        chosen_char_dists: std::collections::HashMap::new(),
+                        fontmap_char_dists: std::collections::HashMap::new(),
+                    };
+                } else if li < 3 {
+                    eprintln!("    [fp-miss] L{} ssim={:.3} font={}", li, score, fm.font_key);
+                }
+            }
+
+            // ── Full pipeline: segmentation → CI search → font match ─
             let preview_end = {
                 let mut end = line.text.len().min(30);
                 while end > 0 && !line.text.is_char_boundary(end) { end -= 1; }
@@ -728,10 +804,12 @@ fn run(args: &cli::Args) -> Result<(), ScanTextError> {
                 })
                 .collect();
             let line_height = line.words.iter().map(|w| w.height).max().unwrap_or(0);
+            let seg_t0 = std::time::Instant::now();
             let line_crops = char_index::extract_line_chars(
                 &gray_page, &word_placements, line_height,
                 diag_seg_dir.as_deref(),
             );
+            prof_seg_us.fetch_add(seg_t0.elapsed().as_micros() as u64, std::sync::atomic::Ordering::Relaxed);
             let char_crops = &line_crops.plain;
             if debug_mem {
                 eprintln!("  MEM line {} after segmentation: {} ({} plain crops, {} lig crops)",
@@ -758,13 +836,14 @@ fn run(args: &cli::Args) -> Result<(), ScanTextError> {
                 }
 
                 // ── Score plain path ─────────────────────────────────
+                let ci_t0 = std::time::Instant::now();
                 let ci_result_plain = char_index::search_candidates(&char_index, char_crops, args.thoroughness, args.audit.is_some());
 
                 // ── Score ligature path (if present) ─────────────────
                 let ci_result_lig = line_crops.ligature.as_ref().map(|lig_crops| {
                     char_index::search_candidates(&char_index, lig_crops, args.thoroughness, args.audit.is_some())
                 });
-
+                prof_ci_us.fetch_add(ci_t0.elapsed().as_micros() as u64, std::sync::atomic::Ordering::Relaxed);
                 // ── Pick the winner: higher top score wins ───────────
                 let plain_top = ci_result_plain.scores.first().map(|(_, s)| *s).unwrap_or(f32::MIN);
                 let lig_top = ci_result_lig.as_ref()
@@ -901,9 +980,13 @@ fn run(args: &cli::Args) -> Result<(), ScanTextError> {
                     (effective_ch, img)
                 })
                 .collect();
+            let pcd_t0 = std::time::Instant::now();
+            // Precompute features once for all per-char distance lookups
+            let crop_feats = char_index::precompute_crop_features(&corrected_char_crops);
+
             let chosen_char_dists: std::collections::HashMap<usize, f32> = if let Some(ref fr) = font_result {
                 if !fr.font_key.is_empty() {
-                    char_index::per_char_distances(&char_index, &fr.font_key, &corrected_char_crops)
+                    char_index::per_char_distances_precomputed(&char_index, &fr.font_key, &crop_feats)
                         .into_iter()
                         .map(|(_, crop_idx, d2)| (crop_idx, d2))
                         .collect()
@@ -918,7 +1001,7 @@ fn run(args: &cli::Args) -> Result<(), ScanTextError> {
             let fontmap_char_dists: std::collections::HashMap<usize, Vec<(String, f32)>> = if !fontmap_keys.is_empty() {
                 let mut result: std::collections::HashMap<usize, Vec<(String, f32)>> = std::collections::HashMap::new();
                 for fk in &fontmap_keys {
-                    for (_, crop_idx, d2) in char_index::per_char_distances(&char_index, fk, &corrected_char_crops) {
+                    for (_, crop_idx, d2) in char_index::per_char_distances_precomputed(&char_index, fk, &crop_feats) {
                         result.entry(crop_idx).or_default().push((fk.clone(), d2));
                     }
                 }
@@ -926,6 +1009,7 @@ fn run(args: &cli::Args) -> Result<(), ScanTextError> {
             } else {
                 std::collections::HashMap::new()
             };
+            prof_pcd_us.fetch_add(pcd_t0.elapsed().as_micros() as u64, std::sync::atomic::Ordering::Relaxed);
 
             // Dump CI reference images into shared font_refs/<label>/U+XXXX.png
             // One copy per font/variant, shared across all lines.
@@ -972,10 +1056,51 @@ fn run(args: &cli::Args) -> Result<(), ScanTextError> {
                     }
                 }
             }
+
+            prof_full_us.fetch_add(line_start.elapsed().as_micros() as u64, std::sync::atomic::Ordering::Relaxed);
             LineMatch { font_result, text_color, ci_top_for_audit, ci_char_detail, ci_top_for_audit_lig, ci_char_detail_lig, seg_winner, diag_seg_dir, chosen_char_dists, fontmap_char_dists }
         }).collect();
+
+        // Update dominant font candidate for next page from this page's results
+        {
+            let mut font_freq: std::collections::HashMap<String, usize> = std::collections::HashMap::new();
+            for lm in &line_matches {
+                if let Some(ref fr) = lm.font_result {
+                    *font_freq.entry(fr.font_key.clone()).or_insert(0) += 1;
+                }
+            }
+            if let Some((top_key, count)) = font_freq.iter().max_by_key(|(_, c)| *c) {
+                eprintln!("    dominant font: {} ({} lines)", top_key, count);
+                dominant_font_candidate = line_matches.iter()
+                    .find_map(|lm| lm.font_result.as_ref()
+                        .filter(|fr| fr.font_key == *top_key)
+                        .cloned());
+            }
+        }
+
+        let fp_hits = fast_path_hits.load(std::sync::atomic::Ordering::Relaxed);
+        let ci_lines = lines.len() as u64 - fp_hits;
         let fontmatch_elapsed = fontmatch_start.elapsed();
-        eprintln!("  Font matching: {:.1}s ({} lines)", fontmatch_elapsed.as_secs_f32(), lines.len());
+        eprintln!("  Font matching: {:.1}s ({} lines, {} fast-path hits)",
+            fontmatch_elapsed.as_secs_f32(), lines.len(), fp_hits);
+        if fp_hits > 0 {
+            eprintln!("    ├─ fast-path total:  {:.2}s ({} lines, {:.1}ms avg)",
+                prof_fp_us.load(std::sync::atomic::Ordering::Relaxed) as f64 / 1_000_000.0,
+                fp_hits,
+                prof_fp_us.load(std::sync::atomic::Ordering::Relaxed) as f64 / 1_000.0 / fp_hits as f64);
+        }
+        if ci_lines > 0 {
+            eprintln!("    ├─ full CI total:    {:.2}s ({} lines, {:.1}ms avg)",
+                prof_full_us.load(std::sync::atomic::Ordering::Relaxed) as f64 / 1_000_000.0,
+                ci_lines,
+                prof_full_us.load(std::sync::atomic::Ordering::Relaxed) as f64 / 1_000.0 / ci_lines as f64);
+        }
+        eprintln!("    ├─ segmentation:     {:.2}s (cumulative across threads)",
+            prof_seg_us.load(std::sync::atomic::Ordering::Relaxed) as f64 / 1_000_000.0);
+        eprintln!("    ├─ CI search:        {:.2}s (cumulative across threads)",
+            prof_ci_us.load(std::sync::atomic::Ordering::Relaxed) as f64 / 1_000_000.0);
+        eprintln!("    └─ per_char_dists:   {:.2}s (cumulative across threads)",
+            prof_pcd_us.load(std::sync::atomic::Ordering::Relaxed) as f64 / 1_000_000.0);
 
         // ── Pass 1.5: Paragraph-level font grouping ─────────────────
         // Find the dominant body font: most common font among matched lines
@@ -1027,6 +1152,8 @@ fn run(args: &cli::Args) -> Result<(), ScanTextError> {
         }
 
         // ── Pass 2: Decision matrix + output ──────────────────────────
+        let verify_start = std::time::Instant::now();
+        let mut verify_count = 0u32;
         for (li, line) in lines.iter().enumerate() {
             let lm = &line_matches[li];
             let text_color = lm.text_color;
@@ -1062,6 +1189,7 @@ fn run(args: &cli::Args) -> Result<(), ScanTextError> {
                 if let Some(ref fm) = font_result {
                     let font_data = font_cache.load(&fm.font_path).ok();
                     if let Some(ref fd) = font_data {
+                        verify_count += 1;
                         let (score, _dy) = verify::verify_text_region(
                             &gray_page,
                             fd.as_slice(),
@@ -1072,6 +1200,7 @@ fn run(args: &cli::Args) -> Result<(), ScanTextError> {
                             fm.glyph_overrides.as_deref(),
                             &fm.variant_tag,
                             lm.diag_seg_dir.as_deref(),
+                            None,
                         );
                         let pass = score >= MIN_VERIFY_SSIM;
                         (Some(score), Some(pass))
@@ -1263,6 +1392,8 @@ fn run(args: &cli::Args) -> Result<(), ScanTextError> {
                 }).collect(),
             });
         }
+        let verify_elapsed = verify_start.elapsed();
+        eprintln!("  SSIM verify: {:.1}s ({} lines verified)", verify_elapsed.as_secs_f32(), verify_count);
 
         stat_lines_vectorized += pg_vec;
         stat_lines_raster += pg_raster;

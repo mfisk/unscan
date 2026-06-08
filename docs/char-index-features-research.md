@@ -1,9 +1,16 @@
 # Char Index Feature Research: Discriminating Close Serif Cousins
 
-**Date:** 2026-05-11
-**Problem:** The char index (57 features) only surfaces the correct specimen font in
-~26% of lines (top-50 candidates). The remaining 74% of lines never get a chance at correct
-identification because the correct font isn't even in the candidate pool.
+**Date:** 2026-05-11 (initial research)  
+**Updated:** 2026-06-07  
+**Status:** The feature vector has been expanded to 99 dimensions (from 57)
+with five weighted groups, row ink profile, counter features, terminal angles,
+horizontal crossings, skeleton topology, and more. The CI now achieves
+454/480 = 94.6% accuracy on the 30-font specimen with CI #1 winning directly
+(no word-level SSIM reranking). Many of the research items below have been
+implemented; others remain as future directions.
+
+**Original problem:** The char index (57 features) only surfaced the correct
+specimen font in ~26% of lines (top-50 candidates).
 
 **Target pairs to discriminate:**
 - EB Garamond vs Georgia vs Libre Caslon Text
@@ -11,7 +18,11 @@ identification because the correct font isn't even in the candidate pool.
 - Libre Bodoni vs PT Serif vs SourceSerif4
 - Zilla Slab vs URWBookman vs Caladea
 
-## 1. Current Feature Inventory (57 features)
+## 1. Current Feature Inventory (99 features, 5 groups)
+
+**Note:** The original 57-feature design has been replaced. See
+[`FEATURES.md`](../FEATURES.md) for the complete current layout. The five
+groups below now use per-group L2 normalization + Fisher-tuned weights.
 
 ### Group 1: Column Ink Profile (32 features, weight 0.40)
 - 32-bin resampled column ink density profile
@@ -36,9 +47,15 @@ identification because the correct font isn't even in the candidate pool.
 10. `compactness` — 4π × area / perimeter²
 11-18. `h_crossings[8]` — ink↔white transitions at 8 scan lines
 
-### Current Weighting
-Three-group L2-normalize-then-scale: profile 40%, scalars 30%, v2 30%.
-All 57 dimensions live in the same CI with squared Euclidean distance.
+### Current Weighting (Updated)
+Five-group L2-normalize-then-scale, tuned via Fisher discriminant analysis:
+- Column profile (32): 0.40
+- Scalar v1 (7): 0.30
+- Scalar v2 (18): 0.30
+- Row profile (32): 0.30
+- Scalar v3 (10): 0.20
+
+Total: 99 dimensions. See [`FEATURES.md`](../FEATURES.md) for details.
 
 ---
 
@@ -349,18 +366,18 @@ The model would learn exactly what distinguishes close serif cousins at the pixe
 
 Ordered by (expected impact × ease of implementation):
 
-| Priority | Feature | New Dims | Impact | Effort | Notes |
+| Priority | Feature | New Dims | Impact | Effort | Status |
 |---|---|---|---|---|---|
-| **1** | Row ink profile (16 bins) | +16 | Medium | Very Low | Copy of column profile, rotated 90° |
-| **2** | Advance width ratio | +1 | Medium | Very Low | Mike's suggestion; move width ratio into index |
-| **3** | Stress angle (quadrant density) | +1-2 | High | Low-Med | Only for round chars |
-| **4** | Serif bracket depth | +1-2 | High | Medium | Only for stemmed chars |
-| **5** | Stroke width histogram (4 bins) | +4 | Med-High | Low | Run-length distribution, not just p90/p10 |
-| **6** | Serif protrusion ratio | +1 | Medium | Low-Med | serif_width / stem_width |
-| **7** | Diagonal balance | +2 | Medium | Low | NW-SE vs NE-SW ink ratio |
-| **8** | DCT coefficients | +8-16 | Medium | Medium | Frequency domain texture |
-| **9** | 'e' aperture | +1 | Medium | Medium | Character-specific |
-| **10** | Learned embeddings | +16-32 | High | Very High | Requires training pipeline |
+| **1** | Row ink profile (32 bins) | +32 | Medium | Very Low | ✅ Done (32 bins, not 16) |
+| **2** | Advance width ratio | +1 | Medium | Very Low | ❌ Not started |
+| **3** | Stress angle (quadrant density) | +1-2 | High | Low-Med | ❌ Not started |
+| **4** | Serif bracket depth | +1-2 | High | Medium | ❌ Not started |
+| **5** | Stroke width histogram (4 bins) | +4 | Med-High | Low | ❌ Not started |
+| **6** | Serif protrusion ratio | +1 | Medium | Low-Med | ❌ Not started |
+| **7** | Diagonal balance | +2 | Medium | Low | ❌ Not started |
+| **8** | DCT coefficients | +8-16 | Medium | Medium | ❌ Not started |
+| **9** | 'e' aperture | +1 | Medium | Medium | ❌ Not started |
+| **10** | Learned embeddings | +16-32 | High | Very High | ❌ Not started |
 
 **Proposed new total: ~57 + 28 = ~85 features** (adding priorities 1-7).
 

@@ -46,29 +46,37 @@ can be lost:
       │
       ▼
   ┌──────────────────────────────────┐
-  │ 1. Character Extraction          │  Tesseract makebox → per-char crops
-  │    extract_line_chars()          │  src/char_index.rs ~L1088
+  │ 0. SSIM Fast Path                │  Try dominant font from previous page
+  │    (parallel, per line)          │  via SSIM (threshold ≥ 0.90).
+  │    src/main.rs                   │  Hit → accept font, skip stages 1-2.
+  └──────────────────────────────────┘
+      │  Miss → fall through to full pipeline
+      ▼
+  ┌──────────────────────────────────┐
+  │ 1. Character Extraction          │  VP + seam carving → per-char crops
+  │    segment_characters()          │  src/segment.rs, src/char_index.rs
   └──────────────────────────────────┘
       │  (char, GrayImage) pairs
       ▼
   ┌──────────────────────────────────┐
-  │ 2. CI Search                     │  Per-char feature vectors → brute-force
-  │    search_candidates()           │  nearest neighbor → geometric mean score
-  │                                  │  → σ cutoff
-  │                                  │  src/char_index.rs ~L1429
+  │ 2. CI Search                     │  Per-char 99-dim feature vectors →
+  │    search_candidates()           │  brute-force nearest neighbor →
+  │                                  │  weighted geometric mean → σ cutoff
+  │                                  │  src/char_index.rs
   └──────────────────────────────────┘
-      │  Vec<(font_key, score)> — ranked candidates
+      │  CI #1 wins directly (no word-level SSIM reranking)
       ▼
   ┌──────────────────────────────────┐
-  │ 3. Word SSIM Rerank              │  Crop full words from scan, render in
-  │    word_level_rerank()           │  each CI candidate, pick best SSIM
-  │                                  │  src/word_match.rs
+  │ 3. Pass 1.5: Paragraph Grouping  │  Detect dominant body font (most
+  │    (main.rs, logging only)       │  common font at most common size).
+  │                                  │  Does not override line matches.
   └──────────────────────────────────┘
-      │  Winner font for the line
+      │
       ▼
   ┌──────────────────────────────────┐
-  │ 4. Paragraph Grouping (DISABLED) │  Majority-vote body font replaces
-  │    (main.rs ~L651)               │  outlier matches in same-size runs
+  │ 4. SSIM Verification             │  Render matched font via FreeType,
+  │    verify_text_region()          │  compare SSIM ≥ 0.3 (MIN_VERIFY_SSIM).
+  │    src/verify.rs                 │  Fail → revert line to raster.
   └──────────────────────────────────┘
       │  Final font assignment
       ▼
@@ -202,9 +210,9 @@ uniform fallback fires.
 ### `--include-font <NAME>`
 
 Injects every font matching `<NAME>` (case-insensitive substring) into the
-word SSIM reranking stage for **every line**, regardless of whether CI selected
-it. Use this to see how a known-correct font renders and scores at the word
-level even when CI pruned it.
+CI candidate list for **every line**, regardless of whether CI's normal scoring
+selected it. Use this to see how a known-correct font scores even when CI
+would normally prune it.
 
 ```bash
 unscan input.pdf -o /dev/null --diagnostic /tmp/diag --include-font merriweather
@@ -381,8 +389,8 @@ Categorize each miss:
 | **Bad crops** | Clipped, merged, or artifact-contaminated char images | Step 1 — fix extraction first |
 | **CI recall failure** | Correct font not in CI candidates at all | Stage 2 (search radius, quorum, quality gate, σ cutoff) |
 | **CI ranking failure** | Correct font in CI but not #1 | Stage 2 (per-char distances, geometric mean aggregation) |
-| **Word SSIM failure** | Correct font is CI #1 but loses word rerank | Stage 3 (crop quality, render sizing, SSIM alignment) |
-| **Paragraph grouping** | Correct font wins word rerank but overridden by majority vote | Stage 4 (grouping logic) |
+| **SSIM verify failure** | Correct font is CI #1 but SSIM < 0.3 | Stage 4 (verify rendering, alignment, scan quality) |
+| **Paragraph grouping** | Correct font wins CI but overridden by majority vote | Stage 3 (grouping logic — currently logging only, not active) |
 
 #### Index/Scan Crop Geometry Mismatch
 
@@ -427,27 +435,23 @@ To see the per-character distances for a specific font, increase log verbosity
 or add temporary debug output in `search_candidates()` around the
 `font_log_dists` map.
 
-### Step 4: Inspect Word SSIM (Stage 3)
+### Step 4: Inspect SSIM Verification (Stage 4)
 
-Open `/tmp/diag/index.html` in a browser. For the failing line:
+**Note:** Word-level SSIM reranking (`word_match.rs`) has been removed. The CI
+#1 candidate wins directly. The only SSIM check remaining is the verification
+gate in Pass 2 (`verify_text_region()`, threshold 0.3).
 
-1. Expand "Word SSIM" — see scan crop alongside each candidate's render
-2. Check SSIM scores — the correct font should have highest SSIM on most words
-3. Look for render problems: wrong sizing, clipped glyphs, baseline misalignment
+If the correct font wins CI but the line reverts to raster, the SSIM verification
+score is below 0.3. This usually indicates a rendering or alignment issue rather
+than a wrong font. Check the `--audit` output for the SSIM scan/render/diff
+images to see what went wrong.
 
-The `data.json` word entries have `candidates[].ssim` and `candidates[].dy`
-(vertical shift). If the correct font has good SSIM on all words but one, that
-one word's crop may have an extraction issue.
+### Step 5: Check Paragraph Grouping (Stage 3)
 
-### Step 5: Check Paragraph Grouping (Stage 4 — currently disabled)
-
-Paragraph grouping is currently disabled. When active, it overrides a line
-match when a different font has majority vote among same-size lines in a
-paragraph run. Check `RUST_LOG=debug` output for `paragraph regroup` messages.
-
-This stage should be transparent on a specimen (each section has its own font,
-no majority vote applies). If it's interfering, the bug is upstream — the
-majority font shouldn't have won enough lines to trigger grouping.
+Paragraph grouping (Pass 1.5) currently detects the dominant body font but does
+**not** override individual line matches. It logs the dominant font for diagnostic
+purposes only. If a future version enables majority-vote font replacement, check
+`RUST_LOG=debug` output for `paragraph grouping` messages.
 
 ---
 
@@ -559,17 +563,19 @@ images inlined.
 | What | Where |
 |------|-------|
 | CLI args | `src/cli.rs` |
-| Pipeline orchestration | `src/main.rs` ~L445–650 |
-| Character extraction (makebox) | `src/char_index.rs` `extract_line_chars()` ~L1088 |
+| Pipeline orchestration | `src/main.rs` |
+| SSIM fast path | `src/main.rs` (parallel font matching section) |
+| Character segmentation | `src/segment.rs` (VP + seam carving DP) |
 | Feature computation | `src/char_index.rs` `compute_features()` |
-| CI search + scoring | `src/char_index.rs` `search_candidates()` ~L1429 |
-| σ cutoff | `src/char_index.rs` ~L1595–1615 |
-| Word SSIM reranking | `src/word_match.rs` `word_level_rerank()` |
-| Paragraph grouping | `src/main.rs` ~L651 |
-| Diagnostic report | `src/diagnostic.rs` |
+| CI search + scoring | `src/char_index.rs` `search_candidates()` |
+| Font-metric word splitting | `src/ocr.rs` `split_wide_whitespace_words()` |
+| Font-metric gap functions | `src/char_index.rs` `font_ink_width()`, `font_pair_ink_gap()` |
+| SSIM verification | `src/verify.rs` `verify_text_region()` |
+| Pass 1.5 paragraph grouping | `src/main.rs` (paragraph-level font grouping section) |
+| Word-level SSIM reranking | `src/word_match.rs` (disabled — CI #1 wins directly) |
+| Font scanning + OT variants | `src/font_scan.rs` |
+| Font cache (shared LRU) | `src/font_cache.rs` |
 | Ground truth | `test-docs/font-timeline-specimen.json` |
-| Clean raster specimen | `test-docs/font-timeline-specimen-scanned.pdf` |
-| Skewed scan specimen | `test-docs/font-timeline-specimen-scanned.pdf` |
 | Accuracy test | `tests/t60_specimen_accuracy_aa.rs` |
 
 ## Build and Run
@@ -587,8 +593,9 @@ Cached specimen run: ~45s. Uncached (index rebuild): ~3min.
 
 When investigating mismatches, the first question is: did the CI (character index)
 put the correct font at rank #1 (or tied for #1)? If not, the bug is in CI scoring
-(feature vectors, σ cutoff, segmentation quality). If CI had it right but the final
-match is wrong, the bug is in word SSIM reranking.
+(feature vectors, σ cutoff, segmentation quality). If CI had it right but the line
+reverts to raster, the SSIM verification gate (0.3) failed — check the verify
+render/alignment.
 
 ### Step 1: Run with audit log
 

@@ -53,5 +53,8 @@ ls /tmp/audit-out/<line_dir>/crops/
 ## Current State
 
 - Segmenter: VP + dual-DP seam carving with diagonal masking and midpoint tie-breaking
-- Accuracy: 473/486 (97.3%) on font-timeline-specimen.pdf
-- Index version: 6, FEAT_LEN: 59, NORM_H: see code
+- Font matching: CI #1 wins directly (no word-level SSIM reranking), with parallel SSIM fast path (dominant font from previous page, threshold ≥0.90)
+- SSIM bail-below: `ssim_windowed()` accepts `bail_below` for early exit when running average drops below threshold (used by fast path)
+- Audit per-char distances: precomputed crop features via `precompute_crop_features()` + `per_char_distances_precomputed()` — avoids redundant feature extraction across multiple fonts
+- Accuracy: 454/480 (94.6%) on font-timeline-specimen.pdf (t60 AA @ 300 DPI)
+- Index version: 8, FEAT_LEN: 99, NORM_H: 48

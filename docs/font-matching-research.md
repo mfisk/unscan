@@ -2,7 +2,13 @@
 
 > Research survey for the `unscan` project — converting scanned PDFs back to vector text by identifying which fonts were used.
 >
-> Last updated: 2025-07-14
+> Last updated: 2025-07-14  
+> **Status note (June 2026):** Since this survey was written, the architecture
+> has changed significantly. Word-level SSIM reranking has been removed; CI #1
+> wins directly. The feature vector has grown from 36 to 99 dimensions with 5
+> weighted groups. A parallel SSIM fast path (dominant font from previous page,
+> threshold 0.90) was added. See `docs/text-matching-approach.md` for the
+> current pipeline description.
 
 ---
 
@@ -38,25 +44,30 @@
 
 ## 1. Our Current Approach
 
-For context, here's what unscan currently does for font matching:
+For context, here's what unscan currently does for font matching (updated June 2026):
 
 **Per-character feature index** (`char_index.rs`):
-- Renders every common character (a-z, A-Z, 0-9, punctuation, quotes, dashes) in each of ~5048 fonts at 48px
-- Extracts a **36-float feature vector** per character:
-  - 32-bin column ink density profile (vertical projection histogram)
-  - Aspect ratio
-  - Ink density (% of pixels that are ink)
-  - Vertical center of mass
-  - Horizontal balance (left vs right ink distribution)
-- Matching via **cosine similarity** against all fonts
-- Serves as a **pre-filter** to reduce 5048 → ~50 candidates
+- Renders ~106 printable characters in each of ~5048 fonts at 48px (NORM_H)
+- Extracts a **99-float feature vector** per character, in 5 weighted groups:
+  - Column ink profile (32 bins, weight 0.40)
+  - Scalar v1 (7 dims, weight 0.30): aspect, ink_density, v_center, h_balance, serif_score, stroke_contrast, xh_cap_ratio
+  - Scalar v2 (18 dims, weight 0.30): counters (4), terminal angles (4), shape (2), horizontal crossings (8)
+  - Row ink profile (32 bins, weight 0.30)
+  - Scalar v3 (10 dims, weight 0.20): holes, symmetry, skeleton topology, corners, quadrant density
+- Per-group L2 normalization + Fisher-tuned weights
+- Matching via brute-force linear scan with squared Euclidean distance
+- **CI #1 wins directly** — no word-level SSIM reranking
 
-**SSIM reranking**:
-- Top candidates are rendered at matched size
-- **Windowed SSIM** with vertical shift search (±6px) compares rendered glyphs against the scan
-- This is the expensive but accurate final stage
+**SSIM fast path** (dominant font acceleration):
+- Before CI, each line tries the dominant font from the previous page via SSIM
+- Threshold ≥ 0.90: accept and skip segmentation + CI entirely
+- All lines run in parallel (`rayon::par_iter`)
+- Candidate updated after each page by font-key frequency tally
 
-**Width-matched scaling**: Font size is chosen so that rendered advance width matches OCR bounding box width, letting height vary naturally.
+**SSIM verification gate** (not reranking):
+- After CI selects a font, `verify_text_region()` renders via FreeType and
+  compares SSIM. If SSIM < 0.3 (`MIN_VERIFY_SSIM`), the line reverts to raster.
+- This is a gate, not a selector — it doesn't choose between candidates.
 
 **Key constraints**:
 - Input: 300 DPI scanned documents (not wild scene text or photos)
@@ -64,6 +75,7 @@ For context, here's what unscan currently does for font matching:
 - Sub-second per-line matching after indexing
 - Unlimited offline pre-computation budget
 - Rust implementation (no Python ML in the hot path)
+- Current accuracy: **454/480 (94.6%)** on 30-font specimen
 
 ---
 
@@ -374,7 +386,7 @@ Tesseract's approach to fonts:
 **Relevance to unscan**: ⭐⭐⭐ (The pretrained-CNN-as-feature-extractor idea)
 - Using a pretrained image CNN (VGG16, ResNet) as a feature extractor is simple and effective
 - No font-specific training needed — just forward pass through the network
-- Could replace our hand-crafted 36-float vector with a ~512-float CNN feature vector
+- Could replace our hand-crafted 99-float vector with a ~512-float CNN feature vector
 - Fast: single forward pass per character, can be batched
 
 ---
@@ -464,7 +476,7 @@ Stage 4: Verification (10s of ms)
 **Concept**: Hash high-dimensional vectors such that similar vectors have high probability of colliding.
 
 **How it works for font matching**:
-1. Compute feature vector for each character in each font (our 36-float vector, or a CNN embedding)
+1. Compute feature vector for each character in each font (our 99-float vector, or a CNN embedding)
 2. Build LSH index with multiple hash tables
 3. At query time, hash the query vector → retrieve candidates from same buckets
 4. Score only the candidates (not all 5,048 fonts)
@@ -478,7 +490,7 @@ Stage 4: Verification (10s of ms)
 **Performance**: For 5,048 fonts × ~80 characters = ~400K vectors, ANN search returns top-K in <1ms even with brute force. LSH becomes more valuable at millions of vectors.
 
 **Relevance to unscan**: ⭐⭐ (Marginal benefit at our scale)
-- With only 5,048 fonts, brute-force cosine similarity across all fonts is already fast enough (~microseconds for 36-float vectors)
+- With only 5,048 fonts, brute-force linear scan across all fonts is already fast enough (~microseconds for 99-float vectors with SIMD auto-vectorization)
 - LSH/ANN would be more useful if we had 100K+ fonts or if we moved to higher-dimensional embeddings (e.g., 256-dim CNN features)
 - FAISS could be useful if we adopt CNN embeddings — but the query overhead of running the CNN dominates anyway
 
@@ -544,30 +556,32 @@ Stage 4: Verification (10s of ms)
 
 1. **Per-character matching**: This is the right granularity for document font identification. Most successful approaches (DeepFont, Matcherator, Font-ProtoNet) work at character or word level.
 
-2. **Two-stage pipeline (coarse → SSIM verify)**: The coarse/fine split is standard and necessary at scale.
+2. **Two-stage pipeline (CI → SSIM verify)**: The CI identifies the font; SSIM verification gates bad matches. Clean separation of concerns.
 
-3. **Width-matched scaling**: Using advance width for size normalization is sound — the Xerox/Google OCR patent confirms word-width matching is more reliable than character-width.
+3. **Parallel SSIM fast path**: The dominant-font acceleration via SSIM (threshold 0.90) avoids CI entirely for the common case of single-font documents.
 
-4. **Controlled rendering conditions**: We render reference glyphs under known conditions, avoiding the domain gap problem that plagues photo-based font recognition.
+4. **Rich 99-dimensional feature set**: Five weighted groups with per-group L2 normalization and Fisher-tuned weights capture typographic properties (serif score, stroke contrast, counter shapes, skeleton topology) as well as pixel-level features (column/row profiles, ink density).
+
+5. **Controlled rendering conditions**: We render reference glyphs under known conditions, avoiding the domain gap problem that plagues photo-based font recognition.
+
+6. **Font-metric word splitting**: Using `outline_glyph().px_bounds()` for derived rendering scale and predicted inter-glyph gaps produces more accurate word boundaries than Tesseract alone.
 
 ### What We're Missing
 
-1. **No typographic features**: We lack serif detection, stroke contrast, x-height ratio — the features typographers actually use to distinguish fonts. These are high-value, cheap to compute.
+1. **No hierarchical pre-filtering**: Every font is scored equally in the CI. A serif/sans-serif classifier alone would halve the work.
 
-2. **No hierarchical pre-filtering**: Every font is scored equally. A serif/sans-serif classifier alone would halve the work.
+2. **No learned features**: Hand-crafted features inevitably miss discriminative information that a CNN would capture. The 94.6% accuracy ceiling may require learned embeddings to break through.
 
-3. **Column profile limitations**: Our 32-bin column ink density profile is a reasonable feature but misses horizontal structure, curve shapes, and terminal details.
+3. **No multi-resolution robustness**: Current testing is at 300 DPI only. Real scans vary widely.
 
-4. **No multi-character consensus**: We score characters independently. Aggregating scores across multiple characters from the same line would improve robustness (the Tensmeyer averaging insight).
-
-5. **No learned features**: Hand-crafted features inevitably miss discriminative information that a CNN would capture.
+4. **Column/row profile limitations**: The 32-bin profiles miss horizontal structure, curve shapes, and terminal details at a fine level.
 
 ### Feature Vector Comparison
 
-| Feature | Ours (36-dim) | Typographic (est. 8-15 dim) | CNN Embedding (128-512 dim) | PCA/EigenFont (50-100 dim) |
-|---------|--------------|---------------------------|---------------------------|---------------------------|
+| Feature | Ours (99-dim, 5 groups) | Typographic (est. 8-15 dim) | CNN Embedding (128-512 dim) | PCA/EigenFont (50-100 dim) |
+|---------|------------------------|---------------------------|---------------------------|---------------------------|
 | Computation speed | ⚡ Very fast | ⚡ Fast | 🔶 Medium (inference) | ⚡ Fast |
-| Discrimination | 🔶 Medium | 🔶 Medium-high | ⭐ High | ⭐ Medium-high |
+| Discrimination | ⭐ Medium-high | 🔶 Medium-high | ⭐ High | ⭐ Medium-high |
 | Robustness to noise | 🔶 Medium | ⭐ High (discrete features) | ⭐ High | 🔶 Medium |
 | Implementation effort | ✅ Done | 🔶 Moderate | 🔴 High (training + ONNX) | 🔶 Moderate |
 | Pre-computation | ⚡ Fast | ⚡ Fast | 🔶 Medium | 🔶 Medium |

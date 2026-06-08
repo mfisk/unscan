@@ -780,6 +780,63 @@ pub fn split_wide_whitespace_words(
         // Fallback: split at gaps ≥ 18% of the line height.
         let fallback_min_gap = (line_h * 18 / 100).max(4);
 
+        // --- Font identification once per LINE (not per word) ---
+        // All words in a Tesseract-assembled line share the same font.
+        // Do a single CI search on the longest word's char crops to identify
+        // the font, then reuse for all words in this line.
+        let line_matched_font: Option<(std::sync::Arc<Vec<u8>>, String)> = char_index.and_then(|ci| {
+            // Pick the longest word (most chars) for the best CI signal
+            let best_word = line.words.iter()
+                .filter(|w| {
+                    let ww = w.width.min(page_w.saturating_sub(w.x.min(page_w.saturating_sub(1))));
+                    let wh = w.height.min(page_h.saturating_sub(w.y.min(page_h.saturating_sub(1))));
+                    ww >= 4 && wh >= 2 && w.text.chars().count() >= 2
+                })
+                .max_by_key(|w| w.text.chars().count())?;
+
+            let bwx = best_word.x.min(page_w.saturating_sub(1));
+            let bwy = best_word.y.min(page_h.saturating_sub(1));
+            let bww = best_word.width.min(page_w - bwx);
+            let bwh = best_word.height.min(page_h - bwy);
+            let bchars: Vec<char> = best_word.text.chars().collect();
+            let bn = bchars.len();
+
+            let bword_img = image::imageops::crop_imm(gray, bwx, bwy, bww, bwh).to_image();
+            let (bbounds, _) = crate::segment::segment_characters(&bword_img, bn);
+            if bbounds.len() != bn + 1 { return None; }
+
+            let mut crops: Vec<(char, GrayImage)> = Vec::new();
+            for (ci_idx, &ch) in bchars.iter().enumerate() {
+                if !crate::char_index::is_indexed(ch) { continue; }
+                let left = bbounds[ci_idx] as u32;
+                let right = bbounds[ci_idx + 1] as u32;
+                if right <= left { continue; }
+                let crop = image::imageops::crop_imm(&bword_img, left, 0, right - left, bwh).to_image();
+                if let Some(norm) = crate::char_index::normalize_to_ink_bounds(&crop) {
+                    crops.push((ch, norm));
+                }
+            }
+            if crops.is_empty() { return None; }
+
+            let result = crate::char_index::search_candidates(ci, &crops, 1.0, false);
+            let font_key = result.scores.first().map(|(name, _)| name.clone())?;
+
+            let font_path = if font_key.contains('|') {
+                font_key.split('|').next().unwrap()
+            } else {
+                &font_key
+            };
+            let font_data: std::sync::Arc<Vec<u8>> = if let Some(fc) = font_cache {
+                fc.load(std::path::Path::new(font_path)).ok()?
+            } else {
+                std::sync::Arc::new(std::fs::read(font_path).ok()?)
+            };
+            Some((font_data, font_key))
+        });
+        let line_font_ref = line_matched_font.as_ref().and_then(|(data, _key)| {
+            ab_glyph::FontRef::try_from_slice(data).ok()
+        });
+
         for word in line.words.drain(..) {
             let wx = word.x.min(page_w.saturating_sub(1));
             let wy = word.y.min(page_h.saturating_sub(1));
@@ -805,46 +862,8 @@ pub fn split_wide_whitespace_words(
                 continue;
             }
 
-            // --- Font identification for metric-based splitting ---
-            // If we have a char index, do a quick CI match on this word's char
-            // crops to identify the font.  We'll use the font's glyph outlines
-            // to compute per-pair expected gaps inline below.
-            let matched_font: Option<(std::sync::Arc<Vec<u8>>, String)> = char_index.and_then(|ci| {
-                // Build char crops from segmentation
-                let mut crops: Vec<(char, GrayImage)> = Vec::new();
-                for (ci_idx, &ch) in chars.iter().enumerate() {
-                    if !crate::char_index::is_indexed(ch) {
-                        continue;
-                    }
-                    let left = boundaries[ci_idx] as u32;
-                    let right = boundaries[ci_idx + 1] as u32;
-                    if right <= left { continue; }
-                    let crop = image::imageops::crop_imm(&word_img, left, 0, right - left, wh).to_image();
-                    if let Some(norm) = crate::char_index::normalize_to_ink_bounds(&crop) {
-                        crops.push((ch, norm));
-                    }
-                }
-                if crops.is_empty() { return None; }
-
-                // Quick CI search — just need the top font name
-                let result = crate::char_index::search_candidates(ci, &crops, 1.0, false);
-                let font_key = result.scores.first().map(|(name, _)| name.clone())?;
-
-                let font_path = if font_key.contains('|') {
-                    font_key.split('|').next().unwrap()
-                } else {
-                    &font_key
-                };
-                let font_data: std::sync::Arc<Vec<u8>> = if let Some(fc) = font_cache {
-                    fc.load(std::path::Path::new(font_path)).ok()?
-                } else {
-                    std::sync::Arc::new(std::fs::read(font_path).ok()?)
-                };
-                Some((font_data, font_key))
-            });
-            let matched_font_ref = matched_font.as_ref().and_then(|(data, _key)| {
-                ab_glyph::FontRef::try_from_slice(data).ok()
-            });
+            // Use the line-level font match for gap metric computation
+            let matched_font_ref = line_font_ref.as_ref();
 
             // For each adjacent pair of characters, measure the zero-ink gap
             // between the rightmost ink of char i and the leftmost ink of char i+1.
@@ -905,7 +924,7 @@ pub fn split_wide_whitespace_words(
                 // Font-metric expected gap: compute the expected inter-ink
                 // gap for this character pair at the derived scale, round it,
                 // and add 5px margin for AA/scan error.
-                let min_gap_for_pair = matched_font_ref.as_ref()
+                let min_gap_for_pair = matched_font_ref
                     .and_then(|font| {
                         let observed_ink_w = if right_ink > left_ink_i {
                             (right_ink - left_ink_i + 1) as f32

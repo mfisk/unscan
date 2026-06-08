@@ -38,6 +38,7 @@ pub fn verify_text_region(
     overrides: Option<&[(char, u16)]>,
     variant_tag: &str,
     audit_dir: Option<&std::path::Path>,
+    bail_below: Option<f32>,
 ) -> (f32, i32) {
     let (iw, ih) = original_gray.dimensions();
     let x = x.min(iw.saturating_sub(1));
@@ -105,7 +106,7 @@ pub fn verify_text_region(
 
         let scan_blur = crate::ssim::gaussian_blur_3x3(&scan_crop);
         let render_blur = crate::ssim::gaussian_blur_3x3(&render_for_ssim);
-        let (score, dy) = crate::ssim::ssim_windowed_best_vshift(&scan_blur, &render_blur, 12);
+        let (score, dy) = crate::ssim::ssim_windowed_best_vshift(&scan_blur, &render_blur, 12, bail_below);
 
         if score > best_score {
             best_score = score;
