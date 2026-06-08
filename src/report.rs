@@ -2,8 +2,8 @@
 //!
 //! Automatically generated into `<audit_dir>/report.html`.  When
 //! `--audit-vector` is also provided, classifies lines as hits/misses against
-//! ground truth (the Rust equivalent of `tools/char-misses.py`).  Without
-//! `--audit-vector`, reports all kept-raster lines.
+//! ground truth from the vector PDF.  Without `--audit-vector`, reports all
+//! kept-raster lines.
 
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
@@ -683,13 +683,10 @@ fn build_char_table(
         });
 
         // Per-char distance for correct font
-        let correct_char_dist: Option<f32> = correct_fe.and_then(|fe| {
-            let fk = fe.font_key();
-            // Check fontmap_dists
-            for (k, d) in &cv.fontmap_dists {
-                if *k == fk || ground_truth::fonts_match(k, correct_font_name) {
-                    return Some(*d);
-                }
+        let correct_char_dist: Option<f32> = correct_fe.and_then(|_fe| {
+            // Check gt_font_dist_sq (from audit-vector GT font injection)
+            if let Some(d) = cv.gt_font_dist_sq {
+                return Some(d);
             }
             // Check nearest
             for (nf, nd) in &cv.nearest {
@@ -806,7 +803,7 @@ fn build_char_table(
     )
 }
 
-// ── CSS (matches char-misses.py) ────────────────────────────────────────────
+// ── CSS ──────────────────────────────────────────────────────────────────────
 
 const CSS: &str = r#"<style>
 * { box-sizing: border-box; margin: 0; padding: 0; }
@@ -1008,11 +1005,11 @@ pub fn generate_report(
          <html>\n\
          <head>\n\
          <meta charset=\"utf-8\">\n\
-         <title>unscan char-misses — {hits}/{compared} ({pct:.1}%)</title>\n\
+         <title>unscan miss report — {hits}/{compared} ({pct:.1}%)</title>\n\
          </head>\n\
          <body style=\"background: white; color: #222;\">\n\
          {CSS}\n\
-         <h2>unscan char-misses</h2>\n\
+         <h2>unscan miss report</h2>\n\
          <div class=\"summary\">{hits}/{compared} correct ({pct:.1}%) — \
          {all_misses} misses shown below{ssim_miss_str}{raster_str}{ocr_corr_str}</div>\n\
          <div class=\"score-legend\">\n\

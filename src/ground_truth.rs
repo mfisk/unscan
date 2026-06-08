@@ -3,7 +3,7 @@
 //! When `--audit-vector <path>` is given alongside `--audit`, unscan parses the vector
 //! PDF upfront and builds a per-page spatial index of text spans with their font
 //! names.  During per-line processing, each matched font is immediately compared
-//! against ground truth: hits skip expensive audit I/O (crop PNGs, fontmap
+//! against ground truth: hits skip expensive audit I/O (crop PNGs, per-char
 //! per-char distances, font ref glyphs); misses get full audit detail.
 
 use lopdf::Document;
@@ -152,7 +152,7 @@ fn strip_subset_prefix(name: &str) -> &str {
 }
 
 /// Check whether two font names refer to the same font family.
-/// Mirrors char-misses.py `fonts_match` + `fonts_match_broad`.
+/// Handles subset prefixes, weight/style suffixes, and metric-compatible clones.
 pub fn fonts_match(matched: &str, actual: &str) -> bool {
     let na = alphanum(strip_subset_prefix(matched));
     let nb = alphanum(strip_subset_prefix(actual));
@@ -182,6 +182,118 @@ pub fn fonts_match(matched: &str, actual: &str) -> bool {
         return true;
     }
     false
+}
+
+// ── Font metrics from PDF /Widths ───────────────────────────────────────────
+
+/// Per-byte advance widths read from the PDF font dictionary's /Widths array.
+/// Widths are in thousandths of a text-space unit (standard PDF convention).
+struct PdfFontWidths {
+    first_char: u32,
+    /// widths[byte_value - first_char] in 1/1000 text-space units.
+    widths: Vec<f32>,
+    /// Average width for bytes outside the FirstChar..LastChar range.
+    default_width: f32,
+}
+
+impl PdfFontWidths {
+    /// Get width for a byte value in 1/1000 text-space units.
+    fn width_for_byte(&self, b: u8) -> f32 {
+        let idx = b as u32;
+        if idx >= self.first_char && ((idx - self.first_char) as usize) < self.widths.len() {
+            let w = self.widths[(idx - self.first_char) as usize];
+            if w > 0.0 { w } else { self.default_width }
+        } else {
+            self.default_width
+        }
+    }
+}
+
+/// Extract /Widths, /FirstChar, /LastChar from a PDF font dictionary.
+fn extract_pdf_font_widths(doc: &Document, font_dict: &lopdf::Dictionary) -> Option<PdfFontWidths> {
+    let first_char = match font_dict.get(b"FirstChar") {
+        Ok(obj) => {
+            let resolved = doc.dereference(obj).ok().map(|(_, o)| o).unwrap_or(obj);
+            as_f32(resolved).unwrap_or(0.0) as u32
+        }
+        Err(_) => return None,
+    };
+
+    let widths_obj = font_dict.get(b"Widths").ok()?;
+    let widths_obj = doc.dereference(widths_obj).ok().map(|(_, o)| o).unwrap_or(widths_obj);
+    let widths_arr = widths_obj.as_array().ok()?;
+
+    let widths: Vec<f32> = widths_arr.iter()
+        .map(|o| {
+            let o2 = doc.dereference(o).ok().map(|(_, o)| o).unwrap_or(o);
+            as_f32(o2).unwrap_or(0.0)
+        })
+        .collect();
+
+    let total: f32 = widths.iter().filter(|&&w| w > 0.0).sum();
+    let count = widths.iter().filter(|&&w| w > 0.0).count();
+    let default_width = if count > 0 { total / count as f32 } else { 500.0 };
+
+    Some(PdfFontWidths { first_char, widths, default_width })
+}
+
+/// Compute the width of text in a Tj/TJ operand list using PDF /Widths.
+/// `word_spacing` is the current Tw value in text-space units.
+/// Returns width in PDF points.
+fn text_width_from_pdf(
+    operands: &[lopdf::Object],
+    fw: &PdfFontWidths,
+    font_size: f32,
+    ctm_x_scale: f32,
+    word_spacing: f32,
+) -> f32 {
+    let mut width_thousandths = 0.0f32;
+    let mut n_spaces = 0u32;
+
+    for op in operands {
+        match op {
+            lopdf::Object::String(bytes, _) => {
+                for &b in bytes.iter() {
+                    width_thousandths += fw.width_for_byte(b);
+                    if b == b' ' { n_spaces += 1; }
+                }
+            }
+            lopdf::Object::Array(arr) => {
+                for item in arr {
+                    match item {
+                        lopdf::Object::String(bytes, _) => {
+                            for &b in bytes.iter() {
+                                width_thousandths += fw.width_for_byte(b);
+                                if b == b' ' { n_spaces += 1; }
+                            }
+                        }
+                        // TJ kerning: value in thousandths of text space unit,
+                        // positive = move left (reduce width).
+                        lopdf::Object::Integer(n) => {
+                            width_thousandths -= *n as f32;
+                        }
+                        lopdf::Object::Real(n) => {
+                            width_thousandths -= *n as f32;
+                        }
+                        _ => {}
+                    }
+                }
+            }
+            _ => {}
+        }
+    }
+
+    let char_width = width_thousandths / 1000.0 * font_size.abs() * ctm_x_scale;
+    // Tw is in text-space units (already sized), NOT thousandths.
+    // PDF spec §9.4.4: tx = ((w0/1000)*Tfs + Tc + Tw) * Th
+    let space_extra = n_spaces as f32 * word_spacing * ctm_x_scale;
+    char_width + space_extra
+}
+
+/// Fallback width estimate when no /Widths available.
+fn text_width_estimate(operands: &[lopdf::Object], font_size: f32, ctm_x_scale: f32) -> f32 {
+    let n = text_length(operands);
+    n as f32 * font_size.abs() * 0.5 * ctm_x_scale
 }
 
 // ── PDF parsing ─────────────────────────────────────────────────────────────
@@ -216,7 +328,7 @@ fn resolve_font_name(doc: &Document, page_id: lopdf::ObjectId, resource_name: &[
     let base_font = font_dict.get(b"BaseFont").ok()?;
     match base_font {
         lopdf::Object::Name(name) => Some(String::from_utf8_lossy(name).to_string()),
-        lopdf::Object::Reference(r) => {
+        lopdf::Object::Reference(_) => {
             if let Ok((_, obj)) = doc.dereference(base_font) {
                 if let lopdf::Object::Name(name) = obj {
                     Some(String::from_utf8_lossy(name).to_string())
@@ -233,10 +345,9 @@ fn resolve_font_name(doc: &Document, page_id: lopdf::ObjectId, resource_name: &[
 
 /// Parse a PDF content stream into text spans with font names and positions.
 ///
-/// We track the text state machine (BT/ET, Tf, Td, Tm, Tj, TJ) and record
-/// a span whenever text is shown.  Bounding boxes are approximate (we use
-/// font size for height and estimate width from character count × 0.5 × size)
-/// but this is sufficient for spatial matching against unscan's line bboxes.
+/// Uses /Widths from the PDF font dictionaries for accurate span widths,
+/// plus Tw (word spacing) tracking.  Falls back to character_count × 0.5 × font_size
+/// when /Widths is not available for a font.
 fn extract_page_spans(
     doc: &Document,
     page_id: lopdf::ObjectId,
@@ -248,8 +359,9 @@ fn extract_page_spans(
         Err(_) => return Vec::new(),
     };
 
-    // Build font resource name → BaseFont name map for this page.
+    // Build font resource name → (BaseFont name, PdfFontWidths) map for this page.
     let mut font_map: HashMap<Vec<u8>, String> = HashMap::new();
+    let mut font_widths_map: HashMap<Vec<u8>, PdfFontWidths> = HashMap::new();
     // Pre-populate from Resources/Font if available.
     if let Ok(page_dict) = doc.get_dictionary(page_id) {
         if let Ok(res_obj) = page_dict.get(b"Resources") {
@@ -258,9 +370,17 @@ fn extract_page_spans(
                     if let Ok(font_obj) = res_dict.get(b"Font") {
                         if let Ok((_, fonts)) = doc.dereference(font_obj) {
                             if let Ok(fonts_dict) = fonts.as_dict() {
-                                for (name, _) in fonts_dict.iter() {
+                                for (name, val) in fonts_dict.iter() {
                                     if let Some(bf) = resolve_font_name(doc, page_id, name) {
                                         font_map.insert(name.clone(), bf);
+                                    }
+                                    // Extract /Widths from font dict
+                                    if let Ok((_, font_obj)) = doc.dereference(val) {
+                                        if let Ok(fd) = font_obj.as_dict() {
+                                            if let Some(fw) = extract_pdf_font_widths(doc, fd) {
+                                                font_widths_map.insert(name.clone(), fw);
+                                            }
+                                        }
                                     }
                                 }
                             }
@@ -273,7 +393,9 @@ fn extract_page_spans(
 
     let mut spans = Vec::new();
     let mut current_font = String::new();
+    let mut current_font_resource: Vec<u8> = Vec::new(); // resource name (e.g. F9+0)
     let mut font_size: f32 = 12.0;
+    let mut word_spacing: f32 = 0.0; // Tw in text-space units (1/1000)
     // Text matrix [a, b, c, d, e, f] — (e, f) is the translation.
     let mut tm = [1.0f32, 0.0, 0.0, 1.0, 0.0, 0.0];
     // Current transformation matrix — we track it for coordinate transforms.
@@ -302,6 +424,7 @@ fn extract_page_spans(
             "Tf" => {
                 if op.operands.len() >= 2 {
                     if let Ok(name_bytes) = op.operands[0].as_name() {
+                        current_font_resource = name_bytes.to_vec();
                         if let Some(bf) = font_map.get(name_bytes) {
                             current_font = bf.clone();
                         } else {
@@ -309,6 +432,13 @@ fn extract_page_spans(
                         }
                     }
                     font_size = as_f32(&op.operands[1]).unwrap_or(12.0);
+                }
+            }
+
+            // Word spacing
+            "Tw" => {
+                if let Some(v) = op.operands.first().and_then(|o| as_f32(o)) {
+                    word_spacing = v;
                 }
             }
 
@@ -351,7 +481,8 @@ fn extract_page_spans(
             "Tj" | "'" | "\"" => {
                 if op.operator == "\"" && op.operands.len() >= 3 {
                     // " sets word and char spacing then shows text
-                    // We skip spacing for our purposes
+                    word_spacing = as_f32(&op.operands[0]).unwrap_or(0.0);
+                    // char spacing (Tc) — tracked but not yet used for width
                 }
                 // Advance to next line for ' and "
                 if op.operator == "'" || op.operator == "\"" {
@@ -362,7 +493,12 @@ fn extract_page_spans(
                 if n_chars > 0 && !current_font.is_empty() {
                     let (x, y) = transform_point(tm[4], tm[5], &ctm);
                     let h = font_size.abs() * ctm[3].abs().max(0.1);
-                    let w = n_chars as f32 * font_size.abs() * 0.5 * ctm[0].abs().max(0.1);
+                    let ctm_x = ctm[0].abs().max(0.1);
+                    let w = if let Some(fw) = font_widths_map.get(&current_font_resource) {
+                        text_width_from_pdf(&op.operands, fw, font_size, ctm_x, word_spacing)
+                    } else {
+                        text_width_estimate(&op.operands, font_size, ctm_x)
+                    };
                     spans.push(VectorSpan {
                         font_name: current_font.clone(),
                         bbox: [x, y, x + w, y + h],
@@ -374,7 +510,12 @@ fn extract_page_spans(
                 if n_chars > 0 && !current_font.is_empty() {
                     let (x, y) = transform_point(tm[4], tm[5], &ctm);
                     let h = font_size.abs() * ctm[3].abs().max(0.1);
-                    let w = n_chars as f32 * font_size.abs() * 0.5 * ctm[0].abs().max(0.1);
+                    let ctm_x = ctm[0].abs().max(0.1);
+                    let w = if let Some(fw) = font_widths_map.get(&current_font_resource) {
+                        text_width_from_pdf(&op.operands, fw, font_size, ctm_x, word_spacing)
+                    } else {
+                        text_width_estimate(&op.operands, font_size, ctm_x)
+                    };
                     spans.push(VectorSpan {
                         font_name: current_font.clone(),
                         bbox: [x, y, x + w, y + h],
@@ -454,6 +595,8 @@ fn text_length(operands: &[lopdf::Object]) -> usize {
 
 impl GroundTruth {
     /// Parse a vector PDF and extract all text spans with font names.
+    /// Reads /Widths from the PDF font dictionaries for accurate span bounding
+    /// boxes; otherwise estimates widths as character_count × 0.5 × font_size.
     pub fn load(path: &Path) -> Result<Self, String> {
         let doc = Document::load(path).map_err(|e| format!("failed to load vector PDF: {}", e))?;
         let page_count = doc.get_pages().len();
@@ -484,7 +627,7 @@ impl GroundTruth {
             pages.insert(*page_num as usize, spans);
         }
 
-        eprintln!("[ground_truth] loaded {} pages, {} total spans",
+        eprintln!("[ground_truth] loaded {} pages, {} total spans (PDF /Widths)",
             page_count,
             pages.values().map(|v| v.len()).sum::<usize>());
 

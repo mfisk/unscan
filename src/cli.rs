@@ -55,7 +55,7 @@ pub struct Args {
 
     /// Audit directory.  Writes audit.json and per-word segmentation
     /// diagnostics (crops, seams, char overlays) into the given directory.
-    /// Also used by tools/char-misses.py to generate the visual miss report.
+    /// When `--audit-vector` is also set, generates report.html.
     #[arg(long, value_name = "DIR")]
     pub audit: Option<PathBuf>,
 
@@ -87,12 +87,6 @@ pub struct Args {
     #[arg(long, value_name = "NAME")]
     pub include_font: Option<String>,
 
-    /// Path to a fontmap JSON ({"FontName": "/path/to/font.ttf", ...}).
-    /// All fonts referenced in the map are injected into the CI audit
-    /// candidate list, like --include-font but in bulk.
-    #[arg(long = "include-fontmap", value_name = "FILE")]
-    pub include_fontmap: Option<std::path::PathBuf>,
-
     /// Thoroughness factor for font matching. Default 1.0.
     /// Higher values relax all CI thresholds (quorum, quality gate, search
     /// radius) so more candidate fonts survive to evaluation.
@@ -101,7 +95,7 @@ pub struct Args {
     pub thoroughness: f32,
 
     /// Vector PDF for ground-truth comparison.  When set alongside --audit,
-    /// only miss lines get full audit detail (crop PNGs, fontmap per-char
+    /// only miss lines get full audit detail (crop PNGs, GT font per-char
     /// distances, font ref glyphs).  Hit lines are logged with minimal data.
     /// A "miss" includes font mismatches, no font match, OCR rejection, and
     /// SSIM rejection.  Also generates an HTML miss report in the audit

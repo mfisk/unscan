@@ -6,35 +6,30 @@ unscan's accuracy is measured by comparing its output against a vector PDF whose
 
 ```
 gen-specimen.py          →  font-timeline-specimen.pdf          (vector, source of truth)
-                         →  font-timeline-specimen-fontmap.json (PS name → file path)
                          →  font-timeline-specimen-scanned.pdf  (rasterized "scan")
 
-rasterize.py prepare     →  rasterized PDF + fontmap from any vector PDF
+rasterize.py rasterize   →  rasterized PDF from any vector PDF
 
 unscan --audit           →  audit.json + SSIM images
-
-char-misses.py           →  HTML miss report (audit vs vector ground truth)
+       --audit-vector    →  ground-truth comparison + report.html
 ```
 
-1. **gen-specimen.py** builds a multi-page vector PDF using 30+ font families. It calls `rasterize.py` to build the fontmap and rasterize.
-2. **rasterize.py** is the single tool for rasterization and fontmap extraction.
+1. **gen-specimen.py** builds a multi-page vector PDF using 30+ font families. It calls `rasterize.py` to rasterize.
+2. **rasterize.py** handles rasterization (with optional scan artifacts).
 3. **unscan** processes the rasterized PDF, producing an audit log with per-line font matches.
-4. **char-misses.py** compares unscan's matches against the vector PDF's embedded fonts.
+4. **report.rs** (built into unscan) compares matches against the vector PDF's ground truth and generates `report.html`.
 
 ## Tools
 
 ### `tools/rasterize.py`
 
-One script, three subcommands:
+One script for rasterization:
 
 ```bash
 # Rasterize a vector PDF to a grayscale raster PDF
 python3 tools/rasterize.py rasterize INPUT.pdf OUTPUT.pdf [--dpi 300] [--no-aa] [--backend mupdf|poppler]
 
-# Build a fontmap (PS name → file path) from a vector PDF
-python3 tools/rasterize.py fontmap INPUT.pdf [-o fontmap.json] [-v]
-
-# Both at once: rasterize + fontmap, with next-step commands printed
+# Rasterize with next-step commands printed
 python3 tools/rasterize.py prepare INPUT.pdf [-d output_dir] [--dpi 300] [--no-aa] [--backend mupdf|poppler]
 ```
 
@@ -48,43 +43,18 @@ python3 tools/rasterize.py prepare INPUT.pdf [-d output_dir] [--dpi 300] [--no-a
 **Prepare options:**
 - `-d` / `--output-dir` — output directory (default: same as input)
 - `-o` / `--output` — explicit rasterized PDF path
-- `--fontmap-only` — skip rasterization
-- `--rasterize-only` — skip fontmap
+- `--rasterize-only` — skip fontmap generation
 
-### `tools/char-misses.py`
+### Built-in miss report
 
-Compares unscan's audit output against the vector PDF's ground truth:
+unscan generates a self-contained HTML miss report at `DIR/report.html` when
+both `--audit DIR` and `--audit-vector VECTOR.pdf` are set. No separate script
+needed.
 
-```bash
-python3 tools/char-misses.py /tmp/audit/audit.json original.pdf --fontmap fontmap.json -o /tmp/misses.html
-```
-
-## The Fontmap
-
-### How It's Built
-
-The fontmap is derived by **introspecting the finished PDF** — not by recording what inputs were given to the generator:
-
-1. Open the PDF with PyMuPDF
-2. Enumerate every embedded font via `page.get_fonts(full=True)`
-3. Extract the PostScript name (stripping `AAAAAA+` subset prefix)
-4. Reverse-resolve each to a file: `fc-list :postscriptname=X`
-
-This guarantees the fontmap matches the PDF by construction. If `fc_find` registers the wrong file, the fontmap records *that wrong file* — the ground truth reflects what's actually in the PDF.
-
-### Format
-
-```json
-{
-  "ArialMT": "/usr/share/fonts/truetype/msttcorefonts/Arial.TTF",
-  "EBGaramond-Bold": "/usr/share/fonts/truetype/specimen-fonts/eb-garamond-700.ttf",
-  "SourceSerif4-Regular": "/usr/share/fonts/truetype/extra/SourceSerif4[opsz,wght].ttf"
-}
-```
-
-**Keys** = PostScript names from the PDF. **Values** = absolute file paths.
-
-Built-in PDF fonts (Helvetica, Times-Roman) have no file on disk and are omitted.
+Ground-truth font identification uses `/Widths` and `Tw` (word spacing) read
+directly from the vector PDF's font dictionaries — no external fontmap file
+required. On miss lines, the ground-truth font is injected into the CI candidate
+list and per-char distances are computed automatically.
 
 ## Running Tests
 
@@ -96,7 +66,7 @@ Tests have strict ordering — **t55 must run before t60/t61/t62**:
 # Build
 cargo build --release
 
-# Generate all fixtures (vector PDF, fontmap, AA + no-AA rasters, char index)
+# Generate all fixtures (vector PDF, AA + no-AA rasters, char index)
 cargo test --test t55_specimen_gen -- --nocapture
 
 # Run accuracy tests (these assert fixtures exist, no fallback generation)
@@ -111,44 +81,37 @@ cargo test --test t62_cross_renderer_accuracy -- --nocapture  # Poppler, thresho
 
 ### Any Vector PDF (Manual)
 
-The tools work on any vector PDF. One command to prepare, two to measure:
+The tools work on any vector PDF:
 
 ```bash
-# 1. Prepare: rasterize + build fontmap
-python3 tools/rasterize.py prepare original.pdf -d /tmp/test
+# 1. Rasterize
+python3 tools/rasterize.py rasterize original.pdf /tmp/rasterized.pdf
 
-# 2. Run unscan with audit
-./target/release/unscan /tmp/test/original-rasterized.pdf \
+# 2. Run unscan with audit + ground-truth comparison
+./target/release/unscan /tmp/rasterized.pdf \
   -o /tmp/out.pdf --audit /tmp/audit \
-  --include-fontmap /tmp/test/original-fontmap.json
+  --audit-vector original.pdf
 
-# 3. Generate miss report
-python3 tools/char-misses.py /tmp/audit/audit.json \
-  original.pdf --fontmap /tmp/test/original-fontmap.json \
-  -o /tmp/misses.html
+# Report at /tmp/audit/report.html
 ```
 
-**Requirements:** The fonts embedded in the vector PDF must be installed on the system. `rasterize.py fontmap` resolves PostScript names via fontconfig — missing fonts appear as unresolved. Built-in PDF fonts (Helvetica, Courier, Times) are expected unresolved entries.
+**Requirements:** The fonts embedded in the vector PDF must be installed on the system.
 
 ### Specimen Pipeline (Full Manual Regeneration)
 
 ```bash
-# Regenerate specimen + fontmap + scanned version
+# Regenerate specimen + scanned version
 cd test-docs && python3 gen-specimen.py && cd ..
 
 # Build
 cargo build --release
 
 # Run unscan with audit
-./target/release/unscan test-docs/font-timeline-specimen-rasterized.pdf \
+./target/release/unscan test-docs/font-timeline-specimen-scanned.pdf \
   -o /tmp/out.pdf --audit /tmp/audit \
-  --include-fontmap test-docs/font-timeline-specimen-fontmap.json
+  --audit-vector test-docs/font-timeline-specimen.pdf
 
-# Miss report
-python3 tools/char-misses.py /tmp/audit/audit.json \
-  test-docs/font-timeline-specimen.pdf \
-  --fontmap test-docs/font-timeline-specimen-fontmap.json \
-  -o /tmp/misses.html
+# Report at /tmp/audit/report.html
 ```
 
 ## Reading the Miss Report
@@ -157,17 +120,18 @@ The HTML report shows every line where unscan's match disagrees with the vector 
 
 - **Page/Line**: Location in the document
 - **Text**: The OCR'd text content
-- **Expected**: Font from the vector PDF (resolved via fontmap)
+- **Expected**: Font from the vector PDF (determined by spatial overlap with ground-truth spans)
 - **Got**: Font unscan matched
+- **Per-char distances**: How far each character crop was from the correct font vs. the chosen font
 - **SSIM images**: Side-by-side scan crop, render crop, and diff
 
 ### Accuracy Tracking
 
-The summary line `Total: N  Hits: H  Misses: M  Skipped: S` is the headline metric.
+The summary line `Report: H/C (P%) — M misses (S SSIM)` is the headline metric.
 
-- **Hit**: unscan's matched font file == fontmap's expected font file
-- **Miss**: different file (includes close variants like Regular vs Light)
-- **Skipped**: lines where the vector PDF's font couldn't be mapped through the fontmap
+- **Hit**: unscan's matched font agrees with the ground-truth font
+- **Miss**: different font (font miss or SSIM failure)
+- **NoGT**: lines where no ground-truth span overlaps the OCR bbox (excluded from denominator)
 
 ## Audit Images
 
@@ -176,6 +140,7 @@ The `--audit` directory contains per-line SSIM comparison images:
 ```
 /tmp/audit/
   audit.json
+  report.html             # Visual miss report (when --audit-vector is set)
   page_1/
     line_000/
       ssim_scan.png       # Scan crop (word-union bbox from OCR)
@@ -241,7 +206,6 @@ Last resort: highest-scoring candidate regardless of width.
 Regenerate when:
 - `gen-specimen.py` changes
 - New fonts are installed or updated
-- You suspect fontmap corruption
 
 ```bash
 cd test-docs && python3 gen-specimen.py

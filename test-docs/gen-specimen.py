@@ -5,7 +5,7 @@ Generate "A Timeline of Typography" — a multi-page vector PDF specimen.
 Output:
   font-timeline-specimen.pdf       — native vector PDF with embedded fonts + SVG logos
   font-timeline-specimen-scanned.pdf — rasterized with scan artifacts (skew, noise, blur)
-  font-timeline-specimen-fontmap.json — font name → file path map for char-misses.py
+  font-timeline-specimen-fontmap.json — font name → file path map for --include-fontmap
 
 All text is real PDF text (not raster). SVG logos are placed as vector drawings.
 The "scanned" version rasterizes entire pages then re-assembles as a raster PDF.

@@ -660,32 +660,9 @@ fn run(args: &cli::Args) -> Result<(), ScanTextError> {
             diag_seg_dir: Option<std::path::PathBuf>,
             /// Per-char distances to the chosen font, keyed by crop_index.
             chosen_char_dists: std::collections::HashMap<usize, f32>,
-            /// Per-char distances to all fontmap fonts, keyed by crop_index.
-            fontmap_char_dists: std::collections::HashMap<usize, Vec<(String, f32)>>,
+            /// Per-char distances to the ground-truth font (audit-vector mode), keyed by crop_index.
+            gt_font_char_dists: std::collections::HashMap<usize, f32>,
         }
-
-        // Pre-load fontmap font_keys once for per-char ground truth distances.
-        let fontmap_keys: Vec<String> = if args.audit.is_some() && args.include_fontmap.is_some() {
-            if let Some(ref fontmap_path) = args.include_fontmap {
-                if let Ok(data) = std::fs::read_to_string(fontmap_path) {
-                    if let Ok(map) = serde_json::from_str::<std::collections::HashMap<String, String>>(&data) {
-                        let mut keys = Vec::new();
-                        for font_path_str in map.values() {
-                            let fp = std::path::Path::new(font_path_str);
-                            for fe in &font_catalog {
-                                if fe.path == fp {
-                                    let key = fe.font_key();
-                                    if !keys.contains(&key) {
-                                        keys.push(key);
-                                    }
-                                }
-                            }
-                        }
-                        keys
-                    } else { Vec::new() }
-                } else { Vec::new() }
-            } else { Vec::new() }
-        } else { Vec::new() };
 
         let fontmatch_start = std::time::Instant::now();
 
@@ -749,7 +726,7 @@ fn run(args: &cli::Args) -> Result<(), ScanTextError> {
                         seg_winner: None,
                         diag_seg_dir: None,
                         chosen_char_dists: std::collections::HashMap::new(),
-                        fontmap_char_dists: std::collections::HashMap::new(),
+                        gt_font_char_dists: std::collections::HashMap::new(),
                     };
                 } else if li < 3 {
                     eprintln!("    [fp-miss] L{} ssim={:.3} font={}", li, score, fm.font_key);
@@ -796,7 +773,7 @@ fn run(args: &cli::Args) -> Result<(), ScanTextError> {
             );
             let mut ci_top_for_audit: Vec<(String, f32)>;
             let ci_char_detail: Vec<char_index::CharCiDetail>;
-            let mut ci_top_for_audit_lig: Vec<(String, f32)>;
+            let ci_top_for_audit_lig: Vec<(String, f32)>;
             let ci_char_detail_lig: Vec<char_index::CharCiDetail>;
             let seg_winner: Option<String>;
             let diag_seg_dir: Option<std::path::PathBuf> = args.diag_seg_dir().map(|d| {
@@ -903,25 +880,6 @@ fn run(args: &cli::Args) -> Result<(), ScanTextError> {
                     }
                 }
 
-                // --include-fontmap: inject all fonts from a fontmap JSON into CI audit list
-                if let Some(ref fontmap_path) = args.include_fontmap {
-                    if let Ok(data) = std::fs::read_to_string(fontmap_path) {
-                        if let Ok(map) = serde_json::from_str::<std::collections::HashMap<String, String>>(&data) {
-                            for font_path_str in map.values() {
-                                let fp = std::path::Path::new(font_path_str);
-                                for fe in &font_catalog {
-                                    if fe.path == fp {
-                                        let key = fe.font_key();
-                                        if !ci_top_for_audit.iter().any(|(n, _)| n == &key) {
-                                            ci_top_for_audit.push((key, -999.0));
-                                        }
-                                    }
-                                }
-                            }
-                        }
-                    }
-                }
-
                 // ── Font selection: use CI #1 directly ───────────────
                 if let Some((top_key, top_score)) = ci_result.scores.first() {
                     font_catalog.iter().find(|fe| fe.font_key() == *top_key)
@@ -994,7 +952,7 @@ fn run(args: &cli::Args) -> Result<(), ScanTextError> {
             let pcd_t0 = std::time::Instant::now();
 
             // Per-char distances and audit detail: only for miss lines (or all if no --audit-vector)
-            let (chosen_char_dists, fontmap_char_dists) = if is_miss && args.audit.is_some() {
+            let (chosen_char_dists, gt_font_char_dists) = if is_miss && args.audit.is_some() {
                 // Precompute features once for all per-char distance lookups
                 let crop_feats = char_index::precompute_crop_features(&corrected_char_crops);
 
@@ -1011,15 +969,32 @@ fn run(args: &cli::Args) -> Result<(), ScanTextError> {
                     std::collections::HashMap::new()
                 };
 
-                // Per-char distances to all fontmap fonts
-                let fontmap: std::collections::HashMap<usize, Vec<(String, f32)>> = if !fontmap_keys.is_empty() {
-                    let mut result: std::collections::HashMap<usize, Vec<(String, f32)>> = std::collections::HashMap::new();
-                    for fk in &fontmap_keys {
-                        for (_, crop_idx, d2) in char_index::per_char_distances_precomputed(&char_index, fk, &crop_feats) {
-                            result.entry(crop_idx).or_default().push((fk.clone(), d2));
+                // Per-char distances to the ground-truth font (if known)
+                let gt_dists: std::collections::HashMap<usize, f32> = if let Some(ref gt) = ground_truth {
+                    let bbox_px = [line.x as f32, line.y as f32,
+                                   (line.x + line.width) as f32,
+                                   (line.y + line.height) as f32];
+                    if let Some(gt_font_name) = gt.lookup_font(page_idx + 1, &bbox_px, args.dpi) {
+                        // Inject GT font into ci_top_for_audit so it appears in audit output
+                        let gt_key = font_catalog.iter()
+                            .find(|fe| ground_truth::fonts_match(&fe.family_name, gt_font_name)
+                                       || ground_truth::fonts_match(&fe.font_key(), gt_font_name))
+                            .map(|fe| fe.font_key());
+                        if let Some(ref gk) = gt_key {
+                            if !ci_top_for_audit.iter().any(|(n, _)| n == gk) {
+                                ci_top_for_audit.push((gk.clone(), -999.0));
+                            }
+                            // Compute per-char distances to the GT font
+                            char_index::per_char_distances_precomputed(&char_index, gk, &crop_feats)
+                                .into_iter()
+                                .map(|(_, crop_idx, d2)| (crop_idx, d2))
+                                .collect()
+                        } else {
+                            std::collections::HashMap::new()
                         }
+                    } else {
+                        std::collections::HashMap::new()
                     }
-                    result
                 } else {
                     std::collections::HashMap::new()
                 };
@@ -1083,14 +1058,14 @@ fn run(args: &cli::Args) -> Result<(), ScanTextError> {
                     }
                 }
 
-                (chosen, fontmap)
+                (chosen, gt_dists)
             } else {
                 (std::collections::HashMap::new(), std::collections::HashMap::new())
             };
             prof_pcd_us.fetch_add(pcd_t0.elapsed().as_micros() as u64, std::sync::atomic::Ordering::Relaxed);
 
             prof_full_us.fetch_add(line_start.elapsed().as_micros() as u64, std::sync::atomic::Ordering::Relaxed);
-            LineMatch { font_result, text_color, ci_top_for_audit, ci_char_detail, ci_top_for_audit_lig, ci_char_detail_lig, seg_winner, diag_seg_dir, chosen_char_dists, fontmap_char_dists }
+            LineMatch { font_result, text_color, ci_top_for_audit, ci_char_detail, ci_top_for_audit_lig, ci_char_detail_lig, seg_winner, diag_seg_dir, chosen_char_dists, gt_font_char_dists }
         }).collect();
 
         // Update dominant font candidate for next page from this page's results
@@ -1320,8 +1295,7 @@ fn run(args: &cli::Args) -> Result<(), ScanTextError> {
                 ci_char_votes: lm.ci_char_detail.iter()
                     .map(|d| {
                         let chosen_d2 = lm.chosen_char_dists.get(&d.crop_index).copied();
-                        let fm_dists = lm.fontmap_char_dists.get(&d.crop_index)
-                            .cloned().unwrap_or_default();
+                        let gt_d2 = lm.gt_font_char_dists.get(&d.crop_index).copied();
                         audit::CharCiVote {
                             ch: d.ch,
                             crop_index: d.crop_index,
@@ -1333,7 +1307,7 @@ fn run(args: &cli::Args) -> Result<(), ScanTextError> {
                             ocr_corrected_from: d.ocr_corrected_from,
                             best_alt_char: d.best_alt_char,
                             best_alt_dist: d.best_alt_dist,
-                            fontmap_dists: fm_dists,
+                            gt_font_dist_sq: gt_d2,
                         }
                     })
                     .collect(),
@@ -1353,7 +1327,7 @@ fn run(args: &cli::Args) -> Result<(), ScanTextError> {
                             ocr_corrected_from: d.ocr_corrected_from,
                             best_alt_char: d.best_alt_char,
                             best_alt_dist: d.best_alt_dist,
-                            fontmap_dists: Vec::new(),
+                            gt_font_dist_sq: None,
                         }
                     })
                     .collect(),

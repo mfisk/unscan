@@ -160,11 +160,11 @@ normalization path, saved as `NN_c_ref.png` alongside the scan crop
 | Tool | Purpose | Usage |
 |------|---------|-------|
 | `tools/verify-accuracy.py` | Span-level accuracy vs vector PDF ground truth | `python3 tools/verify-accuracy.py <audit_dir>/audit.json VECTOR.pdf [--verbose]` |
-| `tools/char-misses.py` | Visual HTML report of line-level misses with inline crop images, scan line overlays, and segmentation pictures | `python3 tools/char-misses.py <audit_dir>/audit.json VECTOR.pdf --fontmap FONTMAP.json -o report.html` |
+| Built-in report (`report.rs`) | Visual HTML miss report with inline crop images, scan line overlays, and per-char distance tables | `unscan RASTER.pdf --audit DIR --audit-vector VECTOR.pdf` → `DIR/report.html` |
 
 **After any accuracy test that is not 100%:** run `tools/verify-accuracy.py`
-with `--misses-only` first.  Understand every miss before proposing fixes.
-
+**After any accuracy test that is not 100%:** examine the miss report.
+Understand every miss before proposing fixes.
 ---
 
 ### Other Diagnostic Flags
@@ -172,7 +172,6 @@ with `--misses-only` first.  Understand every miss before proposing fixes.
 | Flag | Description |
 |------|-------------|
 | `--include-font <NAME>` | Force a font (case-insensitive substring) into CI candidate list for all lines, even if CI would normally prune it. Score shows as -999 in audit. |
-| `--include-fontmap <FILE>` | Inject all fonts from a fontmap JSON (`{"Name": "/path/to/font.ttf", ...}`) into CI audit candidate list. Like `--include-font` but in bulk. |
 | `--thoroughness <FLOAT>` | Scale CI thresholds (default 1.0). Higher = more candidates survive CI, slower. Useful for testing if a correct font is being over-pruned. |
 | `--compare` | Generate side-by-side scan/render overlay images in `<output>-compare/` |
 | `--overlay` | Debug render mode: original raster kept, vector text overlaid in semitransparent red |
@@ -428,12 +427,8 @@ python3 tools/verify-accuracy.py /tmp/audit-out/audit.json \
 
 ### Step 3: Visual Miss Report
 
-```bash
-python3 tools/char-misses.py /tmp/audit-out/audit.json \
-    VECTOR.pdf \
-    --fontmap FONTMAP.json \
-    -o report.html
-```
+The miss report is generated automatically when `--audit-vector` is set.
+Open `DIR/report.html` in a browser.
 
 ### Step 4: Query the Audit JSON
 
@@ -541,6 +536,6 @@ force it into CI candidate list.
 | Word SSIM reranking (disabled) | `src/word_match.rs` | `word_level_rerank()` |
 | Segmentation diag overlay | `src/seg_diag.rs` | `save_split_overlay()` |
 | Span-level accuracy | `tools/verify-accuracy.py` | — |
-| Line-level miss report | `tools/char-misses.py` | — |
+| Line-level miss report | Built-in `report.rs` (via `--audit-vector`) | `DIR/report.html` |
 | Test ground truth | `test-docs/font-timeline-specimen.pdf` | Vector PDF |
 | Test raster (Poppler) | `test-docs/font-timeline-specimen-rasterized-poppler.pdf` | Cross-renderer test |

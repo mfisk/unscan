@@ -1,8 +1,8 @@
 //! Specimen accuracy — 300 dpi, anti-aliased.
 //!
-//! Runs unscan with --audit against the AA-rasterized specimen, then
-//! invokes tools/char-misses.py to compare each matched font against the
-//! vector PDF's spatial ground truth via PyMuPDF.
+//! Runs unscan with --audit and --audit-vector against the AA-rasterized
+//! specimen.  The built-in report.rs compares each matched font against
+//! the vector PDF's spatial ground truth.
 //!
 //! Prerequisites: run t55_specimen_gen first to generate all test fixtures.
 //!
@@ -21,10 +21,9 @@ fn specimen_font_accuracy_aa() {
     ensure_index();
 
     let vector = test_doc("font-timeline-specimen.pdf");
-    let fontmap = test_doc("font-timeline-specimen-fontmap.json");
     let raster = test_doc("font-timeline-specimen-rasterized.pdf");
 
-    let r = common::measure_accuracy(&raster, &vector, &fontmap, "t60-300dpi-aa");
+    let r = common::measure_accuracy(&raster, &vector, "t60-300dpi-aa");
 
     eprintln!(
         "AA @ 300dpi: {}/{} = {:.1}% (threshold: {:.0}%)",

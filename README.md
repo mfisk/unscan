@@ -78,31 +78,26 @@ See [`docs/POPULAR_FONTS.md`](docs/POPULAR_FONTS.md) for the full catalog of
 supported font families (Word, typewriter, LaTeX, Google Fonts) and manual
 install instructions.
 
-## Font ground-truth map
+## Ground-truth audit
 
-When generating the specimen PDF, `test-docs/gen-specimen.py` emits a
-`font-timeline-specimen-fontmap.json` mapping font names to the exact
-TTF/OTF files used. This fontmap serves two purposes:
+When `--audit-vector VECTOR.pdf` is supplied alongside `--audit DIR`, unscan
+reads `/Widths` and `Tw` (word spacing) directly from the vector PDF's font
+dictionaries to compute accurate span bounding boxes. Each OCR line is matched
+against the overlapping vector span to determine the ground-truth font. Lines
+where the matched font disagrees with the ground truth are classified as misses.
 
-1. **Miss report rendering:** pass it to `tools/char-misses.py` so the report
-   can render ground-truth characters from the correct font files.
-
-2. **Audit inclusion:** pass it to unscan via `--include-fontmap` to ensure
-   all ground-truth fonts appear in the CI candidate list for every line,
-   even if CI would normally prune them.
+On miss lines, the ground-truth font is automatically injected into the CI
+candidate list and per-char distances to it are computed, so the HTML report
+shows exactly how far each character was from the correct font.
 
 ```bash
-# Run unscan with fontmap-injected candidates
-unscan test-docs/font-timeline-specimen-rasterized.pdf \
+# Run unscan with ground-truth audit
+unscan test-docs/font-timeline-specimen-scanned.pdf \
   -o /tmp/out.pdf --audit /tmp/audit-out \
-  --include-fontmap test-docs/font-timeline-specimen-fontmap.json
-
-# Generate the visual miss report
-python3 tools/char-misses.py /tmp/audit-out/audit.json \
-  test-docs/font-timeline-specimen.pdf \
-  -o /tmp/misses.html \
-  --fontmap test-docs/font-timeline-specimen-fontmap.json
+  --audit-vector test-docs/font-timeline-specimen.pdf
 ```
+
+The HTML miss report is generated automatically at `DIR/report.html`.
 
 ## Usage
 
@@ -145,7 +140,6 @@ unscan scan.png -o output.pdf
 | `--audit` | *(none)* | Write audit JSON + per-line segmentation diagnostics to DIR |
 | `--compare` | off | Generate side-by-side scan vs. render comparison images |
 | `--include-font` | *(none)* | Force a font (case-insensitive substring) into CI candidate list for every line |
-| `--include-fontmap` | *(none)* | Inject all fonts from a fontmap JSON into CI candidate list |
 | `--thoroughness` | 1.0 | Scale CI thresholds — higher = more candidates survive, slower |
 | `--index` | off | Scan fonts, update the character index cache, and exit |
 | `--index-path` | `~/.cache/unscan/char-index.bin` | Path to the character index cache file |
@@ -189,10 +183,9 @@ PDFs reference standard names all viewers understand. See
 
 | Script | Purpose |
 |--------|---------|
-| `tools/char-misses.py` | Generate visual HTML miss report from audit JSON + vector PDF ground truth |
-| `tools/rasterize.py` | Rasterize vector PDFs, build fontmaps, or both (`rasterize`, `fontmap`, `prepare` subcommands) |
+| `tools/rasterize.py` | Rasterize vector PDFs (`rasterize`, `prepare` subcommands) |
 | `scripts/install-all-fonts.sh` | Install all recommended fonts (MS Core, Google Fonts, typewriter, LaTeX) |
-| `test-docs/gen-specimen.py` | Generate the 6-page font timeline specimen PDF + fontmap |
+| `test-docs/gen-specimen.py` | Generate the 6-page font timeline specimen PDF |
 | `test-docs/gen-resolution-series.py` | Generate resolution degradation series (600→fax DPI) |
 | `test-docs/gen-ligature-test.py` | Generate the ligature test PDF |
 | `test-docs/gen-mixed-font-specimen.py` | Generate the mixed-font (intra-line switching) specimen |
@@ -201,8 +194,8 @@ PDFs reference standard names all viewers understand. See
 
 When `--audit DIR` is set, unscan writes `DIR/audit.json` with full pipeline
 decisions, plus per-line directories containing per-word subdirectories with
-segmentation overlays, character crops, and summary JSONs. Use
-`tools/char-misses.py DIR/audit.json VECTOR.pdf` to generate a visual miss report.
+segmentation overlays, character crops, and summary JSONs. When `--audit-vector`
+is also set, a visual HTML miss report is generated at `DIR/report.html`.
 
 ```
 DIR/
