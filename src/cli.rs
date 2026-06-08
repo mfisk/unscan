@@ -103,8 +103,10 @@ pub struct Args {
     /// Vector PDF for ground-truth comparison.  When set alongside --audit,
     /// only miss lines get full audit detail (crop PNGs, fontmap per-char
     /// distances, font ref glyphs).  Hit lines are logged with minimal data.
-    #[arg(long, value_name = "FILE")]
-    pub vector: Option<std::path::PathBuf>,
+    /// A "miss" includes font mismatches, no font match, OCR rejection, and
+    /// SSIM rejection.
+    #[arg(long = "audit-vector", value_name = "FILE")]
+    pub audit_vector: Option<std::path::PathBuf>,
 
     /// Render characters using the index-time render_char_normalised() pipeline
     /// and save as PNGs.  Takes a JSON object: {"font": "/path/to/font.ttf",

@@ -544,7 +544,7 @@ fn run(args: &cli::Args) -> Result<(), ScanTextError> {
     let mut dominant_font_candidate: Option<font_match::FontMatchResult> = None;
 
     // Load ground truth from vector PDF for miss-only audit gating.
-    let ground_truth: Option<ground_truth::GroundTruth> = if let Some(ref vpath) = args.vector {
+    let ground_truth: Option<ground_truth::GroundTruth> = if let Some(ref vpath) = args.audit_vector {
         match ground_truth::GroundTruth::load(vpath) {
             Ok(gt) => Some(gt),
             Err(e) => {
@@ -834,7 +834,7 @@ fn run(args: &cli::Args) -> Result<(), ScanTextError> {
             let font_result = {
 
                 // Crop PNGs are saved after font matching, gated by ground-truth
-                // miss detection when --vector is set (see below).
+                // miss detection when --audit-vector is set (see below).
 
                 // ── Score plain path ─────────────────────────────────
                 let ci_t0 = std::time::Instant::now();
@@ -943,14 +943,26 @@ fn run(args: &cli::Args) -> Result<(), ScanTextError> {
                     line.words.iter().map(|w| w.text.as_str()).collect::<Vec<_>>().join(" "));
             }
             // ── Ground-truth gated audit detail ─────────────────────────
-            // When --vector is set, check if this line is a miss before doing
-            // expensive audit I/O.  Without --vector, all lines get full audit.
+            // When --audit-vector is set, check if this line is a miss before
+            // doing expensive audit I/O.  Without --audit-vector, all lines
+            // get full audit.  "Miss" means: ground-truth font mismatch, no
+            // font matched, OCR too low, or font confidence too low.
             let is_miss = if let Some(ref gt) = ground_truth {
-                if let Some(ref fr) = font_result {
-                    let bbox_px = [line.x as f32, line.y as f32,
-                                   (line.x + line.width) as f32,
-                                   (line.y + line.height) as f32];
-                    !gt.is_hit(page_idx + 1, &bbox_px, args.dpi, &fr.font_name)
+                // OCR too low → line will be kept raster, treat as miss
+                let ocr_ok = line.confidence >= args.min_ocr_confidence as f32
+                    && !line.text.trim().is_empty();
+                if !ocr_ok {
+                    true
+                } else if let Some(ref fr) = font_result {
+                    // Font confidence too low → kept raster, treat as miss
+                    if fr.score < args.min_font_confidence {
+                        true
+                    } else {
+                        let bbox_px = [line.x as f32, line.y as f32,
+                                       (line.x + line.width) as f32,
+                                       (line.y + line.height) as f32];
+                        !gt.is_hit(page_idx + 1, &bbox_px, args.dpi, &fr.font_name)
+                    }
                 } else {
                     true // no font matched → treat as miss
                 }
@@ -980,7 +992,7 @@ fn run(args: &cli::Args) -> Result<(), ScanTextError> {
 
             let pcd_t0 = std::time::Instant::now();
 
-            // Per-char distances and audit detail: only for miss lines (or all if no --vector)
+            // Per-char distances and audit detail: only for miss lines (or all if no --audit-vector)
             let (chosen_char_dists, fontmap_char_dists) = if is_miss && args.audit.is_some() {
                 // Precompute features once for all per-char distance lookups
                 let crop_feats = char_index::precompute_crop_features(&corrected_char_crops);
