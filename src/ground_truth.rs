@@ -1,6 +1,6 @@
 //! Ground-truth extraction from a vector PDF for miss-only audit gating.
 //!
-//! When `--vector <path>` is given alongside `--audit`, unscan parses the vector
+//! When `--audit-vector <path>` is given alongside `--audit`, unscan parses the vector
 //! PDF upfront and builds a per-page spatial index of text spans with their font
 //! names.  During per-line processing, each matched font is immediately compared
 //! against ground truth: hits skip expensive audit I/O (crop PNGs, fontmap
