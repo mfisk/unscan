@@ -100,6 +100,12 @@ pub struct Args {
     #[arg(long, default_value_t = 1.0)]
     pub thoroughness: f32,
 
+    /// Vector PDF for ground-truth comparison.  When set alongside --audit,
+    /// only miss lines get full audit detail (crop PNGs, fontmap per-char
+    /// distances, font ref glyphs).  Hit lines are logged with minimal data.
+    #[arg(long, value_name = "FILE")]
+    pub vector: Option<std::path::PathBuf>,
+
     /// Render characters using the index-time render_char_normalised() pipeline
     /// and save as PNGs.  Takes a JSON object: {"font": "/path/to/font.ttf",
     /// "chars": "abc", "output_dir": "/tmp/refs"}.  Each character is saved as
