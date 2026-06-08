@@ -270,7 +270,7 @@ fn classify_entries<'a>(
             if let Some(gt) = gt {
                 let actual_font = gt
                     .lookup_font(e.page, &bbox_px, dpi)
-                    .map(|s| s.to_string());
+                    .map(|s| ground_truth::strip_subset_prefix_str(s));
 
                 let kind = if e.decision == Decision::KeptRaster {
                     MissKind::KeptRaster
