@@ -534,27 +534,23 @@ Produce an HTML widget card with inline base64 images. The card must be
 theme-aware (light/dark) and self-contained. Present it with `present_now: true`
 so it renders immediately — don't embed it in a text reply.
 
-### Script: `tools/char-misses.py`
+### Built-in miss report (`report.rs`)
 
-Automates the full procedure — finds all real misses (ignoring metric-compatible
-clones), picks interesting characters, renders all three columns, and produces
-a self-contained HTML report.
+The miss report is generated automatically by unscan when `--audit` and
+`--audit-vector` are both set. It writes a self-contained HTML report to
+`DIR/report.html` with all base64 images inlined. No separate script needed.
 
 ```bash
-# 1. Run unscan with --audit
-./target/debug/unscan INPUT.pdf \
-    -o /dev/null --audit /tmp/audit-out
-
-# 2. Generate the visual report
-python3 tools/char-misses.py /tmp/audit-out test-docs/font-timeline-specimen.pdf \
-    -o /tmp/char-misses.html
-
-# 3. Present as widget card (present_now: true)
+# Run unscan — report.html is generated automatically
+./target/release/unscan INPUT.pdf \
+    -o /dev/null --audit /tmp/audit-out \
+    --audit-vector VECTOR.pdf
+# Report at /tmp/audit-out/report.html
 ```
 
-The script mirrors the clone/alias map from `t60_specimen_accuracy_aa.rs` so its
-miss count matches the test. Output is a single HTML file with all base64
-images inlined.
+On miss lines, the ground-truth font is injected into the CI candidate list
+and per-char distances are computed, so the report shows exactly how far each
+character was from the correct font.
 
 ---
 

@@ -2,7 +2,7 @@
 # regression_ligature.sh — Ligature font-identification regression test
 #
 # Runs unscan on ligature-test.pdf (3 font families × with/without ligatures
-# × 2 text variants = 21 lines), then checks the char-misses report for
+# × 2 text variants = 21 lines), then checks the built-in miss report for
 # perfect font identification (0 misses).
 #
 # Usage:
@@ -18,7 +18,6 @@ set -uo pipefail
 
 UNSCAN="${UNSCAN:-./target/debug/unscan}"
 TESTDIR="test-docs"
-TOOLS="tools"
 TMPDIR=$(mktemp -d)
 trap 'rm -rf "$TMPDIR"' EXIT
 
@@ -37,7 +36,6 @@ if [ ! -x "$UNSCAN" ]; then
 fi
 
 PDF="$TESTDIR/ligature-test.pdf"
-FONTMAP="$TESTDIR/ligature-test-fontmap.json"
 
 if [ ! -f "$PDF" ]; then
     red "ERROR: $PDF not found"
@@ -45,27 +43,12 @@ if [ ! -f "$PDF" ]; then
     exit 1
 fi
 
-# Generate fontmap if missing (has local font paths, .gitignored)
-if [ ! -f "$FONTMAP" ]; then
-    echo "Generating fontmap..."
-    python3 "$TESTDIR/gen-ligature-test.py" 2>/dev/null || true
-    if [ ! -f "$FONTMAP" ]; then
-        yellow "WARN: fontmap generation failed, running without it"
-        FONTMAP=""
-    fi
-fi
-
-# ── Run unscan ────────────────────────────────────────────────────────
+# ── Run unscan with --audit-vector ────────────────────────────────────
 echo "Running unscan on $PDF..."
 AUDIT_DIR="$TMPDIR/audit"
 OUTPUT="$TMPDIR/output.pdf"
 
-UNSCAN_FONTMAP_ARG=""
-if [ -n "${FONTMAP:-}" ] && [ -f "$FONTMAP" ]; then
-    UNSCAN_FONTMAP_ARG="--include-fontmap $FONTMAP"
-fi
-
-$UNSCAN "$PDF" -o "$OUTPUT" --audit "$AUDIT_DIR" $UNSCAN_FONTMAP_ARG 2>"$TMPDIR/unscan.log"
+$UNSCAN "$PDF" -o "$OUTPUT" --audit "$AUDIT_DIR" --audit-vector "$PDF" 2>"$TMPDIR/unscan.log"
 rc=$?
 
 if [ $rc -ne 0 ]; then
@@ -79,27 +62,27 @@ if [ ! -f "$AUDIT_DIR/audit.json" ]; then
     exit 1
 fi
 
-# ── Run char-misses report ────────────────────────────────────────────
-echo "Running char-misses report..."
-
-FONTMAP_ARG=""
-if [ -n "${FONTMAP:-}" ] && [ -f "$FONTMAP" ]; then
-    FONTMAP_ARG="--include-fontmap $FONTMAP"
+if [ ! -f "$AUDIT_DIR/report.html" ]; then
+    red "FAIL: no report.html produced"
+    exit 1
 fi
 
-REPORT_OUTPUT=$(python3 "$TOOLS/char-misses.py" \
-    "$AUDIT_DIR/audit.json" "$PDF" \
-    $FONTMAP_ARG \
-    -o "$TMPDIR/misses.html" 2>&1)
-
-# Parse hits/misses from stderr output: "Total: N  Hits: N  Misses: N ..."
-TOTAL=$(echo "$REPORT_OUTPUT" | grep -oP 'Total: \K[0-9]+')
-HITS=$(echo "$REPORT_OUTPUT" | grep -oP 'Hits: \K[0-9]+')
-MISSES=$(echo "$REPORT_OUTPUT" | grep -oP 'Misses: \K[0-9]+')
-
+# ── Parse report summary from unscan stderr ──────────────────────────
+# Format: "Report: H/C (P%) — M misses ..."
+REPORT_LINE=$(grep "Report:" "$TMPDIR/unscan.log" || true)
 echo ""
-echo "  $REPORT_OUTPUT"
+echo "  $REPORT_LINE"
 echo ""
+
+# Extract hits and compared from "Report: H/C"
+HITS=$(echo "$REPORT_LINE" | grep -oP 'Report: \K[0-9]+')
+COMPARED=$(echo "$REPORT_LINE" | grep -oP 'Report: [0-9]+/\K[0-9]+')
+MISSES_FROM_LINE=$(echo "$REPORT_LINE" | grep -oP '— \K[0-9]+(?= misses)')
+
+# Total = compared (the report only covers compared lines)
+TOTAL="${COMPARED:-0}"
+HITS="${HITS:-0}"
+MISSES="${MISSES_FROM_LINE:-0}"
 
 EXPECTED_TOTAL=21
 EXPECTED_MISSES=0

@@ -96,8 +96,8 @@ This produces:
   artifacts: ~2° skew, Gaussian blur, speckle noise, off-white paper.
   **This is the canonical rasterized input** for accuracy testing (6 pages).
 - `font-timeline-specimen-fontmap.json` — maps font names to the exact
-  TTF/OTF font file paths on disk. Used by `char-misses.py` for ground-truth
-  rendering and by `unscan --include-fontmap` for CI audit injection.
+  TTF/OTF font file paths on disk. Used by `unscan --include-fontmap` for
+  CI audit injection.
 - `font-timeline-specimen.json` — machine-readable ground truth mapping each
   section index to its font family, pango font name, source URL, and which
   OpenType features are demonstrated.

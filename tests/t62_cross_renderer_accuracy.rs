@@ -29,7 +29,6 @@ fn specimen_font_accuracy_poppler() {
     ensure_index();
 
     let vector = test_doc("font-timeline-specimen.pdf");
-    let fontmap = test_doc("font-timeline-specimen-fontmap.json");
 
     assert!(vector.exists(),
         "Vector specimen missing — run t55_specimen_gen first: {}",
@@ -42,7 +41,7 @@ fn specimen_font_accuracy_poppler() {
         "Poppler rasterization failed (pdftoppm missing?)",
     );
 
-    let r = common::measure_accuracy(&poppler_pdf, &vector, &fontmap, "t62-poppler-300dpi-aa");
+    let r = common::measure_accuracy(&poppler_pdf, &vector, "t62-poppler-300dpi-aa");
 
     eprintln!(
         "Poppler AA @ 300dpi: {}/{} = {:.1}% (threshold: {:.0}%)",
@@ -56,7 +55,7 @@ fn specimen_font_accuracy_poppler() {
 
     assert!(
         r.compared > 0,
-        "No lines compared — audit or char-misses.py produced no results",
+        "No lines compared — audit or report generation produced no results",
     );
     assert!(
         r.accuracy >= MIN_ACCURACY_POPPLER_AA,

@@ -323,15 +323,13 @@ def cmd_prepare(args):
     # --- Summary ---
     print()
     print("Next steps:")
-    if not args.rasterize_only and not args.fontmap_only:
-        print(f"  # Run unscan")
+    if not args.rasterize_only:
+        print(f"  # Run unscan with ground-truth audit")
         print(f"  ./target/release/unscan {rasterized_path} \\")
         print(f"    -o /tmp/out.pdf --audit /tmp/audit \\")
-        print(f"    --include-fontmap {fontmap_path}")
+        print(f"    --audit-vector {pdf_path}")
         print()
-        print(f"  # Generate miss report")
-        print(f"  python3 tools/char-misses.py /tmp/audit/audit.json \\")
-        print(f"    {pdf_path} --fontmap {fontmap_path}")
+        print(f"  # Report at /tmp/audit/report.html")
 
 
 # ── Shared argument helpers ──────────────────────────────────────────

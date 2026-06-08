@@ -21,10 +21,9 @@ fn specimen_font_accuracy_noaa() {
     ensure_index();
 
     let vector = test_doc("font-timeline-specimen.pdf");
-    let fontmap = test_doc("font-timeline-specimen-fontmap.json");
     let raster = test_doc("font-timeline-specimen-rasterized-noaa-300dpi.pdf");
 
-    let r = common::measure_accuracy(&raster, &vector, &fontmap, "t61-300dpi-noaa");
+    let r = common::measure_accuracy(&raster, &vector, "t61-300dpi-noaa");
 
     eprintln!(
         "noAA @ 300dpi: {}/{} = {:.1}% (threshold: {:.0}%)",
