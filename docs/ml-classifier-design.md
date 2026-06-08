@@ -7,9 +7,9 @@
 ## Problem
 
 The char index previously used `nearest_within_factor(1.5)` per-character
-range search in 59 dimensions. At 59 dims tree structures degrade to near-linear
-scan with branch-misprediction overhead. The correct font fails to reach the
-top-50 candidates on ~12% of lines.
+range search in feature space. The correct font fails to reach the
+top-50 candidates on ~12% of lines. (Note: this was written when the
+feature vector was 59 dimensions; it has since been expanded to 99.)
 
 ## Constraints
 

@@ -14,7 +14,7 @@ identification misses in unscan.
 The single flag for all diagnostic data.  Produces:
 
 1. `audit.json` — pipeline decisions (per-line font matches, CI votes,
-   word SSIM scores)
+   SSIM verification scores)
 2. Per-line diag-seg directories with per-word segmentation diagnostics
    (word crops, VP/seam overlays, summary.json, character crops)
 3. Per-line `crops/` directories (the exact character images CI scores)
@@ -75,7 +75,7 @@ There is **no separate `--diag-seg` flag** — `--audit` enables everything.
 | `ocr_confidence` | f32 | Tesseract confidence (0–100) |
 | `font_matched` | string? | Final font name after all stages |
 | `font_confidence` | f32? | CI score for matched font |
-| `ssim_score` | f32? | Word-level SSIM of matched font |
+| `ssim_score` | f32? | SSIM verification score (Pass 2 gate, threshold 0.3) |
 | `decision` | "vectorized" \| "kept_raster" | — |
 | `reason` | string | Why this decision was made |
 | `bbox` | {x, y, width, height} | Pixel bounding box at render DPI |
@@ -84,7 +84,7 @@ There is **no separate `--diag-seg` flag** — `--audit` enables everything.
 | `seg_winner` | string? | Which segmentation path won: `"plain"` or `"ligature"` |
 | `ci_candidates_lig` | CiCandidate[]? | CI candidates from the alternate (non-winning) path |
 | `ci_char_votes_lig` | CharCiVote[]? | Per-character CI votes from the alternate path |
-| `words` | WordAudit[] | Per-word SSIM reranking detail |
+| `words` | WordAudit[] | Per-word detail (historical; word SSIM reranking is now disabled) |
 | `word_rerank_winner` | string? | Font chosen by word-level SSIM |
 | `word_bboxes` | WordBBox[] | Post-processed word bounding boxes (after clip/drop/expand) |
 | `word_bboxes_raw` | WordBBox[] | Raw Tesseract word bounding boxes (before post-processing) |
@@ -100,7 +100,8 @@ There is **no separate `--diag-seg` flag** — `--audit` enables everything.
 | `nearest` | [string, f32][] | Top-N nearest font matches with distances |
 | `crop_path` | string? | Path to the crop image (when audit images enabled) |
 
-**Per-word SSIM detail** (`WordAudit`):
+**Per-word detail** (`WordAudit`) — *Note: word-level SSIM reranking is
+disabled; CI #1 wins directly. These fields may be empty in current output:*
 
 | Field | Type | Description |
 |-------|------|-------------|
@@ -170,7 +171,7 @@ with `--misses-only` first.  Understand every miss before proposing fixes.
 
 | Flag | Description |
 |------|-------------|
-| `--include-font <NAME>` | Force a font (case-insensitive substring) into word SSIM reranking for all lines, even if CI pruned it. Score shows as -999 in audit. |
+| `--include-font <NAME>` | Force a font (case-insensitive substring) into CI candidate list for all lines, even if CI would normally prune it. Score shows as -999 in audit. |
 | `--include-fontmap <FILE>` | Inject all fonts from a fontmap JSON (`{"Name": "/path/to/font.ttf", ...}`) into CI audit candidate list. Like `--include-font` but in bulk. |
 | `--thoroughness <FLOAT>` | Scale CI thresholds (default 1.0). Higher = more candidates survive CI, slower. Useful for testing if a correct font is being over-pruned. |
 | `--compare` | Generate side-by-side scan/render overlay images in `<output>-compare/` |
@@ -511,7 +512,7 @@ jq '.text_entries[] | select(.text | contains("Typography")) |
 
 If the correct font isn't in `ci_candidates`, it was pruned by CI's σ cutoff.
 Try `--thoroughness 2.0` to relax all gates, or `--include-font Playfair` to
-force it into word SSIM reranking.
+force it into CI candidate list.
 
 ---
 
@@ -521,8 +522,11 @@ force it into word SSIM reranking.
 |------|------|-----------------|
 | CLI args & flags | `src/cli.rs` | `struct Args` |
 | Pipeline orchestration | `src/main.rs` | `fn run()` |
+| SSIM fast path | `src/main.rs` | Parallel font matching section |
+| Pass 1.5 paragraph grouping | `src/main.rs` | Paragraph-level font grouping section |
 | Audit data structures | `src/audit.rs` | `AuditEntry`, `CharCiVote`, `WordAudit` |
 | OCR + post-processing | `src/ocr.rs` | `extract_text_regions()`, `assemble_lines()`, `merge_overlapping_lines()`, `clip_word_overlaps()`, `drop_outlier_words()`, `expand_words_to_ink()` |
+| Font-metric word splitting | `src/ocr.rs` | `split_wide_whitespace_words()` |
 | Character extraction | `src/char_index.rs` | `extract_line_chars()` |
 | Segmentation algorithm | `src/segment.rs` | `segment_characters_inner()` |
 | Valley-finding (VP) | `src/segment.rs` | `best_low_ink_valley()` |
@@ -531,7 +535,10 @@ force it into word SSIM reranking.
 | Boundary→crop extraction | `src/char_index.rs` | `extract_chars_from_boundaries()` |
 | CI search + scoring | `src/char_index.rs` | `search_candidates()` |
 | Feature computation | `src/char_index.rs` | `compute_features()` |
-| Word SSIM reranking | `src/word_match.rs` | `word_level_rerank()` |
+| Font-metric gap functions | `src/char_index.rs` | `font_ink_width()`, `font_pair_ink_gap()` |
+| Font cache (shared LRU) | `src/font_cache.rs` | `FontCache` |
+| SSIM verification | `src/verify.rs` | `verify_text_region()` |
+| Word SSIM reranking (disabled) | `src/word_match.rs` | `word_level_rerank()` |
 | Segmentation diag overlay | `src/seg_diag.rs` | `save_split_overlay()` |
 | Span-level accuracy | `tools/verify-accuracy.py` | — |
 | Line-level miss report | `tools/char-misses.py` | — |

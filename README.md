@@ -15,26 +15,36 @@ dramatic file-size reduction and quality improvement while maintaining
 ## How it works
 
 1. **OCR** — Tesseract extracts word-level bounding boxes and confidence scores.
-2. **Font matching** — each word is segmented into individual character crops
-   (VP split + seam carving DP — see [`SEGMENTATION.md`](SEGMENTATION.md)),
-   then each crop is converted to a 99-dimensional feature vector
-   (see [`FEATURES.md`](FEATURES.md)). Per-character nearest-neighbor
-   search against a pre-built character index produces a ranked candidate list
-   (the CI — Character Index). The top CI candidates are reranked using
-   word-level SSIM: each candidate font renders the word, and SSIM against
-   the scan crop picks the best visual match. OpenType feature variants
-   (old-style figures, small caps, stylistic sets, etc.) are matched as
-   separate candidates — the SSIM comparison naturally picks the correct
-   variant without heuristics. Common Latin ligatures (ff, fi, fl, ffi, ffl)
-   are handled via dual-path segmentation: plain OCR characters vs.
-   ligature-collapsed characters, with the higher-scoring path winning.
+2. **Font matching** — each line's words are segmented into individual
+   character crops (VP split + seam carving DP — see
+   [`SEGMENTATION.md`](SEGMENTATION.md)), then each crop is converted to a
+   99-dimensional feature vector (see [`FEATURES.md`](FEATURES.md)).
+   Per-character nearest-neighbor search against a pre-built character index
+   produces a ranked candidate list (the CI — Character Index). The CI #1
+   candidate wins directly — there is no word-level SSIM reranking stage.
+   OpenType feature variants (old-style figures, small caps, stylistic sets,
+   etc.) are matched as separate candidates and scored in the CI like any
+   other font entry. Common Latin ligatures (ff, fi, fl, ffi, ffl) are handled
+   via dual-path segmentation: plain OCR characters vs. ligature-collapsed
+   characters, with the higher-scoring path winning.
+
+   **SSIM fast path:** Most documents use one dominant font. A parallel SSIM
+   fast path exploits this: the dominant font from the previous page is tried
+   on every line via SSIM rendering comparison (threshold ≥ 0.90) before
+   running the full CI pipeline. Lines that pass skip segmentation and CI
+   entirely.  All lines run in parallel via `rayon::par_iter` — the fast-path
+   check is the first thing each thread does, falling through to full CI on
+   miss. After each page, the dominant font candidate is updated by tallying
+   the most common matched font across all lines.
 3. **Decision matrix** — OCR confidence and font-match score are checked
    against user-configurable thresholds (`--min-ocr-confidence`,
    `--min-font-confidence`). Lines passing both thresholds are vectorised;
    all others keep the original raster.
 4. **SSIM verification** — vector text is rendered back to raster and compared
    with the original region (ink-cropped to actual glyph extent). If
-   SSIM < 0.3, the region reverts to raster.
+   SSIM < 0.3 (`MIN_VERIFY_SSIM`), the region reverts to raster. This is
+   distinct from the fast-path SSIM gate (0.90) — the verify gate is
+   intentionally loose to catch only catastrophic mismatches.
 5. **Geometry vectorisation** — horizontal/vertical lines, solid-colour fills,
    and rectangles are replaced with native PDF paths.
 6. **PDF generation** — vector text + vector geometry + lossless raster fragments,
@@ -268,6 +278,7 @@ Tests live in the `tests/` directory:
 | `t10_char_index_roundtrip.rs` | Character index build + query roundtrip |
 | `t20_distance_analysis.rs` | Feature-space distance analysis |
 | `t30_regression_ssim.rs` | SSIM regression checks |
+| `t40_mixed_font_underline.rs` | Mixed-font (intra-line italic/bold) regression test |
 | `t40_bodoni_sentence.rs` | Single-font smoke test (Libre Bodoni 400) |
 | `t40_ligature.sh` | 21 ligature lines (3 fonts × with/without ligatures), asserts 21/21 hits |
 | `t50_output_quality.rs` | Output PDF quality validation |

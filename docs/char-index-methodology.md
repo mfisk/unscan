@@ -1,7 +1,7 @@
 # Per-Character Font Index — Methodology & Assessment
 
 **Module:** `src/char_index.rs`  
-**Purpose:** Fast pre-filter to narrow 5,048 candidate fonts to ~50 before expensive SSIM reranking.  
+**Purpose:** Font identification — determines the font for each text line via per-character feature matching.  
 **Date:** 2026-05-10
 
 ---
@@ -10,18 +10,21 @@
 
 The existing font-matching pipeline in `font_match.rs` runs a multi-signal coarse scorer (IoU, NCC, Hu moments, fill ratio) against every font for every OCR line, then SSIM-reranks the top 30. At 5,048 fonts × ~94 lines per page, this is the dominant cost — roughly 7 minutes per page.
 
-The char index is a **pre-filter stage** that slots in before the coarse scorer:
+The char index is a **font identification stage** that directly produces
+the winning font for each line:
 
 ```
 OCR line
-  → extract characters from longest words (char_index.rs)
-  → match against pre-built per-char index → top 50 fonts
-  → coarse score those 50 (font_match.rs)
-  → SSIM rerank top 30 of those (verify.rs)
+  → SSIM fast path (try dominant font from previous page, threshold ≥ 0.90)
+  → On miss: extract characters from longest words (char_index.rs)
+  → match against pre-built per-char index → CI #1 wins directly
+  → SSIM verification gate (MIN_VERIFY_SSIM = 0.3)
   → best match
 ```
 
-The goal is to reduce the coarse scoring from 5,048 candidates to ~50, cutting per-line matching time by ~100×.
+There is no separate word-level SSIM reranking stage. The CI #1 candidate
+wins directly. SSIM serves only as a final verification gate (0.3 threshold)
+to reject catastrophic mismatches.
 
 ---
 
@@ -91,10 +94,12 @@ See `FEATURES.md` for the complete layout. Summary:
 | Row ink profile | 32 | 0.30 | Vertical ink distribution (ascender/x-height/baseline/descender) |
 | Scalar v3 | 10 | 0.20 | Holes, symmetry, skeleton topology, corners, quadrant density |
 
+Weights were tuned via Fisher discriminant analysis over 353K index entries
+and 9K rasterized scan crops.
+
 Each group is independently L2-normalized to unit length, then scaled by its
 weight. This ensures no group dominates the distance computation purely through
-dimension count — a problem that plagued the original flat-vector design where
-the 32-bin profile contributed ~88% of the similarity score.
+dimension count.
 
 ---
 
@@ -160,7 +165,7 @@ Character crops are resized to `NORM_H` (48px) tall using Lanczos3 interpolation
 
 1. Extract character crops from the line's longest words
 2. Compute feature vectors for each crop
-3. For each font in the index, compute mean cosine similarity across all crop-character matches (only characters the font contains)
+3. For each font in the index, compute per-character squared Euclidean distances via brute-force nearest-neighbor search
 4. Return top N fonts by descending score
 
 ### Score aggregation
@@ -183,7 +188,7 @@ mechanism handles the common case where a font lacks ligature glyphs or
 obscure punctuation without unfairly punishing it.
 
 **Nearest-neighbor search:** Per-character lookup uses brute-force linear scan
-over the feature vectors. At 59+ dimensions, tree-based structures provide no
+over the feature vectors. At 99 dimensions, tree-based structures provide no
 pruning benefit, so flat linear scan is both simpler and faster (cache-friendly,
 LLVM auto-vectorizes the distance loop).
 
@@ -254,15 +259,15 @@ Uses glyph outline similarity (Bézier curve matching) rather than raster compar
 The per-character index is a **sound pre-filter architecture** with a **correct
 rendering/normalization pipeline** and a **rich 99-dimensional feature set**
 with proper per-group weighting. Brute-force linear scan provides efficient
-nearest-neighbor lookup at 59+ dimensions, and INDEX_VERSION guards against
+nearest-neighbor lookup at 99 dimensions, and INDEX_VERSION guards against
 stale index files.
 
 The feature set reliably separates font *classes* (serif vs. sans, thin vs.
 bold, condensed vs. regular) and does a reasonable job within classes. It
 struggles to distinguish very similar fonts within the same family (Libre
-Baskerville vs. Libre Caslon vs. Noto Serif) — but that's acceptable because
-the word-level SSIM reranker handles fine discrimination. The CI just needs to
-not accidentally eliminate the correct font from its candidate list.
+Baskerville vs. Libre Caslon vs. Noto Serif) — but since the CI #1 candidate
+wins directly, these close misses are the primary accuracy ceiling.
 
-Current specimen accuracy: **85/94 lines (90.4%)** with dual-path ligature
-support on the 6-page, 30-font timeline specimen.
+Current specimen accuracy: **454/480 lines (94.6%)** with dual-path ligature
+support, parallel SSIM fast path, and font-metric word splitting on the
+6-page, 30-font timeline specimen (t60 AA @ 300 DPI).

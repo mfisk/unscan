@@ -20,7 +20,12 @@ the OCR bounding-box width.
 3. Compute `em_px = 100 × (target_width / advance_at_100)`.
 4. Clamp to `[4, 500]`.
 
-This is used in two places via the shared `layout.rs`:
+**Note (June 2026 update):** The word-level SSIM reranking described in this
+document (`word_match.rs`) has been removed from the pipeline. The CI #1
+candidate now wins directly, and the only SSIM stage is the verification gate
+(Pass 2, threshold 0.3) plus the fast-path dominant-font check (threshold 0.90).
+References to "SSIM reranking" below are historical. The font-size determination
+now uses height-matching for both SSIM verification and PDF output.
 
 - **SSIM renderer** (`verify.rs → render_words_height_scaled`) — per-word: each
   word's advance is forced to equal its OCR bbox width.
@@ -109,9 +114,17 @@ meaning the ink extends above and below the canvas.  Pixels outside the canvas
 are clipped.
 
 **B) Vertical shift search (`verify.rs`):**
-`ssim_windowed_best_vshift(scan_crop, rendered, 6)` tries 13 shifts
-(dy = -6..+6 px).  For each, the rendered image is physically shifted on a white
-canvas and SSIM is computed.  Returns `(best_ssim, best_dy)`.
+`ssim_windowed_best_vshift(scan_crop, rendered, 12)` tries 25 shifts
+(dy = -12..+12 px), searched center-outward (0, -1, 1, -2, 2, …).  For each,
+the rendered image is offset by `dy` (via coordinate arithmetic in the SSIM
+kernel, not by creating shifted copies) and SSIM is computed.  Early exit at
+SSIM ≥ 0.92.  Returns `(best_ssim, best_dy)`.
+
+An optional `bail_below: Option<f32>` parameter is threaded through from
+`verify_text_region()` to `ssim_windowed()`. When set (e.g., by the fast-path
+SSIM check), the SSIM computation bails early if the running average drops
+below the threshold after processing ≥8 windows per row — avoiding full
+evaluation of obviously bad matches.
 
 **C) PDF output (`pdf_out.rs`):**
 `layout::ink_centered_baseline_pt(font, em_px, bbox_h_px, dpi)` converts the
@@ -147,13 +160,14 @@ practice:
   has a bbox that extends below the baseline.  Here `ink_h ≈ bbox_h` and
   centering works acceptably.
 
-The vertical shift search (±6 px) compensates partially.  If the centering is
+The vertical shift search (±12 px) compensates partially.  If the centering is
 off by 3–4 pixels, the shift search finds the optimal offset and returns it as
 `best_dy`.  But:
 
-1. The search range is limited to ±6 px.  At 300 DPI, 6 px = 0.5 pt.  For
+1. The search range is limited to ±12 px.  At 300 DPI, 12 px = 1.0 pt.  For
    large title text (~12–18 pt), the misalignment from ink-centering on an
-   all-caps line can be 8–10 px, exceeding the search range.
+   all-caps line can be 8–10 px, which is within range but leaves little
+   margin.
 
 2. The `best_dy` is per-line, but the ink-centering error depends on the
    *character content* of the line (descenders present or not).  A uniform
@@ -185,12 +199,20 @@ This would eliminate the systematic shift on all-caps or no-descender lines.
 
 **Is the vertical shift search efficient?**
 
-It is brute-force: 13 full SSIM evaluations.  Each SSIM evaluation walks every
+It is brute-force: up to 25 shifts (center-outward with early exit at ≥ 0.92).
+Each SSIM evaluation walks every
 ink-containing 11×11 window at step 4.  For a typical line of 400×30 pixels,
-that's ~75 windows per SSIM call, so 13 × 75 = ~975 window evaluations.  At
+that's ~75 windows per SSIM call, so up to 25 × 75 = ~1,875 window evaluations
+(typically fewer due to early exit).  At
 the cost of ~242 multiply-adds per window (11×11×2 passes), this is about
-236K floating-point operations per line.  Negligible compared to the 5048-font
-scan.
+~450K floating-point operations per line in the worst case.  Negligible compared
+to the font index scan.
+
+The `bail_below` parameter further speeds this up: when the SSIM running average
+drops below the threshold after processing ≥8 windows per row, the evaluation
+returns early without processing remaining rows. This is particularly useful for
+the fast-path check, where most non-matching fonts bail within the first few
+rows.
 
 But a **phase-correlation** approach could find the optimal shift in a single
 pass: compute the cross-power spectrum of the two images, take the inverse FFT,
@@ -344,7 +366,7 @@ stage gets its values:
 |---|---|---|---|
 | Width-matched em | `layout::width_matched_em_px` | `layout::width_matched_em_px` (or `smoothed_em_px`) | ✅ |
 | Baseline (ink-centered) | `layout::ink_centered_baseline_px` | `layout::ink_centered_baseline_pt` | ✅ (same formula, different units) |
-| Vertical shift | `ssim_windowed_best_vshift → best_dy` | Applied as `dy_pt` | ✅ (carried via `FontMatchResult`) |
+| Vertical shift | `ssim_windowed_best_vshift → best_dy` (±12 px, center-outward, early exit at ≥ 0.92) | Applied as `dy_pt` | ✅ (carried via `FontMatchResult`) |
 | Horizontal position | `word.x_off` (relative) | `word.x` (absolute) | ❌ (different coordinate systems, correct in each context) |
 | Deskew | Applied to scan crop before SSIM | Not applied to PDF output | ❌ |
 
@@ -372,12 +394,12 @@ to re-verify), the font might not be loaded in the same context.
    baseline position from character content (descenders present → baseline is
    higher; all-caps → baseline at bottom of bbox).  Align the candidate's
    `font.ascent()` to the estimated baseline.  This eliminates the systematic
-   vertical shift on title / all-caps lines that the current ±6 px brute-force
+   vertical shift on title / all-caps lines that the current ±12 px brute-force
    search struggles to compensate.
 
-2. **Increase shift search range to ±12 px** as a stopgap until #1 is
-   implemented.  At 300 DPI, title text at 18 pt has ~75 px ink height.  A
-   half-descent offset of 10 px is plausible, and the current ±6 px misses it.
+2. ~~**Increase shift search range to ±12 px**~~ — **Done.** The shift range
+   was increased from ±6 to ±12 px and center-outward search with early exit
+   at SSIM ≥ 0.92 was added.
 
 3. **Uniform em for SSIM render.**  After computing per-word `em_px`, take the
    median across the line and use it for all words in the SSIM rendering pass.

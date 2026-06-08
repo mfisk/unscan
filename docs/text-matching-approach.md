@@ -8,48 +8,215 @@ How unscan identifies fonts and places vector text to match the original scan.
 Scanned PDF
   → Rasterize page (pdftoppm at configured DPI)
   → OCR (Tesseract HOCR) → words with bounding boxes
-  → Char Index search → candidate fonts per character
-  → Word-level SSIM reranking → winning font per line
+  → Expand word bboxes to ink bounds
+  → Font-metric word splitting (split_wide_whitespace_words)
+  → Parallel font matching per line:
+      → SSIM fast path (dominant font candidate)
+      → Full pipeline on miss: char segmentation → CI search → font match
+  → Pass 1.5: Paragraph-level font grouping (dominant body font detection)
+  → SSIM verification (MIN_VERIFY_SSIM = 0.3)
   → PDF output → subsetted font + positioned words
 ```
 
-## 1. Character Index (High Recall, Low Precision)
+## 1. Character Index (CI) — Font Identification
 
 **File:** `src/char_index.rs`
 
-Each installed font (~4000+) is rendered at a reference size for ~70 printable characters. A 59-dimensional feature vector is extracted per glyph capturing stroke widths, serif presence, x-height ratio, stress angle, and other geometric properties.
+Each installed font (~5000+) is rendered at a reference size for ~106
+printable characters. A 99-dimensional feature vector is extracted per glyph
+(see [`FEATURES.md`](../FEATURES.md)). The index is serialized to
+`~/.cache/unscan/char-index.bin` (INDEX_VERSION = 8) and rebuilt
+automatically when feature computation changes.
 
-At query time, each OCR'd character's crop is feature-extracted and compared against the index via brute-force linear scan (flat `Vec` per character — at 59 dims, tree-based structures provide no pruning benefit). All fonts within `factor²` of the nearest distance are returned as candidates.
+At query time, each OCR'd character's crop is feature-extracted and compared
+against the index via brute-force linear scan (flat `Vec` per character — at
+99 dims, tree-based structures provide no pruning benefit). All fonts within
+`factor²` of the nearest distance are returned as candidates.
 
-**Role:** The char index is the *recall* stage — it must not miss the true font. It examines individual character shapes without considering letter spacing, word spacing, or kerning. This gives it high recall but low precision: many visually similar fonts pass through. Precision comes from word-level SSIM in the next stage.
+**Role:** The CI is the sole font identification stage. There is no separate
+word-level SSIM reranking step — the CI #1 candidate wins directly. The SSIM
+verification in Pass 2 is a *gate* (reject bad matches), not a *selector*
+(choose between candidates).
 
-**Always returns ≥1:** If the quorum gate drops all candidates, the single font with the lowest average distance is returned as a fallback. Downstream stages always have at least one candidate to work with — there is no "empty CI" path that triggers a full-catalog brute-force fallback.
+**Score aggregation:** Per-character distances are aggregated using a weighted
+geometric mean of log-distances. Characters are weighted by `char_weight()` —
+highly discriminative characters (ligatures at 2.0, structural letters at
+1.5) contribute more than simple/narrow ones (0.5).
 
-**Statistical cutoff (σ-based):** After scoring and sorting, candidates are pruned to the best score and any near-ties within `k·σ` of it (currently k=0.5). This adapts to each line's difficulty: when the score distribution is tight (many similar fonts, ambiguous), more candidates survive for word SSIM to sort out; when there's a clear winner (large gap to second place), only 1-2 candidates pass through. On the 6-page specimen this reduces CI output from ~4000 fonts to 1-17 per line, eliminating pathological 15-25s font_match calls while preserving accuracy.
+**Statistical cutoff (σ-based):** After scoring and sorting, candidates are
+pruned to the best score and any near-ties within `k·σ` of it (currently
+k=0.5). This adapts to each line's difficulty.
 
-## 2. Word-Level SSIM Reranking (Precision Filter)
+**Always returns ≥1:** If the quorum gate drops all candidates, the single
+font with the lowest average distance is returned as a fallback.
 
-**File:** `src/word_match.rs`
+**Dual-path ligature support:** Common Latin ligatures (ff, fi, fl, ffi, ffl)
+are handled via dual-path segmentation: plain OCR characters vs.
+ligature-collapsed characters, with the higher-scoring path winning.
 
-For each candidate font from the char index (capped at top 20 by CI score), the best 4 OCR words (longest first, ≥3 chars, confidence ≥50) are:
-1. Cropped from the scan image
-2. Rendered in the candidate font at the width-matched em size
-3. Both images are whitespace-trimmed (all 4 edges) and resized to match
-4. Compared via SSIM (structural similarity)
+## 2. SSIM Fast Path — Dominant Font Acceleration
 
-The font with the most word-level SSIM "wins" (majority vote across words). This is where close cousins (EB Garamond vs Libre Caslon, Bodoni vs SourceSerif4) get discriminated.
+**File:** `src/main.rs` (parallel font matching section)
 
-**Key design choices:**
-- `trim_whitespace()` trims all 4 edges of both crop and render to align ink regions. This was the single biggest accuracy improvement — words like "brown" jumped from 0.918 to 0.977 SSIM.
-- Render left-padding: glyphs with descenders extending left of origin (like 'j') get a first pass to find `min_px_x`, then all rendering is offset rightward. Fixed "jumps" from 0.745 to 0.963.
-- `MAX_RERANK_CANDIDATES = 50` to prevent font family flooding (e.g. SourceSerif4 has many OT variants that can swamp the top-k).
-- Font family dedup via `font_family_key()` collapses optical sizes / weight / style variants to one candidate per family.
+Most documents use one dominant font for body text. The SSIM fast path
+exploits this by trying a **candidate font** on every line via SSIM rendering
+comparison before running the expensive CI pipeline:
 
-## 3. Font Size Determination
+1. **Candidate selection:** The dominant font from the previous page (tallied
+   by font-key frequency after each page's font matching completes). For the
+   first page, no candidate exists — all lines go through full CI.
 
-**File:** `src/pdf_out.rs`, `src/layout.rs`
+2. **Parallel execution:** All lines run in `rayon::par_iter`. The candidate
+   font and its loaded font data are shared immutably across threads. Each
+   thread's first action is the fast-path check.
 
-Font size is determined from the OCR bounding box **height**, not width:
+3. **SSIM gate:** `verify_text_region()` renders the line in the candidate
+   font and computes SSIM against the scan. If SSIM ≥ 0.90
+   (`FAST_PATH_MIN_SSIM`), the line accepts the candidate — skipping
+   segmentation and CI entirely. The `bail_below` parameter is set to
+   `FAST_PATH_MIN_SSIM`, enabling early bail-out in `ssim_windowed()`:
+   after processing ≥8 windows per row, if the running average is below
+   the threshold, it returns immediately without evaluating the rest of
+   the image.
+
+4. **Fallthrough:** Lines that fail the fast path fall through to the full
+   pipeline (segmentation → CI search → font match) within the same
+   parallel thread.
+
+5. **Candidate update:** After each page, the dominant font is re-tallied
+   from all matched lines (fast-path hits + CI results). This candidate
+   propagates to the next page.
+
+**Why 0.90 and not lower?** The fast-path threshold is intentionally much
+higher than the final verification gate (`MIN_VERIFY_SSIM = 0.3`). At lower
+thresholds (tested: 0.55, 0.65, 0.75, 0.85), wrong-font matches slip
+through, causing accuracy regressions. At 0.90, accuracy is identical to the
+no-fast-path baseline (454/480 = 94.6% on the 30-font specimen).
+
+**Performance:** On a typical single-font document, 90%+ of lines hit the
+fast path, avoiding CI entirely. On the adversarial 30-font specimen (every
+section a different font), most lines miss — but the overhead is just one
+wasted SSIM call per line, which is cheap compared to full CI.
+
+## 3. Full CI Pipeline (per line, on fast-path miss)
+
+For each line that misses the fast path:
+
+1. **Character extraction:** Words are segmented into individual character
+   crops via VP split + seam carving DP (see [`SEGMENTATION.md`](../SEGMENTATION.md)).
+   Crops are normalized to NORM_H (48px) tall.
+
+2. **Feature computation:** Each crop is converted to a 99-dimensional
+   feature vector (see [`FEATURES.md`](../FEATURES.md)).
+
+3. **CI search:** Per-character nearest-neighbor search against the
+   pre-built index. Brute-force linear scan (~5000 fonts per character).
+
+4. **Score aggregation:** Weighted geometric mean across characters.
+   σ-based statistical cutoff prunes candidates.
+
+5. **OCR correction gate:** If the best match for a character is
+   catastrophically bad (d² > 0.5), all indexed characters are scanned
+   to check if Tesseract mis-identified the character. For moderate
+   distances (0.1–0.5), only confusable pairs are checked (O↔0, l↔1, etc.).
+
+6. **Result:** CI #1 wins directly. No word-level SSIM reranking.
+
+## 4. Pass 1.5: Paragraph-Level Font Grouping
+
+**File:** `src/main.rs`
+
+After all lines on a page are matched, the pipeline identifies the **dominant
+body font** — the most common font among matched lines at the most common
+font size (±1pt tolerance). This detects the body font for potential
+paragraph-level consistency enforcement.
+
+Currently, Pass 1.5 logs the dominant font but does not override individual
+line matches. The infrastructure exists for majority-vote font replacement
+but is not active.
+
+## 5. Font-Metric Word Splitting
+
+**File:** `src/ocr.rs` → `split_wide_whitespace_words()`
+
+Before font matching, Tesseract's word boundaries are refined using font
+metrics to detect over-merged words (Tesseract sometimes joins distinct words).
+
+**Algorithm:**
+
+1. **Font identification (once per line):** The longest word in the line is
+   segmented and CI-searched to identify the font. This result is shared
+   across all words in the line.
+
+2. **Per-character segmentation:** Each word is segmented into character
+   crops via VP + seam carving.
+
+3. **Ink gap measurement:** For each adjacent character pair, the zero-ink
+   gap between the rightmost ink of character i and the leftmost ink of
+   character i+1 is measured from the scan image.
+
+4. **Font-metric expected gap:** Using `ab_glyph`'s `outline_glyph()` and
+   `px_bounds()`, the pipeline derives a per-character rendering scale:
+   - Measure the observed ink width of character i
+   - Render the same character in the matched font at a reference scale (100px)
+   - Compute `font_ink_width()` via `outlined.px_bounds()` extents
+   - Derive the actual scale: `s = observed_ink / font_ink * reference_scale`
+   - Compute expected inter-glyph gap via `font_pair_ink_gap()`:
+     `gap = advance_a - ink_right_a + ink_left_b` at the derived scale
+
+5. **Split threshold:** `round(expected_gap) + 5` pixels. The +5 margin
+   absorbs anti-aliasing blur and scan noise. If the measured ink gap
+   exceeds this threshold, the word is split at that point.
+
+6. **Fallback:** If no font match is available, a fallback gap threshold of
+   18% of line height (minimum 4px) is used.
+
+## 6. SSIM Verification (Pass 2)
+
+**File:** `src/verify.rs`
+
+After font matching, each line that will be vectorized undergoes SSIM
+verification:
+
+1. The matched font renders the line's text via FreeType (thread-local
+   library instance) with rustybuzz shaping.
+
+2. Multi-scale rendering: the text is rendered at 2× and 4× resolution,
+   each downscaled and compared via windowed SSIM.
+
+3. Vertical shift search: ±12px offsets are tested, with early termination
+   at SSIM ≥ 0.92 and center-outward search order.
+
+4. `bail_below` parameter: `verify_text_region()` accepts an optional
+   `bail_below: Option<f32>`. When set, this is passed through to
+   `ssim_windowed()`, which bails early if the running SSIM average drops
+   below the threshold after ≥8 windows per row. The fast-path SSIM check
+   sets this to `FAST_PATH_MIN_SSIM` (0.90) so non-matching fonts are
+   rejected cheaply. The normal verification path passes `None` (no
+   early bail).
+
+5. If SSIM < 0.3 (`MIN_VERIFY_SSIM`), the line reverts to raster. This
+   threshold is intentionally loose — it catches only catastrophic
+   mismatches (wrong font entirely), not marginal ones.
+
+**Key distinction:** The verification gate (0.3) is much lower than the
+fast-path gate (0.90). The fast path must be confident because it's
+*accepting* a font without CI evidence. The verify gate only needs to reject
+disasters because CI already chose the best available font.
+
+## 7. Decision Matrix + Output
+
+For each line, the pipeline checks:
+- OCR confidence ≥ `--min-ocr-confidence` (default 0)
+- Font match score ≥ `--min-font-confidence` (default 0.10)
+- SSIM verification ≥ 0.3
+
+Lines passing all thresholds are vectorized; all others keep the original
+raster.
+
+## 8. Font Size Determination
+
+Font size is determined from the OCR bounding box **height**:
 
 ```
 em_px = bbox_height * reference_em / font_ink_height
@@ -57,52 +224,89 @@ em_px = bbox_height * reference_em / font_ink_height
 
 Where `font_ink_height = ascent - descent` at the reference em size.
 
-**Why height, not width:** Width-matching (`width_matched_em_px`) computes a font size that makes rendered text width equal the OCR bbox width. If the OCR bbox is even slightly tight or loose, this distorts natural letter spacing — characters get compressed or stretched. Height is more stable because OCR line heights are consistent and don't depend on word-level bbox precision.
+Height-matching is more stable than width-matching because OCR line heights
+are consistent and don't depend on word-level bbox precision.
 
-Width-matching is still used in word_match.rs for SSIM comparison (where matching the crop dimensions is the goal), but not for final PDF output sizing.
-
-## 4. PDF Text Placement
+## 9. PDF Text Placement
 
 **File:** `src/pdf_out.rs`
 
-Each word is placed at its OCR x-position with a uniform font size for the line:
+Each word is placed at its OCR x-position with a uniform font size for the
+line:
 
-- One `em_px` computed from line bbox height (shared by all words in the line)
-- One baseline computed via `ink_centered_baseline_pt()` (shared by all words)
+- One `em_px` computed from line bbox height
+- One baseline computed via `ink_centered_baseline_pt()`
 - Each word gets its own `BT/Tf/Td/Tj/ET` block at its OCR x-coordinate
-- No character spacing adjustments (Tc), no horizontal scaling — natural font metrics only
+- No character spacing adjustments (Tc), no horizontal scaling
+- Font is subsetted to only the glyphs used (via `subsetter` crate)
 
-The font is subsetted to contain only the glyphs actually used (via the `subsetter` crate), typically reducing a 50-200KB font to 2-5KB.
+## 10. Geometry Vectorization
 
-## 5. Raster Handling
+**File:** `src/geometry.rs`
+
+Horizontal/vertical lines, solid-color fills, and rectangles are detected
+and replaced with native PDF paths.
+
+## 11. Raster Handling
 
 **File:** `src/main.rs`, `src/color.rs`
 
-After vectorizing text, the corresponding regions are erased from the raster image (filled with background color). The remaining raster is split into fragments via a cell-based content detector:
+After vectorizing text, corresponding regions are erased from the raster.
+Remaining raster is split into fragments via cell-based content detection
+(100px cells classified as interesting/blank, flood-fill grouped). Fully
+blank pages produce zero raster fragments.
 
-- 100px cells are classified as interesting/blank via `region_has_content()`
-- Adjacent interesting cells are flood-fill grouped into fragments
-- Each fragment is independently embedded in the output PDF
-- Fully blank pages produce zero raster fragments (no wasted bytes)
+## 12. Audit Mode — Per-Character Distances
 
-Source image encoding is preserved where possible — JPEG passthrough avoids re-encoding when nothing was vectorized on a page.
+**File:** `src/main.rs`, `src/char_index.rs`
 
-## 6. What's NOT Done
+When `--audit` is enabled, the pipeline computes per-character feature-space
+distances between each line's character crops and both:
+- The **chosen font** (CI winner or fast-path hit)
+- All **fontmap fonts** (ground-truth fonts injected via `--include-fontmap`)
 
-- **No character spacing adjustment:** We don't set PDF Tc (character spacing) or Tz (horizontal scaling). The font's built-in metrics and kerning are trusted.
-- **No verify stage:** There was previously a second SSIM check (using FreeType) after font selection. This was redundant with word-level SSIM and used a different renderer (FreeType vs ab_glyph), causing inconsistent results. Removed.
-- **No ML classifier:** With ~4000 font classes and 1 training sample per class, nearest-neighbor is the right approach. A random forest module exists (`src/ml_forest.rs`) but is not integrated.
+To avoid redundant feature computation, crop features are precomputed once
+via `precompute_crop_features()`, which extracts and weights the 99-dim
+feature vector for each character crop. The precomputed vectors are then
+passed to `per_char_distances_precomputed()` for each font, which looks up
+the font's reference vector and computes squared Euclidean distance — no
+`compute_features()` call per font.
+
+This is critical for performance: the fontmap typically contains ~74 fonts,
+and a page can have ~480 character crops. Without precomputation, the audit
+would call `compute_features()` once per crop per font (~35,000 times per
+page). With precomputation, it's called once per crop (~480 times), and the
+per-font lookup is a simple vector distance.
+
+The original `per_char_distances()` function still exists for callers that
+have images rather than precomputed features — it internally calls
+`precompute_crop_features()` and delegates to the precomputed version.
 
 ## Design Principles
 
-1. **Fix inputs, not algorithms.** Every SSIM failure traced to bad inputs (illustration contamination, garbage OCR words, wrong crop geometry), not bad math.
-2. **High recall → high precision.** The char index is the recall stage — it looks at character shapes (no spacing info) and must never miss the true font, even at the cost of false positives. Word SSIM is the precision stage — it renders full words with natural spacing and compares pixel-level structure. No ungated fallback to the full font catalog; CI always returns ≥1 candidate.
-3. **Natural font metrics.** Don't distort spacing to match OCR bboxes. Place words at OCR positions, let the font's natural advance widths handle letter spacing.
-4. **Smaller outputs.** Font subsetting + blank raster elimination should produce outputs smaller than inputs for text-heavy pages.
+1. **CI #1 wins directly.** No word-level SSIM reranking — the character
+   index is the sole font selector. SSIM serves only as a verification gate.
+2. **Parallel everything.** All lines run in `par_iter` with the SSIM fast
+   path as a cheap speculative check before the expensive CI pipeline.
+3. **Fix inputs, not algorithms.** Every SSIM failure traces to bad inputs
+   (illustration contamination, garbage OCR, wrong crop geometry).
+4. **Natural font metrics.** Don't distort spacing to match OCR bboxes.
+5. **Smaller outputs.** Font subsetting + blank raster elimination.
+
+## What's NOT Done
+
+- **No word-level SSIM reranking.** The `word_match.rs` module exists but is
+  disabled. CI ranking is used directly.
+- **No ML classifier.** Nearest-neighbor on 99-dim feature vectors is the
+  approach. A random forest module exists but is not integrated.
+- **No paragraph font override.** Pass 1.5 detects the dominant font but
+  does not override individual line matches.
 
 ## Known Weaknesses
 
-- **Baskerville vs EB Garamond**: Body text in Baskerville sections sometimes matches EB Garamond. These are historically related faces with similar proportions. The char index doesn't separate them reliably enough for word SSIM to differentiate.
-- **Short fragments**: Single-word line wraps ("dogs.") match poorly — too little signal for SSIM voting.
-- **Small/watermark text**: Attribution lines and "Font:" labels at low point sizes get unreliable OCR, leading to poor matches.
-- **Paragraph regrouping**: Still uses a FreeType verify call to decide whether minority lines should switch to the majority font. This is the last remaining verify.rs dependency — could be replaced with word-match SSIM.
+- **Baskerville vs EB Garamond**: Body text in Baskerville sections sometimes
+  matches EB Garamond. These are historically related faces with similar
+  proportions.
+- **Short fragments**: Single-word lines match poorly — too little signal.
+- **Small/watermark text**: Attribution lines at low point sizes get unreliable
+  OCR.

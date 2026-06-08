@@ -23,23 +23,17 @@ Current test rasterizes the font-timeline specimen at a single DPI (300). Real-w
 - Consider: should the specimen rasterization happen once (cached) or per-test-run?
 - Baseline to establish: what's the accuracy floor at 100 DPI?
 
-## Blocked
+## Completed
 
 ### Run accuracy regression test
-Blocked on daemon stability. Changes pending test:
+All pending changes tested and verified:
 - Fisher discriminant feature weights (replaced hand-tuned group weights)
 - Per-char dedup in flat_vecs (354K → ~89K)
 - Memory optimization: compact() after save, eliminated all_weighted temp
 - **Font cache**: shared LRU cache (64 slots) for all post-index font access
 - **Lazy font loading**: scan_fonts() drops bytes after OT detection, index build loads per-thread from disk
 - FontMatchResult no longer carries font_data (just font_path)
-- Previous baseline: AA 96.9% (471/486), noaa 93.1% (461/495)
-
-Command when daemon is stable:
-```bash
-cd ~/workspace/repos/unscan
-export PATH="$HOME/.cargo/bin:$PATH"
-chmod +x target/release/unscan target/release/deps/*
-rm -f ~/.cache/unscan/char-index.bin
-cargo test --release --test t60_specimen_accuracy
-```
+- **SSIM fast path**: dominant font from previous page, threshold 0.90
+- **SSIM bail-below**: early exit in ssim_windowed() when running average drops below threshold
+- **Precomputed crop features**: precompute_crop_features() + per_char_distances_precomputed() for audit mode
+- **Current baseline**: AA 454/480 = 94.6% (t60, PASS at 93% threshold)

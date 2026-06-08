@@ -1,8 +1,27 @@
 # Unscan Performance Audit
 
-**Date:** 2025-07-13
+**Date:** 2025-07-13 (initial audit)  
+**Updated:** 2026-06-07  
+**Status:** Many items implemented. See `OPTIMIZATION-PLAN.md` for current status.
+
+**Current architecture (June 2026):**
+- Word-level SSIM reranking (`word_match.rs`) has been removed — CI #1 wins directly
+- `rayon::par_iter` on all lines with SSIM fast path (dominant font from previous page, threshold ≥ 0.90)
+- SSIM bail-below early exit: `ssim_windowed()` bails after ≥8 windows/row if running average < threshold
+- Precomputed crop features for audit: `precompute_crop_features()` + `per_char_distances_precomputed()` avoid redundant feature extraction when computing distances against multiple fonts
+- Font data no longer stored in FontEntry/FontMatchResult (lazy load via FontCache)
+- Thread-local FreeType library in `verify.rs`
+- OnceLock Gaussian kernel in `ssim.rs`
+- Shared flood-fill, merged pixel scans, Zhang-Suen LUT in `char_index.rs`
+- Font-metric word splitting via `outline_glyph().px_bounds()` in `ocr.rs`
+- Vertical shift search ±12 px with center-outward order and early exit at SSIM ≥ 0.92
+
+Most of the H1–H4 items and several M/L items are resolved. The remaining
+bottleneck is CI search time (~8s cumulative per page on the 30-font specimen).
+
 **Codebase:** ~8,866 LOC across 18 `.rs` files
-**Baseline:** ~3 min for 89-line specimen PDF, ~1-2 min for 33-line Berkeley PDF
+**Baseline (pre-optimization):** ~3 min for 89-line specimen PDF
+**Current (post-optimization):** ~10-15s per page for font matching (parallel CI)
 
 ---
 
@@ -68,6 +87,13 @@ At NORM_H=48 and typical word widths of 80-200 px, each render+process cycle tou
 **Estimated speedup: 20-40% if font parsing cached + morph_open simplified + source-side computation hoisted.**
 
 ### H3. SSIM reranking: 30 candidates × 25 vertical shifts × windowed SSIM
+
+**Status (June 2026):** Word-level SSIM reranking is no longer active — CI #1
+wins directly. The only SSIM evaluations are: (1) the fast-path dominant-font
+check (one call per line, with `bail_below` for early exit), and (2) the
+verification gate (one call for the CI winner). The offset-based vertical
+shift, center-outward search, and early exit at ≥ 0.92 are all implemented
+in the remaining SSIM path. The analysis below is historical.
 
 **File:** `src/verify.rs` function `ssim_windowed_best_vshift()`
 
@@ -136,6 +162,10 @@ Later in `main.rs`, `font_data` is cloned again into `majority_data` for paragra
 **Fix:** Use `Arc<Vec<u8>>` or `&[u8]` references instead of cloning raw bytes. The font data already lives in `FontEntry.data` for the lifetime of the processing.
 
 ### M2. Redundant SSIM verification in main.rs
+
+**Status (June 2026):** Resolved. Word-level SSIM reranking was removed
+entirely — CI #1 wins directly. The only SSIM calls remaining are the
+fast-path dominant-font check and the single verification gate.
 
 **File:** `src/main.rs` lines 468-490
 
