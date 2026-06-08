@@ -151,6 +151,11 @@ fn strip_subset_prefix(name: &str) -> &str {
     if let Some(pos) = name.find('+') { &name[pos + 1..] } else { name }
 }
 
+/// Strip subset prefix, returning an owned String.
+pub fn strip_subset_prefix_str(name: &str) -> String {
+    strip_subset_prefix(name).to_string()
+}
+
 /// Check whether two font names refer to the same font family.
 /// Handles subset prefixes, weight/style suffixes, and metric-compatible clones.
 pub fn fonts_match(matched: &str, actual: &str) -> bool {

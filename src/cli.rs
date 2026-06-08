@@ -94,6 +94,12 @@ pub struct Args {
     #[arg(long, default_value_t = 1.0)]
     pub thoroughness: f32,
 
+    /// Process only the given pages (1-indexed, comma-separated, ranges ok).
+    /// Examples: --pages 3  --pages 1,3,5  --pages 2-4,7
+    /// Omit to process all pages.
+    #[arg(long, value_name = "PAGES")]
+    pub pages: Option<String>,
+
     /// Vector PDF for ground-truth comparison.  When set alongside --audit,
     /// only miss lines get full audit detail (crop PNGs, GT font per-char
     /// distances, font ref glyphs).  Hit lines are logged with minimal data.
@@ -167,4 +173,39 @@ impl Args {
 
 pub fn parse() -> Args {
     Args::parse()
+}
+
+/// Parse a page specification string into a set of 1-indexed page numbers.
+/// Accepts comma-separated values and ranges: "1,3,5" or "2-4,7" or "3".
+pub fn parse_pages(spec: &str) -> Result<std::collections::HashSet<usize>, String> {
+    let mut set = std::collections::HashSet::new();
+    for part in spec.split(',') {
+        let part = part.trim();
+        if part.is_empty() {
+            continue;
+        }
+        if let Some((a, b)) = part.split_once('-') {
+            let start: usize = a.trim().parse().map_err(|_| format!("bad page number: {a}"))?;
+            let end: usize = b.trim().parse().map_err(|_| format!("bad page number: {b}"))?;
+            if start == 0 || end == 0 {
+                return Err("page numbers are 1-indexed".into());
+            }
+            if start > end {
+                return Err(format!("invalid range: {start}-{end}"));
+            }
+            for p in start..=end {
+                set.insert(p);
+            }
+        } else {
+            let p: usize = part.parse().map_err(|_| format!("bad page number: {part}"))?;
+            if p == 0 {
+                return Err("page numbers are 1-indexed".into());
+            }
+            set.insert(p);
+        }
+    }
+    if set.is_empty() {
+        return Err("empty page specification".into());
+    }
+    Ok(set)
 }

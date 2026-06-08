@@ -557,10 +557,39 @@ fn run(args: &cli::Args) -> Result<(), ScanTextError> {
         None
     };
 
+    // Parse --pages filter (1-indexed page numbers).
+    let page_filter: Option<std::collections::HashSet<usize>> = args
+        .pages
+        .as_deref()
+        .map(|spec| cli::parse_pages(spec).unwrap_or_else(|e| {
+            eprintln!("Error: {e}");
+            std::process::exit(1);
+        }));
+
     for (page_idx, page_img) in pages.iter().enumerate() {
+        let page_num = page_idx + 1; // 1-indexed
+
+        // Skip pages not in the --pages filter.
+        if let Some(ref filter) = page_filter {
+            if !filter.contains(&page_num) {
+                // Still need a placeholder for PDF output ordering.
+                all_pages.push(pdf_out::PageContent {
+                    width_px: 0,
+                    height_px: 0,
+                    dpi: args.dpi,
+                    text_regions: Vec::new(),
+                    raster_fragments: Vec::new(),
+                    lines: Vec::new(),
+                    fills: Vec::new(),
+                    bg_color: (255, 255, 255),
+                });
+                continue;
+            }
+        }
+
         info!(
             "━━━ Page {} ({} × {} px) ━━━",
-            page_idx + 1,
+            page_num,
             page_img.width(),
             page_img.height()
         );
@@ -685,6 +714,7 @@ fn run(args: &cli::Args) -> Result<(), ScanTextError> {
         let prof_fp_us = std::sync::atomic::AtomicU64::new(0);
         let prof_full_us = std::sync::atomic::AtomicU64::new(0);
         let line_matches: Vec<LineMatch> = lines.par_iter().enumerate().map(|(li, line)| {
+            let line_num = li + 1; // 1-indexed for output
             let line_start = std::time::Instant::now();
             // ── Fast path: try dominant font via SSIM ────────────────
             if let (Some(fm), Some(ref fd)) = (fast_path_candidate, &fast_path_font_data) {
@@ -729,7 +759,7 @@ fn run(args: &cli::Args) -> Result<(), ScanTextError> {
                         gt_font_char_dists: std::collections::HashMap::new(),
                     };
                 } else if li < 3 {
-                    eprintln!("    [fp-miss] L{} ssim={:.3} font={}", li, score, fm.font_key);
+                    eprintln!("    [fp-miss] L{} ssim={:.3} font={}", line_num, score, fm.font_key);
                 }
             }
 
@@ -741,7 +771,7 @@ fn run(args: &cli::Args) -> Result<(), ScanTextError> {
             };
             let debug_mem = std::env::var("UNSCAN_DEBUG_MEM").is_ok();
             if debug_mem {
-                eprintln!("  MEM line {} start: {} (\"{}\")", li, mem_info(), &line.text[..preview_end]);
+                eprintln!("  MEM line {} start: {} (\"{}\")", line_num, mem_info(), &line.text[..preview_end]);
             }
             // Dump total mapped size from /proc/self/maps
             if debug_mem && (li == 2 || li == 45) {
@@ -756,7 +786,7 @@ fn run(args: &cli::Args) -> Result<(), ScanTextError> {
                             }
                         }
                     }
-                    eprintln!("  MEM line {} maps total: {}MB, {} mappings", li, total / (1024*1024), maps.lines().count());
+                    eprintln!("  MEM line {} maps total: {}MB, {} mappings", line_num, total / (1024*1024), maps.lines().count());
                 }
             }
             let line_start = std::time::Instant::now();
@@ -780,7 +810,7 @@ fn run(args: &cli::Args) -> Result<(), ScanTextError> {
                 let line_slug: String = line.text.chars().take(30)
                     .map(|c| if c.is_alphanumeric() { c } else { '_' })
                     .collect();
-                let p = d.join(format!("p{}_L{:03}_{}", page_idx + 1, li, line_slug));
+                let p = d.join(format!("p{}_L{:03}_{}", page_num, line_num, line_slug));
                 let _ = std::fs::create_dir_all(&p);
                 p
             });
@@ -805,7 +835,7 @@ fn run(args: &cli::Args) -> Result<(), ScanTextError> {
             let char_crops = &line_crops.plain;
             if debug_mem {
                 eprintln!("  MEM line {} after segmentation: {} ({} plain crops, {} lig crops)",
-                    li, mem_info(), char_crops.len(),
+                    line_num, mem_info(), char_crops.len(),
                     line_crops.ligature.as_ref().map_or(0, |v| v.len()));
             }
 
@@ -863,7 +893,7 @@ fn run(args: &cli::Args) -> Result<(), ScanTextError> {
                 };
 
                 if debug_mem {
-                    eprintln!("  MEM line {} after CI search: {}{}", li, mem_info(),
+                    eprintln!("  MEM line {} after CI search: {}{}", line_num, mem_info(),
                         if let Some(ref w) = seg_winner { format!(" [seg: {}]", w) } else { String::new() });
                 }
 
@@ -898,7 +928,7 @@ fn run(args: &cli::Args) -> Result<(), ScanTextError> {
             };
             let line_elapsed = line_start.elapsed();
             if line_elapsed.as_millis() > 500 {
-                eprintln!("  LINE {}: {:.1}s '{:.30}…'", li, line_elapsed.as_secs_f32(),
+                eprintln!("  LINE {}: {:.1}s '{:.30}…'", line_num, line_elapsed.as_secs_f32(),
                     line.words.iter().map(|w| w.text.as_str()).collect::<Vec<_>>().join(" "));
             }
             // ── Ground-truth gated audit detail ─────────────────────────
@@ -920,7 +950,7 @@ fn run(args: &cli::Args) -> Result<(), ScanTextError> {
                         let bbox_px = [line.x as f32, line.y as f32,
                                        (line.x + line.width) as f32,
                                        (line.y + line.height) as f32];
-                        !gt.is_hit(page_idx + 1, &bbox_px, args.dpi, &fr.font_name)
+                        !gt.is_hit(page_num, &bbox_px, args.dpi, &fr.font_name)
                     }
                 } else {
                     true // no font matched → treat as miss
@@ -974,7 +1004,7 @@ fn run(args: &cli::Args) -> Result<(), ScanTextError> {
                     let bbox_px = [line.x as f32, line.y as f32,
                                    (line.x + line.width) as f32,
                                    (line.y + line.height) as f32];
-                    if let Some(gt_font_name) = gt.lookup_font(page_idx + 1, &bbox_px, args.dpi) {
+                    if let Some(gt_font_name) = gt.lookup_font(page_num, &bbox_px, args.dpi) {
                         // Inject GT font into ci_top_for_audit so it appears in audit output
                         let gt_key = font_catalog.iter()
                             .find(|fe| ground_truth::fonts_match(&fe.family_name, gt_font_name)
@@ -1162,6 +1192,7 @@ fn run(args: &cli::Args) -> Result<(), ScanTextError> {
         let verify_start = std::time::Instant::now();
         let mut verify_count = 0u32;
         for (li, line) in lines.iter().enumerate() {
+            let line_num = li + 1; // 1-indexed for output
             let lm = &line_matches[li];
             let text_color = lm.text_color;
             let font_result = &lm.font_result;
@@ -1254,8 +1285,8 @@ fn run(args: &cli::Args) -> Result<(), ScanTextError> {
                 let fname = font_result.as_ref().map(|f| f.font_name.as_str()).unwrap_or("?");
                 let fscore = font_result.as_ref().map(|f| f.score).unwrap_or(0.0);
                 let line_summary = serde_json::json!({
-                    "page": page_idx + 1,
-                    "line_index": li,
+                    "page": page_num,
+                    "line_index": line_num,
                     "text": &line.text,
                     "font_matched": fname,
                     "font_score": fscore,
@@ -1273,8 +1304,8 @@ fn run(args: &cli::Args) -> Result<(), ScanTextError> {
 
             // ── Audit entry ──────────────────────────────────────────
             audit_text.push(AuditEntry {
-                page: page_idx + 1,
-                line_index: li,
+                page: page_num,
+                line_index: line_num,
                 text: line.text.clone(),
                 ocr_confidence: line.confidence,
                 font_matched: font_result.as_ref().map(|f| f.font_name.clone()),
@@ -1420,7 +1451,7 @@ fn run(args: &cli::Args) -> Result<(), ScanTextError> {
 
             for l in &geo.lines {
                 audit_geo.push(GeometryEntry {
-                    page: page_idx + 1,
+                    page: page_num,
                     kind: "line",
                     bbox: BBox {
                         x: l.x1.min(l.x2),
@@ -1432,7 +1463,7 @@ fn run(args: &cli::Args) -> Result<(), ScanTextError> {
             }
             for f in &geo.fills {
                 audit_geo.push(GeometryEntry {
-                    page: page_idx + 1,
+                    page: page_num,
                     kind: "fill",
                     bbox: BBox { x: f.x, y: f.y, width: f.width, height: f.height },
                 });
@@ -1523,7 +1554,7 @@ fn run(args: &cli::Args) -> Result<(), ScanTextError> {
         }
 
         page_summaries.push(PageSummary {
-            page: page_idx + 1,
+            page: page_num,
             width_px: page_img.width(),
             height_px: page_img.height(),
             lines_vectorized: pg_vec,
