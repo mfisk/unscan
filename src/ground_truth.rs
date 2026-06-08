@@ -522,20 +522,6 @@ impl GroundTruth {
             }
         }
 
-        // Fallback: if no overlap, find nearest span by vertical center distance
-        if best_font.is_none() {
-            let cy = (py0 + py1) / 2.0;
-            let mut best_dist = f32::MAX;
-            for span in spans {
-                let span_cy = (span.bbox[1] + span.bbox[3]) / 2.0;
-                let dist = (cy - span_cy).abs();
-                if dist < best_dist && dist < (py1 - py0).max(5.0) {
-                    best_dist = dist;
-                    best_font = Some(&span.font_name);
-                }
-            }
-        }
-
         best_font
     }
 

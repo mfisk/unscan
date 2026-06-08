@@ -20,6 +20,7 @@ mod smooth;
 // mod word_match; // disabled: CI ranking used directly, word-level SSIM rerank removed
 pub(crate) mod verify;
 pub mod ground_truth;
+pub mod report;
 
 use crate::audit::{AuditEntry, AuditLog, BBox, Decision, GeometryEntry, PageSummary};
 
@@ -1617,6 +1618,21 @@ fn run(args: &cli::Args) -> Result<(), ScanTextError> {
             warn!("Failed to write audit log: {}", e);
         } else {
             info!("Audit log: {}", audit_path.display());
+        }
+    }
+
+    // ── 5b. HTML miss report ─────────────────────────────────────────
+    if let Some(ref audit_root) = args.audit {
+        let report_path = audit_root.join("report.html");
+        if let Err(e) = report::generate_report(
+            &report_path,
+            audit_root,
+            &audit.text_entries,
+            ground_truth.as_ref(),
+            args.dpi,
+            &font_catalog,
+        ) {
+            warn!("Failed to generate report: {}", e);
         }
     }
 

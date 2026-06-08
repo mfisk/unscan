@@ -104,7 +104,8 @@ pub struct Args {
     /// only miss lines get full audit detail (crop PNGs, fontmap per-char
     /// distances, font ref glyphs).  Hit lines are logged with minimal data.
     /// A "miss" includes font mismatches, no font match, OCR rejection, and
-    /// SSIM rejection.
+    /// SSIM rejection.  Also generates an HTML miss report in the audit
+    /// directory comparing unscan's font picks against ground truth.
     #[arg(long = "audit-vector", value_name = "FILE")]
     pub audit_vector: Option<std::path::PathBuf>,
 
