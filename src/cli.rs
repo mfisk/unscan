@@ -80,13 +80,6 @@ pub struct Args {
     #[arg(long)]
     pub compare: bool,
 
-    /// Include a font in CI candidate evaluation for every line, even if the
-    /// character index didn't rank it highly. Substring match against font name
-    /// (case-insensitive). Useful for diagnosing why a known-correct font
-    /// scores poorly in the audit.
-    #[arg(long, value_name = "NAME")]
-    pub include_font: Option<String>,
-
     /// Thoroughness factor for font matching. Default 1.0.
     /// Higher values relax all CI thresholds (quorum, quality gate, search
     /// radius) so more candidate fonts survive to evaluation.

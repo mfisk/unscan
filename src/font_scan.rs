@@ -39,6 +39,10 @@ pub enum FontClass {
 pub struct FontEntry {
     pub path: PathBuf,
     pub family_name: String,
+    /// PostScript name (name ID 6) read from the font's name table.
+    /// This is the exact string that appears as BaseFont in PDF dictionaries,
+    /// so GT comparison can use direct equality instead of heuristics.
+    pub postscript_name: String,
     pub is_bold: bool,
     #[allow(dead_code)]
     pub is_italic: bool,
@@ -166,6 +170,7 @@ pub fn scan_fonts(dirs: &[PathBuf]) -> Vec<FontEntry> {
                     let var_entry = FontEntry {
                         path: fe.path.clone(),
                         family_name: format!("{} [{}]", fe.family_name, tag),
+                        postscript_name: fe.postscript_name.clone(),
                         is_bold: fe.is_bold,
                         is_italic: fe.is_italic,
                         class: fe.class,
@@ -624,6 +629,26 @@ fn detect_ligature_glyphs(data: &[u8]) -> Vec<(char, u16)> {
     result
 }
 
+/// Read the PostScript name (name ID 6) from the font's name table.
+/// Returns empty string if unavailable.
+fn read_postscript_name(data: &[u8]) -> String {
+    use rustybuzz::ttf_parser;
+    let face = match ttf_parser::Face::parse(data, 0) {
+        Ok(f) => f,
+        Err(_) => return String::new(),
+    };
+    // name ID 6 = PostScript name. Prefer platformID 3 (Windows) / encodingID 1 (Unicode BMP),
+    // fall back to platformID 1 (Macintosh) / encodingID 0 (Roman).
+    for name in face.names() {
+        if name.name_id == 6 {
+            if let Some(s) = name.to_string() {
+                return s;
+            }
+        }
+    }
+    String::new()
+}
+
 fn load_font_entry(path: &Path, aliases: &HashMap<String, Alias>) -> Option<FontEntry> {
     let data = std::fs::read(path).ok()?;
 
@@ -631,6 +656,7 @@ fn load_font_entry(path: &Path, aliases: &HashMap<String, Alias>) -> Option<Font
     let _ = ab_glyph::FontRef::try_from_slice(&data).ok()?;
 
     let oldstyle_figures = detect_oldstyle_figures(&data);
+    let postscript_name = read_postscript_name(&data);
 
     let stem = path
         .file_stem()
@@ -645,6 +671,7 @@ fn load_font_entry(path: &Path, aliases: &HashMap<String, Alias>) -> Option<Font
         return Some(FontEntry {
             path: path.to_path_buf(),
             family_name: alias.family.to_string(),
+            postscript_name,
             is_bold: alias.bold,
             is_italic: alias.italic,
             class,
@@ -665,6 +692,7 @@ fn load_font_entry(path: &Path, aliases: &HashMap<String, Alias>) -> Option<Font
     Some(FontEntry {
         path: path.to_path_buf(),
         family_name,
+        postscript_name,
         is_bold,
         is_italic,
         class,

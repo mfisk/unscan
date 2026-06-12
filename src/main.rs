@@ -681,9 +681,9 @@ fn run(args: &cli::Args) -> Result<(), ScanTextError> {
         struct LineMatch {
             font_result: Option<font_match::FontMatchResult>,
             text_color: (u8, u8, u8),
-            ci_top_for_audit: Vec<(String, f32)>,
+            ci_top_for_audit: Vec<(String, Option<f32>)>,
             ci_char_detail: Vec<char_index::CharCiDetail>,
-            ci_top_for_audit_lig: Vec<(String, f32)>,
+            ci_top_for_audit_lig: Vec<(String, Option<f32>)>,
             ci_char_detail_lig: Vec<char_index::CharCiDetail>,
             seg_winner: Option<String>,
             diag_seg_dir: Option<std::path::PathBuf>,
@@ -691,6 +691,8 @@ fn run(args: &cli::Args) -> Result<(), ScanTextError> {
             chosen_char_dists: std::collections::HashMap<usize, f32>,
             /// Per-char distances to the ground-truth font (audit-vector mode), keyed by crop_index.
             gt_font_char_dists: std::collections::HashMap<usize, f32>,
+            /// CI tie-break candidates with per-candidate SSIM scores.
+            tie_candidates: Vec<audit::TieCandidate>,
         }
 
         let fontmatch_start = std::time::Instant::now();
@@ -757,6 +759,7 @@ fn run(args: &cli::Args) -> Result<(), ScanTextError> {
                         diag_seg_dir: None,
                         chosen_char_dists: std::collections::HashMap::new(),
                         gt_font_char_dists: std::collections::HashMap::new(),
+                        tie_candidates: Vec::new(),
                     };
                 } else if li < 3 {
                     eprintln!("    [fp-miss] L{} ssim={:.3} font={}", line_num, score, fm.font_key);
@@ -801,9 +804,9 @@ fn run(args: &cli::Args) -> Result<(), ScanTextError> {
                     level: 5, block_num: 0, par_num: 0, line_num: 0, word_num: 0,
                 },
             );
-            let mut ci_top_for_audit: Vec<(String, f32)>;
+            let mut ci_top_for_audit: Vec<(String, Option<f32>)>;
             let ci_char_detail: Vec<char_index::CharCiDetail>;
-            let ci_top_for_audit_lig: Vec<(String, f32)>;
+            let ci_top_for_audit_lig: Vec<(String, Option<f32>)>;
             let ci_char_detail_lig: Vec<char_index::CharCiDetail>;
             let seg_winner: Option<String>;
             let diag_seg_dir: Option<std::path::PathBuf> = args.diag_seg_dir().map(|d| {
@@ -839,7 +842,7 @@ fn run(args: &cli::Args) -> Result<(), ScanTextError> {
                     line_crops.ligature.as_ref().map_or(0, |v| v.len()));
             }
 
-            let font_result = {
+            let (font_result, tie_candidates_audit) = {
 
                 // Crop PNGs are saved after font matching, gated by ground-truth
                 // miss detection when --audit-vector is set (see below).
@@ -868,18 +871,18 @@ fn run(args: &cli::Args) -> Result<(), ScanTextError> {
 
                 // Store both paths for audit
                 ci_top_for_audit = ci_result.scores.iter()
-                    .map(|(name, score)| (name.clone(), *score)).collect();
+                    .map(|(name, score)| (name.clone(), Some(*score))).collect();
                 ci_char_detail = ci_result.char_detail.clone();
 
                 // Store the alternate path for audit
                 let (ci_top_lig_audit, ci_char_lig_audit) = if let Some(ref lig_result) = ci_result_lig {
-                    (lig_result.scores.iter().map(|(n, s)| (n.clone(), *s)).collect(),
+                    (lig_result.scores.iter().map(|(n, s)| (n.clone(), Some(*s))).collect(),
                      lig_result.char_detail.clone())
                 } else {
                     (Vec::new(), Vec::new())
                 };
                 let (ci_top_plain_audit, ci_char_plain_audit) = (
-                    ci_result_plain.scores.iter().map(|(n, s)| (n.clone(), *s)).collect::<Vec<_>>(),
+                    ci_result_plain.scores.iter().map(|(n, s)| (n.clone(), Some(*s))).collect::<Vec<_>>(),
                     ci_result_plain.char_detail.clone(),
                 );
 
@@ -899,31 +902,86 @@ fn run(args: &cli::Args) -> Result<(), ScanTextError> {
 
                 // Crop PNGs saved after font matching (see below).
 
-                // --include-font: inject into CI audit list so it shows in audit
-                if let Some(ref include) = args.include_font {
-                    let include_lc = include.to_lowercase();
-                    for fe in &font_catalog {
-                        let key = fe.font_key();
-                        if key.to_lowercase().contains(&include_lc) && !ci_top_for_audit.iter().any(|(n, _)| n == &key) {
-                            ci_top_for_audit.push((key, -999.0)); // sentinel score = included
-                        }
-                    }
-                }
+                // ── Font selection: CI #1, with SSIM tie-break ───────
+                let mut tie_candidates_audit: Vec<audit::TieCandidate> = Vec::new();
+                if let Some((_top_key, top_score)) = ci_result.scores.first() {
+                    // Collect all candidates that share the top CI score
+                    let tied: Vec<&(String, f32)> = ci_result.scores.iter()
+                        .take_while(|(_, s)| *s == *top_score)
+                        .collect();
 
-                // ── Font selection: use CI #1 directly ───────────────
-                if let Some((top_key, top_score)) = ci_result.scores.first() {
-                    font_catalog.iter().find(|fe| fe.font_key() == *top_key)
-                        .map(|fe| font_match::FontMatchResult {
-                            font_name: fe.family_name.clone(),
-                            font_path: fe.path.clone(),
-                            font_key: fe.font_key(),
-                            variant_tag: fe.variant_tag.clone(),
-                            glyph_overrides: fe.glyph_overrides.clone(),
-                            score: *top_score,
-                            best_dy: 0,
-                        })
+                    if tied.len() >= 2 {
+                        // Multiple candidates tied — SSIM decides
+                        let mut best: Option<(font_match::FontMatchResult, f32)> = None;
+                        let mut log_parts: Vec<String> = Vec::new();
+                        let mut tie_ssim_results: Vec<(String, String, f32)> = Vec::new();
+                        for (ti, (key, _)) in tied.iter().enumerate() {
+                            let fe = match font_catalog.iter().find(|fe| fe.font_key() == *key) {
+                                Some(fe) => fe,
+                                None => continue,
+                            };
+                            let fd = match font_cache.load(&fe.path).ok() {
+                                Some(fd) => fd,
+                                None => continue,
+                            };
+                            // Save per-candidate SSIM images when audit dir exists
+                            let tie_audit_dir = diag_seg_dir.as_ref().map(|d| {
+                                let p = d.join(format!("tie_{}", ti));
+                                let _ = std::fs::create_dir_all(&p);
+                                p
+                            });
+                            let (ssim, dy) = verify::verify_text_region(
+                                &gray_page, &fd, &line.text,
+                                line.x, line.y, line.width, line.height,
+                                &line.words,
+                                fe.glyph_overrides.as_deref(), &fe.variant_tag,
+                                tie_audit_dir.as_deref(), None,
+                            );
+                            log_parts.push(format!("{:.4}({})", ssim, fe.family_name));
+                            tie_ssim_results.push((fe.font_key(), fe.family_name.clone(), ssim));
+                            if best.as_ref().map_or(true, |(_, bs)| ssim > *bs) {
+                                best = Some((font_match::FontMatchResult {
+                                    font_name: fe.family_name.clone(),
+                                    font_path: fe.path.clone(),
+                                    font_key: fe.font_key(),
+                                    variant_tag: fe.variant_tag.clone(),
+                                    glyph_overrides: fe.glyph_overrides.clone(),
+                                    score: *top_score,
+                                    best_dy: dy,
+                                }, ssim));
+                            }
+                        }
+                        // Build tie_candidates for audit
+                        let winner_key = best.as_ref().map(|(fm, _)| fm.font_key.clone());
+                        for (fk, fname, ssim) in tie_ssim_results {
+                            tie_candidates_audit.push(audit::TieCandidate {
+                                font_key: fk.clone(),
+                                family_name: fname,
+                                ssim_score: ssim,
+                                winner: Some(&fk) == winner_key.as_ref(),
+                            });
+                        }
+                        if let Some((ref winner, _)) = best {
+                            eprintln!("    [tie-break] CI={:.4}, {} tied, ssim: {} → {}",
+                                top_score, tied.len(), log_parts.join(" "), winner.font_name);
+                        }
+                        (best.map(|(fm, _)| fm), tie_candidates_audit)
+                    } else {
+                        // No tie — use CI #1 directly
+                        let (ref key, score) = *tied[0];
+                        (font_catalog.iter().find(|fe| fe.font_key() == *key)
+                            .map(|fe| font_match::FontMatchResult {
+                                font_name: fe.family_name.clone(),
+                                font_path: fe.path.clone(),
+                                font_key: fe.font_key(),
+                                variant_tag: fe.variant_tag.clone(),
+                                glyph_overrides: fe.glyph_overrides.clone(),
+                                score,
+                                best_dy: 0,
+                            }), Vec::new())
+                    }
                 } else {
-                    None
+                    (None, Vec::new())
                 }
             };
             let line_elapsed = line_start.elapsed();
@@ -950,7 +1008,12 @@ fn run(args: &cli::Args) -> Result<(), ScanTextError> {
                         let bbox_px = [line.x as f32, line.y as f32,
                                        (line.x + line.width) as f32,
                                        (line.y + line.height) as f32];
-                        !gt.is_hit(page_num, &bbox_px, args.dpi, &fr.font_name)
+                        // Look up chosen font's PostScript name for exact comparison
+                        let chosen_ps = font_catalog.iter()
+                            .find(|fe| fe.font_key() == fr.font_key)
+                            .map(|fe| fe.postscript_name.as_str())
+                            .unwrap_or("");
+                        !gt.is_hit(page_num, &bbox_px, args.dpi, chosen_ps)
                     }
                 } else {
                     true // no font matched → treat as miss
@@ -1006,13 +1069,13 @@ fn run(args: &cli::Args) -> Result<(), ScanTextError> {
                                    (line.y + line.height) as f32];
                     if let Some(gt_font_name) = gt.lookup_font(page_num, &bbox_px, args.dpi) {
                         // Inject GT font into ci_top_for_audit so it appears in audit output
+                        let gt_ps = ground_truth::strip_subset_prefix_str(gt_font_name);
                         let gt_key = font_catalog.iter()
-                            .find(|fe| ground_truth::fonts_match(&fe.family_name, gt_font_name)
-                                       || ground_truth::fonts_match(&fe.font_key(), gt_font_name))
+                            .find(|fe| fe.postscript_name == gt_ps)
                             .map(|fe| fe.font_key());
                         if let Some(ref gk) = gt_key {
                             if !ci_top_for_audit.iter().any(|(n, _)| n == gk) {
-                                ci_top_for_audit.push((gk.clone(), -999.0));
+                                ci_top_for_audit.push((gk.clone(), None));
                             }
                             // Compute per-char distances to the GT font
                             char_index::per_char_distances_precomputed(&char_index, gk, &crop_feats)
@@ -1039,6 +1102,36 @@ fn run(args: &cli::Args) -> Result<(), ScanTextError> {
                                 if ch.is_alphanumeric() { format!("{}", ch) }
                                 else { format!("U{:04X}", *ch as u32) }));
                             let _ = img.save(&path);
+                        }
+                    }
+
+                    // Save full-colour scan line crop for report overlay
+                    // Crop region = union of all word bboxes (raw + final) with padding
+                    let all_wbs: Vec<(u32, u32, u32, u32)> = line.words.iter()
+                        .map(|w| (w.x, w.y, w.width, w.height))
+                        .chain(
+                            if li < raw_word_bboxes.len() {
+                                raw_word_bboxes[li].iter()
+                                    .map(|w| (w.x, w.y, w.width, w.height))
+                                    .collect::<Vec<_>>()
+                            } else {
+                                Vec::new()
+                            }
+                        )
+                        .collect();
+                    if !all_wbs.is_empty() {
+                        let pad = 4u32;
+                        let ux = all_wbs.iter().map(|b| b.0).min().unwrap().saturating_sub(pad);
+                        let uy = all_wbs.iter().map(|b| b.1).min().unwrap().saturating_sub(pad);
+                        let ur = all_wbs.iter().map(|b| b.0 + b.2).max().unwrap().saturating_add(pad).min(page_img.width());
+                        let ub = all_wbs.iter().map(|b| b.1 + b.3).max().unwrap().saturating_add(pad).min(page_img.height());
+                        if ur > ux && ub > uy {
+                            let crop = image::imageops::crop_imm(page_img, ux, uy, ur - ux, ub - uy).to_image();
+                            let _ = crop.save(ddir.join("scan_line.png"));
+                            let _ = std::fs::write(
+                                ddir.join("scan_line_origin.json"),
+                                format!("{{\"x\":{},\"y\":{}}}", ux, uy),
+                            );
                         }
                     }
                 }
@@ -1095,7 +1188,7 @@ fn run(args: &cli::Args) -> Result<(), ScanTextError> {
             prof_pcd_us.fetch_add(pcd_t0.elapsed().as_micros() as u64, std::sync::atomic::Ordering::Relaxed);
 
             prof_full_us.fetch_add(line_start.elapsed().as_micros() as u64, std::sync::atomic::Ordering::Relaxed);
-            LineMatch { font_result, text_color, ci_top_for_audit, ci_char_detail, ci_top_for_audit_lig, ci_char_detail_lig, seg_winner, diag_seg_dir, chosen_char_dists, gt_font_char_dists }
+            LineMatch { font_result, text_color, ci_top_for_audit, ci_char_detail, ci_top_for_audit_lig, ci_char_detail_lig, seg_winner, diag_seg_dir, chosen_char_dists, gt_font_char_dists, tie_candidates: tie_candidates_audit }
         }).collect();
 
         // Update dominant font candidate for next page from this page's results
@@ -1376,6 +1469,7 @@ fn run(args: &cli::Args) -> Result<(), ScanTextError> {
                 } else {
                     Vec::new()
                 },
+                tie_candidates: lm.tie_candidates.clone(),
             });
 
             placed_texts.push(pdf_out::PlacedText {

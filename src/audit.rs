@@ -39,6 +39,9 @@ pub struct AuditEntry {
     /// Raw Tesseract word bboxes before post-processing (clip/drop/expand).
     #[serde(skip_serializing_if = "Vec::is_empty")]
     pub word_bboxes_raw: Vec<WordBBox>,
+    /// CI tie-break candidates with per-candidate SSIM scores.
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub tie_candidates: Vec<TieCandidate>,
 }
 
 /// Word-level bounding box with OCR text.
@@ -56,7 +59,17 @@ pub struct WordBBox {
 #[derive(Debug, Serialize, Clone)]
 pub struct CiCandidate {
     pub font_key: String,
-    pub score: f32,
+    pub score: Option<f32>,
+}
+
+/// SSIM tie-break candidate detail.
+#[derive(Debug, Serialize, Clone)]
+pub struct TieCandidate {
+    pub font_key: String,
+    pub family_name: String,
+    pub ssim_score: f32,
+    /// Whether this candidate was the tie-break winner.
+    pub winner: bool,
 }
 
 /// Per-character CI vote detail.

@@ -75,14 +75,20 @@ fn base_family(name: &str) -> String {
         "mt", "ps",
         "bolditalic", "semibolditalic", "mediumitalic",
         "lightitalic", "thinitalic",
+        "boldit", "semiboldit", "mediumit",
+        "lightit", "thinit", "extraboldit",
+        "blackit", "heavyit", "extralightit",
         "bold", "italic", "oblique",
         "regular", "medium", "light", "thin",
         "semibold", "extrabold", "demibold",
         "condensed", "semicondensed", "expanded",
         "book", "heavy", "black", "demi",
+        "extralight",
         "roman", "normal",
         "display", "caption", "subhead", "smtext",
+        "it", // short-form italic (SourceSerif4-It, SourceSans3-BoldIt, etc.)
         "400", "400i", "500", "600", "700", "800",
+        "bd", "bi",  // MS TTC filenames: Arialbd, Arialbi, Timesbd, Courbi
     ];
     let mut changed = true;
     while changed {
@@ -187,6 +193,74 @@ pub fn fonts_match(matched: &str, actual: &str) -> bool {
         return true;
     }
     false
+}
+
+/// Extract style flags from a font name: (is_italic, is_bold).
+fn font_style_flags(name: &str) -> (bool, bool) {
+    let n = alphanum(strip_subset_prefix(name));
+    let is_italic = n.contains("italic") || n.ends_with("it") ||
+                    n.contains("oblique") || n.ends_with("400i") ||
+                    n.ends_with("bi") || n.ends_with("z"); // MS TTC: Georgiaz = bold-italic
+    let is_bold = n.contains("bold") || n.contains("black") ||
+                  n.contains("heavy") || n.contains("semibold") ||
+                  n.contains("extrabold") || n.contains("demibold") ||
+                  n.ends_with("600") || n.ends_with("700") ||
+                  n.ends_with("800") || n.ends_with("900") ||
+                  n.ends_with("bd") || n.ends_with("bi") ||
+                  n.ends_with("z");  // MS TTC filenames: Arialbd, Arialbi, Georgiaz
+    (is_italic, is_bold)
+}
+
+/// Strict font matching: same family AND same style (italic/bold) AND same variant tag.
+/// Use for accuracy reporting where SourceSerif4-Black ≠ SourceSerif4-It
+/// and Arial-BoldMT ≠ Arial-BoldMT|hist.
+pub fn fonts_match_strict(matched: &str, actual: &str) -> bool {
+    // Split off variant tags: "FontName|hist" or "FontName [hist]"
+    let (matched_base, matched_var) = split_variant(matched);
+    let (actual_base, actual_var) = split_variant(actual);
+
+    // Variant tags must agree, UNLESS the actual (GT) font has no variant —
+    // PDF font dictionaries don't encode OT feature state, so an empty
+    // variant on the GT side means "unknown", not "none".
+    if matched_var != actual_var && !actual_var.is_empty() {
+        return false;
+    }
+
+    let na = alphanum(strip_subset_prefix(matched_base));
+    let nb = alphanum(strip_subset_prefix(actual_base));
+    if na == nb {
+        return true;
+    }
+    if !fonts_match(matched_base, actual_base) {
+        return false;
+    }
+    // Family matches — now check that italic/bold flags agree
+    let (ia, ba) = font_style_flags(matched_base);
+    let (ib, bb) = font_style_flags(actual_base);
+    ia == ib && ba == bb
+}
+
+/// Split a font name into (base, variant_tag).
+/// Handles both "Name|tag" (font_key format) and "Name [tag]" (family_name format).
+fn split_variant(name: &str) -> (&str, &str) {
+    // Try pipe first: "FontName|hist"
+    if let Some((base, var)) = name.split_once('|') {
+        return (base, var);
+    }
+    // Try bracket: "FontName [hist]"
+    if name.ends_with(']') {
+        if let Some(open) = name.rfind(" [") {
+            let var = &name[open + 2..name.len() - 1];
+            let base = &name[..open];
+            return (base, var);
+        }
+    }
+    (name, "")
+}
+
+/// Public access to split_variant for report.rs.
+pub fn split_variant_pub(name: &str) -> (&str, &str) {
+    split_variant(name)
 }
 
 // ── Font metrics from PDF /Widths ───────────────────────────────────────────
@@ -674,10 +748,11 @@ impl GroundTruth {
     }
 
     /// Check whether a matched font is correct for the given position.
+    /// `matched_ps` should be the PostScript name of the chosen font.
     /// Returns true if it's a hit (correct match), false if it's a miss.
-    pub fn is_hit(&self, page: usize, bbox_px: &[f32; 4], dpi: u32, matched_font: &str) -> bool {
+    pub fn is_hit(&self, page: usize, bbox_px: &[f32; 4], dpi: u32, matched_ps: &str) -> bool {
         match self.lookup_font(page, bbox_px, dpi) {
-            Some(actual) => fonts_match(matched_font, actual),
+            Some(actual) => matched_ps == strip_subset_prefix_str(actual),
             None => true, // no ground truth available → assume hit (don't penalize)
         }
     }
