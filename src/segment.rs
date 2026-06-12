@@ -5,12 +5,91 @@
 
 use image::GrayImage;
 use std::collections::{HashMap, HashSet};
+use std::sync::OnceLock;
 
-/// Entry penalty weight for seam carving.  When the seam path moves into
-/// a darker pixel than the previous one, the darkness increase is
-/// multiplied by this weight and added as extra cost.  This penalizes
-/// seams that drift from whitespace into glyph strokes.
-const ENTRY_PENALTY_WEIGHT: f32 = 4.0;
+/// Seam carving scoring parameters, configurable via environment variables
+/// for hill-climbing parameter search.  Defaults reproduce the original
+/// linear scoring (ink_power=1, delta_weight=4, no row_ink influence).
+struct SeamParams {
+    ink_power: f32,         // exponent on darkness for base cost (1.0 = linear)
+    ink_norm: f32,          // divisor after powering (1.0 = raw)
+    ink_row_weight: f32,    // multiplier for row_ink factor (0.0 = ignore)
+    ink_row_power: f32,     // exponent on row_ink
+    delta_weight: f32,      // entry penalty weight (was 4.0)
+    delta_power: f32,       // exponent on darkness delta
+    delta_scale_power: f32, // exponent on cur_dark/max_ink scaling
+    delta_row_weight: f32,  // row_ink multiplier in delta (0.0 = ignore)
+    delta_row_power: f32,   // exponent on row_ink in delta
+}
+
+fn seam_params() -> &'static SeamParams {
+    static PARAMS: OnceLock<SeamParams> = OnceLock::new();
+    PARAMS.get_or_init(|| {
+        fn env_f32(name: &str, default: f32) -> f32 {
+            std::env::var(name).ok()
+                .and_then(|s| s.parse().ok())
+                .unwrap_or(default)
+        }
+        let p = SeamParams {
+            ink_power: env_f32("SEAM_INK_POWER", 1.0),
+            ink_norm: env_f32("SEAM_INK_NORM", 1.0),
+            ink_row_weight: env_f32("SEAM_INK_ROW_WEIGHT", 0.0),
+            ink_row_power: env_f32("SEAM_INK_ROW_POWER", 1.0),
+            delta_weight: env_f32("SEAM_DELTA_WEIGHT", 4.0),
+            delta_power: env_f32("SEAM_DELTA_POWER", 1.0),
+            delta_scale_power: env_f32("SEAM_DELTA_SCALE_POWER", 1.0),
+            delta_row_weight: env_f32("SEAM_DELTA_ROW_WEIGHT", 0.0),
+            delta_row_power: env_f32("SEAM_DELTA_ROW_POWER", 1.0),
+        };
+        eprintln!("[seam params] ink_power={} ink_norm={} ink_row_wt={} ink_row_pow={} \
+delta_wt={} delta_pow={} delta_scale_pow={} delta_row_wt={} delta_row_pow={}",
+            p.ink_power, p.ink_norm, p.ink_row_weight, p.ink_row_power,
+            p.delta_weight, p.delta_power, p.delta_scale_power,
+            p.delta_row_weight, p.delta_row_power);
+        p
+    })
+}
+
+/// Per-pixel ink score: base traversal cost for the seam path.
+#[inline]
+fn ink_score(darkness: f32, row: usize, row_ink: &[f32]) -> f32 {
+    let p = seam_params();
+    let base = if p.ink_power == 1.0 { darkness } else { darkness.powf(p.ink_power) }
+        / p.ink_norm;
+    if p.ink_row_weight == 0.0 {
+        base
+    } else {
+        let ri = if p.ink_row_power == 1.0 { row_ink[row] }
+                 else { row_ink[row].powf(p.ink_row_power) };
+        base * (1.0 + p.ink_row_weight * ri)
+    }
+}
+
+/// Transition penalty: extra cost when the seam moves into darker ink.
+#[inline]
+fn delta_ink_score(
+    dark_cur: f32, dark_prev: f32,
+    row_cur: usize, _row_prev: usize,
+    row_ink: &[f32], max_ink: f32,
+) -> f32 {
+    if dark_cur <= dark_prev { return 0.0; }
+    let p = seam_params();
+    let delta = dark_cur - dark_prev;
+    let base = if p.delta_power == 1.0 { delta } else { delta.powf(p.delta_power) };
+    let scale = if p.delta_scale_power == 1.0 {
+        dark_cur / max_ink
+    } else {
+        (dark_cur / max_ink).powf(p.delta_scale_power)
+    };
+    let row_factor = if p.delta_row_weight == 0.0 {
+        1.0
+    } else {
+        let ri = if p.delta_row_power == 1.0 { row_ink[row_cur] }
+                 else { row_ink[row_cur].powf(p.delta_row_power) };
+        1.0 + p.delta_row_weight * ri
+    };
+    p.delta_weight * base * scale * row_factor
+}
 
 /// Fraction of the crop height that represents the smallest symbol
 /// (a period).  A period is roughly 8% of line height.  The minimum
@@ -34,7 +113,7 @@ const MIN_SYMBOL_FRAC: f32 = 0.07;
 /// vertical seam in each existing segment via DP, pick the globally
 /// cheapest, split there, and repeat.  Energy is ink-based: each pixel's
 /// cost is its darkness (0 white, 255 black) plus an entry penalty
-/// (`ENTRY_PENALTY_WEIGHT × darkness_increase`) when the path moves into
+/// (delta_ink_score) when the path moves into
 /// a darker pixel — directly encoding "stay in whitespace, don't wander
 /// into ink."  The same `min_ink_for_symbol` threshold applies: both
 /// children of every accepted seam split must contain meaningful ink.
@@ -244,6 +323,10 @@ fn segment_characters_inner(
     // For remaining splits, find the cheapest vertical seam in each segment.
     // Greedy: pop cheapest, split, recompute children, repeat.
     let mut seam_paths: HashMap<u32, Vec<u32>> = HashMap::new();
+    // Seam instrumentation: capture seed candidates and greedy-loop events
+    // for the audit summary JSON.
+    let mut seam_seed_candidates: Vec<serde_json::Value> = Vec::new();
+    let mut seam_greedy_log: Vec<serde_json::Value> = Vec::new();
     if splits.len() < need {
         use std::cmp::Ordering;
         use std::collections::BinaryHeap;
@@ -256,13 +339,14 @@ fn segment_characters_inner(
         // the gap, don't wander into ink."
         //
         // The entry penalty is proportional to the darkness increase:
-        //   penalty = ENTRY_PENALTY_WEIGHT * max(0, darkness[r] - darkness[r-1])
+        //   penalty = delta_ink_score(darkness[r], darkness[r-1], r, r-1, row_ink, max_ink)
         //
         // This replaces the Avidan & Shamir gradient-based energy, which
         // couldn't distinguish between the interior of a dark stroke
         // (zero gradient) and a white gap (also zero gradient).
 
-        // Per-pixel darkness: 0.0 for white, 255.0 for black.
+        // Per-pixel darkness: 0.0 for white, 255.0 for black (raw).
+        // ink_score() applies the parameterized transform during DP scoring.
         let darkness: Vec<Vec<f32>> = (0..h)
             .map(|y| {
                 (0..w)
@@ -273,10 +357,40 @@ fn segment_characters_inner(
             })
             .collect();
 
+        // Row ink fractions: what share of the word's total ink is in each
+        // row.  Rows with heavy strokes are high; whitespace rows near zero.
+        let total_ink: f32 = darkness.iter()
+            .flat_map(|row| row.iter()).copied().sum();
+        let row_ink: Vec<f32> = darkness.iter()
+            .map(|row| {
+                if total_ink > 0.0 { row.iter().copied().sum::<f32>() / total_ink }
+                else { 0.0 }
+            })
+            .collect();
+
         // The energy map is just darkness — used for the base per-pixel
         // cost in the DP.  The entry penalty is applied during the DP
         // transition, not stored in the energy map.
         let energy = &darkness;
+
+        // Word-level max ink (p95 of raw darkness): used by delta_ink_score
+        // to scale the entry penalty proportionally.
+        let mut ink_values: Vec<f32> = Vec::new();
+        for row in &darkness {
+            for &d in row {
+                if d > 0.0 {
+                    ink_values.push(d);
+                }
+            }
+        }
+        ink_values.sort_by(|a, b| a.partial_cmp(b).unwrap());
+        let max_ink = if ink_values.is_empty() {
+            255.0
+        } else {
+            let p95_idx = (ink_values.len() as f64 * 0.95) as usize;
+            let p95_idx = p95_idx.min(ink_values.len() - 1);
+            ink_values[p95_idx].max(1.0) // avoid division by zero
+        };
 
         // Min-heap entry: (cost, split_col, seg_start, seg_end).
         // BinaryHeap is a max-heap, so wrap cost in Reverse-style ordering.
@@ -337,7 +451,7 @@ fn segment_characters_inner(
             let (ink_l, ink_r) = ink_extent(&col_has_ink_strict, seg_start, seg_end);
             if ink_r > ink_l + 2 {
                 let sid = next_seg_id; next_seg_id += 1;
-                let (cands, dp, vert_wins) = candidate_seams(&energy, ink_l, ink_r, h, None, None);
+                let (cands, dp, vert_wins) = candidate_seams(&energy, ink_l, ink_r, h, None, None, max_ink, &row_ink);
                 if word_text.map_or(false, |w| w.starts_with("tradition")) {
                     eprintln!("  SEED seg=[{},{}) ink=[{},{}) {} candidates sid={}", seg_start, seg_end, ink_l, ink_r, cands.len(), sid);
                     for (col, cost) in &cands {
@@ -345,7 +459,13 @@ fn segment_characters_inner(
                     }
                 }
                 for (col, cost) in &cands {
-                    heap.push(SeamEntry { cost: *cost, col: *col, seg_start: ink_l, seg_end: ink_r, seg_id: sid, is_vertical: vert_wins.contains(col) });
+                    let is_vert = vert_wins.contains(col);
+                    heap.push(SeamEntry { cost: *cost, col: *col, seg_start: ink_l, seg_end: ink_r, seg_id: sid, is_vertical: is_vert });
+                    seam_seed_candidates.push(serde_json::json!({
+                        "col": col, "cost": *cost as f64,
+                        "seg": [ink_l, ink_r], "sid": sid,
+                        "is_vertical": is_vert,
+                    }));
                 }
                 seg_bounds.insert(sid, SegBounds { left_path: None, right_path: None });
                 dp_cache.insert(sid, dp);
@@ -365,7 +485,13 @@ fn segment_characters_inner(
             };
 
             // Skip candidates from dead segments (replaced or consumed).
-            if dead_sids.contains(&entry.seg_id) { continue; }
+            if dead_sids.contains(&entry.seg_id) {
+                seam_greedy_log.push(serde_json::json!({
+                    "action": "skip_dead", "col": entry.col, "cost": entry.cost as f64,
+                    "seg": [entry.seg_start, entry.seg_end], "sid": entry.seg_id,
+                }));
+                continue;
+            }
 
             if word_text.map_or(false, |w| w.starts_with("tradition") || w.starts_with("abcdefg")) {
                 eprintln!("  SEAM POP [{}]: col={} cost={:.1} seg=[{},{}) sid={} | accepted={:?}", word_text.unwrap_or("?"), entry.col, entry.cost, entry.seg_start, entry.seg_end, entry.seg_id, &splits);
@@ -374,6 +500,10 @@ fn segment_characters_inner(
             // Skip if this exact split column was already accepted.
             if splits.contains(&entry.col) {
                 if word_text.map_or(false, |w| w.starts_with("tradition")) { eprintln!("    SKIP DUP col={}", entry.col); }
+                seam_greedy_log.push(serde_json::json!({
+                    "action": "skip_dup", "col": entry.col, "cost": entry.cost as f64,
+                    "seg": [entry.seg_start, entry.seg_end], "sid": entry.seg_id,
+                }));
                 continue;
             }
 
@@ -385,6 +515,11 @@ fn segment_characters_inner(
 
             if !left_ok || !right_ok {
                 if word_text.map_or(false, |w| w.starts_with("tradition")) { eprintln!("    SKIP INK col={} left_ok={} right_ok={}", entry.col, left_ok, right_ok); }
+                seam_greedy_log.push(serde_json::json!({
+                    "action": "skip_ink", "col": entry.col, "cost": entry.cost as f64,
+                    "seg": [entry.seg_start, entry.seg_end], "sid": entry.seg_id,
+                    "left_ok": left_ok, "right_ok": right_ok,
+                }));
                 // Seam hugged an edge → retry with narrowed range.
                 if !right_ok && left_ok {
                     let new_end = entry.col;
@@ -393,7 +528,7 @@ fn segment_characters_inner(
                         let parent_bounds = seg_bounds.get(&entry.seg_id);
                         let lp = parent_bounds.and_then(|b| b.left_path.clone());
                         let rp = parent_bounds.and_then(|b| b.right_path.clone());
-                        let (cands, dp, vert_wins) = candidate_seams(&energy, entry.seg_start, new_end, h, lp.as_deref(), rp.as_deref());
+                        let (cands, dp, vert_wins) = candidate_seams(&energy, entry.seg_start, new_end, h, lp.as_deref(), rp.as_deref(), max_ink, &row_ink);
                         for (col, cost) in &cands {
                             heap.push(SeamEntry { cost: *cost, col: *col, seg_start: entry.seg_start, seg_end: new_end, seg_id: sid, is_vertical: vert_wins.contains(col) });
                         }
@@ -411,7 +546,7 @@ fn segment_characters_inner(
                         let parent_bounds = seg_bounds.get(&entry.seg_id);
                         let lp = parent_bounds.and_then(|b| b.left_path.clone());
                         let rp = parent_bounds.and_then(|b| b.right_path.clone());
-                        let (cands, dp, vert_wins) = candidate_seams(&energy, new_start, entry.seg_end, h, lp.as_deref(), rp.as_deref());
+                        let (cands, dp, vert_wins) = candidate_seams(&energy, new_start, entry.seg_end, h, lp.as_deref(), rp.as_deref(), max_ink, &row_ink);
                         for (col, cost) in &cands {
                             heap.push(SeamEntry { cost: *cost, col: *col, seg_start: new_start, seg_end: entry.seg_end, seg_id: sid, is_vertical: vert_wins.contains(col) });
                         }
@@ -433,7 +568,7 @@ fn segment_characters_inner(
                 vec![entry.col; h as usize]
             } else {
                 match dp_cache.get(&entry.seg_id) {
-                    Some(dp) => dp.trace_path_through(&energy, entry.col),
+                    Some(dp) => dp.trace_path_through(&energy, entry.col, &row_ink),
                     None => {
                         // Segment was already consumed; skip stale candidate.
                         continue;
@@ -464,12 +599,24 @@ fn segment_characters_inner(
             }
             if seam_ink_left < min_ink_for_symbol || seam_ink_right < min_ink_for_symbol {
                 if word_text.map_or(false, |w| w.starts_with("tradition")) { eprintln!("    SKIP MIN_INK col={} left={} right={} min={}", entry.col, seam_ink_left, seam_ink_right, min_ink_for_symbol); }
+                seam_greedy_log.push(serde_json::json!({
+                    "action": "skip_min_ink", "col": entry.col, "cost": entry.cost as f64,
+                    "seg": [entry.seg_start, entry.seg_end], "sid": entry.seg_id,
+                    "ink_left": seam_ink_left, "ink_right": seam_ink_right,
+                    "min_ink": min_ink_for_symbol,
+                }));
                 continue;
             }
 
             let final_col = entry.col;
 
             splits.push(final_col);
+            seam_greedy_log.push(serde_json::json!({
+                "action": "accept", "col": final_col, "cost": entry.cost as f64,
+                "seg": [entry.seg_start, entry.seg_end], "sid": entry.seg_id,
+                "is_vertical": entry.is_vertical,
+                "splits_so_far": &splits,
+            }));
             seam_paths.insert(final_col, path.clone());
 
             // Capture parent's diagonal bounds before removing.
@@ -493,7 +640,7 @@ fn segment_characters_inner(
                     let sid = next_seg_id; next_seg_id += 1;
                     let lp = parent_lp.clone();
                     let rp: Option<Vec<u32>> = Some(path.clone());
-                    let (cands, dp, vert_wins) = candidate_seams(&energy, ink_l, ink_r, h, lp.as_deref(), rp.as_deref());
+                    let (cands, dp, vert_wins) = candidate_seams(&energy, ink_l, ink_r, h, lp.as_deref(), rp.as_deref(), max_ink, &row_ink);
                     for (col, cost) in &cands {
                         heap.push(SeamEntry { cost: *cost, col: *col, seg_start: ink_l, seg_end: ink_r, seg_id: sid, is_vertical: vert_wins.contains(col) });
                     }
@@ -509,7 +656,7 @@ fn segment_characters_inner(
                     let sid = next_seg_id; next_seg_id += 1;
                     let lp: Option<Vec<u32>> = Some(path.clone());
                     let rp = parent_rp.clone();
-                    let (cands, dp, vert_wins) = candidate_seams(&energy, ink_l, ink_r, h, lp.as_deref(), rp.as_deref());
+                    let (cands, dp, vert_wins) = candidate_seams(&energy, ink_l, ink_r, h, lp.as_deref(), rp.as_deref(), max_ink, &row_ink);
                     for (col, cost) in &cands {
                         heap.push(SeamEntry { cost: *cost, col: *col, seg_start: ink_l, seg_end: ink_r, seg_id: sid, is_vertical: vert_wins.contains(col) });
                     }
@@ -578,6 +725,8 @@ fn segment_characters_inner(
             "final_boundaries": bounds,
             "seam_paths": seam_paths,
             "mismatch": n_segs != n_chars,
+            "seam_seed_candidates": seam_seed_candidates,
+            "seam_greedy_log": seam_greedy_log,
         });
         let _ = std::fs::write(ddir.join("summary.json"), serde_json::to_string_pretty(&summary).unwrap_or_default());
     }
@@ -600,13 +749,15 @@ struct SeamDp {
     seg_end: u32,
     seg_w: usize,
     h: u32,
+    max_ink: f32,
+    row_ink: Vec<f32>,    // per-row ink fraction for ink_score/delta_ink_score
 }
 
 impl SeamDp {
 
     /// Backtrace the cheapest path constrained to pass through
     /// `target_col` at mid-row.
-    fn trace_path_through(&self, energy: &[Vec<f32>], target_col: u32) -> Vec<u32> {
+    fn trace_path_through(&self, energy: &[Vec<f32>], target_col: u32, row_ink: &[f32]) -> Vec<u32> {
         let seg_w = self.seg_w;
         let base = self.seg_start as usize;
         let mid_r = (self.h / 2) as usize;
@@ -626,11 +777,7 @@ impl SeamDp {
                 for &pc in &[c, c.wrapping_sub(1), c + 1] {
                     if pc < seg_w {
                         let prev_dark = energy[r - 1][base + pc];
-                        let entry = if cur_dark > prev_dark {
-                            (cur_dark - prev_dark) * ENTRY_PENALTY_WEIGHT
-                        } else {
-                            0.0
-                        };
+                        let entry = delta_ink_score(cur_dark, prev_dark, r, r - 1, row_ink, self.max_ink);
                         let cand = self.cost_fwd[(r - 1) * seg_w + pc] + entry;
                         if cand < best_cost {
                             best_cost = cand;
@@ -653,11 +800,7 @@ impl SeamDp {
                 for &pc in &[c, c.wrapping_sub(1), c + 1] {
                     if pc < seg_w {
                         let child_dark = energy[r + 1][base + pc];
-                        let entry = if child_dark > cur_dark {
-                            (child_dark - cur_dark) * ENTRY_PENALTY_WEIGHT
-                        } else {
-                            0.0
-                        };
+                        let entry = delta_ink_score(child_dark, cur_dark, r + 1, r, row_ink, self.max_ink);
                         let cand = self.cost_rev[(r + 1) * seg_w + pc] + entry;
                         if cand < best_cost {
                             best_cost = cand;
@@ -681,10 +824,12 @@ fn candidate_seams(
     h: u32,
     left_path: Option<&[u32]>,   // pixels with col <= left_path[r] are masked
     right_path: Option<&[u32]>,  // pixels with col >= right_path[r] are masked
+    max_ink: f32,                // p95 ink darkness — scales entry penalty
+    row_ink: &[f32],             // per-row ink fractions for scoring
 ) -> (Vec<(u32, f32)>, SeamDp, HashSet<u32>) {
     let seg_w = (seg_end - seg_start) as usize;
     if seg_w < 3 || h < 1 {
-        let dp = SeamDp { cost_fwd: Vec::new(), cost_rev: Vec::new(), seg_start, seg_end, seg_w: 0, h };
+        let dp = SeamDp { cost_fwd: Vec::new(), cost_rev: Vec::new(), seg_start, seg_end, seg_w: 0, h, max_ink, row_ink: row_ink.to_vec() };
         return (Vec::new(), dp, HashSet::new());
     }
     let base = seg_start as usize;
@@ -708,29 +853,26 @@ fn candidate_seams(
     let n_cells = h as usize * seg_w;
     let mut cost_fwd = vec![0.0f32; n_cells];
     for c in 0..seg_w {
-        cost_fwd[c] = masked_energy(0, c);
+        cost_fwd[c] = ink_score(masked_energy(0, c), 0, row_ink);
     }
     for r in 1..h as usize {
         let row_off = r * seg_w;
         let prev_off = (r - 1) * seg_w;
         for c in 0..seg_w {
             let cur_dark = masked_energy(r, c);
+            let cur_ink = ink_score(cur_dark, r, row_ink);
             let mut best = f32::INFINITY;
             for &pc in &[c, c.wrapping_sub(1), c + 1] {
                 if pc < seg_w {
                     let prev_dark = masked_energy(r - 1, pc);
-                    let entry = if cur_dark > prev_dark {
-                        (cur_dark - prev_dark) * ENTRY_PENALTY_WEIGHT
-                    } else {
-                        0.0
-                    };
+                    let entry = delta_ink_score(cur_dark, prev_dark, r, r - 1, row_ink, max_ink);
                     let candidate = cost_fwd[prev_off + pc] + entry;
                     if candidate < best {
                         best = candidate;
                     }
                 }
             }
-            cost_fwd[row_off + c] = cur_dark + best;
+            cost_fwd[row_off + c] = cur_ink + best;
         }
     }
 
@@ -739,29 +881,26 @@ fn candidate_seams(
     let mut cost_rev = vec![0.0f32; n_cells];
     let last_off = last_r * seg_w;
     for c in 0..seg_w {
-        cost_rev[last_off + c] = masked_energy(last_r, c);
+        cost_rev[last_off + c] = ink_score(masked_energy(last_r, c), last_r, row_ink);
     }
     for r in (0..last_r).rev() {
         let row_off = r * seg_w;
         let next_off = (r + 1) * seg_w;
         for c in 0..seg_w {
             let cur_dark = masked_energy(r, c);
+            let cur_ink = ink_score(cur_dark, r, row_ink);
             let mut best = f32::INFINITY;
             for &pc in &[c, c.wrapping_sub(1), c + 1] {
                 if pc < seg_w {
                     let child_dark = masked_energy(r + 1, pc);
-                    let entry = if child_dark > cur_dark {
-                        (child_dark - cur_dark) * ENTRY_PENALTY_WEIGHT
-                    } else {
-                        0.0
-                    };
+                    let entry = delta_ink_score(child_dark, cur_dark, r + 1, r, row_ink, max_ink);
                     let candidate = cost_rev[next_off + pc] + entry;
                     if candidate < best {
                         best = candidate;
                     }
                 }
             }
-            cost_rev[row_off + c] = cur_dark + best;
+            cost_rev[row_off + c] = cur_ink + best;
         }
     }
 
@@ -773,7 +912,7 @@ fn candidate_seams(
     for c in 1..seg_w - 1 {
         let me = masked_energy(mid_r, c);
         if me >= f32::INFINITY { continue; } // masked pixel, skip
-        let combined = cost_fwd[mid_off + c] + cost_rev[mid_off + c] - me;
+        let combined = cost_fwd[mid_off + c] + cost_rev[mid_off + c] - ink_score(me, mid_r, row_ink);
         let split_col = seg_start + c as u32;
         dp_candidates.push((split_col, combined));
     }
@@ -819,7 +958,7 @@ fn candidate_seams(
             } else {
                 1.0   // real glyph stroke — full price
             };
-            cost += e * weight;
+            cost += ink_score(e, r, row_ink) * weight;
         }
         if !masked {
             vert_candidates.push((seg_start + c as u32, cost));
@@ -873,7 +1012,7 @@ fn candidate_seams(
         candidates.push(raw_candidates[mid_idx]);
     }
 
-    let dp = SeamDp { cost_fwd, cost_rev, seg_start, seg_end, seg_w, h };
+    let dp = SeamDp { cost_fwd, cost_rev, seg_start, seg_end, seg_w, h, max_ink, row_ink: row_ink.to_vec() };
     (candidates, dp, vertical_winners)
 }
 

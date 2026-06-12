@@ -5,7 +5,12 @@ Generate "A Timeline of Typography" — a multi-page vector PDF specimen.
 Output:
   font-timeline-specimen.pdf       — native vector PDF with embedded fonts + SVG logos
   font-timeline-specimen-scanned.pdf — rasterized with scan artifacts (skew, noise, blur)
-  font-timeline-specimen-fontmap.json — font name → file path map for --include-fontmap
+  font-timeline-specimen-fontmap.json — font name → file path map for ground-truth audit
+
+Fonts are registered under their actual PostScript names (name ID 6) so that
+the PDF BaseFont values exactly match what font catalog indexers read from the
+same font files. This eliminates the need for heuristic string matching during
+font identification audit.
 
 All text is real PDF text (not raster). SVG logos are placed as vector drawings.
 The "scanned" version rasterizes entire pages then re-assembles as a raster PDF.
@@ -110,6 +115,10 @@ def fc_find(family, style="Regular"):
             if weight_ok:      score += 50
             elif weight_close: score += 25
             if not is_var:     score += 10  # prefer static over variable
+            # Prefer system-installed fonts over specimen-fonts directory
+            # (specimen-fonts may have different PS names than system packages)
+            if "/specimen-fonts/" not in path:
+                score += 5
             scored.append((score, path, wt, wd, is_var))
 
         if not scored:
@@ -132,21 +141,50 @@ def fc_find(family, style="Regular"):
         return scored[0][1]
 
     return None
-def register_font(rl_name, ttf_path):
-    """Register a TTF with reportlab. Returns True on success."""
-    if ttf_path and os.path.exists(ttf_path):
+def read_postscript_name(ttf_path):
+    """Read PostScript name (name ID 6) from a font file."""
+    from fontTools.ttLib import TTFont as FTFont
+    try:
+        tt = FTFont(ttf_path)
+        for rec in tt['name'].names:
+            if rec.nameID == 6:
+                try:
+                    ps = rec.toUnicode()
+                    if ps:
+                        tt.close()
+                        return ps
+                except Exception:
+                    pass
+        tt.close()
+    except Exception:
+        pass
+    return None
+
+
+def register_font(ps_name, ttf_path):
+    """Register a TTF with reportlab under its PostScript name. Returns True on success."""
+    if ttf_path and os.path.exists(ttf_path) and ps_name:
         try:
-            pdfmetrics.registerFont(TTFont(rl_name, ttf_path))
+            pdfmetrics.registerFont(TTFont(ps_name, ttf_path))
             return True
         except Exception as e:
-            print(f"  WARN: can't register {rl_name} from {ttf_path}: {e}")
+            print(f"  WARN: can't register {ps_name} from {ttf_path}: {e}")
     return False
 
 # Font spec: (rl_base_name, regular_path, bold_path, italic_path)
 # We'll register {base}, {base}-Bold, {base}-Italic
 
 def register_all_fonts():
-    """Register all specimen fonts with reportlab."""
+    """Register all specimen fonts with reportlab using their actual PostScript names.
+
+    ReportLab uses the registration name as the PDF BaseFont value.
+    By registering under the real PostScript name (name ID 6), the GT PDF
+    will contain exact PS names that match the font catalog — no heuristic
+    string matching needed at audit time.
+
+    Returns (registered, font_file_map, alias_map) where alias_map maps
+    friendly base names to actual PS names for use in section styles.
+    """
     from reportlab.lib.fonts import addMapping
 
     # All fonts are resolved via fontconfig by family name.
@@ -188,34 +226,49 @@ def register_all_fonts():
 
     registered = {}
     font_file_map = {}
+    alias_map = {}  # base_name -> ps_name (for regular), base_name-Bold -> ps_bold, etc.
 
     for base, family in FAMILIES.items():
         reg = fc_find(family, "Regular") or fc_find(family)
         bold = fc_find(family, "Bold") or reg
         italic = fc_find(family, "Italic") or reg
 
-        ok = register_font(base, reg)
+        # Read actual PostScript names from font files
+        ps_reg = read_postscript_name(reg) if reg else None
+        ps_bold = read_postscript_name(bold) if bold else None
+        ps_italic = read_postscript_name(italic) if italic else None
+
+        ok = register_font(ps_reg, reg)
         if ok:
             registered[base] = True
+            alias_map[base] = ps_reg
             if reg:
-                font_file_map[base] = reg
-        ok_b = register_font(f"{base}-Bold", bold)
-        ok_i = register_font(f"{base}-Italic", italic)
-        if not ok_b:
-            register_font(f"{base}-Bold", reg)
-        if not ok_i:
-            register_font(f"{base}-Italic", reg)
+                font_file_map[ps_reg] = reg
+        ok_b = register_font(ps_bold, bold)
+        ok_i = register_font(ps_italic, italic)
+        if not ok_b and ps_reg:
+            register_font(ps_reg + "-Bold-fallback", reg)
+            alias_map[f"{base}-Bold"] = ps_reg + "-Bold-fallback"
+        else:
+            alias_map[f"{base}-Bold"] = ps_bold
+        if not ok_i and ps_reg:
+            register_font(ps_reg + "-Italic-fallback", reg)
+            alias_map[f"{base}-Italic"] = ps_reg + "-Italic-fallback"
+        else:
+            alias_map[f"{base}-Italic"] = ps_italic
         if ok_b and bold:
-            font_file_map[f"{base}-Bold"] = bold
+            font_file_map[ps_bold] = bold
         if ok_i and italic:
-            font_file_map[f"{base}-Italic"] = italic
+            font_file_map[ps_italic] = italic
 
-        addMapping(base, 0, 0, base)
-        addMapping(base, 1, 0, f"{base}-Bold")
-        addMapping(base, 0, 1, f"{base}-Italic")
-        addMapping(base, 1, 1, f"{base}-Bold")
+        # ReportLab font family mapping for <b> and <i> tags in Paragraphs
+        if ps_reg:
+            addMapping(ps_reg, 0, 0, ps_reg)
+            addMapping(ps_reg, 1, 0, alias_map.get(f"{base}-Bold", ps_reg))
+            addMapping(ps_reg, 0, 1, alias_map.get(f"{base}-Italic", ps_reg))
+            addMapping(ps_reg, 1, 1, alias_map.get(f"{base}-Bold", ps_reg))
 
-    return registered, font_file_map
+    return registered, font_file_map, alias_map
 
 
 
@@ -755,8 +808,12 @@ class StackedFlowables(Flowable):
 # ---------------------------------------------------------------------------
 # Build the specimen PDF
 # ---------------------------------------------------------------------------
-def build_specimen(out_pdf, registered):
+def build_specimen(out_pdf, registered, alias_map):
     """Build a proper vector PDF with embedded fonts and SVG logos."""
+
+    def ps(name):
+        """Resolve a friendly font name to its registered PostScript name."""
+        return alias_map.get(name, name)
 
     # Two-column layout
     margin_side = 0.6 * inch
@@ -792,20 +849,20 @@ def build_specimen(out_pdf, registered):
 
     # --- Title block ---
     title_style = ParagraphStyle(
-        'Title', fontName='PlayfairDisplay', fontSize=22, leading=26,
+        'Title', fontName=ps('PlayfairDisplay'), fontSize=22, leading=26,
         spaceAfter=4
     )
     subtitle_style = ParagraphStyle(
-        'Subtitle', fontName='SourceSerif4-Italic',
+        'Subtitle', fontName=ps('SourceSerif4-Italic'),
         fontSize=10, leading=13, spaceAfter=2, textColor='#444444'
     )
     intro_style = ParagraphStyle(
-        'Intro', fontName='SourceSerif4', fontSize=9, leading=12, spaceAfter=10
+        'Intro', fontName=ps('SourceSerif4'), fontSize=9, leading=12, spaceAfter=10
     )
 
     story.append(Paragraph("A Timeline of Typography", title_style))
     story.append(Paragraph(
-        "<i>Five Centuries of Letterforms — A Font Specimen for Unscan</i>",
+        "<i>Five Centuries of Letterforms — A Font Specimen for OCR Audit</i>",
         subtitle_style
     ))
     story.append(Paragraph(
@@ -867,14 +924,14 @@ def build_specimen(out_pdf, registered):
 
         # Heading in the section's own font, bold
         hdr_style = ParagraphStyle(
-            f'Hdr-{rl}', fontName=f'{rl}-Bold', fontSize=14, leading=17,
+            f'Hdr-{rl}', fontName=ps(f'{rl}-Bold'), fontSize=14, leading=17,
             spaceBefore=6, spaceAfter=2
         )
         text_items.append(Paragraph(section["era"], hdr_style))
 
         # Source line
         src_style = ParagraphStyle(
-            f'Src-{rl}', fontName='SourceSerif4-Italic',
+            f'Src-{rl}', fontName=ps('SourceSerif4-Italic'),
             fontSize=7, leading=9, textColor='#777777', spaceAfter=3
         )
         text_items.append(Paragraph(f"Font: {section['source']}", src_style))
@@ -882,14 +939,14 @@ def build_specimen(out_pdf, registered):
         # Body blurb in the section's font
         text_align = TA_JUSTIFY if section.get("alignment") == "justify" else TA_LEFT
         body_style = ParagraphStyle(
-            f'Body-{rl}', fontName=rl, fontSize=10, leading=13, spaceAfter=2,
+            f'Body-{rl}', fontName=ps(rl), fontSize=10, leading=13, spaceAfter=2,
             alignment=text_align
         )
         text_items.append(Paragraph(section["blurb"], body_style))
 
         # Bold sample
         bold_style = ParagraphStyle(
-            f'Bold-{rl}', fontName=f'{rl}-Bold', fontSize=10, leading=13, spaceAfter=1,
+            f'Bold-{rl}', fontName=ps(f'{rl}-Bold'), fontSize=10, leading=13, spaceAfter=1,
             alignment=text_align
         )
         text_items.append(Paragraph(
@@ -899,7 +956,7 @@ def build_specimen(out_pdf, registered):
 
         # Italic sample
         italic_style = ParagraphStyle(
-            f'Italic-{rl}', fontName=f'{rl}-Italic', fontSize=10, leading=13, spaceAfter=1,
+            f'Italic-{rl}', fontName=ps(f'{rl}-Italic'), fontSize=10, leading=13, spaceAfter=1,
             alignment=text_align
         )
         text_items.append(Paragraph(
@@ -909,7 +966,7 @@ def build_specimen(out_pdf, registered):
 
         # Alphabet + digits
         alpha_style = ParagraphStyle(
-            f'Alpha-{rl}', fontName=rl, fontSize=9, leading=11, spaceAfter=1
+            f'Alpha-{rl}', fontName=ps(rl), fontSize=9, leading=11, spaceAfter=1
         )
         text_items.append(Paragraph(
             "ABCDEFGHIJKLMNOPQRSTUVWXYZ  abcdefghijklmnopqrstuvwxyz",
@@ -955,12 +1012,12 @@ _rasterize_mod = _imp("rasterize")
 
 def main():
     print("Registering fonts...")
-    registered, _font_file_map = register_all_fonts()
+    registered, _font_file_map, alias_map = register_all_fonts()
     print(f"  {len(registered)} font families registered")
 
     out_pdf = OUT_DIR / "font-timeline-specimen.pdf"
     print(f"Building vector specimen: {out_pdf}")
-    build_specimen(out_pdf, registered)
+    build_specimen(out_pdf, registered, alias_map)
 
     # Build fontmap by introspecting what's actually in the PDF
     print("Introspecting PDF for font map...")

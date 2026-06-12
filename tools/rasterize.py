@@ -15,6 +15,7 @@ Usage:
 Rasterize options:
     --dpi N          Resolution (default: 300)
     --no-aa          Disable anti-aliasing (binary threshold)
+    --color          Render in RGB color instead of grayscale
     --backend STR    'mupdf' (default) or 'poppler'
     --skew DEG       Apply rotational skew in degrees (default: 0)
     --noise          Add paper texture noise + slight darkening
@@ -23,7 +24,7 @@ Rasterize options:
     --scan           Shorthand for --skew 2.0 --noise --speckle --blur 0.7
 
 Prepare options:
-    --dpi, --no-aa, --backend  (same as rasterize)
+    --dpi, --no-aa, --color, --backend  (same as rasterize)
     -d / --output-dir          Output directory (default: same as input)
     -o / --output              Explicit rasterized PDF path
     --fontmap-only             Only build fontmap, skip rasterization
@@ -54,6 +55,7 @@ def rasterize(
     noise=False,
     speckle=False,
     blur_radius=0.0,
+    color=False,
 ):
     """Rasterize *src* vector PDF → *out* raster PDF."""
     import img2pdf
@@ -64,9 +66,9 @@ def rasterize(
     tmpdir = tempfile.mkdtemp(prefix="unscan-raster-")
 
     if backend == "mupdf":
-        pages = _rasterize_mupdf(src, tmpdir, dpi, aa)
+        pages = _rasterize_mupdf(src, tmpdir, dpi, aa, color=color)
     elif backend == "poppler":
-        pages = _rasterize_poppler(src, tmpdir, dpi, aa)
+        pages = _rasterize_poppler(src, tmpdir, dpi, aa, color=color)
     else:
         raise ValueError(f"Unknown backend: {backend}")
 
@@ -74,7 +76,9 @@ def rasterize(
 
     final_pages = []
     for page_path in pages:
-        im = Image.open(page_path).convert("L")
+        im = Image.open(page_path)
+        if not color:
+            im = im.convert("L")
 
         if need_artifacts:
             orig_w, orig_h = im.size
@@ -130,27 +134,33 @@ def rasterize(
 
 # ── Backend: PyMuPDF ─────────────────────────────────────────────────
 
-def _rasterize_mupdf(src, tmpdir, dpi, aa):
+def _rasterize_mupdf(src, tmpdir, dpi, aa, color=False):
     import fitz
     import numpy as np
     from PIL import Image
 
     doc = fitz.open(src)
     mat = fitz.Matrix(dpi / 72, dpi / 72)
+    cs = fitz.csRGB if color else fitz.csGRAY
     pngs = []
     for i, page in enumerate(doc):
         if not aa:
-            pix = page.get_pixmap(matrix=mat, colorspace=fitz.csGRAY,
+            pix = page.get_pixmap(matrix=mat, colorspace=cs,
                                   alpha=False, annots=False)
-            arr = np.frombuffer(pix.samples, dtype=np.uint8).reshape(
-                pix.height, pix.width
-            )
-            arr = ((arr > 128) * 255).astype(np.uint8)
-            img = Image.fromarray(arr, mode="L")
+            arr = np.frombuffer(pix.samples, dtype=np.uint8)
+            if color:
+                arr = arr.reshape(pix.height, pix.width, 3)
+                # Binary threshold per channel
+                arr = ((arr > 128) * 255).astype(np.uint8)
+                img = Image.fromarray(arr, mode="RGB")
+            else:
+                arr = arr.reshape(pix.height, pix.width)
+                arr = ((arr > 128) * 255).astype(np.uint8)
+                img = Image.fromarray(arr, mode="L")
             path = os.path.join(tmpdir, f"page_{i:03d}.png")
             img.save(path, dpi=(dpi, dpi))
         else:
-            pix = page.get_pixmap(matrix=mat, colorspace=fitz.csGRAY, alpha=False)
+            pix = page.get_pixmap(matrix=mat, colorspace=cs, alpha=False)
             path = os.path.join(tmpdir, f"page_{i:03d}.png")
             pix.save(path)
         pngs.append(path)
@@ -159,29 +169,38 @@ def _rasterize_mupdf(src, tmpdir, dpi, aa):
 
 # ── Backend: Poppler (pdftoppm) ──────────────────────────────────────
 
-def _rasterize_poppler(src, tmpdir, dpi, aa):
+def _rasterize_poppler(src, tmpdir, dpi, aa, color=False):
     import numpy as np
     from PIL import Image
 
     prefix = os.path.join(tmpdir, "page")
+    fmt_args = ["-png"] if color else ["-gray"]
     subprocess.run(
-        ["pdftoppm", "-r", str(dpi), "-gray", src, prefix],
+        ["pdftoppm", "-r", str(dpi)] + fmt_args + [src, prefix],
         check=True,
     )
-    pgms = sorted(glob.glob(os.path.join(tmpdir, "page-*.pgm")))
-    assert pgms, f"pdftoppm produced no output in {tmpdir}"
+    # Poppler outputs .pgm for -gray, .png for -png
+    if color:
+        outputs = sorted(glob.glob(os.path.join(tmpdir, "page-*.png")))
+    else:
+        outputs = sorted(glob.glob(os.path.join(tmpdir, "page-*.pgm")))
+    assert outputs, f"pdftoppm produced no output in {tmpdir}"
 
     pngs = []
-    for pgm in pgms:
-        img = Image.open(pgm).convert("L")
+    for raw in outputs:
+        img = Image.open(raw)
+        if not color:
+            img = img.convert("L")
         if not aa:
             arr = np.array(img)
             arr = ((arr > 128) * 255).astype(np.uint8)
-            img = Image.fromarray(arr, mode="L")
-        png = pgm.replace(".pgm", ".png")
+            mode = "RGB" if color else "L"
+            img = Image.fromarray(arr, mode=mode)
+        png = raw.replace(".pgm", ".png") if raw.endswith(".pgm") else raw
         img.save(png, dpi=(dpi, dpi))
         pngs.append(png)
-        os.remove(pgm)
+        if raw != png:
+            os.remove(raw)
     return pngs
 
 
@@ -257,6 +276,7 @@ def cmd_rasterize(args):
         noise=args.noise,
         speckle=args.speckle,
         blur_radius=args.blur,
+        color=args.color,
     )
     print(f"Rasterized: {args.output}")
 
@@ -300,6 +320,8 @@ def cmd_prepare(args):
         rasterized_path = Path(args.output)
     else:
         suffix = "-noaa" if args.no_aa else ""
+        if args.color:
+            suffix += "-color"
         rasterized_path = out_dir / f"{stem}-rasterized{suffix}.pdf"
     fontmap_path = out_dir / f"{stem}-fontmap.json"
 
@@ -315,9 +337,11 @@ def cmd_prepare(args):
     # --- Rasterize ---
     if not args.fontmap_only:
         aa_label = "no-AA" if args.no_aa else "AA"
-        print(f"Rasterizing at {args.dpi} DPI, {aa_label} ({args.backend})...")
+        color_label = ", color" if args.color else ""
+        print(f"Rasterizing at {args.dpi} DPI, {aa_label}{color_label} ({args.backend})...")
         rasterize(pdf_path, rasterized_path,
-                  dpi=args.dpi, backend=args.backend, aa=not args.no_aa)
+                  dpi=args.dpi, backend=args.backend, aa=not args.no_aa,
+                  color=args.color)
         print(f"  Rasterized: {rasterized_path}")
 
     # --- Summary ---
@@ -338,6 +362,7 @@ def _add_raster_args(p):
     """Add common rasterization arguments to a subparser."""
     p.add_argument("--dpi", type=int, default=300)
     p.add_argument("--no-aa", action="store_true", help="Disable anti-aliasing")
+    p.add_argument("--color", action="store_true", help="Render in RGB color instead of grayscale")
     p.add_argument("--backend", choices=["mupdf", "poppler"], default="mupdf")
 
 

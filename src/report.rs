@@ -76,21 +76,25 @@ fn truncate(s: &str, max: usize) -> &str {
 
 // ── Font resolution ─────────────────────────────────────────────────────────
 
-/// Try to find a font entry in the catalog that matches a ground-truth font name.
+/// Try to find a font entry in the catalog matching a ground-truth font name.
+/// GT BaseFont names are PostScript names (name ID 6), so we do an exact
+/// lookup against each entry's postscript_name. No heuristics.
 fn find_font_in_catalog<'a>(
     font_catalog: &'a [FontEntry],
     gt_font_name: &str,
 ) -> Option<&'a FontEntry> {
-    // Try each entry: compare family_name, font_key stem, etc.
+    let gt_stripped = ground_truth::strip_subset_prefix_str(gt_font_name);
+    // Exact PostScript name match (default/base entries only — variants share
+    // the same PS name, so prefer the base entry with empty variant_tag).
     for fe in font_catalog {
-        if ground_truth::fonts_match(&fe.family_name, gt_font_name) {
+        if fe.variant_tag.is_empty() && fe.postscript_name == gt_stripped {
             return Some(fe);
         }
-        // Also try the filename stem
-        if let Some(stem) = fe.path.file_stem().and_then(|s| s.to_str()) {
-            if ground_truth::fonts_match(stem, gt_font_name) {
-                return Some(fe);
-            }
+    }
+    // If no base entry matched, try variant entries too
+    for fe in font_catalog {
+        if fe.postscript_name == gt_stripped {
+            return Some(fe);
         }
     }
     None
@@ -159,7 +163,8 @@ fn pick_interesting_chars(
 /// Find the diag-seg line directory for an audit entry.
 fn find_diag_seg_dir(audit_root: &Path, page: usize, line_index: usize) -> Option<PathBuf> {
     let prefix = format!("p{page}_L{line_index:03}_");
-    for entry in std::fs::read_dir(audit_root).ok()? {
+    let rd = std::fs::read_dir(audit_root).ok()?;
+    for entry in rd {
         if let Ok(e) = entry {
             let name = e.file_name();
             let name_str = name.to_string_lossy();
@@ -169,6 +174,7 @@ fn find_diag_seg_dir(audit_root: &Path, page: usize, line_index: usize) -> Optio
             }
         }
     }
+    eprintln!("[report] find_diag_seg_dir: no dir for prefix '{}' in {:?}", prefix, audit_root);
     None
 }
 
@@ -256,6 +262,7 @@ fn classify_entries<'a>(
     entries: &'a [AuditEntry],
     gt: Option<&GroundTruth>,
     dpi: u32,
+    font_catalog: &[FontEntry],
 ) -> Vec<ClassifiedEntry<'a>> {
     entries
         .iter()
@@ -275,8 +282,14 @@ fn classify_entries<'a>(
                 let kind = if e.decision == Decision::KeptRaster {
                     MissKind::KeptRaster
                 } else if let Some(ref actual) = actual_font {
-                    let matched = e.font_matched.as_deref().unwrap_or("");
-                    if ground_truth::fonts_match(matched, actual) {
+                    // Compare via PostScript name (exact).
+                    // The chosen CI candidate's font file knows its own PS name;
+                    // the GT BaseFont IS the PS name.
+                    let ps_match = e.ci_candidates.first().and_then(|c| {
+                        find_font_by_key(font_catalog, &c.font_key)
+                    }).map_or(false, |fe| fe.postscript_name == *actual);
+
+                    if ps_match {
                         if e.ssim_pass == Some(false) {
                             MissKind::SsimFailure
                         } else {
@@ -313,21 +326,20 @@ fn classify_entries<'a>(
 
 // ── CI candidate lookup ─────────────────────────────────────────────────────
 
+/// Strip directory and file extension from a font key while preserving the
 fn find_correct_ci_candidate(
     entry: &AuditEntry,
     actual_font: &str,
+    font_catalog: &[FontEntry],
 ) -> (Option<String>, Option<f32>, Option<usize>) {
+    let gt_ps = ground_truth::strip_subset_prefix_str(actual_font);
+
+    // Match CI candidate's PostScript name against GT BaseFont.
+    // Exact lookup — no heuristics.
     for (i, c) in entry.ci_candidates.iter().enumerate() {
-        if ground_truth::fonts_match(&c.font_key, actual_font) {
-            return (Some(c.font_key.clone()), Some(c.score), Some(i + 1));
-        }
-        // Also try filename stem
-        if let Some(stem) = Path::new(&c.font_key)
-            .file_stem()
-            .and_then(|s| s.to_str())
-        {
-            if ground_truth::fonts_match(stem, actual_font) {
-                return (Some(c.font_key.clone()), Some(c.score), Some(i + 1));
+        if let Some(fe) = find_font_by_key(font_catalog, &c.font_key) {
+            if fe.postscript_name == gt_ps {
+                return (Some(c.font_key.clone()), c.score, Some(i + 1));
             }
         }
     }
@@ -349,7 +361,7 @@ fn build_miss_block(
     // Find correct font CI candidate
     let (gt_key, gt_score, gt_rank) =
         if let Some(ref af) = ce.actual_font {
-            find_correct_ci_candidate(entry, af)
+            find_correct_ci_candidate(entry, af, font_catalog)
         } else {
             (None, None, None)
         };
@@ -384,30 +396,16 @@ fn build_miss_block(
         String::new()
     };
 
-    // Scan line image (ssim_scan.png shows the scanned line region)
-    let scan_line_html = if let Some(ref dd) = diag_dir {
-        let scan_path = dd.join("ssim_scan.png");
-        if scan_path.exists() {
-            if let Some(uri) = file_to_b64_uri(&scan_path) {
-                format!(
-                    "<div class=\"scan-line-block\">\
-                     <div class=\"scan-line-label\">Scan line</div>\
-                     <img src=\"{uri}\" class=\"scan-line-img\">\
-                     </div>"
-                )
-            } else {
-                String::new()
-            }
-        } else {
-            String::new()
-        }
+    // CI tie-break comparison block
+    let tie_break_html = if let Some(ref dd) = diag_dir {
+        build_tie_break_block(entry, dd)
     } else {
         String::new()
     };
 
-    // Segmentation stats (per-word segment info from word_*/seg_plain/summary.json)
-    let seg_stats_html = if let Some(ref dd) = diag_dir {
-        build_seg_stats(dd, entry)
+    // Scan line image with word bbox + segmentation overlays
+    let scan_line_html = if let Some(ref dd) = diag_dir {
+        build_scan_line_with_overlays(dd, entry)
     } else {
         String::new()
     };
@@ -442,15 +440,19 @@ fn build_miss_block(
             gt_score,
             font_data_cache,
             diag_dir.as_deref(),
+            font_catalog,
         )
     };
 
     let text_preview = truncate(&entry.text, 60);
     let miss_kind_label = match ce.kind {
-        MissKind::FontMiss => "",
-        MissKind::SsimFailure => " [SSIM failure]",
-        MissKind::KeptRaster => " [kept raster]",
-        _ => "",
+        MissKind::FontMiss => {
+            // Show expected→got summary for font misses
+            format!(" [font: expected {}, got {}]", actual_font, matched)
+        },
+        MissKind::SsimFailure => " [SSIM failure]".to_string(),
+        MissKind::KeptRaster => " [kept raster]".to_string(),
+        _ => String::new(),
     };
 
     format!(
@@ -462,7 +464,260 @@ fn build_miss_block(
          {}\
          </div>",
         entry.page, entry.line_index, text_preview, miss_kind_label, ssim_html,
-        scan_line_html, seg_stats_html, ssim_compare_html, char_table_html,
+        scan_line_html, ssim_compare_html, tie_break_html, char_table_html,
+    )
+}
+
+/// Build scan line image with word bbox and segmentation path overlays.
+/// Replicates the Python char-misses.py `render_scan_line_with_word_boxes()`:
+///   - scan_line.png as the background (colour crop of the word-union region)
+///   - Raw Tesseract word bboxes: dotted orange outlines
+///   - Final post-processed word bboxes: dashed cyan outlines
+///   - VP splits: blue vertical lines with column labels
+///   - Seam paths: magenta diagonal paths with column labels
+///   - Pixel-scale ruler at top of each final word box
+fn build_scan_line_with_overlays(diag_dir: &Path, entry: &AuditEntry) -> String {
+    // Prefer scan_line.png (full-colour); fall back to ssim_scan.png (grayscale)
+    let scan_path = diag_dir.join("scan_line.png");
+    let origin_path = diag_dir.join("scan_line_origin.json");
+    let (img_uri, crop_x, crop_y) = if scan_path.exists() {
+        let uri = match file_to_b64_uri(&scan_path) {
+            Some(u) => u,
+            None => return String::new(),
+        };
+        // Read crop origin
+        let (ox, oy) = if let Ok(data) = std::fs::read_to_string(&origin_path) {
+            let v: serde_json::Value = serde_json::from_str(&data).unwrap_or_default();
+            (
+                v["x"].as_u64().unwrap_or(0) as u32,
+                v["y"].as_u64().unwrap_or(0) as u32,
+            )
+        } else {
+            (entry.bbox.x, entry.bbox.y)
+        };
+        (uri, ox, oy)
+    } else {
+        // Fall back to ssim_scan.png
+        let ssim_path = diag_dir.join("ssim_scan.png");
+        if !ssim_path.exists() {
+            return String::new();
+        }
+        match file_to_b64_uri(&ssim_path) {
+            Some(u) => (u, entry.bbox.x, entry.bbox.y),
+            None => return String::new(),
+        }
+    };
+
+    // Get image dimensions for the container
+    let (img_w, img_h) = if scan_path.exists() {
+        image::image_dimensions(&scan_path)
+            .unwrap_or((entry.bbox.width, entry.bbox.height))
+    } else {
+        let ssim_path = diag_dir.join("ssim_scan.png");
+        image::image_dimensions(&ssim_path)
+            .unwrap_or((entry.bbox.width, entry.bbox.height))
+    };
+
+    let scale = 3u32; // 3× upscale to match Python
+    let margin_top = 18 * scale;
+    let margin_bot = 14 * scale;
+    let canvas_w = img_w * scale;
+    let canvas_h = img_h * scale + margin_top + margin_bot;
+
+    let mut overlays = String::new();
+
+    // Raw Tesseract boxes — dotted orange
+    for wb in &entry.word_bboxes_raw {
+        let bx = (wb.x.saturating_sub(crop_x)) * scale;
+        let by = (wb.y.saturating_sub(crop_y)) * scale + margin_top;
+        let bw = wb.width * scale;
+        let bh = wb.height * scale;
+        overlays.push_str(&format!(
+            "<div style=\"position:absolute;left:{bx}px;top:{by}px;width:{bw}px;height:{bh}px;\
+             border:1px dotted rgba(255,160,0,0.8);pointer-events:none;\"></div>"
+        ));
+    }
+
+    // Final post-processed boxes — dashed cyan
+    for wb in &entry.word_bboxes {
+        let bx = (wb.x.saturating_sub(crop_x)) * scale;
+        let by = (wb.y.saturating_sub(crop_y)) * scale + margin_top;
+        let bw = wb.width * scale;
+        let bh = wb.height * scale;
+        overlays.push_str(&format!(
+            "<div style=\"position:absolute;left:{bx}px;top:{by}px;width:{bw}px;height:{bh}px;\
+             border:1px dashed rgba(0,200,220,0.85);pointer-events:none;\"></div>"
+        ));
+
+        // Pixel-scale ruler at top of each final word box
+        let wb_px_w = wb.width;
+        let mut col = 0u32;
+        while col <= wb_px_w {
+            let sx = bx + col * scale + scale / 2;
+            if col % 10 == 0 {
+                // Major tick + label
+                overlays.push_str(&format!(
+                    "<div style=\"position:absolute;left:{sx}px;top:{}px;width:1px;height:6px;\
+                     background:rgba(140,140,140,0.7);pointer-events:none;\"></div>\
+                     <div style=\"position:absolute;left:{}px;top:{}px;\
+                     font-size:7px;color:rgba(120,120,120,0.8);pointer-events:none;\">{col}</div>",
+                    by.saturating_sub(6), sx.saturating_sub(8), by.saturating_sub(18)
+                ));
+            } else {
+                // Minor tick
+                overlays.push_str(&format!(
+                    "<div style=\"position:absolute;left:{sx}px;top:{}px;width:1px;height:3px;\
+                     background:rgba(180,180,180,0.6);pointer-events:none;\"></div>",
+                    by.saturating_sub(3)
+                ));
+            }
+            col += 5;
+        }
+    }
+
+    // Segmentation paths from diag-seg summary.json
+    if let Ok(rd) = std::fs::read_dir(diag_dir) {
+        let mut word_dirs: Vec<_> = rd
+            .filter_map(|e| e.ok())
+            .filter(|e| {
+                e.file_name().to_string_lossy().starts_with("word_")
+                    && e.path().is_dir()
+            })
+            .collect();
+        word_dirs.sort_by_key(|d| d.file_name().to_string_lossy().to_string());
+
+        for wd in &word_dirs {
+            let wpath = wd.path();
+            let data_path = {
+                let sp = wpath.join("seg_plain");
+                if sp.is_dir() { sp } else { wpath.clone() }
+            };
+            let summary_path = data_path.join("summary.json");
+            if !summary_path.exists() {
+                continue;
+            }
+            let summary: serde_json::Value = match std::fs::read_to_string(&summary_path)
+                .ok()
+                .and_then(|s| serde_json::from_str(&s).ok())
+            {
+                Some(v) => v,
+                None => continue,
+            };
+
+            let word_text = summary["word_text"].as_str().unwrap_or("");
+            let seg_img_w = summary["image_w"].as_u64().unwrap_or(0) as u32;
+            let seg_img_h = summary["image_h"].as_u64().unwrap_or(0) as u32;
+            if seg_img_w == 0 || seg_img_h == 0 {
+                continue;
+            }
+
+            // Find matching word bbox
+            let matching_wb = entry.word_bboxes.iter().find(|wb| wb.text == word_text);
+            let matching_wb = match matching_wb {
+                Some(wb) => wb,
+                None => continue,
+            };
+
+            let wx = (matching_wb.x.saturating_sub(crop_x)) * scale;
+            let wy = (matching_wb.y.saturating_sub(crop_y)) * scale + margin_top;
+            let wb_h = matching_wb.height * scale;
+
+            // Scale factors: seg boundaries are in word image pixels
+            let sx_f = matching_wb.width as f64 / seg_img_w as f64 * scale as f64;
+            let sy_f = matching_wb.height as f64 / seg_img_h as f64 * scale as f64;
+
+            let label_y = wy + wb_h + 2;
+
+            // VP splits — blue vertical lines
+            if let Some(vp_arr) = summary["vp_splits"].as_array() {
+                for vp in vp_arr {
+                    if let Some(col) = vp.as_u64() {
+                        let cx = wx + (col as f64 * sx_f) as u32;
+                        overlays.push_str(&format!(
+                            "<div style=\"position:absolute;left:{cx}px;top:{wy}px;width:1px;height:{wb_h}px;\
+                             background:rgba(40,100,220,0.8);pointer-events:none;\"></div>\
+                             <div style=\"position:absolute;left:{}px;top:{label_y}px;\
+                             font-size:7px;color:rgba(40,100,220,0.9);pointer-events:none;\">{col}</div>",
+                            cx.saturating_sub(6)
+                        ));
+                    }
+                }
+            }
+
+            // Seam paths — magenta diagonal paths (one x per row)
+            if let Some(seam_obj) = summary["seam_paths"].as_object() {
+                for (col_key, path_arr) in seam_obj {
+                    if let Some(path) = path_arr.as_array() {
+                        for (row_idx, px) in path.iter().enumerate() {
+                            if let Some(col_px) = px.as_u64() {
+                                let px_x = wx + (col_px as f64 * sx_f) as u32;
+                                let px_y = wy + (row_idx as f64 * sy_f) as u32;
+                                let dot_pad = scale.max(1) / 3;
+                                overlays.push_str(&format!(
+                                    "<div style=\"position:absolute;left:{}px;top:{px_y}px;\
+                                     width:{}px;height:{}px;\
+                                     background:rgba(255,0,200,0.8);pointer-events:none;\"></div>",
+                                    px_x.saturating_sub(dot_pad),
+                                    dot_pad * 2 + 1,
+                                    scale.max(1),
+                                ));
+                            }
+                        }
+                        // Column label
+                        let nominal_col = col_key.parse::<u64>().unwrap_or(0);
+                        let cx = wx + (nominal_col as f64 * sx_f) as u32;
+                        overlays.push_str(&format!(
+                            "<div style=\"position:absolute;left:{}px;top:{label_y}px;\
+                             font-size:7px;color:rgba(255,0,200,0.9);pointer-events:none;\">{col_key}</div>",
+                            cx.saturating_sub(6)
+                        ));
+                    }
+                }
+            }
+
+            // Seam splits without paths — magenta vertical lines
+            let seam_path_keys: std::collections::HashSet<String> = summary["seam_paths"]
+                .as_object()
+                .map(|m| m.keys().cloned().collect())
+                .unwrap_or_default();
+            if let Some(seam_arr) = summary["seam_splits"].as_array() {
+                for seam in seam_arr {
+                    if let Some(col) = seam.as_u64() {
+                        if !seam_path_keys.contains(&col.to_string()) {
+                            let cx = wx + (col as f64 * sx_f) as u32;
+                            overlays.push_str(&format!(
+                                "<div style=\"position:absolute;left:{cx}px;top:{wy}px;width:1px;height:{wb_h}px;\
+                                 background:rgba(255,0,200,0.7);pointer-events:none;\"></div>\
+                                 <div style=\"position:absolute;left:{}px;top:{label_y}px;\
+                                 font-size:7px;color:rgba(255,0,200,0.9);pointer-events:none;\">{col}</div>",
+                                cx.saturating_sub(6)
+                            ));
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    // Build the segmentation stats line
+    let seg_stats = build_seg_stats(diag_dir, entry);
+
+    format!(
+        "<div class=\"scan-line-block\">\
+         <div class=\"scan-line-label\">\
+         Scan line: <span style=\"color:#ffa000\">···</span> raw box · \
+         <span style=\"color:#00c8dc\">- -</span> final box · \
+         <span style=\"color:#2864dc\">│</span> v-whitespace · \
+         <span style=\"color:#ff00c8\">╲</span> seam</div>\
+         <div style=\"position:relative;display:inline-block;width:{canvas_w}px;height:{canvas_h}px;overflow:visible;\">\
+         <img src=\"{img_uri}\" style=\"position:absolute;left:0;top:{margin_top}px;\
+         width:{cw}px;height:{ch}px;image-rendering:pixelated;\" class=\"scan-line-img\">\
+         {overlays}\
+         </div>\
+         {seg_stats}\
+         </div>",
+        cw = img_w * scale,
+        ch = img_h * scale,
     )
 }
 
@@ -559,6 +814,7 @@ fn build_seg_stats(diag_dir: &Path, entry: &AuditEntry) -> String {
     format!("<div class=\"scan-line-label\">Segmentation: {stats}</div>")
 }
 
+
 fn build_ssim_block(
     diag_dir: &Path,
     correct_font: &str,
@@ -617,6 +873,92 @@ fn build_ssim_block(
     )
 }
 
+/// Build an SSIM tie-break comparison block showing each tied candidate's
+/// render, diff, and SSIM score.
+fn build_tie_break_block(
+    entry: &AuditEntry,
+    diag_dir: &Path,
+) -> String {
+    if entry.tie_candidates.is_empty() {
+        return String::new();
+    }
+
+    // Load scan image (shared across all candidates)
+    let scan_uri = {
+        // Try tie_0/ssim_scan.png first, then fall back to parent ssim_scan.png
+        let tie0_scan = diag_dir.join("tie_0").join("ssim_scan.png");
+        let parent_scan = diag_dir.join("ssim_scan.png");
+        let scan_path = if tie0_scan.exists() { tie0_scan } else { parent_scan };
+        match file_to_b64_uri(&scan_path) {
+            Some(u) => u,
+            None => return String::new(),
+        }
+    };
+
+    let mut rows = String::new();
+
+    // Header row with candidate names
+    let mut header = String::from("<tr><th></th>");
+    for tc in &entry.tie_candidates {
+        let winner_marker = if tc.winner { " ✓" } else { "" };
+        header.push_str(&format!(
+            "<th class=\"{}\">{}{}</th>",
+            if tc.winner { "tie-winner" } else { "tie-loser" },
+            tc.family_name,
+            winner_marker,
+        ));
+    }
+    header.push_str("</tr>");
+    rows.push_str(&header);
+
+    // Scan row (same image for all)
+    rows.push_str(&format!(
+        "<tr><td class=\"ssim-label\">Scan</td><td colspan=\"{}\"><img src=\"{}\" class=\"ssim-compare-img\"></td></tr>",
+        entry.tie_candidates.len(), scan_uri
+    ));
+
+    // Render row — one image per candidate
+    rows.push_str("<tr><td class=\"ssim-label\">Render</td>");
+    for (ti, _tc) in entry.tie_candidates.iter().enumerate() {
+        let render_path = diag_dir.join(format!("tie_{}", ti)).join("ssim_render.png");
+        if let Some(uri) = file_to_b64_uri(&render_path) {
+            rows.push_str(&format!("<td><img src=\"{}\" class=\"ssim-compare-img\"></td>", uri));
+        } else {
+            rows.push_str("<td>—</td>");
+        }
+    }
+    rows.push_str("</tr>");
+
+    // Diff row — one image per candidate
+    rows.push_str("<tr><td class=\"ssim-label\">Diff</td>");
+    for (ti, _tc) in entry.tie_candidates.iter().enumerate() {
+        let diff_path = diag_dir.join(format!("tie_{}", ti)).join("ssim_diff.png");
+        if let Some(uri) = file_to_b64_uri(&diff_path) {
+            rows.push_str(&format!("<td><img src=\"{}\" class=\"ssim-compare-img\"></td>", uri));
+        } else {
+            rows.push_str("<td>—</td>");
+        }
+    }
+    rows.push_str("</tr>");
+
+    // SSIM score row
+    rows.push_str("<tr><td class=\"ssim-label\">SSIM</td>");
+    for tc in &entry.tie_candidates {
+        let class = if tc.winner { "tie-winner" } else { "tie-loser" };
+        rows.push_str(&format!(
+            "<td class=\"{}\">{:.4}</td>", class, tc.ssim_score
+        ));
+    }
+    rows.push_str("</tr>");
+
+    format!(
+        "<div class=\"tie-break-block\">\
+         <div class=\"tie-break-title\">CI Tie-Break ({} candidates, SSIM decides)</div>\
+         <table class=\"ssim-compare-table\">{}</table></div>",
+        entry.tie_candidates.len(), rows
+    )
+}
+
 fn build_char_table(
     entry: &AuditEntry,
     chars_to_show: &[(usize, &crate::audit::CharCiVote)],
@@ -629,6 +971,7 @@ fn build_char_table(
     gt_score: Option<f32>,
     font_data_cache: &mut FontDataCache,
     diag_dir: Option<&Path>,
+    font_catalog: &[FontEntry],
 ) -> String {
     let mut rows = String::new();
 
@@ -688,10 +1031,13 @@ fn build_char_table(
             if let Some(d) = cv.gt_font_dist_sq {
                 return Some(d);
             }
-            // Check nearest
+            // Check nearest via PostScript name match
+            let gt_ps = ground_truth::strip_subset_prefix_str(correct_font_name);
             for (nf, nd) in &cv.nearest {
-                if ground_truth::fonts_match(nf, correct_font_name) {
-                    return Some(*nd);
+                if let Some(fe) = find_font_by_key(font_catalog, nf) {
+                    if fe.postscript_name == gt_ps {
+                        return Some(*nd);
+                    }
                 }
             }
             None
@@ -768,23 +1114,22 @@ fn build_char_table(
         _ => "not in CI".into(),
     };
 
+    // The chosen font is always CI candidate #1
     let chosen_rank_info = entry
         .ci_candidates
-        .iter()
-        .enumerate()
-        .find(|(_, c)| {
-            ground_truth::fonts_match(&c.font_key, chosen_font_name)
-                || Path::new(&c.font_key)
-                    .file_stem()
-                    .and_then(|s| s.to_str())
-                    .map(|s| ground_truth::fonts_match(s, chosen_font_name))
-                    .unwrap_or(false)
+        .first()
+        .map(|c| {
+            match c.score {
+                Some(s) => format!("CI #1, score {:.10}", s),
+                None => format!("CI #1, score n/a (injected)"),
+            }
         })
-        .map(|(i, c)| format!("CI #{}, score {:.10}", i + 1, c.score))
         .unwrap_or_default();
 
-    // If fonts_match(matched, correct), show the correct name for both
-    let display_chosen = if ground_truth::fonts_match(chosen_font_name, correct_font_name) {
+    // If chosen font has same PostScript name as correct, show the correct name for both
+    let chosen_ps = chosen_fe.map(|fe| fe.postscript_name.as_str()).unwrap_or("");
+    let correct_ps = ground_truth::strip_subset_prefix_str(correct_font_name);
+    let display_chosen = if chosen_ps == correct_ps {
         correct_font_name
     } else {
         chosen_font_name
@@ -871,6 +1216,15 @@ img.ci {
   max-width: 100%; image-rendering: pixelated;
   border: 1px solid #ddd; display: block; margin: 2px 0;
 }
+.tie-break-block {
+  margin: 8px 0 10px 0; padding: 8px; background: #fff8f0;
+  border: 1px solid #dca; border-radius: 4px;
+}
+.tie-break-title {
+  font-size: 11px; font-weight: 700; color: #c60; margin-bottom: 6px;
+}
+.tie-winner { background: #e8ffe8; font-weight: 600; }
+.tie-loser { background: #fff0f0; }
 .scan-line-block {
   margin: 6px 0 10px 0; padding: 8px; background: #f0f4f0;
   border: 1px solid #c0c8c0; border-radius: 4px; overflow-x: auto;
@@ -893,7 +1247,7 @@ pub fn generate_report(
     dpi: u32,
     font_catalog: &[FontEntry],
 ) -> Result<(), String> {
-    let classified = classify_entries(entries, gt, dpi);
+    let classified = classify_entries(entries, gt, dpi, font_catalog);
 
     let mut hits = 0usize;
     let mut font_misses: Vec<&ClassifiedEntry> = Vec::new();
@@ -1000,6 +1354,23 @@ pub fn generate_report(
         String::new()
     };
 
+    // SSIM percentiles across all lines that have an SSIM score
+    let ssim_percentile_str = {
+        let mut ssim_vals: Vec<f32> = entries.iter()
+            .filter_map(|e| e.ssim_score)
+            .collect();
+        ssim_vals.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
+        if ssim_vals.is_empty() {
+            String::new()
+        } else {
+            let n = ssim_vals.len();
+            let p50 = ssim_vals[n / 2];
+            let p90_idx = (n as f64 * 0.9).ceil() as usize;
+            let p90 = ssim_vals[p90_idx.min(n - 1)];
+            format!(" | SSIM p50={p50:.4} p90={p90:.4} (n={n})")
+        }
+    };
+
     let html = format!(
         "<!DOCTYPE html>\n\
          <html>\n\
@@ -1011,7 +1382,7 @@ pub fn generate_report(
          {CSS}\n\
          <h2>unscan miss report</h2>\n\
          <div class=\"summary\">{hits}/{compared} correct ({pct:.1}%) — \
-         {all_misses} misses shown below{ssim_miss_str}{raster_str}{ocr_corr_str}</div>\n\
+         {all_misses} misses shown below{ssim_miss_str}{raster_str}{ocr_corr_str}{ssim_percentile_str}</div>\n\
          <div class=\"score-legend\">\n\
          <b>Score key:</b>\n\
          <b>CI score</b> (per-line) = −mean(log(dist²)) across characters; \
