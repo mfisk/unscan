@@ -39,9 +39,9 @@ const FEAT_NAMES: &[&str] = &[
     "row8","row9","row10","row11","row12","row13","row14","row15",
     "row16","row17","row18","row19","row20","row21","row22","row23",
     "row24","row25","row26","row27","row28","row29","row30","row31",
-    // Group 5: Scalar v3 (10)
+    // Group 5: Scalar v3 (11)
     "hole_count","h_symmetry","v_symmetry","skel_branch","skel_endpt",
-    "corner_count","quad_tl","quad_tr","quad_bl","quad_br",
+    "corner_count","quad_tl","quad_tr","quad_bl","quad_br","mean_stroke_w",
 ];
 
 /// Render a character at a given simulated DPI.
@@ -348,7 +348,7 @@ fn main() {
     println!("  {:30}  current: 0.3000  optimal: {:.4}", "Scalar v1 (7 dims)", scal_v1_wt);
     println!("  {:30}  current: 0.3000  optimal: {:.4}", "Scalar v2 (18 dims)", scal_v2_wt);
     println!("  {:30}  current: 0.3000  optimal: {:.4}", "Row profile (32 dims)", row_prof_wt);
-    println!("  {:30}  current: 0.2000  optimal: {:.4}", "Scalar v3 (10 dims)", scal_v3_wt);
+    println!("  {:30}  current: 0.2000  optimal: {:.4}", "Scalar v3 (11 dims)", scal_v3_wt);
 
     // Scalar detail — all scalar groups
     println!("\n={:=>94}", "");
@@ -370,7 +370,7 @@ fn main() {
     println!("\n={:=>94}", "");
     println!("SCALAR FEATURES — v3");
     println!("={:=>94}", "");
-    for j in 0..10 {
+    for j in 0..11 {
         let i = 89 + j;
         println!("  {:>16}  signal={:.6}  noise={:.6}  fisher={:.2}  wt={:.4}",
             FEAT_NAMES[i], signal[i], noise[i], fisher[i], norm_weights[i]);
@@ -386,7 +386,7 @@ fn main() {
         (32, 39, "Scalar v1"),
         (39, 57, "Scalar v2"),
         (57, 89, "Row profile"),
-        (89, 99, "Scalar v3"),
+        (89, 100, "Scalar v3"),
     ] {
         let vals: Vec<String> = (start..end).map(|i| format!("{:.6}", norm_scale_adj[i])).collect();
         println!("    // {}", label);

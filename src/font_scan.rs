@@ -649,6 +649,57 @@ fn read_postscript_name(data: &[u8]) -> String {
     String::new()
 }
 
+/// Font identity for major/minor miss classification.
+/// Read from the font's name table and OS/2 table — no string munging.
+#[derive(Debug, Clone)]
+pub struct FontIdentity {
+    /// Typographic family: name ID 16 if present, else name ID 1.
+    pub family: String,
+    /// OS/2 usWeightClass (400 = Regular, 500 = Medium, 700 = Bold, etc.)
+    pub weight: u16,
+    /// OS/2 fsSelection italic bit.
+    pub italic: bool,
+}
+
+impl FontIdentity {
+    /// Weight bucket: 100-unit ranges (400–499 = Regular, 500–599 = Medium, etc.)
+    pub fn weight_bucket(&self) -> u16 {
+        self.weight / 100
+    }
+
+    /// Two fonts are a "major" difference if family, italic, or weight bucket differ.
+    pub fn is_major_diff(&self, other: &FontIdentity) -> bool {
+        self.family != other.family
+            || self.italic != other.italic
+            || self.weight_bucket() != other.weight_bucket()
+    }
+}
+
+/// Read font identity from a font file path. Returns None on parse failure.
+pub fn read_font_identity(path: &Path) -> Option<FontIdentity> {
+    use rustybuzz::ttf_parser;
+    let data = std::fs::read(path).ok()?;
+    let face = ttf_parser::Face::parse(&data, 0).ok()?;
+
+    // Name ID 16 (typographic family) if present, else name ID 1 (family).
+    let mut nid1: Option<String> = None;
+    let mut nid16: Option<String> = None;
+    for name in face.names() {
+        if name.name_id == 16 && nid16.is_none() {
+            nid16 = name.to_string();
+        }
+        if name.name_id == 1 && nid1.is_none() {
+            nid1 = name.to_string();
+        }
+    }
+    let family = nid16.or(nid1)?;
+
+    let weight = face.tables().os2.map(|os2| os2.weight().to_number()).unwrap_or(400);
+    let italic = face.is_italic();
+
+    Some(FontIdentity { family, weight, italic })
+}
+
 fn load_font_entry(path: &Path, aliases: &HashMap<String, Alias>) -> Option<FontEntry> {
     let data = std::fs::read(path).ok()?;
 

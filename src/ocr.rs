@@ -769,6 +769,7 @@ pub fn split_wide_whitespace_words(
     ink_threshold: u8,
     char_index: Option<&crate::char_index::CharIndex>,
     font_cache: Option<&crate::font_cache::FontCache>,
+    classifier: &dyn crate::classifier::Classifier,
 ) {
     let (page_w, page_h) = gray.dimensions();
     let mut total_splits = 0u32;
@@ -818,7 +819,7 @@ pub fn split_wide_whitespace_words(
             }
             if crops.is_empty() { return None; }
 
-            let result = crate::char_index::search_candidates(ci, &crops, 1.0, false);
+            let result = crate::char_index::search_candidates(ci, &crops, 1.0, false, classifier);
             let font_key = result.scores.first().map(|(name, _)| name.clone())?;
 
             let font_path = if font_key.contains('|') {

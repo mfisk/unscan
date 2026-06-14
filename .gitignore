@@ -16,3 +16,17 @@ test-docs/font-timeline-specimen-rasterized.pdf.old
 test-docs/font-timeline-specimen-fontmap.json
 test-docs/ligature-test-fontmap.json
 __pycache__/
+
+# Training artifacts
+.train_feat_tmp/
+*.log
+fisher-weights.bin
+triplet-weights-*.bin
+weights_smoke.bin
+fisher_smoke.bin
+audit-results/
+test-docs/fisher-audit/
+test-docs/triplet-audit/
+hillclimb_best.txt
+hillclimb_log.jsonl
+Cargo.toml.bak
