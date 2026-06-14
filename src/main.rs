@@ -386,6 +386,74 @@ fn run_index(args: &cli::Args, classifier: &dyn classifier::Classifier) -> Resul
     Ok(())
 }
 
+/// Reconstruct a font catalog from cached index metadata.
+fn catalog_from_meta(index: &char_index::CharIndex) -> Vec<font_scan::FontEntry> {
+    index.font_meta.iter().map(|(_key, meta)| {
+        font_scan::FontEntry {
+            path: meta.path.clone(),
+            family_name: meta.family_name.clone(),
+            postscript_name: meta.postscript_name.clone(),
+            is_bold: meta.is_bold,
+            is_italic: meta.is_italic,
+            class: match meta.class {
+                0 => font_scan::FontClass::Serif,
+                1 => font_scan::FontClass::Sans,
+                2 => font_scan::FontClass::Mono,
+                _ => font_scan::FontClass::Unknown,
+            },
+            data: Vec::new(),
+            oldstyle_figures: meta.oldstyle_figures,
+            variant_tag: meta.variant_tag.clone(),
+            glyph_overrides: meta.glyph_overrides.clone(),
+        }
+    }).collect()
+}
+
+/// Scan fonts from filesystem, build char index, and return both.
+fn scan_and_build_index(
+    args: &cli::Args,
+    classifier: &dyn classifier::Classifier,
+) -> Result<(char_index::CharIndex, Vec<font_scan::FontEntry>), ScanTextError> {
+    let font_dirs = font_scan::default_font_dirs(&args.font_dir);
+    info!("Scanning for fonts…");
+    let _t_scan = std::time::Instant::now();
+    let font_catalog = font_scan::scan_fonts(&font_dirs);
+    eprintln!("  PROF font_scan: {:.2}s ({} fonts)", _t_scan.elapsed().as_secs_f64(), font_catalog.len());
+    if font_catalog.is_empty() {
+        return Err(ScanTextError::NoFonts);
+    }
+
+    let index_path = args.resolved_index_path();
+    info!("Building character index ({} fonts × {} chars)…",
+        font_catalog.len(), char_index::indexed_chars().len());
+    let start = std::time::Instant::now();
+    let pairs: Vec<(String, PathBuf, char_index::GlyphOverrides)> = font_catalog
+        .iter()
+        .map(|e| (e.font_key(), e.path.clone(), e.glyph_overrides.clone()))
+        .collect();
+    let mut index = char_index::build_char_index(&pairs, classifier);
+    let elapsed = start.elapsed();
+    info!("  Built index in {:.1}s", elapsed.as_secs_f64());
+
+    index.populate_font_meta(&font_catalog);
+
+    if let Some(parent) = index_path.parent() {
+        let _ = std::fs::create_dir_all(parent);
+    }
+    match char_index::save_index(&index, &index_path) {
+        Ok(()) => {
+            let sz = std::fs::metadata(&index_path).map(|m| m.len()).unwrap_or(0);
+            info!("  Cached index to {} ({:.2} MB)", index_path.display(), sz as f64 / (1024.0 * 1024.0));
+        }
+        Err(e) => {
+            warn!("  Failed to cache index: {e}");
+        }
+    }
+    index.compact();
+
+    Ok((index, font_catalog))
+}
+
 /// Full index build from scratch (used for first build, format changes, --rebuild-index).
 fn do_full_build(
     system_fonts: &std::collections::HashMap<String, (PathBuf, char_index::GlyphOverrides)>,
@@ -428,92 +496,6 @@ fn do_full_build(
 }
 
 /// Load or build the character index with caching.
-fn load_or_build_index(
-    args: &cli::Args,
-    font_catalog: &[font_scan::FontEntry],
-    classifier: &dyn classifier::Classifier,
-) -> Result<char_index::CharIndex, ScanTextError> {
-    let index_path = args.resolved_index_path();
-
-    if !args.rebuild_index && index_path.exists() {
-        info!("Loading cached character index from {}", index_path.display());
-        let start = std::time::Instant::now();
-        match char_index::load_index(&index_path, classifier) {
-            Ok(mut index) => {
-                let n_entries: usize = index.n_entries();
-                index.compact(); // free raw entries — only flat_vecs needed for search
-                if std::env::var("UNSCAN_DEBUG_MEM").is_ok() {
-                    eprintln!("  MEM after compact: {}", mem_info());
-                }
-                info!(
-                    "  Loaded {} chars × {} entries in {:.1}s",
-                    index.n_chars(),
-                    n_entries,
-                    start.elapsed().as_secs_f64()
-                );
-                return Ok(index);
-            }
-            Err(e) => {
-                warn!("  Stale/corrupt index cache: {e}");
-                info!("  Auto-rebuilding index…");
-            }
-        }
-    }
-
-    info!("Building character index ({} fonts × {} chars)…",
-        font_catalog.len(), char_index::indexed_chars().len());
-    let start = std::time::Instant::now();
-    // Content-hash font dedup disabled — hurt accuracy (AA 471→470, noaa failed 93% threshold).
-    // Keeping code commented out for reference.
-    // let pairs: Vec<(String, Vec<u8>)> = {
-    //     use std::collections::HashSet;
-    //     let mut seen = HashSet::new();
-    //     let mut deduped = Vec::new();
-    //     for e in font_catalog.iter() {
-    //         let content_hash = {
-    //             use std::hash::{Hash, Hasher};
-    //             let mut h = std::collections::hash_map::DefaultHasher::new();
-    //             e.data.hash(&mut h);
-    //             h.finish()
-    //         };
-    //         let key = (content_hash, e.variant_tag.clone());
-    //         if seen.insert(key) {
-    //             deduped.push((e.font_key(), e.data.clone()));
-    //         }
-    //     }
-    //     let n_removed = font_catalog.len() - deduped.len();
-    //     if n_removed > 0 {
-    //         info!("  Deduped {} identical font file+variant entries ({} → {} unique)",
-    //             n_removed, font_catalog.len(), deduped.len());
-    //     }
-    //     deduped
-    // };
-    let pairs: Vec<(String, PathBuf, char_index::GlyphOverrides)> = font_catalog
-        .iter()
-        .map(|e| (e.font_key(), e.path.clone(), e.glyph_overrides.clone()))
-        .collect();
-    let mut index = char_index::build_char_index(&pairs, classifier);
-    let elapsed = start.elapsed();
-    info!("  Built index in {:.1}s", elapsed.as_secs_f64());
-
-    // Cache to disk
-    if let Some(parent) = index_path.parent() {
-        let _ = std::fs::create_dir_all(parent);
-    }
-    match char_index::save_index(&index, &index_path) {
-        Ok(()) => {
-            let sz = std::fs::metadata(&index_path).map(|m| m.len()).unwrap_or(0);
-            info!("  Cached index to {} ({:.2} MB)", index_path.display(), sz as f64 / (1024.0 * 1024.0));
-        }
-        Err(e) => {
-            warn!("  Failed to cache index: {e}");
-        }
-    }
-    index.compact();
-
-    Ok(index)
-}
-
 fn run(args: &cli::Args, classifier: &dyn classifier::Classifier) -> Result<(), ScanTextError> {
     dump_limits();
     let input = args.input.as_ref().expect("input validated");
@@ -541,21 +523,45 @@ fn run(args: &cli::Args, classifier: &dyn classifier::Classifier) -> Result<(), 
         input_size as f64 / (1024.0 * 1024.0)
     );
 
-    // ── 1. Discover fonts ────────────────────────────────────────────
-    let font_dirs = font_scan::default_font_dirs(&args.font_dir);
-    info!("Scanning for fonts…");
-    let _t_scan = std::time::Instant::now();
-    let font_catalog = font_scan::scan_fonts(&font_dirs);
-    eprintln!("  PROF font_scan: {:.2}s ({} fonts)", _t_scan.elapsed().as_secs_f64(), font_catalog.len());
+    // ── 1. Load or build character index + font catalog ────────────
+    let index_path = args.resolved_index_path();
+    let (char_index, font_catalog) = if !args.rebuild_index && index_path.exists() {
+        info!("Loading cached character index from {}", index_path.display());
+        let start = std::time::Instant::now();
+        match char_index::load_index(&index_path, classifier) {
+            Ok(mut index) if !index.font_meta.is_empty() => {
+                let n_entries: usize = index.n_entries();
+                let catalog = catalog_from_meta(&index);
+                index.compact();
+                info!(
+                    "  Loaded {} chars × {} entries in {:.1}s ({}  fonts from cache, scan skipped)",
+                    index.n_chars(),
+                    n_entries,
+                    start.elapsed().as_secs_f64(),
+                    catalog.len(),
+                );
+                (index, catalog)
+            }
+            Ok(_) => {
+                info!("  Index loaded but font_meta is empty — falling back to scan");
+                let (idx, cat) = scan_and_build_index(args, classifier)?;
+                (idx, cat)
+            }
+            Err(e) => {
+                warn!("  Stale/corrupt index cache: {e}");
+                info!("  Auto-rebuilding…");
+                let (idx, cat) = scan_and_build_index(args, classifier)?;
+                (idx, cat)
+            }
+        }
+    } else {
+        scan_and_build_index(args, classifier)?
+    };
     info!("Found {} candidate fonts", font_catalog.len());
     if font_catalog.is_empty() {
         return Err(ScanTextError::NoFonts);
     }
 
-    // ── 1b. Load or build character index ────────────────────────────
-    let char_index = load_or_build_index(args, &font_catalog, classifier)?;
-
-    // Font bytes already cleared by scan_fonts() — catalog holds metadata + paths only.
     // All font access goes through the shared cache below.
 
     // ── 1b''. Shared font cache for all post-index font access ──────
@@ -756,9 +762,6 @@ fn run(args: &cli::Args, classifier: &dyn classifier::Classifier) -> Result<(), 
         ocr::expand_bbox_to_ink(&mut lines, &gray_page, ink_thresh);
         ocr::expand_words_to_ink(&mut lines, &gray_page, ink_thresh);
         eprintln!("  PROF expand_bbox+words: {:.2}s", _t_pre.elapsed().as_secs_f64());
-        let _t_split = std::time::Instant::now();
-        ocr::split_wide_whitespace_words(&mut lines, &gray_page, ink_thresh, Some(&char_index), Some(&font_cache), classifier);
-        eprintln!("  PROF split_wide_whitespace: {:.2}s", _t_split.elapsed().as_secs_f64());
         let mut placed_texts: Vec<pdf_out::PlacedText> = Vec::new();
         let mut pg_vec = 0u32;
         let mut pg_raster = 0u32;
@@ -1367,9 +1370,68 @@ fn run(args: &cli::Args, classifier: &dyn classifier::Classifier) -> Result<(), 
             }
         }
 
-        // ── Pass 2: Decision matrix + output ──────────────────────────
+        // ── Word split: split wide whitespace using matched fonts ──
+        let _t_split = std::time::Instant::now();
+        {
+            let line_fonts: Vec<Option<std::sync::Arc<Vec<u8>>>> = line_matches.iter()
+                .map(|lm| {
+                    lm.font_result.as_ref().and_then(|fm| {
+                        font_cache.load(&fm.font_path).ok()
+                    })
+                })
+                .collect();
+            ocr::split_wide_whitespace_words(&mut lines, &gray_page, ink_thresh, &line_fonts);
+        }
+        eprintln!("  PROF split_wide_whitespace: {:.2}s", _t_split.elapsed().as_secs_f64());
+
+        // ── Pass 2a: Parallel SSIM verification ─────────────────────
         let verify_start = std::time::Instant::now();
-        let mut verify_count = 0u32;
+        let ssim_results: Vec<(Option<f32>, Option<bool>)> = lines.par_iter()
+            .enumerate()
+            .map(|(li, line)| {
+                let lm = &line_matches[li];
+                let font_result = &lm.font_result;
+
+                let ocr_ok = line.confidence >= args.min_ocr_confidence as f32
+                    && !line.text.trim().is_empty();
+                let font_ok = font_result
+                    .as_ref()
+                    .map(|f| f.score >= args.min_font_confidence)
+                    .unwrap_or(false);
+
+                if !ocr_ok || !font_ok {
+                    return (None, None);
+                }
+
+                if let Some(ref fm) = font_result {
+                    let font_data = font_cache.load(&fm.font_path).ok();
+                    if let Some(ref fd) = font_data {
+                        let (score, _dy) = verify::verify_text_region(
+                            &gray_page,
+                            fd.as_slice(),
+                            &line.text,
+                            line.x, line.y,
+                            line.width, line.height,
+                            &line.words,
+                            fm.glyph_overrides.as_deref(),
+                            &fm.variant_tag,
+                            lm.diag_seg_dir.as_deref(),
+                            None,
+                        );
+                        let pass = score >= MIN_VERIFY_SSIM;
+                        (Some(score), Some(pass))
+                    } else {
+                        (None, None)
+                    }
+                } else {
+                    (None, None)
+                }
+            })
+            .collect();
+        let verify_count = ssim_results.iter().filter(|(s, _)| s.is_some()).count() as u32;
+        eprintln!("  SSIM verify: {:.1}s ({} lines verified)", verify_start.elapsed().as_secs_f32(), verify_count);
+
+        // ── Pass 2b: Decision matrix + output ────────────────────────
         for (li, line) in lines.iter().enumerate() {
             let line_num = li + 1; // 1-indexed for output
             let lm = &line_matches[li];
@@ -1401,35 +1463,7 @@ fn run(args: &cli::Args, classifier: &dyn classifier::Classifier) -> Result<(), 
                 (false, "Vectorised".into())
             };
 
-            // ── SSIM verification (if vectorising) ───────────────────
-            let (ssim_score, ssim_pass): (Option<f32>, Option<bool>) = if !keep_raster {
-                if let Some(ref fm) = font_result {
-                    let font_data = font_cache.load(&fm.font_path).ok();
-                    if let Some(ref fd) = font_data {
-                        verify_count += 1;
-                        let (score, _dy) = verify::verify_text_region(
-                            &gray_page,
-                            fd.as_slice(),
-                            &line.text,
-                            line.x, line.y,
-                            line.width, line.height,
-                            &line.words,
-                            fm.glyph_overrides.as_deref(),
-                            &fm.variant_tag,
-                            lm.diag_seg_dir.as_deref(),
-                            None,
-                        );
-                        let pass = score >= MIN_VERIFY_SSIM;
-                        (Some(score), Some(pass))
-                    } else {
-                        (None, None)
-                    }
-                } else {
-                    (None, None)
-                }
-            } else {
-                (None, None)
-            };
+            let (ssim_score, ssim_pass) = ssim_results[li];
 
             // ── Logging ──────────────────────────────────────────────
             if keep_raster {
@@ -1611,8 +1645,6 @@ fn run(args: &cli::Args, classifier: &dyn classifier::Classifier) -> Result<(), 
                 }).collect(),
             });
         }
-        let verify_elapsed = verify_start.elapsed();
-        eprintln!("  SSIM verify: {:.1}s ({} lines verified)", verify_elapsed.as_secs_f32(), verify_count);
 
         stat_lines_vectorized += pg_vec;
         stat_lines_raster += pg_raster;
