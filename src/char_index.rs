@@ -1345,6 +1345,9 @@ pub struct CharIndex {
     pub entries: HashMap<char, Vec<FontCharEntry>>,
     /// Fonts that were scanned but produced no indexable characters.
     pub skipped_fonts: std::collections::HashSet<String>,
+    /// Per-font metadata (font_key → FontMeta). Serialized with the index
+    /// so we can skip the filesystem font scan on warm runs.
+    pub font_meta: HashMap<String, FontMeta>,
     /// Ordered font name table: font_id → font_name
     font_names_table: Vec<String>,
     /// Per-character flat vectors: (font_id, embedded_features) for brute-force search
@@ -1429,12 +1432,51 @@ impl CharIndex {
             self.flat_vecs_font_idx.insert(*c, font_idx);
         }
     }
+
+    /// Populate font_meta from a font catalog so the index can skip filesystem
+    /// scans on warm runs.  Replaces any existing metadata.
+    pub fn populate_font_meta(&mut self, catalog: &[crate::font_scan::FontEntry]) {
+        for fe in catalog {
+            let class_u8 = match fe.class {
+                crate::font_scan::FontClass::Serif => 0,
+                crate::font_scan::FontClass::Sans => 1,
+                crate::font_scan::FontClass::Mono => 2,
+                crate::font_scan::FontClass::Unknown => 3,
+            };
+            self.font_meta.insert(fe.font_key(), FontMeta {
+                path: fe.path.clone(),
+                family_name: fe.family_name.clone(),
+                postscript_name: fe.postscript_name.clone(),
+                is_bold: fe.is_bold,
+                is_italic: fe.is_italic,
+                class: class_u8,
+                variant_tag: fe.variant_tag.clone(),
+                glyph_overrides: fe.glyph_overrides.clone(),
+                oldstyle_figures: fe.oldstyle_figures,
+            });
+        }
+    }
 }
 
 /// Build the per-character index for all provided fonts.
 /// Glyph override map for OT variant entries (e.g. smcp, onum).
 /// Maps character → overridden glyph ID so the CI renders the correct variant glyph.
 pub type GlyphOverrides = Option<Vec<(char, u16)>>;
+
+/// Metadata for a single font entry (one per font_key in the catalog).
+/// Stored in the char index so we can skip the filesystem scan on warm runs.
+#[derive(Debug, Clone)]
+pub struct FontMeta {
+    pub path: std::path::PathBuf,
+    pub family_name: String,
+    pub postscript_name: String,
+    pub is_bold: bool,
+    pub is_italic: bool,
+    pub class: u8, // 0=Serif, 1=Sans, 2=Mono, 3=Unknown
+    pub variant_tag: String,
+    pub glyph_overrides: GlyphOverrides,
+    pub oldstyle_figures: bool,
+}
 
 /// Resolve glyph ID for a character, applying OT variant overrides when present.
 /// Falls back to the font's default cmap lookup if no override exists for this character.
@@ -1534,6 +1576,7 @@ pub fn build_char_index(font_paths: &[(String, std::path::PathBuf, GlyphOverride
     let mut index = CharIndex {
         entries,
         skipped_fonts,
+        font_meta: HashMap::new(),
         font_names_table: Vec::new(),
         flat_vecs: HashMap::new(),
         dim_sigmas: HashMap::new(),
@@ -2492,7 +2535,7 @@ pub fn precompute_crop_features(
 
 /// Bump this whenever the feature vector, normalization, or serialization
 /// layout changes. Stale caches auto-rebuild on mismatch.
-const INDEX_VERSION: u32 = 9;
+const INDEX_VERSION: u32 = 11;
 const INDEX_MAGIC: &[u8; 4] = b"UCIX";
 
 /// Save the character index to a binary file.
@@ -2538,10 +2581,11 @@ pub fn save_index(index: &CharIndex, path: &Path) -> io::Result<()> {
                 buf.extend_from_slice(&v.to_le_bytes());
             }
         }
-        // Write per-dimension σ for this character
+        // Write per-dimension σ for this character (length-prefixed)
         let sigmas = index.dim_sigmas.get(c);
         let default_sigmas = vec![0.0f32; FEAT_LEN];
         let sigmas = sigmas.unwrap_or(&default_sigmas);
+        buf.extend_from_slice(&(sigmas.len() as u32).to_le_bytes());
         for &s in sigmas.iter() {
             buf.extend_from_slice(&s.to_le_bytes());
         }
@@ -2553,6 +2597,47 @@ pub fn save_index(index: &CharIndex, path: &Path) -> io::Result<()> {
         let name_bytes = name.as_bytes();
         buf.extend_from_slice(&(name_bytes.len() as u32).to_le_bytes());
         buf.extend_from_slice(name_bytes);
+    }
+
+    // Append font metadata section
+    buf.extend_from_slice(&(index.font_meta.len() as u32).to_le_bytes());
+    for (font_key, meta) in &index.font_meta {
+        let key_bytes = font_key.as_bytes();
+        buf.extend_from_slice(&(key_bytes.len() as u32).to_le_bytes());
+        buf.extend_from_slice(key_bytes);
+
+        let path_bytes = meta.path.to_string_lossy().as_bytes().to_vec();
+        buf.extend_from_slice(&(path_bytes.len() as u32).to_le_bytes());
+        buf.extend_from_slice(&path_bytes);
+
+        let fam_bytes = meta.family_name.as_bytes();
+        buf.extend_from_slice(&(fam_bytes.len() as u32).to_le_bytes());
+        buf.extend_from_slice(fam_bytes);
+
+        let ps_bytes = meta.postscript_name.as_bytes();
+        buf.extend_from_slice(&(ps_bytes.len() as u32).to_le_bytes());
+        buf.extend_from_slice(ps_bytes);
+
+        let mut flags: u32 = 0;
+        if meta.is_bold { flags |= 1; }
+        if meta.is_italic { flags |= 2; }
+        if meta.oldstyle_figures { flags |= 4; }
+        flags |= (meta.class as u32) << 8;
+        buf.extend_from_slice(&flags.to_le_bytes());
+
+        let vtag_bytes = meta.variant_tag.as_bytes();
+        buf.extend_from_slice(&(vtag_bytes.len() as u32).to_le_bytes());
+        buf.extend_from_slice(vtag_bytes);
+
+        if let Some(ref ovs) = meta.glyph_overrides {
+            buf.extend_from_slice(&(ovs.len() as u32).to_le_bytes());
+            for &(ch, gid) in ovs {
+                buf.extend_from_slice(&(ch as u32).to_le_bytes());
+                buf.extend_from_slice(&(gid as u32).to_le_bytes());
+            }
+        } else {
+            buf.extend_from_slice(&0u32.to_le_bytes());
+        }
     }
 
     let mut f = std::fs::File::create(path)?;
@@ -2702,8 +2787,9 @@ pub fn load_index(path: &Path, classifier: &dyn crate::classifier::Classifier) -
             });
         }
 
-        // Read per-dimension σ
-        let mut sigmas = vec![0.0f32; FEAT_LEN];
+        // Read per-dimension σ (length-prefixed)
+        let sigma_len = read_u32(&mut pos)? as usize;
+        let mut sigmas = vec![0.0f32; sigma_len];
         for s in &mut sigmas {
             *s = read_f32(&mut pos)?;
         }
@@ -2728,9 +2814,86 @@ pub fn load_index(path: &Path, classifier: &dyn crate::classifier::Classifier) -
         }
     }
 
+    // ── Read font metadata section ─────────────────────────────────
+    let mut font_meta: HashMap<String, FontMeta> = HashMap::new();
+    if pos < data.len() {
+        if let Ok(n_meta) = read_u32(&mut pos) {
+            for _ in 0..n_meta as usize {
+                let key_len = read_u32(&mut pos)? as usize;
+                if pos + key_len > data.len() {
+                    return Err(io::Error::new(io::ErrorKind::UnexpectedEof, "truncated font meta key"));
+                }
+                let font_key = String::from_utf8_lossy(&data[pos..pos + key_len]).to_string();
+                pos += key_len;
+
+                let path_len = read_u32(&mut pos)? as usize;
+                if pos + path_len > data.len() {
+                    return Err(io::Error::new(io::ErrorKind::UnexpectedEof, "truncated font meta path"));
+                }
+                let path = std::path::PathBuf::from(String::from_utf8_lossy(&data[pos..pos + path_len]).to_string());
+                pos += path_len;
+
+                let fam_len = read_u32(&mut pos)? as usize;
+                if pos + fam_len > data.len() {
+                    return Err(io::Error::new(io::ErrorKind::UnexpectedEof, "truncated font meta family"));
+                }
+                let family_name = String::from_utf8_lossy(&data[pos..pos + fam_len]).to_string();
+                pos += fam_len;
+
+                let ps_len = read_u32(&mut pos)? as usize;
+                if pos + ps_len > data.len() {
+                    return Err(io::Error::new(io::ErrorKind::UnexpectedEof, "truncated font meta ps name"));
+                }
+                let postscript_name = String::from_utf8_lossy(&data[pos..pos + ps_len]).to_string();
+                pos += ps_len;
+
+                let flags = read_u32(&mut pos)?;
+                let is_bold = (flags & 1) != 0;
+                let is_italic = (flags & 2) != 0;
+                let oldstyle_figures = (flags & 4) != 0;
+                let class = ((flags >> 8) & 0xFF) as u8;
+
+                let vtag_len = read_u32(&mut pos)? as usize;
+                if pos + vtag_len > data.len() {
+                    return Err(io::Error::new(io::ErrorKind::UnexpectedEof, "truncated font meta variant tag"));
+                }
+                let variant_tag = String::from_utf8_lossy(&data[pos..pos + vtag_len]).to_string();
+                pos += vtag_len;
+
+                let n_overrides = read_u32(&mut pos)? as usize;
+                let glyph_overrides = if n_overrides > 0 {
+                    let mut ovs = Vec::with_capacity(n_overrides);
+                    for _ in 0..n_overrides {
+                        let cp = read_u32(&mut pos)?;
+                        let gid = read_u32(&mut pos)? as u16;
+                        if let Some(ch) = char::from_u32(cp) {
+                            ovs.push((ch, gid));
+                        }
+                    }
+                    Some(ovs)
+                } else {
+                    None
+                };
+
+                font_meta.insert(font_key, FontMeta {
+                    path,
+                    family_name,
+                    postscript_name,
+                    is_bold,
+                    is_italic,
+                    class,
+                    variant_tag,
+                    glyph_overrides,
+                    oldstyle_figures,
+                });
+            }
+        }
+    }
+
     let mut index = CharIndex {
         entries,
         skipped_fonts,
+        font_meta,
         font_names_table: Vec::new(),
         flat_vecs: HashMap::new(),
         dim_sigmas,

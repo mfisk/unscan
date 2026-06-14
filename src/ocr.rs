@@ -767,76 +767,22 @@ pub fn split_wide_whitespace_words(
     lines: &mut [TextLine],
     gray: &GrayImage,
     ink_threshold: u8,
-    char_index: Option<&crate::char_index::CharIndex>,
-    font_cache: Option<&crate::font_cache::FontCache>,
-    classifier: &dyn crate::classifier::Classifier,
+    line_fonts: &[Option<std::sync::Arc<Vec<u8>>>],
 ) {
     let (page_w, page_h) = gray.dimensions();
     let mut total_splits = 0u32;
     let debug_gaps = std::env::var("UNSCAN_DEBUG_GAPS").is_ok();
 
-    for line in lines.iter_mut() {
+    for (line_idx, line) in lines.iter_mut().enumerate() {
         let mut new_words: Vec<TextRegion> = Vec::new();
         let line_h = line.height;
         // Fallback: split at gaps ≥ 18% of the line height.
         let fallback_min_gap = (line_h * 18 / 100).max(4);
 
-        // --- Font identification once per LINE (not per word) ---
-        // All words in a Tesseract-assembled line share the same font.
-        // Do a single CI search on the longest word's char crops to identify
-        // the font, then reuse for all words in this line.
-        let line_matched_font: Option<(std::sync::Arc<Vec<u8>>, String)> = char_index.and_then(|ci| {
-            // Pick the longest word (most chars) for the best CI signal
-            let best_word = line.words.iter()
-                .filter(|w| {
-                    let ww = w.width.min(page_w.saturating_sub(w.x.min(page_w.saturating_sub(1))));
-                    let wh = w.height.min(page_h.saturating_sub(w.y.min(page_h.saturating_sub(1))));
-                    ww >= 4 && wh >= 2 && w.text.chars().count() >= 2
-                })
-                .max_by_key(|w| w.text.chars().count())?;
-
-            let bwx = best_word.x.min(page_w.saturating_sub(1));
-            let bwy = best_word.y.min(page_h.saturating_sub(1));
-            let bww = best_word.width.min(page_w - bwx);
-            let bwh = best_word.height.min(page_h - bwy);
-            let bchars: Vec<char> = best_word.text.chars().collect();
-            let bn = bchars.len();
-
-            let bword_img = image::imageops::crop_imm(gray, bwx, bwy, bww, bwh).to_image();
-            let (bbounds, _) = crate::segment::segment_characters(&bword_img, bn);
-            if bbounds.len() != bn + 1 { return None; }
-
-            let mut crops: Vec<(char, GrayImage)> = Vec::new();
-            for (ci_idx, &ch) in bchars.iter().enumerate() {
-                if !crate::char_index::is_indexed(ch) { continue; }
-                let left = bbounds[ci_idx] as u32;
-                let right = bbounds[ci_idx + 1] as u32;
-                if right <= left { continue; }
-                let crop = image::imageops::crop_imm(&bword_img, left, 0, right - left, bwh).to_image();
-                if let Some(norm) = crate::char_index::normalize_to_ink_bounds(&crop) {
-                    crops.push((ch, norm));
-                }
-            }
-            if crops.is_empty() { return None; }
-
-            let result = crate::char_index::search_candidates(ci, &crops, 1.0, false, classifier);
-            let font_key = result.scores.first().map(|(name, _)| name.clone())?;
-
-            let font_path = if font_key.contains('|') {
-                font_key.split('|').next().unwrap()
-            } else {
-                &font_key
-            };
-            let font_data: std::sync::Arc<Vec<u8>> = if let Some(fc) = font_cache {
-                fc.load(std::path::Path::new(font_path)).ok()?
-            } else {
-                std::sync::Arc::new(std::fs::read(font_path).ok()?)
-            };
-            Some((font_data, font_key))
-        });
-        let line_font_ref = line_matched_font.as_ref().and_then(|(data, _key)| {
-            ab_glyph::FontRef::try_from_slice(data).ok()
-        });
+        // Use the pre-identified font for this line (from the main font matching pass)
+        let line_font_ref = line_fonts.get(line_idx)
+            .and_then(|opt| opt.as_ref())
+            .and_then(|data| ab_glyph::FontRef::try_from_slice(data).ok());
 
         for word in line.words.drain(..) {
             let wx = word.x.min(page_w.saturating_sub(1));

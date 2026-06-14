@@ -24,6 +24,7 @@ use rand::prelude::*;
 use rand::rngs::SmallRng;
 
 use unscan::char_index::{self, compute_features, FEAT_LEN};
+use unscan::classifier;
 use unscan::font_scan;
 
 // ---------------------------------------------------------------------------
@@ -84,6 +85,33 @@ struct Args {
     /// Fisher weighting for comparison.
     #[arg(long)]
     fisher: bool,
+
+    /// Mahalanobis mode: compute per-character whitening transforms
+    /// using within-class covariance. Outputs MAHA format weights.
+    #[arg(long)]
+    mahalanobis: bool,
+
+    /// LDA mode: compute per-character discriminant projections.
+    /// Outputs LDAC format weights.
+    #[arg(long)]
+    lda: bool,
+
+    /// LDA: number of projection dimensions (default: auto = min(99, n_features))
+    #[arg(long, default_value = "32")]
+    lda_dims: usize,
+
+    /// LDA regularization strength (fraction of avg diagonal to add)
+    #[arg(long, default_value = "0.01")]
+    lda_reg: f64,
+
+    /// Character index output path. After training, the char index is built
+    /// and saved here. Default: ~/.cache/unscan/char-index.bin
+    #[arg(long)]
+    index_path: Option<PathBuf>,
+
+    /// Skip char index build after training.
+    #[arg(long)]
+    no_index: bool,
 }
 
 // ---------------------------------------------------------------------------
@@ -369,6 +397,93 @@ struct TrainingSample {
     features: [f32; FEAT_LEN],
 }
 
+/// Jacobi eigendecomposition of a symmetric matrix.
+/// Returns the top-k eigenvectors (by eigenvalue magnitude) as rows of
+/// a k × n matrix (flattened row-major).
+fn jacobi_eigen_top_k(mat: &[f64], n: usize, k: usize) -> Vec<f64> {
+    assert_eq!(mat.len(), n * n);
+    let k = k.min(n);
+
+    // Copy matrix (will be modified in place)
+    let mut a = mat.to_vec();
+    // Eigenvector matrix (starts as identity)
+    let mut v = vec![0.0f64; n * n];
+    for i in 0..n { v[i * n + i] = 1.0; }
+
+    let max_iter = 200;
+    for _ in 0..max_iter {
+        // Find largest off-diagonal element
+        let mut max_val = 0.0f64;
+        let mut p = 0usize;
+        let mut q = 1usize;
+        for i in 0..n {
+            for j in i+1..n {
+                let val = a[i * n + j].abs();
+                if val > max_val {
+                    max_val = val;
+                    p = i;
+                    q = j;
+                }
+            }
+        }
+
+        if max_val < 1e-12 { break; }
+
+        // Compute rotation angle
+        let app = a[p * n + p];
+        let aqq = a[q * n + q];
+        let apq = a[p * n + q];
+
+        let theta = if (app - aqq).abs() < 1e-15 {
+            std::f64::consts::FRAC_PI_4
+        } else {
+            0.5 * (2.0 * apq / (app - aqq)).atan()
+        };
+
+        let cos_t = theta.cos();
+        let sin_t = theta.sin();
+
+        // Apply Givens rotation to rows/cols p and q
+        let mut new_a = a.clone();
+        for i in 0..n {
+            if i == p || i == q { continue; }
+            let aip = a[i * n + p];
+            let aiq = a[i * n + q];
+            new_a[i * n + p] = cos_t * aip + sin_t * aiq;
+            new_a[p * n + i] = new_a[i * n + p];
+            new_a[i * n + q] = -sin_t * aip + cos_t * aiq;
+            new_a[q * n + i] = new_a[i * n + q];
+        }
+        new_a[p * n + p] = cos_t * cos_t * app + 2.0 * cos_t * sin_t * apq + sin_t * sin_t * aqq;
+        new_a[q * n + q] = sin_t * sin_t * app - 2.0 * cos_t * sin_t * apq + cos_t * cos_t * aqq;
+        new_a[p * n + q] = 0.0;
+        new_a[q * n + p] = 0.0;
+        a = new_a;
+
+        // Update eigenvectors
+        for i in 0..n {
+            let vip = v[i * n + p];
+            let viq = v[i * n + q];
+            v[i * n + p] = cos_t * vip + sin_t * viq;
+            v[i * n + q] = -sin_t * vip + cos_t * viq;
+        }
+    }
+
+    // Extract eigenvalues (diagonal of a)
+    let mut eigen_pairs: Vec<(f64, usize)> = (0..n).map(|i| (a[i * n + i], i)).collect();
+    eigen_pairs.sort_by(|a, b| b.0.abs().partial_cmp(&a.0.abs()).unwrap_or(std::cmp::Ordering::Equal));
+
+    // Return top-k eigenvectors as rows
+    let mut result = vec![0.0f64; k * n];
+    for d in 0..k {
+        let col = eigen_pairs[d].1;
+        for i in 0..n {
+            result[d * n + i] = v[i * n + col];
+        }
+    }
+    result
+}
+
 /// Load per-character samples from multiple (height, aa) combo files.
 fn load_char_combo_samples(
     feat_dir: &std::path::Path,
@@ -399,8 +514,181 @@ fn load_char_combo_samples(
 }
 
 // ---------------------------------------------------------------------------
+// Centroid-based MRR evaluation
+// ---------------------------------------------------------------------------
+
+/// Accumulated MRR/top-k statistics from centroid-based ranking.
+#[derive(Default)]
+struct RankStats {
+    /// Sum of 1/rank (strict: exact font_id)
+    strict_rr: f64,
+    strict_top1: usize,
+    strict_top5: usize,
+    /// Sum of 1/rank (family: best same-family variant)
+    family_rr: f64,
+    family_top1: usize,
+    family_top5: usize,
+    /// Baseline (unweighted Euclidean to centroid)
+    base_rr: f64,
+    base_top1: usize,
+    /// Number of evaluated samples
+    n_eval: usize,
+}
+
+impl RankStats {
+    fn accumulate(&mut self, other: &RankStats) {
+        self.strict_rr += other.strict_rr;
+        self.strict_top1 += other.strict_top1;
+        self.strict_top5 += other.strict_top5;
+        self.family_rr += other.family_rr;
+        self.family_top1 += other.family_top1;
+        self.family_top5 += other.family_top5;
+        self.base_rr += other.base_rr;
+        self.base_top1 += other.base_top1;
+        self.n_eval += other.n_eval;
+    }
+
+    fn strict_mrr(&self) -> f64 { if self.n_eval > 0 { self.strict_rr / self.n_eval as f64 } else { 0.0 } }
+    fn strict_top1_pct(&self) -> f64 { if self.n_eval > 0 { self.strict_top1 as f64 / self.n_eval as f64 * 100.0 } else { 0.0 } }
+    fn strict_top5_pct(&self) -> f64 { if self.n_eval > 0 { self.strict_top5 as f64 / self.n_eval as f64 * 100.0 } else { 0.0 } }
+    fn family_mrr(&self) -> f64 { if self.n_eval > 0 { self.family_rr / self.n_eval as f64 } else { 0.0 } }
+    fn family_top1_pct(&self) -> f64 { if self.n_eval > 0 { self.family_top1 as f64 / self.n_eval as f64 * 100.0 } else { 0.0 } }
+    fn family_top5_pct(&self) -> f64 { if self.n_eval > 0 { self.family_top5 as f64 / self.n_eval as f64 * 100.0 } else { 0.0 } }
+    fn base_mrr(&self) -> f64 { if self.n_eval > 0 { self.base_rr / self.n_eval as f64 } else { 0.0 } }
+    fn base_top1_pct(&self) -> f64 { if self.n_eval > 0 { self.base_top1 as f64 / self.n_eval as f64 * 100.0 } else { 0.0 } }
+}
+
+/// Evaluate a set of samples against centroids using a caller-provided distance
+/// function, computing strict, family, and baseline MRR.
+///
+/// - `samples`: the full sample array (each has `.font_id` and `.features`)
+/// - `eval_indices`: which samples to evaluate (subsampled)
+/// - `class_means`: font_id → centroid (in raw feature space, used for baseline)
+/// - `centroid_fids`: ordered list of centroid font_ids
+/// - `font_family`: font_id → family_id mapping (indexed by font_id)
+/// - `calc_dists`: given a sample index, returns `Vec<(font_id, distance)>` using
+///    the classifier-specific metric
+fn eval_mrr(
+    samples: &[TrainingSample],
+    eval_indices: &[usize],
+    class_means: &HashMap<u32, Vec<f64>>,
+    centroid_fids: &[u32],
+    font_family: &[u32],
+    calc_dists: &dyn Fn(usize) -> Vec<(u32, f64)>,
+) -> RankStats {
+    let mut stats = RankStats::default();
+    stats.n_eval = eval_indices.len();
+
+    for &i in eval_indices {
+        let correct = samples[i].font_id;
+        let correct_famid = font_family[correct as usize];
+
+        // Classifier-specific distances
+        let dists = calc_dists(i);
+
+        // Strict: rank of exact font_id
+        let d_correct = dists.iter()
+            .find(|&&(fid, _)| fid == correct)
+            .map(|&(_, d)| d)
+            .unwrap_or(f64::MAX);
+        let rank = dists.iter()
+            .filter(|&&(fid, d)| fid != correct && d < d_correct)
+            .count();
+        stats.strict_rr += 1.0 / (rank as f64 + 1.0);
+        if rank == 0 { stats.strict_top1 += 1; }
+        if rank < 5 { stats.strict_top5 += 1; }
+
+        // Family: best rank among any font in same family
+        let best_fam_dist = dists.iter()
+            .filter(|&&(fid, _)| font_family[fid as usize] == correct_famid)
+            .map(|&(_, d)| d)
+            .fold(f64::MAX, f64::min);
+        let fam_rank = dists.iter()
+            .filter(|&&(fid, d)| font_family[fid as usize] != correct_famid && d < best_fam_dist)
+            .count();
+        stats.family_rr += 1.0 / (fam_rank as f64 + 1.0);
+        if fam_rank == 0 { stats.family_top1 += 1; }
+        if fam_rank < 5 { stats.family_top5 += 1; }
+
+        // Baseline: unweighted Euclidean to class means
+        let correct_cm = &class_means[&correct];
+        let d_base: f64 = (0..FEAT_LEN)
+            .map(|j| { let d = samples[i].features[j] as f64 - correct_cm[j]; d * d })
+            .sum();
+        let base_rank = class_means.iter()
+            .filter(|(&fid, cm)| {
+                if fid == correct { return false; }
+                let d: f64 = (0..FEAT_LEN)
+                    .map(|j| { let diff = samples[i].features[j] as f64 - cm[j]; diff * diff })
+                    .sum();
+                d < d_base
+            })
+            .count();
+        stats.base_rr += 1.0 / (base_rank as f64 + 1.0);
+        if base_rank == 0 { stats.base_top1 += 1; }
+    }
+
+    stats
+}
+
+/// Select up to `max_eval` evaluation indices, subsampling with a deterministic
+/// seed derived from the character.
+fn subsample_eval(n: usize, max_eval: usize, c: char) -> Vec<usize> {
+    if n <= max_eval {
+        (0..n).collect()
+    } else {
+        let mut rng = SmallRng::seed_from_u64(c as u64);
+        let mut idx: Vec<usize> = (0..n).collect();
+        idx.shuffle(&mut rng);
+        idx.truncate(max_eval);
+        idx
+    }
+}
+
+// ---------------------------------------------------------------------------
 // Main
 // ---------------------------------------------------------------------------
+
+/// Resolve the character index path (same default as the main binary).
+fn default_index_path() -> PathBuf {
+    let home = std::env::var("HOME").unwrap_or_else(|_| "/tmp".to_string());
+    PathBuf::from(home)
+        .join(".cache")
+        .join("unscan")
+        .join("char-index.bin")
+}
+
+/// Build and save the character index using the just-trained classifier.
+fn build_and_save_char_index(
+    catalog: &[font_scan::FontEntry],
+    classifier: &dyn classifier::Classifier,
+    index_path: &std::path::Path,
+) {
+    eprintln!("\nBuilding character index ({} fonts × {} chars)…",
+        catalog.len(), char_index::indexed_chars().len());
+    let start = std::time::Instant::now();
+
+    let pairs: Vec<(String, PathBuf, char_index::GlyphOverrides)> = catalog
+        .iter()
+        .map(|e| (e.font_key(), e.path.clone(), e.glyph_overrides.clone()))
+        .collect();
+    let mut index = char_index::build_char_index(&pairs, classifier);
+    index.populate_font_meta(catalog);
+
+    if let Some(parent) = index_path.parent() {
+        let _ = std::fs::create_dir_all(parent);
+    }
+    char_index::save_index(&index, index_path).expect("save char index");
+    index.compact();
+
+    let file_size = std::fs::metadata(index_path).map(|m| m.len()).unwrap_or(0);
+    let elapsed = start.elapsed();
+    eprintln!("  Character index built in {:.1}s", elapsed.as_secs_f64());
+    eprintln!("  {} fonts, {} chars, {:.1} MB → {}",
+        catalog.len(), index.n_chars(),
+        file_size as f64 / (1024.0 * 1024.0),
+        index_path.display());
+}
 
 fn main() {
     let args = Args::parse();
@@ -727,17 +1015,7 @@ fn main() {
         let mut skipped = 0usize;
 
         // Accumulators for baseline (uniform) and Fisher-weighted MRR
-        // Strict: each font_id is independent
-        // Family: best rank among same-family variants counts
-        let mut base_rr = 0.0f64;
-        let mut base_top1 = 0usize;
-        let mut fish_rr = 0.0f64;
-        let mut fish_top1 = 0usize;
-        let mut fish_top5 = 0usize;
-        let mut fish_fam_rr = 0.0f64;
-        let mut fish_fam_top1 = 0usize;
-        let mut fish_fam_top5 = 0usize;
-        let mut total_eval = 0usize;
+        let mut total_stats = RankStats::default();
 
         for (ci, &c) in chars.iter().enumerate() {
             let n_samples = char_counts[ci];
@@ -814,142 +1092,50 @@ fn main() {
             fisher_chars.push((c, scores));
 
             // ── Evaluate: baseline (uniform) vs Fisher-weighted MRR ──
-            // Subsample if too many samples (MRR estimate stabilizes well below full n)
-            let max_eval = 2000usize;
-            let eval_indices: Vec<usize> = if n <= max_eval {
-                (0..n).collect()
-            } else {
-                let mut rng = SmallRng::seed_from_u64(c as u64);
-                let mut idx: Vec<usize> = (0..n).collect();
-                idx.shuffle(&mut rng);
-                idx.truncate(max_eval);
-                idx
-            };
-            let n_eval = eval_indices.len();
-
-            // Flatten centroids for cache-friendly access
+            let eval_indices = subsample_eval(n, 2000, c);
             let centroid_fids: Vec<u32> = class_means.keys().copied().collect();
             let centroid_feats: Vec<&Vec<f64>> = centroid_fids.iter()
                 .map(|fid| &class_means[fid])
                 .collect();
-            let k = centroid_fids.len();
 
-            // Precompute family membership for each centroid
-            let centroid_famid: Vec<u32> = centroid_fids.iter()
-                .map(|&fid| font_family[fid as usize])
-                .collect();
-
-            let mut c_base_rr = 0.0f64;
-            let mut c_base_top1 = 0usize;
-            let mut c_fish_rr = 0.0f64;
-            let mut c_fish_top1 = 0usize;
-            let mut c_fish_top5 = 0usize;
-            let mut c_fish_fam_rr = 0.0f64;
-            let mut c_fish_fam_top1 = 0usize;
-            let mut c_fish_fam_top5 = 0usize;
-
-            for &i in &eval_indices {
-                let correct = samples[i].font_id;
-                let correct_famid = font_family[correct as usize];
-
-                // Compute Fisher distance to every centroid
-                let mut fish_dists: Vec<(u32, f64)> = Vec::with_capacity(k);
-                let mut d_base_correct = 0.0f64;
-                for ci in 0..k {
-                    let mut d_fish = 0.0f64;
-                    for j in 0..FEAT_LEN {
-                        let diff = samples[i].features[j] as f64 - centroid_feats[ci][j];
-                        d_fish += scores[j] as f64 * diff * diff;
-                    }
-                    fish_dists.push((centroid_fids[ci], d_fish));
-
-                    // Baseline distance for the correct font only
-                    if centroid_fids[ci] == correct {
+            let char_stats = eval_mrr(
+                &samples,
+                &eval_indices,
+                &class_means,
+                &centroid_fids,
+                &font_family,
+                &|i| {
+                    centroid_fids.iter().enumerate().map(|(ci2, &fid)| {
                         let mut d = 0.0f64;
                         for j in 0..FEAT_LEN {
-                            let diff = samples[i].features[j] as f64 - centroid_feats[ci][j];
-                            d += diff * diff;
+                            let diff = samples[i].features[j] as f64 - centroid_feats[ci2][j];
+                            d += scores[j] as f64 * diff * diff;
                         }
-                        d_base_correct = d;
-                    }
-                }
-
-                // Baseline: count how many are closer (unweighted)
-                let mut base_rank = 0usize;
-                for ci in 0..k {
-                    if centroid_fids[ci] == correct { continue; }
-                    let mut d = 0.0f64;
-                    for j in 0..FEAT_LEN {
-                        let diff = samples[i].features[j] as f64 - centroid_feats[ci][j];
-                        d += diff * diff;
-                    }
-                    if d < d_base_correct { base_rank += 1; }
-                }
-                c_base_rr += 1.0 / (base_rank as f64 + 1.0);
-                if base_rank == 0 { c_base_top1 += 1; }
-
-                // Strict Fisher: rank of exact font_id
-                let d_fish_correct = fish_dists.iter()
-                    .find(|&&(fid, _)| fid == correct).unwrap().1;
-                let fish_rank = fish_dists.iter()
-                    .filter(|&&(fid, d)| fid != correct && d < d_fish_correct)
-                    .count();
-                c_fish_rr += 1.0 / (fish_rank as f64 + 1.0);
-                if fish_rank == 0 { c_fish_top1 += 1; }
-                if fish_rank < 5 { c_fish_top5 += 1; }
-
-                // Family Fisher: best rank among any font in same family
-                let best_fam_dist = fish_dists.iter()
-                    .filter(|&&(fid, _)| font_family[fid as usize] == correct_famid)
-                    .map(|&(_, d)| d)
-                    .fold(f64::MAX, f64::min);
-                let fam_rank = fish_dists.iter()
-                    .filter(|&&(fid, d)| {
-                        font_family[fid as usize] != correct_famid && d < best_fam_dist
-                    })
-                    .count();
-                c_fish_fam_rr += 1.0 / (fam_rank as f64 + 1.0);
-                if fam_rank == 0 { c_fish_fam_top1 += 1; }
-                if fam_rank < 5 { c_fish_fam_top5 += 1; }
-            }
-
-            base_rr += c_base_rr;
-            base_top1 += c_base_top1;
-            fish_rr += c_fish_rr;
-            fish_top1 += c_fish_top1;
-            fish_top5 += c_fish_top5;
-            fish_fam_rr += c_fish_fam_rr;
-            fish_fam_top1 += c_fish_fam_top1;
-            fish_fam_top5 += c_fish_fam_top5;
-            total_eval += n_eval;
+                        (fid, d)
+                    }).collect()
+                },
+            );
 
             if ci < 5 || ci == chars.len() - 1 || (ci + 1) % 20 == 0 {
                 eprintln!("  char '{}' base={:.3} | strict={:.3} t1={:.1}% | family={:.3} t1={:.1}%",
                     c,
-                    c_base_rr / n_eval as f64,
-                    c_fish_rr / n_eval as f64,
-                    c_fish_top1 as f64 / n_eval as f64 * 100.0,
-                    c_fish_fam_rr / n_eval as f64,
-                    c_fish_fam_top1 as f64 / n_eval as f64 * 100.0);
+                    char_stats.base_mrr(),
+                    char_stats.strict_mrr(),
+                    char_stats.strict_top1_pct(),
+                    char_stats.family_mrr(),
+                    char_stats.family_top1_pct());
             }
+
+            total_stats.accumulate(&char_stats);
         }
 
         let fisher_elapsed = fisher_start.elapsed();
 
-        let b_mrr = if total_eval > 0 { base_rr / total_eval as f64 } else { 0.0 };
-        let b_top1 = if total_eval > 0 { base_top1 as f64 / total_eval as f64 * 100.0 } else { 0.0 };
-        let f_mrr = if total_eval > 0 { fish_rr / total_eval as f64 } else { 0.0 };
-        let f_top1 = if total_eval > 0 { fish_top1 as f64 / total_eval as f64 * 100.0 } else { 0.0 };
-        let f_top5 = if total_eval > 0 { fish_top5 as f64 / total_eval as f64 * 100.0 } else { 0.0 };
-        let ff_mrr = if total_eval > 0 { fish_fam_rr / total_eval as f64 } else { 0.0 };
-        let ff_top1 = if total_eval > 0 { fish_fam_top1 as f64 / total_eval as f64 * 100.0 } else { 0.0 };
-        let ff_top5 = if total_eval > 0 { fish_fam_top5 as f64 / total_eval as f64 * 100.0 } else { 0.0 };
-
         eprintln!("\nFisher scoring complete: {} characters, {} skipped, {:.1}s",
             fisher_chars.len(), skipped, fisher_elapsed.as_secs_f64());
-        eprintln!("  Baseline:       MRR={:.3} top1={:.1}%", b_mrr, b_top1);
-        eprintln!("  Fisher strict:  MRR={:.3} top1={:.1}% top5={:.1}%", f_mrr, f_top1, f_top5);
-        eprintln!("  Fisher family:  MRR={:.3} top1={:.1}% top5={:.1}%", ff_mrr, ff_top1, ff_top5);
+        eprintln!("  Baseline:       MRR={:.3} top1={:.1}%", total_stats.base_mrr(), total_stats.base_top1_pct());
+        eprintln!("  Fisher strict:  MRR={:.3} top1={:.1}% top5={:.1}%", total_stats.strict_mrr(), total_stats.strict_top1_pct(), total_stats.strict_top5_pct());
+        eprintln!("  Fisher family:  MRR={:.3} top1={:.1}% top5={:.1}%", total_stats.family_mrr(), total_stats.family_top1_pct(), total_stats.family_top5_pct());
         eprintln!("  ({} families, {} multi-variant)", n_families, multi_variant_families);
 
         // ── Export Fisher weights ─────────────────────────────────
@@ -976,13 +1162,557 @@ fn main() {
         eprintln!("  Characters: {}/{}", fisher_chars.len(), chars.len());
         eprintln!("  Families:   {} ({} multi-variant)", n_families, multi_variant_families);
         eprintln!("  Weights:    {} ({:.1} KB)", args.output.display(), file_size as f64 / 1e3);
-        eprintln!("  Baseline:       MRR={:.3} top1={:.1}%", b_mrr, b_top1);
-        eprintln!("  Fisher strict:  MRR={:.3} top1={:.1}% top5={:.1}%", f_mrr, f_top1, f_top5);
-        eprintln!("  Fisher family:  MRR={:.3} top1={:.1}% top5={:.1}%", ff_mrr, ff_top1, ff_top5);
+        eprintln!("  Baseline:       MRR={:.3} top1={:.1}%", total_stats.base_mrr(), total_stats.base_top1_pct());
+        eprintln!("  Fisher strict:  MRR={:.3} top1={:.1}% top5={:.1}%", total_stats.strict_mrr(), total_stats.strict_top1_pct(), total_stats.strict_top5_pct());
+        eprintln!("  Fisher family:  MRR={:.3} top1={:.1}% top5={:.1}%", total_stats.family_mrr(), total_stats.family_top1_pct(), total_stats.family_top5_pct());
         eprintln!("  Render:     {:.1}s", render_secs);
         eprintln!("  Score:      {:.1}s", fisher_elapsed.as_secs_f64());
         eprintln!("  Total:      {:.1}s", total_elapsed.as_secs_f64());
 
+        if !args.no_index {
+            let idx_path = args.index_path.clone().unwrap_or_else(default_index_path);
+            let cls = classifier::FisherClassifier;
+            build_and_save_char_index(&catalog, &cls, &idx_path);
+        }
+        return;
+    }
+
+    // ── 3b. Mahalanobis mode ─────────────────────────────────────
+    if args.mahalanobis {
+        eprintln!("\nMahalanobis training {} characters...", chars.len());
+        let maha_start = std::time::Instant::now();
+        let mut maha_chars: Vec<(char, Vec<f32>)> = Vec::new(); // (char, L_inv flattened)
+        let mut skipped = 0usize;
+
+        // MRR accumulators
+        let mut total_stats = RankStats::default();
+
+        for (ci, &c) in chars.iter().enumerate() {
+            let n_samples = char_counts[ci];
+            if n_samples == 0 { skipped += 1; continue; }
+
+            let samples = load_char_combo_samples(&feat_dir, ci, &cached_combos);
+
+            // Group by font
+            let mut font_indices: HashMap<u32, Vec<usize>> = HashMap::new();
+            for (i, s) in samples.iter().enumerate() {
+                font_indices.entry(s.font_id).or_default().push(i);
+            }
+            if font_indices.len() < args.min_fonts.max(2) { skipped += 1; continue; }
+
+            let n = samples.len();
+
+            // Compute class means
+            let class_means: HashMap<u32, Vec<f64>> = font_indices.iter().map(|(&fid, indices)| {
+                let mut mean = vec![0.0f64; FEAT_LEN];
+                for &i in indices {
+                    for j in 0..FEAT_LEN { mean[j] += samples[i].features[j] as f64; }
+                }
+                let cnt = indices.len() as f64;
+                for j in 0..FEAT_LEN { mean[j] /= cnt; }
+                (fid, mean)
+            }).collect();
+
+            // Compute within-class scatter matrix Sw (100×100)
+            let mut sw = vec![0.0f64; FEAT_LEN * FEAT_LEN];
+            for (&fid, indices) in &font_indices {
+                let cm = &class_means[&fid];
+                for &i in indices {
+                    for a in 0..FEAT_LEN {
+                        let da = samples[i].features[a] as f64 - cm[a];
+                        for b in a..FEAT_LEN {
+                            let db = samples[i].features[b] as f64 - cm[b];
+                            sw[a * FEAT_LEN + b] += da * db;
+                        }
+                    }
+                }
+            }
+            // Fill lower triangle by symmetry, then normalize
+            for a in 0..FEAT_LEN {
+                for b in 0..a {
+                    sw[a * FEAT_LEN + b] = sw[b * FEAT_LEN + a];
+                }
+            }
+            for v in &mut sw { *v /= n as f64; }
+
+            // Regularize: heavy shrinkage toward identity to prevent overfitting
+            // to training rendering pipeline. Use Ledoit-Wolf style:
+            // Sw_reg = (1-alpha)*Sw + alpha*(trace/D)*I
+            let trace: f64 = (0..FEAT_LEN).map(|j| sw[j * FEAT_LEN + j]).sum();
+            let avg_var = trace / FEAT_LEN as f64;
+            let alpha = 0.9; // Heavy shrinkage toward identity
+            for a in 0..FEAT_LEN {
+                for b in 0..FEAT_LEN {
+                    sw[a * FEAT_LEN + b] *= 1.0 - alpha;
+                }
+                sw[a * FEAT_LEN + a] += alpha * avg_var;
+            }
+
+            // Cholesky decomposition: Sw = L L^T
+            let mut l = vec![0.0f64; FEAT_LEN * FEAT_LEN];
+            let mut chol_ok = true;
+            for i in 0..FEAT_LEN {
+                for j in 0..=i {
+                    let mut sum = sw[i * FEAT_LEN + j];
+                    for k in 0..j {
+                        sum -= l[i * FEAT_LEN + k] * l[j * FEAT_LEN + k];
+                    }
+                    if i == j {
+                        if sum <= 0.0 { chol_ok = false; break; }
+                        l[i * FEAT_LEN + j] = sum.sqrt();
+                    } else {
+                        l[i * FEAT_LEN + j] = sum / l[j * FEAT_LEN + j];
+                    }
+                }
+                if !chol_ok { break; }
+            }
+
+            if !chol_ok {
+                eprintln!("  char '{}' Cholesky failed, skipping", c);
+                skipped += 1;
+                continue;
+            }
+
+            // Compute L^{-1} by forward substitution (L is lower triangular)
+            let mut linv = vec![0.0f64; FEAT_LEN * FEAT_LEN];
+            for j in 0..FEAT_LEN {
+                // Solve L * x = e_j
+                for i in 0..FEAT_LEN {
+                    let mut sum = if i == j { 1.0 } else { 0.0 };
+                    for k in 0..i {
+                        sum -= l[i * FEAT_LEN + k] * linv[k * FEAT_LEN + j];
+                    }
+                    linv[i * FEAT_LEN + j] = sum / l[i * FEAT_LEN + i];
+                }
+            }
+
+            // Scale calibration: compute median within-class distance in whitened
+            // space, then scale L^{-1} so this median ≈ target_dist.
+            // This ensures the quality gate threshold (0.5) works correctly.
+            let target_dist = 0.03f64;
+            let mut within_dists: Vec<f64> = Vec::new();
+            let mut rng_cal = SmallRng::seed_from_u64(c as u64 + 9999);
+            for (&fid, indices) in &font_indices {
+                if indices.len() < 2 { continue; }
+                // Sample up to 5 pairs per font
+                let npairs = 5.min(indices.len() * (indices.len() - 1) / 2);
+                for _ in 0..npairs {
+                    let a = indices[rng_cal.gen_range(0..indices.len())];
+                    let b = loop {
+                        let x = indices[rng_cal.gen_range(0..indices.len())];
+                        if x != a { break x; }
+                    };
+                    let mut d = 0.0f64;
+                    for dim in 0..FEAT_LEN {
+                        let mut ea = 0.0f64;
+                        let mut eb = 0.0f64;
+                        for j in 0..FEAT_LEN {
+                            ea += linv[dim * FEAT_LEN + j] * samples[a].features[j] as f64;
+                            eb += linv[dim * FEAT_LEN + j] * samples[b].features[j] as f64;
+                        }
+                        let diff = ea - eb;
+                        d += diff * diff;
+                    }
+                    within_dists.push(d);
+                }
+            }
+            let scale = if !within_dists.is_empty() {
+                within_dists.sort_by(|a, b| a.partial_cmp(b).unwrap());
+                let median = within_dists[within_dists.len() / 2];
+                if median > 1e-15 { (target_dist / median).sqrt() } else { 1.0 }
+            } else {
+                1.0
+            };
+
+            // Apply scale to L^{-1}
+            for v in &mut linv { *v *= scale; }
+
+            // Convert to f32
+            let linv_f32: Vec<f32> = linv.iter().map(|&v| v as f32).collect();
+
+            // ── Evaluate MRR ──
+            let eval_indices = subsample_eval(n, 2000, c);
+
+            // Centroid embeddings (transform class means through L_inv)
+            let centroid_fids: Vec<u32> = class_means.keys().copied().collect();
+            let centroid_embeds: Vec<Vec<f64>> = centroid_fids.iter().map(|fid| {
+                let cm = &class_means[fid];
+                let mut emb = vec![0.0f64; FEAT_LEN];
+                for i in 0..FEAT_LEN {
+                    let mut sum = 0.0f64;
+                    for j in 0..FEAT_LEN {
+                        sum += linv[i * FEAT_LEN + j] * cm[j];
+                    }
+                    emb[i] = sum;
+                }
+                emb
+            }).collect();
+
+            let char_stats = eval_mrr(
+                &samples,
+                &eval_indices,
+                &class_means,
+                &centroid_fids,
+                &font_family,
+                &|i| {
+                    // Embed sample via L_inv
+                    let mut emb = vec![0.0f64; FEAT_LEN];
+                    for a in 0..FEAT_LEN {
+                        let mut sum = 0.0f64;
+                        for b in 0..FEAT_LEN {
+                            sum += linv[a * FEAT_LEN + b] * samples[i].features[b] as f64;
+                        }
+                        emb[a] = sum;
+                    }
+                    // Euclidean distances in whitened space
+                    centroid_fids.iter().enumerate().map(|(ci2, &fid)| {
+                        let mut d = 0.0f64;
+                        for j in 0..FEAT_LEN {
+                            let diff = emb[j] - centroid_embeds[ci2][j];
+                            d += diff * diff;
+                        }
+                        (fid, d)
+                    }).collect()
+                },
+            );
+
+            maha_chars.push((c, linv_f32));
+
+            if ci < 5 || ci == chars.len() - 1 || (ci + 1) % 20 == 0 {
+                eprintln!("  char '{}' base={:.3} | strict={:.3} t1={:.1}% | family={:.3} t1={:.1}%",
+                    c,
+                    char_stats.base_mrr(),
+                    char_stats.strict_mrr(),
+                    char_stats.strict_top1_pct(),
+                    char_stats.family_mrr(),
+                    char_stats.family_top1_pct());
+            }
+
+            total_stats.accumulate(&char_stats);
+        }
+
+        let maha_elapsed = maha_start.elapsed();
+
+        eprintln!("\nMahalanobis complete: {} characters, {} skipped, {:.1}s",
+            maha_chars.len(), skipped, maha_elapsed.as_secs_f64());
+        eprintln!("  Baseline:        MRR={:.3} top1={:.1}%", total_stats.base_mrr(), total_stats.base_top1_pct());
+        eprintln!("  Maha strict:     MRR={:.3} top1={:.1}% top5={:.1}%", total_stats.strict_mrr(), total_stats.strict_top1_pct(), total_stats.strict_top5_pct());
+        eprintln!("  Maha family:     MRR={:.3} top1={:.1}% top5={:.1}%", total_stats.family_mrr(), total_stats.family_top1_pct(), total_stats.family_top5_pct());
+
+        // Export MAHA weights
+        eprintln!("Writing Mahalanobis weights to {}...", args.output.display());
+        let f = std::fs::File::create(&args.output).expect("create output file");
+        let mut w = BufWriter::new(f);
+        w.write_all(b"MAHA").unwrap();
+        w.write_all(&1u32.to_le_bytes()).unwrap();
+        w.write_all(&(maha_chars.len() as u32).to_le_bytes()).unwrap();
+        w.write_all(&(FEAT_LEN as u32).to_le_bytes()).unwrap();
+
+        for (c, linv) in &maha_chars {
+            w.write_all(&(*c as u32).to_le_bytes()).unwrap();
+            for &v in linv { w.write_all(&v.to_le_bytes()).unwrap(); }
+        }
+        w.flush().unwrap();
+
+        let file_size = std::fs::metadata(&args.output).map(|m| m.len()).unwrap_or(0);
+        let total_elapsed = start.elapsed();
+        eprintln!("\n=== Mahalanobis complete ===");
+        eprintln!("  Characters: {}/{}", maha_chars.len(), chars.len());
+        eprintln!("  Weights:    {} ({:.1} MB)", args.output.display(), file_size as f64 / 1e6);
+        eprintln!("  Baseline:        MRR={:.3} top1={:.1}%", total_stats.base_mrr(), total_stats.base_top1_pct());
+        eprintln!("  Maha strict:     MRR={:.3} top1={:.1}% top5={:.1}%", total_stats.strict_mrr(), total_stats.strict_top1_pct(), total_stats.strict_top5_pct());
+        eprintln!("  Maha family:     MRR={:.3} top1={:.1}% top5={:.1}%", total_stats.family_mrr(), total_stats.family_top1_pct(), total_stats.family_top5_pct());
+        eprintln!("  Render:     {:.1}s", render_secs);
+        eprintln!("  Train:      {:.1}s", maha_elapsed.as_secs_f64());
+        eprintln!("  Total:      {:.1}s", total_elapsed.as_secs_f64());
+
+        if !args.no_index {
+            let idx_path = args.index_path.clone().unwrap_or_else(default_index_path);
+            let cls = classifier::MahalanobisClassifier::load(&args.output)
+                .expect("reload Mahalanobis weights for index build");
+            build_and_save_char_index(&catalog, &cls, &idx_path);
+        }
+        return;
+    }
+
+    // ── 3c. LDA mode ─────────────────────────────────────────────
+    if args.lda {
+        let out_dim = args.lda_dims.min(FEAT_LEN - 1);
+        eprintln!("\nLDA training {} characters (target dim={})...", chars.len(), out_dim);
+        let lda_start = std::time::Instant::now();
+        let mut lda_chars: Vec<(char, usize, Vec<f32>)> = Vec::new(); // (char, out_dim, proj)
+        let mut skipped = 0usize;
+
+        // MRR accumulators
+        let mut total_stats = RankStats::default();
+
+        for (ci, &c) in chars.iter().enumerate() {
+            let n_samples = char_counts[ci];
+            if n_samples == 0 { skipped += 1; continue; }
+
+            let samples = load_char_combo_samples(&feat_dir, ci, &cached_combos);
+
+            let mut font_indices: HashMap<u32, Vec<usize>> = HashMap::new();
+            for (i, s) in samples.iter().enumerate() {
+                font_indices.entry(s.font_id).or_default().push(i);
+            }
+            if font_indices.len() < args.min_fonts.max(2) { skipped += 1; continue; }
+
+            let n = samples.len();
+
+            // Class means and global mean
+            let mut global_mean = vec![0.0f64; FEAT_LEN];
+            for s in &samples {
+                for j in 0..FEAT_LEN { global_mean[j] += s.features[j] as f64; }
+            }
+            for j in 0..FEAT_LEN { global_mean[j] /= n as f64; }
+
+            let class_means: HashMap<u32, Vec<f64>> = font_indices.iter().map(|(&fid, indices)| {
+                let mut mean = vec![0.0f64; FEAT_LEN];
+                for &i in indices {
+                    for j in 0..FEAT_LEN { mean[j] += samples[i].features[j] as f64; }
+                }
+                let cnt = indices.len() as f64;
+                for j in 0..FEAT_LEN { mean[j] /= cnt; }
+                (fid, mean)
+            }).collect();
+
+            // Within-class scatter Sw (symmetric 100×100)
+            let mut sw = vec![0.0f64; FEAT_LEN * FEAT_LEN];
+            for (&fid, indices) in &font_indices {
+                let cm = &class_means[&fid];
+                for &i in indices {
+                    for a in 0..FEAT_LEN {
+                        let da = samples[i].features[a] as f64 - cm[a];
+                        for b in a..FEAT_LEN {
+                            let db = samples[i].features[b] as f64 - cm[b];
+                            sw[a * FEAT_LEN + b] += da * db;
+                        }
+                    }
+                }
+            }
+            for a in 0..FEAT_LEN { for b in 0..a { sw[a * FEAT_LEN + b] = sw[b * FEAT_LEN + a]; } }
+            for v in &mut sw { *v /= n as f64; }
+
+            // Regularize Sw
+            let trace: f64 = (0..FEAT_LEN).map(|j| sw[j * FEAT_LEN + j]).sum();
+            let eps = (trace / FEAT_LEN as f64) * args.lda_reg + 1e-6;
+            for j in 0..FEAT_LEN { sw[j * FEAT_LEN + j] += eps; }
+
+            // Cholesky: Sw = L L^T
+            let mut l = vec![0.0f64; FEAT_LEN * FEAT_LEN];
+            let mut chol_ok = true;
+            for i in 0..FEAT_LEN {
+                for j in 0..=i {
+                    let mut sum = sw[i * FEAT_LEN + j];
+                    for k in 0..j { sum -= l[i * FEAT_LEN + k] * l[j * FEAT_LEN + k]; }
+                    if i == j {
+                        if sum <= 0.0 { chol_ok = false; break; }
+                        l[i * FEAT_LEN + j] = sum.sqrt();
+                    } else {
+                        l[i * FEAT_LEN + j] = sum / l[j * FEAT_LEN + j];
+                    }
+                }
+                if !chol_ok { break; }
+            }
+            if !chol_ok { skipped += 1; continue; }
+
+            // L^{-1}
+            let mut linv = vec![0.0f64; FEAT_LEN * FEAT_LEN];
+            for j in 0..FEAT_LEN {
+                for i in 0..FEAT_LEN {
+                    let mut sum = if i == j { 1.0 } else { 0.0 };
+                    for k in 0..i { sum -= l[i * FEAT_LEN + k] * linv[k * FEAT_LEN + j]; }
+                    linv[i * FEAT_LEN + j] = sum / l[i * FEAT_LEN + i];
+                }
+            }
+
+            // Whiten class means: z_k = L^{-1} * (μ_k - μ)
+            let centroid_fids: Vec<u32> = class_means.keys().copied().collect();
+            let whitened_means: Vec<Vec<f64>> = centroid_fids.iter().map(|fid| {
+                let cm = &class_means[fid];
+                let mut centered = vec![0.0f64; FEAT_LEN];
+                for j in 0..FEAT_LEN { centered[j] = cm[j] - global_mean[j]; }
+                let mut wm = vec![0.0f64; FEAT_LEN];
+                for i in 0..FEAT_LEN {
+                    for j in 0..FEAT_LEN {
+                        wm[i] += linv[i * FEAT_LEN + j] * centered[j];
+                    }
+                }
+                wm
+            }).collect();
+
+            // PCA on whitened means to find top-k directions
+            // Covariance of whitened means (this IS Sw^{-1} * Sb in disguise)
+            let k_classes = centroid_fids.len();
+            let mut wm_mean = vec![0.0f64; FEAT_LEN];
+            for wm in &whitened_means { for j in 0..FEAT_LEN { wm_mean[j] += wm[j]; } }
+            for j in 0..FEAT_LEN { wm_mean[j] /= k_classes as f64; }
+
+            let mut cov = vec![0.0f64; FEAT_LEN * FEAT_LEN];
+            for wm in &whitened_means {
+                for a in 0..FEAT_LEN {
+                    let da = wm[a] - wm_mean[a];
+                    for b in a..FEAT_LEN {
+                        let db = wm[b] - wm_mean[b];
+                        cov[a * FEAT_LEN + b] += da * db;
+                    }
+                }
+            }
+            for a in 0..FEAT_LEN { for b in 0..a { cov[a * FEAT_LEN + b] = cov[b * FEAT_LEN + a]; } }
+
+            // Eigendecomposition via Jacobi method (symmetric matrix)
+            let actual_dim = out_dim.min(FEAT_LEN);
+            let eigvecs = jacobi_eigen_top_k(&cov, FEAT_LEN, actual_dim);
+
+            // Final projection: P = eigvecs^T * L^{-1}
+            // Each row of P is one projection direction
+            let mut proj = vec![0.0f64; actual_dim * FEAT_LEN];
+            for d in 0..actual_dim {
+                for j in 0..FEAT_LEN {
+                    let mut sum = 0.0f64;
+                    for k in 0..FEAT_LEN {
+                        sum += eigvecs[d * FEAT_LEN + k] * linv[k * FEAT_LEN + j];
+                    }
+                    proj[d * FEAT_LEN + j] = sum;
+                }
+            }
+
+            // Scale calibration for LDA projection
+            let target_dist = 0.03f64;
+            let mut within_dists: Vec<f64> = Vec::new();
+            let mut rng_cal = SmallRng::seed_from_u64(c as u64 + 9999);
+            for (&fid, indices) in &font_indices {
+                if indices.len() < 2 { continue; }
+                let npairs = 5.min(indices.len() * (indices.len() - 1) / 2);
+                for _ in 0..npairs {
+                    let a = indices[rng_cal.gen_range(0..indices.len())];
+                    let b = loop {
+                        let x = indices[rng_cal.gen_range(0..indices.len())];
+                        if x != a { break x; }
+                    };
+                    let mut d = 0.0f64;
+                    for dim in 0..actual_dim {
+                        let mut ea = 0.0f64;
+                        let mut eb = 0.0f64;
+                        for j in 0..FEAT_LEN {
+                            ea += proj[dim * FEAT_LEN + j] * samples[a].features[j] as f64;
+                            eb += proj[dim * FEAT_LEN + j] * samples[b].features[j] as f64;
+                        }
+                        let diff = ea - eb;
+                        d += diff * diff;
+                    }
+                    within_dists.push(d);
+                }
+            }
+            let scale = if !within_dists.is_empty() {
+                within_dists.sort_by(|a, b| a.partial_cmp(b).unwrap());
+                let median = within_dists[within_dists.len() / 2];
+                if median > 1e-15 { (target_dist / median).sqrt() } else { 1.0 }
+            } else {
+                1.0
+            };
+            for v in &mut proj { *v *= scale; }
+
+            let proj_f32: Vec<f32> = proj.iter().map(|&v| v as f32).collect();
+
+            // ── Evaluate MRR ──
+            let eval_indices = subsample_eval(n, 2000, c);
+
+            // Project centroids
+            let centroid_embeds: Vec<Vec<f64>> = centroid_fids.iter().map(|fid| {
+                let cm = &class_means[fid];
+                let mut emb = vec![0.0f64; actual_dim];
+                for d in 0..actual_dim {
+                    for j in 0..FEAT_LEN {
+                        emb[d] += proj[d * FEAT_LEN + j] * cm[j];
+                    }
+                }
+                emb
+            }).collect();
+
+            let char_stats = eval_mrr(
+                &samples,
+                &eval_indices,
+                &class_means,
+                &centroid_fids,
+                &font_family,
+                &|i| {
+                    // Project sample
+                    let mut emb = vec![0.0f64; actual_dim];
+                    for d in 0..actual_dim {
+                        for j in 0..FEAT_LEN {
+                            emb[d] += proj[d * FEAT_LEN + j] * samples[i].features[j] as f64;
+                        }
+                    }
+                    // Euclidean distances in projected space
+                    centroid_fids.iter().enumerate().map(|(ci2, &fid)| {
+                        let mut d = 0.0f64;
+                        for j in 0..actual_dim {
+                            let diff = emb[j] - centroid_embeds[ci2][j];
+                            d += diff * diff;
+                        }
+                        (fid, d)
+                    }).collect()
+                },
+            );
+
+            lda_chars.push((c, actual_dim, proj_f32));
+
+            if ci < 5 || ci == chars.len() - 1 || (ci + 1) % 20 == 0 {
+                eprintln!("  char '{}' base={:.3} | strict={:.3} t1={:.1}% | family={:.3} t1={:.1}%",
+                    c,
+                    char_stats.base_mrr(),
+                    char_stats.strict_mrr(),
+                    char_stats.strict_top1_pct(),
+                    char_stats.family_mrr(),
+                    char_stats.family_top1_pct());
+            }
+
+            total_stats.accumulate(&char_stats);
+        }
+
+        let lda_elapsed = lda_start.elapsed();
+
+        eprintln!("\nLDA complete: {} characters, {} skipped, {:.1}s",
+            lda_chars.len(), skipped, lda_elapsed.as_secs_f64());
+        eprintln!("  Baseline:    MRR={:.3} top1={:.1}%", total_stats.base_mrr(), total_stats.base_top1_pct());
+        eprintln!("  LDA strict:  MRR={:.3} top1={:.1}% top5={:.1}%", total_stats.strict_mrr(), total_stats.strict_top1_pct(), total_stats.strict_top5_pct());
+        eprintln!("  LDA family:  MRR={:.3} top1={:.1}% top5={:.1}%", total_stats.family_mrr(), total_stats.family_top1_pct(), total_stats.family_top5_pct());
+
+        // Export LDAC weights
+        eprintln!("Writing LDA weights to {}...", args.output.display());
+        let f = std::fs::File::create(&args.output).expect("create output file");
+        let mut w = BufWriter::new(f);
+        w.write_all(b"LDAC").unwrap();
+        w.write_all(&1u32.to_le_bytes()).unwrap();
+        w.write_all(&(lda_chars.len() as u32).to_le_bytes()).unwrap();
+
+        for (c, dim, proj) in &lda_chars {
+            w.write_all(&(*c as u32).to_le_bytes()).unwrap();
+            w.write_all(&(*dim as u32).to_le_bytes()).unwrap();
+            for &v in proj { w.write_all(&v.to_le_bytes()).unwrap(); }
+        }
+        w.flush().unwrap();
+
+        let file_size = std::fs::metadata(&args.output).map(|m| m.len()).unwrap_or(0);
+        let total_elapsed = start.elapsed();
+        eprintln!("\n=== LDA complete ===");
+        eprintln!("  Characters: {}/{}", lda_chars.len(), chars.len());
+        eprintln!("  Weights:    {} ({:.1} MB)", args.output.display(), file_size as f64 / 1e6);
+        eprintln!("  Baseline:    MRR={:.3} top1={:.1}%", total_stats.base_mrr(), total_stats.base_top1_pct());
+        eprintln!("  LDA strict:  MRR={:.3} top1={:.1}% top5={:.1}%", total_stats.strict_mrr(), total_stats.strict_top1_pct(), total_stats.strict_top5_pct());
+        eprintln!("  LDA family:  MRR={:.3} top1={:.1}% top5={:.1}%", total_stats.family_mrr(), total_stats.family_top1_pct(), total_stats.family_top5_pct());
+        eprintln!("  Render:     {:.1}s", render_secs);
+        eprintln!("  Train:      {:.1}s", lda_elapsed.as_secs_f64());
+        eprintln!("  Total:      {:.1}s", total_elapsed.as_secs_f64());
+
+        if !args.no_index {
+            let idx_path = args.index_path.clone().unwrap_or_else(default_index_path);
+            let cls = classifier::LdaClassifier::load(&args.output)
+                .expect("reload LDA weights for index build");
+            build_and_save_char_index(&catalog, &cls, &idx_path);
+        }
         return;
     }
 
@@ -1231,6 +1961,13 @@ fn main() {
     eprintln!("  Render:     {:.1}s", render_secs);
     eprintln!("  Train:      {:.1}s", train_elapsed.as_secs_f64());
     eprintln!("  Total:      {:.1}s", total_elapsed.as_secs_f64());
+
+    if !args.no_index {
+        let idx_path = args.index_path.clone().unwrap_or_else(default_index_path);
+        let cls = classifier::TripletClassifier::load(&args.output)
+            .expect("reload Triplet weights for index build");
+        build_and_save_char_index(&catalog, &cls, &idx_path);
+    }
 }
 
 
