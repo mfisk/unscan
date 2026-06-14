@@ -42,6 +42,15 @@ pub struct AuditEntry {
     /// CI tie-break candidates with per-candidate SSIM scores.
     #[serde(skip_serializing_if = "Vec::is_empty")]
     pub tie_candidates: Vec<TieCandidate>,
+    /// Ground-truth classification: "hit", "major_miss", "minor_miss",
+    /// "ssim_failure", "kept_raster", or "no_ground_truth".
+    /// Populated when --audit is provided.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub miss_type: Option<String>,
+    /// Ground-truth expected font (PostScript name from the vector PDF).
+    /// Populated when --audit is provided.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub expected_font: Option<String>,
 }
 
 /// Word-level bounding box with OCR text.
@@ -97,8 +106,8 @@ pub struct CharCiVote {
     /// Distance of the best alternative character.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub best_alt_dist: Option<f32>,
-    /// Per-char squared distance to the ground-truth font (audit-vector mode).
-    /// Only populated when --audit-vector is provided and --audit is active.
+    /// Per-char squared distance to the ground-truth font (--audit mode).
+    /// Only populated when --audit is provided and --audit is active.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub gt_font_dist_sq: Option<f32>,
 }

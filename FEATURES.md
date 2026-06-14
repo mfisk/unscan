@@ -1,4 +1,4 @@
-# Feature Vector: 99 Dimensions
+# Feature Vector: 100 Dimensions
 
 Each character crop is normalized to NORM_H (48px) tall, then converted to a
 99-dimensional feature vector for nearest-neighbor matching against the font
@@ -12,9 +12,9 @@ and weighting.
 [32..38]  Scalar v1                  7 dims   weight 0.30
 [39..56]  Scalar v2                 18 dims   weight 0.30
 [57..88]  Row ink profile           32 dims   weight 0.30
-[89..98]  Scalar v3                 10 dims   weight 0.20
+[89..99]  Scalar v3                 11 dims   weight 0.20
                                     ─────────
-                                    99 total
+                                    100 total
 ```
 
 ## Group 1: Column Ink Profile (32 dims)
@@ -72,7 +72,7 @@ vertical axis: ascender, x-height, baseline, descender. 'g' has a descender
 spike that 'q' shares but 'a' lacks. 'T' has a heavy top row and thin stem
 below. Together with the column profile, gives a 2D density fingerprint.
 
-## Group 5: Scalar v3 (10 dims)
+## Group 5: Scalar v3 (11 dims)
 
 | # | Feature | Range | What it captures |
 |---|---------|-------|------------------|
@@ -83,6 +83,7 @@ below. Together with the column profile, gives a 2D density fingerprint.
 | 4 | `skeleton_end_pts` | 0+ (÷10) | Endpoints after thinning. 'T' = 3, 'O' = 0, 'C' = 2 |
 | 5 | `corner_count` | 0+ (÷20) | L-shaped boundary junctions. Serifs create corners; sans-serif has fewer. 'M' > 'I' |
 | 6-9 | `quadrant_density[0..3]` | 0-1 | Ink density in TL / TR / BL / BR quadrants. 'P' has ink TR but not BR. 'L' has ink BL+BR but not TR |
+| 10 | `mean_stroke_width` | 0-1 | Mean ink run length (horizontal + vertical) normalised by glyph height. Captures absolute stroke heaviness — the primary signal distinguishing weight classes (Light ≈ 0.08, Regular ≈ 0.12, Medium ≈ 0.14, Bold ≈ 0.18). Complements `stroke_contrast` which measures the ratio of thick-to-thin strokes (similar across weights) but not absolute thickness |
 
 ## Weighting
 
@@ -90,8 +91,8 @@ Each group is independently L2-normalized to unit length, then scaled by its
 weight. This prevents high-dimensional groups (32-bin profiles) from
 dominating lower-dimensional scalar groups purely through dimension count.
 
-Weights were tuned via Fisher discriminant analysis over 353K index entries and
-9K rasterized scan crops:
+Weights were tuned via Fisher discriminant analysis over 513K index entries and
+1.5M rasterized renders across 3 DPIs (300, 200, 100):
 
 | Group | Dims | Weight | Rationale |
 |-------|------|--------|-----------|
@@ -99,7 +100,7 @@ Weights were tuned via Fisher discriminant analysis over 353K index entries and
 | Scalar v1 | 7 | 0.30 | Core geometric features |
 | Scalar v2 | 18 | 0.30 | Structural/topological features |
 | Row profile | 32 | 0.30 | Complements column profile |
-| Scalar v3 | 10 | 0.20 | Fine-grained discriminators, lower individual Fisher ratios |
+| Scalar v3 | 11 | 0.20 | Fine-grained discriminators; `mean_stroke_width` has highest per-dim Fisher score in this group (25.25) |
 
 ## OCR Correction Gate
 

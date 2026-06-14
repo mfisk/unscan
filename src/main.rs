@@ -1,4 +1,5 @@
 mod audit;
+mod classifier;
 mod cli;
 mod color;
 mod deskew;
@@ -141,14 +142,55 @@ fn main() {
         render_ref_chars_and_exit(json_str);
     }
 
+    // ── Build the classifier based on --classifier flag ──────────────
+    let clf: Box<dyn classifier::Classifier> = make_classifier(&args);
+    eprintln!("Using classifier: {}", clf.name());
+
     if args.index {
-        if let Err(e) = run_index(&args) {
+        if let Err(e) = run_index(&args, &*clf) {
             eprintln!("Error: {e}");
             std::process::exit(1);
         }
     } else {
-        if let Err(e) = run(&args) {
+        if let Err(e) = run(&args, &*clf) {
             eprintln!("Error: {e}");
+            std::process::exit(1);
+        }
+    }
+}
+
+/// Create the classifier selected by CLI args.
+fn make_classifier(args: &cli::Args) -> Box<dyn classifier::Classifier> {
+    match args.classifier.as_str() {
+        "fisher" => Box::new(classifier::FisherClassifier),
+        "triplet" => {
+            let weights_path = args.triplet_weights.as_ref().unwrap_or_else(|| {
+                eprintln!("Error: --triplet-weights is required when using --classifier=triplet");
+                std::process::exit(1);
+            });
+            match classifier::TripletClassifier::load(weights_path) {
+                Ok(c) => Box::new(c),
+                Err(e) => {
+                    eprintln!("Error: {e}");
+                    std::process::exit(1);
+                }
+            }
+        }
+        "global-triplet" => {
+            let weights_path = args.triplet_weights.as_ref().unwrap_or_else(|| {
+                eprintln!("Error: --triplet-weights is required when using --classifier=global-triplet");
+                std::process::exit(1);
+            });
+            match classifier::GlobalTripletClassifier::load(weights_path) {
+                Ok(c) => Box::new(c),
+                Err(e) => {
+                    eprintln!("Error: {e}");
+                    std::process::exit(1);
+                }
+            }
+        }
+        other => {
+            eprintln!("Error: unknown classifier '{other}'. Use 'fisher', 'triplet', or 'global-triplet'.");
             std::process::exit(1);
         }
     }
@@ -157,7 +199,7 @@ fn main() {
 /// Scan available fonts, compare against the cached index, and incrementally
 /// update: add new fonts, remove stale fonts, or report "Index is current".
 /// With `--rebuild-index`, forces a full rebuild.
-fn run_index(args: &cli::Args) -> Result<(), ScanTextError> {
+fn run_index(args: &cli::Args, classifier: &dyn classifier::Classifier) -> Result<(), ScanTextError> {
     let font_dirs = font_scan::default_font_dirs(&args.font_dir);
     info!("Scanning for fonts…");
     let font_catalog = font_scan::scan_fonts(&font_dirs);
@@ -180,13 +222,13 @@ fn run_index(args: &cli::Args) -> Result<(), ScanTextError> {
     // ── Full rebuild path ──────────────────────────────────────────
     if args.rebuild_index {
         info!("Forced full rebuild requested");
-        return do_full_build(&system_fonts, &index_path);
+        return do_full_build(&system_fonts, &index_path, classifier);
     }
 
     // ── Try loading existing index ─────────────────────────────────
     if !index_path.exists() {
         info!("No cached index found — building from scratch");
-        return do_full_build(&system_fonts, &index_path);
+        return do_full_build(&system_fonts, &index_path, classifier);
     }
 
     // Fast header check first (12 bytes, no full deserialize).
@@ -197,23 +239,23 @@ fn run_index(args: &cli::Args) -> Result<(), ScanTextError> {
                 info!(
                     "Index format changed (v{version}/feat{feat_len} → v{exp_ver}/feat{exp_fl}) — full rebuild"
                 );
-                return do_full_build(&system_fonts, &index_path);
+                return do_full_build(&system_fonts, &index_path, classifier);
             }
         }
         Err(e) => {
             info!("Cannot read index header ({e}) — full rebuild");
-            return do_full_build(&system_fonts, &index_path);
+            return do_full_build(&system_fonts, &index_path, classifier);
         }
     }
 
     // Header OK — load the full index for incremental comparison.
     info!("Loading cached index from {}", index_path.display());
     let start = std::time::Instant::now();
-    let mut index = match char_index::load_index(&index_path) {
+    let mut index = match char_index::load_index(&index_path, classifier) {
         Ok(idx) => idx,
         Err(e) => {
             warn!("Failed to load index ({e}) — full rebuild");
-            return do_full_build(&system_fonts, &index_path);
+            return do_full_build(&system_fonts, &index_path, classifier);
         }
     };
     let load_time = start.elapsed();
@@ -255,7 +297,7 @@ fn run_index(args: &cli::Args) -> Result<(), ScanTextError> {
         if removed_fonts.len() > 10 {
             debug!("  … and {} more", removed_fonts.len() - 10);
         }
-        index.remove_fonts(&removed_fonts);
+        index.remove_fonts(&removed_fonts, classifier);
     }
 
     // ── Build entries for new fonts only ────────────────────────────
@@ -272,9 +314,9 @@ fn run_index(args: &cli::Args) -> Result<(), ScanTextError> {
             .filter_map(|name| system_fonts.get(name).map(|(p, g)| (name.clone(), p.clone(), g.clone())))
             .collect();
         let start = std::time::Instant::now();
-        let partial = char_index::build_char_index(&pairs);
+        let partial = char_index::build_char_index(&pairs, classifier);
         info!("  Built entries for {} fonts in {:.1}s", new_fonts.len(), start.elapsed().as_secs_f64());
-        index.merge(partial);
+        index.merge(partial, classifier);
     }
 
     // ── Save updated index ─────────────────────────────────────────
@@ -308,6 +350,7 @@ fn run_index(args: &cli::Args) -> Result<(), ScanTextError> {
 fn do_full_build(
     system_fonts: &std::collections::HashMap<String, (PathBuf, char_index::GlyphOverrides)>,
     index_path: &Path,
+    classifier: &dyn classifier::Classifier,
 ) -> Result<(), ScanTextError> {
     let pairs: Vec<(String, PathBuf, char_index::GlyphOverrides)> = system_fonts
         .iter()
@@ -318,7 +361,7 @@ fn do_full_build(
         pairs.len(), char_index::indexed_chars().len());
 
     let start = std::time::Instant::now();
-    let mut index = char_index::build_char_index(&pairs);
+    let mut index = char_index::build_char_index(&pairs, classifier);
     let elapsed = start.elapsed();
 
     if let Some(parent) = index_path.parent() {
@@ -348,13 +391,14 @@ fn do_full_build(
 fn load_or_build_index(
     args: &cli::Args,
     font_catalog: &[font_scan::FontEntry],
+    classifier: &dyn classifier::Classifier,
 ) -> Result<char_index::CharIndex, ScanTextError> {
     let index_path = args.resolved_index_path();
 
     if !args.rebuild_index && index_path.exists() {
         info!("Loading cached character index from {}", index_path.display());
         let start = std::time::Instant::now();
-        match char_index::load_index(&index_path) {
+        match char_index::load_index(&index_path, classifier) {
             Ok(mut index) => {
                 let n_entries: usize = index.n_entries();
                 index.compact(); // free raw entries — only flat_vecs needed for search
@@ -408,7 +452,7 @@ fn load_or_build_index(
         .iter()
         .map(|e| (e.font_key(), e.path.clone(), e.glyph_overrides.clone()))
         .collect();
-    let mut index = char_index::build_char_index(&pairs);
+    let mut index = char_index::build_char_index(&pairs, classifier);
     let elapsed = start.elapsed();
     info!("  Built index in {:.1}s", elapsed.as_secs_f64());
 
@@ -430,12 +474,14 @@ fn load_or_build_index(
     Ok(index)
 }
 
-fn run(args: &cli::Args) -> Result<(), ScanTextError> {
+fn run(args: &cli::Args, classifier: &dyn classifier::Classifier) -> Result<(), ScanTextError> {
     dump_limits();
     let input = args.input.as_ref().expect("input validated");
-    let output = args.output.as_ref().expect("output validated");
+    let dev_null = std::path::PathBuf::from("/dev/null");
+    let output = args.output.as_ref().unwrap_or(&dev_null);
+    let test_mode = args.test.is_some();
 
-    // ── Audit directory (created when --audit is set) ──────────────
+    // ── Audit directory (created when --audit is set) ─────────────
     if let Some(ref dir) = args.audit {
         let _ = std::fs::create_dir_all(dir);
     }
@@ -467,7 +513,7 @@ fn run(args: &cli::Args) -> Result<(), ScanTextError> {
     }
 
     // ── 1b. Load or build character index ────────────────────────────
-    let char_index = load_or_build_index(args, &font_catalog)?;
+    let char_index = load_or_build_index(args, &font_catalog, classifier)?;
 
     // Font bytes already cleared by scan_fonts() — catalog holds metadata + paths only.
     // All font access goes through the shared cache below.
@@ -544,8 +590,8 @@ fn run(args: &cli::Args) -> Result<(), ScanTextError> {
     // Dominant font candidate for fast-path SSIM, persists across pages.
     let mut dominant_font_candidate: Option<font_match::FontMatchResult> = None;
 
-    // Load ground truth from vector PDF for miss-only audit gating.
-    let ground_truth: Option<ground_truth::GroundTruth> = if let Some(ref vpath) = args.audit_vector {
+    // Load ground truth from vector PDF (--audit or --test).
+    let ground_truth: Option<ground_truth::GroundTruth> = if let Some(vpath) = args.gt_vector_pdf() {
         match ground_truth::GroundTruth::load(vpath) {
             Ok(gt) => Some(gt),
             Err(e) => {
@@ -671,7 +717,7 @@ fn run(args: &cli::Args) -> Result<(), ScanTextError> {
         ocr::expand_words_to_ink(&mut lines, &gray_page, ink_thresh);
         eprintln!("  PROF expand_bbox+words: {:.2}s", _t_pre.elapsed().as_secs_f64());
         let _t_split = std::time::Instant::now();
-        ocr::split_wide_whitespace_words(&mut lines, &gray_page, ink_thresh, Some(&char_index), Some(&font_cache));
+        ocr::split_wide_whitespace_words(&mut lines, &gray_page, ink_thresh, Some(&char_index), Some(&font_cache), classifier);
         eprintln!("  PROF split_wide_whitespace: {:.2}s", _t_split.elapsed().as_secs_f64());
         let mut placed_texts: Vec<pdf_out::PlacedText> = Vec::new();
         let mut pg_vec = 0u32;
@@ -689,7 +735,7 @@ fn run(args: &cli::Args) -> Result<(), ScanTextError> {
             diag_seg_dir: Option<std::path::PathBuf>,
             /// Per-char distances to the chosen font, keyed by crop_index.
             chosen_char_dists: std::collections::HashMap<usize, f32>,
-            /// Per-char distances to the ground-truth font (audit-vector mode), keyed by crop_index.
+            /// Per-char distances to the ground-truth font (--audit mode), keyed by crop_index.
             gt_font_char_dists: std::collections::HashMap<usize, f32>,
             /// CI tie-break candidates with per-candidate SSIM scores.
             tie_candidates: Vec<audit::TieCandidate>,
@@ -845,15 +891,15 @@ fn run(args: &cli::Args) -> Result<(), ScanTextError> {
             let (font_result, tie_candidates_audit) = {
 
                 // Crop PNGs are saved after font matching, gated by ground-truth
-                // miss detection when --audit-vector is set (see below).
+                // miss detection when --audit is set (see below).
 
                 // ── Score plain path ─────────────────────────────────
                 let ci_t0 = std::time::Instant::now();
-                let ci_result_plain = char_index::search_candidates(&char_index, char_crops, args.thoroughness, args.audit.is_some());
+                let ci_result_plain = char_index::search_candidates(&char_index, char_crops, args.thoroughness, args.full_audit(), classifier);
 
                 // ── Score ligature path (if present) ─────────────────
                 let ci_result_lig = line_crops.ligature.as_ref().map(|lig_crops| {
-                    char_index::search_candidates(&char_index, lig_crops, args.thoroughness, args.audit.is_some())
+                    char_index::search_candidates(&char_index, lig_crops, args.thoroughness, args.full_audit(), classifier)
                 });
                 prof_ci_us.fetch_add(ci_t0.elapsed().as_micros() as u64, std::sync::atomic::Ordering::Relaxed);
                 // ── Pick the winner: higher top score wins ───────────
@@ -990,8 +1036,8 @@ fn run(args: &cli::Args) -> Result<(), ScanTextError> {
                     line.words.iter().map(|w| w.text.as_str()).collect::<Vec<_>>().join(" "));
             }
             // ── Ground-truth gated audit detail ─────────────────────────
-            // When --audit-vector is set, check if this line is a miss before
-            // doing expensive audit I/O.  Without --audit-vector, all lines
+            // When --audit is set, check if this line is a miss before
+            // doing expensive audit I/O.  Without --audit, all lines
             // get full audit.  "Miss" means: ground-truth font mismatch, no
             // font matched, OCR too low, or font confidence too low.
             let is_miss = if let Some(ref gt) = ground_truth {
@@ -1044,10 +1090,10 @@ fn run(args: &cli::Args) -> Result<(), ScanTextError> {
 
             let pcd_t0 = std::time::Instant::now();
 
-            // Per-char distances and audit detail: only for miss lines (or all if no --audit-vector)
-            let (chosen_char_dists, gt_font_char_dists) = if is_miss && args.audit.is_some() {
+            // Per-char distances and audit detail: only for miss lines when full audit is active
+            let (chosen_char_dists, gt_font_char_dists) = if is_miss && args.full_audit() {
                 // Precompute features once for all per-char distance lookups
-                let crop_feats = char_index::precompute_crop_features(&corrected_char_crops);
+                let crop_feats = char_index::precompute_crop_features(&corrected_char_crops, classifier);
 
                 let chosen: std::collections::HashMap<usize, f32> = if let Some(ref fr) = font_result {
                     if !fr.font_key.is_empty() {
@@ -1470,6 +1516,8 @@ fn run(args: &cli::Args) -> Result<(), ScanTextError> {
                     Vec::new()
                 },
                 tie_candidates: lm.tie_candidates.clone(),
+                miss_type: None,
+                expected_font: None,
             });
 
             placed_texts.push(pdf_out::PlacedText {
@@ -1693,15 +1741,18 @@ fn run(args: &cli::Args) -> Result<(), ScanTextError> {
         }
     }
 
-    info!("Generating output PDF: {}", output.display());
-    pdf_out::generate_pdf(output, &all_pages, args.overlay, &font_cache)?;
+    if !test_mode {
+        info!("Generating output PDF: {}", output.display());
+        pdf_out::generate_pdf(output, &all_pages, args.overlay, &font_cache)?;
+    }
 
-    let output_size = std::fs::metadata(output).map(|m| m.len()).unwrap_or(0);
+    let output_size = if test_mode { 0 } else { std::fs::metadata(output).map(|m| m.len()).unwrap_or(0) };
     let ratio = if output_size > 0 { input_size as f64 / output_size as f64 } else { 0.0 };
 
-    // ── 5. Write audit log (skip for /dev/null output) ────────────────
-    let audit_path = args.audit_log_path();
-    let audit = AuditLog {
+    // ── 5. Accuracy & audit ──────────────────────────────────────────
+    // Build a minimal AuditLog for classification (needed by both --test
+    // and full audit paths).
+    let mut audit = AuditLog {
         input_file: input.display().to_string(),
         output_file: output.display().to_string(),
         input_size_bytes: input_size,
@@ -1712,6 +1763,60 @@ fn run(args: &cli::Args) -> Result<(), ScanTextError> {
         text_entries: audit_text,
         geometry_entries: audit_geo,
     };
+    // Enrich entries with ground-truth classification before writing JSON.
+    report::enrich_audit_entries(
+        &mut audit.text_entries,
+        ground_truth.as_ref(),
+        args.dpi,
+        &font_catalog,
+    );
+
+    if test_mode {
+        // ── Test mode: compute accuracy, print JSON to stdout ────────
+        let acc = report::compute_accuracy(
+            &audit.text_entries,
+            ground_truth.as_ref(),
+            args.dpi,
+            &font_catalog,
+        );
+        // JSON output to stdout
+        let test_json = serde_json::json!({
+            "primary_hits": acc.primary_hits,
+            "compared": acc.compared,
+            "pct": (acc.pct * 10.0).round() / 10.0,
+            "major_misses": acc.major_misses,
+            "minor_misses": acc.minor_misses,
+            "ssim_failures": acc.ssim_failures,
+            "hits": acc.hits,
+            "kept_raster": acc.kept_raster,
+        });
+        println!("{}", serde_json::to_string_pretty(&test_json).unwrap());
+
+        // If --audit is also set, write audit artifacts + HTML report
+        if let Some(ref audit_root) = args.audit {
+            let audit_path = args.audit_log_path();
+            if let Err(e) = audit.write_to_file(&audit_path) {
+                warn!("Failed to write audit log: {}", e);
+            } else {
+                info!("Audit log: {}", audit_path.display());
+            }
+            let report_path = audit_root.join("report.html");
+            if let Err(e) = report::generate_report(
+                &report_path,
+                audit_root,
+                &audit.text_entries,
+                ground_truth.as_ref(),
+                args.dpi,
+                &font_catalog,
+            ) {
+                warn!("Failed to generate report: {}", e);
+            }
+        }
+        return Ok(());
+    }
+
+    let audit_path = args.audit_log_path();
+
     if output.to_str() != Some("/dev/null") || args.audit.is_some() {
         if let Err(e) = audit.write_to_file(&audit_path) {
             warn!("Failed to write audit log: {}", e);

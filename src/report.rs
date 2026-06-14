@@ -1,8 +1,8 @@
 //! HTML miss report generation.
 //!
 //! Automatically generated into `<audit_dir>/report.html`.  When
-//! `--audit-vector` is also provided, classifies lines as hits/misses against
-//! ground truth from the vector PDF.  Without `--audit-vector`, reports all
+//! `--audit` is also provided, classifies lines as hits/misses against
+//! ground truth from the vector PDF.  Without `--audit`, reports all
 //! kept-raster lines.
 
 use std::collections::HashMap;
@@ -252,10 +252,24 @@ struct ClassifiedEntry<'a> {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum MissKind {
     Hit,
-    FontMiss,
+    MajorMiss,
+    MinorMiss,
     SsimFailure,
     KeptRaster,
     NoGroundTruth,
+}
+
+impl MissKind {
+    fn as_str(&self) -> &'static str {
+        match self {
+            MissKind::Hit => "hit",
+            MissKind::MajorMiss => "major_miss",
+            MissKind::MinorMiss => "minor_miss",
+            MissKind::SsimFailure => "ssim_failure",
+            MissKind::KeptRaster => "kept_raster",
+            MissKind::NoGroundTruth => "no_ground_truth",
+        }
+    }
 }
 
 fn classify_entries<'a>(
@@ -296,7 +310,27 @@ fn classify_entries<'a>(
                             MissKind::Hit
                         }
                     } else {
-                        MissKind::FontMiss
+                        // Font miss — classify as major or minor.
+                        // Read identity from both the picked font and the GT font.
+                        let picked_path = e.ci_candidates.first()
+                            .and_then(|c| find_font_by_key(font_catalog, &c.font_key))
+                            .map(|fe| fe.path.clone());
+                        let gt_path = font_catalog.iter()
+                            .find(|fe| fe.postscript_name == *actual && fe.variant_tag.is_empty())
+                            .map(|fe| fe.path.clone());
+
+                        let is_minor = match (picked_path, gt_path) {
+                            (Some(pp), Some(gp)) => {
+                                match (crate::font_scan::read_font_identity(&pp),
+                                       crate::font_scan::read_font_identity(&gp)) {
+                                    (Some(pi), Some(gi)) => !pi.is_major_diff(&gi),
+                                    _ => false, // can't read → assume major
+                                }
+                            }
+                            _ => false,
+                        };
+
+                        if is_minor { MissKind::MinorMiss } else { MissKind::MajorMiss }
                     }
                 } else {
                     MissKind::NoGroundTruth
@@ -322,6 +356,30 @@ fn classify_entries<'a>(
             }
         })
         .collect()
+}
+
+/// Enrich audit entries with ground-truth classification fields
+/// (`miss_type` and `expected_font`).  Call this before writing
+/// the audit JSON so downstream tools never have to parse the HTML
+/// report.
+pub fn enrich_audit_entries(
+    entries: &mut [AuditEntry],
+    gt: Option<&GroundTruth>,
+    dpi: u32,
+    font_catalog: &[FontEntry],
+) {
+    // classify_entries produces a 1:1 parallel vec.
+    let results: Vec<(String, Option<String>)> = {
+        let classified = classify_entries(entries, gt, dpi, font_catalog);
+        classified
+            .iter()
+            .map(|ce| (ce.kind.as_str().to_string(), ce.actual_font.clone()))
+            .collect()
+    };
+    for (e, (kind, expected)) in entries.iter_mut().zip(results) {
+        e.miss_type = Some(kind);
+        e.expected_font = expected;
+    }
 }
 
 // ── CI candidate lookup ─────────────────────────────────────────────────────
@@ -446,9 +504,12 @@ fn build_miss_block(
 
     let text_preview = truncate(&entry.text, 60);
     let miss_kind_label = match ce.kind {
-        MissKind::FontMiss => {
+        MissKind::MajorMiss => {
             // Show expected→got summary for font misses
-            format!(" [font: expected {}, got {}]", actual_font, matched)
+            format!(" [MAJOR: expected {}, got {}]", actual_font, matched)
+        },
+        MissKind::MinorMiss => {
+            format!(" [minor: expected {}, got {}]", actual_font, matched)
         },
         MissKind::SsimFailure => " [SSIM failure]".to_string(),
         MissKind::KeptRaster => " [kept raster]".to_string(),
@@ -1027,7 +1088,7 @@ fn build_char_table(
 
         // Per-char distance for correct font
         let correct_char_dist: Option<f32> = correct_fe.and_then(|_fe| {
-            // Check gt_font_dist_sq (from audit-vector GT font injection)
+            // Check gt_font_dist_sq (from --audit GT font injection)
             if let Some(d) = cv.gt_font_dist_sq {
                 return Some(d);
             }
@@ -1239,6 +1300,67 @@ img.ci {
 
 // ── Public API ──────────────────────────────────────────────────────────────
 
+/// Accuracy result from classifying audit entries against ground truth.
+pub struct AccuracyResult {
+    pub hits: usize,
+    pub major_misses: usize,
+    pub minor_misses: usize,
+    pub ssim_failures: usize,
+    pub kept_raster: usize,
+    pub compared: usize,
+    pub primary_hits: usize,
+    pub pct: f64,
+}
+
+/// Compute accuracy without generating any HTML or audit I/O.
+/// Used by --test for fast scoring.
+pub fn compute_accuracy(
+    entries: &[AuditEntry],
+    gt: Option<&GroundTruth>,
+    dpi: u32,
+    font_catalog: &[FontEntry],
+) -> AccuracyResult {
+    let classified = classify_entries(entries, gt, dpi, font_catalog);
+
+    let mut hits = 0usize;
+    let mut major_misses = 0usize;
+    let mut minor_misses = 0usize;
+    let mut ssim_failures = 0usize;
+    let mut kept_raster = 0usize;
+
+    for ce in &classified {
+        match ce.kind {
+            MissKind::Hit => hits += 1,
+            MissKind::MajorMiss => major_misses += 1,
+            MissKind::MinorMiss => minor_misses += 1,
+            MissKind::SsimFailure => ssim_failures += 1,
+            MissKind::KeptRaster => kept_raster += 1,
+            MissKind::NoGroundTruth => {}
+        }
+    }
+
+    let all_misses = major_misses + minor_misses + ssim_failures;
+    let compared = hits + all_misses;
+    let major_total = major_misses + ssim_failures;
+    let primary_hits = compared - major_total;
+    let pct = if compared > 0 {
+        primary_hits as f64 / compared as f64 * 100.0
+    } else {
+        100.0
+    };
+
+    AccuracyResult {
+        hits,
+        major_misses,
+        minor_misses,
+        ssim_failures,
+        kept_raster,
+        compared,
+        primary_hits,
+        pct,
+    }
+}
+
 pub fn generate_report(
     report_path: &Path,
     audit_root: &Path,
@@ -1250,7 +1372,8 @@ pub fn generate_report(
     let classified = classify_entries(entries, gt, dpi, font_catalog);
 
     let mut hits = 0usize;
-    let mut font_misses: Vec<&ClassifiedEntry> = Vec::new();
+    let mut major_misses: Vec<&ClassifiedEntry> = Vec::new();
+    let mut minor_misses: Vec<&ClassifiedEntry> = Vec::new();
     let mut ssim_failures: Vec<&ClassifiedEntry> = Vec::new();
     let mut kept_raster: Vec<&ClassifiedEntry> = Vec::new();
     let mut total_chars = 0usize;
@@ -1267,27 +1390,42 @@ pub fn generate_report(
 
         match ce.kind {
             MissKind::Hit => hits += 1,
-            MissKind::FontMiss => font_misses.push(ce),
+            MissKind::MajorMiss => major_misses.push(ce),
+            MissKind::MinorMiss => minor_misses.push(ce),
             MissKind::SsimFailure => ssim_failures.push(ce),
             MissKind::KeptRaster => kept_raster.push(ce),
             MissKind::NoGroundTruth => {} // excluded from hit/miss denominator
         }
     }
 
-    let all_misses = font_misses.len() + ssim_failures.len();
+    let all_misses = major_misses.len() + minor_misses.len() + ssim_failures.len();
     let compared = hits + all_misses;
+    // Primary metric: only major misses count against the score.
+    let major_total = major_misses.len() + ssim_failures.len();
+    let primary_hits = compared - major_total;
     let pct = if compared > 0 {
-        hits as f64 / compared as f64 * 100.0
+        primary_hits as f64 / compared as f64 * 100.0
     } else {
         100.0
     };
 
     let mut font_data_cache = FontDataCache::new();
 
-    // Build miss blocks
-    let mut miss_blocks = String::new();
-    for ce in &font_misses {
-        miss_blocks.push_str(&build_miss_block(
+    // Build major miss blocks
+    let mut major_miss_blocks = String::new();
+    for ce in &major_misses {
+        major_miss_blocks.push_str(&build_miss_block(
+            ce,
+            audit_root,
+            font_catalog,
+            &mut font_data_cache,
+        ));
+    }
+
+    // Build minor miss blocks
+    let mut minor_miss_blocks = String::new();
+    for ce in &minor_misses {
+        minor_miss_blocks.push_str(&build_miss_block(
             ce,
             audit_root,
             font_catalog,
@@ -1376,13 +1514,13 @@ pub fn generate_report(
          <html>\n\
          <head>\n\
          <meta charset=\"utf-8\">\n\
-         <title>unscan miss report — {hits}/{compared} ({pct:.1}%)</title>\n\
+         <title>unscan miss report — {primary_hits}/{compared} ({pct:.1}%)</title>\n\
          </head>\n\
          <body style=\"background: white; color: #222;\">\n\
          {CSS}\n\
          <h2>unscan miss report</h2>\n\
-         <div class=\"summary\">{hits}/{compared} correct ({pct:.1}%) — \
-         {all_misses} misses shown below{ssim_miss_str}{raster_str}{ocr_corr_str}{ssim_percentile_str}</div>\n\
+         <div class=\"summary\">{primary_hits}/{compared} correct ({pct:.1}%) — \
+         {n_major} major + {n_minor} minor misses{ssim_miss_str}{raster_str}{ocr_corr_str}{ssim_percentile_str}</div>\n\
          <div class=\"score-legend\">\n\
          <b>Score key:</b>\n\
          <b>CI score</b> (per-line) = −mean(log(dist²)) across characters; \
@@ -1393,11 +1531,16 @@ pub fn generate_report(
          <b>SSIM</b> (per-line) = structural similarity between scanned line \
          and re-render; <b>0–1, higher = more similar</b>.\n\
          </div>\n\
-         {miss_blocks}\n\
+         <h2>Major Misses ({n_major})</h2>\n\
+         {major_miss_blocks}\n\
+         <h2 style=\"margin-top:2em; color:#e90;\">Minor Misses ({n_minor})</h2>\n\
+         {minor_miss_blocks}\n\
          {ssim_section}\n\
          {raster_section}\n\
          </body>\n\
-         </html>"
+         </html>",
+        n_major = major_misses.len(),
+        n_minor = minor_misses.len(),
     );
 
     if let Some(parent) = report_path.parent() {
@@ -1408,8 +1551,10 @@ pub fn generate_report(
         .map_err(|e| format!("Failed to write report: {e}"))?;
 
     eprintln!(
-        "Report: {hits}/{compared} ({pct:.1}%) — {all_misses} misses{ssim_miss_str} → {}",
-        report_path.display()
+        "Report: {primary_hits}/{compared} ({pct:.1}%) — {n_major} major + {n_minor} minor misses{ssim_miss_str} → {}",
+        report_path.display(),
+        n_major = major_misses.len(),
+        n_minor = minor_misses.len(),
     );
 
     Ok(())

@@ -16,5 +16,6 @@ pub mod pdf_out;
 pub mod smooth;
 // pub mod word_match; // disabled: CI ranking used directly, word-level SSIM rerank removed
 pub mod audit;
+pub mod classifier;
 pub mod seg_diag;
 pub mod ssim;

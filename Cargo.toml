@@ -9,6 +9,14 @@ license = "MIT"
 name = "unscan"
 path = "src/main.rs"
 
+[[bin]]
+name = "gen_training_data"
+path = "src/bin/gen_training_data.rs"
+
+[[bin]]
+name = "train"
+path = "src/bin/train.rs"
+
 [dependencies]
 clap = { version = "4", features = ["derive"] }
 image = "0.25"
@@ -26,9 +34,14 @@ freetype-rs = "0.38"
 rustybuzz = "0.18"
 subsetter = "0.2"
 base64 = "0.22.1"
+rand = { version = "0.8", features = ["small_rng"] }
 
 # Fast iteration: opt-level 1 gives ~10x runtime speedup over opt-level 0
 # while keeping incremental compilation fast
 [profile.dev]
 opt-level = 1
 split-debuginfo = "unpacked"
+
+[profile.release]
+lto = "fat"
+codegen-units = 1

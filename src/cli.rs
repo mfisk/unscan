@@ -53,9 +53,10 @@ pub struct Args {
     #[arg(long)]
     pub smooth: bool,
 
-    /// Audit directory.  Writes audit.json and per-word segmentation
+    /// Audit output directory.  Writes audit.json and per-word segmentation
     /// diagnostics (crops, seams, char overlays) into the given directory.
-    /// When `--audit-vector` is also set, generates report.html.
+    /// When --test is also set, generates report.html with ground-truth
+    /// hit/miss classification.
     #[arg(long, value_name = "DIR")]
     pub audit: Option<PathBuf>,
 
@@ -93,14 +94,11 @@ pub struct Args {
     #[arg(long, value_name = "PAGES")]
     pub pages: Option<String>,
 
-    /// Vector PDF for ground-truth comparison.  When set alongside --audit,
-    /// only miss lines get full audit detail (crop PNGs, GT font per-char
-    /// distances, font ref glyphs).  Hit lines are logged with minimal data.
-    /// A "miss" includes font mismatches, no font match, OCR rejection, and
-    /// SSIM rejection.  Also generates an HTML miss report in the audit
-    /// directory comparing unscan's font picks against ground truth.
-    #[arg(long = "audit-vector", value_name = "FILE")]
-    pub audit_vector: Option<std::path::PathBuf>,
+    /// Ground-truth vector PDF for accuracy evaluation.  Outputs performance
+    /// stats as JSON to stdout.  When --audit is also set, the audit report
+    /// includes ground-truth hit/miss classification.  Does not require --output.
+    #[arg(long, value_name = "PDF")]
+    pub test: Option<PathBuf>,
 
     /// Render characters using the index-time render_char_normalised() pipeline
     /// and save as PNGs.  Takes a JSON object: {"font": "/path/to/font.ttf",
@@ -108,6 +106,17 @@ pub struct Args {
     /// U+XXXX.png (e.g. U+0048.png for 'H').  Exits after rendering.
     #[arg(long, value_name = "JSON")]
     pub render_ref_chars: Option<String>,
+
+    /// Font matching classifier: 'fisher' (default, Fisher-weighted kNN),
+    /// 'triplet' (per-glyph learned embedding), or 'global-triplet'
+    /// (single learned embedding across all characters).
+    #[arg(long, default_value = "fisher")]
+    pub classifier: String,
+
+    /// Path to triplet network weights file (required when --classifier=triplet
+    /// or --classifier=global-triplet).
+    #[arg(long)]
+    pub triplet_weights: Option<PathBuf>,
 }
 
 impl Args {
@@ -149,13 +158,28 @@ impl Args {
         }
     }
 
-    /// Validate: if not --index, require input and output.
+    /// The ground-truth vector PDF path — from --test.
+    pub fn gt_vector_pdf(&self) -> Option<&PathBuf> {
+        self.test.as_ref()
+    }
+
+    /// Whether full audit I/O (crops, per-char diagnostics, HTML) is enabled.
+    /// True when --audit is set.
+    pub fn full_audit(&self) -> bool {
+        self.audit.is_some()
+    }
+
+    /// Validate: if not --index, require input and output (unless --test).
     pub fn validate(&self) -> Result<(), String> {
         if self.index || self.render_ref_chars.is_some() {
             return Ok(());
         }
         if self.input.is_none() {
             return Err("Input file required (or use --index)".to_string());
+        }
+        // --test mode doesn't require output
+        if self.test.is_some() {
+            return Ok(());
         }
         if self.output.is_none() {
             return Err("Output path required (use -o / --output)".to_string());
