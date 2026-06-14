@@ -190,8 +190,48 @@ fn make_classifier(args: &cli::Args) -> Box<dyn classifier::Classifier> {
             }
         }
         other => {
-            eprintln!("Error: unknown classifier '{other}'. Use 'fisher', 'triplet', or 'global-triplet'.");
-            std::process::exit(1);
+            // Check for weight-file-based classifiers
+            match other {
+                "lda" => {
+                    // LDA has built-in weights; external file is optional override
+                    if let Some(ref weights_path) = args.triplet_weights {
+                        match classifier::LdaClassifier::load(weights_path) {
+                            Ok(c) => Box::new(c),
+                            Err(e) => { eprintln!("Error: {e}"); std::process::exit(1); }
+                        }
+                    } else {
+                        static LDA_WEIGHTS: &[u8] = include_bytes!("../lda28-weights.bin");
+                        match classifier::LdaClassifier::from_bytes(LDA_WEIGHTS) {
+                            Ok(c) => Box::new(c),
+                            Err(e) => { eprintln!("Error loading built-in LDA weights: {e}"); std::process::exit(1); }
+                        }
+                    }
+                }
+                _ => {
+                    let weights_path = args.triplet_weights.as_ref().unwrap_or_else(|| {
+                        eprintln!("Error: --triplet-weights is required when using --classifier={other}");
+                        std::process::exit(1);
+                    });
+                    match other {
+                        "perchar-fisher" => {
+                            match classifier::PerCharFisherClassifier::load(weights_path) {
+                                Ok(c) => Box::new(c),
+                                Err(e) => { eprintln!("Error: {e}"); std::process::exit(1); }
+                            }
+                        }
+                        "mahalanobis" => {
+                            match classifier::MahalanobisClassifier::load(weights_path) {
+                                Ok(c) => Box::new(c),
+                                Err(e) => { eprintln!("Error: {e}"); std::process::exit(1); }
+                            }
+                        }
+                        _ => {
+                            eprintln!("Error: unknown classifier '{other}'. Use 'lda', 'fisher', 'perchar-fisher', 'triplet', 'global-triplet', or 'mahalanobis'.");
+                            std::process::exit(1);
+                        }
+                    }
+                }
+            }
         }
     }
 }

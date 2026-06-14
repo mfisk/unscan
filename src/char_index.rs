@@ -1377,7 +1377,7 @@ impl CharIndex {
         self.flat_vecs.clear();
         self.dim_sigmas.clear();
 
-        let embed_dim = classifier.embed_dim();
+        let prep_dim = classifier.prepare_dim();
 
         for (c, char_entries) in &self.entries {
             if char_entries.is_empty() {
@@ -1387,7 +1387,7 @@ impl CharIndex {
             let mut points: Vec<(usize, Vec<f32>)> = Vec::with_capacity(char_entries.len());
 
             for e in char_entries {
-                let embedded = classifier.embed(*c, &e.features);
+                let embedded = classifier.prepare(*c, &e.features);
                 if let Some(&font_id) = name_to_id.get(e.font_name.as_str()) {
                     points.push((font_id, embedded));
                 }
@@ -1399,24 +1399,24 @@ impl CharIndex {
 
             // Compute per-dimension mean and σ
             let n = points.len() as f32;
-            let mut means = vec![0.0f32; embed_dim];
+            let mut means = vec![0.0f32; prep_dim];
             for (_, w) in &points {
-                for d in 0..embed_dim {
+                for d in 0..prep_dim {
                     means[d] += w[d];
                 }
             }
-            for d in 0..embed_dim {
+            for d in 0..prep_dim {
                 means[d] /= n;
             }
 
-            let mut sigmas = vec![0.0f32; embed_dim];
+            let mut sigmas = vec![0.0f32; prep_dim];
             for (_, w) in &points {
-                for d in 0..embed_dim {
+                for d in 0..prep_dim {
                     let diff = w[d] - means[d];
                     sigmas[d] += diff * diff;
                 }
             }
-            for d in 0..embed_dim {
+            for d in 0..prep_dim {
                 sigmas[d] = (sigmas[d] / n).sqrt();
             }
 
@@ -2032,7 +2032,7 @@ pub fn search_candidates(
         .iter()
         .enumerate()
         .filter_map(|(i, (c, img))| {
-            compute_features(img).map(|f| (i, *c, classifier.embed(*c, &f)))
+            compute_features(img).map(|f| (i, *c, classifier.prepare(*c, &f)))
         })
         .collect();
     let feat_us = feat_t0.elapsed().as_micros();
@@ -2434,7 +2434,7 @@ pub fn per_char_distances(
         .iter()
         .enumerate()
         .filter_map(|(i, (c, img))| {
-            compute_features(img).map(|f| (i, *c, classifier.embed(*c, &f)))
+            compute_features(img).map(|f| (i, *c, classifier.prepare(*c, &f)))
         })
         .collect();
     per_char_distances_precomputed(index, font_key, &precomputed)
@@ -2481,7 +2481,7 @@ pub fn precompute_crop_features(
         .iter()
         .enumerate()
         .filter_map(|(i, (c, img))| {
-            compute_features(img).map(|f| (i, *c, classifier.embed(*c, &f)))
+            compute_features(img).map(|f| (i, *c, classifier.prepare(*c, &f)))
         })
         .collect()
 }
