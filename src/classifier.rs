@@ -24,29 +24,62 @@ use std::collections::HashMap;
 // Trait
 // ---------------------------------------------------------------------------
 
-/// A font classifier that transforms raw character features into an
-/// embedding space and computes distances in that space.
+/// A font classifier that stores per-font representations at index time
+/// and ranks candidates against a query glyph at search time.
 pub trait Classifier: Send + Sync {
-    /// Dimensionality of the embedding (output length of [`embed`]).
-    fn embed_dim(&self) -> usize;
+    /// Dimensionality of the stored representation per font entry.
+    fn prepare_dim(&self) -> usize;
 
-    /// Transform raw character features into the classifier's embedding space.
+    /// Compute the stored representation for a font entry at index build time.
     ///
     /// The `ch` parameter identifies which character the features represent.
-    /// Global classifiers (like Fisher) ignore it; per-glyph classifiers
-    /// use it to select the appropriate model.
-    fn embed(&self, ch: char, features: &CharFeatures) -> Vec<f32>;
+    /// The returned vector is stored in the index and passed back to [`rank`]
+    /// at query time.
+    fn prepare(&self, ch: char, features: &CharFeatures) -> Vec<f32>;
 
-    /// Squared distance between two embedded vectors.
+    /// Rank all candidates for a character against a query glyph.
     ///
-    /// **Contract**: lower values mean closer match (more similar fonts).
-    /// All classifiers must follow this convention so the downstream scoring
-    /// pipeline (log-distance aggregation, negation to higher-is-better)
-    /// produces consistent results regardless of classifier choice.
-    fn distance_sq(&self, a: &[f32], b: &[f32]) -> f32;
+    /// Returns an iterator of `(font_id, score)` in **best-first order**
+    /// (lowest score = closest match). The caller can pull matches one at
+    /// a time, stopping when one passes downstream verification (e.g. SSIM).
+    ///
+    /// `candidates` contains `(font_id, stored_representation)` pairs from
+    /// the index, where each `stored_representation` was produced by a prior
+    /// call to [`prepare`].
+    fn rank<'a>(
+        &'a self,
+        ch: char,
+        query: &CharFeatures,
+        candidates: &'a [(usize, Vec<f32>)],
+    ) -> Box<dyn Iterator<Item = (usize, f32)> + 'a>;
 
     /// Short name for logging and cache invalidation.
     fn name(&self) -> &str;
+}
+
+// ---------------------------------------------------------------------------
+// Helpers for embedding-based classifiers
+// ---------------------------------------------------------------------------
+
+/// Squared Euclidean distance between two slices.
+fn sq_euclid(a: &[f32], b: &[f32]) -> f32 {
+    debug_assert_eq!(a.len(), b.len());
+    a.iter().zip(b.iter()).map(|(x, y)| { let d = x - y; d * d }).sum()
+}
+
+/// Default rank implementation for embedding-based classifiers:
+/// embed the query, compute squared Euclidean distance to every candidate,
+/// return sorted by distance.
+fn rank_by_embedding(
+    query_embedded: Vec<f32>,
+    candidates: &[(usize, Vec<f32>)],
+) -> Box<dyn Iterator<Item = (usize, f32)> + '_> {
+    let mut scored: Vec<(usize, f32)> = candidates
+        .iter()
+        .map(|(id, stored)| (*id, sq_euclid(&query_embedded, stored)))
+        .collect();
+    scored.sort_by(|a, b| a.1.partial_cmp(&b.1).unwrap_or(std::cmp::Ordering::Equal));
+    Box::new(scored.into_iter())
 }
 
 // ---------------------------------------------------------------------------
@@ -61,11 +94,11 @@ pub trait Classifier: Send + Sync {
 pub struct FisherClassifier;
 
 impl Classifier for FisherClassifier {
-    fn embed_dim(&self) -> usize {
+    fn prepare_dim(&self) -> usize {
         FEAT_LEN
     }
 
-    fn embed(&self, _ch: char, features: &CharFeatures) -> Vec<f32> {
+    fn prepare(&self, _ch: char, features: &CharFeatures) -> Vec<f32> {
         let raw = features.as_slice();
         let mut v = vec![0.0f32; FEAT_LEN];
         for i in 0..FEAT_LEN {
@@ -74,15 +107,14 @@ impl Classifier for FisherClassifier {
         v
     }
 
-    fn distance_sq(&self, a: &[f32], b: &[f32]) -> f32 {
-        debug_assert_eq!(a.len(), b.len());
-        a.iter()
-            .zip(b.iter())
-            .map(|(x, y)| {
-                let d = x - y;
-                d * d
-            })
-            .sum()
+    fn rank<'a>(
+        &'a self,
+        _ch: char,
+        query: &CharFeatures,
+        candidates: &'a [(usize, Vec<f32>)],
+    ) -> Box<dyn Iterator<Item = (usize, f32)> + 'a> {
+        let q = self.prepare(_ch, query);
+        rank_by_embedding(q, candidates)
     }
 
     fn name(&self) -> &str {
@@ -270,30 +302,27 @@ impl TripletClassifier {
 }
 
 impl Classifier for TripletClassifier {
-    fn embed_dim(&self) -> usize {
+    fn prepare_dim(&self) -> usize {
         L3_OUT
     }
 
-    fn embed(&self, ch: char, features: &CharFeatures) -> Vec<f32> {
+    fn prepare(&self, ch: char, features: &CharFeatures) -> Vec<f32> {
         if let Some(net) = self.nets.get(&ch) {
             net.forward(&features.as_slice())
         } else {
-            // Fallback: Fisher weights truncated to L3_OUT dims.
-            // Only fires for chars not in the training data.
             let fisher = Self::fisher_embed(features);
             fisher[..L3_OUT.min(fisher.len())].to_vec()
         }
     }
 
-    fn distance_sq(&self, a: &[f32], b: &[f32]) -> f32 {
-        debug_assert_eq!(a.len(), b.len());
-        a.iter()
-            .zip(b.iter())
-            .map(|(x, y)| {
-                let d = x - y;
-                d * d
-            })
-            .sum()
+    fn rank<'a>(
+        &'a self,
+        ch: char,
+        query: &CharFeatures,
+        candidates: &'a [(usize, Vec<f32>)],
+    ) -> Box<dyn Iterator<Item = (usize, f32)> + 'a> {
+        let q = self.prepare(ch, query);
+        rank_by_embedding(q, candidates)
     }
 
     fn name(&self) -> &str {
@@ -392,26 +421,405 @@ impl GlobalTripletClassifier {
 }
 
 impl Classifier for GlobalTripletClassifier {
-    fn embed_dim(&self) -> usize {
+    fn prepare_dim(&self) -> usize {
         L3_OUT
     }
 
-    fn embed(&self, _ch: char, features: &CharFeatures) -> Vec<f32> {
+    fn prepare(&self, _ch: char, features: &CharFeatures) -> Vec<f32> {
         self.net.forward(&features.as_slice())
     }
 
-    fn distance_sq(&self, a: &[f32], b: &[f32]) -> f32 {
-        debug_assert_eq!(a.len(), b.len());
-        a.iter()
-            .zip(b.iter())
-            .map(|(x, y)| {
-                let d = x - y;
-                d * d
-            })
-            .sum()
+    fn rank<'a>(
+        &'a self,
+        ch: char,
+        query: &CharFeatures,
+        candidates: &'a [(usize, Vec<f32>)],
+    ) -> Box<dyn Iterator<Item = (usize, f32)> + 'a> {
+        let q = self.prepare(ch, query);
+        rank_by_embedding(q, candidates)
     }
 
     fn name(&self) -> &str {
         "global-triplet"
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Per-character Fisher (loads per-char weights from FISH file)
+// ---------------------------------------------------------------------------
+
+/// Per-character Fisher-weighted Euclidean distance.
+///
+/// Unlike [`FisherClassifier`] which uses a single global weight vector,
+/// this variant loads per-character weights from a FISH file, so each
+/// character uses its own discriminative feature weighting.
+///
+/// Binary format (same as FISH):
+/// ```text
+/// magic:    b"FISH" (4 bytes)
+/// version:  u32 LE (1)
+/// n_chars:  u32 LE
+/// feat_len: u32 LE (100)
+/// Per character (repeated n_chars times):
+///   char_code: u32 LE
+///   weights:   [f32; FEAT_LEN] LE
+/// ```
+pub struct PerCharFisherClassifier {
+    weights: HashMap<char, [f32; FEAT_LEN]>,
+}
+
+impl PerCharFisherClassifier {
+    /// Load per-character Fisher weights from a FISH binary file.
+    pub fn load(path: &std::path::Path) -> Result<Self, String> {
+        use std::io::Read;
+
+        let mut data = Vec::new();
+        std::fs::File::open(path)
+            .map_err(|e| format!("cannot open per-char Fisher weights {}: {e}", path.display()))?
+            .read_to_end(&mut data)
+            .map_err(|e| format!("read error on {}: {e}", path.display()))?;
+
+        if data.len() < 16 {
+            return Err("per-char Fisher file too small".into());
+        }
+        if &data[0..4] != b"FISH" {
+            return Err(format!("bad magic (expected FISH, got {:?})", &data[0..4]));
+        }
+        let version = u32::from_le_bytes(data[4..8].try_into().unwrap());
+        if version != 1 {
+            return Err(format!("unsupported version {version}"));
+        }
+        let n_chars = u32::from_le_bytes(data[8..12].try_into().unwrap()) as usize;
+        let feat_len = u32::from_le_bytes(data[12..16].try_into().unwrap()) as usize;
+        if feat_len != FEAT_LEN {
+            return Err(format!("feat_len mismatch: file has {feat_len}, expected {FEAT_LEN}"));
+        }
+
+        let per_char_bytes = 4 + FEAT_LEN * 4;
+        let expected = 16 + n_chars * per_char_bytes;
+        if data.len() != expected {
+            return Err(format!("size mismatch: {} bytes, expected {expected}", data.len()));
+        }
+
+        let mut weights = HashMap::with_capacity(n_chars);
+        let mut pos = 16;
+        for _ in 0..n_chars {
+            let cp = u32::from_le_bytes(data[pos..pos+4].try_into().unwrap());
+            pos += 4;
+            let ch = char::from_u32(cp)
+                .ok_or_else(|| format!("invalid codepoint U+{cp:04X}"))?;
+            let mut w = [0.0f32; FEAT_LEN];
+            for j in 0..FEAT_LEN {
+                w[j] = f32::from_le_bytes(data[pos..pos+4].try_into().unwrap());
+                pos += 4;
+            }
+
+            // Normalize: cap f32::MAX, take sqrt, scale to sum=1
+            let max_finite = w.iter().filter(|v| v.is_finite()).copied()
+                .fold(0.0f32, f32::max);
+            for v in &mut w {
+                if !v.is_finite() || *v > max_finite {
+                    *v = max_finite;
+                }
+                *v = v.sqrt();
+            }
+            let sum: f32 = w.iter().sum();
+            if sum > 1e-12 {
+                for v in &mut w { *v /= sum; }
+            }
+
+            weights.insert(ch, w);
+        }
+
+        eprintln!("Loaded per-char Fisher weights: {} characters from {}", weights.len(), path.display());
+        Ok(Self { weights })
+    }
+}
+
+impl Classifier for PerCharFisherClassifier {
+    fn prepare_dim(&self) -> usize {
+        FEAT_LEN
+    }
+
+    fn prepare(&self, ch: char, features: &CharFeatures) -> Vec<f32> {
+        let raw = features.as_slice();
+        let w = self.weights.get(&ch)
+            .map(|w| w.as_slice())
+            .unwrap_or(&FISHER_WEIGHTS);
+        let mut v = vec![0.0f32; FEAT_LEN];
+        for i in 0..FEAT_LEN {
+            v[i] = raw[i] * w[i];
+        }
+        v
+    }
+
+    fn rank<'a>(
+        &'a self,
+        ch: char,
+        query: &CharFeatures,
+        candidates: &'a [(usize, Vec<f32>)],
+    ) -> Box<dyn Iterator<Item = (usize, f32)> + 'a> {
+        let q = self.prepare(ch, query);
+        rank_by_embedding(q, candidates)
+    }
+
+    fn name(&self) -> &str {
+        "perchar-fisher"
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Mahalanobis (per-character whitening via Cholesky)
+// ---------------------------------------------------------------------------
+
+/// Per-character Mahalanobis distance classifier.
+///
+/// For each character, computes the within-class scatter matrix Sw,
+/// then whitens features using the inverse Cholesky factor: L^{-1}
+/// where Sw = L L^T.  In the whitened space, Euclidean distance equals
+/// Mahalanobis distance, which accounts for feature correlations.
+///
+/// Binary format (magic `b"MAHA"`):
+/// ```text
+/// magic:    b"MAHA" (4 bytes)
+/// version:  u32 LE (1)
+/// n_chars:  u32 LE
+/// feat_len: u32 LE
+/// Per character (repeated n_chars times):
+///   char_code: u32 LE
+///   L_inv:     [f32; feat_len * feat_len] LE (row-major)
+/// ```
+pub struct MahalanobisClassifier {
+    transforms: HashMap<char, Vec<f32>>, // L_inv per char, FEAT_LEN × FEAT_LEN row-major
+}
+
+impl MahalanobisClassifier {
+    pub fn load(path: &std::path::Path) -> Result<Self, String> {
+        use std::io::Read;
+
+        let mut data = Vec::new();
+        std::fs::File::open(path)
+            .map_err(|e| format!("cannot open Mahalanobis weights {}: {e}", path.display()))?
+            .read_to_end(&mut data)
+            .map_err(|e| format!("read error on {}: {e}", path.display()))?;
+
+        if data.len() < 16 {
+            return Err("Mahalanobis file too small".into());
+        }
+        if &data[0..4] != b"MAHA" {
+            return Err(format!("bad magic (expected MAHA, got {:?})", &data[0..4]));
+        }
+        let version = u32::from_le_bytes(data[4..8].try_into().unwrap());
+        if version != 1 {
+            return Err(format!("unsupported version {version}"));
+        }
+        let n_chars = u32::from_le_bytes(data[8..12].try_into().unwrap()) as usize;
+        let feat_len = u32::from_le_bytes(data[12..16].try_into().unwrap()) as usize;
+        if feat_len != FEAT_LEN {
+            return Err(format!("feat_len mismatch: {feat_len} vs {FEAT_LEN}"));
+        }
+
+        let per_char = 4 + FEAT_LEN * FEAT_LEN * 4;
+        let expected = 16 + n_chars * per_char;
+        if data.len() != expected {
+            return Err(format!("size mismatch: {} bytes, expected {expected}", data.len()));
+        }
+
+        let mut transforms = HashMap::with_capacity(n_chars);
+        let mut pos = 16;
+        for _ in 0..n_chars {
+            let cp = u32::from_le_bytes(data[pos..pos+4].try_into().unwrap());
+            pos += 4;
+            let ch = char::from_u32(cp)
+                .ok_or_else(|| format!("invalid codepoint U+{cp:04X}"))?;
+            let mut linv = vec![0.0f32; FEAT_LEN * FEAT_LEN];
+            for j in 0..FEAT_LEN * FEAT_LEN {
+                linv[j] = f32::from_le_bytes(data[pos..pos+4].try_into().unwrap());
+                pos += 4;
+            }
+            transforms.insert(ch, linv);
+        }
+
+        eprintln!("Loaded Mahalanobis weights: {} characters from {}", transforms.len(), path.display());
+        Ok(Self { transforms })
+    }
+
+    /// Apply L_inv transform: y = L_inv * x
+    fn apply_transform(linv: &[f32], x: &[f32]) -> Vec<f32> {
+        let mut y = vec![0.0f32; FEAT_LEN];
+        for i in 0..FEAT_LEN {
+            let mut sum = 0.0f32;
+            let row = &linv[i * FEAT_LEN..(i + 1) * FEAT_LEN];
+            for j in 0..FEAT_LEN {
+                sum += row[j] * x[j];
+            }
+            y[i] = sum;
+        }
+        y
+    }
+}
+
+impl Classifier for MahalanobisClassifier {
+    fn prepare_dim(&self) -> usize {
+        FEAT_LEN
+    }
+
+    fn prepare(&self, ch: char, features: &CharFeatures) -> Vec<f32> {
+        let raw = features.as_slice();
+        if let Some(linv) = self.transforms.get(&ch) {
+            Self::apply_transform(linv, &raw)
+        } else {
+            let mut v = vec![0.0f32; FEAT_LEN];
+            for i in 0..FEAT_LEN {
+                v[i] = raw[i] * FISHER_WEIGHTS[i];
+            }
+            v
+        }
+    }
+
+    fn rank<'a>(
+        &'a self,
+        ch: char,
+        query: &CharFeatures,
+        candidates: &'a [(usize, Vec<f32>)],
+    ) -> Box<dyn Iterator<Item = (usize, f32)> + 'a> {
+        let q = self.prepare(ch, query);
+        rank_by_embedding(q, candidates)
+    }
+
+    fn name(&self) -> &str {
+        "mahalanobis"
+    }
+}
+
+// ---------------------------------------------------------------------------
+// LDA (per-character linear discriminant analysis)
+// ---------------------------------------------------------------------------
+
+/// Per-character LDA classifier.
+///
+/// Projects features into a lower-dimensional discriminant subspace that
+/// maximizes class separability.  Uses the top-k eigenvectors of
+/// Sw^{-1} * Sb.
+///
+/// Binary format (magic `b"LDAC"`):
+/// ```text
+/// magic:    b"LDAC" (4 bytes)
+/// version:  u32 LE (1)
+/// n_chars:  u32 LE
+/// Per character:
+///   char_code: u32 LE
+///   out_dim:   u32 LE (number of projection dimensions)
+///   proj:      [f32; out_dim * FEAT_LEN] LE (row-major, each row = one projection direction)
+/// ```
+pub struct LdaClassifier {
+    projections: HashMap<char, (usize, Vec<f32>)>, // (out_dim, proj matrix)
+}
+
+impl LdaClassifier {
+    pub fn load(path: &std::path::Path) -> Result<Self, String> {
+        use std::io::Read;
+
+        let mut data = Vec::new();
+        std::fs::File::open(path)
+            .map_err(|e| format!("cannot open LDA weights {}: {e}", path.display()))?
+            .read_to_end(&mut data)
+            .map_err(|e| format!("read error on {}: {e}", path.display()))?;
+
+        let result = Self::from_bytes(&data)?;
+        eprintln!("Loaded LDA weights from {}", path.display());
+        Ok(result)
+    }
+
+    pub fn from_bytes(data: &[u8]) -> Result<Self, String> {
+
+        if data.len() < 12 {
+            return Err("LDA file too small".into());
+        }
+        if &data[0..4] != b"LDAC" {
+            return Err(format!("bad magic (expected LDAC, got {:?})", &data[0..4]));
+        }
+        let version = u32::from_le_bytes(data[4..8].try_into().unwrap());
+        if version != 1 {
+            return Err(format!("unsupported version {version}"));
+        }
+        let n_chars = u32::from_le_bytes(data[8..12].try_into().unwrap()) as usize;
+
+        let mut projections = HashMap::with_capacity(n_chars);
+        let mut pos = 12;
+        for _ in 0..n_chars {
+            if pos + 8 > data.len() {
+                return Err("truncated LDA file".into());
+            }
+            let cp = u32::from_le_bytes(data[pos..pos+4].try_into().unwrap());
+            pos += 4;
+            let ch = char::from_u32(cp)
+                .ok_or_else(|| format!("invalid codepoint U+{cp:04X}"))?;
+            let out_dim = u32::from_le_bytes(data[pos..pos+4].try_into().unwrap()) as usize;
+            pos += 4;
+            let n_floats = out_dim * FEAT_LEN;
+            if pos + n_floats * 4 > data.len() {
+                return Err("truncated LDA projection data".into());
+            }
+            let mut proj = vec![0.0f32; n_floats];
+            for j in 0..n_floats {
+                proj[j] = f32::from_le_bytes(data[pos..pos+4].try_into().unwrap());
+                pos += 4;
+            }
+            projections.insert(ch, (out_dim, proj));
+        }
+
+        let dims: Vec<usize> = projections.values().map(|(d, _)| *d).collect();
+        let max_dim = dims.iter().max().copied().unwrap_or(0);
+        eprintln!("Loaded LDA weights: {} characters (max dim={})", projections.len(), max_dim);
+        Ok(Self { projections })
+    }
+
+    fn project(out_dim: usize, proj: &[f32], x: &[f32]) -> Vec<f32> {
+        let mut y = vec![0.0f32; out_dim];
+        for i in 0..out_dim {
+            let row = &proj[i * FEAT_LEN..(i + 1) * FEAT_LEN];
+            let mut sum = 0.0f32;
+            for j in 0..FEAT_LEN {
+                sum += row[j] * x[j];
+            }
+            y[i] = sum;
+        }
+        y
+    }
+}
+
+impl Classifier for LdaClassifier {
+    fn prepare_dim(&self) -> usize {
+        // Variable per char; return max across all chars
+        self.projections.values().map(|(d, _)| *d).max().unwrap_or(FEAT_LEN)
+    }
+
+    fn prepare(&self, ch: char, features: &CharFeatures) -> Vec<f32> {
+        let raw = features.as_slice();
+        if let Some((out_dim, proj)) = self.projections.get(&ch) {
+            Self::project(*out_dim, proj, &raw)
+        } else {
+            // Fallback to Fisher
+            let mut v = vec![0.0f32; FEAT_LEN];
+            for i in 0..FEAT_LEN {
+                v[i] = raw[i] * FISHER_WEIGHTS[i];
+            }
+            v
+        }
+    }
+
+    fn rank<'a>(
+        &'a self,
+        ch: char,
+        query: &CharFeatures,
+        candidates: &'a [(usize, Vec<f32>)],
+    ) -> Box<dyn Iterator<Item = (usize, f32)> + 'a> {
+        let q = self.prepare(ch, query);
+        rank_by_embedding(q, candidates)
+    }
+
+    fn name(&self) -> &str {
+        "lda"
     }
 }

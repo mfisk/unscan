@@ -107,14 +107,15 @@ pub struct Args {
     #[arg(long, value_name = "JSON")]
     pub render_ref_chars: Option<String>,
 
-    /// Font matching classifier: 'fisher' (default, Fisher-weighted kNN),
-    /// 'triplet' (per-glyph learned embedding), or 'global-triplet'
-    /// (single learned embedding across all characters).
-    #[arg(long, default_value = "fisher")]
+    /// Font matching classifier: 'lda' (default, LDA-projected kNN),
+    /// 'fisher' (Fisher-weighted kNN), 'triplet' (per-glyph learned embedding),
+    /// or 'global-triplet' (single learned embedding across all characters).
+    #[arg(long, default_value = "lda")]
     pub classifier: String,
 
-    /// Path to triplet network weights file (required when --classifier=triplet
-    /// or --classifier=global-triplet).
+    /// Path to classifier weights file.  Required for triplet, global-triplet,
+    /// perchar-fisher, mahalanobis.  Optional for lda (built-in weights used
+    /// when omitted).
     #[arg(long)]
     pub triplet_weights: Option<PathBuf>,
 }
