@@ -823,3 +823,376 @@ impl Classifier for LdaClassifier {
         "lda"
     }
 }
+
+// ---------------------------------------------------------------------------
+// MLP (per-character direct multi-class softmax classifier)
+// ---------------------------------------------------------------------------
+
+/// Inference-only linear layer (no gradients, no optimizer state).
+struct InferenceLinear {
+    rows: usize,
+    cols: usize,
+    w: Vec<f32>, // rows × cols, row-major
+    b: Vec<f32>, // cols
+}
+
+impl InferenceLinear {
+    /// Forward: output[j] = sum_i(input[i] * w[i*cols+j]) + b[j]
+    fn forward(&self, input: &[f32]) -> Vec<f32> {
+        debug_assert_eq!(input.len(), self.rows);
+        let mut out = self.b.clone();
+        for j in 0..self.cols {
+            let mut sum = out[j];
+            for i in 0..self.rows {
+                sum += input[i] * self.w[i * self.cols + j];
+            }
+            out[j] = sum;
+        }
+        out
+    }
+}
+
+/// Per-character MLP weights for direct multi-class classification.
+struct MlpCharNet {
+    fc1: InferenceLinear, // 100 → 256
+    fc2: InferenceLinear, // 256 → 128
+    fc3: InferenceLinear, // 128 → k
+    class_map: Vec<u32>,  // class_index → font_id
+}
+
+impl MlpCharNet {
+    /// Forward pass: ReLU(fc1) → ReLU(fc2) → fc3 (logits).
+    /// Returns raw logits (length k). No softmax — caller handles scoring.
+    fn forward(&self, raw: &[f32]) -> Vec<f32> {
+        // Layer 1: ReLU(W1*x + b1)
+        let mut h1 = self.fc1.forward(raw);
+        for v in &mut h1 { *v = v.max(0.0); }
+
+        // Layer 2: ReLU(W2*h1 + b2)
+        let mut h2 = self.fc2.forward(&h1);
+        for v in &mut h2 { *v = v.max(0.0); }
+
+        // Layer 3: logits (no activation)
+        self.fc3.forward(&h2)
+    }
+}
+
+/// Per-character MLP classifier with direct softmax output.
+///
+/// Instead of embedding + nearest-centroid, this classifier runs a forward
+/// pass through a per-character MLP and returns class probabilities directly.
+/// Trained with cross-entropy loss and input noise augmentation for domain-gap
+/// robustness.
+///
+/// Binary format (magic `b"MLPC"`):
+/// ```text
+/// magic:    b"MLPC" (4 bytes)
+/// version:  u32 LE (1)
+/// n_chars:  u32 LE
+/// Per character:
+///   char_code: u32 LE
+///   k:         u32 LE (number of classes)
+///   class_map: [u32; k] LE (class_index → font_id)
+///   W1: [f32; 100×256] LE, b1: [f32; 256] LE
+///   W2: [f32; 256×128] LE, b2: [f32; 128] LE
+///   W3: [f32; 128×k]   LE, b3: [f32; k]   LE
+/// ```
+pub struct MlpClassifier {
+    nets: HashMap<char, MlpCharNet>,
+}
+
+// MLP hidden layer sizes (must match trainer)
+const MLP_H1: usize = 256;
+const MLP_H2: usize = 128;
+
+impl MlpClassifier {
+    /// Load per-character MLP weights from a binary file.
+    pub fn load(path: &std::path::Path) -> Result<Self, String> {
+        use std::io::Read;
+
+        let mut data = Vec::new();
+        std::fs::File::open(path)
+            .map_err(|e| format!("cannot open MLP weights {}: {e}", path.display()))?
+            .read_to_end(&mut data)
+            .map_err(|e| format!("read error on {}: {e}", path.display()))?;
+
+        Self::from_bytes(&data)
+    }
+
+    pub fn from_bytes(data: &[u8]) -> Result<Self, String> {
+        if data.len() < 12 {
+            return Err("MLP file too small".into());
+        }
+        if &data[0..4] != b"MLPC" {
+            return Err(format!("bad magic (expected MLPC, got {:?})", &data[0..4]));
+        }
+        let version = u32::from_le_bytes(data[4..8].try_into().unwrap());
+        if version != 1 {
+            return Err(format!("unsupported MLP version {version}"));
+        }
+        let n_chars = u32::from_le_bytes(data[8..12].try_into().unwrap()) as usize;
+
+        let mut nets = HashMap::with_capacity(n_chars);
+        let mut pos = 12;
+
+        let read_f32s = |pos: &mut usize, n: usize, data: &[u8]| -> Result<Vec<f32>, String> {
+            let need = n * 4;
+            if *pos + need > data.len() {
+                return Err("truncated MLP weight data".into());
+            }
+            let mut v = Vec::with_capacity(n);
+            for _ in 0..n {
+                v.push(f32::from_le_bytes(data[*pos..*pos + 4].try_into().unwrap()));
+                *pos += 4;
+            }
+            Ok(v)
+        };
+
+        let read_u32 = |pos: &mut usize, data: &[u8]| -> Result<u32, String> {
+            if *pos + 4 > data.len() {
+                return Err("truncated MLP header data".into());
+            }
+            let v = u32::from_le_bytes(data[*pos..*pos + 4].try_into().unwrap());
+            *pos += 4;
+            Ok(v)
+        };
+
+        for _ in 0..n_chars {
+            let cp = read_u32(&mut pos, data)?;
+            let ch = char::from_u32(cp)
+                .ok_or_else(|| format!("invalid codepoint U+{cp:04X}"))?;
+            let k = read_u32(&mut pos, data)? as usize;
+            if k == 0 {
+                return Err(format!("char '{}': zero classes", ch));
+            }
+
+            // class_map: k × u32
+            let mut class_map = Vec::with_capacity(k);
+            for _ in 0..k {
+                class_map.push(read_u32(&mut pos, data)?);
+            }
+
+            // Layer weights
+            let w1 = read_f32s(&mut pos, FEAT_LEN * MLP_H1, data)?;
+            let b1 = read_f32s(&mut pos, MLP_H1, data)?;
+            let w2 = read_f32s(&mut pos, MLP_H1 * MLP_H2, data)?;
+            let b2 = read_f32s(&mut pos, MLP_H2, data)?;
+            let w3 = read_f32s(&mut pos, MLP_H2 * k, data)?;
+            let b3 = read_f32s(&mut pos, k, data)?;
+
+            nets.insert(ch, MlpCharNet {
+                fc1: InferenceLinear { rows: FEAT_LEN, cols: MLP_H1, w: w1, b: b1 },
+                fc2: InferenceLinear { rows: MLP_H1, cols: MLP_H2, w: w2, b: b2 },
+                fc3: InferenceLinear { rows: MLP_H2, cols: k, w: w3, b: b3 },
+                class_map,
+            });
+        }
+
+        eprintln!("Loaded MLP weights: {} characters", nets.len());
+        Ok(Self { nets })
+    }
+}
+
+impl Classifier for MlpClassifier {
+    fn prepare_dim(&self) -> usize {
+        // We store only the font_id (as f32) for each candidate.
+        // The MLP does not use stored embeddings — it classifies the query
+        // directly and maps outputs back to font_ids via the class map.
+        1
+    }
+
+    fn prepare(&self, _ch: char, _features: &CharFeatures) -> Vec<f32> {
+        // Minimal storage: we just need the font_id back from candidates.
+        // The char_index stores font_id as the first element of the tuple,
+        // so we return an empty-ish marker. But since prepare_dim() == 1,
+        // we must return exactly 1 element. We store 0.0 as a placeholder.
+        vec![0.0]
+    }
+
+    fn rank<'a>(
+        &'a self,
+        ch: char,
+        query: &CharFeatures,
+        candidates: &'a [(usize, Vec<f32>)],
+    ) -> Box<dyn Iterator<Item = (usize, f32)> + 'a> {
+        let raw = query.as_slice();
+
+        if let Some(net) = self.nets.get(&ch) {
+            let logits = net.forward(&raw);
+            let k = logits.len();
+
+            // Numerically stable softmax
+            let max_logit = logits.iter().copied().fold(f32::NEG_INFINITY, f32::max);
+            let mut probs = vec![0.0f32; k];
+            let mut sum_exp = 0.0f32;
+            for i in 0..k {
+                probs[i] = (logits[i] - max_logit).exp();
+                sum_exp += probs[i];
+            }
+            for p in &mut probs { *p /= sum_exp; }
+
+            // Build font_id → probability lookup
+            let mut fid_to_prob: HashMap<usize, f32> = HashMap::with_capacity(k);
+            for (ci, &fid) in net.class_map.iter().enumerate() {
+                fid_to_prob.insert(fid as usize, probs[ci]);
+            }
+
+            // Score each candidate: -probability (lower = better)
+            let mut scored: Vec<(usize, f32)> = candidates
+                .iter()
+                .map(|(id, _)| {
+                    let prob = fid_to_prob.get(id).copied().unwrap_or(0.0);
+                    (*id, -prob)
+                })
+                .collect();
+            scored.sort_by(|a, b| a.1.partial_cmp(&b.1).unwrap_or(std::cmp::Ordering::Equal));
+            Box::new(scored.into_iter())
+        } else {
+            // Fallback to Fisher for unknown characters
+            let mut v = vec![0.0f32; FEAT_LEN];
+            for i in 0..FEAT_LEN {
+                v[i] = raw[i] * FISHER_WEIGHTS[i];
+            }
+            rank_by_embedding(v, candidates)
+        }
+    }
+
+    fn name(&self) -> &str {
+        "mlp"
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Rank fusion (combines multiple classifiers)
+// ---------------------------------------------------------------------------
+
+/// Rank-fusion classifier that combines scores from multiple child classifiers.
+///
+/// At index time, stores each child's prepared representation concatenated
+/// with length prefixes. At query time, reconstructs per-child candidate
+/// lists, calls each child's `rank()`, normalizes scores to [0,1], and
+/// computes a weighted average. The fused score determines final ranking.
+pub struct FusionClassifier {
+    children: Vec<(f32, Box<dyn Classifier>)>, // (weight, classifier)
+    /// Cached sum of weights for normalization.
+    weight_sum: f32,
+}
+
+impl FusionClassifier {
+    /// Create a new fusion classifier from weighted children.
+    /// Weights do not need to sum to 1 — they are normalized internally.
+    pub fn new(children: Vec<(f32, Box<dyn Classifier>)>) -> Self {
+        let weight_sum: f32 = children.iter().map(|(w, _)| *w).sum();
+        Self { children, weight_sum }
+    }
+}
+
+impl Classifier for FusionClassifier {
+    fn prepare_dim(&self) -> usize {
+        // Sum of all children's dims + 1 length header per child
+        self.children.iter()
+            .map(|(_, c)| 1 + c.prepare_dim())
+            .sum()
+    }
+
+    fn prepare(&self, ch: char, features: &CharFeatures) -> Vec<f32> {
+        // Concatenate: [child0_len, child0_data..., child1_len, child1_data..., ...]
+        let mut result = Vec::new();
+        for (_, child) in &self.children {
+            let child_data = child.prepare(ch, features);
+            result.push(child_data.len() as f32);
+            result.extend_from_slice(&child_data);
+        }
+        result
+    }
+
+    fn rank<'a>(
+        &'a self,
+        ch: char,
+        query: &CharFeatures,
+        candidates: &'a [(usize, Vec<f32>)],
+    ) -> Box<dyn Iterator<Item = (usize, f32)> + 'a> {
+        let n_children = self.children.len();
+
+        // For each child, reconstruct its candidate slice from the concatenated data
+        // and call its rank() to get scores.
+        let mut per_child_scores: Vec<HashMap<usize, f32>> = Vec::with_capacity(n_children);
+
+        for (child_idx, (_, child)) in self.children.iter().enumerate() {
+            // Reconstruct per-child candidates
+            let child_candidates: Vec<(usize, Vec<f32>)> = candidates.iter().map(|(id, stored)| {
+                // Parse stored data to extract this child's portion
+                let mut pos = 0usize;
+                for _ci in 0..child_idx {
+                    if pos >= stored.len() { break; }
+                    let len = stored[pos] as usize;
+                    pos += 1 + len;
+                }
+                let child_data = if pos < stored.len() {
+                    let len = stored[pos] as usize;
+                    pos += 1;
+                    if pos + len <= stored.len() {
+                        stored[pos..pos + len].to_vec()
+                    } else {
+                        Vec::new()
+                    }
+                } else {
+                    Vec::new()
+                };
+                (*id, child_data)
+            }).collect();
+
+            let scores: Vec<(usize, f32)> = child.rank(ch, query, &child_candidates).collect();
+            let score_map: HashMap<usize, f32> = scores.into_iter().collect();
+            per_child_scores.push(score_map);
+        }
+
+        // Normalize each child's scores to [0, 1] range and compute weighted average
+        let mut fused: HashMap<usize, f32> = HashMap::with_capacity(candidates.len());
+
+        // First pass: find min/max per child
+        let mut child_ranges: Vec<(f32, f32)> = Vec::with_capacity(n_children);
+        for scores in &per_child_scores {
+            let min = scores.values().copied().fold(f32::INFINITY, f32::min);
+            let max = scores.values().copied().fold(f32::NEG_INFINITY, f32::max);
+            child_ranges.push((min, max));
+        }
+
+        // Initialize fused scores
+        for (id, _) in candidates {
+            fused.insert(*id, 0.0);
+        }
+
+        // Accumulate weighted normalized scores
+        for (child_idx, ((weight, _), (min, max))) in
+            self.children.iter().zip(child_ranges.iter()).enumerate()
+        {
+            let range = max - min;
+            let norm_weight = weight / self.weight_sum;
+
+            for (id, _) in candidates {
+                let raw_score = per_child_scores[child_idx]
+                    .get(id)
+                    .copied()
+                    .unwrap_or(*max); // worst score for missing
+
+                let normalized = if range > 1e-12 {
+                    (raw_score - min) / range
+                } else {
+                    0.5 // all scores equal
+                };
+
+                *fused.get_mut(id).unwrap() += norm_weight * normalized;
+            }
+        }
+
+        // Sort by fused score (lower = better)
+        let mut scored: Vec<(usize, f32)> = fused.into_iter().collect();
+        scored.sort_by(|a, b| a.1.partial_cmp(&b.1).unwrap_or(std::cmp::Ordering::Equal));
+        Box::new(scored.into_iter())
+    }
+
+    fn name(&self) -> &str {
+        "fusion"
+    }
+}

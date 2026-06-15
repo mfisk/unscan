@@ -207,6 +207,19 @@ fn make_classifier(args: &cli::Args) -> Box<dyn classifier::Classifier> {
                         }
                     }
                 }
+                "fusion" => {
+                    // Rank-fusion of LDA + Fisher (no external weights needed)
+                    static LDA_WEIGHTS: &[u8] = include_bytes!("../lda28-weights.bin");
+                    let lda = match classifier::LdaClassifier::from_bytes(LDA_WEIGHTS) {
+                        Ok(c) => c,
+                        Err(e) => { eprintln!("Error loading built-in LDA weights: {e}"); std::process::exit(1); }
+                    };
+                    let fisher = classifier::FisherClassifier;
+                    Box::new(classifier::FusionClassifier::new(vec![
+                        (0.5, Box::new(lda)),
+                        (0.5, Box::new(fisher)),
+                    ]))
+                }
                 _ => {
                     let weights_path = args.triplet_weights.as_ref().unwrap_or_else(|| {
                         eprintln!("Error: --triplet-weights is required when using --classifier={other}");
@@ -225,8 +238,14 @@ fn make_classifier(args: &cli::Args) -> Box<dyn classifier::Classifier> {
                                 Err(e) => { eprintln!("Error: {e}"); std::process::exit(1); }
                             }
                         }
+                        "mlp" => {
+                            match classifier::MlpClassifier::load(weights_path) {
+                                Ok(c) => Box::new(c),
+                                Err(e) => { eprintln!("Error: {e}"); std::process::exit(1); }
+                            }
+                        }
                         _ => {
-                            eprintln!("Error: unknown classifier '{other}'. Use 'lda', 'fisher', 'perchar-fisher', 'triplet', 'global-triplet', or 'mahalanobis'.");
+                            eprintln!("Error: unknown classifier '{other}'. Use 'lda', 'fisher', 'perchar-fisher', 'triplet', 'global-triplet', 'mahalanobis', 'mlp', or 'fusion'.");
                             std::process::exit(1);
                         }
                     }
@@ -723,16 +742,7 @@ fn run(args: &cli::Args, classifier: &dyn classifier::Classifier) -> Result<(), 
             };
         let mut lines = ocr::assemble_lines(&word_regions);
         // Snapshot raw Tesseract word bboxes before post-processing
-        let raw_word_bboxes: Vec<Vec<audit::WordBBox>> = lines.iter().map(|line| {
-            line.words.iter().map(|w| audit::WordBBox {
-                text: w.text.clone(),
-                x: w.x,
-                y: w.y,
-                width: w.width,
-                height: w.height,
-                confidence: w.confidence,
-            }).collect()
-        }).collect();
+        ocr::snapshot_raw_bboxes(&mut lines);
         ocr::merge_overlapping_lines(&mut lines);
         ocr::clip_word_overlaps(&mut lines);
         ocr::drop_outlier_words(&mut lines);
@@ -1199,13 +1209,8 @@ fn run(args: &cli::Args, classifier: &dyn classifier::Classifier) -> Result<(), 
                     let all_wbs: Vec<(u32, u32, u32, u32)> = line.words.iter()
                         .map(|w| (w.x, w.y, w.width, w.height))
                         .chain(
-                            if li < raw_word_bboxes.len() {
-                                raw_word_bboxes[li].iter()
-                                    .map(|w| (w.x, w.y, w.width, w.height))
-                                    .collect::<Vec<_>>()
-                            } else {
-                                Vec::new()
-                            }
+                            line.raw_words.iter()
+                                .map(|w| (w.x, w.y, w.width, w.height))
                         )
                         .collect();
                     if !all_wbs.is_empty() {
@@ -1584,11 +1589,14 @@ fn run(args: &cli::Args, classifier: &dyn classifier::Classifier) -> Result<(), 
                     height: w.height,
                     confidence: w.confidence,
                 }).collect(),
-                word_bboxes_raw: if li < raw_word_bboxes.len() {
-                    raw_word_bboxes[li].clone()
-                } else {
-                    Vec::new()
-                },
+                word_bboxes_raw: line.raw_words.iter().map(|w| audit::WordBBox {
+                    text: w.text.clone(),
+                    x: w.x,
+                    y: w.y,
+                    width: w.width,
+                    height: w.height,
+                    confidence: w.confidence,
+                }).collect(),
                 tie_candidates: lm.tie_candidates.clone(),
                 miss_type: None,
                 expected_font: None,

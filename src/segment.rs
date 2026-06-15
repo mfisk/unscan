@@ -20,6 +20,9 @@ struct SeamParams {
     delta_scale_power: f32, // exponent on cur_dark/max_ink scaling
     delta_row_weight: f32,  // row_ink multiplier in delta (0.0 = ignore)
     delta_row_power: f32,   // exponent on row_ink in delta
+    vert_run_discount: f32,  // weight for short horizontal dark runs in vertical scoring
+    vert_run_threshold: u32, // run length cutoff for discount (<=threshold gets discount)
+    vert_row_ink_power: f32, // exponent on (row_ink/max_row_ink) discount in vertical scoring (0=off)
 }
 
 fn seam_params() -> &'static SeamParams {
@@ -40,12 +43,18 @@ fn seam_params() -> &'static SeamParams {
             delta_scale_power: env_f32("SEAM_DELTA_SCALE_POWER", 1.0),
             delta_row_weight: env_f32("SEAM_DELTA_ROW_WEIGHT", 0.0),
             delta_row_power: env_f32("SEAM_DELTA_ROW_POWER", 1.0),
+            vert_run_discount: env_f32("SEAM_VERT_RUN_DISCOUNT", 0.9),
+            vert_run_threshold: std::env::var("SEAM_VERT_RUN_THRESHOLD").ok()
+                .and_then(|s| s.parse().ok()).unwrap_or(3u32),
+            vert_row_ink_power: env_f32("SEAM_VERT_ROW_INK_POWER", 0.0),
         };
         eprintln!("[seam params] ink_power={} ink_norm={} ink_row_wt={} ink_row_pow={} \
-delta_wt={} delta_pow={} delta_scale_pow={} delta_row_wt={} delta_row_pow={}",
+delta_wt={} delta_pow={} delta_scale_pow={} delta_row_wt={} delta_row_pow={} \
+vert_run_disc={} vert_run_thresh={} vert_row_ink_pow={}",
             p.ink_power, p.ink_norm, p.ink_row_weight, p.ink_row_power,
             p.delta_weight, p.delta_power, p.delta_scale_power,
-            p.delta_row_weight, p.delta_row_power);
+            p.delta_row_weight, p.delta_row_power,
+            p.vert_run_discount, p.vert_run_threshold, p.vert_row_ink_power);
         p
     })
 }
@@ -745,6 +754,8 @@ fn segment_characters_inner(
 struct SeamDp {
     cost_fwd: Vec<f32>,   // flat [row * seg_w + col]
     cost_rev: Vec<f32>,   // flat [row * seg_w + col]
+    pred_fwd: Vec<u32>,   // flat [row * seg_w + col] — packed (r, c) predecessor
+    pred_rev: Vec<u32>,   // flat [row * seg_w + col] — packed (r, c) predecessor
     seg_start: u32,
     seg_end: u32,
     seg_w: usize,
@@ -767,49 +778,45 @@ impl SeamDp {
         let mut path = vec![0u32; self.h as usize];
         path[mid_r] = target_col;
 
-        // Top half: backtrace upward from (mid_r, tc) through cost_fwd
+        // Top half: backtrace upward from (mid_r, tc) through pred_fwd
         {
             let mut c = tc;
-            for r in (1..=mid_r).rev() {
-                let cur_dark = energy[r][base + c];
-                let mut best_cost = f32::INFINITY;
-                let mut best_c = c;
-                for &pc in &[c, c.wrapping_sub(1), c + 1] {
-                    if pc < seg_w {
-                        let prev_dark = energy[r - 1][base + pc];
-                        let entry = delta_ink_score(cur_dark, prev_dark, r, r - 1, row_ink, self.max_ink);
-                        let cand = self.cost_fwd[(r - 1) * seg_w + pc] + entry;
-                        if cand < best_cost {
-                            best_cost = cand;
-                            best_c = pc;
-                        }
-                    }
+            let mut r = mid_r;
+            while r > 0 {
+                let pred = self.pred_fwd[r * seg_w + c] as usize;
+                let pr = pred / seg_w;
+                let pc = pred % seg_w;
+                if pr < r {
+                    // Vertical step: predecessor is in row above
+                    path[r - 1] = self.seg_start + pc as u32;
+                    c = pc;
+                    r = pr;
+                    if r == 0 { break; }
+                } else {
+                    // Horizontal step: predecessor on same row, keep going
+                    c = pc;
                 }
-                c = best_c;
-                path[r - 1] = self.seg_start + c as u32;
             }
         }
 
-        // Bottom half: backtrace downward from (mid_r, tc) through cost_rev
+        // Bottom half: backtrace downward from (mid_r, tc) through pred_rev
         {
             let mut c = tc;
-            for r in mid_r..last_r {
-                let cur_dark = energy[r][base + c];
-                let mut best_cost = f32::INFINITY;
-                let mut best_c = c;
-                for &pc in &[c, c.wrapping_sub(1), c + 1] {
-                    if pc < seg_w {
-                        let child_dark = energy[r + 1][base + pc];
-                        let entry = delta_ink_score(child_dark, cur_dark, r + 1, r, row_ink, self.max_ink);
-                        let cand = self.cost_rev[(r + 1) * seg_w + pc] + entry;
-                        if cand < best_cost {
-                            best_cost = cand;
-                            best_c = pc;
-                        }
-                    }
+            let mut r = mid_r;
+            while r < last_r {
+                let pred = self.pred_rev[r * seg_w + c] as usize;
+                let pr = pred / seg_w;
+                let pc = pred % seg_w;
+                if pr > r {
+                    // Vertical step: predecessor is in row below
+                    path[r + 1] = self.seg_start + pc as u32;
+                    c = pc;
+                    r = pr;
+                    if r >= last_r { break; }
+                } else {
+                    // Horizontal step: predecessor on same row, keep going
+                    c = pc;
                 }
-                c = best_c;
-                path[r + 1] = self.seg_start + c as u32;
             }
         }
 
@@ -829,7 +836,7 @@ fn candidate_seams(
 ) -> (Vec<(u32, f32)>, SeamDp, HashSet<u32>) {
     let seg_w = (seg_end - seg_start) as usize;
     if seg_w < 3 || h < 1 {
-        let dp = SeamDp { cost_fwd: Vec::new(), cost_rev: Vec::new(), seg_start, seg_end, seg_w: 0, h, max_ink, row_ink: row_ink.to_vec() };
+        let dp = SeamDp { cost_fwd: Vec::new(), cost_rev: Vec::new(), pred_fwd: Vec::new(), pred_rev: Vec::new(), seg_start, seg_end, seg_w: 0, h, max_ink, row_ink: row_ink.to_vec() };
         return (Vec::new(), dp, HashSet::new());
     }
     let base = seg_start as usize;
@@ -852,55 +859,93 @@ fn candidate_seams(
     // an entry penalty each time the path moves into a darker pixel.
     let n_cells = h as usize * seg_w;
     let mut cost_fwd = vec![0.0f32; n_cells];
+    let mut pred_fwd = vec![0u32; n_cells];
     for c in 0..seg_w {
         cost_fwd[c] = ink_score(masked_energy(0, c), 0, row_ink);
+        pred_fwd[c] = c as u32; // self
     }
     for r in 1..h as usize {
         let row_off = r * seg_w;
         let prev_off = (r - 1) * seg_w;
+        // Step 1: vertical-only from row above (same column)
         for c in 0..seg_w {
             let cur_dark = masked_energy(r, c);
             let cur_ink = ink_score(cur_dark, r, row_ink);
-            let mut best = f32::INFINITY;
-            for &pc in &[c, c.wrapping_sub(1), c + 1] {
-                if pc < seg_w {
-                    let prev_dark = masked_energy(r - 1, pc);
-                    let entry = delta_ink_score(cur_dark, prev_dark, r, r - 1, row_ink, max_ink);
-                    let candidate = cost_fwd[prev_off + pc] + entry;
-                    if candidate < best {
-                        best = candidate;
-                    }
-                }
+            let prev_dark = masked_energy(r - 1, c);
+            let entry = delta_ink_score(cur_dark, prev_dark, r, r - 1, row_ink, max_ink);
+            cost_fwd[row_off + c] = cur_ink + cost_fwd[prev_off + c] + entry;
+            pred_fwd[row_off + c] = (prev_off + c) as u32;
+        }
+        // Step 2: horizontal propagation left-to-right
+        for c in 1..seg_w {
+            let cur_dark = masked_energy(r, c);
+            let cur_ink = ink_score(cur_dark, r, row_ink);
+            let nbr_dark = masked_energy(r, c - 1);
+            let entry = delta_ink_score(cur_dark, nbr_dark, r, r, row_ink, max_ink);
+            let via_left = cost_fwd[row_off + c - 1] + cur_ink + entry;
+            if via_left < cost_fwd[row_off + c] {
+                cost_fwd[row_off + c] = via_left;
+                pred_fwd[row_off + c] = (row_off + c - 1) as u32;
             }
-            cost_fwd[row_off + c] = cur_ink + best;
+        }
+        // Step 3: horizontal propagation right-to-left
+        for c in (0..seg_w - 1).rev() {
+            let cur_dark = masked_energy(r, c);
+            let cur_ink = ink_score(cur_dark, r, row_ink);
+            let nbr_dark = masked_energy(r, c + 1);
+            let entry = delta_ink_score(cur_dark, nbr_dark, r, r, row_ink, max_ink);
+            let via_right = cost_fwd[row_off + c + 1] + cur_ink + entry;
+            if via_right < cost_fwd[row_off + c] {
+                cost_fwd[row_off + c] = via_right;
+                pred_fwd[row_off + c] = (row_off + c + 1) as u32;
+            }
         }
     }
 
     // Reverse DP: models downward continuation from (r, c) to bottom.
     let last_r = (h - 1) as usize;
     let mut cost_rev = vec![0.0f32; n_cells];
+    let mut pred_rev = vec![0u32; n_cells];
     let last_off = last_r * seg_w;
     for c in 0..seg_w {
         cost_rev[last_off + c] = ink_score(masked_energy(last_r, c), last_r, row_ink);
+        pred_rev[last_off + c] = (last_off + c) as u32; // self
     }
     for r in (0..last_r).rev() {
         let row_off = r * seg_w;
         let next_off = (r + 1) * seg_w;
+        // Step 1: vertical-only from row below (same column)
         for c in 0..seg_w {
             let cur_dark = masked_energy(r, c);
             let cur_ink = ink_score(cur_dark, r, row_ink);
-            let mut best = f32::INFINITY;
-            for &pc in &[c, c.wrapping_sub(1), c + 1] {
-                if pc < seg_w {
-                    let child_dark = masked_energy(r + 1, pc);
-                    let entry = delta_ink_score(child_dark, cur_dark, r + 1, r, row_ink, max_ink);
-                    let candidate = cost_rev[next_off + pc] + entry;
-                    if candidate < best {
-                        best = candidate;
-                    }
-                }
+            let child_dark = masked_energy(r + 1, c);
+            let entry = delta_ink_score(child_dark, cur_dark, r + 1, r, row_ink, max_ink);
+            cost_rev[row_off + c] = cur_ink + cost_rev[next_off + c] + entry;
+            pred_rev[row_off + c] = (next_off + c) as u32;
+        }
+        // Step 2: horizontal propagation left-to-right
+        for c in 1..seg_w {
+            let cur_dark = masked_energy(r, c);
+            let cur_ink = ink_score(cur_dark, r, row_ink);
+            let nbr_dark = masked_energy(r, c - 1);
+            let entry = delta_ink_score(cur_dark, nbr_dark, r, r, row_ink, max_ink);
+            let via_left = cost_rev[row_off + c - 1] + cur_ink + entry;
+            if via_left < cost_rev[row_off + c] {
+                cost_rev[row_off + c] = via_left;
+                pred_rev[row_off + c] = (row_off + c - 1) as u32;
             }
-            cost_rev[row_off + c] = cur_ink + best;
+        }
+        // Step 3: horizontal propagation right-to-left
+        for c in (0..seg_w - 1).rev() {
+            let cur_dark = masked_energy(r, c);
+            let cur_ink = ink_score(cur_dark, r, row_ink);
+            let nbr_dark = masked_energy(r, c + 1);
+            let entry = delta_ink_score(cur_dark, nbr_dark, r, r, row_ink, max_ink);
+            let via_right = cost_rev[row_off + c + 1] + cur_ink + entry;
+            if via_right < cost_rev[row_off + c] {
+                cost_rev[row_off + c] = via_right;
+                pred_rev[row_off + c] = (row_off + c + 1) as u32;
+            }
         }
     }
 
@@ -924,10 +969,12 @@ fn candidate_seams(
     // (lowercase x-height, baseline, cap-height, etc.).
     let img_w = energy[0].len();
     let mut vert_candidates: Vec<(u32, f32)> = Vec::with_capacity(seg_w.saturating_sub(2));
+    let max_row_ink = row_ink.iter().copied().fold(0.0f32, f32::max).max(1e-9);
     for c in 1..seg_w - 1 {
         let abs_col = base + c;
         let mut cost = 0.0f32;
         let mut masked = false;
+        let mut prev_dark = 0.0f32;
         for r in 0..h as usize {
             let e = masked_energy(r, c);
             if e >= f32::INFINITY { masked = true; break; }
@@ -951,14 +998,25 @@ fn candidate_seams(
                     cx += 1;
                 }
             }
-            let weight = if run_len <= 3 {
-                0.15  // thin serif bridge — heavy discount
-            } else if run_len <= 6 {
-                0.4   // moderate connection
+            let p = seam_params();
+            let run_weight = if run_len <= p.vert_run_threshold {
+                p.vert_run_discount
             } else {
-                1.0   // real glyph stroke — full price
+                1.0
             };
-            cost += ink_score(e, r, row_ink) * weight;
+            let row_weight = if p.vert_row_ink_power == 0.0 {
+                1.0
+            } else {
+                (row_ink[r] / max_row_ink).powf(p.vert_row_ink_power)
+            };
+            let weight = run_weight * row_weight;
+            // Same scoring as DP: ink_score + delta_ink_score
+            let ink = ink_score(e, r, row_ink);
+            let delta = if r == 0 { 0.0 } else {
+                delta_ink_score(e, prev_dark, r, r - 1, row_ink, max_ink)
+            };
+            cost += (ink + delta) * weight;
+            prev_dark = e;
         }
         if !masked {
             vert_candidates.push((seg_start + c as u32, cost));
@@ -1012,7 +1070,7 @@ fn candidate_seams(
         candidates.push(raw_candidates[mid_idx]);
     }
 
-    let dp = SeamDp { cost_fwd, cost_rev, seg_start, seg_end, seg_w, h, max_ink, row_ink: row_ink.to_vec() };
+    let dp = SeamDp { cost_fwd, cost_rev, pred_fwd, pred_rev, seg_start, seg_end, seg_w, h, max_ink, row_ink: row_ink.to_vec() };
     (candidates, dp, vertical_winners)
 }
 
