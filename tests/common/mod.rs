@@ -357,13 +357,12 @@ pub fn measure_accuracy(raster: &Path, vector: &Path, label: &str) -> AccuracyRe
 
     let output_pdf = audit_dir.join("out.pdf");
 
-    // Run unscan with --audit and --audit-vector
+    // Run unscan with --audit and --test (ground-truth vector PDF)
     let bin = unscan_bin();
     let output = Command::new(&bin)
         .arg(raster)
-        .args(["-o", output_pdf.to_str().unwrap()])
         .args(["--audit", audit_dir.to_str().unwrap()])
-        .args(["--audit-vector", vector.to_str().unwrap()])
+        .args(["--test", vector.to_str().unwrap()])
         .env("RUST_LOG", "info")
         .output()
         .unwrap_or_else(|e| panic!("failed to run unscan: {}", e));

@@ -45,6 +45,36 @@ pub struct TextLine {
     pub font_size_pt: f32,
     pub confidence: f32,
     pub words: Vec<TextRegion>,
+    /// Snapshot of word bboxes as Tesseract originally reported them,
+    /// before merge/clip/expand post-processing.  Populated by
+    /// `snapshot_raw_bboxes()` right after `assemble_lines()`.
+    pub raw_words: Vec<RawWordBBox>,
+}
+
+/// Lightweight snapshot of a Tesseract word bbox before post-processing.
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+pub struct RawWordBBox {
+    pub text: String,
+    pub x: u32,
+    pub y: u32,
+    pub width: u32,
+    pub height: u32,
+    pub confidence: f32,
+}
+
+/// Capture a raw-bbox snapshot into each line's `raw_words` field.
+/// Call once, right after `assemble_lines()` and before any merge/clip/expand.
+pub fn snapshot_raw_bboxes(lines: &mut [TextLine]) {
+    for line in lines.iter_mut() {
+        line.raw_words = line.words.iter().map(|w| RawWordBBox {
+            text: w.text.clone(),
+            x: w.x,
+            y: w.y,
+            width: w.width,
+            height: w.height,
+            confidence: w.confidence,
+        }).collect();
+    }
 }
 
 /// Run Tesseract on a page image and return word-level regions plus
@@ -158,6 +188,7 @@ pub fn assemble_lines(words: &[TextRegion]) -> Vec<TextLine> {
             font_size_pt,
             confidence: avg_conf,
             words: gw.into_iter().cloned().collect(),
+            raw_words: Vec::new(), // populated by snapshot_raw_bboxes()
         });
     }
     lines
@@ -238,6 +269,7 @@ fn lines_overlap(a: &TextLine, b: &TextLine) -> bool {
 /// words, then recompute line-level fields.
 fn merge_line_into(target: &mut TextLine, donor: TextLine) {
     target.words.extend(donor.words);
+    target.raw_words.extend(donor.raw_words);
     // Sort all words by x position
     target.words.sort_by_key(|w| w.x);
     // Merge overlapping or abutting words

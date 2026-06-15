@@ -104,6 +104,19 @@ struct Args {
     #[arg(long, default_value = "0.01")]
     lda_reg: f64,
 
+    /// MLP mode: train per-character direct multi-class softmax classifier.
+    /// Outputs MLPC format weights.
+    #[arg(long)]
+    mlp: bool,
+
+    /// MLP: input noise standard deviation for domain-gap augmentation
+    #[arg(long, default_value = "0.02")]
+    mlp_noise: f32,
+
+    /// MLP: dropout probability during training (0 = no dropout)
+    #[arg(long, default_value = "0.3")]
+    mlp_dropout: f32,
+
     /// Character index output path. After training, the char index is built
     /// and saved here. Default: ~/.cache/unscan/char-index.bin
     #[arg(long)]
@@ -1711,6 +1724,352 @@ fn main() {
             let idx_path = args.index_path.clone().unwrap_or_else(default_index_path);
             let cls = classifier::LdaClassifier::load(&args.output)
                 .expect("reload LDA weights for index build");
+            build_and_save_char_index(&catalog, &cls, &idx_path);
+        }
+        return;
+    }
+
+    // ── 3d. MLP mode ─────────────────────────────────────────────
+    if args.mlp {
+        eprintln!("\nMLP training {} characters (epochs={}, noise={}, dropout={})...",
+            chars.len(), args.epochs, args.mlp_noise, args.mlp_dropout);
+        let mlp_start = std::time::Instant::now();
+
+        // MLP architecture constants
+        const MLP_H1: usize = 256;
+        const MLP_H2: usize = 128;
+
+        /// Trainable MLP for multi-class softmax classification.
+        struct MlpNet {
+            fc1: Linear,   // FEAT_LEN → MLP_H1
+            fc2: Linear,   // MLP_H1 → MLP_H2
+            fc3: Linear,   // MLP_H2 → k (output classes)
+        }
+
+        impl MlpNet {
+            fn new(k: usize, rng: &mut SmallRng) -> Self {
+                Self {
+                    fc1: Linear::new(FEAT_LEN, MLP_H1, rng),
+                    fc2: Linear::new(MLP_H1, MLP_H2, rng),
+                    fc3: Linear::new(MLP_H2, k, rng),
+                }
+            }
+
+            /// Forward pass with optional dropout (training mode).
+            /// Returns (logits, cached activations for backprop).
+            fn forward_train(
+                &self,
+                input: &[f32],
+                dropout: f32,
+                rng: &mut SmallRng,
+            ) -> MlpForwardCache {
+                // Layer 1: ReLU + dropout
+                let z1 = self.fc1.forward(input);
+                let mut h1 = z1.clone();
+                let mut mask1 = vec![1.0f32; MLP_H1];
+                for j in 0..MLP_H1 {
+                    h1[j] = h1[j].max(0.0);
+                    if dropout > 0.0 && rng.gen::<f32>() < dropout {
+                        h1[j] = 0.0;
+                        mask1[j] = 0.0;
+                    } else if dropout > 0.0 {
+                        h1[j] /= 1.0 - dropout; // inverted dropout scaling
+                    }
+                }
+
+                // Layer 2: ReLU + dropout
+                let z2 = self.fc2.forward(&h1);
+                let mut h2 = z2.clone();
+                let mut mask2 = vec![1.0f32; MLP_H2];
+                for j in 0..MLP_H2 {
+                    h2[j] = h2[j].max(0.0);
+                    if dropout > 0.0 && rng.gen::<f32>() < dropout {
+                        h2[j] = 0.0;
+                        mask2[j] = 0.0;
+                    } else if dropout > 0.0 {
+                        h2[j] /= 1.0 - dropout;
+                    }
+                }
+
+                // Layer 3: raw logits
+                let logits = self.fc3.forward(&h2);
+
+                MlpForwardCache {
+                    input: input.to_vec(),
+                    z1, h1, mask1,
+                    z2, h2, mask2,
+                    logits,
+                }
+            }
+
+            /// Forward pass without dropout (inference mode).
+            fn forward_eval(&self, input: &[f32]) -> Vec<f32> {
+                let z1 = self.fc1.forward(input);
+                let h1: Vec<f32> = z1.iter().map(|&x| x.max(0.0)).collect();
+                let z2 = self.fc2.forward(&h1);
+                let h2: Vec<f32> = z2.iter().map(|&x| x.max(0.0)).collect();
+                self.fc3.forward(&h2)
+            }
+
+            /// Backward pass from softmax cross-entropy loss.
+            /// `d_logits` is the gradient of loss w.r.t. logits (= probs - one_hot).
+            fn backward(&mut self, cache: &MlpForwardCache, d_logits: &[f32], dropout: f32) {
+                // Backprop through fc3 (linear)
+                let d_h2 = self.fc3.backward(&cache.h2, d_logits);
+
+                // Backprop through dropout + ReLU on layer 2
+                // With inverted dropout, forward scaled kept units by 1/(1-p),
+                // so backward must apply the same factor.
+                let drop_scale2 = if dropout > 0.0 { 1.0 / (1.0 - dropout) } else { 1.0 };
+                let d_z2: Vec<f32> = d_h2.iter().enumerate()
+                    .map(|(j, &dh)| {
+                        if cache.mask2[j] == 0.0 { return 0.0; }
+                        let relu_grad = if cache.z2[j] > 0.0 { 1.0 } else { 0.0 };
+                        dh * drop_scale2 * relu_grad
+                    })
+                    .collect();
+
+                let d_h1 = self.fc2.backward(&cache.h1, &d_z2);
+
+                // Backprop through dropout + ReLU on layer 1
+                let drop_scale1 = if dropout > 0.0 { 1.0 / (1.0 - dropout) } else { 1.0 };
+                let d_z1: Vec<f32> = d_h1.iter().enumerate()
+                    .map(|(j, &dh)| {
+                        if cache.mask1[j] == 0.0 { return 0.0; }
+                        let relu_grad = if cache.z1[j] > 0.0 { 1.0 } else { 0.0 };
+                        dh * drop_scale1 * relu_grad
+                    })
+                    .collect();
+
+                let _ = self.fc1.backward(&cache.input, &d_z1);
+            }
+
+            fn adam_step(&mut self, lr: f32, t: usize, batch_size: usize) {
+                self.fc1.adam_step(lr, t, batch_size);
+                self.fc2.adam_step(lr, t, batch_size);
+                self.fc3.adam_step(lr, t, batch_size);
+            }
+        }
+
+        struct MlpForwardCache {
+            input: Vec<f32>,
+            z1: Vec<f32>,
+            h1: Vec<f32>,
+            mask1: Vec<f32>,
+            z2: Vec<f32>,
+            h2: Vec<f32>,
+            mask2: Vec<f32>,
+            logits: Vec<f32>,
+        }
+
+        // Collected per-char results: (char, k, class_map, trained_net)
+        let mut mlp_chars: Vec<(char, usize, Vec<u32>, MlpNet)> = Vec::new();
+        let mut skipped = 0usize;
+
+        let mut total_stats = RankStats::default();
+
+        for (ci, &c) in chars.iter().enumerate() {
+            let n_samples = char_counts[ci];
+            if n_samples == 0 { skipped += 1; continue; }
+
+            let samples = load_char_combo_samples(&feat_dir, ci, &cached_combos);
+
+            // Group by font
+            let mut font_indices: HashMap<u32, Vec<usize>> = HashMap::new();
+            for (i, s) in samples.iter().enumerate() {
+                font_indices.entry(s.font_id).or_default().push(i);
+            }
+            if font_indices.len() < args.min_fonts.max(2) { skipped += 1; continue; }
+
+            let n = samples.len();
+
+            // Build contiguous class mapping: font_id → class_index (0..k-1)
+            let mut font_ids_sorted: Vec<u32> = font_indices.keys().copied().collect();
+            font_ids_sorted.sort_unstable();
+            let k = font_ids_sorted.len();
+            let fid_to_class: HashMap<u32, usize> = font_ids_sorted.iter()
+                .enumerate()
+                .map(|(ci2, &fid)| (fid, ci2))
+                .collect();
+
+            // Build class_map: class_index → font_id
+            let class_map: Vec<u32> = font_ids_sorted.clone();
+
+            let mut rng = SmallRng::seed_from_u64(c as u64);
+            let mut net = MlpNet::new(k, &mut rng);
+            let mut adam_t = 0usize;
+
+            // Shuffled indices for mini-batch iteration
+            let mut sample_order: Vec<usize> = (0..n).collect();
+
+            for epoch in 0..args.epochs {
+                sample_order.shuffle(&mut rng);
+                let mut epoch_loss = 0.0f64;
+                let mut _n_batches = 0usize;
+
+                for batch_start in (0..n).step_by(args.batch_size) {
+                    let batch_end = (batch_start + args.batch_size).min(n);
+                    let batch_len = batch_end - batch_start;
+
+                    for &si in &sample_order[batch_start..batch_end] {
+                        let label = fid_to_class[&samples[si].font_id];
+
+                        // Add input noise augmentation
+                        let mut noisy = samples[si].features;
+                        if args.mlp_noise > 0.0 {
+                            for f in &mut noisy {
+                                // Box-Muller approximation: two uniform → one normal
+                                let u1: f32 = rng.gen::<f32>().max(1e-10);
+                                let u2: f32 = rng.gen::<f32>();
+                                let z = (-2.0 * u1.ln()).sqrt() * (2.0 * std::f32::consts::PI * u2).cos();
+                                *f += z * args.mlp_noise;
+                            }
+                        }
+
+                        // Forward
+                        let cache = net.forward_train(&noisy, args.mlp_dropout, &mut rng);
+
+                        // Softmax + cross-entropy loss
+                        let max_logit = cache.logits.iter().copied().fold(f32::NEG_INFINITY, f32::max);
+                        let mut probs = vec![0.0f32; k];
+                        let mut sum_exp = 0.0f32;
+                        for j in 0..k {
+                            probs[j] = (cache.logits[j] - max_logit).exp();
+                            sum_exp += probs[j];
+                        }
+                        for p in &mut probs { *p /= sum_exp; }
+
+                        // Loss: -log(prob[label])
+                        epoch_loss += -(probs[label].max(1e-10)).ln() as f64;
+
+                        // Gradient of cross-entropy w.r.t. logits: probs - one_hot
+                        let mut d_logits = probs;
+                        d_logits[label] -= 1.0;
+
+                        net.backward(&cache, &d_logits, args.mlp_dropout);
+                    }
+
+                    // Adam step
+                    adam_t += 1;
+                    net.adam_step(args.lr, adam_t, batch_len);
+                    _n_batches += 1;
+                }
+
+                if (epoch + 1) % 10 == 0 || epoch == 0 {
+                    let avg_loss = epoch_loss / n as f64;
+                    if ci < 5 || ci == chars.len() - 1 {
+                        eprintln!("  char '{}' epoch {}/{}: loss={:.4}",
+                            c, epoch + 1, args.epochs, avg_loss);
+                    }
+                }
+            }
+
+            // ── Evaluate: MRR with direct classification ──
+            let class_means: HashMap<u32, Vec<f64>> = font_indices.iter().map(|(&fid, indices)| {
+                let mut mean = vec![0.0f64; FEAT_LEN];
+                for &i in indices {
+                    for j in 0..FEAT_LEN { mean[j] += samples[i].features[j] as f64; }
+                }
+                let cnt = indices.len() as f64;
+                for j in 0..FEAT_LEN { mean[j] /= cnt; }
+                (fid, mean)
+            }).collect();
+
+            let centroid_fids: Vec<u32> = class_means.keys().copied().collect();
+
+            let eval_indices = subsample_eval(n, 2000, c);
+
+            let char_stats = eval_mrr(
+                &samples,
+                &eval_indices,
+                &class_means,
+                &centroid_fids,
+                &font_family,
+                &|i| {
+                    // MLP forward → softmax → use -probability as distance
+                    let logits = net.forward_eval(&samples[i].features);
+                    let max_logit = logits.iter().copied().fold(f32::NEG_INFINITY, f32::max);
+                    let mut probs = vec![0.0f32; k];
+                    let mut sum_exp = 0.0f32;
+                    for j in 0..k {
+                        probs[j] = (logits[j] - max_logit).exp();
+                        sum_exp += probs[j];
+                    }
+                    for p in &mut probs { *p /= sum_exp; }
+
+                    // Map class probabilities back to font_ids
+                    // Use negative log-probability as distance (lower = better)
+                    font_ids_sorted.iter().enumerate().map(|(ci2, &fid)| {
+                        let neg_log_prob = -(probs[ci2].max(1e-10)).ln() as f64;
+                        (fid, neg_log_prob)
+                    }).collect()
+                },
+            );
+
+            if ci < 5 || ci == chars.len() - 1 || (ci + 1) % 20 == 0 {
+                eprintln!("  char '{}' base={:.3} | strict={:.3} t1={:.1}% | family={:.3} t1={:.1}%",
+                    c,
+                    char_stats.base_mrr(),
+                    char_stats.strict_mrr(),
+                    char_stats.strict_top1_pct(),
+                    char_stats.family_mrr(),
+                    char_stats.family_top1_pct());
+            }
+
+            total_stats.accumulate(&char_stats);
+
+            mlp_chars.push((c, k, class_map, net));
+        }
+
+        let mlp_elapsed = mlp_start.elapsed();
+
+        eprintln!("\nMLP complete: {} characters, {} skipped, {:.1}s",
+            mlp_chars.len(), skipped, mlp_elapsed.as_secs_f64());
+        eprintln!("  Baseline:    MRR={:.3} top1={:.1}%", total_stats.base_mrr(), total_stats.base_top1_pct());
+        eprintln!("  MLP strict:  MRR={:.3} top1={:.1}% top5={:.1}%", total_stats.strict_mrr(), total_stats.strict_top1_pct(), total_stats.strict_top5_pct());
+        eprintln!("  MLP family:  MRR={:.3} top1={:.1}% top5={:.1}%", total_stats.family_mrr(), total_stats.family_top1_pct(), total_stats.family_top5_pct());
+
+        // Export MLPC weights
+        eprintln!("Writing MLP weights to {}...", args.output.display());
+        let f = std::fs::File::create(&args.output).expect("create output file");
+        let mut w = BufWriter::new(f);
+        w.write_all(b"MLPC").unwrap();
+        w.write_all(&1u32.to_le_bytes()).unwrap();
+        w.write_all(&(mlp_chars.len() as u32).to_le_bytes()).unwrap();
+
+        for (c, k, class_map, net) in &mlp_chars {
+            w.write_all(&(*c as u32).to_le_bytes()).unwrap();
+            w.write_all(&(*k as u32).to_le_bytes()).unwrap();
+            // class_map: k × u32
+            for &fid in class_map { w.write_all(&fid.to_le_bytes()).unwrap(); }
+            // W1, b1
+            for &v in &net.fc1.w { w.write_all(&v.to_le_bytes()).unwrap(); }
+            for &v in &net.fc1.b { w.write_all(&v.to_le_bytes()).unwrap(); }
+            // W2, b2
+            for &v in &net.fc2.w { w.write_all(&v.to_le_bytes()).unwrap(); }
+            for &v in &net.fc2.b { w.write_all(&v.to_le_bytes()).unwrap(); }
+            // W3, b3
+            for &v in &net.fc3.w { w.write_all(&v.to_le_bytes()).unwrap(); }
+            for &v in &net.fc3.b { w.write_all(&v.to_le_bytes()).unwrap(); }
+        }
+        w.flush().unwrap();
+
+        let file_size = std::fs::metadata(&args.output).map(|m| m.len()).unwrap_or(0);
+        let total_elapsed = start.elapsed();
+        eprintln!("\n=== MLP complete ===");
+        eprintln!("  Characters: {}/{}", mlp_chars.len(), chars.len());
+        eprintln!("  Weights:    {} ({:.1} MB)", args.output.display(), file_size as f64 / 1e6);
+        eprintln!("  Baseline:    MRR={:.3} top1={:.1}%", total_stats.base_mrr(), total_stats.base_top1_pct());
+        eprintln!("  MLP strict:  MRR={:.3} top1={:.1}% top5={:.1}%", total_stats.strict_mrr(), total_stats.strict_top1_pct(), total_stats.strict_top5_pct());
+        eprintln!("  MLP family:  MRR={:.3} top1={:.1}% top5={:.1}%", total_stats.family_mrr(), total_stats.family_top1_pct(), total_stats.family_top5_pct());
+        eprintln!("  Render:     {:.1}s", render_secs);
+        eprintln!("  Train:      {:.1}s", mlp_elapsed.as_secs_f64());
+        eprintln!("  Total:      {:.1}s", total_elapsed.as_secs_f64());
+
+        if !args.no_index {
+            let idx_path = args.index_path.clone().unwrap_or_else(default_index_path);
+            let cls = classifier::MlpClassifier::load(&args.output)
+                .expect("reload MLP weights for index build");
             build_and_save_char_index(&catalog, &cls, &idx_path);
         }
         return;
