@@ -5,7 +5,7 @@ Generate "A Timeline of Typography" — a multi-page vector PDF specimen.
 Output:
   font-timeline-specimen.pdf       — native vector PDF with embedded fonts + SVG logos
   font-timeline-specimen-scanned.pdf — rasterized with scan artifacts (skew, noise, blur)
-  font-timeline-specimen-fontmap.json — font name → file path map for ground-truth audit
+  font-timeline-specimen-scanned.pdf — rasterized with scan artifacts
 
 Fonts are registered under their actual PostScript names (name ID 6) so that
 the PDF BaseFont values exactly match what font catalog indexers read from the
@@ -43,104 +43,197 @@ LOGO_DIR = SCRIPT_DIR / "logos"
 PAGE_W, PAGE_H = letter  # 612 × 792 points (8.5 × 11 in)
 
 # ---------------------------------------------------------------------------
+# Variable font instantiation cache
+# ---------------------------------------------------------------------------
+_INSTANCE_CACHE = {}  # (path, weight) -> instantiated_path
+
+def _instantiate_variable(path, target_weight, style):
+    """Instantiate a variable font at a fixed weight, returning a static .ttf path.
+
+    Uses fontTools.varLib.instancer to pin the wght axis.  Result is cached in
+    a temp directory so we only instantiate once per (path, weight) pair.
+    """
+    key = (path, target_weight)
+    if key in _INSTANCE_CACHE:
+        return _INSTANCE_CACHE[key]
+
+    import os, tempfile
+    from fontTools.ttLib import TTFont as FTFont
+    from fontTools.varLib.instancer import instantiateVariableFont
+
+    tt = FTFont(path)
+    inst = instantiateVariableFont(tt, {"wght": target_weight})
+    # Drop GPOS — its repack can hang for 10+ minutes on multi-axis fonts.
+    # We don't need kerning for specimen rendering.
+    if "GPOS" in inst:
+        del inst["GPOS"]
+
+    # Update the PostScript name (nameID 6) to reflect the pinned weight.
+    # Without this, ReportLab embeds the original variable-font PS name
+    # (e.g. "Merriweather-Light") even though glyphs are at weight 700.
+    WEIGHT_SUFFIX = {
+        300: "Light", 400: "Regular", 500: "Medium",
+        600: "SemiBold", 700: "Bold", 800: "ExtraBold", 900: "Black",
+    }
+    suffix = WEIGHT_SUFFIX.get(target_weight, f"w{target_weight}")
+    # Derive family from the original PS name: strip everything after the
+    # first hyphen (weight/style suffix).
+    orig_ps = None
+    for rec in inst["name"].names:
+        if rec.nameID == 6:
+            try:
+                orig_ps = rec.toUnicode()
+                break
+            except Exception:
+                pass
+    if orig_ps:
+        family_stem = orig_ps.split("-")[0]
+        is_italic = "italic" in style.lower()
+        new_ps = f"{family_stem}-{'BoldItalic' if is_italic and target_weight == 700 else suffix}"
+        for rec in inst["name"].names:
+            if rec.nameID == 6:
+                rec.string = new_ps
+    basename = os.path.splitext(os.path.basename(path))[0]
+    # Sanitize brackets from variable font filenames
+    basename = basename.replace("[", "_").replace("]", "")
+    out_dir = os.path.join(tempfile.gettempdir(), "unscan-instances")
+    os.makedirs(out_dir, exist_ok=True)
+    style_tag = style.replace(" ", "")
+    out_path = os.path.join(out_dir, f"{basename}-{style_tag}-w{target_weight}.ttf")
+    inst.save(out_path)
+    tt.close()
+    _INSTANCE_CACHE[key] = out_path
+    return out_path
+
+
+# ---------------------------------------------------------------------------
 # Font registration — fonts are resolved via fontconfig
 # ---------------------------------------------------------------------------
 def fc_find(family, style="Regular"):
-    """Find a font file via fontconfig, validated against OS/2 metrics.
+    """Find a font file via fontconfig for the given family and style.
 
-    Fontconfig's style matching is unreliable for two reasons:
-    1. **4-font-family naming model**: SemiBold, Light, etc. declare subfamily
-       "Regular" under an alternate family name. fc-list style=Regular matches them.
-    2. **Large superfamilies**: Noto Serif has ~50 width/weight combos. fc-list
-       returns Condensed/ExtraCondensed variants for "Noto Serif:style=Regular".
-
-    We validate every candidate against OS/2.usWeightClass and OS/2.usWidthClass.
-    Variable fonts whose OS/2 weight reflects the axis default (not the style we
-    want) are deprioritized — static instances are preferred when available, since
-    ReportLab doesn't support variable font instances anyway.
-
-    Prefers .ttf over .otf (ReportLab needs TrueType outlines).
+    Resolution is strict and deterministic:
+    1. Query fontconfig for candidates matching family + style.
+    2. Filter to normal-width (.ttf) candidates with the exact target weight.
+       Prefer static fonts over variable fonts at this step.
+    3. If no exact-weight static font, find a variable font that covers the
+       target weight on its wght axis and instantiate it.
+    4. If none of the above, raise an error.  No silent fallbacks.
     """
     from fontTools.ttLib import TTFont as FTFont
 
     STYLE_WEIGHTS = {
-        "Regular": 400,
-        "Bold": 700,
-        "Light": 300,
-        "Medium": 500,
-        "Italic": 400,
-        "Bold Italic": 700,
+        "Regular": 400, "Bold": 700, "Light": 300,
+        "Medium": 500, "SemiBold": 600, "ExtraBold": 800, "Black": 900,
+        "Italic": 400, "Bold Italic": 700,
     }
-    expected_weight = STYLE_WEIGHTS.get(style)
-    expected_width = 5  # usWidthClass: 5 = normal (not condensed/expanded)
+    target_weight = STYLE_WEIGHTS.get(style, 400)
+    NORMAL_WIDTH = 5  # usWidthClass: 5 = normal
 
+    # Gather candidates from fontconfig
+    candidates = []
     for query in [f"{family}:style={style}", family]:
         r = subprocess.run(
             ["fc-list", query, "--format=%{file}\n"],
-            capture_output=True, text=True
+            capture_output=True, text=True,
         )
-        candidates = [l for l in r.stdout.strip().split('\n') if l.lower().endswith(('.ttf', '.otf'))]
-        # Prefer .ttf — ReportLab can't handle PostScript-outline .otf
-        ttf = [c for c in candidates if c.lower().endswith('.ttf')]
-        pool = ttf if ttf else candidates
-        if not pool:
+        for line in r.stdout.strip().split("\n"):
+            if line and line.lower().endswith(".ttf") and line not in candidates:
+                candidates.append(line)
+
+    if not candidates:
+        raise RuntimeError(f"fc_find: no .ttf candidates for '{family}' style='{style}'")
+
+    # Classify candidates
+    exact_static = []   # static font, exact weight, normal width
+    variable = []       # variable font, normal width, wght axis covers target
+
+    for path in candidates:
+        try:
+            tt = FTFont(path)
+            wt = tt["OS/2"].usWeightClass
+            wd = tt["OS/2"].usWidthClass
+            fvar = tt.get("fvar")
+            is_var = fvar is not None
+            wght_range = None
+            if is_var:
+                for axis in fvar.axes:
+                    if axis.axisTag == "wght":
+                        wght_range = (axis.minValue, axis.maxValue)
+                        break
+            tt.close()
+        except Exception:
             continue
 
-        def _check(path):
-            """Return (weight_ok, width_ok, is_variable, weight, width)."""
-            try:
-                tt = FTFont(path)
-                wt = tt['OS/2'].usWeightClass
-                wd = tt['OS/2'].usWidthClass
-                is_var = tt.get('fvar') is not None
-                tt.close()
-                return (wt, wd, is_var)
-            except Exception:
-                return None
-
-        # Score and rank candidates
-        scored = []
-        for path in pool:
-            info = _check(path)
-            if info is None:
-                continue
-            wt, wd, is_var = info
-            width_ok = (wd == expected_width)
-            weight_ok = (wt == expected_weight) if expected_weight else True
-            weight_close = (abs(wt - expected_weight) <= 50) if expected_weight else True
-            # Priority: exact weight + normal width + static > variable
-            # Condensed/expanded fonts are almost never what we want for specimen
-            score = 0
-            if width_ok:       score += 100
-            if weight_ok:      score += 50
-            elif weight_close: score += 25
-            if not is_var:     score += 10  # prefer static over variable
-            # Prefer system-installed fonts over specimen-fonts directory
-            # (specimen-fonts may have different PS names than system packages)
-            if "/specimen-fonts/" not in path:
-                score += 5
-            scored.append((score, path, wt, wd, is_var))
-
-        if not scored:
+        if wd != NORMAL_WIDTH:
             continue
 
-        scored.sort(key=lambda x: -x[0])
-        best_score, best_path, best_wt, best_wd, best_var = scored[0]
+        if not is_var and wt == target_weight:
+            exact_static.append(path)
+        elif is_var and wght_range and wght_range[0] <= target_weight <= wght_range[1]:
+            variable.append(path)
 
-        # Accept if width is normal and weight is at least close
-        if best_wd == expected_width:
-            if not expected_weight or best_wt == expected_weight or abs(best_wt - expected_weight) <= 50:
-                return best_path
+    # 1. Prefer static font with exact weight
+    if exact_static:
+        # Prefer non-specimen-fonts paths (system packages have canonical PS names)
+        for p in exact_static:
+            if "/specimen-fonts/" not in p:
+                return p
+        return exact_static[0]
 
-        # Fallback: accept anything with normal width regardless of weight
-        for s, path, wt, wd, is_var in scored:
-            if wd == expected_width:
-                return path
+    # 2. Instantiate variable font at the target weight
+    if variable:
+        return _instantiate_variable(variable[0], target_weight, style)
 
-        # Last resort: return highest-scored candidate even if condensed
-        return scored[0][1]
+    raise RuntimeError(
+        f"fc_find: no font for '{family}' style='{style}' (weight={target_weight}). "
+        f"Candidates: {candidates}"
+    )
 
-    return None
+
+def make_weight_explicit(path):
+    """Ensure the font's PS name always contains an explicit weight keyword.
+
+    Delegates to `unscan --weight-explicit` so the logic lives in one place
+    (Rust font_scan::make_weight_explicit).  The Rust catalog scanner applies
+    the same function at index time, so GT and catalog names always agree.
+
+    Returns (original_ps_name, display_ps_name, path).
+    """
+    from fontTools.ttLib import TTFont as FTFont
+    if not path:
+        return None, None, path
+
+    orig_ps = read_postscript_name(path)
+    if not orig_ps:
+        return None, None, path
+
+    try:
+        tt = FTFont(path)
+        weight = tt['OS/2'].usWeightClass
+        tt.close()
+    except Exception:
+        return orig_ps, orig_ps, path
+
+    unscan_bin = os.path.join(os.path.dirname(__file__), "..", "target", "release", "unscan")
+    if not os.path.exists(unscan_bin):
+        # Fallback: try PATH
+        unscan_bin = "unscan"
+
+    r = subprocess.run(
+        [unscan_bin, "--weight-explicit", f"{orig_ps}:{weight}"],
+        capture_output=True, text=True
+    )
+    if r.returncode == 0:
+        new_ps = r.stdout.strip()
+    else:
+        new_ps = orig_ps
+
+    if new_ps != orig_ps:
+        print(f"  WEIGHT EXPLICIT: {orig_ps} (w{weight}) → {new_ps}")
+    return orig_ps, new_ps, path
+
+
 def read_postscript_name(ttf_path):
     """Read PostScript name (name ID 6) from a font file."""
     from fontTools.ttLib import TTFont as FTFont
@@ -182,7 +275,7 @@ def register_all_fonts():
     will contain exact PS names that match the font catalog — no heuristic
     string matching needed at audit time.
 
-    Returns (registered, font_file_map, alias_map) where alias_map maps
+    Returns (registered, alias_map) where alias_map maps
     friendly base names to actual PS names for use in section styles.
     """
     from reportlab.lib.fonts import addMapping
@@ -225,25 +318,46 @@ def register_all_fonts():
     }
 
     registered = {}
-    font_file_map = {}
     alias_map = {}  # base_name -> ps_name (for regular), base_name-Bold -> ps_bold, etc.
 
     for base, family in FAMILIES.items():
-        reg = fc_find(family, "Regular") or fc_find(family)
-        bold = fc_find(family, "Bold") or reg
-        italic = fc_find(family, "Italic") or reg
+        reg = fc_find(family, "Regular")
 
-        # Read actual PostScript names from font files
-        ps_reg = read_postscript_name(reg) if reg else None
-        ps_bold = read_postscript_name(bold) if bold else None
-        ps_italic = read_postscript_name(italic) if italic else None
+        # Bold and Italic may not exist for every family.  When missing,
+        # apply CSS font-weight matching: try heavier weights first (800, 900),
+        # then lighter (600, 500).  Only fall back to Regular if nothing works.
+        # See CSS Fonts Module Level 4 §4.7.2 — weight matching for bold.
+        try:
+            bold = fc_find(family, "Bold")
+        except RuntimeError:
+            bold = None
+            for fallback_style in ("ExtraBold", "Black", "SemiBold", "Medium"):
+                try:
+                    bold = fc_find(family, fallback_style)
+                    print(f"  NOTE: {family} has no Bold — CSS fallback to {fallback_style}")
+                    break
+                except RuntimeError:
+                    continue
+            if bold is None:
+                print(f"  NOTE: {family} has no Bold or nearby weight — using Regular")
+                bold = reg
+        try:
+            italic = fc_find(family, "Italic")
+        except RuntimeError:
+            print(f"  NOTE: {family} has no Italic — using Regular")
+            italic = reg
+
+        # Always make weight explicit in PostScript names.
+        # E.g. "Lato-Italic" (w400) → "Lato-RegularItalic"
+        # The Rust font catalog does the same transformation so both sides agree.
+        _, ps_reg, reg = make_weight_explicit(reg)
+        _, ps_bold, bold = make_weight_explicit(bold)
+        _, ps_italic, italic = make_weight_explicit(italic)
 
         ok = register_font(ps_reg, reg)
         if ok:
             registered[base] = True
             alias_map[base] = ps_reg
-            if reg:
-                font_file_map[ps_reg] = reg
         ok_b = register_font(ps_bold, bold)
         ok_i = register_font(ps_italic, italic)
         if not ok_b and ps_reg:
@@ -256,10 +370,6 @@ def register_all_fonts():
             alias_map[f"{base}-Italic"] = ps_reg + "-Italic-fallback"
         else:
             alias_map[f"{base}-Italic"] = ps_italic
-        if ok_b and bold:
-            font_file_map[ps_bold] = bold
-        if ok_i and italic:
-            font_file_map[ps_italic] = italic
 
         # ReportLab font family mapping for <b> and <i> tags in Paragraphs
         if ps_reg:
@@ -268,7 +378,7 @@ def register_all_fonts():
             addMapping(ps_reg, 0, 1, alias_map.get(f"{base}-Italic", ps_reg))
             addMapping(ps_reg, 1, 1, alias_map.get(f"{base}-Bold", ps_reg))
 
-    return registered, font_file_map, alias_map
+    return registered, alias_map
 
 
 
@@ -1012,21 +1122,12 @@ _rasterize_mod = _imp("rasterize")
 
 def main():
     print("Registering fonts...")
-    registered, _font_file_map, alias_map = register_all_fonts()
+    registered, alias_map = register_all_fonts()
     print(f"  {len(registered)} font families registered")
 
     out_pdf = OUT_DIR / "font-timeline-specimen.pdf"
     print(f"Building vector specimen: {out_pdf}")
     build_specimen(out_pdf, registered, alias_map)
-
-    # Build fontmap by introspecting what's actually in the PDF
-    print("Introspecting PDF for font map...")
-    resolved, unresolved = _rasterize_mod.build_fontmap(str(out_pdf))
-    out_fontmap = OUT_DIR / "font-timeline-specimen-fontmap.json"
-    _rasterize_mod.write_fontmap(resolved, out_fontmap)
-    print(f"  {len(resolved)} fonts → {out_fontmap}")
-    if unresolved:
-        print(f"  {len(unresolved)} unresolved (builtins): {', '.join(unresolved)}")
 
     # Rasterize
     scanned_pdf = OUT_DIR / "font-timeline-specimen-scanned.pdf"
