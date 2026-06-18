@@ -119,6 +119,12 @@ pub struct Args {
     /// weights used when omitted).  Not needed for fisher or fusion.
     #[arg(long)]
     pub triplet_weights: Option<PathBuf>,
+
+    /// Normalize PostScript name(s) to include explicit weight keywords.
+    /// Pass one or more "PSName:weight" pairs (e.g. "Lato-Italic:400").
+    /// Prints the normalized name(s) to stdout and exits.
+    #[arg(long, value_name = "PS:WEIGHT")]
+    pub weight_explicit: Vec<String>,
 }
 
 impl Args {
@@ -173,7 +179,7 @@ impl Args {
 
     /// Validate: if not --index, require input and output (unless --test).
     pub fn validate(&self) -> Result<(), String> {
-        if self.index || self.render_ref_chars.is_some() {
+        if self.index || self.render_ref_chars.is_some() || !self.weight_explicit.is_empty() {
             return Ok(());
         }
         if self.input.is_none() {

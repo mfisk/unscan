@@ -142,6 +142,24 @@ fn main() {
         render_ref_chars_and_exit(json_str);
     }
 
+    // ── weight-explicit: normalize PS names and exit ─────────────────
+    if !args.weight_explicit.is_empty() {
+        for spec in &args.weight_explicit {
+            if let Some((ps, w_str)) = spec.rsplit_once(':') {
+                if let Ok(w) = w_str.parse::<u16>() {
+                    println!("{}", font_scan::make_weight_explicit(ps, w));
+                } else {
+                    eprintln!("Bad weight in {:?} — expected PSName:weight", spec);
+                    std::process::exit(1);
+                }
+            } else {
+                eprintln!("Bad format {:?} — expected PSName:weight", spec);
+                std::process::exit(1);
+            }
+        }
+        std::process::exit(0);
+    }
+
     // ── Build the classifier based on --classifier flag ──────────────
     let clf: Box<dyn classifier::Classifier> = make_classifier(&args);
     eprintln!("Using classifier: {}", clf.name());

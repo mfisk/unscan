@@ -649,6 +649,61 @@ fn read_postscript_name(data: &[u8]) -> String {
     String::new()
 }
 
+/// Ensure the PostScript name contains an explicit weight keyword.
+///
+/// If the PS name already contains a weight marker (Regular, Bold, Light, etc.),
+/// it is returned unchanged.  Otherwise the OS/2 usWeightClass is mapped to a
+/// keyword and inserted:
+///   "Lato-Italic" (w400) → "Lato-RegularItalic"
+///   "OpenSans"    (w400) → "OpenSans-Regular"
+///   "Lato-Bold"   (w700) → "Lato-Bold" (already explicit)
+///
+/// The specimen generator (`gen-specimen.py`) applies the identical transform so
+/// ground-truth PDF names and catalog names always agree.
+pub fn make_weight_explicit(ps_name: &str, weight: u16) -> String {
+    if ps_name.is_empty() {
+        return ps_name.to_string();
+    }
+
+    let weight_keyword = match weight {
+        0..=150   => "Thin",
+        151..=250 => "ExtraLight",
+        251..=350 => "Light",
+        351..=450 => "Regular",
+        451..=475 => "Text",
+        476..=550 => "Medium",
+        551..=650 => "SemiBold",
+        651..=750 => "Bold",
+        751..=850 => "ExtraBold",
+        _         => "Black",
+    };
+
+    // Check if PS name already contains an explicit weight marker.
+    let lower = ps_name.to_lowercase().replace('-', "");
+    let markers = [
+        "thin", "extralight", "ultralight", "light",
+        "regular", "text", "book",
+        "medium", "semibold", "demibold", "demi",
+        "bold", "extrabold", "ultrabold",
+        "black", "heavy",
+    ];
+    if markers.iter().any(|m| lower.contains(m)) {
+        return ps_name.to_string();
+    }
+
+    // Insert weight: before "Italic"/"It" suffix, or append.
+    if let Some(idx) = ps_name.to_lowercase().find("italic") {
+        let prefix = ps_name[..idx].trim_end_matches('-');
+        let italic_part = &ps_name[idx..];
+        format!("{}-{}{}", prefix, weight_keyword, italic_part)
+    } else if ps_name.ends_with("It") {
+        let prefix = ps_name[..ps_name.len()-2].trim_end_matches('-');
+        format!("{}-{}It", prefix, weight_keyword)
+    } else {
+        format!("{}-{}", ps_name, weight_keyword)
+    }
+}
+
 /// Font identity for major/minor miss classification.
 /// Read from the font's name table and OS/2 table — no string munging.
 #[derive(Debug, Clone)]
@@ -707,7 +762,18 @@ fn load_font_entry(path: &Path, aliases: &HashMap<String, Alias>) -> Option<Font
     let _ = ab_glyph::FontRef::try_from_slice(&data).ok()?;
 
     let oldstyle_figures = detect_oldstyle_figures(&data);
-    let postscript_name = read_postscript_name(&data);
+    let raw_ps_name = read_postscript_name(&data);
+
+    // Read OS/2 weight for make_weight_explicit
+    let os2_weight = {
+        use rustybuzz::ttf_parser;
+        ttf_parser::Face::parse(&data, 0)
+            .ok()
+            .and_then(|face| face.tables().os2)
+            .map(|os2| os2.weight().to_number())
+            .unwrap_or(400)
+    };
+    let postscript_name = make_weight_explicit(&raw_ps_name, os2_weight);
 
     let stem = path
         .file_stem()
