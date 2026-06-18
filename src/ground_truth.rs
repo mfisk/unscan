@@ -16,6 +16,8 @@ pub struct VectorSpan {
     pub font_name: String,
     /// Bounding box in PDF points: (x0, y0, x1, y1).
     pub bbox: [f32; 4],
+    /// Effective font size in PDF points (font_size × CTM y-scale).
+    pub font_size_pt: f32,
 }
 
 /// Ground truth for the entire document, keyed by 1-based page number.
@@ -581,6 +583,7 @@ fn extract_page_spans(
                     spans.push(VectorSpan {
                         font_name: current_font.clone(),
                         bbox: [x, y, x + w, y + h],
+                        font_size_pt: h,
                     });
                 }
             }
@@ -598,6 +601,7 @@ fn extract_page_spans(
                     spans.push(VectorSpan {
                         font_name: current_font.clone(),
                         bbox: [x, y, x + w, y + h],
+                        font_size_pt: h,
                     });
                 }
             }
@@ -747,12 +751,50 @@ impl GroundTruth {
         best_font
     }
 
+    /// Look up the ground-truth font name and effective font size (in PDF
+    /// points) for a given audit bbox (in pixels at the given DPI).
+    pub fn lookup_font_and_size(&self, page: usize, bbox_px: &[f32; 4], dpi: u32) -> Option<(&str, f32)> {
+        let scale = dpi as f32 / 72.0;
+        let px0 = bbox_px[0] / scale;
+        let py0 = bbox_px[1] / scale;
+        let px1 = bbox_px[2] / scale;
+        let py1 = bbox_px[3] / scale;
+
+        let spans = self.pages.get(&page)?;
+
+        let mut best: Option<(&str, f32)> = None;
+        let mut best_area: f32 = 0.0;
+
+        for span in spans {
+            let [sx0, sy0, sx1, sy1] = span.bbox;
+            let ox0 = sx0.max(px0);
+            let oy0 = sy0.max(py0);
+            let ox1 = sx1.min(px1);
+            let oy1 = sy1.min(py1);
+            if ox0 < ox1 && oy0 < oy1 {
+                let area = (ox1 - ox0) * (oy1 - oy0);
+                if area > best_area {
+                    best_area = area;
+                    best = Some((&span.font_name, span.font_size_pt));
+                }
+            }
+        }
+
+        best
+    }
+
     /// Check whether a matched font is correct for the given position.
     /// `matched_ps` should be the PostScript name of the chosen font.
     /// Returns true if it's a hit (correct match), false if it's a miss.
     pub fn is_hit(&self, page: usize, bbox_px: &[f32; 4], dpi: u32, matched_ps: &str) -> bool {
         match self.lookup_font(page, bbox_px, dpi) {
-            Some(actual) => matched_ps == strip_subset_prefix_str(actual),
+            Some(actual) => {
+                let actual_stripped = strip_subset_prefix_str(actual);
+                // Use fonts_match_strict: the catalog PS name has weight-explicit
+                // suffixes (e.g. ArialMT-Regular) while the PDF BaseFont is the
+                // raw PS name (ArialMT).  Exact == would always mismatch.
+                fonts_match_strict(matched_ps, &actual_stripped)
+            }
             None => true, // no ground truth available → assume hit (don't penalize)
         }
     }
