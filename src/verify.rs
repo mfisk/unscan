@@ -156,7 +156,7 @@ pub fn verify_text_region(
 
 /// Compute absolute pixel difference between two grayscale images.
 /// Images are resized to match dimensions if needed (using the scan crop size).
-fn compute_abs_diff(a: &GrayImage, b: &GrayImage) -> GrayImage {
+pub fn compute_abs_diff(a: &GrayImage, b: &GrayImage) -> GrayImage {
     let (aw, ah) = a.dimensions();
     let b_resized = if b.dimensions() != (aw, ah) {
         image::imageops::resize(b, aw, ah, image::imageops::FilterType::Lanczos3)
@@ -188,21 +188,14 @@ fn render_via_freetype_scaled(
     canvas_w: u32,
     canvas_h: u32,
     render_scale: u32,
-    overrides: Option<&[(char, u16)]>,
+    _overrides: Option<&[(char, u16)]>,
     variant_tag: &str,
 ) -> Option<GrayImage> {
-    // Try PDF-based rendering first (proper OT shaping via the PDF renderer).
-    // Falls back to ab_glyph if PDF rendering fails.
-    if let Some(img) = render_via_freetype(font_data, words, canvas_w, canvas_h, render_scale, variant_tag) {
-        return Some(img);
-    }
-    if render_scale == 2 {
-        // Only fall back for the default scale
-        log::warn!("FreeType rendering failed, falling back to ab_glyph for SSIM");
-        render_words_ab_glyph(font_data, words, canvas_w, canvas_h, overrides)
-    } else {
-        None
-    }
+    // NOTE: ab_glyph fallback disabled.  width_matched_em_px (ab_glyph) does
+    // not compensate for sidebearings, so it systematically underestimates font
+    // size (~3% too small).  The shaped path (rustybuzz + FreeType) handles
+    // sidebearing correction and should be the only render path.
+    render_via_freetype(font_data, words, canvas_w, canvas_h, render_scale, variant_tag)
 }
 
 /// Render text using rustybuzz (OT shaping) + FreeType (rasterisation).
@@ -222,13 +215,14 @@ fn render_via_freetype(
     }
 
     // Compute font size from ab_glyph (consistent with coarse scoring).
+    // Compute per-word em_px using rustybuzz (shaped advances with
+    // sidebearing correction).  No ab_glyph fallback — it lacks sidebearing
+    // compensation and systematically underestimates font size by ~3%.
     let font_ref = FontRef::try_from_slice(font_data).ok()?;
     let mut all_em: Vec<f32> = words.iter()
         .filter(|w| !w.text.is_empty() && w.width >= 1)
         .filter_map(|w| {
-            // Prefer rustybuzz-shaped advance for consistency with FreeType rendering
             crate::layout::width_matched_em_px_shaped(font_data, &w.text, w.width as f32, variant_tag)
-                .or_else(|| crate::layout::width_matched_em_px(&font_ref, &w.text, w.width as f32, None))
         })
         .collect();
     if all_em.is_empty() {
@@ -259,20 +253,9 @@ fn render_via_freetype(
 
     // Set up rustybuzz for shaping
     let buzz_face = rustybuzz::Face::from_slice(font_data, 0)?;
+    let ot_features = crate::layout::ot_features(variant_tag);
     let units_per_em = buzz_face.units_per_em() as f64;
     let px_per_unit = render_em as f64 / units_per_em;
-
-    // OT variant features for shaping (e.g. smcp, onum)
-    let ot_features: Vec<rustybuzz::Feature> = if !variant_tag.is_empty() && variant_tag.len() <= 4 {
-        let mut tag_bytes = [b' '; 4];
-        for (i, b) in variant_tag.as_bytes().iter().enumerate().take(4) {
-            tag_bytes[i] = *b;
-        }
-        let tag = rustybuzz::ttf_parser::Tag::from_bytes(&tag_bytes);
-        vec![rustybuzz::Feature::new(tag, 1, ..)]
-    } else {
-        vec![]
-    };
 
     let mut canvas = GrayImage::from_pixel(render_w, render_h, Luma([255u8]));
 
@@ -281,25 +264,23 @@ fn render_via_freetype(
             continue;
         }
 
-        // Shape with rustybuzz
-        let mut buffer = rustybuzz::UnicodeBuffer::new();
-        buffer.push_str(&word.text);
-        let glyphs = rustybuzz::shape(&buzz_face, &ot_features, buffer);
-        let infos = glyphs.glyph_infos();
-        let positions = glyphs.glyph_positions();
+        // Shape with shared helper
+        let shaped = match crate::layout::shape_word(&buzz_face, &ot_features, &word.text) {
+            Some(s) => s,
+            None => continue,
+        };
 
         // Walk glyphs, accumulating pen position in subpixel floats
-        let mut pen_x = word.x_off as f64 * render_scale as f64;
+        // Start at ink edge: subtract first glyph's LSB (in pixels) so
+        // rendered ink aligns with the OCR bbox edge.
+        let lsb_px = shaped.first_lsb_fu * px_per_unit;
+        let mut pen_x = word.x_off as f64 * render_scale as f64 - lsb_px;
         let pen_y = baseline_y;
 
-        // Compensate for first glyph's left side bearing so ink aligns
-        // with the OCR bbox edge (which is ink-extent, not advance-extent).
-        let mut lsb_compensated = false;
-
-        for (info, pos) in infos.iter().zip(positions.iter()) {
-            let glyph_id = info.glyph_id; // after shaping = glyph ID
-            let x_offset = pos.x_offset as f64 * px_per_unit;
-            let y_offset = pos.y_offset as f64 * px_per_unit;
+        for i in 0..shaped.glyph_ids.len() {
+            let glyph_id = shaped.glyph_ids[i];
+            let x_offset = shaped.x_offsets[i] as f64 * px_per_unit;
+            let y_offset = shaped.y_offsets[i] as f64 * px_per_unit;
 
             // Load glyph in FreeType
             ft_face.load_glyph(glyph_id, freetype::face::LoadFlag::RENDER | freetype::face::LoadFlag::NO_HINTING).ok()?;
@@ -311,18 +292,7 @@ fn render_via_freetype(
             let bmp_pitch = bitmap.pitch().unsigned_abs() as usize;
 
             if bmp_w == 0 || bmp_h == 0 || bmp_buf.is_empty() {
-                pen_x += pos.x_advance as f64 * px_per_unit;
-                continue;
-            }
-
-            // Shift pen left by first glyph's bitmap_left so ink starts at crop edge
-            if !lsb_compensated {
-                pen_x -= glyph.bitmap_left() as f64;
-                lsb_compensated = true;
-            }
-
-            if bmp_w == 0 || bmp_h == 0 || bmp_buf.is_empty() {
-                pen_x += pos.x_advance as f64 * px_per_unit;
+                pen_x += shaped.x_advances[i] as f64 * px_per_unit;
                 continue;
             }
 
@@ -348,7 +318,7 @@ fn render_via_freetype(
                 }
             }
 
-            pen_x += pos.x_advance as f64 * px_per_unit;
+            pen_x += shaped.x_advances[i] as f64 * px_per_unit;
         }
     }
 
@@ -406,6 +376,9 @@ fn render_via_freetype(
 }
 
 /// Fallback: ab_glyph-based rendering (no OT shaping, legacy kern only).
+/// DISABLED: lacks sidebearing compensation, systematically underestimates
+/// font size by ~3%.  Kept for reference only.
+#[allow(dead_code)]
 fn render_words_ab_glyph(
     font_data: &[u8],
     words: &[WordPlacement],
@@ -481,6 +454,36 @@ fn render_words_ab_glyph(
     }
 
     Some(canvas)
+}
+
+// ---------------------------------------------------------------------------
+// Public: render a line for visual comparison in the miss report
+// ---------------------------------------------------------------------------
+
+/// Render a line of text for visual comparison.
+/// Returns the ink-cropped render image, or None if rendering fails.
+pub fn render_line_for_comparison(
+    font_data: &[u8],
+    words: &[WordPlacement],
+    canvas_w: u32,
+    canvas_h: u32,
+    overrides: Option<&[(char, u16)]>,
+    variant_tag: &str,
+) -> Option<GrayImage> {
+    let rendered = render_via_freetype_scaled(
+        font_data, words, canvas_w, canvas_h, 2, overrides, variant_tag,
+    )?;
+
+    // Ink-crop vertically for clean display
+    let ink_threshold = 240u8;
+    let (rw, rh) = rendered.dimensions();
+    let (r_top, r_bot) = crate::ocr::ink_vertical_extent(&rendered, 0, rw, 0, rh, ink_threshold);
+    let ink_h = r_bot.saturating_sub(r_top);
+    if ink_h >= 3 {
+        Some(image::imageops::crop_imm(&rendered, 0, r_top, rw, ink_h).to_image())
+    } else {
+        Some(rendered)
+    }
 }
 
 // ---------------------------------------------------------------------------
