@@ -43,7 +43,7 @@ fn seam_params() -> &'static SeamParams {
             delta_scale_power: env_f32("SEAM_DELTA_SCALE_POWER", 1.0),
             delta_row_weight: env_f32("SEAM_DELTA_ROW_WEIGHT", 0.0),
             delta_row_power: env_f32("SEAM_DELTA_ROW_POWER", 1.0),
-            vert_run_discount: env_f32("SEAM_VERT_RUN_DISCOUNT", 0.9),
+            vert_run_discount: env_f32("SEAM_VERT_RUN_DISCOUNT", 0.8),
             vert_run_threshold: std::env::var("SEAM_VERT_RUN_THRESHOLD").ok()
                 .and_then(|s| s.parse().ok()).unwrap_or(3u32),
             vert_row_ink_power: env_f32("SEAM_VERT_ROW_INK_POWER", 0.0),

@@ -152,18 +152,13 @@ pub fn baseline_aligned_baseline_pt<F: Font>(
     (baseline_offset_pt, ink_h_pt)
 }
 
-/// Compute em_px using rustybuzz shaped advances (full OT shaping).
-/// More accurate than `width_matched_em_px` which uses ab_glyph (no GPOS).
-/// When `variant_tag` is non-empty (e.g. "smcp", "onum"), the corresponding
-/// OT feature is activated during shaping.
-pub fn width_matched_em_px_shaped(font_data: &[u8], text: &str, target_width_px: f32, variant_tag: &str) -> Option<f32> {
-    let face = rustybuzz::Face::from_slice(font_data, 0)?;
-    let units_per_em = face.units_per_em() as f64;
+// ---------------------------------------------------------------------------
+// Shared rustybuzz shaping
+// ---------------------------------------------------------------------------
 
-    let mut buffer = rustybuzz::UnicodeBuffer::new();
-    buffer.push_str(text);
-
-    let features: Vec<rustybuzz::Feature> = if !variant_tag.is_empty() && variant_tag.len() <= 4 {
+/// Build OT feature list from a variant tag (e.g. "smcp", "onum").
+pub fn ot_features(variant_tag: &str) -> Vec<rustybuzz::Feature> {
+    if !variant_tag.is_empty() && variant_tag.len() <= 4 {
         let mut tag_bytes = [b' '; 4];
         for (i, b) in variant_tag.as_bytes().iter().enumerate().take(4) {
             tag_bytes[i] = *b;
@@ -172,19 +167,105 @@ pub fn width_matched_em_px_shaped(font_data: &[u8], text: &str, target_width_px:
         vec![rustybuzz::Feature::new(tag, 1, ..)]
     } else {
         vec![]
-    };
+    }
+}
 
-    let glyphs = rustybuzz::shape(&face, &features, buffer);
+/// Result of shaping a word with rustybuzz, including sidebearing info.
+pub struct ShapedWord {
+    /// Per-glyph IDs (post-shaping).
+    pub glyph_ids: Vec<u32>,
+    /// Per-glyph x_advance in font units.
+    pub x_advances: Vec<i32>,
+    /// Per-glyph x_offset in font units.
+    pub x_offsets: Vec<i32>,
+    /// Per-glyph y_offset in font units.
+    pub y_offsets: Vec<i32>,
+    /// Total advance width in font units (sum of x_advances).
+    pub total_advance_fu: f64,
+    /// Ink-only advance in font units (advance minus first LSB and last RSB).
+    pub ink_advance_fu: f64,
+    /// First glyph's left side-bearing in font units.
+    pub first_lsb_fu: f64,
+    /// Units per em for this font.
+    pub units_per_em: f64,
+}
+
+impl ShapedWord {
+    /// Compute em_px such that ink advance == target_width_px.
+    pub fn ink_matched_em_px(&self, target_width_px: f32) -> Option<f32> {
+        if self.ink_advance_fu < 0.1 {
+            return None;
+        }
+        let em_px = (target_width_px as f64 * self.units_per_em / self.ink_advance_fu) as f32;
+        Some(em_px.clamp(4.0, 500.0))
+    }
+
+    /// Pixels per font-unit at a given em_px.
+    pub fn px_per_unit(&self, em_px: f64) -> f64 {
+        em_px / self.units_per_em
+    }
+}
+
+/// Shape a word using rustybuzz and compute sidebearing-corrected metrics.
+pub fn shape_word(face: &rustybuzz::Face, features: &[rustybuzz::Feature], text: &str) -> Option<ShapedWord> {
+    let units_per_em = face.units_per_em() as f64;
+
+    let mut buffer = rustybuzz::UnicodeBuffer::new();
+    buffer.push_str(text);
+    let glyphs = rustybuzz::shape(face, features, buffer);
     let positions = glyphs.glyph_positions();
+    let infos = glyphs.glyph_infos();
 
-    let total_advance_fu: f64 = positions.iter().map(|p| p.x_advance as f64).sum();
+    let glyph_ids: Vec<u32> = infos.iter().map(|gi| gi.glyph_id).collect();
+    let x_advances: Vec<i32> = positions.iter().map(|p| p.x_advance).collect();
+    let x_offsets: Vec<i32> = positions.iter().map(|p| p.x_offset).collect();
+    let y_offsets: Vec<i32> = positions.iter().map(|p| p.y_offset).collect();
+
+    let total_advance_fu: f64 = x_advances.iter().map(|&a| a as f64).sum();
     if total_advance_fu < 0.1 {
         return None;
     }
 
-    // em_px such that total_advance_fu / units_per_em * em_px = target_width_px
-    let em_px = (target_width_px as f64 * units_per_em / total_advance_fu) as f32;
-    Some(em_px.clamp(4.0, 500.0))
+    let ttfp = face.as_ref();
+    let first_lsb_fu = infos.first().and_then(|gi| {
+        let gid = rustybuzz::ttf_parser::GlyphId(gi.glyph_id as u16);
+        ttfp.glyph_bounding_box(gid).map(|bb| bb.x_min as f64)
+    }).unwrap_or(0.0);
+
+    let last_rsb = if let (Some(last_info), Some(last_pos)) = (infos.last(), positions.last()) {
+        let gid = rustybuzz::ttf_parser::GlyphId(last_info.glyph_id as u16);
+        if let Some(bb) = ttfp.glyph_bounding_box(gid) {
+            let adv = last_pos.x_advance as f64;
+            (adv - bb.x_max as f64).max(0.0)
+        } else {
+            0.0
+        }
+    } else {
+        0.0
+    };
+
+    let ink_advance_fu = total_advance_fu - first_lsb_fu - last_rsb;
+
+    Some(ShapedWord {
+        glyph_ids,
+        x_advances,
+        x_offsets,
+        y_offsets,
+        total_advance_fu,
+        ink_advance_fu,
+        first_lsb_fu,
+        units_per_em,
+    })
+}
+
+/// Compute em_px using rustybuzz shaped advances (full OT shaping).
+/// More accurate than `width_matched_em_px` which uses ab_glyph (no GPOS).
+/// When `variant_tag` is non-empty (e.g. "smcp", "onum"), the corresponding
+/// OT feature is activated during shaping.
+pub fn width_matched_em_px_shaped(font_data: &[u8], text: &str, target_width_px: f32, variant_tag: &str) -> Option<f32> {
+    let face = rustybuzz::Face::from_slice(font_data, 0)?;
+    let features = ot_features(variant_tag);
+    shape_word(&face, &features, text)?.ink_matched_em_px(target_width_px)
 }
 
 // ---------------------------------------------------------------------------
