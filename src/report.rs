@@ -112,48 +112,90 @@ fn pick_interesting_chars(
     n_worst: usize,
     n_normal: usize,
 ) -> Vec<(usize, &crate::audit::CharCiVote)> {
-    let corrected: Vec<(usize, &crate::audit::CharCiVote)> = chars
-        .iter()
-        .enumerate()
-        .filter(|(_, c)| c.ocr_corrected_from.is_some())
-        .collect();
-
-    let mut by_dist: Vec<(usize, &crate::audit::CharCiVote)> =
-        chars.iter().enumerate().collect();
-    by_dist.sort_by(|a, b| {
-        b.1.min_dist_sq
-            .partial_cmp(&a.1.min_dist_sq)
-            .unwrap_or(std::cmp::Ordering::Equal)
-    });
-
-    let corrected_idxs: std::collections::HashSet<usize> =
-        corrected.iter().map(|(i, _)| *i).collect();
-
-    let worst: Vec<(usize, &crate::audit::CharCiVote)> = by_dist
-        .iter()
-        .filter(|(i, _)| !corrected_idxs.contains(i))
-        .take(n_worst)
-        .cloned()
-        .collect();
-
-    let used: std::collections::HashSet<usize> = corrected_idxs
-        .iter()
-        .chain(worst.iter().map(|(i, _)| i))
-        .cloned()
-        .collect();
-
-    let mut normal: Vec<(usize, &crate::audit::CharCiVote)> = by_dist
-        .iter()
-        .filter(|(i, c)| !used.contains(i) && c.min_dist_sq < 0.008)
-        .cloned()
-        .collect();
-    normal.reverse();
-    normal.truncate(n_normal);
-
+    let mut used: std::collections::HashSet<usize> = std::collections::HashSet::new();
     let mut result: Vec<(usize, &crate::audit::CharCiVote)> = Vec::new();
-    result.extend(corrected);
-    result.extend(worst);
-    result.extend(normal);
+
+    // 1. OCR-corrected characters (always show)
+    for (i, c) in chars.iter().enumerate() {
+        if c.ocr_corrected_from.is_some() {
+            used.insert(i);
+            result.push((i, c));
+        }
+    }
+
+    // 2. Worst characters for the chosen/matched font (highest chosen_dist_sq)
+    {
+        let mut by_chosen: Vec<(usize, &crate::audit::CharCiVote)> =
+            chars.iter().enumerate()
+                .filter(|(_, c)| c.chosen_dist_sq.is_some())
+                .collect();
+        by_chosen.sort_by(|a, b| {
+            b.1.chosen_dist_sq.unwrap()
+                .partial_cmp(&a.1.chosen_dist_sq.unwrap())
+                .unwrap_or(std::cmp::Ordering::Equal)
+        });
+        for (i, c) in by_chosen.iter().take(n_worst) {
+            if used.insert(*i) {
+                result.push((*i, c));
+            }
+        }
+    }
+
+    // 3. Worst characters for the ground-truth font (highest gt_font_dist_sq)
+    {
+        let mut by_gt: Vec<(usize, &crate::audit::CharCiVote)> =
+            chars.iter().enumerate()
+                .filter(|(_, c)| c.gt_font_dist_sq.is_some())
+                .collect();
+        by_gt.sort_by(|a, b| {
+            b.1.gt_font_dist_sq.unwrap()
+                .partial_cmp(&a.1.gt_font_dist_sq.unwrap())
+                .unwrap_or(std::cmp::Ordering::Equal)
+        });
+        for (i, c) in by_gt.iter().take(n_worst) {
+            if used.insert(*i) {
+                result.push((*i, c));
+            }
+        }
+    }
+
+    // 4. Worst by global min_dist_sq (original behavior — catch remaining outliers)
+    {
+        let mut by_dist: Vec<(usize, &crate::audit::CharCiVote)> =
+            chars.iter().enumerate().collect();
+        by_dist.sort_by(|a, b| {
+            b.1.min_dist_sq
+                .partial_cmp(&a.1.min_dist_sq)
+                .unwrap_or(std::cmp::Ordering::Equal)
+        });
+        for (i, c) in by_dist.iter().take(n_worst) {
+            if used.insert(*i) {
+                result.push((*i, c));
+            }
+        }
+    }
+
+    // 5. A few normal characters for contrast
+    {
+        let mut by_dist: Vec<(usize, &crate::audit::CharCiVote)> =
+            chars.iter().enumerate().collect();
+        by_dist.sort_by(|a, b| {
+            a.1.min_dist_sq
+                .partial_cmp(&b.1.min_dist_sq)
+                .unwrap_or(std::cmp::Ordering::Equal)
+        });
+        let mut count = 0;
+        for (i, c) in by_dist.iter() {
+            if count >= n_normal {
+                break;
+            }
+            if c.min_dist_sq < 0.008 && used.insert(*i) {
+                result.push((*i, c));
+                count += 1;
+            }
+        }
+    }
+
     result.sort_by_key(|(i, _)| *i);
     result
 }
