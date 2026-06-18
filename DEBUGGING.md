@@ -536,21 +536,26 @@ so it renders immediately — don't embed it in a text reply.
 
 ### Built-in miss report (`report.rs`)
 
-The miss report is generated automatically by unscan when `--audit` and
-`--audit-vector` are both set. It writes a self-contained HTML report to
-`DIR/report.html` with all base64 images inlined. No separate script needed.
+`--test VECTOR.pdf` runs ground-truth accuracy evaluation against the vector
+PDF. It outputs performance stats as JSON to stdout and does not require
+`--output`, making it the fastest way to run scoring or regression tests:
 
 ```bash
-# Run unscan — report.html is generated automatically
+# Fast accuracy scoring — no audit overhead
+./target/release/unscan INPUT.pdf --test VECTOR.pdf
+
+# Full audit + ground-truth report
 ./target/release/unscan INPUT.pdf \
     -o /dev/null --audit /tmp/audit-out \
-    --audit-vector VECTOR.pdf
+    --test VECTOR.pdf
 # Report at /tmp/audit-out/report.html
 ```
 
-On miss lines, the ground-truth font is injected into the CI candidate list
-and per-char distances are computed, so the report shows exactly how far each
-character was from the correct font.
+When `--audit` is also set, the audit report includes ground-truth hit/miss
+classification with a self-contained HTML report at `DIR/report.html` (all
+base64 images inlined). On miss lines, the ground-truth font is injected into
+the CI candidate list and per-char distances are computed, so the report shows
+exactly how far each character was from the correct font.
 
 ---
 
