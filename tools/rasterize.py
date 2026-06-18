@@ -14,7 +14,8 @@ Usage:
 
 Rasterize options:
     --dpi N          Resolution (default: 300)
-    --no-aa          Disable anti-aliasing (binary threshold)
+    --no-aa          Disable anti-aliasing at the renderer level (8-bit output)
+    --threshold      Binary threshold output to 1-bit (0/255)
     --color          Render in RGB color instead of grayscale
     --backend STR    'mupdf' (default) or 'poppler'
     --skew DEG       Apply rotational skew in degrees (default: 0)
@@ -56,6 +57,7 @@ def rasterize(
     speckle=False,
     blur_radius=0.0,
     color=False,
+    threshold=False,
 ):
     """Rasterize *src* vector PDF → *out* raster PDF."""
     import img2pdf
@@ -66,9 +68,9 @@ def rasterize(
     tmpdir = tempfile.mkdtemp(prefix="unscan-raster-")
 
     if backend == "mupdf":
-        pages = _rasterize_mupdf(src, tmpdir, dpi, aa, color=color)
+        pages = _rasterize_mupdf(src, tmpdir, dpi, aa, color=color, threshold=threshold)
     elif backend == "poppler":
-        pages = _rasterize_poppler(src, tmpdir, dpi, aa, color=color)
+        pages = _rasterize_poppler(src, tmpdir, dpi, aa, color=color, threshold=threshold)
     else:
         raise ValueError(f"Unknown backend: {backend}")
 
@@ -134,49 +136,53 @@ def rasterize(
 
 # ── Backend: PyMuPDF ─────────────────────────────────────────────────
 
-def _rasterize_mupdf(src, tmpdir, dpi, aa, color=False):
+def _rasterize_mupdf(src, tmpdir, dpi, aa, color=False, threshold=False):
     import fitz
     import numpy as np
     from PIL import Image
+
+    if not aa:
+        fitz.TOOLS.set_aa_level(0)
 
     doc = fitz.open(src)
     mat = fitz.Matrix(dpi / 72, dpi / 72)
     cs = fitz.csRGB if color else fitz.csGRAY
     pngs = []
     for i, page in enumerate(doc):
-        if not aa:
-            pix = page.get_pixmap(matrix=mat, colorspace=cs,
-                                  alpha=False, annots=False)
-            arr = np.frombuffer(pix.samples, dtype=np.uint8)
+        pix = page.get_pixmap(matrix=mat, colorspace=cs, alpha=False)
+        if threshold:
+            arr = np.frombuffer(pix.samples, dtype=np.uint8).copy()
             if color:
                 arr = arr.reshape(pix.height, pix.width, 3)
-                # Binary threshold per channel
-                arr = ((arr > 128) * 255).astype(np.uint8)
-                img = Image.fromarray(arr, mode="RGB")
             else:
                 arr = arr.reshape(pix.height, pix.width)
-                arr = ((arr > 128) * 255).astype(np.uint8)
-                img = Image.fromarray(arr, mode="L")
+            arr = ((arr > 128) * 255).astype(np.uint8)
+            mode = "RGB" if color else "L"
+            img = Image.fromarray(arr, mode=mode)
             path = os.path.join(tmpdir, f"page_{i:03d}.png")
             img.save(path, dpi=(dpi, dpi))
         else:
-            pix = page.get_pixmap(matrix=mat, colorspace=cs, alpha=False)
             path = os.path.join(tmpdir, f"page_{i:03d}.png")
             pix.save(path)
         pngs.append(path)
+
+    if not aa:
+        fitz.TOOLS.set_aa_level(8)  # restore default
+
     return pngs
 
 
 # ── Backend: Poppler (pdftoppm) ──────────────────────────────────────
 
-def _rasterize_poppler(src, tmpdir, dpi, aa, color=False):
+def _rasterize_poppler(src, tmpdir, dpi, aa, color=False, threshold=False):
     import numpy as np
     from PIL import Image
 
     prefix = os.path.join(tmpdir, "page")
     fmt_args = ["-png"] if color else ["-gray"]
+    aa_args = [] if aa else ["-aa", "no", "-aaVector", "no"]
     subprocess.run(
-        ["pdftoppm", "-r", str(dpi)] + fmt_args + [src, prefix],
+        ["pdftoppm", "-r", str(dpi)] + fmt_args + aa_args + [src, prefix],
         check=True,
     )
     # Poppler outputs .pgm for -gray, .png for -png
@@ -191,7 +197,7 @@ def _rasterize_poppler(src, tmpdir, dpi, aa, color=False):
         img = Image.open(raw)
         if not color:
             img = img.convert("L")
-        if not aa:
+        if threshold:
             arr = np.array(img)
             arr = ((arr > 128) * 255).astype(np.uint8)
             mode = "RGB" if color else "L"
@@ -277,6 +283,7 @@ def cmd_rasterize(args):
         speckle=args.speckle,
         blur_radius=args.blur,
         color=args.color,
+        threshold=args.threshold,
     )
     print(f"Rasterized: {args.output}")
 
@@ -337,11 +344,12 @@ def cmd_prepare(args):
     # --- Rasterize ---
     if not args.fontmap_only:
         aa_label = "no-AA" if args.no_aa else "AA"
+        threshold_label = "+threshold" if args.threshold else ""
         color_label = ", color" if args.color else ""
-        print(f"Rasterizing at {args.dpi} DPI, {aa_label}{color_label} ({args.backend})...")
+        print(f"Rasterizing at {args.dpi} DPI, {aa_label}{threshold_label}{color_label} ({args.backend})...")
         rasterize(pdf_path, rasterized_path,
                   dpi=args.dpi, backend=args.backend, aa=not args.no_aa,
-                  color=args.color)
+                  color=args.color, threshold=args.threshold)
         print(f"  Rasterized: {rasterized_path}")
 
     # --- Summary ---
@@ -361,7 +369,8 @@ def cmd_prepare(args):
 def _add_raster_args(p):
     """Add common rasterization arguments to a subparser."""
     p.add_argument("--dpi", type=int, default=300)
-    p.add_argument("--no-aa", action="store_true", help="Disable anti-aliasing")
+    p.add_argument("--no-aa", action="store_true", help="Disable anti-aliasing at the renderer level (8-bit output)")
+    p.add_argument("--threshold", action="store_true", help="Binary threshold output to 1-bit (0/255). Combine with --no-aa for true binary rasterization")
     p.add_argument("--color", action="store_true", help="Render in RGB color instead of grayscale")
     p.add_argument("--backend", choices=["mupdf", "poppler"], default="mupdf")
 

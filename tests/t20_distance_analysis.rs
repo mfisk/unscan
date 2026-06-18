@@ -9,6 +9,7 @@ use std::collections::HashMap;
 use unscan::char_index::{
     load_index, CharIndex, FEAT_LEN,
 };
+use unscan::classifier::FisherClassifier;
 
 /// Extract a short display name from a font path or name
 fn short_name(full: &str) -> &str {
@@ -120,7 +121,7 @@ fn distance_analysis_specimen_fonts() {
         panic!("Char index not found at {:?}", index_path);
     }
     
-    let index = load_index(&index_path).expect("Failed to load index");
+    let index = load_index(&index_path, &FisherClassifier).expect("Failed to load index");
     eprintln!("Loaded index: {} chars indexed", index.entries.len());
     
     // Dump specimen-related font names to find the correct naming

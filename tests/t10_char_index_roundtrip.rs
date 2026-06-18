@@ -14,6 +14,7 @@ use unscan::char_index::{
     build_char_index, compute_features, compute_font_serif_score, compute_xh_cap_ratio,
     render_char_normalised, search_candidates, GlyphOverrides, CharFeatures, FEAT_LEN,
 };
+use unscan::classifier::FisherClassifier;
 
 /// Render a single character in the given font at NORM_H=48 ink height,
 /// tight-cropped — same as what the index stores.
@@ -127,7 +128,7 @@ fn setup() -> (unscan::char_index::CharIndex, Vec<(char, GrayImage)>, Vec<u8>) {
     let target_path = "/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf";
     let target_data = load_font(target_path);
     let font_set = test_font_set();
-    let index = build_char_index(&font_set);
+    let index = build_char_index(&font_set, &FisherClassifier);
 
     let test_word = "hamburgefontsiv";
     let mut crops: Vec<(char, GrayImage)> = Vec::new();
@@ -163,7 +164,7 @@ fn char_index_identifies_dejavu_sans() {
     eprintln!("\n=== Per-character nearest fonts ===");
     for (c, img) in &unique_crops {
         let single = vec![(*c, img.clone())];
-        let char_results = search_candidates(&index, &single, 3.0, false).scores;
+        let char_results = search_candidates(&index, &single, 3.0, false, &FisherClassifier).scores;
         let top3: Vec<String> = char_results.iter()
             .map(|(n, s)| format!("{} ({:.4})", n, s))
             .collect();
@@ -171,7 +172,7 @@ fn char_index_identifies_dejavu_sans() {
     }
 
     // Overall query
-    let results = search_candidates(&index, &unique_crops, 5.0, false).scores;
+    let results = search_candidates(&index, &unique_crops, 5.0, false, &FisherClassifier).scores;
 
     eprintln!("\n=== Overall top {} matches ===", results.len());
     for (i, (name, score)) in results.iter().enumerate() {
@@ -199,7 +200,7 @@ fn ci_single_char_diagnostics() {
     for test_char in ['e', 'g', 'a'] {
         if let Some((_, crop)) = unique_crops.iter().find(|(c, _)| *c == test_char) {
             let single = vec![(test_char, crop.clone())];
-            let result = search_candidates(&index, &single, 5.0, false);
+            let result = search_candidates(&index, &single, 5.0, false, &FisherClassifier);
 
             eprintln!("\n=== CI search: '{}' ===", test_char);
             eprintln!("  Candidates:");
@@ -228,7 +229,7 @@ fn char_index_identifies_dejavu_sans_full_index() {
     let target_data = load_font(target_font);
 
     eprintln!("\n=== Loading full index from {:?} ===", index_path);
-    let index = unscan::char_index::load_index(&index_path).expect("load index");
+    let index = unscan::char_index::load_index(&index_path, &FisherClassifier).expect("load index");
     let font_count = unscan::char_index::count_fonts(&index);
     eprintln!("  {} fonts in index", font_count);
 
@@ -251,7 +252,7 @@ fn char_index_identifies_dejavu_sans_full_index() {
     eprintln!("\n=== Per-character nearest fonts (full index) ===");
     for (c, img) in &unique_crops {
         let single = vec![(*c, img.clone())];
-        let char_results = search_candidates(&index, &single, 5.0, false).scores;
+        let char_results = search_candidates(&index, &single, 5.0, false, &FisherClassifier).scores;
         let top5: Vec<String> = char_results.iter()
             .take(5)
             .map(|(n, s)| format!("{} ({:.4})", n, s))
@@ -260,7 +261,7 @@ fn char_index_identifies_dejavu_sans_full_index() {
     }
 
     // Overall top 10
-    let results = search_candidates(&index, &unique_crops, 10.0, false).scores;
+    let results = search_candidates(&index, &unique_crops, 10.0, false, &FisherClassifier).scores;
 
     eprintln!("\n=== Overall top 10 matches (full {} font index) ===", font_count);
     for (i, (name, score)) in results.iter().take(10).enumerate() {
@@ -292,7 +293,7 @@ fn compare_dejavu_vs_noto_per_char() {
 
     let target_path = "/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf";
     let target_data = load_font(target_path);
-    let index = unscan::char_index::load_index(&index_path).expect("load index");
+    let index = unscan::char_index::load_index(&index_path, &FisherClassifier).expect("load index");
 
     let test_word = "hamburgefontsiv";
     let mut seen = std::collections::HashSet::new();
@@ -309,7 +310,7 @@ fn compare_dejavu_vs_noto_per_char() {
         };
         let single = vec![(c, img)];
         // Get ALL results with high thoroughness
-        let results = search_candidates(&index, &single, 100.0, false).scores;
+        let results = search_candidates(&index, &single, 100.0, false, &FisherClassifier).scores;
 
         let dv = results.iter().enumerate()
             .find(|(_, (n, _))| n.contains("DejaVuSans.ttf"));
@@ -387,7 +388,7 @@ fn feature_self_consistency() {
 
         // Build a 1-font index from just this font
         let font_set = vec![(font_path.to_string(), PathBuf::from(*font_path), None)];
-        let index = build_char_index(&font_set);
+        let index = build_char_index(&font_set, &FisherClassifier);
 
         // Parse the font for per-font metric overrides (same as build path)
         let font = FontRef::try_from_slice(&font_data).expect("parse font");
