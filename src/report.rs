@@ -289,6 +289,8 @@ struct ClassifiedEntry<'a> {
     entry: &'a AuditEntry,
     actual_font: Option<String>,
     kind: MissKind,
+    /// Ground-truth effective font size in PDF points (if available).
+    gt_font_size_pt: Option<f32>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -331,19 +333,24 @@ fn classify_entries<'a>(
             ];
 
             if let Some(gt) = gt {
-                let actual_font = gt
-                    .lookup_font(e.page, &bbox_px, dpi)
-                    .map(|s| ground_truth::strip_subset_prefix_str(s));
+                let (actual_font, gt_font_size_pt) = match gt
+                    .lookup_font_and_size(e.page, &bbox_px, dpi)
+                {
+                    Some((name, size)) => (Some(ground_truth::strip_subset_prefix_str(name)), Some(size)),
+                    None => (None, None),
+                };
 
                 let kind = if e.decision == Decision::KeptRaster {
                     MissKind::KeptRaster
                 } else if let Some(ref actual) = actual_font {
-                    // Compare via PostScript name (exact).
-                    // The chosen CI candidate's font file knows its own PS name;
-                    // the GT BaseFont IS the PS name.
+                    // Compare via fonts_match_strict: the catalog PS name has
+                    // weight-explicit suffixes (e.g. ArialMT-Regular) while the
+                    // PDF BaseFont is the raw PS name (ArialMT).
                     let ps_match = e.ci_candidates.first().and_then(|c| {
                         find_font_by_key(font_catalog, &c.font_key)
-                    }).map_or(false, |fe| fe.postscript_name == *actual);
+                    }).map_or(false, |fe| {
+                        ground_truth::fonts_match_strict(&fe.postscript_name, actual)
+                    });
 
                     if ps_match {
                         if e.ssim_pass == Some(false) {
@@ -382,6 +389,7 @@ fn classify_entries<'a>(
                     entry: e,
                     actual_font,
                     kind,
+                    gt_font_size_pt,
                 }
             } else {
                 // No ground truth: only classify kept-raster vs hit
@@ -394,6 +402,7 @@ fn classify_entries<'a>(
                     entry: e,
                     actual_font: None,
                     kind,
+                    gt_font_size_pt: None,
                 }
             }
         })
@@ -435,10 +444,10 @@ fn find_correct_ci_candidate(
     let gt_ps = ground_truth::strip_subset_prefix_str(actual_font);
 
     // Match CI candidate's PostScript name against GT BaseFont.
-    // Exact lookup — no heuristics.
+    // Use fonts_match_strict to handle weight-explicit name differences.
     for (i, c) in entry.ci_candidates.iter().enumerate() {
         if let Some(fe) = find_font_by_key(font_catalog, &c.font_key) {
-            if fe.postscript_name == gt_ps {
+            if ground_truth::fonts_match_strict(&fe.postscript_name, &gt_ps) {
                 return (Some(c.font_key.clone()), c.score, Some(i + 1));
             }
         }
@@ -453,6 +462,7 @@ fn build_miss_block(
     audit_root: &Path,
     font_catalog: &[FontEntry],
     font_data_cache: &mut FontDataCache,
+    dpi: u32,
 ) -> String {
     let entry = ce.entry;
     let actual_font = ce.actual_font.as_deref().unwrap_or("?");
@@ -489,9 +499,30 @@ fn build_miss_block(
     // Find diag_seg_dir for this line
     let diag_dir = find_diag_seg_dir(audit_root, entry.page, entry.line_index);
 
-    // SSIM comparison block
+    // Determine if font pick is correct (skip char table + GT render for SSIM-only failures)
+    let font_is_correct = ce.kind == MissKind::SsimFailure;
+
+    // SSIM comparison block — render correct font for side-by-side if this is a font miss
+    let (gt_render_uri, gt_diff_uri) = if !font_is_correct {
+        render_correct_font_comparison(entry, correct_fe, font_data_cache, diag_dir.as_deref())
+    } else {
+        (None, None)
+    };
+    // Compute font sizes for comparison
+    let gt_font_size_pt = ce.gt_font_size_pt;
+    let inferred_size = chosen_fe.and_then(|fe| {
+        let data = font_data_cache.load(&fe.path)?;
+        compute_inferred_font_size(data, &entry.word_bboxes, &fe.variant_tag, dpi)
+    });
+    let unscan_font_size_pt = inferred_size.as_ref().map(|s| s.median_pt);
+
     let ssim_compare_html = if let Some(ref dd) = diag_dir {
-        build_ssim_block(dd, actual_font, matched, entry.ssim_score)
+        build_ssim_block(
+            dd, actual_font, matched, entry.ssim_score,
+            gt_render_uri.as_deref(), gt_diff_uri.as_deref(),
+            gt_font_size_pt, unscan_font_size_pt,
+            inferred_size.as_ref().map(|s| s.per_word.as_slice()),
+        )
     } else {
         String::new()
     };
@@ -519,9 +550,6 @@ fn build_miss_block(
         }
         _ => String::new(),
     };
-
-    // Determine if font pick is correct (skip char table for SSIM-only failures)
-    let font_is_correct = ce.kind == MissKind::SsimFailure;
 
     // Per-character comparison table
     let char_table_html = if font_is_correct || entry.ci_char_votes.is_empty() {
@@ -917,12 +945,148 @@ fn build_seg_stats(diag_dir: &Path, entry: &AuditEntry) -> String {
     format!("<div class=\"scan-line-label\">Segmentation: {stats}</div>")
 }
 
+/// Render the correct (ground-truth) font for a miss entry and produce
+/// base64 URIs for the render image and its diff against the scan crop.
+fn render_correct_font_comparison(
+    entry: &AuditEntry,
+    correct_fe: Option<&FontEntry>,
+    font_data_cache: &mut FontDataCache,
+    diag_dir: Option<&Path>,
+) -> (Option<String>, Option<String>) {
+    let fe = match correct_fe {
+        Some(fe) => fe,
+        None => return (None, None),
+    };
+    let dd = match diag_dir {
+        Some(d) => d,
+        None => return (None, None),
+    };
+
+    // Load font data
+    let font_data = match font_data_cache.load(&fe.path) {
+        Some(d) => d,
+        None => return (None, None),
+    };
+
+    // Build word placements relative to line bbox
+    let placements: Vec<crate::verify::WordPlacement> = entry
+        .word_bboxes
+        .iter()
+        .map(|wb| crate::verify::WordPlacement {
+            text: wb.text.clone(),
+            x_off: wb.x.saturating_sub(entry.bbox.x),
+            y_off: wb.y.saturating_sub(entry.bbox.y),
+            width: wb.width,
+            height: wb.height,
+            confidence: wb.confidence,
+        })
+        .collect();
+
+    if placements.is_empty() {
+        return (None, None);
+    }
+
+    let overrides: Option<Vec<(char, u16)>> = fe
+        .glyph_overrides
+        .as_ref()
+        .map(|v| v.iter().cloned().collect());
+
+    // Render the line in the correct font
+    let render_img = match crate::verify::render_line_for_comparison(
+        font_data,
+        &placements,
+        entry.bbox.width,
+        entry.bbox.height,
+        overrides.as_deref(),
+        &fe.variant_tag,
+    ) {
+        Some(img) => img,
+        None => return (None, None),
+    };
+
+    let render_uri = img_to_b64_uri(&render_img);
+
+    // Load ssim_scan.png and compute diff
+    let scan_path = dd.join("ssim_scan.png");
+    let diff_uri = if scan_path.exists() {
+        if let Ok(scan_dyn) = image::open(&scan_path) {
+            let scan_gray = scan_dyn.to_luma8();
+            let diff_img = crate::verify::compute_abs_diff(&scan_gray, &render_img);
+            Some(img_to_b64_uri(&diff_img))
+        } else {
+            None
+        }
+    } else {
+        None
+    };
+
+    (Some(render_uri), diff_uri)
+}
+
+/// Compute the font size (in PDF points) that unscan would infer for the
+/// picked font, based on word-width matching.
+/// Per-word font-size detail for the audit report.
+#[derive(Clone)]
+struct WordSizeDetail {
+    text: String,
+    width_px: u32,
+    em_px: f32,
+    pt: f32,
+}
+
+struct InferredFontSize {
+    median_pt: f32,
+    per_word: Vec<WordSizeDetail>,
+}
+
+fn compute_inferred_font_size(
+    font_data: &[u8],
+    word_bboxes: &[crate::audit::WordBBox],
+    variant_tag: &str,
+    dpi: u32,
+) -> Option<InferredFontSize> {
+    let scale = 72.0 / dpi as f32;
+    let per_word: Vec<WordSizeDetail> = word_bboxes
+        .iter()
+        .filter(|wb| !wb.text.is_empty() && wb.width >= 1)
+        .filter_map(|wb| {
+            let em_px = crate::layout::width_matched_em_px_shaped(
+                font_data,
+                &wb.text,
+                wb.width as f32,
+                variant_tag,
+            )?;
+            Some(WordSizeDetail {
+                text: wb.text.clone(),
+                width_px: wb.width,
+                em_px,
+                pt: em_px * scale,
+            })
+        })
+        .collect();
+    if per_word.is_empty() {
+        return None;
+    }
+    let mut sorted_em: Vec<f32> = per_word.iter().map(|w| w.em_px).collect();
+    sorted_em.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
+    let median_em_px = sorted_em[sorted_em.len() / 2];
+    Some(InferredFontSize {
+        median_pt: median_em_px * scale,
+        per_word,
+    })
+}
+
 
 fn build_ssim_block(
     diag_dir: &Path,
     correct_font: &str,
     chosen_font: &str,
     ssim_score: Option<f32>,
+    correct_render_uri: Option<&str>,
+    correct_diff_uri: Option<&str>,
+    gt_font_size_pt: Option<f32>,
+    unscan_font_size_pt: Option<f32>,
+    per_word_sizes: Option<&[WordSizeDetail]>,
 ) -> String {
     let scan_path = diag_dir.join("ssim_scan.png");
     let render_path = diag_dir.join("ssim_render.png");
@@ -943,9 +1107,95 @@ fn build_ssim_block(
 
     let diff_row = if diff_path.exists() {
         if let Some(diff_uri) = file_to_b64_uri(&diff_path) {
+            Some(diff_uri)
+        } else {
+            None
+        }
+    } else {
+        None
+    };
+
+    let ssim_str = ssim_score
+        .map(|s| format!("{s:.10}"))
+        .unwrap_or_else(|| "—".into());
+
+    // Render row: side-by-side if correct-font render is available
+    let render_row = if let Some(gt_uri) = correct_render_uri {
+        format!(
+            "<tr><td class=\"ssim-label\">Render</td>\
+             <td><img src=\"{gt_uri}\" class=\"ssim-compare-img\"></td>\
+             <td><img src=\"{render_uri}\" class=\"ssim-compare-img\"></td></tr>"
+        )
+    } else {
+        format!(
+            "<tr><td class=\"ssim-label\">Render</td>\
+             <td colspan=\"2\"><img src=\"{render_uri}\" class=\"ssim-compare-img\"></td></tr>"
+        )
+    };
+
+    // Diff row: side-by-side if both diffs are available
+    let diff_row_html = match (correct_diff_uri, &diff_row) {
+        (Some(gt_diff), Some(picked_diff)) => format!(
+            "<tr><td class=\"ssim-label\">Diff</td>\
+             <td><img src=\"{gt_diff}\" class=\"ssim-compare-img\"></td>\
+             <td><img src=\"{picked_diff}\" class=\"ssim-compare-img\"></td></tr>"
+        ),
+        (Some(gt_diff), None) => format!(
+            "<tr><td class=\"ssim-label\">Diff</td>\
+             <td><img src=\"{gt_diff}\" class=\"ssim-compare-img\"></td>\
+             <td>—</td></tr>"
+        ),
+        (None, Some(picked_diff)) => format!(
+            "<tr><td class=\"ssim-label\">Diff</td>\
+             <td colspan=\"2\"><img src=\"{picked_diff}\" class=\"ssim-compare-img\"></td></tr>"
+        ),
+        (None, None) => String::new(),
+    };
+
+    // Font size comparison row
+    let font_size_row = match (gt_font_size_pt, unscan_font_size_pt) {
+        (Some(gt_sz), Some(us_sz)) => {
+            let delta = us_sz - gt_sz;
+            let pct = if gt_sz.abs() > 0.01 { (delta / gt_sz * 100.0) } else { 0.0 };
+            let delta_class = if pct.abs() > 5.0 { "bad" } else if pct.abs() > 2.0 { "warn" } else { "ok" };
             format!(
-                "<tr><td class=\"ssim-label\">Diff</td>\
-                 <td colspan=\"2\"><img src=\"{diff_uri}\" class=\"ssim-compare-img\"></td></tr>"
+                "<tr><td class=\"ssim-label\">Size</td>\
+                 <td class=\"correct\"><span class=\"num\">{gt_sz:.2}pt</span></td>\
+                 <td class=\"chosen\"><span class=\"num\">{us_sz:.2}pt</span> \
+                 <span class=\"num {delta_class}\">({delta:+.2}pt / {pct:+.1}%)</span></td></tr>"
+            )
+        }
+        (Some(gt_sz), None) => format!(
+            "<tr><td class=\"ssim-label\">Size</td>\
+             <td class=\"correct\"><span class=\"num\">{gt_sz:.2}pt</span></td>\
+             <td class=\"chosen\">—</td></tr>"
+        ),
+        (None, Some(us_sz)) => format!(
+            "<tr><td class=\"ssim-label\">Size</td>\
+             <td class=\"correct\">—</td>\
+             <td class=\"chosen\"><span class=\"num\">{us_sz:.2}pt</span></td></tr>"
+        ),
+        (None, None) => String::new(),
+    };
+
+    // Per-word size breakdown row
+    let per_word_row = if let Some(words) = per_word_sizes {
+        if words.len() > 1 {
+            let median_pt = unscan_font_size_pt.unwrap_or(0.0);
+            let mut cells: Vec<String> = Vec::new();
+            for w in words {
+                let pct = if median_pt.abs() > 0.01 { (w.pt - median_pt) / median_pt * 100.0 } else { 0.0 };
+                let cls = if pct.abs() > 10.0 { "bad" } else if pct.abs() > 5.0 { "warn" } else { "ok" };
+                let txt_esc = w.text.replace('&', "&amp;").replace('<', "&lt;").replace('>', "&gt;").replace('"', "&quot;");
+                cells.push(format!(
+                    "<span class=\"word-size-cell {cls}\">\"{txt_esc}\" <b>{:.2}pt</b> ({pct:+.1}%) [{}px]</span>",
+                    w.pt, w.width_px
+                ));
+            }
+            format!(
+                "<tr><td class=\"ssim-label\">Words</td>\
+                 <td colspan=\"2\" class=\"per-word-sizes\">{}</td></tr>",
+                cells.join(" ")
             )
         } else {
             String::new()
@@ -954,10 +1204,6 @@ fn build_ssim_block(
         String::new()
     };
 
-    let ssim_str = ssim_score
-        .map(|s| format!("{s:.10}"))
-        .unwrap_or_else(|| "—".into());
-
     format!(
         "<div class=\"ssim-compare-block\">\
          <table class=\"ssim-compare-table\">\
@@ -965,11 +1211,12 @@ fn build_ssim_block(
          <tr><td class=\"ssim-label\">Font</td>\
          <td class=\"correct\">{correct_font}</td>\
          <td class=\"chosen\">{chosen_font}</td></tr>\
+         {font_size_row}\
+         {per_word_row}\
          <tr><td class=\"ssim-label\">Scan</td>\
          <td colspan=\"2\"><img src=\"{scan_uri}\" class=\"ssim-compare-img\"></td></tr>\
-         <tr><td class=\"ssim-label\">Render</td>\
-         <td colspan=\"2\"><img src=\"{render_uri}\" class=\"ssim-compare-img\"></td></tr>\
-         {diff_row}\
+         {render_row}\
+         {diff_row_html}\
          <tr><td class=\"ssim-label\">SSIM</td>\
          <td colspan=\"2\">{ssim_str}</td></tr>\
          </table></div>"
@@ -1295,6 +1542,10 @@ img.ci {
 .num.bad { color: #c62828; font-weight: bold; }
 .num.warn { color: #e65100; }
 .num.ok { color: #2e7d32; }
+.per-word-sizes { font-family: monospace; font-size: 11px; line-height: 1.8; }
+.word-size-cell { display: inline-block; padding: 1px 5px; margin: 1px 3px; border-radius: 3px; background: #f5f5f5; border: 1px solid #ddd; }
+.word-size-cell.bad { background: #ffebee; border-color: #ef9a9a; }
+.word-size-cell.warn { background: #fff3e0; border-color: #ffcc80; }
 .ocr-col { text-align: center; font-size: 11px; vertical-align: middle; padding: 4px; }
 .char-label { font-size: 14px; font-weight: 600; }
 .font-mini { font-size: 9px; color: #888; word-break: break-all; max-width: 100px; display: inline-block; }
@@ -1461,6 +1712,7 @@ pub fn generate_report(
             audit_root,
             font_catalog,
             &mut font_data_cache,
+            dpi,
         ));
     }
 
@@ -1472,6 +1724,7 @@ pub fn generate_report(
             audit_root,
             font_catalog,
             &mut font_data_cache,
+            dpi,
         ));
     }
 
@@ -1483,6 +1736,7 @@ pub fn generate_report(
             audit_root,
             font_catalog,
             &mut font_data_cache,
+            dpi,
         ));
     }
 
@@ -1494,6 +1748,7 @@ pub fn generate_report(
             audit_root,
             font_catalog,
             &mut font_data_cache,
+            dpi,
         ));
     }
 
