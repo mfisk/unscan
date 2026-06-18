@@ -1,6 +1,6 @@
 //! Specimen generation test.
 //!
-//! Generates the font-timeline specimen PDF, fontmap JSON, and rasterized
+//! Generates the font-timeline specimen PDF and rasterized
 //! variants (AA and no-AA at 300 dpi).  Downstream accuracy tests (t60,
 //! t61, t62) depend on these outputs and will fail if they're missing.
 //!
@@ -37,12 +37,9 @@ fn specimen_gen() {
     assert!(output.status.success(), "gen-specimen.py failed");
 
     let vector_pdf = test_doc("font-timeline-specimen.pdf");
-    let fontmap = test_doc("font-timeline-specimen-fontmap.json");
     assert!(vector_pdf.exists(), "gen-specimen.py did not create vector PDF");
-    assert!(fontmap.exists(), "gen-specimen.py did not create fontmap JSON");
 
     eprintln!("[t55] Vector PDF: {}", vector_pdf.display());
-    eprintln!("[t55] Fontmap:    {}", fontmap.display());
 
     // Rasterize AA at 300 dpi
     let raster_aa = test_doc("font-timeline-specimen-rasterized.pdf");
@@ -52,12 +49,20 @@ fn specimen_gen() {
         "AA rasterization failed",
     );
 
-    // Rasterize no-AA at 300 dpi
+    // Rasterize no-AA at 300 dpi (8-bit, renderer-native AA disabled)
     let raster_noaa = test_doc("font-timeline-specimen-rasterized-noaa-300dpi.pdf");
     eprintln!("[t55] Rasterizing 300dpi no-AA ...");
     assert!(
         common::rasterize_pdf(&vector_pdf, &raster_noaa, 300, false),
         "no-AA rasterization failed",
+    );
+
+    // Rasterize 1-bit threshold at 300 dpi (no-AA + binary threshold)
+    let raster_1bit = test_doc("font-timeline-specimen-rasterized-1bit-300dpi.pdf");
+    eprintln!("[t55] Rasterizing 300dpi 1-bit ...");
+    assert!(
+        common::rasterize_pdf_threshold(&vector_pdf, &raster_1bit, 300, false),
+        "1-bit rasterization failed",
     );
 
     // Build character index
