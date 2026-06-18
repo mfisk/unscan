@@ -286,10 +286,14 @@ fn raster_cache_ok(src: &Path, out_path: &Path) -> bool {
 /// `backend` selects the rasterizer: "mupdf" (default) or "poppler".
 /// Result is cached at `out_path`; regenerated only if the source is newer.
 pub fn rasterize_pdf_with(src: &Path, out_path: &Path, dpi: u32, aa: bool, backend: &str) -> bool {
+    rasterize_pdf_opts(src, out_path, dpi, aa, false, backend)
+}
+
+pub fn rasterize_pdf_opts(src: &Path, out_path: &Path, dpi: u32, aa: bool, threshold: bool, backend: &str) -> bool {
     if raster_cache_ok(src, out_path) { return true; }
 
-    eprintln!("  Rasterizing {:?} → {:?} (dpi={}, aa={}, backend={})",
-        src.file_name().unwrap(), out_path.file_name().unwrap(), dpi, aa, backend);
+    eprintln!("  Rasterizing {:?} → {:?} (dpi={}, aa={}, threshold={}, backend={})",
+        src.file_name().unwrap(), out_path.file_name().unwrap(), dpi, aa, threshold, backend);
 
     let mut cmd = Command::new("python3");
     cmd.arg(rasterize_py())
@@ -300,6 +304,7 @@ pub fn rasterize_pdf_with(src: &Path, out_path: &Path, dpi: u32, aa: bool, backe
         .args(["--dpi", &dpi.to_string()])
         .args(["--backend", backend]);
     if !aa { cmd.arg("--no-aa"); }
+    if threshold { cmd.arg("--threshold"); }
 
     let ok = cmd.status().map(|s| s.success()).unwrap_or(false);
     if ok {
@@ -313,6 +318,11 @@ pub fn rasterize_pdf_with(src: &Path, out_path: &Path, dpi: u32, aa: bool, backe
 /// Rasterize with MuPDF backend (default for tests).
 pub fn rasterize_pdf(src: &Path, out_path: &Path, dpi: u32, aa: bool) -> bool {
     rasterize_pdf_with(src, out_path, dpi, aa, "mupdf")
+}
+
+/// Rasterize with MuPDF backend + binary threshold (1-bit).
+pub fn rasterize_pdf_threshold(src: &Path, out_path: &Path, dpi: u32, aa: bool) -> bool {
+    rasterize_pdf_opts(src, out_path, dpi, aa, true, "mupdf")
 }
 
 /// Rasterize with Poppler/Cairo backend (cross-renderer accuracy tests).
