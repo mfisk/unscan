@@ -80,7 +80,7 @@ install instructions.
 
 ## Ground-truth audit
 
-When `--audit-vector VECTOR.pdf` is supplied alongside `--audit DIR`, unscan
+When `--test VECTOR.pdf` is supplied alongside `--audit DIR`, unscan
 reads `/Widths` and `Tw` (word spacing) directly from the vector PDF's font
 dictionaries to compute accurate span bounding boxes. Each OCR line is matched
 against the overlapping vector span to determine the ground-truth font. Lines
@@ -94,7 +94,7 @@ shows exactly how far each character was from the correct font.
 # Run unscan with ground-truth audit
 unscan test-docs/font-timeline-specimen-scanned.pdf \
   -o /tmp/out.pdf --audit /tmp/audit-out \
-  --audit-vector test-docs/font-timeline-specimen.pdf
+  --test test-docs/font-timeline-specimen.pdf
 ```
 
 The HTML miss report is generated automatically at `DIR/report.html`.
@@ -194,7 +194,7 @@ PDFs reference standard names all viewers understand. See
 
 When `--audit DIR` is set, unscan writes `DIR/audit.json` with full pipeline
 decisions, plus per-line directories containing per-word subdirectories with
-segmentation overlays, character crops, and summary JSONs. When `--audit-vector`
+segmentation overlays, character crops, and summary JSONs. When `--test`
 is also set, a visual HTML miss report is generated at `DIR/report.html`.
 
 ```

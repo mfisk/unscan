@@ -11,7 +11,7 @@ gen-specimen.py          →  font-timeline-specimen.pdf          (vector, sourc
 rasterize.py rasterize   →  rasterized PDF from any vector PDF
 
 unscan --audit           →  audit.json + SSIM images
-       --audit-vector    →  ground-truth comparison + report.html
+       --test    →  ground-truth comparison + report.html
 ```
 
 1. **gen-specimen.py** builds a multi-page vector PDF using 30+ font families. It calls `rasterize.py` to rasterize.
@@ -48,7 +48,7 @@ python3 tools/rasterize.py prepare INPUT.pdf [-d output_dir] [--dpi 300] [--no-a
 ### Built-in miss report
 
 unscan generates a self-contained HTML miss report at `DIR/report.html` when
-both `--audit DIR` and `--audit-vector VECTOR.pdf` are set. No separate script
+both `--audit DIR` and `--test VECTOR.pdf` are set. No separate script
 needed.
 
 Ground-truth font identification uses `/Widths` and `Tw` (word spacing) read
@@ -90,7 +90,7 @@ python3 tools/rasterize.py rasterize original.pdf /tmp/rasterized.pdf
 # 2. Run unscan with audit + ground-truth comparison
 ./target/release/unscan /tmp/rasterized.pdf \
   -o /tmp/out.pdf --audit /tmp/audit \
-  --audit-vector original.pdf
+  --test original.pdf
 
 # Report at /tmp/audit/report.html
 ```
@@ -109,7 +109,7 @@ cargo build --release
 # Run unscan with audit
 ./target/release/unscan test-docs/font-timeline-specimen-scanned.pdf \
   -o /tmp/out.pdf --audit /tmp/audit \
-  --audit-vector test-docs/font-timeline-specimen.pdf
+  --test test-docs/font-timeline-specimen.pdf
 
 # Report at /tmp/audit/report.html
 ```
@@ -140,7 +140,7 @@ The `--audit` directory contains per-line SSIM comparison images:
 ```
 /tmp/audit/
   audit.json
-  report.html             # Visual miss report (when --audit-vector is set)
+  report.html             # Visual miss report (when --test is set)
   page_1/
     line_000/
       ssim_scan.png       # Scan crop (word-union bbox from OCR)

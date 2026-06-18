@@ -20,7 +20,7 @@ Use `cargo build --release` only for final accuracy runs where runtime performan
 cargo build --bin unscan                      # ~30s debug build
 ./target/debug/unscan test-docs/font-timeline-specimen-scanned.pdf \
     --audit /tmp/audit-out -o /tmp/out.pdf \
-    --audit-vector test-docs/font-timeline-specimen.pdf
+    --test test-docs/font-timeline-specimen.pdf
 # Report at /tmp/audit-out/report.html
 ```
 
