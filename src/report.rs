@@ -216,7 +216,6 @@ fn find_diag_seg_dir(audit_root: &Path, page: usize, line_index: usize) -> Optio
             }
         }
     }
-    eprintln!("[report] find_diag_seg_dir: no dir for prefix '{}' in {:?}", prefix, audit_root);
     None
 }
 
@@ -1846,13 +1845,6 @@ pub fn generate_report(
     }
     std::fs::write(report_path, &html)
         .map_err(|e| format!("Failed to write report: {e}"))?;
-
-    eprintln!(
-        "Report: {primary_hits}/{compared} ({pct:.1}%) — {n_major} major + {n_minor} minor misses{ssim_miss_str} → {}",
-        report_path.display(),
-        n_major = major_misses.len(),
-        n_minor = minor_misses.len(),
-    );
 
     Ok(())
 }

@@ -710,10 +710,6 @@ impl GroundTruth {
             pages.insert(*page_num as usize, spans);
         }
 
-        eprintln!("[ground_truth] loaded {} pages, {} total spans (PDF /Widths)",
-            page_count,
-            pages.values().map(|v| v.len()).sum::<usize>());
-
         Ok(GroundTruth { pages })
     }
 

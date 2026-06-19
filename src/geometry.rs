@@ -8,7 +8,6 @@
 
 use crate::color::Rgb;
 use image::DynamicImage;
-use log::debug;
 
 // ---------------------------------------------------------------------------
 // Types
@@ -151,11 +150,9 @@ pub fn detect_geometry(
     let mut all_lines = h_lines;
     all_lines.extend(v_lines);
 
-    debug!("  geometry: {} lines detected", all_lines.len());
 
     // ── Solid fills ──────────────────────────────────────────────────
     let fills = detect_fills(img, &text_mask, w, h);
-    debug!("  geometry: {} fills detected", fills.len());
 
     GeometryResult {
         lines: all_lines,

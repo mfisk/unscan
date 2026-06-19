@@ -286,7 +286,6 @@ impl TripletClassifier {
             nets.insert(ch, net);
         }
 
-        eprintln!("Loaded triplet weights: {} per-glyph models from {}", nets.len(), path.display());
         Ok(Self { nets })
     }
 
@@ -415,7 +414,6 @@ impl GlobalTripletClassifier {
             b3: read_vec(&mut pos, L3_OUT),
         };
 
-        eprintln!("Loaded global-triplet weights from {}", path.display());
         Ok(Self { net })
     }
 }
@@ -531,7 +529,6 @@ impl PerCharFisherClassifier {
             weights.insert(ch, w);
         }
 
-        eprintln!("Loaded per-char Fisher weights: {} characters from {}", weights.len(), path.display());
         Ok(Self { weights })
     }
 }
@@ -640,7 +637,6 @@ impl MahalanobisClassifier {
             transforms.insert(ch, linv);
         }
 
-        eprintln!("Loaded Mahalanobis weights: {} characters from {}", transforms.len(), path.display());
         Ok(Self { transforms })
     }
 
@@ -727,7 +723,6 @@ impl LdaClassifier {
             .map_err(|e| format!("read error on {}: {e}", path.display()))?;
 
         let result = Self::from_bytes(&data)?;
-        eprintln!("Loaded LDA weights from {}", path.display());
         Ok(result)
     }
 
@@ -771,7 +766,6 @@ impl LdaClassifier {
 
         let dims: Vec<usize> = projections.values().map(|(d, _)| *d).collect();
         let max_dim = dims.iter().max().copied().unwrap_or(0);
-        eprintln!("Loaded LDA weights: {} characters (max dim={})", projections.len(), max_dim);
         Ok(Self { projections })
     }
 
@@ -988,7 +982,6 @@ impl MlpClassifier {
             });
         }
 
-        eprintln!("Loaded MLP weights: {} characters", nets.len());
         Ok(Self { nets })
     }
 }

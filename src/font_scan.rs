@@ -18,7 +18,6 @@
 //! that produce at least one different glyph ID are emitted as variants.
 
 use ab_glyph::{Font, FontRef, PxScale, ScaleFont};
-use log::debug;
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use walkdir::WalkDir;
@@ -149,12 +148,10 @@ pub fn scan_fonts(dirs: &[PathBuf]) -> Vec<FontEntry> {
             }
             if let Some(fe) = load_font_entry(path, &aliases) {
                 let fig_label = if fe.oldstyle_figures { "OLDSTYLE" } else { "lining" };
-                debug!("  Font: {} [{}] [{}] {}", fe.family_name, class_label(fe.class), fig_label, fe.path.display());
 
                 // Detect ligature glyphs (liga + dlig)
                 let ligatures = detect_ligature_glyphs(&fe.data);
                 if !ligatures.is_empty() {
-                    debug!("    + {} ligature glyphs", ligatures.len());
                 }
 
                 // Probe all OT features — emit a variant entry for each that changes glyphs
@@ -179,7 +176,6 @@ pub fn scan_fonts(dirs: &[PathBuf]) -> Vec<FontEntry> {
                         variant_tag: tag.clone(),
                         glyph_overrides: Some(combined),
                     };
-                    debug!("    + variant [{}]: {} glyph overrides", tag, overrides.len());
                     fonts.push(var_entry);
                 }
                 // Drop font bytes — metadata + path is all we keep.

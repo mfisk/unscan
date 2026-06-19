@@ -11,7 +11,6 @@ use crate::font_match::FontMatchResult;
 use crate::geometry::{DetectedFill, DetectedLine};
 use lopdf::content::{Content, Operation};
 use lopdf::{dictionary, Document, Object, Stream};
-use log::debug;
 use std::collections::{HashMap, HashSet};
 use std::path::Path;
 
@@ -328,8 +327,6 @@ for tr in &page.text_regions {
             // Per-word placement: each word positioned at its OCR x-offset,
             // width-matched independently. This avoids em-dash / special char
             // width differences stealing space from regular letters.
-            log::debug!("pdf_out: '{}...' — {} words, font_match={}", 
-                &tr.text.chars().take(30).collect::<String>(), tr.words.len(), tr.font_match.is_some());
             if !tr.words.is_empty() && tr.font_match.is_some() {
                 let fm = tr.font_match.as_ref().unwrap();
                 let font_bytes = font_cache.load(&fm.font_path).ok();
@@ -534,13 +531,10 @@ fn embed_subsetted_font(
                     cid_map.insert(ch, new_gid);
                 }
             }
-            log::debug!("pdf_out: subsetted font {} → {} bytes ({} glyphs)",
-                font_data.len(), subsetted.len(), cid_map.len());
             (subsetted, cid_map)
         }
         Err(e) => {
             // Fallback: embed full font, use original GIDs as CIDs
-            log::warn!("pdf_out: font subsetting failed ({e}), embedding full font");
             let mut cid_map = HashMap::new();
             for &(ch, orig_gid) in &char_to_orig_gid {
                 cid_map.insert(ch, orig_gid);
@@ -736,40 +730,15 @@ fn embed_passthrough_image(
     match &info.filter {
         ImageFilter::DCTDecode => {
             dict.set("Filter", Object::Name(b"DCTDecode".to_vec()));
-            debug!(
-                "  embed_passthrough: JPEG pass-through {}×{} ({} bytes)",
-                info.width,
-                info.height,
-                info.stream_bytes.len()
-            );
         }
         ImageFilter::FlateDecode => {
             dict.set("Filter", Object::Name(b"FlateDecode".to_vec()));
-            debug!(
-                "  embed_passthrough: FlateDecode pass-through {}×{} ({} bytes)",
-                info.width,
-                info.height,
-                info.stream_bytes.len()
-            );
         }
         ImageFilter::None => {
             // No filter — raw bytes
-            debug!(
-                "  embed_passthrough: raw pass-through {}×{} ({} bytes)",
-                info.width,
-                info.height,
-                info.stream_bytes.len()
-            );
         }
         ImageFilter::Other(name) => {
             dict.set("Filter", Object::Name(name.as_bytes().to_vec()));
-            debug!(
-                "  embed_passthrough: {} pass-through {}×{} ({} bytes)",
-                name,
-                info.width,
-                info.height,
-                info.stream_bytes.len()
-            );
         }
     }
 
