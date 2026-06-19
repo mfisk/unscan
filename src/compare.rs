@@ -151,13 +151,6 @@ pub fn generate_comparison(
             std::io::Error::new(std::io::ErrorKind::Other, e.to_string())
         })?;
 
-        log::info!(
-            "  Compare: {} — '{}' ({} @ {:.3})",
-            fname,
-            text_preview,
-            fm.font_name,
-            fm.score,
-        );
 
         panels.push(panel);
         line_idx += 1;
@@ -180,13 +173,6 @@ pub fn generate_comparison(
         combined.save(&combined_path).map_err(|e| {
             std::io::Error::new(std::io::ErrorKind::Other, e.to_string())
         })?;
-        log::info!(
-            "  Compare strip: {} ({} lines, {}×{})",
-            combined_path.display(),
-            panels.len(),
-            target_width,
-            total_h,
-        );
     }
 
     Ok(())

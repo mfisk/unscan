@@ -2,7 +2,6 @@
 
 use crate::error::ScanTextError;
 use image::{DynamicImage, GrayImage};
-use log::{debug, info};
 use std::process::Command;
 
 /// A character-level bounding box from Tesseract HOCR output.
@@ -145,11 +144,9 @@ pub fn extract_text_regions(
     let char_boxes = if hocr_output.status.success() {
         parse_hocr(&String::from_utf8_lossy(&hocr_output.stdout))
     } else {
-        debug!("  HOCR pass failed, no character boxes");
         Vec::new()
     };
 
-    info!("  OCR: {} words, {} char boxes from HOCR", regions.len(), char_boxes.len());
 
     Ok((regions, char_boxes))
 }
@@ -217,11 +214,6 @@ pub fn merge_overlapping_lines(lines: &mut Vec<TextLine>) {
         while j < lines.len() {
             if lines_overlap(&lines[i], &lines[j]) {
                 // Merge line j into line i
-                debug!(
-                    "  merge overlapping lines: '{}' + '{}'",
-                    &lines[i].text.chars().take(40).collect::<String>(),
-                    &lines[j].text.chars().take(40).collect::<String>(),
-                );
                 let donor = lines.remove(j);
                 merge_line_into(&mut lines[i], donor);
                 merged_count += 1;
@@ -234,7 +226,6 @@ pub fn merge_overlapping_lines(lines: &mut Vec<TextLine>) {
     }
 
     if merged_count > 0 {
-        info!("  Merged {} overlapping line pair(s)", merged_count);
     }
 }
 
@@ -361,11 +352,6 @@ pub fn clip_word_overlaps(lines: &mut [TextLine]) {
             if a_right > b_left {
                 let new_width = b_left.saturating_sub(line.words[i].x);
                 if new_width > 0 {
-                    debug!(
-                        "  word overlap clip: '{}' width {}→{} (was overlapping '{}')",
-                        line.words[i].text, line.words[i].width, new_width,
-                        line.words[i + 1].text,
-                    );
                     line.words[i].width = new_width;
                     clipped += 1;
                 }
@@ -373,7 +359,6 @@ pub fn clip_word_overlaps(lines: &mut [TextLine]) {
         }
     }
     if clipped > 0 {
-        info!("  Clipped {} overlapping word bbox(es)", clipped);
     }
 }
 
@@ -410,10 +395,6 @@ pub fn drop_outlier_words(lines: &mut Vec<TextLine>) {
             let height_outlier = w.height as f64 >= median_h as f64 * 1.8;
             let low_conf = w.confidence < 70.0;
             if height_outlier && low_conf {
-                debug!(
-                    "  drop outlier word '{}' (h={}, median_h={}, conf={:.1})",
-                    w.text, w.height, median_h, w.confidence
-                );
                 false
             } else {
                 true
@@ -441,7 +422,6 @@ pub fn drop_outlier_words(lines: &mut Vec<TextLine>) {
         true
     });
     if dropped_total > 0 {
-        info!("  Dropped {} outlier word(s) (image artifacts)", dropped_total);
     }
 }
 
@@ -514,12 +494,6 @@ pub fn expand_bbox_to_ink(lines: &mut [TextLine], gray: &GrayImage, ink_threshol
 
         if vert_grew || horiz_grew {
             expanded_count += 1;
-            debug!(
-                "  bbox expand: '{}' x {}→{} y {}→{} w {}→{} h {}→{}",
-                &line.text.chars().take(40).collect::<String>(),
-                lx, line.x, search_top.max(ink_top), line.y,
-                lw, line.width, new_h.saturating_sub(new_h - line.height), line.height
-            );
         }
 
         // ── NOTE: word bboxes are NOT expanded here ────────────────
@@ -527,7 +501,6 @@ pub fn expand_bbox_to_ink(lines: &mut [TextLine], gray: &GrayImage, ink_threshol
     }
 
     if expanded_count > 0 {
-        info!("  Expanded {expanded_count}/{} line bboxes to ink extent", lines.len());
     }
 }
 
@@ -581,10 +554,6 @@ pub fn expand_words_to_ink(lines: &mut [TextLine], gray: &GrayImage, ink_thresho
                         }
                         if new_right > right_edge {
                             let growth = new_right - right_edge;
-                            debug!(
-                                "  word ink-expand right: '{}' width {}→{} (+{}px)",
-                                line.words[i].text, line.words[i].width, line.words[i].width + growth, growth
-                            );
                             line.words[i].width += growth;
                             changed = true;
                         }
@@ -637,11 +606,6 @@ pub fn expand_words_to_ink(lines: &mut [TextLine], gray: &GrayImage, ink_thresho
                     if shrink_to < prev_right {
                         let old_w = line.words[i - 1].width;
                         line.words[i - 1].width = shrink_to.saturating_sub(prev_x);
-                        debug!(
-                            "  word ink-shrink trailing: '{}' width {}→{} (freed {}px for '{}')",
-                            line.words[i - 1].text, old_w, line.words[i - 1].width,
-                            prev_right - shrink_to, line.words[i].text
-                        );
                         limit = shrink_to;
                     } else if left_edge <= prev_right {
                         // Phase 2: phase 1 found nothing (rightmost column
@@ -672,11 +636,6 @@ pub fn expand_words_to_ink(lines: &mut [TextLine], gray: &GrayImage, ink_thresho
                         if let Some(gc) = gap_col {
                             let old_w = line.words[i - 1].width;
                             line.words[i - 1].width = gc.saturating_sub(prev_x);
-                            debug!(
-                                "  word boundary rebalance: '{}' width {}→{} (freed {}px for '{}')",
-                                line.words[i - 1].text, old_w, line.words[i - 1].width,
-                                prev_right - gc, line.words[i].text
-                            );
                             limit = gc;
                         }
                     }
@@ -709,10 +668,6 @@ pub fn expand_words_to_ink(lines: &mut [TextLine], gray: &GrayImage, ink_thresho
                         }
                         if new_left < left_edge {
                             let growth = left_edge - new_left;
-                            debug!(
-                                "  word ink-expand left: '{}' x {}→{} (+{}px)",
-                                line.words[i].text, line.words[i].x, new_left, growth
-                            );
                             line.words[i].x = new_left;
                             line.words[i].width += growth;
                             changed = true;
@@ -763,10 +718,6 @@ pub fn expand_words_to_ink(lines: &mut [TextLine], gray: &GrayImage, ink_thresho
                     let old_h = line.words[i].height;
                     line.words[i].y = new_top;
                     line.words[i].height = new_bot - new_top;
-                    debug!(
-                        "  word ink-expand vert: '{}' y {}→{} h {}→{}",
-                        line.words[i].text, word_top, new_top, old_h, line.words[i].height
-                    );
                     changed = true;
                 }
             }
@@ -778,7 +729,6 @@ pub fn expand_words_to_ink(lines: &mut [TextLine], gray: &GrayImage, ink_thresho
     }
 
     if expanded > 0 {
-        info!("  Expanded {} word bbox(es) to ink (horiz+vert)", expanded);
     }
 }
 
@@ -803,7 +753,6 @@ pub fn split_wide_whitespace_words(
 ) {
     let (page_w, page_h) = gray.dimensions();
     let mut total_splits = 0u32;
-    let debug_gaps = std::env::var("UNSCAN_DEBUG_GAPS").is_ok();
 
     for (line_idx, line) in lines.iter_mut().enumerate() {
         let mut new_words: Vec<TextRegion> = Vec::new();
@@ -918,21 +867,9 @@ pub fn split_wide_whitespace_words(
                         let scale = ab_glyph::PxScale { x: s, y: s };
                         let expected = crate::char_index::font_pair_ink_gap(font, scale, chars[i], chars[i + 1]);
                         let threshold = expected.round() as u32 + 5;
-                        if debug_gaps {
-                            let word_text: String = chars.iter().collect();
-                            eprintln!("[gap-debug] '{}'→'{}' word=\"{}\" obs_ink={:.1} font_ink={:.1} scale={:.1} expected_gap={:.1} threshold={} scan_gap={} fallback={}",
-                                chars[i], chars[i+1], word_text, observed_ink_w, font_ink_w, s, expected, threshold, gap, fallback_min_gap);
-                        }
                         Some(threshold)
                     })
-                    .unwrap_or_else(|| {
-                        if debug_gaps {
-                            let word_text: String = chars.iter().collect();
-                            eprintln!("[gap-debug] '{}'→'{}' word=\"{}\" FALLBACK (no font metric) scan_gap={} fallback={}",
-                                chars[i], chars[i+1], word_text, gap, fallback_min_gap);
-                        }
-                        fallback_min_gap
-                    });
+                    .unwrap_or(fallback_min_gap);
 
                 if gap >= min_gap_for_pair {
                     wide_gap_indices.push(i);
@@ -1003,10 +940,6 @@ pub fn split_wide_whitespace_words(
             }
 
             total_splits += wide_gap_indices.len() as u32;
-            debug!(
-                "  split word '{}' into {} pieces at {} gap(s) (min_gap={}px, line_h={}px)",
-                word.text, groups.len(), wide_gap_indices.len(), fallback_min_gap, line_h
-            );
         }
 
         // Replace words and rebuild line text
@@ -1015,7 +948,6 @@ pub fn split_wide_whitespace_words(
     }
 
     if total_splits > 0 {
-        info!("split_wide_whitespace_words: {} splits across all lines", total_splits);
     }
 }
 
@@ -1084,10 +1016,6 @@ fn parse_tsv(tsv: &str, dpi: u32) -> Result<Vec<TextRegion>, ScanTextError> {
         let confidence: f32 = cols[10].parse().unwrap_or(0.0);
         let font_size_pt = height as f32 * 72.0 / dpi as f32;
 
-        debug!(
-            "  OCR word: '{}' at ({},{} {}x{}) conf={:.0} size={:.1}pt",
-            text, x, y, width, height, confidence, font_size_pt
-        );
 
         regions.push(TextRegion {
             text,

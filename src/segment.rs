@@ -48,13 +48,6 @@ fn seam_params() -> &'static SeamParams {
                 .and_then(|s| s.parse().ok()).unwrap_or(3u32),
             vert_row_ink_power: env_f32("SEAM_VERT_ROW_INK_POWER", 0.0),
         };
-        eprintln!("[seam params] ink_power={} ink_norm={} ink_row_wt={} ink_row_pow={} \
-delta_wt={} delta_pow={} delta_scale_pow={} delta_row_wt={} delta_row_pow={} \
-vert_run_disc={} vert_run_thresh={} vert_row_ink_pow={}",
-            p.ink_power, p.ink_norm, p.ink_row_weight, p.ink_row_power,
-            p.delta_weight, p.delta_power, p.delta_scale_power,
-            p.delta_row_weight, p.delta_row_power,
-            p.vert_run_discount, p.vert_run_threshold, p.vert_row_ink_power);
         p
     })
 }
@@ -146,9 +139,6 @@ fn segment_characters_inner(
     diag_dir: Option<&std::path::Path>,
     word_text: Option<&str>,
 ) -> (Vec<u32>, HashMap<u32, Vec<u32>>) {
-    if word_text.map_or(false, |w| w.starts_with("abcdefg")) {
-        eprintln!("  SEGINNER ENTRY: n_chars={} diag={} wtext={:?}", n_chars, diag_dir.is_some(), word_text);
-    }
     let (w, h) = img.dimensions();
     if n_chars <= 1 {
         return (vec![0, w], HashMap::new());
@@ -321,10 +311,7 @@ fn segment_characters_inner(
     if let (Some(ddir), Some(wtext)) = (diag_dir, word_text) {
         let _ = std::fs::create_dir_all(ddir);
         let _ = img.save(ddir.join("word_crop.png"));
-        eprintln!(
-            "  DIAG-SEG VP: \"{}\" {}x{} — {} vp splits, need {} total",
-            &wtext.chars().take(30).collect::<String>(), w, h, vp_splits.len(), need,
-        );
+
     }
 
     // --- Pass 2: greedy seam carving ---
@@ -461,12 +448,6 @@ fn segment_characters_inner(
             if ink_r > ink_l + 2 {
                 let sid = next_seg_id; next_seg_id += 1;
                 let (cands, dp, vert_wins) = candidate_seams(&energy, ink_l, ink_r, h, None, None, max_ink, &row_ink);
-                if word_text.map_or(false, |w| w.starts_with("tradition")) {
-                    eprintln!("  SEED seg=[{},{}) ink=[{},{}) {} candidates sid={}", seg_start, seg_end, ink_l, ink_r, cands.len(), sid);
-                    for (col, cost) in &cands {
-                        eprintln!("    candidate col={} cost={:.1}", col, cost);
-                    }
-                }
                 for (col, cost) in &cands {
                     let is_vert = vert_wins.contains(col);
                     heap.push(SeamEntry { cost: *cost, col: *col, seg_start: ink_l, seg_end: ink_r, seg_id: sid, is_vertical: is_vert });
@@ -478,8 +459,6 @@ fn segment_characters_inner(
                 }
                 seg_bounds.insert(sid, SegBounds { left_path: None, right_path: None });
                 dp_cache.insert(sid, dp);
-            } else if word_text.map_or(false, |w| w.starts_with("tradition")) {
-                eprintln!("  SKIP NARROW seg=[{},{}) ink=[{},{})", seg_start, seg_end, ink_l, ink_r);
             }
         }
 
@@ -502,13 +481,8 @@ fn segment_characters_inner(
                 continue;
             }
 
-            if word_text.map_or(false, |w| w.starts_with("tradition") || w.starts_with("abcdefg")) {
-                eprintln!("  SEAM POP [{}]: col={} cost={:.1} seg=[{},{}) sid={} | accepted={:?}", word_text.unwrap_or("?"), entry.col, entry.cost, entry.seg_start, entry.seg_end, entry.seg_id, &splits);
-            }
-
             // Skip if this exact split column was already accepted.
             if splits.contains(&entry.col) {
-                if word_text.map_or(false, |w| w.starts_with("tradition")) { eprintln!("    SKIP DUP col={}", entry.col); }
                 seam_greedy_log.push(serde_json::json!({
                     "action": "skip_dup", "col": entry.col, "cost": entry.cost as f64,
                     "seg": [entry.seg_start, entry.seg_end], "sid": entry.seg_id,
@@ -523,7 +497,6 @@ fn segment_characters_inner(
             let right_ok = right_ink.1 > right_ink.0 + 2;
 
             if !left_ok || !right_ok {
-                if word_text.map_or(false, |w| w.starts_with("tradition")) { eprintln!("    SKIP INK col={} left_ok={} right_ok={}", entry.col, left_ok, right_ok); }
                 seam_greedy_log.push(serde_json::json!({
                     "action": "skip_ink", "col": entry.col, "cost": entry.cost as f64,
                     "seg": [entry.seg_start, entry.seg_end], "sid": entry.seg_id,
@@ -607,7 +580,6 @@ fn segment_characters_inner(
                 }
             }
             if seam_ink_left < min_ink_for_symbol || seam_ink_right < min_ink_for_symbol {
-                if word_text.map_or(false, |w| w.starts_with("tradition")) { eprintln!("    SKIP MIN_INK col={} left={} right={} min={}", entry.col, seam_ink_left, seam_ink_right, min_ink_for_symbol); }
                 seam_greedy_log.push(serde_json::json!({
                     "action": "skip_min_ink", "col": entry.col, "cost": entry.cost as f64,
                     "seg": [entry.seg_start, entry.seg_end], "sid": entry.seg_id,
@@ -687,10 +659,6 @@ fn segment_characters_inner(
     if let Some(ddir) = diag_dir {
         let vp_mids: Vec<u32> = vp_splits.clone();
         crate::seg_diag::save_split_overlay_with_paths(img, &vp_mids, &seam_splits, &[], &seam_paths, &ddir.join("seam_overlay.png"));
-        eprintln!(
-            "  DIAG-SEG SEAM: {} seam splits added (total now {})",
-            seam_splits.len(), splits.len(),
-        );
     }
 
     // Build final boundaries: [0, split1, split2, ..., w]
@@ -714,13 +682,6 @@ fn segment_characters_inner(
         // (the actual CI code path), not here — so diag shows exact CI inputs.
 
         let n_segs = bounds.len().saturating_sub(1);
-        eprintln!(
-            "  DIAG-SEG FINAL: {} total splits, {} boundaries, {} segments (expected {})",
-            splits.len(), bounds.len(), n_segs, n_chars,
-        );
-        if n_segs != n_chars {
-            eprintln!("  *** MISMATCH: {} segments vs {} expected chars", n_segs, n_chars);
-        }
 
         // Write summary JSON
         let summary = serde_json::json!({

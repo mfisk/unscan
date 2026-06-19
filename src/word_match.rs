@@ -9,7 +9,6 @@
 
 use ab_glyph::{Font, FontRef};
 use image::GrayImage;
-use log::debug;
 use std::collections::HashMap;
 
 use crate::audit;
@@ -241,13 +240,6 @@ pub fn word_level_rerank(
             })
         })
         .map(|(&f, &v)| {
-            debug!(
-                "  word rerank: winner='{}' with {}/{} votes ({} candidates)",
-                f,
-                v,
-                total_words,
-                parsed.len()
-            );
             f.to_string()
         });
 

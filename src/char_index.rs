@@ -2254,22 +2254,8 @@ pub fn search_candidates(
         }
     }
     if backfill_count > 0 {
-        eprintln!("  CI: backfilled {} real distances for out-of-radius candidates", backfill_count);
     }
 
-    eprintln!(
-        "  CI: {} crops, {} pass gate, {} fail gate, {} no_tree → {} fonts in voting [feat={:.1}ms search={:.1}ms (brute={:.1}ms alt={:.1}ms) backfill={}]",
-        crop_feats.len(),
-        quality_gate_pass,
-        quality_gate_fail,
-        no_tree,
-        font_log_dists.len(),
-        feat_us as f64 / 1000.0,
-        search_us as f64 / 1000.0,
-        brute_us as f64 / 1000.0,
-        alt_us as f64 / 1000.0,
-        backfill_count,
-    );
 
     // Aggregate: weighted geometric mean of distances per font.
     //
@@ -2405,7 +2391,6 @@ pub fn search_candidates(
                 .filter(|(i, _)| !drop_indices.contains(i))
                 .map(|(_, v)| v)
                 .collect();
-            eprintln!("  CI: Noto family dedup {before} → {} fonts", scores.len());
         }
     }
 
@@ -2432,10 +2417,6 @@ pub fn search_candidates(
         let cutoff = best - k * sigma;
         let before = scores.len();
         scores.retain(|(_, s)| *s >= cutoff);
-        eprintln!(
-            "  CI sigma cutoff: best={:.3} top50_σ={:.3} cutoff={:.3} → {} of {} kept",
-            best, sigma, cutoff, scores.len(), before,
-        );
     }
 
     // Guarantee at least 1 result: if quorum dropped everything, return the

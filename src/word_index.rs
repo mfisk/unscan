@@ -15,7 +15,6 @@ use std::collections::HashMap;
 
 use ab_glyph::{Font, FontRef};
 use image::GrayImage;
-use log::{debug, info};
 
 use crate::font_scan::FontEntry;
 
@@ -121,7 +120,6 @@ pub fn build_word_index(
         .copied()
         .collect();
 
-    info!("Building word index: {} words × {} fonts", words_set.len(), font_catalog.len());
 
     let mut entries: HashMap<String, Vec<(usize, [f32; WORD_FEAT_LEN])>> = HashMap::new();
     let mut font_names: Vec<String> = Vec::with_capacity(font_catalog.len());
@@ -152,7 +150,6 @@ pub fn build_word_index(
     }
 
     let total: usize = entries.values().map(|v| v.len()).sum();
-    info!("Word index built: {} word keys, {} total entries", entries.len(), total);
 
     WordIndex { entries, font_names }
 }
@@ -219,10 +216,6 @@ pub fn search_word_index(
         }
     }
 
-    eprintln!(
-        "  WI: {} queryable words, quorum={}, {} fonts in voting",
-        crop_feats.len(), quorum, font_log_dists.len(),
-    );
 
     // Aggregate: geometric mean of distances (same as char_index)
     let mut scores: Vec<(String, f32)> = font_log_dists
@@ -251,10 +244,6 @@ pub fn search_word_index(
         let cutoff = best - 0.5 * sigma;
         let before = scores.len();
         scores.retain(|(_, s)| *s >= cutoff);
-        eprintln!(
-            "  WI sigma cutoff: best={:.3} σ={:.3} cutoff={:.3} → {} of {} kept",
-            best, sigma, cutoff, scores.len(), before,
-        );
     }
 
     scores
