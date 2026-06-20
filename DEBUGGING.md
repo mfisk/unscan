@@ -2,6 +2,118 @@
 
 How to diagnose and fix font identification errors in unscan.
 
+## Font Name Ambiguity and Canonical Lookup
+
+PostScript names like `Lato-Italic` are ambiguous — is it weight 400 or 500?
+Both `Lato-Italic` (400) and `Lato-MediumItalic` (500) exist and are nearly
+indistinguishable at SSIM resolution. Multiple families have this problem:
+Roboto, IBM Plex, Noto Serif, Open Sans, Source Serif 4 all have weight-400
+variants with close siblings within 100 weight units.
+
+The solution is **one canonical font lookup implementation** that resolves a
+font name to a specific (file, variant, size) — used everywhere we need to
+go from a name to actual font data. The Rust font scanner, the specimen
+generator (gen-specimen.py), and the ground-truth reader (ground_truth.rs)
+all use this same lookup. The function `make_weight_explicit(ps_name, weight)`
+is the core of this: it produces a name with a numeric weight
+(e.g. `Lato-400Italic`, `EBGaramond-700`, `SourceSerif4-400It`) that
+unambiguously identifies the font.
+
+Font name comparison must use exact equality (`==`), never fuzzy matching.
+If names don't match, fix the lookup or the naming — don't fuzz the
+comparison. The lookup function is the single authority for resolving
+ambiguity; no downstream code should re-derive or normalize names on its own.
+
+### `/UnprintCanonical` PDF Annotation
+
+The raw `/BaseFont` in a PDF font dictionary is whatever the font file's
+nameID 6 says — not unique, not weight-explicit, not safe to compare across
+tools. Two different font files can share the same nameID 6 (e.g., a static
+and a variable font for the same family). ReportLab writes nameID 6 as
+`/BaseFont` after subsetting, so the PDF carries the raw name, not ours.
+
+Specimen PDFs solve this by carrying the canonical name directly in each
+font dictionary as a custom `/UnprintCanonical` key:
+
+```
+<< /Type /Font /Subtype /TrueType /BaseFont /AAAAAA+Lato-Italic
+   /UnprintCanonical (Lato-400Italic) >>
+```
+
+#### How it works (gen-specimen.py → ground_truth.rs)
+
+1. **Font registration** (`register_all_fonts()` in gen-specimen.py):
+   For each font file, call `make_weight_explicit(raw_ps, weight)` via
+   `unscan --weight-explicit`. This returns the canonical name. Build
+   `canonical_map: dict[str, str]` mapping raw PS name → canonical name.
+   Include PDF base14 fonts (Times-Roman, Helvetica, Courier, etc.) — these
+   are already unambiguous and map to themselves.
+
+2. **PDF generation**: Register fonts with ReportLab under the canonical
+   name. ReportLab writes its own `/BaseFont` (raw nameID 6 + subset prefix).
+   Fonts go to ReportLab untouched — no font file mutation.
+
+3. **Post-processing** (`annotate_canonical_names()` in gen-specimen.py):
+   After `doc.build()`, open the PDF with pikepdf. Walk every page's
+   `Resources → Font → {resource_name} → font_dict`. For each font dict:
+   - Read `/BaseFont`, strip subset prefix (6 uppercase chars + `+`).
+   - Look up the raw name in `canonical_map`.
+   - Write `/UnprintCanonical` as a PDF String on the font dict object.
+   - If any font dict has no mapping, warn — this is a verification failure.
+
+4. **GT reading** (`resolve_font_name()` in ground_truth.rs):
+   Walk the same `Resources → Font → resource_name → font_dict` path.
+   Check for `/UnprintCanonical` first — if present, return it (handles
+   both `Name` and `String` PDF objects, plus indirect references).
+   Fall back to `/BaseFont` only for unannotated (wild) PDFs.
+
+5. **Canonicalization** (`canonicalize_names()` in ground_truth.rs):
+   For each span after GT loading, strip subset prefix, then:
+   - If the name already matches a catalog `postscript_name` → keep it
+     (annotated PDF path — already canonical).
+   - Else look up by `raw_postscript_name` → use canonical `postscript_name`
+     (wild PDF path).
+   - Else leave as-is (unknown font — will correctly miss).
+
+6. **Comparison**: Exact `==` everywhere. No fuzzy matching, no normalization.
+
+#### Why this works for both static and variable fonts
+
+The annotation is computed at generation time when we know the exact font
+file and its OS/2 weight. A static `SourceSerif4-It.ttf` (weight 400) gets
+`/UnprintCanonical (SourceSerif4-400It)`. A variable font instantiated at
+weight 700 would get its own annotation based on its nameID 6 + 700. Each
+font dictionary is annotated independently — no `/BaseFont` uniqueness
+assumption, no global mapping table that could collide.
+
+#### Reproducing from scratch
+
+```bash
+# 1. Build unscan with make_weight_explicit support
+cargo build --release
+
+# 2. Generate specimen PDF (registers fonts, builds PDF, annotates)
+cd test-docs && python3 gen-specimen.py
+
+# 3. Verify annotations exist
+python3 -c "
+import pikepdf
+pdf = pikepdf.open('font-timeline-specimen.pdf')
+for page in pdf.pages:
+    for name in page.get('/Resources',{}).get('/Font',{}).keys():
+        fd = page['/Resources']['/Font'][name]
+        bf = str(fd.get('/BaseFont','')).lstrip('/')
+        uc = fd.get('/UnprintCanonical')
+        print(f'{name}: BaseFont={bf}  UnprintCanonical={uc}')
+pdf.close()
+"
+
+# 4. Run audit — GT reader will use /UnprintCanonical automatically
+./target/release/unscan font-timeline-specimen-rasterized.pdf \
+    --audit /tmp/audit --test font-timeline-specimen.pdf
+```
+
+
 ## Pipeline Stages
 
 **Critical invariant:** Index build and scan lookup must produce identical

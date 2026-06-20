@@ -13,7 +13,7 @@ mod common;
 use common::{test_doc, ensure_index};
 
 /// 1-bit is the hardest condition — expect lower accuracy than 8-bit no-AA.
-const MIN_ACCURACY: f64 = 0.70;
+const MIN_ACCURACY: f64 = 0.86;
 
 #[test]
 fn specimen_font_accuracy_1bit() {

@@ -319,6 +319,18 @@ def register_all_fonts():
 
     registered = {}
     alias_map = {}  # base_name -> ps_name (for regular), base_name-Bold -> ps_bold, etc.
+    canonical_map = {}  # raw PS name (nameID 6) → canonical (weight-explicit) PS name
+
+    # ReportLab base14 fonts: these may appear as default Tf state even when
+    # all visible text uses our registered fonts.  Add them to canonical_map
+    # so every font dict in the PDF gets annotated.
+    for base14 in [
+        "Times-Roman", "Times-Bold", "Times-Italic", "Times-BoldItalic",
+        "Helvetica", "Helvetica-Bold", "Helvetica-Oblique", "Helvetica-BoldOblique",
+        "Courier", "Courier-Bold", "Courier-Oblique", "Courier-BoldOblique",
+        "Symbol", "ZapfDingbats",
+    ]:
+        canonical_map[base14] = base14  # base14 names are already unambiguous
 
     for base, family in FAMILIES.items():
         reg = fc_find(family, "Regular")
@@ -348,11 +360,19 @@ def register_all_fonts():
             italic = reg
 
         # Always make weight explicit in PostScript names.
-        # E.g. "Lato-Italic" (w400) → "Lato-RegularItalic"
+        # E.g. "Lato-Italic" (w400) → "Lato-400Italic"
         # The Rust font catalog does the same transformation so both sides agree.
-        _, ps_reg, reg = make_weight_explicit(reg)
-        _, ps_bold, bold = make_weight_explicit(bold)
-        _, ps_italic, italic = make_weight_explicit(italic)
+        orig_reg, ps_reg, reg = make_weight_explicit(reg)
+        orig_bold, ps_bold, bold = make_weight_explicit(bold)
+        orig_italic, ps_italic, italic = make_weight_explicit(italic)
+
+        # Track raw → canonical mapping for PDF annotation.
+        if orig_reg and ps_reg:
+            canonical_map[orig_reg] = ps_reg
+        if orig_bold and ps_bold:
+            canonical_map[orig_bold] = ps_bold
+        if orig_italic and ps_italic:
+            canonical_map[orig_italic] = ps_italic
 
         ok = register_font(ps_reg, reg)
         if ok:
@@ -378,7 +398,7 @@ def register_all_fonts():
             addMapping(ps_reg, 0, 1, alias_map.get(f"{base}-Italic", ps_reg))
             addMapping(ps_reg, 1, 1, alias_map.get(f"{base}-Bold", ps_reg))
 
-    return registered, alias_map
+    return registered, alias_map, canonical_map
 
 
 
@@ -1111,6 +1131,57 @@ def build_specimen(out_pdf, registered, alias_map):
     return out_pdf
 
 
+def annotate_canonical_names(pdf_path, canonical_map):
+    """Post-process a PDF: add /UnprintCanonical to every font dictionary.
+
+    For each font dictionary in the PDF, reads /BaseFont (stripping subset
+    prefix), looks it up in canonical_map, and writes /UnprintCanonical with
+    the canonical (weight-explicit) name.
+
+    Returns the number of fonts annotated and a list of any BaseFont names
+    that were NOT found in canonical_map (verification failures).
+    """
+    import pikepdf
+
+    pdf = pikepdf.open(pdf_path, allow_overwriting_input=True)
+    annotated = 0
+    missing = []
+
+    for page in pdf.pages:
+        resources = page.get("/Resources")
+        if resources is None:
+            continue
+        fonts = resources.get("/Font")
+        if fonts is None:
+            continue
+        for res_name in list(fonts.keys()):
+            font_dict = fonts[res_name]
+            if isinstance(font_dict, pikepdf.Object) and hasattr(font_dict, 'get'):
+                pass
+            else:
+                continue
+            base_font = font_dict.get("/BaseFont")
+            if base_font is None:
+                continue
+            bf_str = str(base_font).lstrip("/")
+            # Strip subset prefix (e.g. "AAAAAA+Lato-Italic" → "Lato-Italic")
+            if len(bf_str) > 7 and bf_str[6] == '+':
+                raw_ps = bf_str[7:]
+            else:
+                raw_ps = bf_str
+            canonical = canonical_map.get(raw_ps)
+            if canonical:
+                font_dict[pikepdf.Name("/UnprintCanonical")] = pikepdf.String(canonical)
+                annotated += 1
+            else:
+                if raw_ps not in missing:
+                    missing.append(raw_ps)
+
+    pdf.save(pdf_path)
+    pdf.close()
+    return annotated, missing
+
+
 # ---------------------------------------------------------------------------
 # Rasterization + fontmap — all logic lives in tools/rasterize.py.
 # gen-specimen.py only builds the vector PDF; rasterize.py does the rest.
@@ -1122,12 +1193,22 @@ _rasterize_mod = _imp("rasterize")
 
 def main():
     print("Registering fonts...")
-    registered, alias_map = register_all_fonts()
+    registered, alias_map, canonical_map = register_all_fonts()
     print(f"  {len(registered)} font families registered")
+    print(f"  {len(canonical_map)} raw→canonical mappings")
 
     out_pdf = OUT_DIR / "font-timeline-specimen.pdf"
     print(f"Building vector specimen: {out_pdf}")
     build_specimen(out_pdf, registered, alias_map)
+
+    # Annotate font dictionaries with /UnprintCanonical
+    print("Annotating PDF with canonical font names...")
+    annotated, missing = annotate_canonical_names(str(out_pdf), canonical_map)
+    print(f"  {annotated} font dicts annotated")
+    if missing:
+        print(f"  WARNING: {len(missing)} BaseFont names not in canonical_map:")
+        for m in missing:
+            print(f"    {m}")
 
     # Rasterize
     scanned_pdf = OUT_DIR / "font-timeline-specimen-scanned.pdf"

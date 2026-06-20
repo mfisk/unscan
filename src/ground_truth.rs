@@ -214,8 +214,9 @@ fn font_style_flags(name: &str) -> (bool, bool) {
 }
 
 /// Strict font matching: same family AND same style (italic/bold) AND same variant tag.
-/// Use for accuracy reporting where SourceSerif4-Black ≠ SourceSerif4-It
-/// and Arial-BoldMT ≠ Arial-BoldMT|hist.
+/// DEPRECATED: use exact == comparison after canonicalize_names() instead.
+/// Kept temporarily for reference during migration to canonical lookup.
+#[allow(dead_code)]
 pub fn fonts_match_strict(matched: &str, actual: &str) -> bool {
     // Split off variant tags: "FontName|hist" or "FontName [hist]"
     let (matched_base, matched_var) = split_variant(matched);
@@ -379,9 +380,11 @@ fn text_width_estimate(operands: &[lopdf::Object], font_size: f32, ctm_x_scale: 
 
 // ── PDF parsing ─────────────────────────────────────────────────────────────
 
-/// Resolve the /BaseFont name for a font resource name on a given page.
+/// Resolve the canonical font name for a font resource on a given page.
+/// Prefers /UnprintCanonical (our annotation with the unambiguous canonical
+/// name) over /BaseFont (raw PS name from the font file).
 fn resolve_font_name(doc: &Document, page_id: lopdf::ObjectId, resource_name: &[u8]) -> Option<String> {
-    // Walk the page's Resources → Font → resource_name → BaseFont
+    // Walk the page's Resources → Font → resource_name → font dict
     let page_dict = doc.get_dictionary(page_id).ok()?;
 
     // Get Resources dict (may be direct or indirect)
@@ -405,7 +408,30 @@ fn resolve_font_name(doc: &Document, page_id: lopdf::ObjectId, resource_name: &[
     }?;
     let font_dict = font_obj.as_dict().ok()?;
 
-    // Get BaseFont name
+    // Prefer /UnprintCanonical — our annotation with the unambiguous name.
+    if let Ok(canonical) = font_dict.get(b"UnprintCanonical") {
+        let name = match canonical {
+            lopdf::Object::String(bytes, _) => Some(String::from_utf8_lossy(bytes).to_string()),
+            lopdf::Object::Name(bytes) => Some(String::from_utf8_lossy(bytes).to_string()),
+            lopdf::Object::Reference(_) => {
+                if let Ok((_, obj)) = doc.dereference(canonical) {
+                    match obj {
+                        lopdf::Object::String(bytes, _) => Some(String::from_utf8_lossy(bytes).to_string()),
+                        lopdf::Object::Name(bytes) => Some(String::from_utf8_lossy(bytes).to_string()),
+                        _ => None,
+                    }
+                } else {
+                    None
+                }
+            }
+            _ => None,
+        };
+        if let Some(n) = name {
+            return Some(n);
+        }
+    }
+
+    // Fall back to /BaseFont (raw PS name).
     let base_font = font_dict.get(b"BaseFont").ok()?;
     match base_font {
         lopdf::Object::Name(name) => Some(String::from_utf8_lossy(name).to_string()),
@@ -713,6 +739,29 @@ impl GroundTruth {
         Ok(GroundTruth { pages })
     }
 
+    /// Rewrite all span font names from raw PDF BaseFont to canonical names.
+    /// For each span, strips the subset prefix, finds the matching catalog
+    /// entry by raw_postscript_name, and replaces with the canonical
+    /// (weight-explicit) postscript_name.  Names that don't match any catalog
+    /// entry are left as-is (with subset prefix stripped).
+    pub fn canonicalize_names(&mut self, catalog: &[crate::font_scan::FontEntry]) {
+        for spans in self.pages.values_mut() {
+            for span in spans.iter_mut() {
+                let raw = strip_subset_prefix(&span.font_name).to_string();
+                // If the name already matches a canonical postscript_name
+                // (e.g., from /UnprintCanonical in an annotated PDF), keep it.
+                if catalog.iter().any(|fe| fe.postscript_name == raw) {
+                    span.font_name = raw;
+                } else if let Some(fe) = catalog.iter().find(|fe| fe.raw_postscript_name == raw) {
+                    // Wild PDF: map raw PS name → canonical via catalog.
+                    span.font_name = fe.postscript_name.clone();
+                } else {
+                    span.font_name = raw;
+                }
+            }
+        }
+    }
+
     /// Look up the ground-truth font for a given audit bbox (in pixels at the
     /// given DPI).  Returns the font name of the best-overlapping span, or None
     /// if no span overlaps.
@@ -785,11 +834,9 @@ impl GroundTruth {
     pub fn is_hit(&self, page: usize, bbox_px: &[f32; 4], dpi: u32, matched_ps: &str) -> bool {
         match self.lookup_font(page, bbox_px, dpi) {
             Some(actual) => {
-                let actual_stripped = strip_subset_prefix_str(actual);
-                // Use fonts_match_strict: the catalog PS name has weight-explicit
-                // suffixes (e.g. ArialMT-Regular) while the PDF BaseFont is the
-                // raw PS name (ArialMT).  Exact == would always mismatch.
-                fonts_match_strict(matched_ps, &actual_stripped)
+                // After canonicalize_names(), span font names are already
+                // canonical (weight-explicit).  Exact equality is correct.
+                matched_ps == actual
             }
             None => true, // no ground truth available → assume hit (don't penalize)
         }

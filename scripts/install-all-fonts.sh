@@ -47,6 +47,9 @@ GF_PATHS=(
   ofl/notoserif/NotoSerif[wdth,wght].ttf
   ofl/ptserif/PT_Serif-Web-Regular.ttf
   ofl/ptserif/PT_Serif-Web-Italic.ttf
+  ofl/ptserif/PT_Serif-Web-Bold.ttf
+  ofl/ptsans/PT_Sans-Web-Regular.ttf
+  ofl/ptsans/PT_Sans-Web-Bold.ttf
   ofl/sourceserif4/SourceSerif4[opsz,wght].ttf
   ofl/sourceserif4/SourceSerif4-Italic[opsz,wght].ttf
   apache/specialelite/SpecialElite-Regular.ttf

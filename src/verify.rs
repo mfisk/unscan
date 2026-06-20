@@ -9,6 +9,47 @@ use image::{GrayImage, Luma};
 use crate::ocr::TextRegion;
 
 // ---------------------------------------------------------------------------
+// FreeType variable-font axis coordination helper
+// ---------------------------------------------------------------------------
+
+/// Apply variable-font design coordinates to a FreeType face.
+///
+/// Reads the fvar axis order from the raw font data (via ttf_parser) and maps
+/// the provided tag→value pairs to `FT_Set_Var_Design_Coordinates`.
+fn set_ft_variations<B>(ft_face: &freetype::Face<B>, font_data: &[u8], vars: &[([u8; 4], f32)]) {
+    use rustybuzz::ttf_parser;
+
+    let parsed = match ttf_parser::Face::parse(font_data, 0) {
+        Ok(f) => f,
+        Err(_) => return,
+    };
+
+    // Get the axis list in fvar order
+    let axes: Vec<ttf_parser::VariationAxis> = parsed.variation_axes().into_iter().collect();
+    if axes.is_empty() { return; }
+
+    // Build coordinate array: each axis gets its value from vars, or its default
+    let coords: Vec<i64> = axes.iter().map(|ax| {
+        let val = vars.iter()
+            .find(|(tag, _)| *tag == ax.tag.to_bytes())
+            .map(|(_, v)| *v)
+            .unwrap_or(ax.def_value);
+        // FT_Fixed is 16.16 fixed-point
+        (val as f64 * 65536.0).round() as i64
+    }).collect();
+
+    // Call FT_Set_Var_Design_Coordinates via raw FFI
+    let raw_face: freetype::freetype_sys::FT_Face = ft_face.raw() as *const _ as *mut _;
+    unsafe {
+        freetype::freetype_sys::FT_Set_Var_Design_Coordinates(
+            raw_face,
+            coords.len() as u32,
+            coords.as_ptr() as *const freetype::freetype_sys::FT_Fixed,
+        );
+    }
+}
+
+// ---------------------------------------------------------------------------
 // Public API
 // ---------------------------------------------------------------------------
 
@@ -37,6 +78,7 @@ pub fn verify_text_region(
     words: &[TextRegion],
     overrides: Option<&[(char, u16)]>,
     variant_tag: &str,
+    variations: Option<&[([u8; 4], f32)]>,
     audit_dir: Option<&std::path::Path>,
     bail_below: Option<f32>,
 ) -> (f32, i32) {
@@ -85,7 +127,7 @@ pub fn verify_text_region(
 
     for &scale in &scales {
         // Render into the full line bbox canvas (word placements are relative to it)
-        let full_render = match render_via_freetype_scaled(font_data, &placements, w, h, scale, overrides, variant_tag) {
+        let full_render = match render_via_freetype_scaled(font_data, &placements, w, h, scale, overrides, variant_tag, variations) {
             Some(r) => r,
             None => continue,
         };
@@ -190,12 +232,13 @@ fn render_via_freetype_scaled(
     render_scale: u32,
     _overrides: Option<&[(char, u16)]>,
     variant_tag: &str,
+    variations: Option<&[([u8; 4], f32)]>,
 ) -> Option<GrayImage> {
     // NOTE: ab_glyph fallback disabled.  width_matched_em_px (ab_glyph) does
     // not compensate for sidebearings, so it systematically underestimates font
     // size (~3% too small).  The shaped path (rustybuzz + FreeType) handles
     // sidebearing correction and should be the only render path.
-    render_via_freetype(font_data, words, canvas_w, canvas_h, render_scale, variant_tag)
+    render_via_freetype(font_data, words, canvas_w, canvas_h, render_scale, variant_tag, variations)
 }
 
 /// Render text using rustybuzz (OT shaping) + FreeType (rasterisation).
@@ -207,6 +250,7 @@ fn render_via_freetype(
     canvas_h: u32,
     render_scale: u32,
     variant_tag: &str,
+    variations: Option<&[([u8; 4], f32)]>,
 ) -> Option<GrayImage> {
     use std::cell::RefCell;
 
@@ -218,11 +262,18 @@ fn render_via_freetype(
     // Compute per-word em_px using rustybuzz (shaped advances with
     // sidebearing correction).  No ab_glyph fallback — it lacks sidebearing
     // compensation and systematically underestimates font size by ~3%.
-    let font_ref = FontRef::try_from_slice(font_data).ok()?;
+    let mut font_ref = FontRef::try_from_slice(font_data).ok()?;
+    // Apply variable-font axis coordinates
+    if let Some(vars) = variations {
+        use ab_glyph::VariableFont;
+        for (tag, val) in vars {
+            font_ref.set_variation(tag, *val);
+        }
+    }
     let mut all_em: Vec<f32> = words.iter()
         .filter(|w| !w.text.is_empty() && w.width >= 1)
         .filter_map(|w| {
-            crate::layout::width_matched_em_px_shaped(font_data, &w.text, w.width as f32, variant_tag)
+            crate::layout::width_matched_em_px_shaped(font_data, &w.text, w.width as f32, variant_tag, variations)
         })
         .collect();
     if all_em.is_empty() {
@@ -251,8 +302,19 @@ fn render_via_freetype(
         let size_26_6 = (render_em as f64 * 64.0) as isize;
         ft_face.set_char_size(size_26_6, size_26_6, 72, 72).ok()?;
 
+        // Apply variable-font axis coordinates to FreeType face
+        if let Some(vars) = variations {
+            set_ft_variations(&ft_face, font_data, vars);
+        }
+
     // Set up rustybuzz for shaping
-    let buzz_face = rustybuzz::Face::from_slice(font_data, 0)?;
+    let mut buzz_face = rustybuzz::Face::from_slice(font_data, 0)?;
+    if let Some(vars) = variations {
+        for (tag, val) in vars {
+            let t = rustybuzz::ttf_parser::Tag::from_bytes(tag);
+            buzz_face.set_variation(t, *val);
+        }
+    }
     let ot_features = crate::layout::ot_features(variant_tag);
     let units_per_em = buzz_face.units_per_em() as f64;
     let px_per_unit = render_em as f64 / units_per_em;
@@ -469,9 +531,10 @@ pub fn render_line_for_comparison(
     canvas_h: u32,
     overrides: Option<&[(char, u16)]>,
     variant_tag: &str,
+    variations: Option<&[([u8; 4], f32)]>,
 ) -> Option<GrayImage> {
     let rendered = render_via_freetype_scaled(
-        font_data, words, canvas_w, canvas_h, 2, overrides, variant_tag,
+        font_data, words, canvas_w, canvas_h, 2, overrides, variant_tag, variations,
     )?;
 
     // Ink-crop vertically for clean display

@@ -262,8 +262,14 @@ pub fn shape_word(face: &rustybuzz::Face, features: &[rustybuzz::Feature], text:
 /// More accurate than `width_matched_em_px` which uses ab_glyph (no GPOS).
 /// When `variant_tag` is non-empty (e.g. "smcp", "onum"), the corresponding
 /// OT feature is activated during shaping.
-pub fn width_matched_em_px_shaped(font_data: &[u8], text: &str, target_width_px: f32, variant_tag: &str) -> Option<f32> {
-    let face = rustybuzz::Face::from_slice(font_data, 0)?;
+pub fn width_matched_em_px_shaped(font_data: &[u8], text: &str, target_width_px: f32, variant_tag: &str, variations: Option<&[([u8; 4], f32)]>) -> Option<f32> {
+    let mut face = rustybuzz::Face::from_slice(font_data, 0)?;
+    if let Some(vars) = variations {
+        for (tag, val) in vars {
+            let t = rustybuzz::ttf_parser::Tag::from_bytes(tag);
+            face.set_variation(t, *val);
+        }
+    }
     let features = ot_features(variant_tag);
     shape_word(&face, &features, text)?.ink_matched_em_px(target_width_px)
 }
