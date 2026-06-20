@@ -12,7 +12,7 @@ use std::path::PathBuf;
 
 use unscan::char_index::{
     build_char_index, compute_features, compute_font_serif_score, compute_xh_cap_ratio,
-    render_char_normalised, search_candidates, GlyphOverrides, CharFeatures, FEAT_LEN,
+    render_char_normalised, search_candidates, GlyphOverrides, Variations, CharFeatures, FEAT_LEN,
 };
 use unscan::classifier::FisherClassifier;
 
@@ -111,12 +111,12 @@ const FONT_PATHS: &[&str] = &[
     "/usr/share/fonts/truetype/freefont/FreeMono.ttf",
 ];
 
-/// Collect system fonts as (name, PathBuf, GlyphOverrides) for build_char_index.
-fn test_font_set() -> Vec<(String, PathBuf, GlyphOverrides)> {
+/// Collect system fonts as (name, PathBuf, GlyphOverrides, Variations) for build_char_index.
+fn test_font_set() -> Vec<(String, PathBuf, GlyphOverrides, Variations)> {
     let mut fonts = Vec::new();
     for path in FONT_PATHS {
         if std::path::Path::new(path).exists() {
-            fonts.push((path.to_string(), PathBuf::from(path), None));
+            fonts.push((path.to_string(), PathBuf::from(path), None, None));
         }
     }
     assert!(fonts.len() >= 4, "Need at least 4 system fonts for meaningful test");
@@ -153,7 +153,7 @@ fn char_index_identifies_dejavu_sans() {
 
     let font_set = test_font_set();
     eprintln!("\n=== Building index from {} fonts ===", font_set.len());
-    for (key, _, _) in &font_set {
+    for (key, _, _, _) in &font_set {
         eprintln!("  {}", key);
     }
 
@@ -387,7 +387,7 @@ fn feature_self_consistency() {
         let font_data = std::fs::read(font_path).unwrap();
 
         // Build a 1-font index from just this font
-        let font_set = vec![(font_path.to_string(), PathBuf::from(*font_path), None)];
+        let font_set = vec![(font_path.to_string(), PathBuf::from(*font_path), None, None)];
         let index = build_char_index(&font_set, &FisherClassifier);
 
         // Parse the font for per-font metric overrides (same as build path)

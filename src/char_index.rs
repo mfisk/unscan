@@ -535,6 +535,46 @@ pub fn compute_xh_cap_ratio<F: Font>(font: &F) -> f32 {
     }
 }
 
+/// Aggregate per-char weighted log-distances into a single overall CI score.
+/// Used by both `search_candidates` and `score_single_font` — one formula,
+/// one implementation.  Higher = better (smaller distance = better match).
+fn aggregate_ci_score(log_dists: &[(f32, f32)], n_total_chars: usize) -> f32 {
+    let penalty_log_dist = 0.0_f32; // log(1.0); for genuinely missing glyphs
+    let matched = log_dists.len();
+    let mut total_weight = 0.0_f32;
+    let mut weighted_sum = 0.0_f32;
+    for &(ld, w) in log_dists {
+        weighted_sum += ld * w;
+        total_weight += w;
+    }
+    for _ in matched..n_total_chars {
+        weighted_sum += penalty_log_dist * 1.0;
+        total_weight += 1.0;
+    }
+    let mean_log_dist = weighted_sum / total_weight.max(1e-9);
+    -mean_log_dist
+}
+
+/// Compute the overall CI score for a single font, using the same aggregation
+/// as `search_candidates`.  Returns `None` if the font has no indexed chars
+/// matching the crops.
+pub fn score_single_font(
+    index: &CharIndex,
+    font_key: &str,
+    crop_feats: &[(usize, char, Vec<f32>)],
+) -> Option<f32> {
+    let dists = per_char_distances_precomputed(index, font_key, crop_feats);
+    if dists.is_empty() {
+        return None;
+    }
+    let log_dists: Vec<(f32, f32)> = dists
+        .iter()
+        .map(|(ch, _, d2)| ((*d2 + 1e-10_f32).ln(), char_weight(*ch)))
+        .collect();
+    let score = aggregate_ci_score(&log_dists, crop_feats.len());
+    if score.is_finite() { Some(score) } else { None }
+}
+
 /// Character discriminativeness weight for scoring.
 fn char_weight(c: char) -> f32 {
     match c {
@@ -1453,6 +1493,7 @@ impl CharIndex {
                 variant_tag: fe.variant_tag.clone(),
                 glyph_overrides: fe.glyph_overrides.clone(),
                 oldstyle_figures: fe.oldstyle_figures,
+                variations: fe.variations.clone(),
             });
         }
     }
@@ -1462,6 +1503,9 @@ impl CharIndex {
 /// Glyph override map for OT variant entries (e.g. smcp, onum).
 /// Maps character → overridden glyph ID so the CI renders the correct variant glyph.
 pub type GlyphOverrides = Option<Vec<(char, u16)>>;
+
+/// Variable-font axis coordinates to apply before rendering.
+pub type Variations = Option<Vec<([u8; 4], f32)>>;
 
 /// Metadata for a single font entry (one per font_key in the catalog).
 /// Stored in the char index so we can skip the filesystem scan on warm runs.
@@ -1476,6 +1520,7 @@ pub struct FontMeta {
     pub variant_tag: String,
     pub glyph_overrides: GlyphOverrides,
     pub oldstyle_figures: bool,
+    pub variations: Variations,
 }
 
 /// Resolve glyph ID for a character, applying OT variant overrides when present.
@@ -1489,7 +1534,7 @@ pub fn resolve_glyph<F: ab_glyph::Font>(font: &F, ch: char, overrides: Option<&[
     font.glyph_id(ch)
 }
 
-pub fn build_char_index(font_paths: &[(String, std::path::PathBuf, GlyphOverrides)], classifier: &dyn crate::classifier::Classifier) -> CharIndex {
+pub fn build_char_index(font_paths: &[(String, std::path::PathBuf, GlyphOverrides, Variations)], classifier: &dyn crate::classifier::Classifier) -> CharIndex {
     use rayon::prelude::*;
 
     let chars = indexed_chars();
@@ -1503,7 +1548,7 @@ pub fn build_char_index(font_paths: &[(String, std::path::PathBuf, GlyphOverride
     // Phase 1: process each font in parallel (CPU-bound: render + features).
     // Font bytes are loaded from disk per-thread and dropped after processing,
     // so only ~N fonts are in memory at once (N = rayon thread count).
-    let results: Vec<FontResult> = font_paths.par_iter().map(|(font_name, font_path, glyph_overrides)| {
+    let results: Vec<FontResult> = font_paths.par_iter().map(|(font_name, font_path, glyph_overrides, variations)| {
         let font_data = match std::fs::read(font_path) {
             Ok(d) => d,
             Err(_) => {
@@ -1513,7 +1558,7 @@ pub fn build_char_index(font_paths: &[(String, std::path::PathBuf, GlyphOverride
                 };
             }
         };
-        let font = match FontRef::try_from_slice(&font_data) {
+        let mut font = match FontRef::try_from_slice(&font_data) {
             Ok(f) => f,
             Err(_) => {
                 return FontResult {
@@ -1522,6 +1567,14 @@ pub fn build_char_index(font_paths: &[(String, std::path::PathBuf, GlyphOverride
                 };
             }
         };
+
+        // Apply variable-font axis coordinates (e.g. wght=700 for Bold)
+        if let Some(vars) = variations {
+            use ab_glyph::VariableFont;
+            for (tag, value) in vars {
+                font.set_variation(tag, *value);
+            }
+        }
 
         // Build fast lookup for glyph overrides
         let override_map: HashMap<char, u16> = glyph_overrides
@@ -2261,10 +2314,8 @@ pub fn search_candidates(
     //
     // After the second pass, candidate fonts have real distances for all
     // characters they were within radius on PLUS actual distances for chars
-    // they fell outside the radius on.  The fixed penalty below now only
-    // fires for fonts that genuinely lack a glyph for a character (rare
-    // for Latin text).
-    let penalty_log_dist = 0.0_f32; // log(1.0); appropriate for genuinely missing glyphs
+    // they fell outside the radius on.  Penalty for genuinely missing glyphs
+    // is inside aggregate_ci_score().
 
     // Keep a backup for the "at least 1" fallback
     let font_log_dists_backup: HashMap<usize, Vec<(f32, f32)>> = font_log_dists.clone();
@@ -2272,28 +2323,8 @@ pub fn search_candidates(
     let mut scores: Vec<(String, f32)> = font_log_dists
         .into_iter()
         .filter_map(|(font_id, log_dists)| {
-            let matched = log_dists.len();
             let name = index.font_names_table.get(font_id)?.clone();
-
-            // Weighted mean of log-distances.
-            let mut total_weight = 0.0_f32;
-            let mut weighted_sum = 0.0_f32;
-            for (ld, w) in &log_dists {
-                weighted_sum += ld * w;
-                total_weight += w;
-            }
-
-            // Penalty for genuinely missing glyphs (font can't render char).
-            // After the second-pass backfill, this only fires when a font
-            // truly lacks a glyph — not when it fell outside the search radius.
-            for _ in matched..n_chars {
-                weighted_sum += penalty_log_dist * 1.0;
-                total_weight += 1.0;
-            }
-
-            let mean_log_dist = weighted_sum / total_weight.max(1e-9);
-            // Negate so higher = better (smaller distance = better match)
-            let score = -mean_log_dist;
+            let score = aggregate_ci_score(&log_dists, n_chars);
             Some((name, score))
         })
         .collect();
@@ -2619,6 +2650,17 @@ pub fn save_index(index: &CharIndex, path: &Path) -> io::Result<()> {
         } else {
             buf.extend_from_slice(&0u32.to_le_bytes());
         }
+
+        // Variations: count, then for each: 4-byte tag + f32 value
+        if let Some(ref vars) = meta.variations {
+            buf.extend_from_slice(&(vars.len() as u32).to_le_bytes());
+            for (tag, val) in vars {
+                buf.extend_from_slice(tag);
+                buf.extend_from_slice(&val.to_le_bytes());
+            }
+        } else {
+            buf.extend_from_slice(&0u32.to_le_bytes());
+        }
     }
 
     let mut f = std::fs::File::create(path)?;
@@ -2856,6 +2898,31 @@ pub fn load_index(path: &Path, classifier: &dyn crate::classifier::Classifier) -
                     None
                 };
 
+                // Variations (backward-compat: missing → None)
+                let variations = if pos < data.len() {
+                    match read_u32(&mut pos) {
+                        Ok(n_vars) if n_vars > 0 => {
+                            let n = n_vars as usize;
+                            let mut vars = Vec::with_capacity(n);
+                            for _ in 0..n {
+                                if pos + 8 > data.len() { break; }
+                                let mut tag = [0u8; 4];
+                                tag.copy_from_slice(&data[pos..pos + 4]);
+                                pos += 4;
+                                let val = f32::from_le_bytes([
+                                    data[pos], data[pos+1], data[pos+2], data[pos+3]
+                                ]);
+                                pos += 4;
+                                vars.push((tag, val));
+                            }
+                            Some(vars)
+                        }
+                        _ => None,
+                    }
+                } else {
+                    None
+                };
+
                 font_meta.insert(font_key, FontMeta {
                     path,
                     family_name,
@@ -2866,6 +2933,7 @@ pub fn load_index(path: &Path, classifier: &dyn crate::classifier::Classifier) -
                     variant_tag,
                     glyph_overrides,
                     oldstyle_figures,
+                    variations,
                 });
             }
         }

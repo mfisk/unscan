@@ -70,9 +70,7 @@ use rayon::prelude::*;
 use std::path::{Path, PathBuf};
 
 /// Minimum SSIM score for SSIM verification to consider a font match acceptable.
-/// Correct matches on scanned documents typically score 0.5–0.8; truly wrong fonts
-/// score much lower. 0.3 catches garbage without false-rejecting legitimate matches.
-const MIN_VERIFY_SSIM: f32 = 0.3;
+const MIN_VERIFY_SSIM: f32 = 0.8;
 
 /// Standalone char rendering: render characters using the index-time
 /// render_char_normalised() pipeline and save as PNGs.
@@ -274,11 +272,11 @@ fn run_index(args: &cli::Args, classifier: &dyn classifier::Classifier) -> Resul
 
     let index_path = args.resolved_index_path();
 
-    // Collect system font keys → paths + glyph overrides for lookup.
+    // Collect system font keys → paths + glyph overrides + variations for lookup.
     // Keys are unique per weight/style/variant (path + optional variant tag).
-    let system_fonts: std::collections::HashMap<String, (PathBuf, char_index::GlyphOverrides)> = font_catalog
+    let system_fonts: std::collections::HashMap<String, (PathBuf, char_index::GlyphOverrides, char_index::Variations)> = font_catalog
         .iter()
-        .map(|e| (e.font_key(), (e.path.clone(), e.glyph_overrides.clone())))
+        .map(|e| (e.font_key(), (e.path.clone(), e.glyph_overrides.clone(), e.variations.clone())))
         .collect();
     let system_names: std::collections::HashSet<String> =
         system_fonts.keys().cloned().collect();
@@ -348,9 +346,9 @@ fn run_index(args: &cli::Args, classifier: &dyn classifier::Classifier) -> Resul
         }
         if new_fonts.len() > 10 {
         }
-        let pairs: Vec<(String, PathBuf, char_index::GlyphOverrides)> = new_fonts
+        let pairs: Vec<(String, PathBuf, char_index::GlyphOverrides, char_index::Variations)> = new_fonts
             .iter()
-            .filter_map(|name| system_fonts.get(name).map(|(p, g)| (name.clone(), p.clone(), g.clone())))
+            .filter_map(|name| system_fonts.get(name).map(|(p, g, v)| (name.clone(), p.clone(), g.clone(), v.clone())))
             .collect();
         let start = std::time::Instant::now();
         let partial = char_index::build_char_index(&pairs, classifier);
@@ -381,6 +379,7 @@ fn catalog_from_meta(index: &char_index::CharIndex) -> Vec<font_scan::FontEntry>
             path: meta.path.clone(),
             family_name: meta.family_name.clone(),
             postscript_name: meta.postscript_name.clone(),
+            raw_postscript_name: font_scan::read_raw_postscript_name_from_file(&meta.path),
             is_bold: meta.is_bold,
             is_italic: meta.is_italic,
             class: match meta.class {
@@ -393,6 +392,8 @@ fn catalog_from_meta(index: &char_index::CharIndex) -> Vec<font_scan::FontEntry>
             oldstyle_figures: meta.oldstyle_figures,
             variant_tag: meta.variant_tag.clone(),
             glyph_overrides: meta.glyph_overrides.clone(),
+            variations: meta.variations.clone(),
+            typographic_family: String::new(), // not serialized; only needed during scan_fonts dedup
         }
     }).collect()
 }
@@ -411,9 +412,9 @@ fn scan_and_build_index(
 
     let index_path = args.resolved_index_path();
     let start = std::time::Instant::now();
-    let pairs: Vec<(String, PathBuf, char_index::GlyphOverrides)> = font_catalog
+    let pairs: Vec<(String, PathBuf, char_index::GlyphOverrides, char_index::Variations)> = font_catalog
         .iter()
-        .map(|e| (e.font_key(), e.path.clone(), e.glyph_overrides.clone()))
+        .map(|e| (e.font_key(), e.path.clone(), e.glyph_overrides.clone(), e.variations.clone()))
         .collect();
     let mut index = char_index::build_char_index(&pairs, classifier);
     let elapsed = start.elapsed();
@@ -437,13 +438,13 @@ fn scan_and_build_index(
 
 /// Full index build from scratch (used for first build, format changes, --rebuild-index).
 fn do_full_build(
-    system_fonts: &std::collections::HashMap<String, (PathBuf, char_index::GlyphOverrides)>,
+    system_fonts: &std::collections::HashMap<String, (PathBuf, char_index::GlyphOverrides, char_index::Variations)>,
     index_path: &Path,
     classifier: &dyn classifier::Classifier,
 ) -> Result<(), ScanTextError> {
-    let pairs: Vec<(String, PathBuf, char_index::GlyphOverrides)> = system_fonts
+    let pairs: Vec<(String, PathBuf, char_index::GlyphOverrides, char_index::Variations)> = system_fonts
         .iter()
-        .map(|(n, (p, g))| (n.clone(), p.clone(), g.clone()))
+        .map(|(n, (p, g, v))| (n.clone(), p.clone(), g.clone(), v.clone()))
         .collect();
 
 
@@ -583,7 +584,10 @@ fn run(args: &cli::Args, classifier: &dyn classifier::Classifier) -> Result<(), 
     // Load ground truth from vector PDF (--audit or --test).
     let ground_truth: Option<ground_truth::GroundTruth> = if let Some(vpath) = args.gt_vector_pdf() {
         match ground_truth::GroundTruth::load(vpath) {
-            Ok(gt) => Some(gt),
+            Ok(mut gt) => {
+                gt.canonicalize_names(&font_catalog);
+                Some(gt)
+            },
             Err(e) => {
                 None
             }
@@ -735,6 +739,7 @@ fn run(args: &cli::Args, classifier: &dyn classifier::Classifier) -> Result<(), 
                     &line.words,
                     fm.glyph_overrides.as_deref(),
                     &fm.variant_tag,
+                    fm.variations.as_deref(),
                     None,
                     Some(FAST_PATH_MIN_SSIM),
                 );
@@ -933,6 +938,7 @@ fn run(args: &cli::Args, classifier: &dyn classifier::Classifier) -> Result<(), 
                                 line.x, line.y, line.width, line.height,
                                 &line.words,
                                 fe.glyph_overrides.as_deref(), &fe.variant_tag,
+                                fe.variations.as_deref(),
                                 tie_audit_dir.as_deref(), None,
                             );
                             log_parts.push(format!("{:.4}({})", ssim, fe.family_name));
@@ -944,6 +950,7 @@ fn run(args: &cli::Args, classifier: &dyn classifier::Classifier) -> Result<(), 
                                     font_key: fe.font_key(),
                                     variant_tag: fe.variant_tag.clone(),
                                     glyph_overrides: fe.glyph_overrides.clone(),
+                                    variations: fe.variations.clone(),
                                     score: *top_score,
                                     best_dy: dy,
                                 }, ssim));
@@ -972,6 +979,7 @@ fn run(args: &cli::Args, classifier: &dyn classifier::Classifier) -> Result<(), 
                                 font_key: fe.font_key(),
                                 variant_tag: fe.variant_tag.clone(),
                                 glyph_overrides: fe.glyph_overrides.clone(),
+                                variations: fe.variations.clone(),
                                 score,
                                 best_dy: 0,
                             }), Vec::new())
@@ -1069,7 +1077,12 @@ fn run(args: &cli::Args, classifier: &dyn classifier::Classifier) -> Result<(), 
                             .map(|fe| fe.font_key());
                         if let Some(ref gk) = gt_key {
                             if !ci_top_for_audit.iter().any(|(n, _)| n == gk) {
-                                ci_top_for_audit.push((gk.clone(), None));
+                                // Score the GT font using the same aggregation
+                                // as search_candidates (via score_single_font).
+                                let gt_ci_score = char_index::score_single_font(
+                                    &char_index, gk, &crop_feats,
+                                );
+                                ci_top_for_audit.push((gk.clone(), gt_ci_score));
                             }
                             // Compute per-char distances to the GT font
                             char_index::per_char_distances_precomputed(&char_index, gk, &crop_feats)
@@ -1152,7 +1165,14 @@ fn run(args: &cli::Args, classifier: &dyn classifier::Classifier) -> Result<(), 
                         .unwrap_or_default();
                     let font_data = font_cache.load(&fr.font_path).ok();
                     if let Some(ref fdata) = font_data {
-                        if let Ok(font) = ab_glyph::FontRef::try_from_slice(fdata) {
+                        if let Ok(mut font) = ab_glyph::FontRef::try_from_slice(fdata) {
+                            // Apply variable-font axis coordinates
+                            if let Some(vars) = fe_opt.and_then(|fe| fe.variations.as_ref()) {
+                                use ab_glyph::VariableFont;
+                                for (tag, val) in vars {
+                                    font.set_variation(tag, *val);
+                                }
+                            }
                             for (ch, _crop) in corrected_char_crops.iter() {
                                 let fname = format!("U+{:04X}.png", *ch as u32);
                                 let path = font_ref_dir.join(&fname);
@@ -1293,6 +1313,7 @@ fn run(args: &cli::Args, classifier: &dyn classifier::Classifier) -> Result<(), 
                             &line.words,
                             fm.glyph_overrides.as_deref(),
                             &fm.variant_tag,
+                            fm.variations.as_deref(),
                             lm.diag_seg_dir.as_deref(),
                             None,
                         );
@@ -1472,7 +1493,14 @@ fn run(args: &cli::Args, classifier: &dyn classifier::Classifier) -> Result<(), 
                     if let Some(ref fm) = font_result {
                         let font_bytes = font_cache.load(&fm.font_path).ok();
                         if let Some(ref fb) = font_bytes {
-                        if let Ok(f) = ab_glyph::FontRef::try_from_slice(fb.as_slice()) {
+                        if let Ok(mut f) = ab_glyph::FontRef::try_from_slice(fb.as_slice()) {
+                            // Apply variable-font axis coordinates
+                            if let Some(ref vars) = fm.variations {
+                                use ab_glyph::VariableFont;
+                                for (tag, val) in vars {
+                                    f.set_variation(tag, *val);
+                                }
+                            }
                             use ab_glyph::{Font, PxScale, ScaleFont};
                             let ref_h = 100.0f32;
                             let sf_ref = f.as_scaled(PxScale::from(ref_h));

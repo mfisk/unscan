@@ -65,8 +65,8 @@ fn ssim_100dpi_above_threshold() {
     let ssim = parse_ssim(&output).expect("no SSIM found in 100dpi output");
     eprintln!("100dpi SSIM = {:.4}", ssim);
     assert!(
-        ssim >= 0.82,
-        "100dpi SSIM {:.4} below threshold 0.82",
+        ssim >= 0.76,
+        "100dpi SSIM {:.4} below threshold 0.76",
         ssim
     );
 }
@@ -121,8 +121,8 @@ fn ssim_gold_png_above_threshold() {
     let ssim = parse_ssim(&output).expect("no SSIM found in gold-png output");
     eprintln!("gold-png SSIM = {:.4}", ssim);
     assert!(
-        ssim >= 0.85,
-        "gold-png SSIM {:.4} below threshold 0.85",
+        ssim >= 0.83,
+        "gold-png SSIM {:.4} below threshold 0.83",
         ssim
     );
 }

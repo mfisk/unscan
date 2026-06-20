@@ -16,6 +16,8 @@ pub struct FontMatchResult {
     pub variant_tag: String,
     /// Glyph overrides for OT variant rendering.
     pub glyph_overrides: crate::char_index::GlyphOverrides,
+    /// Variable-font axis coordinates to apply before rendering.
+    pub variations: crate::char_index::Variations,
     pub score: f32,
     /// Best vertical pixel shift from SSIM alignment search (0 if coarse-only).
     pub best_dy: i32,

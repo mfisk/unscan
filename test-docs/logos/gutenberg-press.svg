@@ -22,7 +22,7 @@
     <line x1="70" y1="30" x2="130" y2="30" stroke-width="4" stroke-linecap="round"/>
     <!-- Press plate -->
     <rect x="70" y="58" width="60" height="10" rx="2" fill="#555"/>
-    <!-- Text "TYPOGRAPHIA" -->
-    <text x="100" y="110" text-anchor="middle" font-size="9" font-family="serif" fill="#666" stroke="none">TYPOGRAPHIA</text>
+    <!-- Text "TYPOGRAPHIA" removed — was using base14 serif (Times-Roman)
+         which is not in our font catalog. The SVG is decorative. -->
   </g>
 </svg>

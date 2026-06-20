@@ -84,20 +84,9 @@ fn find_font_in_catalog<'a>(
     gt_font_name: &str,
 ) -> Option<&'a FontEntry> {
     let gt_stripped = ground_truth::strip_subset_prefix_str(gt_font_name);
-    // Exact PostScript name match (default/base entries only — variants share
-    // the same PS name, so prefer the base entry with empty variant_tag).
-    for fe in font_catalog {
-        if fe.variant_tag.is_empty() && fe.postscript_name == gt_stripped {
-            return Some(fe);
-        }
-    }
-    // If no base entry matched, try variant entries too
-    for fe in font_catalog {
-        if fe.postscript_name == gt_stripped {
-            return Some(fe);
-        }
-    }
-    None
+    // Exact PostScript name match.  Variant entries carry "PSName|tag"
+    // so they won't collide with base "PSName" — single-pass lookup.
+    font_catalog.iter().find(|fe| fe.postscript_name == gt_stripped)
 }
 
 /// Try to find a font entry matching a CI candidate font_key.
@@ -342,13 +331,14 @@ fn classify_entries<'a>(
                 let kind = if e.decision == Decision::KeptRaster {
                     MissKind::KeptRaster
                 } else if let Some(ref actual) = actual_font {
-                    // Compare via fonts_match_strict: the catalog PS name has
-                    // weight-explicit suffixes (e.g. ArialMT-Regular) while the
-                    // PDF BaseFont is the raw PS name (ArialMT).
+                    // After GT canonicalization, both sides use canonical
+                    // (weight-explicit) names.  Variant entries carry
+                    // "PSName|tag" which won't match base "PSName", so
+                    // exact equality is sufficient.
                     let ps_match = e.ci_candidates.first().and_then(|c| {
                         find_font_by_key(font_catalog, &c.font_key)
                     }).map_or(false, |fe| {
-                        ground_truth::fonts_match_strict(&fe.postscript_name, actual)
+                        fe.postscript_name == *actual
                     });
 
                     if ps_match {
@@ -364,7 +354,7 @@ fn classify_entries<'a>(
                             .and_then(|c| find_font_by_key(font_catalog, &c.font_key))
                             .map(|fe| fe.path.clone());
                         let gt_path = font_catalog.iter()
-                            .find(|fe| fe.postscript_name == *actual && fe.variant_tag.is_empty())
+                            .find(|fe| fe.postscript_name == *actual)
                             .map(|fe| fe.path.clone());
 
                         let is_minor = match (picked_path, gt_path) {
@@ -442,11 +432,12 @@ fn find_correct_ci_candidate(
 ) -> (Option<String>, Option<f32>, Option<usize>) {
     let gt_ps = ground_truth::strip_subset_prefix_str(actual_font);
 
-    // Match CI candidate's PostScript name against GT BaseFont.
-    // Use fonts_match_strict to handle weight-explicit name differences.
+    // Match CI candidate's PostScript name against GT font.
+    // After GT canonicalization, both names are canonical — exact equality.
+    // Variant entries carry "PSName|tag" so they won't match base "PSName".
     for (i, c) in entry.ci_candidates.iter().enumerate() {
         if let Some(fe) = find_font_by_key(font_catalog, &c.font_key) {
-            if ground_truth::fonts_match_strict(&fe.postscript_name, &gt_ps) {
+            if fe.postscript_name == gt_ps {
                 return (Some(c.font_key.clone()), c.score, Some(i + 1));
             }
         }
@@ -502,16 +493,16 @@ fn build_miss_block(
     let font_is_correct = ce.kind == MissKind::SsimFailure;
 
     // SSIM comparison block — render correct font for side-by-side if this is a font miss
-    let (gt_render_uri, gt_diff_uri) = if !font_is_correct {
+    let (gt_render_uri, gt_diff_uri, gt_ssim) = if !font_is_correct {
         render_correct_font_comparison(entry, correct_fe, font_data_cache, diag_dir.as_deref())
     } else {
-        (None, None)
+        (None, None, None)
     };
     // Compute font sizes for comparison
     let gt_font_size_pt = ce.gt_font_size_pt;
     let inferred_size = chosen_fe.and_then(|fe| {
         let data = font_data_cache.load(&fe.path)?;
-        compute_inferred_font_size(data, &entry.word_bboxes, &fe.variant_tag, dpi)
+        compute_inferred_font_size(data, &entry.word_bboxes, &fe.variant_tag, fe.variations.as_deref(), dpi)
     });
     let unscan_font_size_pt = inferred_size.as_ref().map(|s| s.median_pt);
 
@@ -519,6 +510,7 @@ fn build_miss_block(
         build_ssim_block(
             dd, actual_font, matched, entry.ssim_score,
             gt_render_uri.as_deref(), gt_diff_uri.as_deref(),
+            gt_ssim,
             gt_font_size_pt, unscan_font_size_pt,
             inferred_size.as_ref().map(|s| s.per_word.as_slice()),
         )
@@ -951,20 +943,20 @@ fn render_correct_font_comparison(
     correct_fe: Option<&FontEntry>,
     font_data_cache: &mut FontDataCache,
     diag_dir: Option<&Path>,
-) -> (Option<String>, Option<String>) {
+) -> (Option<String>, Option<String>, Option<f32>) {
     let fe = match correct_fe {
         Some(fe) => fe,
-        None => return (None, None),
+        None => return (None, None, None),
     };
     let dd = match diag_dir {
         Some(d) => d,
-        None => return (None, None),
+        None => return (None, None, None),
     };
 
     // Load font data
     let font_data = match font_data_cache.load(&fe.path) {
         Some(d) => d,
-        None => return (None, None),
+        None => return (None, None, None),
     };
 
     // Build word placements relative to line bbox
@@ -982,7 +974,7 @@ fn render_correct_font_comparison(
         .collect();
 
     if placements.is_empty() {
-        return (None, None);
+        return (None, None, None);
     }
 
     let overrides: Option<Vec<(char, u16)>> = fe
@@ -998,28 +990,35 @@ fn render_correct_font_comparison(
         entry.bbox.height,
         overrides.as_deref(),
         &fe.variant_tag,
+        fe.variations.as_deref(),
     ) {
         Some(img) => img,
-        None => return (None, None),
+        None => return (None, None, None),
     };
 
     let render_uri = img_to_b64_uri(&render_img);
 
-    // Load ssim_scan.png and compute diff
+    // Load ssim_scan.png, compute diff and SSIM (same path as verify_text_region)
     let scan_path = dd.join("ssim_scan.png");
-    let diff_uri = if scan_path.exists() {
+    let (diff_uri, correct_ssim) = if scan_path.exists() {
         if let Ok(scan_dyn) = image::open(&scan_path) {
             let scan_gray = scan_dyn.to_luma8();
             let diff_img = crate::verify::compute_abs_diff(&scan_gray, &render_img);
-            Some(img_to_b64_uri(&diff_img))
+            // Compute SSIM: same blur + vshift pipeline as verify_text_region
+            let scan_blur = crate::ssim::gaussian_blur_3x3(&scan_gray);
+            let render_blur = crate::ssim::gaussian_blur_3x3(&render_img);
+            let (ssim_val, _dy) = crate::ssim::ssim_windowed_best_vshift(
+                &scan_blur, &render_blur, 12, None,
+            );
+            (Some(img_to_b64_uri(&diff_img)), Some(ssim_val))
         } else {
-            None
+            (None, None)
         }
     } else {
-        None
+        (None, None)
     };
 
-    (Some(render_uri), diff_uri)
+    (Some(render_uri), diff_uri, correct_ssim)
 }
 
 /// Compute the font size (in PDF points) that unscan would infer for the
@@ -1042,6 +1041,7 @@ fn compute_inferred_font_size(
     font_data: &[u8],
     word_bboxes: &[crate::audit::WordBBox],
     variant_tag: &str,
+    variations: Option<&[([u8; 4], f32)]>,
     dpi: u32,
 ) -> Option<InferredFontSize> {
     let scale = 72.0 / dpi as f32;
@@ -1054,6 +1054,7 @@ fn compute_inferred_font_size(
                 &wb.text,
                 wb.width as f32,
                 variant_tag,
+                variations,
             )?;
             Some(WordSizeDetail {
                 text: wb.text.clone(),
@@ -1083,6 +1084,7 @@ fn build_ssim_block(
     ssim_score: Option<f32>,
     correct_render_uri: Option<&str>,
     correct_diff_uri: Option<&str>,
+    correct_ssim: Option<f32>,
     gt_font_size_pt: Option<f32>,
     unscan_font_size_pt: Option<f32>,
     per_word_sizes: Option<&[WordSizeDetail]>,
@@ -1115,6 +1117,10 @@ fn build_ssim_block(
     };
 
     let ssim_str = ssim_score
+        .map(|s| format!("{s:.10}"))
+        .unwrap_or_else(|| "—".into());
+
+    let correct_ssim_str = correct_ssim
         .map(|s| format!("{s:.10}"))
         .unwrap_or_else(|| "—".into());
 
@@ -1217,7 +1223,8 @@ fn build_ssim_block(
          {render_row}\
          {diff_row_html}\
          <tr><td class=\"ssim-label\">SSIM</td>\
-         <td colspan=\"2\">{ssim_str}</td></tr>\
+         <td class=\"correct\">{correct_ssim_str}</td>\
+         <td class=\"chosen\">{ssim_str}</td></tr>\
          </table></div>"
     )
 }
@@ -1338,7 +1345,14 @@ fn build_char_table(
         // Correct font reference glyph — render on the fly
         let correct_ref_uri = correct_fe.and_then(|fe| {
             let data = font_data_cache.load(&fe.path)?;
-            let font = FontRef::try_from_slice(data).ok()?;
+            let mut font = FontRef::try_from_slice(data).ok()?;
+            // Apply variable-font axis coordinates
+            if let Some(ref vars) = fe.variations {
+                use ab_glyph::VariableFont;
+                for (tag, val) in vars {
+                    font.set_variation(tag, *val);
+                }
+            }
             let override_map: HashMap<char, u16> = fe
                 .glyph_overrides
                 .as_ref()
@@ -1360,7 +1374,14 @@ fn build_char_table(
             }
             // Render on the fly
             let data = font_data_cache.load(&fe.path)?;
-            let font = FontRef::try_from_slice(data).ok()?;
+            let mut font = FontRef::try_from_slice(data).ok()?;
+            // Apply variable-font axis coordinates
+            if let Some(ref vars) = fe.variations {
+                use ab_glyph::VariableFont;
+                for (tag, val) in vars {
+                    font.set_variation(tag, *val);
+                }
+            }
             let override_map: HashMap<char, u16> = fe
                 .glyph_overrides
                 .as_ref()
@@ -1470,7 +1491,7 @@ fn build_char_table(
         .map(|c| {
             match c.score {
                 Some(s) => format!("CI #1, score {:.10}", s),
-                None => format!("CI #1, score n/a (injected)"),
+                None => "CI #1".into(),
             }
         })
         .unwrap_or_default();

@@ -681,9 +681,9 @@ fn build_and_save_char_index(
         catalog.len(), char_index::indexed_chars().len());
     let start = std::time::Instant::now();
 
-    let pairs: Vec<(String, PathBuf, char_index::GlyphOverrides)> = catalog
+    let pairs: Vec<(String, PathBuf, char_index::GlyphOverrides, char_index::Variations)> = catalog
         .iter()
-        .map(|e| (e.font_key(), e.path.clone(), e.glyph_overrides.clone()))
+        .map(|e| (e.font_key(), e.path.clone(), e.glyph_overrides.clone(), e.variations.clone()))
         .collect();
     let mut index = char_index::build_char_index(&pairs, classifier);
     index.populate_font_meta(catalog);

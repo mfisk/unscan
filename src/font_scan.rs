@@ -38,10 +38,13 @@ pub enum FontClass {
 pub struct FontEntry {
     pub path: PathBuf,
     pub family_name: String,
-    /// PostScript name (name ID 6) read from the font's name table.
-    /// This is the exact string that appears as BaseFont in PDF dictionaries,
-    /// so GT comparison can use direct equality instead of heuristics.
+    /// Canonical PostScript name: raw nameID 6 with numeric weight appended
+    /// via `make_weight_explicit`.  Used for all font identity comparisons.
     pub postscript_name: String,
+    /// Raw PostScript name (nameID 6) as it appears in the font file and
+    /// therefore in PDF BaseFont entries.  Used only to map PDF BaseFont
+    /// back to a catalog entry during GT canonicalization.
+    pub raw_postscript_name: String,
     pub is_bold: bool,
     #[allow(dead_code)]
     pub is_italic: bool,
@@ -56,6 +59,15 @@ pub struct FontEntry {
     /// Only characters whose glyph ID differs from default are included.
     /// None for the default entry (use normal cmap lookup).
     pub glyph_overrides: Option<Vec<(char, u16)>>,
+    /// For variable-font weight instances: axis coordinates to set before
+    /// rendering (e.g. `[(b"wght", 700.0)]`).  None for static fonts and
+    /// the default instance of variable fonts.
+    pub variations: Option<Vec<([u8; 4], f32)>>,
+    /// Typographic family name from the font's name table (nameID 16,
+    /// falling back to nameID 1).  Used for dedup: when a static font and
+    /// a variable-font weight instance share the same family+weight, the
+    /// static one wins.  Not serialized in the char index.
+    pub typographic_family: String,
 }
 
 impl FontEntry {
@@ -167,7 +179,12 @@ pub fn scan_fonts(dirs: &[PathBuf]) -> Vec<FontEntry> {
                     let var_entry = FontEntry {
                         path: fe.path.clone(),
                         family_name: format!("{} [{}]", fe.family_name, tag),
-                        postscript_name: fe.postscript_name.clone(),
+                        // Variant gets its own unambiguous canonical name:
+                        // base PS name + "|" + variant tag.  This ensures
+                        // exact == comparison never confuses a variant with
+                        // its base entry.
+                        postscript_name: format!("{}|{}", fe.postscript_name, tag),
+                        raw_postscript_name: fe.raw_postscript_name.clone(),
                         is_bold: fe.is_bold,
                         is_italic: fe.is_italic,
                         class: fe.class,
@@ -175,6 +192,8 @@ pub fn scan_fonts(dirs: &[PathBuf]) -> Vec<FontEntry> {
                         oldstyle_figures: fe.oldstyle_figures,
                         variant_tag: tag.clone(),
                         glyph_overrides: Some(combined),
+                        variations: None,
+                        typographic_family: fe.typographic_family.clone(),
                     };
                     fonts.push(var_entry);
                 }
@@ -185,11 +204,81 @@ pub fn scan_fonts(dirs: &[PathBuf]) -> Vec<FontEntry> {
                 // Add ligature overrides to base entry
                 if !ligatures.is_empty() {
                     let mut base_overrides = fe.glyph_overrides.take().unwrap_or_default();
-                    base_overrides.extend(ligatures);
+                    base_overrides.extend(ligatures.clone());
                     fe.glyph_overrides = Some(base_overrides);
                 }
+
+                // ── Variable font weight instances ──────────────────────
+                // If the font has a wght axis, emit additional entries at
+                // each named-instance weight so the CI indexes bold/light/
+                // etc. renderings from the same file.
+                let weight_instances = detect_weight_instances(path, fe.class);
+                for wi in &weight_instances {
+                    let var_ps = make_weight_explicit(&fe.raw_postscript_name, wi.os2_weight);
+                    let var_tag = format!("wght{}", wi.os2_weight);
+                    let mut var_fe = FontEntry {
+                        path: fe.path.clone(),
+                        family_name: format!("{} [{}]", fe.family_name, var_tag),
+                        postscript_name: var_ps,
+                        raw_postscript_name: fe.raw_postscript_name.clone(),
+                        is_bold: wi.os2_weight >= 700,
+                        is_italic: fe.is_italic,
+                        class: fe.class,
+                        data: Vec::new(),
+                        oldstyle_figures: fe.oldstyle_figures,
+                        variant_tag: var_tag,
+                        glyph_overrides: None,
+                        variations: Some(wi.axes.clone()),
+                        typographic_family: fe.typographic_family.clone(),
+                    };
+                    // Add ligature overrides to weight-instance entry
+                    if !ligatures.is_empty() {
+                        var_fe.glyph_overrides = Some(ligatures.clone());
+                    }
+                    fonts.push(var_fe);
+                }
+
                 fonts.push(fe);
             }
+        }
+    }
+
+    // ── Dedup: prefer static fonts over variable-font weight instances ──
+    // When a static font file exists at the same typographic family + weight
+    // + italic as a variable-font weight instance, drop the variable instance.
+    // The static file is the canonical rendering at that weight.
+    {
+        use std::collections::HashSet;
+        let static_keys: HashSet<(String, u16, bool)> = fonts.iter()
+            .filter(|f| f.variations.is_none() && !f.variant_tag.starts_with("wght"))
+            .filter_map(|f| {
+                if f.typographic_family.is_empty() { return None; }
+                // Extract weight from postscript_name (output of make_weight_explicit).
+                // Format: "Name-{weight}" or "Name-{weight}It" / "Name-{weight}Italic"
+                let ps = &f.postscript_name;
+                let base = ps.strip_suffix("Italic")
+                    .or_else(|| ps.strip_suffix("It"))
+                    .unwrap_or(ps);
+                let w = base.rsplit('-').next()
+                    .and_then(|s| s.parse::<u16>().ok())
+                    .filter(|&w| (100..=900).contains(&w))?;
+                Some((f.typographic_family.clone(), w, f.is_italic))
+            })
+            .collect();
+
+        let before = fonts.len();
+        fonts.retain(|f| {
+            if !f.variant_tag.starts_with("wght") {
+                return true; // keep everything that isn't a weight instance
+            }
+            let weight = f.variant_tag.strip_prefix("wght")
+                .and_then(|s| s.parse::<u16>().ok())
+                .unwrap_or(0);
+            !static_keys.contains(&(f.typographic_family.clone(), weight, f.is_italic))
+        });
+        let removed = before - fonts.len();
+        if removed > 0 {
+            eprintln!("[scan] Dropped {} variable-font weight instances covered by static fonts", removed);
         }
     }
 
@@ -512,6 +601,87 @@ const VARIANT_FEATURES: &[&[u8; 4]] = &[
 /// Test string covering Latin alphanumerics + a few common punctuation marks.
 const PROBE_STRING: &str = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789";
 
+// ---------------------------------------------------------------------------
+// Variable font weight instances
+// ---------------------------------------------------------------------------
+
+/// A weight instance to emit from a variable font.
+struct WeightInstance {
+    /// OS/2-style weight value (e.g. 400, 700).
+    os2_weight: u16,
+    /// Axis coordinates to set before rendering.
+    axes: Vec<([u8; 4], f32)>,
+}
+
+/// Detect named weight instances for a variable font.
+///
+/// Returns instances at each named weight that differs from the default.
+/// Only fires if the font has a `wght` axis.  All other axes are pinned
+/// to their defaults so the instance is fully determined.
+fn detect_weight_instances(path: &Path, _class: FontClass) -> Vec<WeightInstance> {
+    use ab_glyph::{FontRef, VariableFont};
+
+    let data = match std::fs::read(path) {
+        Ok(d) => d,
+        Err(_) => return Vec::new(),
+    };
+    let font = match FontRef::try_from_slice(&data) {
+        Ok(f) => f,
+        Err(_) => return Vec::new(),
+    };
+
+    let axes = font.variations();
+    let wght_axis = match axes.iter().find(|a| &a.tag == b"wght") {
+        Some(a) => a,
+        None => return Vec::new(), // not a variable font (or no weight axis)
+    };
+
+    let default_wght = wght_axis.default_value;
+
+    // Read named instances from fvar via ttf_parser
+    let named_weights: Vec<u16> = {
+        use rustybuzz::ttf_parser;
+        match ttf_parser::Face::parse(&data, 0) {
+            Ok(face) => {
+                let mut weights = Vec::new();
+                // fvar named instances
+                if let Some(fvar) = face.tables().fvar {
+                    for inst in fvar.axes {
+                        // axes gives us axis records, not instances
+                        let _ = inst;
+                    }
+                }
+                // Use common weight stops that fall within the axis range
+                for w in [100, 200, 300, 400, 500, 600, 700, 800, 900] {
+                    let wf = w as f32;
+                    if wf >= wght_axis.min_value && wf <= wght_axis.max_value
+                        && (wf - default_wght).abs() > 0.5
+                    {
+                        weights.push(w);
+                    }
+                }
+                weights
+            }
+            Err(_) => return Vec::new(),
+        }
+    };
+
+    // Build axis pinning: set wght to each weight, all other axes to default
+    let other_axes: Vec<([u8; 4], f32)> = axes.iter()
+        .filter(|a| &a.tag != b"wght")
+        .map(|a| (a.tag, a.default_value))
+        .collect();
+
+    named_weights.iter().map(|&w| {
+        let mut ax = vec![(*b"wght", w as f32)];
+        ax.extend(other_axes.iter().cloned());
+        WeightInstance {
+            os2_weight: w,
+            axes: ax,
+        }
+    }).collect()
+}
+
 /// Use rustybuzz to detect which OT features produce different glyph IDs
 /// for common Latin characters. Returns a vec of (feature_tag, glyph_overrides)
 /// for each feature that changes at least one glyph.
@@ -627,6 +797,39 @@ fn detect_ligature_glyphs(data: &[u8]) -> Vec<(char, u16)> {
 
 /// Read the PostScript name (name ID 6) from the font's name table.
 /// Returns empty string if unavailable.
+/// Read the raw PostScript name (nameID 6) from a font file on disk.
+pub fn read_raw_postscript_name_from_file(path: &std::path::Path) -> String {
+    match std::fs::read(path) {
+        Ok(data) => read_postscript_name(&data),
+        Err(_) => String::new(),
+    }
+}
+
+/// Read the typographic family name from the font's name table.
+///
+/// Prefers nameID 16 (Typographic Family Name), falls back to nameID 1
+/// (Font Family Name).  Returns empty string if neither is available.
+fn read_typographic_family(data: &[u8]) -> String {
+    use rustybuzz::ttf_parser;
+    let face = match ttf_parser::Face::parse(data, 0) {
+        Ok(f) => f,
+        Err(_) => return String::new(),
+    };
+    // nameID 16 first (typographic/preferred family), then nameID 1
+    let mut id1 = None;
+    for name in face.names() {
+        if name.name_id == 16 {
+            if let Some(s) = name.to_string() {
+                return s;
+            }
+        }
+        if name.name_id == 1 && id1.is_none() {
+            id1 = name.to_string();
+        }
+    }
+    id1.unwrap_or_default()
+}
+
 fn read_postscript_name(data: &[u8]) -> String {
     use rustybuzz::ttf_parser;
     let face = match ttf_parser::Face::parse(data, 0) {
@@ -661,42 +864,18 @@ pub fn make_weight_explicit(ps_name: &str, weight: u16) -> String {
         return ps_name.to_string();
     }
 
-    let weight_keyword = match weight {
-        0..=150   => "Thin",
-        151..=250 => "ExtraLight",
-        251..=350 => "Light",
-        351..=450 => "Regular",
-        451..=475 => "Text",
-        476..=550 => "Medium",
-        551..=650 => "SemiBold",
-        651..=750 => "Bold",
-        751..=850 => "ExtraBold",
-        _         => "Black",
-    };
+    let weight_str = weight.to_string();
 
-    // Check if PS name already contains an explicit weight marker.
-    let lower = ps_name.to_lowercase().replace('-', "");
-    let markers = [
-        "thin", "extralight", "ultralight", "light",
-        "regular", "text", "book",
-        "medium", "semibold", "demibold", "demi",
-        "bold", "extrabold", "ultrabold",
-        "black", "heavy",
-    ];
-    if markers.iter().any(|m| lower.contains(m)) {
-        return ps_name.to_string();
-    }
-
-    // Insert weight: before "Italic"/"It" suffix, or append.
+    // Separate italic suffix — insert weight number before it.
     if let Some(idx) = ps_name.to_lowercase().find("italic") {
         let prefix = ps_name[..idx].trim_end_matches('-');
         let italic_part = &ps_name[idx..];
-        format!("{}-{}{}", prefix, weight_keyword, italic_part)
+        format!("{}-{}{}", prefix, weight_str, italic_part)
     } else if ps_name.ends_with("It") {
         let prefix = ps_name[..ps_name.len()-2].trim_end_matches('-');
-        format!("{}-{}It", prefix, weight_keyword)
+        format!("{}-{}It", prefix, weight_str)
     } else {
-        format!("{}-{}", ps_name, weight_keyword)
+        format!("{}-{}", ps_name, weight_str)
     }
 }
 
@@ -718,11 +897,11 @@ impl FontIdentity {
         self.weight / 100
     }
 
-    /// Two fonts are a "major" difference if family, italic, or weight bucket differ.
+    /// Two fonts are a "major" difference if family or italic differ.
+    /// Weight differences within the same family+italic are always minor.
     pub fn is_major_diff(&self, other: &FontIdentity) -> bool {
         self.family != other.family
             || self.italic != other.italic
-            || self.weight_bucket() != other.weight_bucket()
     }
 }
 
@@ -770,6 +949,7 @@ fn load_font_entry(path: &Path, aliases: &HashMap<String, Alias>) -> Option<Font
             .unwrap_or(400)
     };
     let postscript_name = make_weight_explicit(&raw_ps_name, os2_weight);
+    let typographic_family = read_typographic_family(&data);
 
     let stem = path
         .file_stem()
@@ -785,6 +965,7 @@ fn load_font_entry(path: &Path, aliases: &HashMap<String, Alias>) -> Option<Font
             path: path.to_path_buf(),
             family_name: alias.family.to_string(),
             postscript_name,
+            raw_postscript_name: raw_ps_name.clone(),
             is_bold: alias.bold,
             is_italic: alias.italic,
             class,
@@ -792,6 +973,8 @@ fn load_font_entry(path: &Path, aliases: &HashMap<String, Alias>) -> Option<Font
             oldstyle_figures,
             variant_tag: String::new(),
             glyph_overrides: None,
+            variations: None,
+            typographic_family,
         });
     }
 
@@ -806,6 +989,7 @@ fn load_font_entry(path: &Path, aliases: &HashMap<String, Alias>) -> Option<Font
         path: path.to_path_buf(),
         family_name,
         postscript_name,
+        raw_postscript_name: raw_ps_name,
         is_bold,
         is_italic,
         class,
@@ -813,5 +997,7 @@ fn load_font_entry(path: &Path, aliases: &HashMap<String, Alias>) -> Option<Font
         oldstyle_figures,
         variant_tag: String::new(),
         glyph_overrides: None,
+        variations: None,
+        typographic_family,
     })
 }
