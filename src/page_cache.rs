@@ -1,7 +1,10 @@
 //! Page-level cache for rasterized images and OCR results.
 //!
-//! Cache location: `~/.cache/unscan/page-cache/<key>/`
-//! Key: `<filename>-<file_size>-<mtime_secs>-<dpi>`
+//! Cache location: `/tmp/unscan-page-cache/<key>/`
+//! Key: `<filename>-<file_size>-<dpi>`
+//!
+//! Staleness: if the source PDF is newer than the cached page-0 image,
+//! the cache is invalidated and pages are re-rasterized.
 //!
 //! Per page:
 //!   - `page-N.png`       — rasterized page image
@@ -19,28 +22,37 @@ struct CachedOcr {
 }
 
 /// Build a cache key string from input file metadata + DPI.
+/// The key is stable across runs for the same file path + size + DPI;
+/// staleness is checked separately via `is_cache_stale`.
 pub fn cache_key(path: &Path, dpi: u32) -> Option<String> {
     let file_name = path.file_name()?.to_string_lossy();
     let meta = std::fs::metadata(path).ok()?;
     let size = meta.len();
-    let mtime = meta
-        .modified()
-        .ok()?
-        .duration_since(std::time::UNIX_EPOCH)
-        .ok()?
-        .as_secs();
     // Sanitize filename: replace anything that isn't alphanumeric, dot, or hyphen
     let safe_name: String = file_name
         .chars()
         .map(|c| if c.is_alphanumeric() || c == '.' || c == '-' { c } else { '_' })
         .collect();
-    Some(format!("{}-{}-{}-{}dpi", safe_name, size, mtime, dpi))
+    Some(format!("{}-{}-{}dpi", safe_name, size, dpi))
+}
+
+/// Return true if the source file is newer than the cached page-0 image,
+/// meaning the cache is stale and should be regenerated.
+pub fn is_cache_stale(cache_dir: &Path, source: &Path) -> bool {
+    let source_mtime = match std::fs::metadata(source).and_then(|m| m.modified()) {
+        Ok(t) => t,
+        Err(_) => return true, // can't stat source → treat as stale
+    };
+    let cached_page0 = cache_dir.join("page-0.png");
+    match std::fs::metadata(&cached_page0).and_then(|m| m.modified()) {
+        Ok(cache_mtime) => source_mtime > cache_mtime,
+        Err(_) => true, // no cached file → stale
+    }
 }
 
 /// Return the cache directory for a given key.
 pub fn cache_dir(key: &str) -> Option<PathBuf> {
-    let home = std::env::var("HOME").ok()?;
-    Some(PathBuf::from(home).join(".cache/unscan/page-cache").join(key))
+    Some(PathBuf::from("/tmp/unscan-page-cache").join(key))
 }
 
 /// Try to load a cached page image from disk.

@@ -1456,7 +1456,10 @@ fn build_char_table(
         let correct_score_label = correct_char_dist
             .map(|d| {
                 let dc = dist_class(d);
-                format!("<div class='sub'><span class='num {dc}'>{d:.6}</span></div>")
+                let rank_part = cv.gt_font_rank
+                    .map(|r| format!(" <span class='font-mini'>rank {r}</span>"))
+                    .unwrap_or_default();
+                format!("<div class='sub'><span class='num {dc}'>{d:.6}</span>{rank_part}</div>")
             })
             .unwrap_or_default();
 
@@ -1826,6 +1829,30 @@ pub fn generate_report(
         }
     };
 
+    // Per-character GT font rank statistics
+    let gt_rank_str = {
+        let mut all_ranks: Vec<usize> = classified.iter()
+            .flat_map(|ce| ce.entry.ci_char_votes.iter())
+            .filter_map(|cv| cv.gt_font_rank)
+            .collect();
+        all_ranks.sort();
+        if all_ranks.is_empty() {
+            String::new()
+        } else {
+            let n = all_ranks.len();
+            let median = all_ranks[n / 2];
+            let p90_idx = (n as f64 * 0.9).ceil() as usize;
+            let p90 = all_ranks[p90_idx.min(n - 1)];
+            let top1 = all_ranks.iter().filter(|&&r| r == 1).count();
+            let top10 = all_ranks.iter().filter(|&&r| r <= 10).count();
+            format!(
+                " | GT char rank: median={median} p90={p90} top1={top1}/{n} ({:.0}%) top10={top10}/{n} ({:.0}%)",
+                top1 as f64 / n as f64 * 100.0,
+                top10 as f64 / n as f64 * 100.0,
+            )
+        }
+    };
+
     let html = format!(
         "<!DOCTYPE html>\n\
          <html>\n\
@@ -1837,7 +1864,7 @@ pub fn generate_report(
          {CSS}\n\
          <h2>unscan miss report</h2>\n\
          <div class=\"summary\">{primary_hits}/{compared} correct ({pct:.1}%) — \
-         {n_major} major + {n_minor} minor misses{ssim_miss_str}{raster_str}{ocr_corr_str}{ssim_percentile_str}</div>\n\
+         {n_major} major + {n_minor} minor misses{ssim_miss_str}{raster_str}{ocr_corr_str}{ssim_percentile_str}{gt_rank_str}</div>\n\
          <div class=\"score-legend\">\n\
          <b>Score key:</b>\n\
          <b>CI score</b> (per-line) = −mean(log(dist²)) across characters; \

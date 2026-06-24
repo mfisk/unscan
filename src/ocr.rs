@@ -50,6 +50,21 @@ pub struct TextLine {
     pub raw_words: Vec<RawWordBBox>,
 }
 
+impl TextLine {
+    /// Union bbox of all final (post-processed) word bboxes.
+    /// Falls back to the line-level OCR bbox if there are no words.
+    pub fn word_union_bbox(&self) -> (u32, u32, u32, u32) {
+        if self.words.is_empty() {
+            return (self.x, self.y, self.width, self.height);
+        }
+        let x0 = self.words.iter().map(|w| w.x).min().unwrap();
+        let y0 = self.words.iter().map(|w| w.y).min().unwrap();
+        let x1 = self.words.iter().map(|w| w.x + w.width).max().unwrap();
+        let y1 = self.words.iter().map(|w| w.y + w.height).max().unwrap();
+        (x0, y0, x1 - x0, y1 - y0)
+    }
+}
+
 /// Lightweight snapshot of a Tesseract word bbox before post-processing.
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub struct RawWordBBox {

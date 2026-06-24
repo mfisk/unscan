@@ -1,4 +1,4 @@
-//! Compare all 100 features between a scan crop and two font renderings of the same character.
+//! Compare all FEAT_LEN features between a scan crop and two font renderings of the same character.
 //!
 //! Usage: feat_compare <crop.png> <char> <font1.ttf> <font2.ttf>
 
@@ -8,33 +8,29 @@ use image::GrayImage;
 use unscan::char_index::{self, compute_features, FEAT_LEN};
 
 const FEAT_NAMES: &[&str] = &[
-    // Group 1: Column ink profile (32)
+    // Group 1: Column ink profile (16)
     "col0","col1","col2","col3","col4","col5","col6","col7",
     "col8","col9","col10","col11","col12","col13","col14","col15",
-    "col16","col17","col18","col19","col20","col21","col22","col23",
-    "col24","col25","col26","col27","col28","col29","col30","col31",
     // Group 2: Scalar v1 (7)
     "aspect","ink_density","v_center","h_balance","serif_score","stroke_contrast","xh_cap_ratio",
-    // Group 3: Scalar v2 (18)
+    // Group 3: Scalar v2 (14)
     "counter_area","counter_cx","counter_cy","counter_asp",
     "term0","term1","term2","term3",
     "ink_perim","compactness",
-    "cross0","cross1","cross2","cross3","cross4","cross5","cross6","cross7",
-    // Group 4: Row ink profile (32)
+    "cross0","cross1","cross2","cross3",
+    // Group 4: Row ink profile (16)
     "row0","row1","row2","row3","row4","row5","row6","row7",
     "row8","row9","row10","row11","row12","row13","row14","row15",
-    "row16","row17","row18","row19","row20","row21","row22","row23",
-    "row24","row25","row26","row27","row28","row29","row30","row31",
     // Group 5: Scalar v3 (11)
     "hole_count","h_symmetry","v_symmetry","skel_branch","skel_endpt",
     "corner_count","quad_tl","quad_tr","quad_bl","quad_br","mean_stroke_w",
 ];
 
 fn group_name(i: usize) -> &'static str {
-    if i < 32 { "col_prof" }
-    else if i < 39 { "scal_v1" }
-    else if i < 57 { "scal_v2" }
-    else if i < 89 { "row_prof" }
+    if i < 16 { "col_prof" }
+    else if i < 23 { "scal_v1" }
+    else if i < 37 { "scal_v2" }
+    else if i < 53 { "row_prof" }
     else { "scal_v3" }
 }
 
