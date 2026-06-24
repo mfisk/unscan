@@ -2,7 +2,7 @@
 //! All-in-one triplet network trainer for unscan font classification.
 //!
 //! Renders glyphs from system fonts, computes features, trains a per-character
-//! 3-layer MLP (100→128→64→32) with triplet margin loss, and exports weights
+//! 3-layer MLP (FEAT_LEN→128→64→32) with triplet margin loss, and exports weights
 //! in the binary format consumed by TripletClassifier (magic b"TRIP").
 //!
 //! Zero disk I/O for training data — everything stays in memory.
@@ -131,7 +131,7 @@ struct Args {
 // Network architecture — matches classifier.rs exactly
 // ---------------------------------------------------------------------------
 
-const L1_IN: usize = FEAT_LEN;  // 100
+const L1_IN: usize = FEAT_LEN;  // 64 (was 100 at NORM_H=48)
 const L1_OUT: usize = 128;
 const L2_OUT: usize = 64;
 const L3_OUT: usize = 32;
@@ -741,8 +741,7 @@ fn main() {
 
     // ── 2. Render & extract features ──────────────────────────────
     // Write per-char binary feature files to disk to avoid OOM.
-    // Each file: sequence of (font_id: u32, features: [f32; 100]) = 404 bytes/sample.
-    // With ~10M samples × 404 bytes ≈ 4 GB on disk, but only ~38 MB per char in memory.
+    // Each file: sequence of (font_id: u32, features: [f32; FEAT_LEN]) per sample.
 
     let total_fonts = catalog.len();
     let progress = AtomicUsize::new(0);
@@ -782,18 +781,21 @@ fn main() {
         .map(|(i, &c)| (c, i))
         .collect();
 
-    // Create temp directory for per-char feature files.
-    // Default: subdirectory next to the output file (avoids tmpfs/ramdisk OOM).
+    // Training feature cache directory.
+    // Default: ~/.cache/unscan/training/ (XDG-compliant, persists across runs).
+    // Override with --tmpdir for custom location.
     let feat_dir = match &args.tmpdir {
-        Some(d) => d.join(".train_feat_tmp"),
+        Some(d) => d.clone(),
         None => {
-            let parent = args.output.parent()
-                .filter(|p| !p.as_os_str().is_empty() && *p != std::path::Path::new("/dev"))
-                .unwrap_or(std::path::Path::new("."));
-            parent.join(".train_feat_tmp")
+            let home = std::env::var("HOME").unwrap_or_else(|_| "/tmp".to_string());
+            std::path::PathBuf::from(home)
+                .join(".cache")
+                .join("unscan")
+                .join("training")
         }
     };
-    std::fs::create_dir_all(&feat_dir).expect("create feature temp dir");
+    std::fs::create_dir_all(&feat_dir).expect("create training cache dir");
+    eprintln!("Training cache: {}", feat_dir.display());
 
     // ── Determine which (height, aa) combos need rendering ───────
     // All possible combos (always render the full set so fast/normal share files)
@@ -902,6 +904,10 @@ fn main() {
                     let ci = char_to_idx[&c];
 
                     let gid = char_index::resolve_glyph(&font, c, overrides);
+                    // Use render_glyph_normalised — the EXACT same function
+                    // that builds the char index and generates audit report
+                    // reference images.  This ensures training features live
+                    // in the same image domain as index & scan features.
                     let full = match char_index::render_glyph_normalised(&font, gid) {
                         Some(img) => img,
                         None => continue,
@@ -913,10 +919,13 @@ fn main() {
                         if !aa_needed { continue; }
 
                         let aa_full = aa.apply(&full);
-                        let (fw, fh) = aa_full.dimensions();
-                        if fh == 0 || fw == 0 { continue; }
 
-                        let full_normed = char_index::normalize_to_ink_bounds(&aa_full);
+                        // normalize_to_ink_bounds handles tight ink crop +
+                        // 1px pad + Lanczos3 resize to NORM_H.  For the
+                        // native AA variant this is nearly a no-op (image
+                        // is already at NORM_H), but it still ensures the
+                        // canonical geometry.
+                        let normed = char_index::normalize_to_ink_bounds(&aa_full);
 
                         for &ht in all_heights {
                             if !needed_set.contains(&(ht, aa_idx_all)) { continue; }
@@ -925,22 +934,9 @@ fn main() {
                                 .position(|&(h, a)| h == ht && a == aa_idx_all)
                                 .unwrap();
 
-                            let img = if ht >= 48 {
-                                match full_normed {
-                                    Some(ref img) => img.clone(),
-                                    None => continue,
-                                }
-                            } else {
-                                let scale = ht as f32 / fh as f32;
-                                let new_w = ((fw as f32 * scale).round() as u32).max(1);
-                                let small = image::imageops::resize(
-                                    &aa_full, new_w, ht,
-                                    image::imageops::FilterType::Lanczos3,
-                                );
-                                match char_index::normalize_to_ink_bounds(&small) {
-                                    Some(img) => img,
-                                    None => continue,
-                                }
+                            let img = match normed {
+                                Some(ref img) => img.clone(),
+                                None => continue,
                             };
 
                             let feats = match compute_features(&img) {
@@ -1226,7 +1222,7 @@ fn main() {
                 (fid, mean)
             }).collect();
 
-            // Compute within-class scatter matrix Sw (100×100)
+            // Compute within-class scatter matrix Sw (FEAT_LEN×FEAT_LEN)
             let mut sw = vec![0.0f64; FEAT_LEN * FEAT_LEN];
             for (&fid, indices) in &font_indices {
                 let cm = &class_means[&fid];
@@ -1490,7 +1486,7 @@ fn main() {
                 (fid, mean)
             }).collect();
 
-            // Within-class scatter Sw (symmetric 100×100)
+            // Within-class scatter Sw (symmetric FEAT_LEN×FEAT_LEN)
             let mut sw = vec![0.0f64; FEAT_LEN * FEAT_LEN];
             for (&fid, indices) in &font_indices {
                 let cm = &class_means[&fid];

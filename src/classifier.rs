@@ -1,6 +1,6 @@
 //! Pluggable font classifiers for the character index.
 //!
-//! A **classifier** transforms raw 100-dim feature vectors into an embedding
+//! A **classifier** transforms raw FEAT_LEN-dim feature vectors into an embedding
 //! space and defines a distance metric in that space.  The character index
 //! stores embedded vectors and uses the classifier's distance function for
 //! nearest-neighbor search.
@@ -9,7 +9,7 @@
 //!
 //! - [`FisherClassifier`]: the original diagonal Fisher-weighted Euclidean
 //!   distance.  Equivalent to the pre-refactor behaviour.
-//! - [`TripletClassifier`]: per-glyph learned 3-layer MLPs (100→128→64→32)
+//! - [`TripletClassifier`]: per-glyph learned 3-layer MLPs (FEAT_LEN→128→64→32)
 //!   trained with triplet loss.  One network per indexed character.
 
 use crate::char_index::{CharFeatures, FEAT_LEN};
@@ -24,18 +24,70 @@ use std::collections::HashMap;
 // Trait
 // ---------------------------------------------------------------------------
 
-/// A font classifier that stores per-font representations at index time
-/// and ranks candidates against a query glyph at search time.
-pub trait Classifier: Send + Sync {
+/// Index-time methods for a classifier.  These are implementation details
+/// of how the character index stores font representations; query-time code
+/// should use [`Classifier::classify`] or [`Classifier::rank`] instead.
+pub(crate) trait ClassifierIndex {
     /// Dimensionality of the stored representation per font entry.
     fn prepare_dim(&self) -> usize;
 
     /// Compute the stored representation for a font entry at index build time.
     ///
     /// The `ch` parameter identifies which character the features represent.
-    /// The returned vector is stored in the index and passed back to [`rank`]
+    /// The returned vector is stored in the index and passed to [`Classifier::classify`]
     /// at query time.
     fn prepare(&self, ch: char, features: &CharFeatures) -> Vec<f32>;
+}
+
+/// A font classifier that identifies fonts from character glyph images.
+///
+/// At **index build time**, [`ClassifierIndex::prepare`] computes a stored
+/// representation for each font's rendering of a character.
+///
+/// At **query time**, [`classify`] takes a crop's features and all stored
+/// representations for that character, and returns the best-matching font(s).
+/// When multiple fonts tie at the best score, all are returned.
+///
+/// The default [`classify`] implementation embeds the query via
+/// [`ClassifierIndex::prepare`] and picks the font(s) with the smallest
+/// squared Euclidean distance.  Classifiers that score fonts directly
+/// (e.g. softmax MLP) should override [`classify`] to bypass embedding
+/// entirely.
+pub trait Classifier: ClassifierIndex + Send + Sync {
+    /// Classify a single character crop: return the best-matching font(s).
+    ///
+    /// Returns `(font_id, distance)` for the best match.  When multiple fonts
+    /// are tied at the same best distance, all tied entries are returned.
+    /// Lower distance = better match.
+    ///
+    /// `candidates` contains `(font_id, stored_representation)` pairs from
+    /// the index, where each representation was produced by [`prepare`].
+    ///
+    /// The default implementation embeds the query via [`prepare`], computes
+    /// squared Euclidean distance to every candidate, and returns ties at the
+    /// minimum.  Override this for classifiers that don't use embeddings.
+    fn classify(
+        &self,
+        ch: char,
+        query: &CharFeatures,
+        candidates: &[(usize, Vec<f32>)],
+    ) -> Vec<(usize, f32)> {
+        let q = self.prepare(ch, query);
+        let mut all: Vec<(usize, f32)> = candidates
+            .iter()
+            .map(|(id, stored)| (*id, sq_euclid(&q, stored)))
+            .collect();
+        if all.is_empty() {
+            return Vec::new();
+        }
+        all.sort_by(|a, b| a.1.partial_cmp(&b.1).unwrap_or(std::cmp::Ordering::Equal));
+        // K=10 plus ties: find the distance at rank 10 (or last if fewer),
+        // then return everything up to that distance.
+        let k = 10.min(all.len());
+        let cutoff_dist = all[k - 1].1;
+        let eps = cutoff_dist * 1e-5 + 1e-10;
+        all.into_iter().filter(|(_, d)| *d <= cutoff_dist + eps).collect()
+    }
 
     /// Rank all candidates for a character against a query glyph.
     ///
@@ -93,7 +145,7 @@ fn rank_by_embedding(
 /// Distance is plain squared Euclidean in the weighted space.
 pub struct FisherClassifier;
 
-impl Classifier for FisherClassifier {
+impl ClassifierIndex for FisherClassifier {
     fn prepare_dim(&self) -> usize {
         FEAT_LEN
     }
@@ -106,7 +158,9 @@ impl Classifier for FisherClassifier {
         }
         v
     }
+}
 
+impl Classifier for FisherClassifier {
     fn rank<'a>(
         &'a self,
         _ch: char,
@@ -126,7 +180,7 @@ impl Classifier for FisherClassifier {
 // Triplet network (per-glyph)
 // ---------------------------------------------------------------------------
 
-const L1_IN: usize = FEAT_LEN; // 100
+const L1_IN: usize = FEAT_LEN;
 const L1_OUT: usize = 128;
 const L2_OUT: usize = 64;
 const L3_OUT: usize = 32;
@@ -139,7 +193,7 @@ const PARAMS_PER_CHAR: usize =
 
 /// Weights for a single character's MLP.
 struct GlyphNet {
-    w1: Vec<f32>, // 100 × 128 row-major
+    w1: Vec<f32>, // L1_IN × 128 row-major
     b1: Vec<f32>, // 128
     w2: Vec<f32>, // 128 × 64
     b2: Vec<f32>, // 64
@@ -207,7 +261,7 @@ impl GlyphNet {
 /// n_chars: u32 LE
 /// Per character (repeated n_chars times):
 ///   char_code: u32 LE (Unicode codepoint)
-///   W1: 100×128 f32 LE, b1: 128 f32 LE
+///   W1: L1_IN×128 f32 LE, b1: 128 f32 LE
 ///   W2: 128×64 f32 LE,  b2: 64 f32 LE
 ///   W3: 64×32 f32 LE,   b3: 32 f32 LE
 /// ```
@@ -300,7 +354,7 @@ impl TripletClassifier {
     }
 }
 
-impl Classifier for TripletClassifier {
+impl ClassifierIndex for TripletClassifier {
     fn prepare_dim(&self) -> usize {
         L3_OUT
     }
@@ -313,7 +367,9 @@ impl Classifier for TripletClassifier {
             fisher[..L3_OUT.min(fisher.len())].to_vec()
         }
     }
+}
 
+impl Classifier for TripletClassifier {
     fn rank<'a>(
         &'a self,
         ch: char,
@@ -347,7 +403,7 @@ impl Classifier for TripletClassifier {
 /// ```text
 /// magic:   b"TRPG" (4 bytes)
 /// version: u32 LE (1)
-/// W1: 100×128 f32 LE, b1: 128 f32 LE
+/// W1: L1_IN×128 f32 LE, b1: 128 f32 LE
 /// W2: 128×64 f32 LE,  b2: 64 f32 LE
 /// W3: 64×32 f32 LE,   b3: 32 f32 LE
 /// Total: 8 + 23 264 × 4 = 93 064 bytes
@@ -418,7 +474,7 @@ impl GlobalTripletClassifier {
     }
 }
 
-impl Classifier for GlobalTripletClassifier {
+impl ClassifierIndex for GlobalTripletClassifier {
     fn prepare_dim(&self) -> usize {
         L3_OUT
     }
@@ -426,7 +482,9 @@ impl Classifier for GlobalTripletClassifier {
     fn prepare(&self, _ch: char, features: &CharFeatures) -> Vec<f32> {
         self.net.forward(&features.as_slice())
     }
+}
 
+impl Classifier for GlobalTripletClassifier {
     fn rank<'a>(
         &'a self,
         ch: char,
@@ -457,7 +515,7 @@ impl Classifier for GlobalTripletClassifier {
 /// magic:    b"FISH" (4 bytes)
 /// version:  u32 LE (1)
 /// n_chars:  u32 LE
-/// feat_len: u32 LE (100)
+/// feat_len: u32 LE (FEAT_LEN)
 /// Per character (repeated n_chars times):
 ///   char_code: u32 LE
 ///   weights:   [f32; FEAT_LEN] LE
@@ -533,7 +591,7 @@ impl PerCharFisherClassifier {
     }
 }
 
-impl Classifier for PerCharFisherClassifier {
+impl ClassifierIndex for PerCharFisherClassifier {
     fn prepare_dim(&self) -> usize {
         FEAT_LEN
     }
@@ -549,7 +607,9 @@ impl Classifier for PerCharFisherClassifier {
         }
         v
     }
+}
 
+impl Classifier for PerCharFisherClassifier {
     fn rank<'a>(
         &'a self,
         ch: char,
@@ -655,7 +715,7 @@ impl MahalanobisClassifier {
     }
 }
 
-impl Classifier for MahalanobisClassifier {
+impl ClassifierIndex for MahalanobisClassifier {
     fn prepare_dim(&self) -> usize {
         FEAT_LEN
     }
@@ -672,7 +732,9 @@ impl Classifier for MahalanobisClassifier {
             v
         }
     }
+}
 
+impl Classifier for MahalanobisClassifier {
     fn rank<'a>(
         &'a self,
         ch: char,
@@ -783,7 +845,7 @@ impl LdaClassifier {
     }
 }
 
-impl Classifier for LdaClassifier {
+impl ClassifierIndex for LdaClassifier {
     fn prepare_dim(&self) -> usize {
         // Variable per char; return max across all chars
         self.projections.values().map(|(d, _)| *d).max().unwrap_or(FEAT_LEN)
@@ -802,7 +864,9 @@ impl Classifier for LdaClassifier {
             v
         }
     }
+}
 
+impl Classifier for LdaClassifier {
     fn rank<'a>(
         &'a self,
         ch: char,
@@ -986,7 +1050,7 @@ impl MlpClassifier {
     }
 }
 
-impl Classifier for MlpClassifier {
+impl ClassifierIndex for MlpClassifier {
     fn prepare_dim(&self) -> usize {
         // We store only the font_id (as f32) for each candidate.
         // The MLP does not use stored embeddings — it classifies the query
@@ -1001,7 +1065,9 @@ impl Classifier for MlpClassifier {
         // we must return exactly 1 element. We store 0.0 as a placeholder.
         vec![0.0]
     }
+}
 
+impl Classifier for MlpClassifier {
     fn rank<'a>(
         &'a self,
         ch: char,
@@ -1080,7 +1146,7 @@ impl FusionClassifier {
     }
 }
 
-impl Classifier for FusionClassifier {
+impl ClassifierIndex for FusionClassifier {
     fn prepare_dim(&self) -> usize {
         // Sum of all children's dims + 1 length header per child
         self.children.iter()
@@ -1098,7 +1164,9 @@ impl Classifier for FusionClassifier {
         }
         result
     }
+}
 
+impl Classifier for FusionClassifier {
     fn rank<'a>(
         &'a self,
         ch: char,

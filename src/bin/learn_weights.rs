@@ -22,23 +22,19 @@ use unscan::char_index::{self, compute_features, FEAT_LEN};
 use unscan::font_scan;
 
 const FEAT_NAMES: &[&str] = &[
-    // Group 1: Column ink profile (32)
+    // Group 1: Column ink profile (16)
     "col0","col1","col2","col3","col4","col5","col6","col7",
     "col8","col9","col10","col11","col12","col13","col14","col15",
-    "col16","col17","col18","col19","col20","col21","col22","col23",
-    "col24","col25","col26","col27","col28","col29","col30","col31",
     // Group 2: Scalar v1 (7)
     "aspect","ink_density","v_center","h_balance","serif_score","stroke_contrast","xh_cap_ratio",
-    // Group 3: Scalar v2 (18)
+    // Group 3: Scalar v2 (14)
     "counter_area","counter_cx","counter_cy","counter_asp",
     "term0","term1","term2","term3",
     "ink_perim","compactness",
-    "cross0","cross1","cross2","cross3","cross4","cross5","cross6","cross7",
-    // Group 4: Row ink profile (32)
+    "cross0","cross1","cross2","cross3",
+    // Group 4: Row ink profile (16)
     "row0","row1","row2","row3","row4","row5","row6","row7",
     "row8","row9","row10","row11","row12","row13","row14","row15",
-    "row16","row17","row18","row19","row20","row21","row22","row23",
-    "row24","row25","row26","row27","row28","row29","row30","row31",
     // Group 5: Scalar v3 (11)
     "hole_count","h_symmetry","v_symmetry","skel_branch","skel_endpt",
     "corner_count","quad_tl","quad_tr","quad_bl","quad_br","mean_stroke_w",
@@ -326,28 +322,28 @@ fn main() {
     let mut order: Vec<usize> = (0..FEAT_LEN).collect();
     order.sort_by(|a, b| fisher[*b].partial_cmp(&fisher[*a]).unwrap_or(std::cmp::Ordering::Equal));
     for (rank, &i) in order.iter().enumerate() {
-        let group = if i < 32 { "col_prof" }
-            else if i < 39 { "scal_v1" }
-            else if i < 57 { "scal_v2" }
-            else if i < 89 { "row_prof" }
+        let group = if i < 16 { "col_prof" }
+            else if i < 23 { "scal_v1" }
+            else if i < 37 { "scal_v2" }
+            else if i < 53 { "row_prof" }
             else { "scal_v3" };
         println!("{:>4} {:>4} {:>16} {:>12.6} {:>12.6} {:>12.2} {:>8.4}  {}",
             rank + 1, i, FEAT_NAMES[i], signal[i], noise[i], fisher[i], norm_weights[i], group);
     }
 
     // Group totals
-    let col_prof_wt: f64 = norm_weights[..32].iter().sum();
-    let scal_v1_wt: f64 = norm_weights[32..39].iter().sum();
-    let scal_v2_wt: f64 = norm_weights[39..57].iter().sum();
-    let row_prof_wt: f64 = norm_weights[57..89].iter().sum();
-    let scal_v3_wt: f64 = norm_weights[89..].iter().sum();
+    let col_prof_wt: f64 = norm_weights[..16].iter().sum();
+    let scal_v1_wt: f64 = norm_weights[16..23].iter().sum();
+    let scal_v2_wt: f64 = norm_weights[23..37].iter().sum();
+    let row_prof_wt: f64 = norm_weights[37..53].iter().sum();
+    let scal_v3_wt: f64 = norm_weights[53..].iter().sum();
     println!("\n={:=>94}", "");
     println!("GROUP WEIGHTS — CURRENT vs OPTIMAL");
     println!("={:=>94}", "");
-    println!("  {:30}  current: 0.4000  optimal: {:.4}", "Col profile (32 dims)", col_prof_wt);
+    println!("  {:30}  current: 0.4000  optimal: {:.4}", "Col profile (16 dims)", col_prof_wt);
     println!("  {:30}  current: 0.3000  optimal: {:.4}", "Scalar v1 (7 dims)", scal_v1_wt);
-    println!("  {:30}  current: 0.3000  optimal: {:.4}", "Scalar v2 (18 dims)", scal_v2_wt);
-    println!("  {:30}  current: 0.3000  optimal: {:.4}", "Row profile (32 dims)", row_prof_wt);
+    println!("  {:30}  current: 0.3000  optimal: {:.4}", "Scalar v2 (14 dims)", scal_v2_wt);
+    println!("  {:30}  current: 0.3000  optimal: {:.4}", "Row profile (16 dims)", row_prof_wt);
     println!("  {:30}  current: 0.2000  optimal: {:.4}", "Scalar v3 (11 dims)", scal_v3_wt);
 
     // Scalar detail — all scalar groups
@@ -355,15 +351,15 @@ fn main() {
     println!("SCALAR FEATURES — v1");
     println!("={:=>94}", "");
     for j in 0..7 {
-        let i = 32 + j;
+        let i = 16 + j;
         println!("  {:>16}  signal={:.6}  noise={:.6}  fisher={:.2}  wt={:.4}",
             FEAT_NAMES[i], signal[i], noise[i], fisher[i], norm_weights[i]);
     }
     println!("\n={:=>94}", "");
     println!("SCALAR FEATURES — v2");
     println!("={:=>94}", "");
-    for j in 0..18 {
-        let i = 39 + j;
+    for j in 0..14 {
+        let i = 23 + j;
         println!("  {:>16}  signal={:.6}  noise={:.6}  fisher={:.2}  wt={:.4}",
             FEAT_NAMES[i], signal[i], noise[i], fisher[i], norm_weights[i]);
     }
@@ -371,7 +367,7 @@ fn main() {
     println!("SCALAR FEATURES — v3");
     println!("={:=>94}", "");
     for j in 0..11 {
-        let i = 89 + j;
+        let i = 53 + j;
         println!("  {:>16}  signal={:.6}  noise={:.6}  fisher={:.2}  wt={:.4}",
             FEAT_NAMES[i], signal[i], noise[i], fisher[i], norm_weights[i]);
     }
@@ -382,11 +378,11 @@ fn main() {
     println!("={:=>94}", "");
     println!("const FISHER_WEIGHTS: [f32; FEAT_LEN] = [");
     for (start, end, label) in [
-        (0, 32, "Col profile"),
-        (32, 39, "Scalar v1"),
-        (39, 57, "Scalar v2"),
-        (57, 89, "Row profile"),
-        (89, 100, "Scalar v3"),
+        (0, 16, "Col profile"),
+        (16, 23, "Scalar v1"),
+        (23, 37, "Scalar v2"),
+        (37, 53, "Row profile"),
+        (53, 64, "Scalar v3"),
     ] {
         let vals: Vec<String> = (start..end).map(|i| format!("{:.6}", norm_scale_adj[i])).collect();
         println!("    // {}", label);

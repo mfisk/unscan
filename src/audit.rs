@@ -110,6 +110,11 @@ pub struct CharCiVote {
     /// Only populated when --audit is provided and --audit is active.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub gt_font_dist_sq: Option<f32>,
+    /// 1-based rank of the ground-truth font among all fonts for this
+    /// character, sorted by distance (1 = closest).  `None` when GT font
+    /// is unknown or not in the index for this character.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub gt_font_rank: Option<usize>,
 }
 
 #[derive(Debug, Serialize, Clone)]

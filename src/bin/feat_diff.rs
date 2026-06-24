@@ -7,21 +7,25 @@ use image::ImageReader;
 use unscan::char_index::{compute_features, FEAT_LEN};
 
 const NAMES: &[&str] = &[
-    // 0..31: column profile bins
+    // 0..15: column profile bins (16)
     "prof[0]", "prof[1]", "prof[2]", "prof[3]", "prof[4]", "prof[5]", "prof[6]", "prof[7]",
     "prof[8]", "prof[9]", "prof[10]", "prof[11]", "prof[12]", "prof[13]", "prof[14]", "prof[15]",
-    "prof[16]", "prof[17]", "prof[18]", "prof[19]", "prof[20]", "prof[21]", "prof[22]", "prof[23]",
-    "prof[24]", "prof[25]", "prof[26]", "prof[27]", "prof[28]", "prof[29]", "prof[30]", "prof[31]",
-    // 32..38: original scalars
+    // 16..22: original scalars (7)
     "aspect", "ink_density", "v_center", "h_balance", "serif_score", "stroke_contrast", "xh_cap_ratio",
-    // 39..42: counter features
+    // 23..26: counter features (4)
     "counter_area", "counter_cx", "counter_cy", "counter_asp",
-    // 43..46: terminal angles
+    // 27..30: terminal angles (4)
     "term[0]", "term[1]", "term[2]", "term[3]",
-    // 47..48: boundary
+    // 31..32: boundary (2)
     "ink_perim", "compactness",
-    // 49..56: h_crossings
-    "cross[0]", "cross[1]", "cross[2]", "cross[3]", "cross[4]", "cross[5]", "cross[6]", "cross[7]",
+    // 33..36: h_crossings (4)
+    "cross[0]", "cross[1]", "cross[2]", "cross[3]",
+    // 37..52: row profile bins (16)
+    "row[0]", "row[1]", "row[2]", "row[3]", "row[4]", "row[5]", "row[6]", "row[7]",
+    "row[8]", "row[9]", "row[10]", "row[11]", "row[12]", "row[13]", "row[14]", "row[15]",
+    // 53..63: scalar v3 (11)
+    "hole_count", "h_symmetry", "v_symmetry", "skel_branch", "skel_endpt",
+    "corner_count", "quad_tl", "quad_tr", "quad_bl", "quad_br", "mean_stroke_w",
 ];
 
 fn main() {

@@ -528,8 +528,10 @@ fn run(args: &cli::Args, classifier: &dyn classifier::Classifier) -> Result<(), 
 
     // Try loading all pages from cache first.
     let (pages, raster_cached) = if let Some(ref cdir) = cache_dir {
-        // Probe page-0 to see if cache is populated; then load all sequentially.
-        if page_cache::load_cached_image(cdir, 0).is_some() {
+        // Check if cache is stale (source PDF newer than cached images).
+        if page_cache::is_cache_stale(cdir, input) {
+            (load_pages(input, args.dpi)?, false)
+        } else if page_cache::load_cached_image(cdir, 0).is_some() {
             let mut cached_pages = Vec::new();
             let mut idx = 0;
             while let Some(img) = page_cache::load_cached_image(cdir, idx) {
@@ -681,7 +683,7 @@ fn run(args: &cli::Args, classifier: &dyn classifier::Classifier) -> Result<(), 
         // (bg - 56) counts as ink (works for both light and dark backgrounds).
         let ink_thresh = bg_color.0.saturating_sub(56);
         let _t_pre = std::time::Instant::now();
-        ocr::expand_bbox_to_ink(&mut lines, &gray_page, ink_thresh);
+        // Word-level ink expansion (italic overshoot, etc.)
         ocr::expand_words_to_ink(&mut lines, &gray_page, ink_thresh);
         let mut placed_texts: Vec<pdf_out::PlacedText> = Vec::new();
         let mut pg_vec = 0u32;
@@ -701,6 +703,8 @@ fn run(args: &cli::Args, classifier: &dyn classifier::Classifier) -> Result<(), 
             chosen_char_dists: std::collections::HashMap<usize, f32>,
             /// Per-char distances to the ground-truth font (--audit mode), keyed by crop_index.
             gt_font_char_dists: std::collections::HashMap<usize, f32>,
+            /// Per-char rank (1-based) of the ground-truth font among all fonts, keyed by crop_index.
+            gt_font_char_ranks: std::collections::HashMap<usize, usize>,
             /// CI tie-break candidates with per-candidate SSIM scores.
             tie_candidates: Vec<audit::TieCandidate>,
         }
@@ -728,14 +732,16 @@ fn run(args: &cli::Args, classifier: &dyn classifier::Classifier) -> Result<(), 
         let line_matches: Vec<LineMatch> = lines.par_iter().enumerate().map(|(li, line)| {
             let line_num = li + 1; // 1-indexed for output
             let line_start = std::time::Instant::now();
+            // Word-union bbox: the union of all final (post-processed) word bboxes.
+            // This is the "good" bbox that matches what the report draws.
+            let (bx, by, bw, bh) = line.word_union_bbox();
             // ── Fast path: try dominant font via SSIM ────────────────
             if let (Some(fm), Some(ref fd)) = (fast_path_candidate, &fast_path_font_data) {
                 let (score, _dy) = verify::verify_text_region(
                     &gray_page,
                     fd.as_slice(),
                     &line.text,
-                    line.x, line.y,
-                    line.width, line.height,
+                    bx, by, bw, bh,
                     &line.words,
                     fm.glyph_overrides.as_deref(),
                     &fm.variant_tag,
@@ -770,6 +776,7 @@ fn run(args: &cli::Args, classifier: &dyn classifier::Classifier) -> Result<(), 
                         diag_seg_dir: None,
                         chosen_char_dists: std::collections::HashMap::new(),
                         gt_font_char_dists: std::collections::HashMap::new(),
+                        gt_font_char_ranks: std::collections::HashMap::new(),
                         tie_candidates: Vec::new(),
                     };
                 } else if li < 3 {
@@ -935,7 +942,7 @@ fn run(args: &cli::Args, classifier: &dyn classifier::Classifier) -> Result<(), 
                             });
                             let (ssim, dy) = verify::verify_text_region(
                                 &gray_page, &fd, &line.text,
-                                line.x, line.y, line.width, line.height,
+                                bx, by, bw, bh,
                                 &line.words,
                                 fe.glyph_overrides.as_deref(), &fe.variant_tag,
                                 fe.variations.as_deref(),
@@ -1047,7 +1054,7 @@ fn run(args: &cli::Args, classifier: &dyn classifier::Classifier) -> Result<(), 
             let pcd_t0 = std::time::Instant::now();
 
             // Per-char distances and audit detail: only for miss lines when full audit is active
-            let (chosen_char_dists, gt_font_char_dists) = if is_miss && args.full_audit() {
+            let (chosen_char_dists, gt_font_char_dists, gt_font_char_ranks) = if is_miss && args.full_audit() {
                 // Precompute features once for all per-char distance lookups
                 let crop_feats = char_index::precompute_crop_features(&corrected_char_crops, classifier);
 
@@ -1064,8 +1071,8 @@ fn run(args: &cli::Args, classifier: &dyn classifier::Classifier) -> Result<(), 
                     std::collections::HashMap::new()
                 };
 
-                // Per-char distances to the ground-truth font (if known)
-                let gt_dists: std::collections::HashMap<usize, f32> = if let Some(ref gt) = ground_truth {
+                // Per-char distances and ranks for the ground-truth font (if known)
+                let (gt_dists, gt_ranks): (std::collections::HashMap<usize, f32>, std::collections::HashMap<usize, usize>) = if let Some(ref gt) = ground_truth {
                     let bbox_px = [line.x as f32, line.y as f32,
                                    (line.x + line.width) as f32,
                                    (line.y + line.height) as f32];
@@ -1085,18 +1092,20 @@ fn run(args: &cli::Args, classifier: &dyn classifier::Classifier) -> Result<(), 
                                 ci_top_for_audit.push((gk.clone(), gt_ci_score));
                             }
                             // Compute per-char distances to the GT font
-                            char_index::per_char_distances_precomputed(&char_index, gk, &crop_feats)
+                            let dists = char_index::per_char_distances_precomputed(&char_index, gk, &crop_feats)
                                 .into_iter()
                                 .map(|(_, crop_idx, d2)| (crop_idx, d2))
-                                .collect()
+                                .collect();
+                            let ranks = char_index::gt_font_ranks(&char_index, gk, &crop_feats, &corrected_char_crops, classifier);
+                            (dists, ranks)
                         } else {
-                            std::collections::HashMap::new()
+                            (std::collections::HashMap::new(), std::collections::HashMap::new())
                         }
                     } else {
-                        std::collections::HashMap::new()
+                        (std::collections::HashMap::new(), std::collections::HashMap::new())
                     }
                 } else {
-                    std::collections::HashMap::new()
+                    (std::collections::HashMap::new(), std::collections::HashMap::new())
                 };
 
                 // Save crop PNGs for miss lines
@@ -1112,27 +1121,20 @@ fn run(args: &cli::Args, classifier: &dyn classifier::Classifier) -> Result<(), 
                         }
                     }
 
-                    // Save full-colour scan line crop for report overlay
-                    // Crop region = union of all word bboxes (raw + final) with padding
-                    let all_wbs: Vec<(u32, u32, u32, u32)> = line.words.iter()
-                        .map(|w| (w.x, w.y, w.width, w.height))
-                        .chain(
-                            line.raw_words.iter()
-                                .map(|w| (w.x, w.y, w.width, w.height))
-                        )
-                        .collect();
-                    if !all_wbs.is_empty() {
-                        let pad = 4u32;
-                        let ux = all_wbs.iter().map(|b| b.0).min().unwrap().saturating_sub(pad);
-                        let uy = all_wbs.iter().map(|b| b.1).min().unwrap().saturating_sub(pad);
-                        let ur = all_wbs.iter().map(|b| b.0 + b.2).max().unwrap().saturating_add(pad).min(page_img.width());
-                        let ub = all_wbs.iter().map(|b| b.1 + b.3).max().unwrap().saturating_add(pad).min(page_img.height());
-                        if ur > ux && ub > uy {
-                            let crop = image::imageops::crop_imm(page_img, ux, uy, ur - ux, ub - uy).to_image();
+                    // Save full-colour scan line crop for report overlay.
+                    // Use the word-union bbox — same bbox that SSIM uses.
+                    {
+                        let (wbx, wby, wbw, wbh) = line.word_union_bbox();
+                        let lx = wbx.min(page_img.width().saturating_sub(1));
+                        let ly = wby.min(page_img.height().saturating_sub(1));
+                        let lw = wbw.min(page_img.width() - lx);
+                        let lh = wbh.min(page_img.height() - ly);
+                        if lw >= 3 && lh >= 3 {
+                            let crop = image::imageops::crop_imm(page_img, lx, ly, lw, lh).to_image();
                             let _ = crop.save(ddir.join("scan_line.png"));
                             let _ = std::fs::write(
                                 ddir.join("scan_line_origin.json"),
-                                format!("{{\"x\":{},\"y\":{}}}", ux, uy),
+                                format!("{{\"x\":{},\"y\":{}}}", lx, ly),
                             );
                         }
                     }
@@ -1190,14 +1192,14 @@ fn run(args: &cli::Args, classifier: &dyn classifier::Classifier) -> Result<(), 
                     }
                 }
 
-                (chosen, gt_dists)
+                (chosen, gt_dists, gt_ranks)
             } else {
-                (std::collections::HashMap::new(), std::collections::HashMap::new())
+                (std::collections::HashMap::new(), std::collections::HashMap::new(), std::collections::HashMap::new())
             };
             prof_pcd_us.fetch_add(pcd_t0.elapsed().as_micros() as u64, std::sync::atomic::Ordering::Relaxed);
 
             prof_full_us.fetch_add(line_start.elapsed().as_micros() as u64, std::sync::atomic::Ordering::Relaxed);
-            LineMatch { font_result, text_color, ci_top_for_audit, ci_char_detail, ci_top_for_audit_lig, ci_char_detail_lig, seg_winner, diag_seg_dir, chosen_char_dists, gt_font_char_dists, tie_candidates: tie_candidates_audit }
+            LineMatch { font_result, text_color, ci_top_for_audit, ci_char_detail, ci_top_for_audit_lig, ci_char_detail_lig, seg_winner, diag_seg_dir, chosen_char_dists, gt_font_char_dists, gt_font_char_ranks, tie_candidates: tie_candidates_audit }
         }).collect();
 
         // Update dominant font candidate for next page from this page's results
@@ -1304,12 +1306,12 @@ fn run(args: &cli::Args, classifier: &dyn classifier::Classifier) -> Result<(), 
                 if let Some(ref fm) = font_result {
                     let font_data = font_cache.load(&fm.font_path).ok();
                     if let Some(ref fd) = font_data {
+                        let (bx, by, bw, bh) = line.word_union_bbox();
                         let (score, _dy) = verify::verify_text_region(
                             &gray_page,
                             fd.as_slice(),
                             &line.text,
-                            line.x, line.y,
-                            line.width, line.height,
+                            bx, by, bw, bh,
                             &line.words,
                             fm.glyph_overrides.as_deref(),
                             &fm.variant_tag,
@@ -1422,6 +1424,7 @@ fn run(args: &cli::Args, classifier: &dyn classifier::Classifier) -> Result<(), 
                     .map(|d| {
                         let chosen_d2 = lm.chosen_char_dists.get(&d.crop_index).copied();
                         let gt_d2 = lm.gt_font_char_dists.get(&d.crop_index).copied();
+                        let gt_rank = lm.gt_font_char_ranks.get(&d.crop_index).copied();
                         audit::CharCiVote {
                             ch: d.ch,
                             crop_index: d.crop_index,
@@ -1434,6 +1437,7 @@ fn run(args: &cli::Args, classifier: &dyn classifier::Classifier) -> Result<(), 
                             best_alt_char: d.best_alt_char,
                             best_alt_dist: d.best_alt_dist,
                             gt_font_dist_sq: gt_d2,
+                            gt_font_rank: gt_rank,
                         }
                     })
                     .collect(),
@@ -1454,6 +1458,7 @@ fn run(args: &cli::Args, classifier: &dyn classifier::Classifier) -> Result<(), 
                             best_alt_char: d.best_alt_char,
                             best_alt_dist: d.best_alt_dist,
                             gt_font_dist_sq: None,
+                            gt_font_rank: None,
                         }
                     })
                     .collect(),

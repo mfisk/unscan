@@ -182,10 +182,11 @@ Characters that appear multiple times (e.g., 'e' extracted from three different
 words) each contribute independently to the score.
 
 **Missing character handling:** If a font doesn't contain a query character,
-that character gets a score contribution of `log(1.0) = 0` — neutral. It
-doesn't help the font, but it doesn't penalize it either. This padding
-mechanism handles the common case where a font lacks ligature glyphs or
-obscure punctuation without unfairly punishing it.
+that character gets `MISSING_GLYPH_PENALTY = f32::INFINITY`. A font that
+cannot render even one character in the line is categorically disqualified —
+the infinite penalty makes the aggregate score non-finite, which causes the
+font to be filtered out of the candidate list entirely. This is not a tunable
+threshold; a missing glyph is not a bad match, it is a non-starter.
 
 **Nearest-neighbor search:** Per-character lookup uses brute-force linear scan
 over the feature vectors. At 99 dimensions, tree-based structures provide no

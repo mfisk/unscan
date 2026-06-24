@@ -111,13 +111,9 @@ pub fn verify_text_region(
     // Try multiple render scales and pick the best SSIM.
     let scales = vec![2, 4];
 
-    // Ink-crop the render to where the glyphs actually are; crop the scan to
-    // the word-union bbox (tight to OCR word bounds, no adjacent-line bleed).
-    // SSIM scores word-union crops of both (vshift handles baseline offset);
-    // audit render image uses the tighter ink crop for visual clarity.
-    let word_top = placements.iter().map(|p| p.y_off).min().unwrap_or(0);
-    let word_bot = placements.iter().map(|p| p.y_off + p.height).max().unwrap_or(h);
-    let word_h = word_bot.saturating_sub(word_top).min(h - word_top);
+    // Both scan and render use the word-union bbox — the union of all
+    // final (post-processed) word bboxes.  This matches what the report
+    // draws as the "final" cyan-dashed boxes.
 
     let mut best_score = 0.0f32;
     let mut best_dy = 0i32;
@@ -126,25 +122,14 @@ pub fn verify_text_region(
     let mut best_diff: Option<GrayImage> = None;
 
     for &scale in &scales {
-        // Render into the full line bbox canvas (word placements are relative to it)
+        // Render into the expanded line bbox canvas
         let full_render = match render_via_freetype_scaled(font_data, &placements, w, h, scale, overrides, variant_tag, variations) {
             Some(r) => r,
             None => continue,
         };
 
-        // Scan: word-union bbox crop (no adjacent-line bleed)
-        let scan_crop = if word_h >= 3 && word_h < h {
-            image::imageops::crop_imm(&full_scan, 0, word_top, w, word_h).to_image()
-        } else {
-            full_scan.clone()
-        };
-
-        // Render for SSIM: same word-union region (vshift handles baseline offset)
-        let render_for_ssim = if word_h >= 3 && word_h < h {
-            image::imageops::crop_imm(&full_render, 0, word_top, w, word_h).to_image()
-        } else {
-            full_render.clone()
-        };
+        let scan_crop = full_scan.clone();
+        let render_for_ssim = full_render.clone();
 
         let scan_blur = crate::ssim::gaussian_blur_3x3(&scan_crop);
         let render_blur = crate::ssim::gaussian_blur_3x3(&render_for_ssim);
@@ -282,13 +267,22 @@ fn render_via_freetype(
     all_em.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
     let line_em_px = all_em[all_em.len() / 2];
 
-    let render_w = canvas_w * render_scale;
-    let render_h = canvas_h * render_scale;
+    // Pad the render canvas so italic overshoot / wide terminal strokes
+    // aren't clipped.  After rendering, we trim back to the scan width.
+    let render_pad: u32 = 20;
+    let render_w = (canvas_w + render_pad) * render_scale;
+    let final_w = canvas_w * render_scale;  // target width after trim
     let render_em = line_em_px * render_scale as f32;
 
-    // Baseline for the 2× canvas
+    // The caller's canvas_h is the OCR-expanded bbox — sized to the scan's
+    // ink extent.  The rendered font's metric height (ascent − descent) may
+    // exceed that, so use whichever is larger to avoid vertical clipping.
     let sf2 = font_ref.as_scaled(PxScale::from(render_em));
     let ink_h2 = sf2.ascent() - sf2.descent();
+    let min_render_h = canvas_h * render_scale;
+    let render_h = min_render_h.max(ink_h2.ceil() as u32);
+
+    // Baseline centred in the (possibly taller) canvas
     let baseline_y = ((render_h as f32 - ink_h2) / 2.0 + sf2.ascent()) as f64;
 
     // Set up FreeType (reuse thread-local library)
@@ -416,19 +410,17 @@ fn render_via_freetype(
         let scale_x = target_ink_w_rs as f64 / rendered_ink_w as f64;
         let new_w = (canvas.width() as f64 * scale_x).round() as u32;
         canvas = image::imageops::resize(&canvas, new_w, canvas.height(), image::imageops::FilterType::Lanczos3);
-        // Crop or pad back to render_w
-        if canvas.width() > render_w {
-            canvas = image::imageops::crop_imm(&canvas, 0, 0, render_w, canvas.height()).to_image();
-        } else if canvas.width() < render_w {
-            let mut padded = GrayImage::from_pixel(render_w, canvas.height(), Luma([255u8]));
-            image::imageops::overlay(&mut padded, &canvas, 0, 0);
-            canvas = padded;
-        }
     }
 
-    // Downsample from render resolution to canvas size
+    // Trim render padding: crop (not resize!) back to the scan bbox width.
+    // The extra padding was only to avoid clipping during glyph rasterisation.
+    let trim_w = final_w.min(canvas.width());
+    canvas = image::imageops::crop_imm(&canvas, 0, 0, trim_w, canvas.height()).to_image();
+
+    // Downsample from render resolution to 1x (keep expanded height if canvas was grown)
     if render_scale > 1 {
-        Some(image::imageops::resize(&canvas, canvas_w, canvas_h, image::imageops::FilterType::Lanczos3))
+        let out_h = render_h / render_scale;
+        Some(image::imageops::resize(&canvas, canvas_w, out_h, image::imageops::FilterType::Lanczos3))
     } else {
         Some(canvas)
     }
