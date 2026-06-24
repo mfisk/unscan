@@ -683,8 +683,9 @@ fn run(args: &cli::Args, classifier: &dyn classifier::Classifier) -> Result<(), 
         // (bg - 56) counts as ink (works for both light and dark backgrounds).
         let ink_thresh = bg_color.0.saturating_sub(56);
         let _t_pre = std::time::Instant::now();
-        // Word-level ink expansion (italic overshoot, etc.)
-        ocr::expand_words_to_ink(&mut lines, &gray_page, ink_thresh);
+        // Line-level ink expansion (vertical ascender/descender coverage)
+        // Also expands word bboxes horizontally (italic overshoot, etc.)
+        ocr::expand_bbox_to_ink(&mut lines, &gray_page, ink_thresh);
         let mut placed_texts: Vec<pdf_out::PlacedText> = Vec::new();
         let mut pg_vec = 0u32;
         let mut pg_raster = 0u32;
@@ -732,16 +733,13 @@ fn run(args: &cli::Args, classifier: &dyn classifier::Classifier) -> Result<(), 
         let line_matches: Vec<LineMatch> = lines.par_iter().enumerate().map(|(li, line)| {
             let line_num = li + 1; // 1-indexed for output
             let line_start = std::time::Instant::now();
-            // Word-union bbox: the union of all final (post-processed) word bboxes.
-            // This is the "good" bbox that matches what the report draws.
-            let (bx, by, bw, bh) = line.word_union_bbox();
             // ── Fast path: try dominant font via SSIM ────────────────
             if let (Some(fm), Some(ref fd)) = (fast_path_candidate, &fast_path_font_data) {
                 let (score, _dy) = verify::verify_text_region(
                     &gray_page,
                     fd.as_slice(),
                     &line.text,
-                    bx, by, bw, bh,
+                    line.x, line.y, line.width, line.height,
                     &line.words,
                     fm.glyph_overrides.as_deref(),
                     &fm.variant_tag,
@@ -843,10 +841,10 @@ fn run(args: &cli::Args, classifier: &dyn classifier::Classifier) -> Result<(), 
                     confidence: w.confidence,
                 })
                 .collect();
-            let line_height = line.words.iter().map(|w| w.height).max().unwrap_or(0);
+            let word_height = line.words.iter().map(|w| w.height).max().unwrap_or(0);
             let seg_t0 = std::time::Instant::now();
             let line_crops = char_index::extract_line_chars(
-                &gray_page, &word_placements, line_height,
+                &gray_page, &word_placements, word_height,
                 diag_seg_dir.as_deref(),
             );
             prof_seg_us.fetch_add(seg_t0.elapsed().as_micros() as u64, std::sync::atomic::Ordering::Relaxed);
@@ -942,7 +940,7 @@ fn run(args: &cli::Args, classifier: &dyn classifier::Classifier) -> Result<(), 
                             });
                             let (ssim, dy) = verify::verify_text_region(
                                 &gray_page, &fd, &line.text,
-                                bx, by, bw, bh,
+                                line.x, line.y, line.width, line.height,
                                 &line.words,
                                 fe.glyph_overrides.as_deref(), &fe.variant_tag,
                                 fe.variations.as_deref(),
@@ -1122,19 +1120,33 @@ fn run(args: &cli::Args, classifier: &dyn classifier::Classifier) -> Result<(), 
                     }
 
                     // Save full-colour scan line crop for report overlay.
-                    // Use the word-union bbox — same bbox that SSIM uses.
+                    // "Surroundings" bbox: union of line bbox (= word-union)
+                    // and raw word bboxes, plus 4px padding, so the report
+                    // can show both original and expanded bbox sets.
                     {
-                        let (wbx, wby, wbw, wbh) = line.word_union_bbox();
-                        let lx = wbx.min(page_img.width().saturating_sub(1));
-                        let ly = wby.min(page_img.height().saturating_sub(1));
-                        let lw = wbw.min(page_img.width() - lx);
-                        let lh = wbh.min(page_img.height() - ly);
-                        if lw >= 3 && lh >= 3 {
-                            let crop = image::imageops::crop_imm(page_img, lx, ly, lw, lh).to_image();
+                        let pad = 4u32;
+                        let mut sx0 = line.x;
+                        let mut sy0 = line.y;
+                        let mut sx1 = line.x + line.width;
+                        let mut sy1 = line.y + line.height;
+                        for rw in &line.raw_words {
+                            sx0 = sx0.min(rw.x);
+                            sy0 = sy0.min(rw.y);
+                            sx1 = sx1.max(rw.x + rw.width);
+                            sy1 = sy1.max(rw.y + rw.height);
+                        }
+                        let surr_x = sx0.saturating_sub(pad).min(page_img.width().saturating_sub(1));
+                        let surr_y = sy0.saturating_sub(pad).min(page_img.height().saturating_sub(1));
+                        let surr_r = sx1.saturating_add(pad).min(page_img.width());
+                        let surr_b = sy1.saturating_add(pad).min(page_img.height());
+                        let surr_w = surr_r - surr_x;
+                        let surr_h = surr_b - surr_y;
+                        if surr_w >= 3 && surr_h >= 3 {
+                            let crop = image::imageops::crop_imm(page_img, surr_x, surr_y, surr_w, surr_h).to_image();
                             let _ = crop.save(ddir.join("scan_line.png"));
                             let _ = std::fs::write(
                                 ddir.join("scan_line_origin.json"),
-                                format!("{{\"x\":{},\"y\":{}}}", lx, ly),
+                                format!("{{\"x\":{},\"y\":{}}}", surr_x, surr_y),
                             );
                         }
                     }
@@ -1306,12 +1318,11 @@ fn run(args: &cli::Args, classifier: &dyn classifier::Classifier) -> Result<(), 
                 if let Some(ref fm) = font_result {
                     let font_data = font_cache.load(&fm.font_path).ok();
                     if let Some(ref fd) = font_data {
-                        let (bx, by, bw, bh) = line.word_union_bbox();
                         let (score, _dy) = verify::verify_text_region(
                             &gray_page,
                             fd.as_slice(),
                             &line.text,
-                            bx, by, bw, bh,
+                            line.x, line.y, line.width, line.height,
                             &line.words,
                             fm.glyph_overrides.as_deref(),
                             &fm.variant_tag,
@@ -1510,7 +1521,6 @@ fn run(args: &cli::Args, classifier: &dyn classifier::Classifier) -> Result<(), 
                             let ref_h = 100.0f32;
                             let sf_ref = f.as_scaled(PxScale::from(ref_h));
                             let ref_ink = sf_ref.ascent() - sf_ref.descent();
-                            // Use the line bbox height — spans full ascender-to-descender
                             let line_h = line.height as f32;
                             if line_h > 1.0 {
                                 let em_px = ref_h * (line_h / ref_ink);

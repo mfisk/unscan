@@ -1833,10 +1833,10 @@ pub struct LineCharCrops {
 pub fn extract_line_chars(
     page: &GrayImage,
     words: &[WordPlacement],
-    line_height: u32,
+    word_height: u32,
     diag_seg_dir: Option<&std::path::Path>,
 ) -> LineCharCrops {
-    if words.is_empty() || line_height == 0 {
+    if words.is_empty() || word_height == 0 {
         return LineCharCrops { plain: Vec::new(), ligature: None };
     }
 
@@ -1884,8 +1884,7 @@ pub fn extract_line_chars(
             continue;
         }
 
-        // Crop the word at Tesseract's bbox (already horizontally ink-expanded
-        // by expand_words_to_ink in the OCR pass).
+        // Crop the word at its expanded bbox (ink-expanded by expand_bbox_to_ink).
         // Don't ink-trim — trimming picks up stray text from adjacent lines.
         let word_img = image::imageops::crop_imm(page, wx, wy, crop_w, crop_h).to_image();
 

@@ -51,18 +51,6 @@ pub struct TextLine {
 }
 
 impl TextLine {
-    /// Union bbox of all final (post-processed) word bboxes.
-    /// Falls back to the line-level OCR bbox if there are no words.
-    pub fn word_union_bbox(&self) -> (u32, u32, u32, u32) {
-        if self.words.is_empty() {
-            return (self.x, self.y, self.width, self.height);
-        }
-        let x0 = self.words.iter().map(|w| w.x).min().unwrap();
-        let y0 = self.words.iter().map(|w| w.y).min().unwrap();
-        let x1 = self.words.iter().map(|w| w.x + w.width).max().unwrap();
-        let y1 = self.words.iter().map(|w| w.y + w.height).max().unwrap();
-        (x0, y0, x1 - x0, y1 - y0)
-    }
 }
 
 /// Lightweight snapshot of a Tesseract word bbox before post-processing.
@@ -443,16 +431,21 @@ pub fn drop_outlier_words(lines: &mut Vec<TextLine>) {
 // Scan the actual grayscale pixels to find true ink boundaries.
 // ---------------------------------------------------------------------------
 
-/// Expand each line's (and its words') bounding boxes vertically so they
-/// encompass the actual ink extent on the page.  Tesseract frequently
-/// under-reports height by clipping descenders (measured 10 px / ~3 pt on
-/// 300 dpi Bodoni body text).
+/// Expand bounding boxes to cover actual ink on the page.
 ///
-/// Only **expands** — never shrinks a bbox.  Horizontal bounds are untouched.
+/// Two passes:
+///   1. **Line bbox** (`line.x/y/width/height`): expanded vertically and
+///      horizontally ±margin px by scanning for ink pixels.  Used only for
+///      PDF output positioning — NOT for image crops or SSIM.
+///   2. **Word bboxes** (`word.x/y/width/height`): expanded horizontally
+///      to capture italic overshoot, constrained to gaps between words.
+///      These are the authoritative final bboxes — use their union for
+///      image crops and SSIM verification.
+///
+/// Only **expands** — never shrinks.
 pub fn expand_bbox_to_ink(lines: &mut [TextLine], gray: &GrayImage, ink_threshold: u8) {
     let (page_w, page_h) = gray.dimensions();
     let margin: u32 = 20; // search this many px beyond the OCR bbox
-    let mut expanded_count = 0u32;
 
     for line in lines.iter_mut() {
         // ── expand the line bbox vertically ─────────────────────────
@@ -468,7 +461,6 @@ pub fn expand_bbox_to_ink(lines: &mut [TextLine], gray: &GrayImage, ink_threshol
         let new_bottom = ink_bot.max(line.y + line.height);
         let new_h = new_bottom.saturating_sub(new_y);
 
-        let vert_grew = new_h > line.height;
         line.y = new_y;
         line.height = new_h;
 
@@ -503,19 +495,24 @@ pub fn expand_bbox_to_ink(lines: &mut [TextLine], gray: &GrayImage, ink_threshol
             }
         }
 
-        let horiz_grew = new_x < line.x || new_right > old_right;
         line.x = new_x;
         line.width = new_right.saturating_sub(new_x);
-
-        if vert_grew || horiz_grew {
-            expanded_count += 1;
-        }
-
-        // ── NOTE: word bboxes are NOT expanded here ────────────────
-        // expand_words_to_ink handles word-level expansion separately.
     }
 
-    if expanded_count > 0 {
+    // Word-level horizontal ink expansion (italic overshoot, etc.)
+    expand_words_to_ink(lines, gray, ink_threshold);
+
+    // Update line bbox to match the word-union — the authoritative bbox.
+    // After this, line.x/y/width/height == union of expanded word bboxes.
+    for line in lines.iter_mut() {
+        let x0 = line.words.iter().map(|w| w.x).min().unwrap();
+        let y0 = line.words.iter().map(|w| w.y).min().unwrap();
+        let x1 = line.words.iter().map(|w| w.x + w.width).max().unwrap();
+        let y1 = line.words.iter().map(|w| w.y + w.height).max().unwrap();
+        line.x = x0;
+        line.y = y0;
+        line.width = x1 - x0;
+        line.height = y1 - y0;
     }
 }
 
@@ -527,7 +524,7 @@ pub fn expand_bbox_to_ink(lines: &mut [TextLine], gray: &GrayImage, ink_threshol
 ///
 /// Only **expands** — never shrinks.  Must run AFTER `clip_word_overlaps` so
 /// the word list is already gap-safe.
-pub fn expand_words_to_ink(lines: &mut [TextLine], gray: &GrayImage, ink_threshold: u8) {
+fn expand_words_to_ink(lines: &mut [TextLine], gray: &GrayImage, ink_threshold: u8) {
     let (page_w, page_h) = gray.dimensions();
     let mut expanded = 0u32;
 
@@ -759,7 +756,7 @@ pub fn expand_words_to_ink(lines: &mut [TextLine], gray: &GrayImage, ink_thresho
 /// exceeds the font's natural spacing.  When no char_index is available,
 /// falls back to a fixed threshold of 18% of line height.
 ///
-/// Must run AFTER `expand_words_to_ink` so bboxes are ink-tight.
+/// Must run AFTER `expand_bbox_to_ink` so bboxes are ink-tight.
 pub fn split_wide_whitespace_words(
     lines: &mut [TextLine],
     gray: &GrayImage,
