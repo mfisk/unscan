@@ -9,6 +9,8 @@ mod font_match;
 mod font_scan;
 mod geometry;
 pub mod char_index;
+pub mod char_render;
+pub mod train;
 pub mod layout;
 mod compare;
 pub mod seg_diag;
@@ -18,7 +20,6 @@ mod page_cache;
 mod pdf_out;
 mod segment;
 mod smooth;
-// mod word_match; // disabled: CI ranking used directly, word-level SSIM rerank removed
 pub(crate) mod verify;
 pub mod ground_truth;
 pub mod report;
@@ -109,7 +110,7 @@ fn render_ref_chars_and_exit(json_str: &str) -> ! {
         if font.glyph_id(c).0 == 0 {
             continue; // no glyph for this char
         }
-        if let Some(img) = char_index::render_char_normalised(&font, c) {
+        if let Some(img) = char_render::get_rendered_char_default(&font, &req.font, c, None) {
             let fname = format!("U+{:04X}.png", c as u32);
             let _ = img.save(out.join(&fname));
             rendered += 1;
@@ -128,6 +129,17 @@ fn main() {
     // ── render-ref-chars: standalone char rendering, no PDF needed ───
     if let Some(ref json_str) = args.render_ref_chars {
         render_ref_chars_and_exit(json_str);
+    }
+
+    // ── train-lda: train LDA classifier and exit ────────────────────
+    if args.train_lda {
+        let train_args = train::TrainArgs {
+            font_dir: args.font_dir.clone(),
+            render_params: args.render_params(),
+            ..train::TrainArgs::default()
+        };
+        train::run_train(train_args);
+        std::process::exit(0);
     }
 
     // ── weight-explicit: normalize PS names and exit ─────────────────
@@ -160,6 +172,44 @@ fn main() {
         if let Err(e) = run(&args, &*clf) {
             eprintln!("Error: {e}");
             std::process::exit(1);
+        }
+    }
+}
+
+/// Default path for cached LDA weights.
+fn default_lda_weights_path() -> PathBuf {
+    let home = std::env::var("HOME").unwrap_or_else(|_| ".".to_string());
+    PathBuf::from(home).join(".cache").join("unscan").join("lda-weights.bin")
+}
+
+/// Load LDA classifier from --triplet-weights override or cached default.
+/// If no weights exist, auto-trains them first.
+fn load_lda_classifier(args: &cli::Args) -> Box<dyn classifier::Classifier> {
+    if let Some(ref weights_path) = args.triplet_weights {
+        match classifier::LdaClassifier::load(weights_path) {
+            Ok(c) => Box::new(c),
+            Err(e) => { eprintln!("Error loading LDA weights from {:?}: {e}", weights_path); std::process::exit(1); }
+        }
+    } else {
+        let default_path = default_lda_weights_path();
+        if !default_path.exists() {
+            eprintln!("No LDA weights found, training automatically...");
+            let train_args = train::TrainArgs {
+                font_dir: args.font_dir.clone(),
+                no_index: true, // skip index build during auto-train; we'll build it right after
+                render_params: args.render_params(),
+                ..train::TrainArgs::default()
+            };
+            train::run_train(train_args);
+            if !default_path.exists() {
+                eprintln!("Auto-training failed to produce weights at {:?}", default_path);
+                std::process::exit(1);
+            }
+            eprintln!("Auto-training complete, continuing with scan...");
+        }
+        match classifier::LdaClassifier::load(&default_path) {
+            Ok(c) => Box::new(c),
+            Err(e) => { eprintln!("Error loading LDA weights from {:?}: {e}", default_path); std::process::exit(1); }
         }
     }
 }
@@ -197,27 +247,19 @@ fn make_classifier(args: &cli::Args) -> Box<dyn classifier::Classifier> {
         other => {
             // Check for weight-file-based classifiers
             match other {
-                "lda" => {
-                    // LDA has built-in weights; external file is optional override
-                    if let Some(ref weights_path) = args.triplet_weights {
-                        match classifier::LdaClassifier::load(weights_path) {
-                            Ok(c) => Box::new(c),
-                            Err(e) => { eprintln!("Error: {e}"); std::process::exit(1); }
-                        }
-                    } else {
-                        static LDA_WEIGHTS: &[u8] = include_bytes!("../lda28-weights.bin");
-                        match classifier::LdaClassifier::from_bytes(LDA_WEIGHTS) {
-                            Ok(c) => Box::new(c),
-                            Err(e) => { eprintln!("Error loading built-in LDA weights: {e}"); std::process::exit(1); }
-                        }
-                    }
-                }
+                "lda" => load_lda_classifier(args),
                 "fusion" => {
-                    // Rank-fusion of LDA + Fisher (no external weights needed)
-                    static LDA_WEIGHTS: &[u8] = include_bytes!("../lda28-weights.bin");
-                    let lda = match classifier::LdaClassifier::from_bytes(LDA_WEIGHTS) {
+                    // Rank-fusion of LDA + Fisher
+                    // load_lda_classifier handles auto-training if needed
+                    let _ = load_lda_classifier(args); // triggers auto-train if weights missing
+                    let default_path = if let Some(ref p) = args.triplet_weights {
+                        p.clone()
+                    } else {
+                        default_lda_weights_path()
+                    };
+                    let lda = match classifier::LdaClassifier::load(&default_path) {
                         Ok(c) => c,
-                        Err(e) => { eprintln!("Error loading built-in LDA weights: {e}"); std::process::exit(1); }
+                        Err(e) => { eprintln!("Error loading LDA for fusion: {e}"); std::process::exit(1); }
                     };
                     let fisher = classifier::FisherClassifier;
                     Box::new(classifier::FusionClassifier::new(vec![
@@ -283,12 +325,12 @@ fn run_index(args: &cli::Args, classifier: &dyn classifier::Classifier) -> Resul
 
     // ── Full rebuild path ──────────────────────────────────────────
     if args.rebuild_index {
-        return do_full_build(&system_fonts, &index_path, classifier);
+        return do_full_build(&system_fonts, &index_path, classifier, &args.render_params());
     }
 
     // ── Try loading existing index ─────────────────────────────────
     if !index_path.exists() {
-        return do_full_build(&system_fonts, &index_path, classifier);
+        return do_full_build(&system_fonts, &index_path, classifier, &args.render_params());
     }
 
     // Fast header check first (12 bytes, no full deserialize).
@@ -296,11 +338,11 @@ fn run_index(args: &cli::Args, classifier: &dyn classifier::Classifier) -> Resul
         Ok((version, feat_len)) => {
             let (exp_ver, exp_fl) = char_index::expected_header();
             if version != exp_ver || feat_len != exp_fl {
-                return do_full_build(&system_fonts, &index_path, classifier);
+                return do_full_build(&system_fonts, &index_path, classifier, &args.render_params());
             }
         }
         Err(e) => {
-            return do_full_build(&system_fonts, &index_path, classifier);
+            return do_full_build(&system_fonts, &index_path, classifier, &args.render_params());
         }
     }
 
@@ -309,7 +351,7 @@ fn run_index(args: &cli::Args, classifier: &dyn classifier::Classifier) -> Resul
     let mut index = match char_index::load_index(&index_path, classifier) {
         Ok(idx) => idx,
         Err(e) => {
-            return do_full_build(&system_fonts, &index_path, classifier);
+            return do_full_build(&system_fonts, &index_path, classifier, &args.render_params());
         }
     };
     let load_time = start.elapsed();
@@ -351,7 +393,7 @@ fn run_index(args: &cli::Args, classifier: &dyn classifier::Classifier) -> Resul
             .filter_map(|name| system_fonts.get(name).map(|(p, g, v)| (name.clone(), p.clone(), g.clone(), v.clone())))
             .collect();
         let start = std::time::Instant::now();
-        let partial = char_index::build_char_index(&pairs, classifier);
+        let partial = char_index::build_char_index(&pairs, classifier, &args.render_params());
         index.merge(partial, classifier);
     }
 
@@ -416,7 +458,8 @@ fn scan_and_build_index(
         .iter()
         .map(|e| (e.font_key(), e.path.clone(), e.glyph_overrides.clone(), e.variations.clone()))
         .collect();
-    let mut index = char_index::build_char_index(&pairs, classifier);
+
+    let mut index = char_index::build_char_index(&pairs, classifier, &args.render_params());
     let elapsed = start.elapsed();
 
     index.populate_font_meta(&font_catalog);
@@ -441,6 +484,7 @@ fn do_full_build(
     system_fonts: &std::collections::HashMap<String, (PathBuf, char_index::GlyphOverrides, char_index::Variations)>,
     index_path: &Path,
     classifier: &dyn classifier::Classifier,
+    render_params: &char_render::RenderParams,
 ) -> Result<(), ScanTextError> {
     let pairs: Vec<(String, PathBuf, char_index::GlyphOverrides, char_index::Variations)> = system_fonts
         .iter()
@@ -449,7 +493,7 @@ fn do_full_build(
 
 
     let start = std::time::Instant::now();
-    let mut index = char_index::build_char_index(&pairs, classifier);
+    let mut index = char_index::build_char_index(&pairs, classifier, render_params);
     let elapsed = start.elapsed();
 
     if let Some(parent) = index_path.parent() {
@@ -846,6 +890,7 @@ fn run(args: &cli::Args, classifier: &dyn classifier::Classifier) -> Result<(), 
             let line_crops = char_index::extract_line_chars(
                 &gray_page, &word_placements, word_height,
                 diag_seg_dir.as_deref(),
+                &args.render_params(),
             );
             prof_seg_us.fetch_add(seg_t0.elapsed().as_micros() as u64, std::sync::atomic::Ordering::Relaxed);
             let char_crops = &line_crops.plain;
@@ -1008,10 +1053,6 @@ fn run(args: &cli::Args, classifier: &dyn classifier::Classifier) -> Result<(), 
                 if !ocr_ok {
                     true
                 } else if let Some(ref fr) = font_result {
-                    // Font confidence too low → kept raster, treat as miss
-                    if fr.score < args.min_font_confidence {
-                        true
-                    } else {
                         let bbox_px = [line.x as f32, line.y as f32,
                                        (line.x + line.width) as f32,
                                        (line.y + line.height) as f32];
@@ -1021,7 +1062,6 @@ fn run(args: &cli::Args, classifier: &dyn classifier::Classifier) -> Result<(), 
                             .map(|fe| fe.postscript_name.as_str())
                             .unwrap_or("");
                         !gt.is_hit(page_num, &bbox_px, args.dpi, chosen_ps)
-                    }
                 } else {
                     true // no font matched → treat as miss
                 }
@@ -1191,11 +1231,9 @@ fn run(args: &cli::Args, classifier: &dyn classifier::Classifier) -> Result<(), 
                                 let fname = format!("U+{:04X}.png", *ch as u32);
                                 let path = font_ref_dir.join(&fname);
                                 if path.exists() { continue; }
-                                let ref_img = if let Some(&gid) = override_map.get(ch) {
-                                    char_index::render_glyph_normalised(&font, ab_glyph::GlyphId(gid))
-                                } else {
-                                    char_index::render_char_normalised(&font, *ch)
-                                };
+                                let gid_override = override_map.get(ch).map(|&gid| ab_glyph::GlyphId(gid));
+                                let font_key = fr.font_key.clone();
+                                let ref_img = char_render::get_rendered_char_default(&font, &font_key, *ch, gid_override);
                                 if let Some(img) = ref_img {
                                     let _ = img.save(&path);
                                 }
@@ -1246,11 +1284,9 @@ fn run(args: &cli::Args, classifier: &dyn classifier::Classifier) -> Result<(), 
             // Collect (font_name, font_size_bucket) frequencies
             let mut size_freq: HashMap<i32, u32> = std::collections::HashMap::new();
             for (i, lm) in line_matches.iter().enumerate() {
-                if let Some(ref fm) = lm.font_result {
-                    if fm.score >= args.min_font_confidence {
-                        let bucket = lines[i].font_size_pt.round() as i32;
-                        *size_freq.entry(bucket).or_default() += 1;
-                    }
+                if lm.font_result.is_some() {
+                    let bucket = lines[i].font_size_pt.round() as i32;
+                    *size_freq.entry(bucket).or_default() += 1;
                 }
             }
             // Find most common size bucket
@@ -1266,11 +1302,9 @@ fn run(args: &cli::Args, classifier: &dyn classifier::Classifier) -> Result<(), 
                     let sz = lines[i].font_size_pt.round() as i32;
                     if (sz - body_size).abs() <= 1 {
                         if let Some(ref fm) = lm.font_result {
-                            if fm.score >= args.min_font_confidence {
                                 let entry = font_freq.entry(fm.font_name.clone())
                                     .or_insert_with(|| (0, fm.font_path.clone()));
                                 entry.0 += 1;
-                            }
                         }
                     }
                 }
@@ -1306,10 +1340,7 @@ fn run(args: &cli::Args, classifier: &dyn classifier::Classifier) -> Result<(), 
 
                 let ocr_ok = line.confidence >= args.min_ocr_confidence as f32
                     && !line.text.trim().is_empty();
-                let font_ok = font_result
-                    .as_ref()
-                    .map(|f| f.score >= args.min_font_confidence)
-                    .unwrap_or(false);
+                let font_ok = font_result.is_some();
 
                 if !ocr_ok || !font_ok {
                     return (None, None);
@@ -1352,24 +1383,12 @@ fn run(args: &cli::Args, classifier: &dyn classifier::Classifier) -> Result<(), 
             // ── Decision matrix ──────────────────────────────────────
             let ocr_ok = line.confidence >= args.min_ocr_confidence as f32
                 && !line.text.trim().is_empty();
-            let font_ok = font_result
-                .as_ref()
-                .map(|f| f.score >= args.min_font_confidence)
-                .unwrap_or(false);
+            let font_ok = font_result.is_some();
 
             let (keep_raster, reason) = if !ocr_ok {
                 (true, format!("OCR confidence too low ({:.0}%)", line.confidence))
             } else if !font_ok {
-                let best = font_result
-                    .as_ref()
-                    .map(|f| format!("{} at {:.3}", f.font_name, f.score))
-                    .unwrap_or_else(|| "none".into());
-                (
-                    true,
-                    format!(
-                        "No confident font match (best: {best}). Kept as raster."
-                    ),
-                )
+                (true, "No font match. Kept as raster.".into())
             } else {
                 (false, "Vectorised".into())
             };

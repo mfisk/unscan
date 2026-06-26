@@ -28,11 +28,6 @@ pub struct Args {
     #[arg(long, default_value = "0")]
     pub min_ocr_confidence: u32,
 
-    /// Minimum font-match confidence (0.0–1.0).
-    /// Below this, text is kept as raster — we never replace with a wrong font.
-    #[arg(long, default_value = "0.10")]
-    pub min_font_confidence: f32,
-
     /// DPI for PDF page rasterization
     #[arg(long, default_value = "300")]
     pub dpi: u32,
@@ -76,6 +71,12 @@ pub struct Args {
     #[arg(long)]
     pub rebuild_index: bool,
 
+    /// Train LDA classifier weights and save to ~/.cache/unscan/lda-weights.bin.
+    /// Scans all system fonts, renders characters, computes features, and trains
+    /// the LDA projection.  Exits after training.
+    #[arg(long)]
+    pub train_lda: bool,
+
     /// Generate side-by-side comparison images (scan crop vs rendered font)
     /// for every vectorized line. Output goes to <output_base>-compare/ directory.
     #[arg(long)]
@@ -115,8 +116,8 @@ pub struct Args {
     pub classifier: String,
 
     /// Path to classifier weights file.  Required for triplet, global-triplet,
-    /// perchar-fisher, mahalanobis, and mlp.  Optional for lda (built-in
-    /// weights used when omitted).  Not needed for fisher or fusion.
+    /// perchar-fisher, mahalanobis, and mlp.  Optional for lda (auto-trained
+    /// if absent).  Not needed for fisher or fusion.
     #[arg(long)]
     pub triplet_weights: Option<PathBuf>,
 
@@ -125,9 +126,38 @@ pub struct Args {
     /// Prints the normalized name(s) to stdout and exits.
     #[arg(long, value_name = "PS:WEIGHT")]
     pub weight_explicit: Vec<String>,
+
+    // ── Render pipeline parameters ─────────────────────────────────
+    /// Render scale multiplier for reference character images.
+    /// 1 = render directly at target height, 3 = render at 3× then downscale.
+    #[arg(long, default_value = "1")]
+    pub render_scale: u32,
+
+    /// AA variant for reference character images: native, blur_0.5, sharpen.
+    #[arg(long, default_value = "native")]
+    pub render_aa: String,
+
+    /// Binarize threshold for reference character images (0–255).
+    /// Default: no binarization (keep native greyscale with AA).
+    #[arg(long)]
+    pub render_binarize: Option<u8>,
 }
 
 impl Args {
+    /// Build RenderParams from CLI flags. This is the single source of truth
+    /// for how reference characters are rendered — used by training, indexing,
+    /// and inference.
+    pub fn render_params(&self) -> crate::char_render::RenderParams {
+        use crate::char_index::AaVariant;
+        let aa = AaVariant::parse(&self.render_aa).unwrap_or(AaVariant::Native);
+        crate::char_render::RenderParams {
+            height: crate::char_index::NORM_H,
+            render_scale: self.render_scale,
+            aa,
+            binarize_threshold: self.render_binarize.filter(|&v| v > 0),
+        }
+    }
+
     /// Resolve the audit JSON path.
     /// With --audit DIR, it's DIR/audit.json.
     /// Without --audit, falls back to <output>.audit.json.
@@ -179,7 +209,7 @@ impl Args {
 
     /// Validate: if not --index, require input and output (unless --test).
     pub fn validate(&self) -> Result<(), String> {
-        if self.index || self.render_ref_chars.is_some() || !self.weight_explicit.is_empty() {
+        if self.index || self.render_ref_chars.is_some() || !self.weight_explicit.is_empty() || self.train_lda {
             return Ok(());
         }
         if self.input.is_none() {

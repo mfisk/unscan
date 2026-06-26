@@ -47,7 +47,7 @@ use crate::segment::{segment_characters, segment_characters_diag};
 pub const FISHER_WEIGHTS: [f32; FEAT_LEN] = [1.0 / FEAT_LEN as f32; FEAT_LEN];
 
 /// Normalised character height for all feature computation.
-const NORM_H: u32 = 24;
+pub const NORM_H: u32 = 24;
 
 /// Number of bins in the column ink density profile.
 /// At NORM_H=24, typical char widths are 10–20 px, so 16 bins avoids
@@ -57,6 +57,68 @@ const PROFILE_BINS: usize = 16;
 /// Number of bins in the row ink density profile (horizontal).
 /// 24 rows → 16 bins keeps roughly 1:1 sampling.  (Was 32.)
 const ROW_PROFILE_BINS: usize = 16;
+
+/// Anti-aliasing variant for reference character rendering.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum AaVariant {
+    /// Native rasterizer AA (no post-processing).
+    Native,
+    /// Gaussian blur σ=0.5 post-process.
+    Blur05,
+    /// Sharpen (unsharp mask) post-process.
+    Sharpen,
+}
+
+impl AaVariant {
+    pub fn name(&self) -> &'static str {
+        match self {
+            AaVariant::Native => "native",
+            AaVariant::Blur05 => "blur05",
+            AaVariant::Sharpen => "sharpen",
+        }
+    }
+
+    pub fn parse(s: &str) -> Option<AaVariant> {
+        match s.to_lowercase().as_str() {
+            "native" => Some(AaVariant::Native),
+            "blur05" | "blur" => Some(AaVariant::Blur05),
+            "sharpen" => Some(AaVariant::Sharpen),
+            _ => None,
+        }
+    }
+
+    pub fn all() -> &'static [AaVariant] {
+        &[AaVariant::Native, AaVariant::Blur05, AaVariant::Sharpen]
+    }
+
+    /// Apply this AA variant to a greyscale character image.
+    pub fn apply(&self, img: &image::GrayImage) -> image::GrayImage {
+        match self {
+            AaVariant::Native => img.clone(),
+            AaVariant::Blur05 => image::imageops::blur(img, 0.5),
+            AaVariant::Sharpen => {
+                // Unsharp mask: original + (original - blurred) * amount
+                let blurred = image::imageops::blur(img, 0.5);
+                let mut out = img.clone();
+                for (p, b) in out.pixels_mut().zip(blurred.pixels()) {
+                    let diff = p.0[0] as f32 - b.0[0] as f32;
+                    p.0[0] = (p.0[0] as f32 + diff * 0.5).clamp(0.0, 255.0) as u8;
+                }
+                out
+            }
+        }
+    }
+}
+
+/// Binarize a greyscale image at the given threshold.
+/// Pixels with value < threshold → 0 (black ink), >= threshold → 255 (white).
+pub fn binarize(img: &image::GrayImage, threshold: u8) -> image::GrayImage {
+    let mut out = img.clone();
+    for p in out.pixels_mut() {
+        p.0[0] = if p.0[0] < threshold { 0 } else { 255 };
+    }
+    out
+}
 
 /// Number of horizontal crossing scan lines.
 /// 24 px / 4 lines ≈ 6 px spacing — same density as 48 px / 8.  (Was 8.)
@@ -1525,7 +1587,11 @@ pub fn resolve_glyph<F: ab_glyph::Font>(font: &F, ch: char, overrides: Option<&[
     font.glyph_id(ch)
 }
 
-pub fn build_char_index(font_paths: &[(String, std::path::PathBuf, GlyphOverrides, Variations)], classifier: &dyn crate::classifier::Classifier) -> CharIndex {
+pub fn build_char_index(
+    font_paths: &[(String, std::path::PathBuf, GlyphOverrides, Variations)],
+    classifier: &dyn crate::classifier::Classifier,
+    _render_params: &crate::char_render::RenderParams,
+) -> CharIndex {
     use rayon::prelude::*;
 
     let chars = indexed_chars();
@@ -1835,7 +1901,9 @@ pub fn extract_line_chars(
     words: &[WordPlacement],
     word_height: u32,
     diag_seg_dir: Option<&std::path::Path>,
+    render_params: &crate::char_render::RenderParams,
 ) -> LineCharCrops {
+    let _ = render_params; // reserved for scan-side binarize
     if words.is_empty() || word_height == 0 {
         return LineCharCrops { plain: Vec::new(), ligature: None };
     }
@@ -2153,7 +2221,7 @@ pub struct CiSearchResult {
 pub fn search_candidates(
     index: &CharIndex,
     char_crops: &[(char, GrayImage)],
-    thoroughness: f32,
+    _thoroughness: f32,
     audit: bool,
     classifier: &dyn crate::classifier::Classifier,
 ) -> CiSearchResult {
@@ -2274,81 +2342,7 @@ pub fn search_candidates(
             .then_with(|| a.0.contains('|').cmp(&b.0.contains('|')))
     });
 
-    // ── Cross-family Latin clone dedup ───────────────────────────────
-    {
-        // Pass 1: score-epsilon dedup
-        let eps = 1e-5_f32;
-        let mut deduped: Vec<(String, f32)> = Vec::new();
-        for (name, score) in &scores {
-            if let Some(last) = deduped.last_mut() {
-                if (score - last.1).abs() < eps {
-                    if name.len() < last.0.len() {
-                        *last = (name.clone(), *score);
-                    }
-                    continue;
-                }
-            }
-            deduped.push((name.clone(), *score));
-        }
-        scores = deduped;
-
-        // Pass 2: Noto family grouping
-        fn noto_group(name: &str) -> Option<&'static str> {
-            let is_noto = name.contains("/noto/") || {
-                let base = name.rsplit('/').next().unwrap_or(name);
-                base.starts_with("Noto")
-            };
-            if !is_noto { return None; }
-            let base = name.rsplit('/').next().unwrap_or(name);
-            if base.starts_with("NotoSerif") {
-                Some("__noto_serif__")
-            } else if base.starts_with("NotoSansMono") || base.starts_with("NotoMono") {
-                Some("__noto_mono__")
-            } else {
-                Some("__noto_sans__")
-            }
-        }
-
-        let mut best_by_group: HashMap<&str, (usize, f32)> = HashMap::new();
-        for (i, (name, score)) in scores.iter().enumerate() {
-            if let Some(group) = noto_group(name) {
-                let entry = best_by_group.entry(group).or_insert((i, *score));
-                if *score > entry.1 {
-                    *entry = (i, *score);
-                }
-            }
-        }
-
-        let mut drop_indices: HashSet<usize> = HashSet::new();
-        for (_group, (keep_idx, _)) in &best_by_group {
-            for (i, (name, _)) in scores.iter().enumerate() {
-                if noto_group(name).is_some() && i != *keep_idx {
-                    drop_indices.insert(i);
-                }
-            }
-        }
-
-        if !drop_indices.is_empty() {
-            scores = scores.into_iter().enumerate()
-                .filter(|(i, _)| !drop_indices.contains(i))
-                .map(|(_, v)| v)
-                .collect();
-        }
-    }
-
-    // ── Statistical cutoff: keep best + near-ties ────────────────────
-    if scores.len() >= 2 {
-        let top_n = 50.min(scores.len());
-        let vals: Vec<f32> = scores.iter().take(top_n).map(|(_, s)| *s).collect();
-        let n = vals.len() as f32;
-        let mean = vals.iter().sum::<f32>() / n;
-        let variance = vals.iter().map(|v| (v - mean).powi(2)).sum::<f32>() / n;
-        let sigma = variance.sqrt();
-        let best = vals[0];
-        let k = 0.5 * thoroughness;
-        let cutoff = best - k * sigma;
-        scores.retain(|(_, s)| *s >= cutoff);
-    }
+    // No candidate pruning — SSIM is the real arbiter.
 
     CiSearchResult { scores, char_detail }
 }

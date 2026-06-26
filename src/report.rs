@@ -14,6 +14,7 @@ use image::GrayImage;
 
 use crate::audit::{AuditEntry, Decision};
 use crate::char_index;
+use crate::char_render;
 use crate::ground_truth::{self, GroundTruth};
 use crate::font_scan::FontEntry;
 
@@ -1342,27 +1343,20 @@ fn build_char_table(
                 .and_then(|p| file_to_b64_uri(&p))
         });
 
-        // Correct font reference glyph — render on the fly
+        // Correct font reference glyph — render via shared pipeline
         let correct_ref_uri = correct_fe.and_then(|fe| {
             let data = font_data_cache.load(&fe.path)?;
             let mut font = FontRef::try_from_slice(data).ok()?;
-            // Apply variable-font axis coordinates
             if let Some(ref vars) = fe.variations {
                 use ab_glyph::VariableFont;
                 for (tag, val) in vars {
                     font.set_variation(tag, *val);
                 }
             }
-            let override_map: HashMap<char, u16> = fe
-                .glyph_overrides
-                .as_ref()
-                .map(|v| v.iter().cloned().collect())
-                .unwrap_or_default();
-            let img = if let Some(&gid) = override_map.get(&ch) {
-                char_index::render_glyph_normalised(&font, ab_glyph::GlyphId(gid))
-            } else {
-                char_index::render_char_normalised(&font, ch)
-            }?;
+            let gid_override = fe.glyph_overrides.as_ref()
+                .and_then(|ovs| ovs.iter().find(|(c, _)| *c == ch).map(|(_, g)| ab_glyph::GlyphId(*g)));
+            let font_key = fe.path.to_string_lossy();
+            let img = char_render::get_rendered_char_default(&font, &font_key, ch, gid_override)?;
             Some(img_to_b64_uri(&img))
         });
 
@@ -1372,26 +1366,19 @@ fn build_char_table(
             if let Some(path) = find_font_ref_png(audit_root, fe, ch) {
                 return file_to_b64_uri(&path);
             }
-            // Render on the fly
+            // Render via shared pipeline
             let data = font_data_cache.load(&fe.path)?;
             let mut font = FontRef::try_from_slice(data).ok()?;
-            // Apply variable-font axis coordinates
             if let Some(ref vars) = fe.variations {
                 use ab_glyph::VariableFont;
                 for (tag, val) in vars {
                     font.set_variation(tag, *val);
                 }
             }
-            let override_map: HashMap<char, u16> = fe
-                .glyph_overrides
-                .as_ref()
-                .map(|v| v.iter().cloned().collect())
-                .unwrap_or_default();
-            let img = if let Some(&gid) = override_map.get(&ch) {
-                char_index::render_glyph_normalised(&font, ab_glyph::GlyphId(gid))
-            } else {
-                char_index::render_char_normalised(&font, ch)
-            }?;
+            let gid_override = fe.glyph_overrides.as_ref()
+                .and_then(|ovs| ovs.iter().find(|(c, _)| *c == ch).map(|(_, g)| ab_glyph::GlyphId(*g)));
+            let font_key = fe.path.to_string_lossy();
+            let img = char_render::get_rendered_char_default(&font, &font_key, ch, gid_override)?;
             Some(img_to_b64_uri(&img))
         });
 
