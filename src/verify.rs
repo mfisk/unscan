@@ -277,10 +277,13 @@ fn render_via_freetype(
     // The caller's canvas_h is the OCR-expanded bbox — sized to the scan's
     // ink extent.  The rendered font's metric height (ascent − descent) may
     // exceed that, so use whichever is larger to avoid vertical clipping.
+    // Add vertical padding so glyphs whose descenders exceed the font's
+    // declared descent (e.g. Q tail, swash g) aren't clipped.
+    let vert_pad: u32 = 10 * render_scale;
     let sf2 = font_ref.as_scaled(PxScale::from(render_em));
     let ink_h2 = sf2.ascent() - sf2.descent();
     let min_render_h = canvas_h * render_scale;
-    let render_h = min_render_h.max(ink_h2.ceil() as u32);
+    let render_h = min_render_h.max(ink_h2.ceil() as u32) + vert_pad;
 
     // Baseline centred in the (possibly taller) canvas
     let baseline_y = ((render_h as f32 - ink_h2) / 2.0 + sf2.ascent()) as f64;

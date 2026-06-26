@@ -67,17 +67,14 @@ struct Args {
     #[arg(long, default_value = "training-data")]
     output_dir: PathBuf,
 
-    /// Comma-separated native pixel heights to simulate (default: 48,36,24,18,12,9).
+    /// Comma-separated native pixel heights to simulate (default: NORM_H).
     /// Each value represents the glyph height in pixels before normalization.
-    /// 48 = full quality (NORM_H, no downscale).
-    /// 12 ≈ 9pt text at 100 DPI.
-    /// 9  = worst-case tiny text.
-    #[arg(long, default_value = "48,36,24,18,12,9", value_delimiter = ',')]
+    #[arg(long, value_delimiter = ',')]
     heights: Vec<u32>,
 
-    /// Comma-separated AA variants (default: native,blur_0.5,sharpen).
-    /// Options: native, blur_0.5, sharpen
-    #[arg(long, default_value = "native,blur_0.5,sharpen", value_delimiter = ',')]
+    /// Comma-separated AA variants (default: native,blur_0.5,sharpen,binary_128).
+    /// Options: native, blur_0.5, sharpen, binary_128
+    #[arg(long, default_value = "native,blur_0.5,sharpen,binary_128", value_delimiter = ',')]
     aa: Vec<String>,
 
     /// Maximum number of fonts to process (for testing). 0 = all.
@@ -90,68 +87,10 @@ struct Args {
 }
 
 // ---------------------------------------------------------------------------
-// AA variant enum
+// AA variant — use shared definition from char_index
 // ---------------------------------------------------------------------------
 
-#[derive(Clone, Copy, Debug)]
-enum AaVariant {
-    /// Native ab_glyph antialiasing (same as index).
-    Native,
-    /// Gaussian blur σ=0.5 applied after rendering (heavier AA).
-    Blur05,
-    /// Contrast stretch / sharpen (lighter AA).
-    Sharpen,
-}
-
-impl AaVariant {
-    fn parse(s: &str) -> Option<Self> {
-        match s.trim().to_lowercase().as_str() {
-            "native" => Some(Self::Native),
-            "blur_0.5" | "blur" => Some(Self::Blur05),
-            "sharpen" | "sharp" => Some(Self::Sharpen),
-            _ => {
-                eprintln!("WARNING: unknown AA variant '{}', skipping", s);
-                None
-            }
-        }
-    }
-
-    fn name(&self) -> &'static str {
-        match self {
-            Self::Native => "native",
-            Self::Blur05 => "blur_0.5",
-            Self::Sharpen => "sharpen",
-        }
-    }
-
-    /// Apply AA transformation to a rendered glyph image.
-    fn apply(&self, img: &GrayImage) -> GrayImage {
-        match self {
-            Self::Native => img.clone(),
-            Self::Blur05 => image::imageops::blur(img, 0.5),
-            Self::Sharpen => contrast_stretch(img),
-        }
-    }
-}
-
-/// Simple contrast stretch: push pixels toward 0 or 255 to simulate
-/// lighter/crisper antialiasing. Midpoint at 128, sigmoidal mapping.
-fn contrast_stretch(img: &GrayImage) -> GrayImage {
-    let (w, h) = img.dimensions();
-    let mut out = GrayImage::new(w, h);
-    for y in 0..h {
-        for x in 0..w {
-            let px = img.get_pixel(x, y).0[0] as f32;
-            // Sigmoidal contrast around midpoint 128
-            // Maps 0→0, 128→128, 255→255, with steeper slope at midpoint
-            let norm = (px - 128.0) / 128.0; // [-1, 1]
-            let stretched = norm * (1.0 + 0.5 * norm.abs()); // steepened
-            let val = ((stretched * 128.0 + 128.0).clamp(0.0, 255.0)) as u8;
-            out.put_pixel(x, y, Luma([val]));
-        }
-    }
-    out
-}
+use unscan::char_index::AaVariant;
 
 // ---------------------------------------------------------------------------
 // Native-height simulation
@@ -344,7 +283,10 @@ struct Manifest {
 // ---------------------------------------------------------------------------
 
 fn main() {
-    let args = Args::parse();
+    let mut args = Args::parse();
+    if args.heights.is_empty() {
+        args.heights = vec![char_index::NORM_H];
+    }
 
     let aa_variants: Vec<AaVariant> = args.aa.iter()
         .filter_map(|s| AaVariant::parse(s))
@@ -568,7 +510,7 @@ fn main() {
         heights: args.heights.clone(),
         aa_variants: aa_variants.iter().map(|a| a.name().to_string()).collect(),
         chars: chars_strs,
-        norm_h: 48,  // NORM_H from char_index
+        norm_h: char_index::NORM_H,  // NORM_H from char_index
         generated_at: chrono_now(),
         git_commit,
     };

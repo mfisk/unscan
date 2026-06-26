@@ -13,10 +13,6 @@ path = "src/main.rs"
 name = "gen_training_data"
 path = "src/bin/gen_training_data.rs"
 
-[[bin]]
-name = "train"
-path = "src/bin/train.rs"
-
 [dependencies]
 clap = { version = "4", features = ["derive"] }
 image = "0.25"
