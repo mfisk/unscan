@@ -2,7 +2,7 @@
 //! Outputs side-by-side PNGs to /tmp/ci_diag/
 
 use image::{GrayImage, Luma, imageops};
-use ab_glyph::{FontRef, Font, PxScale, ScaleFont, point};
+use ab_glyph::{FontRef, Font};
 use std::path::Path;
 
 fn main() {
@@ -24,7 +24,7 @@ fn main() {
         ("Verdana Bold Ital", "/usr/share/fonts/truetype/msttcorefonts/Verdana_Bold_Italic.ttf"),
     ];
 
-    let norm_h: u32 = 48;
+    let norm_h: u32 = unscan::char_index::NORM_H;
     let test_chars = ['e', 'a', 'o', 'n', 't', 'h', 'r'];
 
     // For each font, render each char at NORM_H and save
@@ -90,7 +90,7 @@ fn main() {
     let grid_h = rows * grid_cell_h;
     let mut grid = GrayImage::from_pixel(grid_w, grid_h, Luma([240u8]));
 
-    for (col, (name, path)) in fonts.iter().enumerate() {
+    for (col, (_name, path)) in fonts.iter().enumerate() {
         let data = match std::fs::read(path) {
             Ok(d) => d,
             Err(_) => continue,
@@ -123,14 +123,15 @@ fn main() {
             let data = match std::fs::read(path) { Ok(d) => d, Err(_) => continue };
             let font = match FontRef::try_from_slice(&data) { Ok(f) => f, Err(_) => continue };
             if let Some(img) = render_char_normalised(&font, c, norm_h) {
-                let feats = compute_simple_features(&img);
+                let feats_cf = unscan::char_index::compute_features(&img).map(|f| f.as_slice().to_vec()).unwrap_or_else(|| vec![0.0; unscan::char_index::FEAT_LEN]);
+                let feats = feats_cf;
                 feat_vecs.push((name.to_string(), feats));
             }
         }
 
         // Print distances between each specimen font and each CI-top font
         let specimen_names: Vec<&str> = vec!["EB Garamond 400", "Libre Caslon 400", "Libre Baskerville 400", "Libre Bodoni 400", "Zilla Slab 400"];
-        let ci_top_names: Vec<&str> = vec!["Impact", "Arial Bold", "Georgia Bold", "Times NR Bold Ital", "Verdana Bold Ital"];
+        let _ci_top_names: Vec<&str> = vec!["Impact", "Arial Bold", "Georgia Bold", "Times NR Bold Ital", "Verdana Bold Ital"];
 
         for spec in &specimen_names {
             let spec_feat = feat_vecs.iter().find(|(n,_)| n == spec);
@@ -154,91 +155,11 @@ fn main() {
 }
 
 fn render_char_normalised(font: &FontRef, c: char, norm_h: u32) -> Option<GrayImage> {
-    let gid = font.glyph_id(c);
-    if gid.0 == 0 {
-        return None;
-    }
-
-    let ref_h = 200.0f32;
-    let ref_scale = PxScale::from(ref_h);
-    let sf_ref = font.as_scaled(ref_scale);
-
-    let glyph = gid.with_scale_and_position(ref_scale, point(0.0, sf_ref.ascent()));
-    let outlined = font.outline_glyph(glyph)?;
-    let bounds = outlined.px_bounds();
-    let ink_h_ref = bounds.max.y - bounds.min.y;
-    if ink_h_ref < 1.0 {
-        return None;
-    }
-
-    let target_scale = ref_h * (norm_h as f32 / ink_h_ref);
-    let scale = PxScale::from(target_scale);
-    let sf = font.as_scaled(scale);
-
-    let glyph2 = gid.with_scale_and_position(scale, point(0.0, sf.ascent()));
-    let outlined2 = font.outline_glyph(glyph2)?;
-    let b2 = outlined2.px_bounds();
-
-    let img_w = (b2.max.x - b2.min.x).ceil() as u32 + 2;
-    let img_h = (b2.max.y - b2.min.y).ceil() as u32 + 2;
-    if img_w == 0 || img_h == 0 || img_w > 500 || img_h > 500 {
-        return None;
-    }
-
-    let mut canvas = GrayImage::from_pixel(img_w, img_h, Luma([255u8]));
-    let ox = b2.min.x.floor() as i32;
-    let oy = b2.min.y.floor() as i32;
-
-    outlined2.draw(|gx, gy, cov| {
-        let px = gx as i32 + (b2.min.x.floor() as i32) - ox + 1;
-        let py = gy as i32 + (b2.min.y.floor() as i32) - oy + 1;
-        if px >= 0 && py >= 0 && (px as u32) < img_w && (py as u32) < img_h {
-            let val = (255.0 * (1.0 - cov)) as u8;
-            let cur = canvas.get_pixel(px as u32, py as u32).0[0];
-            canvas.put_pixel(px as u32, py as u32, Luma([cur.min(val)]));
-        }
-    });
-
-    Some(canvas)
+    let canvas = unscan::char_render::render_glyph_at_ink_height(font, font.glyph_id(c), norm_h)?;
+    unscan::char_index::normalize_to_ink_bounds(&canvas, norm_h)
 }
 
-fn compute_simple_features(img: &GrayImage) -> Vec<f32> {
-    let (w, h) = img.dimensions();
-    let threshold = 200u8;
-    let mut ink_pixels = 0u32;
-    let mut total = 0u32;
-    let mut wy_sum = 0.0f64;
-    let mut min_x = w; let mut max_x = 0u32;
-    let mut min_y = h; let mut max_y = 0u32;
 
-    for y in 0..h {
-        for x in 0..w {
-            let px = img.get_pixel(x, y).0[0];
-            total += 1;
-            if px < threshold {
-                ink_pixels += 1;
-                wy_sum += y as f64;
-                if x < min_x { min_x = x; }
-                if x > max_x { max_x = x; }
-                if y < min_y { min_y = y; }
-                if y > max_y { max_y = y; }
-            }
-        }
-    }
-
-    if ink_pixels == 0 {
-        return vec![0.0; 5];
-    }
-
-    let ink_w = (max_x - min_x + 1) as f32;
-    let ink_h = (max_y - min_y + 1) as f32;
-    let aspect = ink_w / ink_h.max(1.0);
-    let density = ink_pixels as f32 / (ink_w * ink_h).max(1.0);
-    let v_center = (wy_sum / ink_pixels as f64) as f32 / h as f32;
-    let fill = ink_pixels as f32 / total as f32;
-
-    vec![aspect, density, v_center, fill, ink_w / w as f32]
-}
 
 fn extract_scan_chars_and_compare(page: &GrayImage, fonts: &[(&str, &str); 10], norm_h: u32, out_dir: &Path) {
     // Find horizontal text lines by looking for rows with significant ink
@@ -400,13 +321,15 @@ fn extract_scan_chars_and_compare(page: &GrayImage, fonts: &[(&str, &str); 10], 
     // Print feature distances between scan crops and font renders
     eprintln!("\n=== Scan crop vs rendered feature distances ===");
     for (row, scan_img) in scan_crops.iter().take(5).enumerate() {
-        let scan_feat = compute_simple_features(scan_img);
-        eprintln!("Scan line {} features: aspect={:.2} density={:.2} vcenter={:.2} fill={:.2}",
-            row, scan_feat[0], scan_feat[1], scan_feat[2], scan_feat[3]);
+        let scan_cf = unscan::char_index::compute_features(scan_img).map(|f| f.as_slice().to_vec()).unwrap_or_else(|| vec![0.0; unscan::char_index::FEAT_LEN]);
+        let scan_feat = &scan_cf;
+        eprintln!("Scan line {} features: aspect={:.2} density={:.2} vcenter={:.2}",
+            row, scan_feat[16], scan_feat[17], scan_feat[18]);
         for (name, fimg) in &font_renders {
-            let font_feat = compute_simple_features(fimg);
+            let font_cf = unscan::char_index::compute_features(fimg).map(|f| f.as_slice().to_vec()).unwrap_or_else(|| vec![0.0; unscan::char_index::FEAT_LEN]);
+            let font_feat = &font_cf;
             let dist: f32 = scan_feat.iter().zip(font_feat.iter()).map(|(a,b)| (a-b)*(a-b)).sum::<f32>().sqrt();
-            eprint!("  {} d={:.3} (asp={:.2} den={:.2}) |", name, dist, font_feat[0], font_feat[1]);
+            eprint!("  {} d={:.3} (asp={:.2} den={:.2}) |", name, dist, font_feat[16], font_feat[17]);
         }
         eprintln!();
     }

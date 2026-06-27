@@ -12,8 +12,8 @@
 ///   learn_weights                           Run full analysis (all fonts × chars × DPIs)
 ///   learn_weights --dpis 300,200,100        Custom DPI set (default: 300,200,100)
 
-use ab_glyph::{Font, FontRef, PxScale, ScaleFont};
-use image::{GrayImage, Luma};
+use ab_glyph::{Font, FontRef};
+use image::GrayImage;
 use rayon::prelude::*;
 use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
@@ -21,59 +21,26 @@ use std::path::PathBuf;
 use unscan::char_index::{self, compute_features, FEAT_LEN};
 use unscan::font_scan;
 
-const FEAT_NAMES: &[&str] = &[
-    // Group 1: Column ink profile (16)
-    "col0","col1","col2","col3","col4","col5","col6","col7",
-    "col8","col9","col10","col11","col12","col13","col14","col15",
-    // Group 2: Scalar v1 (7)
-    "aspect","ink_density","v_center","h_balance","serif_score","stroke_contrast","xh_cap_ratio",
-    // Group 3: Scalar v2 (14)
-    "counter_area","counter_cx","counter_cy","counter_asp",
-    "term0","term1","term2","term3",
-    "ink_perim","compactness",
-    "cross0","cross1","cross2","cross3",
-    // Group 4: Row ink profile (16)
-    "row0","row1","row2","row3","row4","row5","row6","row7",
-    "row8","row9","row10","row11","row12","row13","row14","row15",
-    // Group 5: Scalar v3 (11)
-    "hole_count","h_symmetry","v_symmetry","skel_branch","skel_endpt",
-    "corner_count","quad_tl","quad_tr","quad_bl","quad_br","mean_stroke_w",
-];
+use unscan::char_index::FEAT_NAMES;
 
 /// Render a character at a given simulated DPI.
 ///
-/// The approach mirrors the real pipeline:
-/// - Render at full quality using ab_glyph (same as index)
-/// - Downscale to simulate capture at `dpi` (relative to 300 DPI reference)
-/// - Run through `normalize_to_ink_bounds` (same as scan-side crop normalization)
+/// Uses the canonical render pipeline (get_rendered_char) for the full-quality
+/// image, then degrades to simulate lower-resolution capture.
 ///
 /// At 300 DPI this is identical to the index render.  At lower DPIs, the
 /// downscale→upscale cycle loses detail just like a real lower-resolution scan.
-fn render_char_at_dpi<F: Font>(font: &F, c: char, dpi: u32) -> Option<GrayImage> {
-    // Render at full quality (same as render_char_normalised)
-    let full = char_index::render_char_normalised(font, c)?;
+fn render_char_at_dpi<F: Font>(font: &F, font_key: &str, c: char, dpi: u32) -> Option<GrayImage> {
+    // Render through the canonical pipeline — same code path as index-time
+    let params = unscan::char_render::RenderParams::default();
+    let full = unscan::char_render::get_rendered_char(font, font_key, c, None, &params)?;
 
     if dpi >= 300 {
-        // At reference DPI, return as-is (already normalized)
         return Some(full);
     }
 
-    // Downscale to simulate lower DPI, then normalize back up
-    let scale_factor = dpi as f32 / 300.0;
-    let (w, h) = full.dimensions();
-    let small_w = ((w as f32 * scale_factor).round() as u32).max(3);
-    let small_h = ((h as f32 * scale_factor).round() as u32).max(3);
-
-    // Downscale (simulates lower-resolution capture)
-    let small = image::imageops::resize(
-        &full,
-        small_w,
-        small_h,
-        image::imageops::FilterType::Lanczos3,
-    );
-
-    // Normalize back through the same path as scan crops
-    char_index::normalize_to_ink_bounds(&small)
+    // Downscale + re-normalize (simulates lower-resolution capture)
+    char_index::degrade_and_renormalize(&full, dpi as f32 / 300.0)
 }
 
 /// One (font, char, dpi) → feature vector result.
@@ -135,7 +102,7 @@ fn main() {
 
         let mut batch = Vec::new();
         for &c in chars {
-            if let Some(img) = render_char_at_dpi(&font, c, dpi) {
+            if let Some(img) = render_char_at_dpi(&font, font_name, c, dpi) {
                 if let Some(feats) = compute_features(&img) {
                     batch.push(RenderResult {
                         font_name: font_name.clone(),
@@ -332,17 +299,17 @@ fn main() {
     }
 
     // Group totals
-    let col_prof_wt: f64 = norm_weights[..16].iter().sum();
-    let scal_v1_wt: f64 = norm_weights[16..23].iter().sum();
-    let scal_v2_wt: f64 = norm_weights[23..37].iter().sum();
-    let row_prof_wt: f64 = norm_weights[37..53].iter().sum();
-    let scal_v3_wt: f64 = norm_weights[53..].iter().sum();
+    let col_prof_wt: f64 = norm_weights[..unscan::char_index::PROFILE_BINS].iter().sum();
+    let scal_v1_wt: f64 = norm_weights[unscan::char_index::GROUP_OFFSETS[1].0..unscan::char_index::GROUP_OFFSETS[1].1].iter().sum();
+    let scal_v2_wt: f64 = norm_weights[unscan::char_index::GROUP_OFFSETS[2].0..unscan::char_index::GROUP_OFFSETS[2].1].iter().sum();
+    let row_prof_wt: f64 = norm_weights[unscan::char_index::GROUP_OFFSETS[3].0..unscan::char_index::GROUP_OFFSETS[3].1].iter().sum();
+    let scal_v3_wt: f64 = norm_weights[unscan::char_index::GROUP_OFFSETS[4].0..].iter().sum();
     println!("\n={:=>94}", "");
     println!("GROUP WEIGHTS — CURRENT vs OPTIMAL");
     println!("={:=>94}", "");
-    println!("  {:30}  current: 0.4000  optimal: {:.4}", "Col profile (16 dims)", col_prof_wt);
-    println!("  {:30}  current: 0.3000  optimal: {:.4}", "Scalar v1 (7 dims)", scal_v1_wt);
-    println!("  {:30}  current: 0.3000  optimal: {:.4}", "Scalar v2 (14 dims)", scal_v2_wt);
+    println!("  {:30}  current: 0.4000  optimal: {:.4}", "Col profile", col_prof_wt);
+    println!("  {:30}  current: 0.3000  optimal: {:.4}", "Scalar v1", scal_v1_wt);
+    println!("  {:30}  current: 0.3000  optimal: {:.4}", "Scalar v2", scal_v2_wt);
     println!("  {:30}  current: 0.3000  optimal: {:.4}", "Row profile (16 dims)", row_prof_wt);
     println!("  {:30}  current: 0.2000  optimal: {:.4}", "Scalar v3 (11 dims)", scal_v3_wt);
 
@@ -350,24 +317,21 @@ fn main() {
     println!("\n={:=>94}", "");
     println!("SCALAR FEATURES — v1");
     println!("={:=>94}", "");
-    for j in 0..7 {
-        let i = 16 + j;
+    for i in unscan::char_index::GROUP_OFFSETS[1].0..unscan::char_index::GROUP_OFFSETS[1].1 {
         println!("  {:>16}  signal={:.6}  noise={:.6}  fisher={:.2}  wt={:.4}",
             FEAT_NAMES[i], signal[i], noise[i], fisher[i], norm_weights[i]);
     }
     println!("\n={:=>94}", "");
     println!("SCALAR FEATURES — v2");
     println!("={:=>94}", "");
-    for j in 0..14 {
-        let i = 23 + j;
+    for i in unscan::char_index::GROUP_OFFSETS[2].0..unscan::char_index::GROUP_OFFSETS[2].1 {
         println!("  {:>16}  signal={:.6}  noise={:.6}  fisher={:.2}  wt={:.4}",
             FEAT_NAMES[i], signal[i], noise[i], fisher[i], norm_weights[i]);
     }
     println!("\n={:=>94}", "");
     println!("SCALAR FEATURES — v3");
     println!("={:=>94}", "");
-    for j in 0..11 {
-        let i = 53 + j;
+    for i in unscan::char_index::GROUP_OFFSETS[4].0..unscan::char_index::GROUP_OFFSETS[4].1 {
         println!("  {:>16}  signal={:.6}  noise={:.6}  fisher={:.2}  wt={:.4}",
             FEAT_NAMES[i], signal[i], noise[i], fisher[i], norm_weights[i]);
     }
@@ -378,11 +342,11 @@ fn main() {
     println!("={:=>94}", "");
     println!("const FISHER_WEIGHTS: [f32; FEAT_LEN] = [");
     for (start, end, label) in [
-        (0, 16, "Col profile"),
-        (16, 23, "Scalar v1"),
-        (23, 37, "Scalar v2"),
-        (37, 53, "Row profile"),
-        (53, 64, "Scalar v3"),
+        (unscan::char_index::GROUP_OFFSETS[0].0, unscan::char_index::GROUP_OFFSETS[0].1, "Col profile"),
+        (unscan::char_index::GROUP_OFFSETS[1].0, unscan::char_index::GROUP_OFFSETS[1].1, "Scalar v1"),
+        (unscan::char_index::GROUP_OFFSETS[2].0, unscan::char_index::GROUP_OFFSETS[2].1, "Scalar v2"),
+        (unscan::char_index::GROUP_OFFSETS[3].0, unscan::char_index::GROUP_OFFSETS[3].1, "Row profile"),
+        (unscan::char_index::GROUP_OFFSETS[4].0, unscan::char_index::GROUP_OFFSETS[4].1, "Scalar v3"),
     ] {
         let vals: Vec<String> = (start..end).map(|i| format!("{:.6}", norm_scale_adj[i])).collect();
         println!("    // {}", label);

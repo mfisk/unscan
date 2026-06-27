@@ -708,7 +708,7 @@ impl GroundTruth {
     /// boxes; otherwise estimates widths as character_count × 0.5 × font_size.
     pub fn load(path: &Path) -> Result<Self, String> {
         let doc = Document::load(path).map_err(|e| format!("failed to load vector PDF: {}", e))?;
-        let page_count = doc.get_pages().len();
+        let _page_count = doc.get_pages().len();
         let mut pages: HashMap<usize, Vec<VectorSpan>> = HashMap::new();
 
         let page_ids: Vec<(u32, lopdf::ObjectId)> = doc.get_pages().into_iter().collect();

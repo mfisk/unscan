@@ -26,20 +26,6 @@ pub mod report;
 
 use crate::audit::{AuditEntry, AuditLog, BBox, Decision, GeometryEntry, PageSummary};
 
-fn mem_info() -> String {
-    let s = std::fs::read_to_string("/proc/self/status").unwrap_or_default();
-    let mut rss = 0u64;
-    let mut vsz = 0u64;
-    for l in s.lines() {
-        if l.starts_with("VmRSS:") {
-            rss = l.split_whitespace().nth(1).and_then(|v| v.parse().ok()).unwrap_or(0);
-        }
-        if l.starts_with("VmSize:") {
-            vsz = l.split_whitespace().nth(1).and_then(|v| v.parse().ok()).unwrap_or(0);
-        }
-    }
-    format!("RSS={}MB VSZ={}MB", rss / 1024, vsz / 1024)
-}
 
 fn dump_limits() {
     if let Ok(s) = std::fs::read_to_string("/proc/self/limits") {
@@ -55,12 +41,12 @@ fn dump_limits() {
             }
         }
     }
-    if let Ok(s) = std::fs::read_to_string("/proc/sys/vm/overcommit_memory") {
+    if let Ok(_s) = std::fs::read_to_string("/proc/sys/vm/overcommit_memory") {
     }
     // cgroup memory limit
     for path in &["/sys/fs/cgroup/memory/memory.limit_in_bytes",
                    "/sys/fs/cgroup/memory.max"] {
-        if let Ok(s) = std::fs::read_to_string(path) {
+        if let Ok(_s) = std::fs::read_to_string(path) {
         }
     }
 }
@@ -74,7 +60,7 @@ use std::path::{Path, PathBuf};
 const MIN_VERIFY_SSIM: f32 = 0.8;
 
 /// Standalone char rendering: render characters using the index-time
-/// render_char_normalised() pipeline and save as PNGs.
+/// render_glyph_at_ink_height() pipeline and save as PNGs.
 fn render_ref_chars_and_exit(json_str: &str) -> ! {
     use ab_glyph::{Font, FontVec};
 
@@ -105,7 +91,7 @@ fn render_ref_chars_and_exit(json_str: &str) -> ! {
         std::process::exit(1);
     });
 
-    let mut rendered = 0u32;
+    let mut _rendered = 0u32;
     for c in req.chars.chars() {
         if font.glyph_id(c).0 == 0 {
             continue; // no glyph for this char
@@ -113,7 +99,7 @@ fn render_ref_chars_and_exit(json_str: &str) -> ! {
         if let Some(img) = char_render::get_rendered_char_default(&font, &req.font, c, None) {
             let fname = format!("U+{:04X}.png", c as u32);
             let _ = img.save(out.join(&fname));
-            rendered += 1;
+            _rendered += 1;
         }
     }
     std::process::exit(0);
@@ -161,15 +147,15 @@ fn main() {
     }
 
     // ── Build the classifier based on --classifier flag ──────────────
-    let clf: Box<dyn classifier::Classifier> = make_classifier(&args);
+    let mut clf: Box<dyn classifier::Classifier> = make_classifier(&args);
 
     if args.index {
-        if let Err(e) = run_index(&args, &*clf) {
+        if let Err(e) = run_index(&args, &mut *clf) {
             eprintln!("Error: {e}");
             std::process::exit(1);
         }
     } else {
-        if let Err(e) = run(&args, &*clf) {
+        if let Err(e) = run(&args, &mut *clf) {
             eprintln!("Error: {e}");
             std::process::exit(1);
         }
@@ -186,7 +172,7 @@ fn default_lda_weights_path() -> PathBuf {
 /// If no weights exist, auto-trains them first.
 fn load_lda_classifier(args: &cli::Args) -> Box<dyn classifier::Classifier> {
     if let Some(ref weights_path) = args.triplet_weights {
-        match classifier::LdaClassifier::load(weights_path) {
+        match classifier::load_lda(weights_path) {
             Ok(c) => Box::new(c),
             Err(e) => { eprintln!("Error loading LDA weights from {:?}: {e}", weights_path); std::process::exit(1); }
         }
@@ -207,7 +193,7 @@ fn load_lda_classifier(args: &cli::Args) -> Box<dyn classifier::Classifier> {
             }
             eprintln!("Auto-training complete, continuing with scan...");
         }
-        match classifier::LdaClassifier::load(&default_path) {
+        match classifier::load_lda(&default_path) {
             Ok(c) => Box::new(c),
             Err(e) => { eprintln!("Error loading LDA weights from {:?}: {e}", default_path); std::process::exit(1); }
         }
@@ -217,13 +203,13 @@ fn load_lda_classifier(args: &cli::Args) -> Box<dyn classifier::Classifier> {
 /// Create the classifier selected by CLI args.
 fn make_classifier(args: &cli::Args) -> Box<dyn classifier::Classifier> {
     match args.classifier.as_str() {
-        "fisher" => Box::new(classifier::FisherClassifier),
+        "fisher" => Box::new(classifier::new_fisher()),
         "triplet" => {
             let weights_path = args.triplet_weights.as_ref().unwrap_or_else(|| {
                 eprintln!("Error: --triplet-weights is required when using --classifier=triplet");
                 std::process::exit(1);
             });
-            match classifier::TripletClassifier::load(weights_path) {
+            match classifier::load_triplet(weights_path) {
                 Ok(c) => Box::new(c),
                 Err(e) => {
                     eprintln!("Error: {e}");
@@ -236,7 +222,7 @@ fn make_classifier(args: &cli::Args) -> Box<dyn classifier::Classifier> {
                 eprintln!("Error: --triplet-weights is required when using --classifier=global-triplet");
                 std::process::exit(1);
             });
-            match classifier::GlobalTripletClassifier::load(weights_path) {
+            match classifier::load_global_triplet(weights_path) {
                 Ok(c) => Box::new(c),
                 Err(e) => {
                     eprintln!("Error: {e}");
@@ -257,11 +243,11 @@ fn make_classifier(args: &cli::Args) -> Box<dyn classifier::Classifier> {
                     } else {
                         default_lda_weights_path()
                     };
-                    let lda = match classifier::LdaClassifier::load(&default_path) {
+                    let lda = match classifier::load_lda(&default_path) {
                         Ok(c) => c,
                         Err(e) => { eprintln!("Error loading LDA for fusion: {e}"); std::process::exit(1); }
                     };
-                    let fisher = classifier::FisherClassifier;
+                    let fisher = classifier::new_fisher();
                     Box::new(classifier::FusionClassifier::new(vec![
                         (0.5, Box::new(lda)),
                         (0.5, Box::new(fisher)),
@@ -274,13 +260,13 @@ fn make_classifier(args: &cli::Args) -> Box<dyn classifier::Classifier> {
                     });
                     match other {
                         "perchar-fisher" => {
-                            match classifier::PerCharFisherClassifier::load(weights_path) {
+                            match classifier::load_per_char_fisher(weights_path) {
                                 Ok(c) => Box::new(c),
                                 Err(e) => { eprintln!("Error: {e}"); std::process::exit(1); }
                             }
                         }
                         "mahalanobis" => {
-                            match classifier::MahalanobisClassifier::load(weights_path) {
+                            match classifier::load_mahalanobis(weights_path) {
                                 Ok(c) => Box::new(c),
                                 Err(e) => { eprintln!("Error: {e}"); std::process::exit(1); }
                             }
@@ -305,7 +291,7 @@ fn make_classifier(args: &cli::Args) -> Box<dyn classifier::Classifier> {
 /// Scan available fonts, compare against the cached index, and incrementally
 /// update: add new fonts, remove stale fonts, or report "Index is current".
 /// With `--rebuild-index`, forces a full rebuild.
-fn run_index(args: &cli::Args, classifier: &dyn classifier::Classifier) -> Result<(), ScanTextError> {
+fn run_index(args: &cli::Args, classifier: &mut dyn classifier::Classifier) -> Result<(), ScanTextError> {
     let font_dirs = font_scan::default_font_dirs(&args.font_dir);
     let font_catalog = font_scan::scan_fonts(&font_dirs);
     if font_catalog.is_empty() {
@@ -341,7 +327,7 @@ fn run_index(args: &cli::Args, classifier: &dyn classifier::Classifier) -> Resul
                 return do_full_build(&system_fonts, &index_path, classifier, &args.render_params());
             }
         }
-        Err(e) => {
+        Err(_e) => {
             return do_full_build(&system_fonts, &index_path, classifier, &args.render_params());
         }
     }
@@ -350,14 +336,14 @@ fn run_index(args: &cli::Args, classifier: &dyn classifier::Classifier) -> Resul
     let start = std::time::Instant::now();
     let mut index = match char_index::load_index(&index_path, classifier) {
         Ok(idx) => idx,
-        Err(e) => {
+        Err(_e) => {
             return do_full_build(&system_fonts, &index_path, classifier, &args.render_params());
         }
     };
-    let load_time = start.elapsed();
+    let _load_time = start.elapsed();
     let indexed_names = index.font_names(); // includes both indexed + skipped
-    let indexed_count = index.indexed_font_names().len();
-    let skipped_count = index.skipped_fonts.len();
+    let _indexed_count = index.indexed_font_names().len();
+    let _skipped_count = index.skipped_fonts.len();
 
     // ── Diff: new vs removed ───────────────────────────────────────
     let new_fonts: Vec<String> = system_names
@@ -375,7 +361,7 @@ fn run_index(args: &cli::Args, classifier: &dyn classifier::Classifier) -> Resul
 
     // ── Remove stale fonts ─────────────────────────────────────────
     if !removed_fonts.is_empty() {
-        for name in removed_fonts.iter().take(10) {
+        for _name in removed_fonts.iter().take(10) {
         }
         if removed_fonts.len() > 10 {
         }
@@ -384,7 +370,7 @@ fn run_index(args: &cli::Args, classifier: &dyn classifier::Classifier) -> Resul
 
     // ── Build entries for new fonts only ────────────────────────────
     if !new_fonts.is_empty() {
-        for name in new_fonts.iter().take(10) {
+        for _name in new_fonts.iter().take(10) {
         }
         if new_fonts.len() > 10 {
         }
@@ -392,7 +378,7 @@ fn run_index(args: &cli::Args, classifier: &dyn classifier::Classifier) -> Resul
             .iter()
             .filter_map(|name| system_fonts.get(name).map(|(p, g, v)| (name.clone(), p.clone(), g.clone(), v.clone())))
             .collect();
-        let start = std::time::Instant::now();
+        let _start = std::time::Instant::now();
         let partial = char_index::build_char_index(&pairs, classifier, &args.render_params());
         index.merge(partial, classifier);
     }
@@ -402,9 +388,9 @@ fn run_index(args: &cli::Args, classifier: &dyn classifier::Classifier) -> Resul
         let _ = std::fs::create_dir_all(parent);
     }
     char_index::save_index(&index, &index_path).map_err(ScanTextError::Io)?;
-    index.compact(); // drop raw entries — flat_vecs is all we need for search
-    let file_size = std::fs::metadata(&index_path).map(|m| m.len()).unwrap_or(0);
-    let final_count = char_index::count_fonts(&index);
+    index.compact(); // drop raw entries — classifier holds the search vectors now
+    let _file_size = std::fs::metadata(&index_path).map(|m| m.len()).unwrap_or(0);
+    let _final_count = char_index::count_fonts(&index);
 
     if !new_fonts.is_empty() {
     }
@@ -443,7 +429,7 @@ fn catalog_from_meta(index: &char_index::CharIndex) -> Vec<font_scan::FontEntry>
 /// Scan fonts from filesystem, build char index, and return both.
 fn scan_and_build_index(
     args: &cli::Args,
-    classifier: &dyn classifier::Classifier,
+    classifier: &mut dyn classifier::Classifier,
 ) -> Result<(char_index::CharIndex, Vec<font_scan::FontEntry>), ScanTextError> {
     let font_dirs = font_scan::default_font_dirs(&args.font_dir);
     let _t_scan = std::time::Instant::now();
@@ -460,7 +446,7 @@ fn scan_and_build_index(
         .collect();
 
     let mut index = char_index::build_char_index(&pairs, classifier, &args.render_params());
-    let elapsed = start.elapsed();
+    let _elapsed = start.elapsed();
 
     index.populate_font_meta(&font_catalog);
 
@@ -469,9 +455,9 @@ fn scan_and_build_index(
     }
     match char_index::save_index(&index, &index_path) {
         Ok(()) => {
-            let sz = std::fs::metadata(&index_path).map(|m| m.len()).unwrap_or(0);
+            let _sz = std::fs::metadata(&index_path).map(|m| m.len()).unwrap_or(0);
         }
-        Err(e) => {
+        Err(_e) => {
         }
     }
     index.compact();
@@ -483,7 +469,7 @@ fn scan_and_build_index(
 fn do_full_build(
     system_fonts: &std::collections::HashMap<String, (PathBuf, char_index::GlyphOverrides, char_index::Variations)>,
     index_path: &Path,
-    classifier: &dyn classifier::Classifier,
+    classifier: &mut dyn classifier::Classifier,
     render_params: &char_render::RenderParams,
 ) -> Result<(), ScanTextError> {
     let pairs: Vec<(String, PathBuf, char_index::GlyphOverrides, char_index::Variations)> = system_fonts
@@ -494,15 +480,15 @@ fn do_full_build(
 
     let start = std::time::Instant::now();
     let mut index = char_index::build_char_index(&pairs, classifier, render_params);
-    let elapsed = start.elapsed();
+    let _elapsed = start.elapsed();
 
     if let Some(parent) = index_path.parent() {
         std::fs::create_dir_all(parent).map_err(ScanTextError::Io)?;
     }
     char_index::save_index(&index, index_path).map_err(ScanTextError::Io)?;
 
-    let file_size = std::fs::metadata(index_path).map(|m| m.len()).unwrap_or(0);
-    let n_entries: usize = index.n_entries();
+    let _file_size = std::fs::metadata(index_path).map(|m| m.len()).unwrap_or(0);
+    let _n_entries: usize = index.n_entries();
     index.compact();
 
 
@@ -510,7 +496,7 @@ fn do_full_build(
 }
 
 /// Load or build the character index with caching.
-fn run(args: &cli::Args, classifier: &dyn classifier::Classifier) -> Result<(), ScanTextError> {
+fn run(args: &cli::Args, classifier: &mut dyn classifier::Classifier) -> Result<(), ScanTextError> {
     dump_limits();
     let input = args.input.as_ref().expect("input validated");
     let dev_null = std::path::PathBuf::from("/dev/null");
@@ -535,10 +521,10 @@ fn run(args: &cli::Args, classifier: &dyn classifier::Classifier) -> Result<(), 
     // ── 1. Load or build character index + font catalog ────────────
     let index_path = args.resolved_index_path();
     let (char_index, font_catalog) = if !args.rebuild_index && index_path.exists() {
-        let start = std::time::Instant::now();
+        let _start = std::time::Instant::now();
         match char_index::load_index(&index_path, classifier) {
             Ok(mut index) if !index.font_meta.is_empty() => {
-                let n_entries: usize = index.n_entries();
+                let _n_entries: usize = index.n_entries();
                 let catalog = catalog_from_meta(&index);
                 index.compact();
                 (index, catalog)
@@ -547,7 +533,7 @@ fn run(args: &cli::Args, classifier: &dyn classifier::Classifier) -> Result<(), 
                 let (idx, cat) = scan_and_build_index(args, classifier)?;
                 (idx, cat)
             }
-            Err(e) => {
+            Err(_e) => {
                 let (idx, cat) = scan_and_build_index(args, classifier)?;
                 (idx, cat)
             }
@@ -603,7 +589,7 @@ fn run(args: &cli::Args, classifier: &dyn classifier::Classifier) -> Result<(), 
         }
     }
 
-    let raster_elapsed = raster_start.elapsed();
+    let _raster_elapsed = raster_start.elapsed();
     if std::env::var("UNSCAN_DEBUG_MEM").is_ok() {
     }
 
@@ -620,10 +606,10 @@ fn run(args: &cli::Args, classifier: &dyn classifier::Classifier) -> Result<(), 
     let mut audit_geo: Vec<GeometryEntry> = Vec::new();
     let mut page_summaries: Vec<PageSummary> = Vec::new();
 
-    let mut stat_lines_vectorized = 0u32;
-    let mut stat_lines_raster = 0u32;
-    let mut stat_geo_elements = 0u32;
-    let mut stat_raster_frags = 0u32;
+    let mut _stat_lines_vectorized = 0u32;
+    let mut _stat_lines_raster = 0u32;
+    let mut _stat_geo_elements = 0u32;
+    let mut _stat_raster_frags = 0u32;
     // Dominant font candidate for fast-path SSIM, persists across pages.
     let mut dominant_font_candidate: Option<font_match::FontMatchResult> = None;
 
@@ -634,7 +620,7 @@ fn run(args: &cli::Args, classifier: &dyn classifier::Classifier) -> Result<(), 
                 gt.canonicalize_names(&font_catalog);
                 Some(gt)
             },
-            Err(e) => {
+            Err(_e) => {
                 None
             }
         }
@@ -696,7 +682,7 @@ fn run(args: &cli::Args, classifier: &dyn classifier::Classifier) -> Result<(), 
 
         // 3a. OCR (with cache) ─────────────────────────────────────────
         let ocr_start = std::time::Instant::now();
-        let (word_regions, _page_char_boxes, ocr_cached) =
+        let (word_regions, _page_char_boxes, _ocr_cached) =
             if let Some((wr, cb)) = cache_dir.as_ref().and_then(|d| page_cache::load_cached_ocr(d, page_idx)) {
                 (wr, cb, true)
             } else {
@@ -712,7 +698,7 @@ fn run(args: &cli::Args, classifier: &dyn classifier::Classifier) -> Result<(), 
         ocr::merge_overlapping_lines(&mut lines);
         ocr::clip_word_overlaps(&mut lines);
         ocr::drop_outlier_words(&mut lines);
-        let ocr_elapsed = ocr_start.elapsed();
+        let _ocr_elapsed = ocr_start.elapsed();
 
         // 3b. Background colour ───────────────────────────────────────
         let bg_color = color::detect_background_color(page_img);
@@ -726,10 +712,10 @@ fn run(args: &cli::Args, classifier: &dyn classifier::Classifier) -> Result<(), 
         // Use a threshold relative to the background: anything darker than
         // (bg - 56) counts as ink (works for both light and dark backgrounds).
         let ink_thresh = bg_color.0.saturating_sub(56);
+        let blur_thresh = bg_color.0.saturating_sub(15);
         let _t_pre = std::time::Instant::now();
-        // Line-level ink expansion (vertical ascender/descender coverage)
-        // Also expands word bboxes horizontally (italic overshoot, etc.)
-        ocr::expand_bbox_to_ink(&mut lines, &gray_page, ink_thresh);
+        // Expand word bboxes to actual ink, then union into line bboxes.
+        ocr::expand_words_to_ink(&mut lines, &gray_page, ink_thresh, blur_thresh, 20);
         let mut placed_texts: Vec<pdf_out::PlacedText> = Vec::new();
         let mut pg_vec = 0u32;
         let mut pg_raster = 0u32;
@@ -826,7 +812,7 @@ fn run(args: &cli::Args, classifier: &dyn classifier::Classifier) -> Result<(), 
             }
 
             // ── Full pipeline: segmentation → CI search → font match ─
-            let preview_end = {
+            let _preview_end = {
                 let mut end = line.text.len().min(30);
                 while end > 0 && !line.text.is_char_boundary(end) { end -= 1; }
                 end
@@ -837,12 +823,12 @@ fn run(args: &cli::Args, classifier: &dyn classifier::Classifier) -> Result<(), 
             // Dump total mapped size from /proc/self/maps
             if debug_mem && (li == 2 || li == 45) {
                 if let Ok(maps) = std::fs::read_to_string("/proc/self/maps") {
-                    let mut total: u64 = 0;
+                    let mut _total: u64 = 0;
                     for l in maps.lines() {
                         if let Some(range) = l.split_whitespace().next() {
                             if let Some((start_s, end_s)) = range.split_once('-') {
                                 if let (Ok(s), Ok(e)) = (u64::from_str_radix(start_s, 16), u64::from_str_radix(end_s, 16)) {
-                                    total += e - s;
+                                    _total += e - s;
                                 }
                             }
                         }
@@ -1016,7 +1002,7 @@ fn run(args: &cli::Args, classifier: &dyn classifier::Classifier) -> Result<(), 
                                 winner: Some(&fk) == winner_key.as_ref(),
                             });
                         }
-                        if let Some((ref winner, _)) = best {
+                        if let Some((ref _winner, _)) = best {
                         }
                         (best.map(|(fm, _)| fm), tie_candidates_audit)
                     } else {
@@ -1093,15 +1079,27 @@ fn run(args: &cli::Args, classifier: &dyn classifier::Classifier) -> Result<(), 
 
             // Per-char distances and audit detail: only for miss lines when full audit is active
             let (chosen_char_dists, gt_font_char_dists, gt_font_char_ranks) = if is_miss && args.full_audit() {
-                // Precompute features once for all per-char distance lookups
-                let crop_feats = char_index::precompute_crop_features(&corrected_char_crops, classifier);
+                // Compute raw features for each crop
+                let crop_feats: Vec<(usize, char, char_index::CharFeatures)> = corrected_char_crops
+                    .iter()
+                    .enumerate()
+                    .filter_map(|(i, (c, img))| {
+                        char_index::compute_features(img).map(|f| (i, *c, f))
+                    })
+                    .collect();
 
                 let chosen: std::collections::HashMap<usize, f32> = if let Some(ref fr) = font_result {
                     if !fr.font_key.is_empty() {
-                        char_index::per_char_distances_precomputed(&char_index, &fr.font_key, &crop_feats)
-                            .into_iter()
-                            .map(|(_, crop_idx, d2)| (crop_idx, d2))
-                            .collect()
+                        if let Some(font_id) = char_index.font_names_table.iter().position(|n| n == &fr.font_key) {
+                            crop_feats.iter()
+                                .filter_map(|&(crop_idx, ch, ref feat)| {
+                                    let d = classifier.distance(ch, feat, font_id)?;
+                                    Some((crop_idx, d))
+                                })
+                                .collect()
+                        } else {
+                            std::collections::HashMap::new()
+                        }
                     } else {
                         std::collections::HashMap::new()
                     }
@@ -1122,20 +1120,45 @@ fn run(args: &cli::Args, classifier: &dyn classifier::Classifier) -> Result<(), 
                             .map(|fe| fe.font_key());
                         if let Some(ref gk) = gt_key {
                             if !ci_top_for_audit.iter().any(|(n, _)| n == gk) {
-                                // Score the GT font using the same aggregation
-                                // as search_candidates (via score_single_font).
-                                let gt_ci_score = char_index::score_single_font(
-                                    &char_index, gk, &crop_feats,
-                                );
-                                ci_top_for_audit.push((gk.clone(), gt_ci_score));
+                                // Score the GT font using classifier.distance()
+                                if let Some(gt_font_id) = char_index.font_names_table.iter().position(|n| n == gk) {
+                                    let gt_dists_for_score: Vec<(f32, f32)> = crop_feats.iter()
+                                        .filter_map(|&(_, ch, ref feat)| {
+                                            let d = classifier.distance(ch, feat, gt_font_id)?;
+                                            Some(((d + 1e-10_f32).ln(), char_index::char_weight(ch)))
+                                        })
+                                        .collect();
+                                    if !gt_dists_for_score.is_empty() {
+                                        let score = char_index::aggregate_ci_score(&gt_dists_for_score, crop_feats.len());
+                                        if score.is_finite() {
+                                            ci_top_for_audit.push((gk.clone(), Some(score)));
+                                        }
+                                    }
+                                }
                             }
                             // Compute per-char distances to the GT font
-                            let dists = char_index::per_char_distances_precomputed(&char_index, gk, &crop_feats)
-                                .into_iter()
-                                .map(|(_, crop_idx, d2)| (crop_idx, d2))
-                                .collect();
-                            let ranks = char_index::gt_font_ranks(&char_index, gk, &crop_feats, &corrected_char_crops, classifier);
-                            (dists, ranks)
+                            if let Some(gt_font_id) = char_index.font_names_table.iter().position(|n| n == gk) {
+                                let dists = crop_feats.iter()
+                                    .filter_map(|&(crop_idx, ch, ref feat)| {
+                                        let d = classifier.distance(ch, feat, gt_font_id)?;
+                                        Some((crop_idx, d))
+                                    })
+                                    .collect();
+                                // Ranks: for each crop, classify all fonts and find GT font's rank
+                                let mut ranks = std::collections::HashMap::new();
+                                for &(crop_idx, ch, ref feat) in &crop_feats {
+                                    let ranked = classifier.classify(ch, feat, usize::MAX);
+                                    for (rank_pos, (fid, _)) in ranked.iter().enumerate() {
+                                        if *fid == gt_font_id {
+                                            ranks.insert(crop_idx, rank_pos + 1);
+                                            break;
+                                        }
+                                    }
+                                }
+                                (dists, ranks)
+                            } else {
+                                (std::collections::HashMap::new(), std::collections::HashMap::new())
+                            }
                         } else {
                             (std::collections::HashMap::new(), std::collections::HashMap::new())
                         }
@@ -1260,7 +1283,7 @@ fn run(args: &cli::Args, classifier: &dyn classifier::Classifier) -> Result<(), 
                     *font_freq.entry(fr.font_key.clone()).or_insert(0) += 1;
                 }
             }
-            if let Some((top_key, count)) = font_freq.iter().max_by_key(|(_, c)| *c) {
+            if let Some((top_key, _count)) = font_freq.iter().max_by_key(|(_, c)| *c) {
                 dominant_font_candidate = line_matches.iter()
                     .find_map(|lm| lm.font_result.as_ref()
                         .filter(|fr| fr.font_key == *top_key)
@@ -1270,7 +1293,7 @@ fn run(args: &cli::Args, classifier: &dyn classifier::Classifier) -> Result<(), 
 
         let fp_hits = fast_path_hits.load(std::sync::atomic::Ordering::Relaxed);
         let ci_lines = lines.len() as u64 - fp_hits;
-        let fontmatch_elapsed = fontmatch_start.elapsed();
+        let _fontmatch_elapsed = fontmatch_start.elapsed();
         if fp_hits > 0 {
         }
         if ci_lines > 0 {
@@ -1309,10 +1332,10 @@ fn run(args: &cli::Args, classifier: &dyn classifier::Classifier) -> Result<(), 
                     }
                 }
                 // Find majority font
-                if let Some((majority_name, (majority_count, _majority_path))) = font_freq.iter()
+                if let Some((_majority_name, (_majority_count, _majority_path))) = font_freq.iter()
                     .max_by_key(|(_, (count, _))| *count)
                 {
-                    let total_body: u32 = font_freq.values().map(|(c, _)| c).sum();
+                    let _total_body: u32 = font_freq.values().map(|(c, _)| c).sum();
                 }
             }
         }
@@ -1331,7 +1354,7 @@ fn run(args: &cli::Args, classifier: &dyn classifier::Classifier) -> Result<(), 
         }
 
         // ── Pass 2a: Parallel SSIM verification ─────────────────────
-        let verify_start = std::time::Instant::now();
+        let _verify_start = std::time::Instant::now();
         let ssim_results: Vec<(Option<f32>, Option<bool>)> = lines.par_iter()
             .enumerate()
             .map(|(li, line)| {
@@ -1371,7 +1394,7 @@ fn run(args: &cli::Args, classifier: &dyn classifier::Classifier) -> Result<(), 
                 }
             })
             .collect();
-        let verify_count = ssim_results.iter().filter(|(s, _)| s.is_some()).count() as u32;
+        let _verify_count = ssim_results.iter().filter(|(s, _)| s.is_some()).count() as u32;
 
         // ── Pass 2b: Decision matrix + output ────────────────────────
         for (li, line) in lines.iter().enumerate() {
@@ -1400,9 +1423,9 @@ fn run(args: &cli::Args, classifier: &dyn classifier::Classifier) -> Result<(), 
                 pg_raster += 1;
             } else {
                 pg_vec += 1;
-                let fname = font_result.as_ref().map(|f| f.font_name.as_str()).unwrap_or("?");
-                let fscore = font_result.as_ref().map(|f| f.score).unwrap_or(0.0);
-                let ssim_part = ssim_score
+                let _fname = font_result.as_ref().map(|f| f.font_name.as_str()).unwrap_or("?");
+                let _fscore = font_result.as_ref().map(|f| f.score).unwrap_or(0.0);
+                let _ssim_part = ssim_score
                     .map(|s| format!(" ssim={s:.3}"))
                     .unwrap_or_default();
             }
@@ -1572,8 +1595,8 @@ fn run(args: &cli::Args, classifier: &dyn classifier::Classifier) -> Result<(), 
             });
         }
 
-        stat_lines_vectorized += pg_vec;
-        stat_lines_raster += pg_raster;
+        _stat_lines_vectorized += pg_vec;
+        _stat_lines_raster += pg_raster;
 
         // 3d. Geometry detection ──────────────────────────────────────
         let (det_lines, det_fills) = if args.no_geometry {
@@ -1610,7 +1633,7 @@ fn run(args: &cli::Args, classifier: &dyn classifier::Classifier) -> Result<(), 
             }
 
             let count = geo.lines.len() + geo.fills.len();
-            stat_geo_elements += count as u32;
+            _stat_geo_elements += count as u32;
             if count > 0 {
             }
             (geo.lines, geo.fills)
@@ -1667,12 +1690,12 @@ fn run(args: &cli::Args, classifier: &dyn classifier::Classifier) -> Result<(), 
             )
         };
 
-        stat_raster_frags += raster_fragments.len() as u32;
+        _stat_raster_frags += raster_fragments.len() as u32;
 
         if !raster_fragments.is_empty() {
             let is_passthrough = raster_fragments.iter().any(|f| f.passthrough.is_some());
             if !is_passthrough {
-                let frag_bytes: usize = raster_fragments.iter().map(|f| f.raw_rgb.len()).sum();
+                let _frag_bytes: usize = raster_fragments.iter().map(|f| f.raw_rgb.len()).sum();
             }
         }
 
@@ -1691,7 +1714,7 @@ fn run(args: &cli::Args, classifier: &dyn classifier::Classifier) -> Result<(), 
             let compare_dir = output.with_extension("").to_string_lossy().to_string()
                 + "-compare";
             let compare_path = std::path::PathBuf::from(&compare_dir);
-            if let Err(e) = compare::generate_comparison(
+            if let Err(_e) = compare::generate_comparison(
                 &gray_page,
                 &placed_texts,
                 page_idx,
@@ -1774,11 +1797,11 @@ fn run(args: &cli::Args, classifier: &dyn classifier::Classifier) -> Result<(), 
         // If --audit is also set, write audit artifacts + HTML report
         if let Some(ref audit_root) = args.audit {
             let audit_path = args.audit_log_path();
-            if let Err(e) = audit.write_to_file(&audit_path) {
+            if let Err(_e) = audit.write_to_file(&audit_path) {
             } else {
             }
             let report_path = audit_root.join("report.html");
-            if let Err(e) = report::generate_report(
+            if let Err(_e) = report::generate_report(
                 &report_path,
                 audit_root,
                 &audit.text_entries,
@@ -1794,7 +1817,7 @@ fn run(args: &cli::Args, classifier: &dyn classifier::Classifier) -> Result<(), 
     let audit_path = args.audit_log_path();
 
     if output.to_str() != Some("/dev/null") || args.audit.is_some() {
-        if let Err(e) = audit.write_to_file(&audit_path) {
+        if let Err(_e) = audit.write_to_file(&audit_path) {
         } else {
         }
     }
@@ -1802,7 +1825,7 @@ fn run(args: &cli::Args, classifier: &dyn classifier::Classifier) -> Result<(), 
     // ── 5b. HTML miss report ─────────────────────────────────────────
     if let Some(ref audit_root) = args.audit {
         let report_path = audit_root.join("report.html");
-        if let Err(e) = report::generate_report(
+        if let Err(_e) = report::generate_report(
             &report_path,
             audit_root,
             &audit.text_entries,
@@ -1814,7 +1837,7 @@ fn run(args: &cli::Args, classifier: &dyn classifier::Classifier) -> Result<(), 
     }
 
     // ── 6. Report ────────────────────────────────────────────────────
-    let (cache_hits, cache_misses) = font_cache.stats();
+    let (_cache_hits, _cache_misses) = font_cache.stats();
 
     Ok(())
 }
@@ -1955,20 +1978,6 @@ fn extract_raster_fragments(
     fragments
 }
 
-fn truncate_str(s: &str, max: usize) -> String {
-    let s = s.replace('\n', " ").replace('\r', "");
-    if s.len() <= max {
-        s
-    } else {
-        // Walk backwards from `max` to find the nearest char boundary,
-        // avoiding panics on multi-byte UTF-8 (e.g. em-dash '—' is 3 bytes).
-        let mut end = max;
-        while end > 0 && !s.is_char_boundary(end) {
-            end -= 1;
-        }
-        format!("{}…", &s[..end])
-    }
-}
 
 // ---------------------------------------------------------------------------
 // Source image extraction — preserve original encoding
@@ -1980,7 +1989,7 @@ fn truncate_str(s: &str, max: usize) -> String {
 fn extract_source_images(path: &Path) -> Vec<Option<pdf_out::SourceImageInfo>> {
     let doc = match lopdf::Document::load(path) {
         Ok(d) => d,
-        Err(e) => {
+        Err(_e) => {
             return Vec::new();
         }
     };

@@ -19,7 +19,7 @@
 
 use ab_glyph::{Font, FontRef};
 use clap::Parser;
-use image::{GrayImage, Luma};
+use image::GrayImage;
 use rayon::prelude::*;
 use serde::Serialize;
 use std::io::{BufWriter, Write};
@@ -27,34 +27,13 @@ use std::path::PathBuf;
 use std::sync::atomic::{AtomicUsize, Ordering};
 
 use unscan::char_index::{self, compute_features, FEAT_LEN};
-use unscan::font_scan::{self, FontClass};
+use unscan::font_scan::{self, read_font_metadata, is_ligature_char};
 
 // ---------------------------------------------------------------------------
 // Feature names (copied from learn_weights.rs)
 // ---------------------------------------------------------------------------
 
-const FEAT_NAMES: &[&str] = &[
-    // Group 1: Column ink profile (32)
-    "col0","col1","col2","col3","col4","col5","col6","col7",
-    "col8","col9","col10","col11","col12","col13","col14","col15",
-    "col16","col17","col18","col19","col20","col21","col22","col23",
-    "col24","col25","col26","col27","col28","col29","col30","col31",
-    // Group 2: Scalar v1 (7)
-    "aspect","ink_density","v_center","h_balance","serif_score","stroke_contrast","xh_cap_ratio",
-    // Group 3: Scalar v2 (18)
-    "counter_area","counter_cx","counter_cy","counter_asp",
-    "term0","term1","term2","term3",
-    "ink_perim","compactness",
-    "cross0","cross1","cross2","cross3","cross4","cross5","cross6","cross7",
-    // Group 4: Row ink profile (32)
-    "row0","row1","row2","row3","row4","row5","row6","row7",
-    "row8","row9","row10","row11","row12","row13","row14","row15",
-    "row16","row17","row18","row19","row20","row21","row22","row23",
-    "row24","row25","row26","row27","row28","row29","row30","row31",
-    // Group 5: Scalar v3 (11)
-    "hole_count","h_symmetry","v_symmetry","skel_branch","skel_endpt",
-    "corner_count","quad_tl","quad_tr","quad_bl","quad_br","mean_stroke_w",
-];
+use unscan::char_index::FEAT_NAMES;
 
 // ---------------------------------------------------------------------------
 // CLI
@@ -112,90 +91,32 @@ use unscan::char_index::AaVariant;
 /// When `overrides` is provided (OT variant entries), uses resolve_glyph to
 /// pick the variant-specific glyph ID instead of the default cmap.
 fn render_char_at_native_height<F: Font>(
-    font: &F, c: char, target_height: u32, aa: AaVariant,
+    font: &F, font_key: &str, c: char, target_height: u32, aa: AaVariant,
     overrides: Option<&[(char, u16)]>,
 ) -> Option<GrayImage> {
-    // Render at full quality — use resolve_glyph for variant support
-    let gid = char_index::resolve_glyph(font, c, overrides);
-    let full = char_index::render_glyph_normalised(font, gid)?;
+    // Resolve glyph override for this character
+    let glyph_override = overrides
+        .and_then(|ovs| ovs.iter().find(|(ch, _)| *ch == c))
+        .map(|&(_, gid)| ab_glyph::GlyphId(gid));
 
-    // Apply AA transformation before downscaling
-    let aa_applied = aa.apply(&full);
-
-    let (_w, h) = aa_applied.dimensions();
-
-    // If target height is >= actual rendered height, skip downscale/upscale
-    if target_height >= h {
-        return char_index::normalize_to_ink_bounds(&aa_applied);
-    }
-
-    // Downscale: height goes to target_height, width scales proportionally
-    let scale_factor = target_height as f32 / h as f32;
-    let small_h = target_height.max(3);
-    let small_w = ((_w as f32 * scale_factor).round() as u32).max(3);
-
-    // Downscale (simulates a natively small glyph)
-    let small = image::imageops::resize(
-        &aa_applied,
-        small_w,
-        small_h,
-        image::imageops::FilterType::Lanczos3,
-    );
-
-    // Normalize back through the same path as scan crops
-    // (scales back up to NORM_H — this is where feature drift happens)
-    char_index::normalize_to_ink_bounds(&small)
-}
-
-// ---------------------------------------------------------------------------
-// Font identity extraction
-// ---------------------------------------------------------------------------
-
-/// Read all available name table entries from a font file.
-fn read_name_ids(data: &[u8]) -> (String, String, String, String) {
-    use rustybuzz::ttf_parser;
-
-    let face = match ttf_parser::Face::parse(data, 0) {
-        Ok(f) => f,
-        Err(_) => return (String::new(), String::new(), String::new(), String::new()),
+    // Render through the canonical pipeline — same code path as index-time
+    let params = unscan::char_render::RenderParams {
+        height: char_index::NORM_H,
+        render_scale: 1,
+        aa,
+        binarize_threshold: None,
     };
+    let full = unscan::char_render::get_rendered_char(font, font_key, c, glyph_override, &params)?;
 
-    let mut nid1 = String::new();  // family
-    let mut nid2 = String::new();  // subfamily
-    let mut nid4 = String::new();  // full name
-    let mut nid6 = String::new();  // PostScript name
+    let (_w, h) = full.dimensions();
 
-    for name in face.names() {
-        match name.name_id {
-            1 if nid1.is_empty() => { if let Some(s) = name.to_string() { nid1 = s; } }
-            2 if nid2.is_empty() => { if let Some(s) = name.to_string() { nid2 = s; } }
-            4 if nid4.is_empty() => { if let Some(s) = name.to_string() { nid4 = s; } }
-            6 if nid6.is_empty() => { if let Some(s) = name.to_string() { nid6 = s; } }
-            _ => {}
-        }
+    // If target height is >= actual rendered height, no degradation needed
+    if target_height >= h {
+        return Some(full);
     }
 
-    (nid1, nid2, nid4, nid6)
-}
-
-/// Read OS/2 weight class from font data.
-fn read_weight_class(data: &[u8]) -> u16 {
-    use rustybuzz::ttf_parser;
-    match ttf_parser::Face::parse(data, 0) {
-        Ok(face) => face.tables().os2
-            .map(|os2| os2.weight().to_number())
-            .unwrap_or(400),
-        Err(_) => 400,
-    }
-}
-
-/// Check if italic via OS/2 fsSelection.
-fn read_italic(data: &[u8]) -> bool {
-    use rustybuzz::ttf_parser;
-    match ttf_parser::Face::parse(data, 0) {
-        Ok(face) => face.is_italic(),
-        Err(_) => false,
-    }
+    // Downscale + re-normalize (simulates a natively small glyph)
+    char_index::degrade_and_renormalize(&full, target_height as f32 / h as f32)
 }
 
 // ---------------------------------------------------------------------------
@@ -238,24 +159,7 @@ struct Sample {
 // Ligature detection
 // ---------------------------------------------------------------------------
 
-fn is_ligature(c: char) -> bool {
-    matches!(c,
-        '\u{FB00}' | // ff
-        '\u{FB01}' | // fi
-        '\u{FB02}' | // fl
-        '\u{FB03}' | // ffi
-        '\u{FB04}'   // ffl
-    )
-}
 
-fn font_class_str(class: FontClass) -> &'static str {
-    match class {
-        FontClass::Serif => "serif",
-        FontClass::Sans => "sans",
-        FontClass::Mono => "mono",
-        FontClass::Unknown => "unknown",
-    }
-}
 
 // ---------------------------------------------------------------------------
 // Manifest
@@ -378,26 +282,12 @@ fn main() {
             }
         };
 
-        // Read font identity metadata
-        let (nid1, nid2, nid4, nid6) = read_name_ids(&font_data);
-        let weight_class = read_weight_class(&font_data);
-        let italic = read_italic(&font_data);
-        let nid16_family = {
-            // nid16 is the typographic family; read_font_identity extracts it
-            // but we may need it separately. Try to get it from the name table.
-            use rustybuzz::ttf_parser;
-            ttf_parser::Face::parse(&font_data, 0).ok()
-                .and_then(|face| {
-                    face.names().into_iter()
-                        .find(|n| n.name_id == 16)
-                        .and_then(|n| n.to_string())
-                })
-                .unwrap_or_else(|| nid1.clone())
-        };
+        // Read font identity metadata (single parse)
+        let meta = read_font_metadata(&font_data);
 
         let font_key = fe.font_key();
         let font_path = fe.path.display().to_string();
-        let font_class = font_class_str(fe.class);
+        let font_class = fe.class.as_str();
 
         let overrides = fe.glyph_overrides.as_deref();
 
@@ -406,7 +296,7 @@ fn main() {
         for &c in chars {
             for &ht in &args.heights {
                 for &aa in &aa_variants {
-                    let img = match render_char_at_native_height(&font, c, ht, aa, overrides) {
+                    let img = match render_char_at_native_height(&font, &font_key, c, ht, aa, overrides) {
                         Some(img) => img,
                         None => continue,
                     };
@@ -419,22 +309,22 @@ fn main() {
                     let label = LabelRecord {
                         font_path: font_path.clone(),
                         font_key: font_key.clone(),
-                        postscript_name: if !nid6.is_empty() { nid6.clone() } else { fe.postscript_name.clone() },
+                        postscript_name: if !meta.nid6_postscript.is_empty() { meta.nid6_postscript.clone() } else { fe.postscript_name.clone() },
                         family_name: fe.family_name.clone(),
-                        nid1_family: nid1.clone(),
-                        nid2_subfamily: nid2.clone(),
-                        nid4_full_name: nid4.clone(),
-                        nid16_family: nid16_family.clone(),
-                        weight_class,
-                        weight_bucket: weight_class / 100,
-                        italic,
+                        nid1_family: meta.nid1_family.clone(),
+                        nid2_subfamily: meta.nid2_subfamily.clone(),
+                        nid4_full_name: meta.nid4_full_name.clone(),
+                        nid16_family: meta.nid16_typographic.clone(),
+                        weight_class: meta.weight_class,
+                        weight_bucket: meta.weight_class / 100,
+                        italic: meta.italic,
                         font_class: font_class.to_string(),
                         variant_tag: fe.variant_tag.clone(),
                         char_str: c.to_string(),
                         char_code: c as u32,
                         native_height: ht,
                         aa_variant: aa.name().to_string(),
-                        is_ligature: is_ligature(c),
+                        is_ligature: is_ligature_char(c),
                     };
 
                     batch.push(Sample {

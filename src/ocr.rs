@@ -431,111 +431,92 @@ pub fn drop_outlier_words(lines: &mut Vec<TextLine>) {
 // Scan the actual grayscale pixels to find true ink boundaries.
 // ---------------------------------------------------------------------------
 
-/// Expand bounding boxes to cover actual ink on the page.
+/// Walk columns outward from an edge, returning the furthest column that
+/// contains non-background pixels.  `blur` is the threshold (bg − 15):
+/// any pixel darker counts as ink or blur/bleed from real rasterisation.
+/// The walk stops at the first fully-background column.
 ///
-/// Two passes:
-///   1. **Line bbox** (`line.x/y/width/height`): expanded vertically and
-///      horizontally ±margin px by scanning for ink pixels.  Used only for
-///      PDF output positioning — NOT for image crops or SSIM.
-///   2. **Word bboxes** (`word.x/y/width/height`): expanded horizontally
-///      to capture italic overshoot, constrained to gaps between words.
-///      These are the authoritative final bboxes — use their union for
-///      image crops and SSIM verification.
-///
-/// Only **expands** — never shrinks.
-pub fn expand_bbox_to_ink(lines: &mut [TextLine], gray: &GrayImage, ink_threshold: u8) {
-    let (page_w, page_h) = gray.dimensions();
-    let margin: u32 = 20; // search this many px beyond the OCR bbox
-
-    for line in lines.iter_mut() {
-        // ── expand the line bbox vertically ─────────────────────────
-        let lx = line.x.min(page_w.saturating_sub(1));
-        let lw = line.width.min(page_w - lx);
-        let search_top = line.y.saturating_sub(margin);
-        let search_bot = (line.y + line.height + margin).min(page_h);
-
-        let (ink_top, ink_bot) = ink_vertical_extent(gray, lx, lw, search_top, search_bot, ink_threshold);
-
-        // Only expand, never shrink
-        let new_y = ink_top.min(line.y);
-        let new_bottom = ink_bot.max(line.y + line.height);
-        let new_h = new_bottom.saturating_sub(new_y);
-
-        line.y = new_y;
-        line.height = new_h;
-
-        // ── expand the line bbox horizontally ───────────────────────
-        // Check leftward: walk columns left from line.x within the
-        // vertical extent, looking for ink.
-        let y_top = line.y;
-        let y_bot = (line.y + line.height).min(page_h);
-        let search_left = line.x.saturating_sub(margin);
-        let mut new_x = line.x;
-        for col in (search_left..line.x).rev() {
-            let col_has_ink = (y_top..y_bot)
-                .any(|row| gray.get_pixel(col, row).0[0] < ink_threshold);
-            if col_has_ink {
-                new_x = col;
+/// Rightward (direction > 0): checks columns `start..limit`, returns new
+/// exclusive right edge.
+/// Leftward (direction < 0): checks columns `(limit..start).rev()`,
+/// returns new inclusive left edge.
+fn walk_ink_edge(
+    gray: &GrayImage,
+    start: u32,
+    limit: u32,
+    y_top: u32,
+    y_bot: u32,
+    blur: u8,
+    direction: i32,
+) -> u32 {
+    let page_w = gray.width();
+    let mut edge = start;
+    if direction > 0 {
+        for col in start..limit.min(page_w) {
+            if (y_top..y_bot).any(|row| gray.get_pixel(col, row).0[0] < blur) {
+                edge = col + 1;
             } else {
                 break;
             }
         }
-
-        // Check rightward
-        let old_right = line.x + line.width;
-        let search_right = (old_right + margin).min(page_w);
-        let mut new_right = old_right;
-        for col in old_right..search_right {
-            let col_has_ink = (y_top..y_bot)
-                .any(|row| gray.get_pixel(col, row).0[0] < ink_threshold);
-            if col_has_ink {
-                new_right = col + 1;
+    } else {
+        for col in (limit..start).rev() {
+            if (y_top..y_bot).any(|row| gray.get_pixel(col.min(page_w - 1), row).0[0] < blur) {
+                edge = col;
             } else {
                 break;
             }
         }
-
-        line.x = new_x;
-        line.width = new_right.saturating_sub(new_x);
     }
-
-    // Word-level horizontal ink expansion (italic overshoot, etc.)
-    expand_words_to_ink(lines, gray, ink_threshold);
-
-    // Update line bbox to match the word-union — the authoritative bbox.
-    // After this, line.x/y/width/height == union of expanded word bboxes.
-    for line in lines.iter_mut() {
-        let x0 = line.words.iter().map(|w| w.x).min().unwrap();
-        let y0 = line.words.iter().map(|w| w.y).min().unwrap();
-        let x1 = line.words.iter().map(|w| w.x + w.width).max().unwrap();
-        let y1 = line.words.iter().map(|w| w.y + w.height).max().unwrap();
-        line.x = x0;
-        line.y = y0;
-        line.width = x1 - x0;
-        line.height = y1 - y0;
-    }
+    edge
 }
 
-/// Expand word bboxes horizontally when ink is present at the edge and there
-/// is free space before the next word.  Italic glyphs frequently overshoot
-/// the OCR bbox to the right.  For each word, if the rightmost column of its
-/// crop contains ink, extend rightward column-by-column as long as (a) we
-/// find ink and (b) we haven't reached the next word's left edge.
+/// Walk rows outward, same semantics as `walk_ink_edge` but vertical.
+fn walk_ink_edge_vertical(
+    gray: &GrayImage,
+    start: u32,
+    limit: u32,
+    x_left: u32,
+    x_right: u32,
+    blur: u8,
+    direction: i32,
+) -> u32 {
+    let page_w = gray.width();
+    let page_h = gray.height();
+    let mut edge = start;
+    if direction > 0 {
+        for row in start..limit.min(page_h) {
+            if (x_left..x_right.min(page_w)).any(|col| gray.get_pixel(col, row).0[0] < blur) {
+                edge = row + 1;
+            } else {
+                break;
+            }
+        }
+    } else {
+        for row in (limit..start).rev() {
+            if (x_left..x_right.min(page_w)).any(|col| gray.get_pixel(col, row).0[0] < blur) {
+                edge = row;
+            } else {
+                break;
+            }
+        }
+    }
+    edge
+}
+
+/// Expand word bboxes when ink/blur is present beyond the current edge.
+/// Uses `blur` threshold for expansion walks, `ink_threshold` for gates.
+/// `margin` bounds edge-word and vertical searches.
 ///
 /// Only **expands** — never shrinks.  Must run AFTER `clip_word_overlaps` so
 /// the word list is already gap-safe.
-fn expand_words_to_ink(lines: &mut [TextLine], gray: &GrayImage, ink_threshold: u8) {
+pub fn expand_words_to_ink(lines: &mut [TextLine], gray: &GrayImage, ink_threshold: u8, blur: u8, margin: u32) {
     let (page_w, page_h) = gray.dimensions();
-    let mut expanded = 0u32;
 
     for line in lines.iter_mut() {
         let n = line.words.len();
-        let line_top = line.y;
-        let line_bot = (line.y + line.height).min(page_h);
 
         for i in 0..n {
-            let mut changed = false;
-
             // ── Rightward expansion ─────────────────────────────────
             {
                 let w = &line.words[i];
@@ -543,7 +524,7 @@ fn expand_words_to_ink(lines: &mut [TextLine], gray: &GrayImage, ink_threshold: 
                 let limit = if i + 1 < n {
                     line.words[i + 1].x
                 } else {
-                    (line.x + line.width).min(page_w)
+                    (right_edge + margin).min(page_w)
                 };
 
                 if right_edge < limit && right_edge < page_w {
@@ -554,20 +535,9 @@ fn expand_words_to_ink(lines: &mut [TextLine], gray: &GrayImage, ink_threshold: 
                         .any(|row| gray.get_pixel(check_col.min(page_w - 1), row).0[0] < ink_threshold);
 
                     if has_edge_ink {
-                        let mut new_right = right_edge;
-                        for col in right_edge..limit.min(page_w) {
-                            let col_has_ink = (y_top..y_bot)
-                                .any(|row| gray.get_pixel(col, row).0[0] < ink_threshold);
-                            if col_has_ink {
-                                new_right = col + 1;
-                            } else {
-                                break;
-                            }
-                        }
+                        let new_right = walk_ink_edge(gray, right_edge, limit, y_top, y_bot, blur, 1);
                         if new_right > right_edge {
-                            let growth = new_right - right_edge;
-                            line.words[i].width += growth;
-                            changed = true;
+                            line.words[i].width = new_right - line.words[i].x;
                         }
                     }
                 }
@@ -581,7 +551,7 @@ fn expand_words_to_ink(lines: &mut [TextLine], gray: &GrayImage, ink_threshold: 
                 let mut limit = if i > 0 {
                     line.words[i - 1].x + line.words[i - 1].width
                 } else {
-                    line.x
+                    left_edge.saturating_sub(margin)
                 };
 
                 // Trim the previous word's trailing empty columns so
@@ -616,7 +586,6 @@ fn expand_words_to_ink(lines: &mut [TextLine], gray: &GrayImage, ink_threshold: 
                         shrink_to = col;
                     }
                     if shrink_to < prev_right {
-                        let old_w = line.words[i - 1].width;
                         line.words[i - 1].width = shrink_to.saturating_sub(prev_x);
                         limit = shrink_to;
                     } else if left_edge <= prev_right {
@@ -646,7 +615,6 @@ fn expand_words_to_ink(lines: &mut [TextLine], gray: &GrayImage, ink_threshold: 
                             }
                         }
                         if let Some(gc) = gap_col {
-                            let old_w = line.words[i - 1].width;
                             line.words[i - 1].width = gc.saturating_sub(prev_x);
                             limit = gc;
                         }
@@ -668,79 +636,50 @@ fn expand_words_to_ink(lines: &mut [TextLine], gray: &GrayImage, ink_threshold: 
                         .any(|row| gray.get_pixel(left_edge.min(page_w - 1), row).0[0] < ink_threshold);
 
                     if has_edge_ink || gap_has_ink {
-                        let mut new_left = left_edge;
-                        for col in (limit..left_edge).rev() {
-                            let col_has_ink = (y_top..y_bot)
-                                .any(|row| gray.get_pixel(col, row).0[0] < ink_threshold);
-                            if col_has_ink {
-                                new_left = col;
-                            } else {
-                                break;
-                            }
-                        }
+                        let new_left = walk_ink_edge(gray, left_edge, limit, y_top, y_bot, blur, -1);
                         if new_left < left_edge {
                             let growth = left_edge - new_left;
                             line.words[i].x = new_left;
                             line.words[i].width += growth;
-                            changed = true;
                         }
                     }
                 }
             }
 
-            // ── Vertical expansion (bounded by line bbox) ───────────
+            // ── Vertical expansion (bounded by ±margin) ─────────────
             {
                 let w = &line.words[i];
                 let wx = w.x;
                 let wr = (w.x + w.width).min(page_w);
                 let word_top = w.y;
                 let word_bot = w.y + w.height;
+                let search_top = word_top.saturating_sub(margin);
+                let search_bot = (word_bot + margin).min(page_h);
 
-                // Expand upward
-                let mut new_top = word_top;
-                for row in (line_top..word_top).rev() {
-                    let row_has_ink = (wx..wr)
-                        .any(|col| gray.get_pixel(col, row).0[0] < ink_threshold);
-                    if row_has_ink {
-                        new_top = row;
-                    } else {
-                        break;
-                    }
-                }
-
-                // Expand downward
-                let mut new_bot = word_bot;
-                for row in word_bot..line_bot {
-                    let row_has_ink = (wx..wr)
-                        .any(|col| gray.get_pixel(col, row).0[0] < ink_threshold);
-                    if row_has_ink {
-                        new_bot = row + 1;
-                    } else {
-                        break;
-                    }
-                }
-
-                // Add 1px anti-alias padding (bounded by line bbox).
-                // Rasterized text has sub-threshold anti-aliased edges
-                // that the ink walk misses; the padding captures them.
-                if new_top > line_top { new_top -= 1; }
-                if new_bot < line_bot { new_bot += 1; }
+                let new_top = walk_ink_edge_vertical(gray, word_top, search_top, wx, wr, blur, -1);
+                let new_bot = walk_ink_edge_vertical(gray, word_bot, search_bot, wx, wr, blur, 1);
 
                 if new_top < word_top || new_bot > word_bot {
-                    let old_h = line.words[i].height;
                     line.words[i].y = new_top;
                     line.words[i].height = new_bot - new_top;
-                    changed = true;
                 }
-            }
-
-            if changed {
-                expanded += 1;
             }
         }
     }
 
-    if expanded > 0 {
+    // Line bbox = union of expanded word bboxes.
+    for line in lines.iter_mut() {
+        if let (Some(x0), Some(y0), Some(x1), Some(y1)) = (
+            line.words.iter().map(|w| w.x).min(),
+            line.words.iter().map(|w| w.y).min(),
+            line.words.iter().map(|w| w.x + w.width).max(),
+            line.words.iter().map(|w| w.y + w.height).max(),
+        ) {
+            line.x = x0;
+            line.y = y0;
+            line.width = x1 - x0;
+            line.height = y1 - y0;
+        }
     }
 }
 
@@ -756,7 +695,7 @@ fn expand_words_to_ink(lines: &mut [TextLine], gray: &GrayImage, ink_threshold: 
 /// exceeds the font's natural spacing.  When no char_index is available,
 /// falls back to a fixed threshold of 18% of line height.
 ///
-/// Must run AFTER `expand_bbox_to_ink` so bboxes are ink-tight.
+/// Must run AFTER `expand_words_to_ink` so bboxes are ink-tight.
 pub fn split_wide_whitespace_words(
     lines: &mut [TextLine],
     gray: &GrayImage,

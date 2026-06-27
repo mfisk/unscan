@@ -1,6 +1,7 @@
 //! Dump CI index render for a specific char in a specific font
-use ab_glyph::FontRef;
-use unscan::char_index::render_char_normalised;
+use ab_glyph::{Font, FontRef};
+use unscan::char_render::render_glyph_at_ink_height;
+use unscan::char_index::{normalize_to_ink_bounds, NORM_H};
 
 fn main() {
     let font_path = std::env::args().nth(1).expect("usage: dump_ci_glyph <font_path> <char_hex>");
@@ -13,14 +14,14 @@ fn main() {
     let data = std::fs::read(&font_path).expect("can't read font");
     let font = FontRef::try_from_slice(&data).expect("can't parse font");
     
-    match render_char_normalised(&font, c) {
+    match render_glyph_at_ink_height(&font, font.glyph_id(c), NORM_H).and_then(|img| normalize_to_ink_bounds(&img, NORM_H)) {
         Some(img) => {
             let out = format!("/tmp/ci_render_U+{:04X}.png", codepoint);
             img.save(&out).unwrap();
             println!("Saved {} ({}x{})", out, img.width(), img.height());
         }
         None => {
-            println!("render_char_normalised returned None for U+{:04X} — glyph not found in font", codepoint);
+            println!("render returned None for U+{:04X} — glyph not found in font", codepoint);
         }
     }
 }

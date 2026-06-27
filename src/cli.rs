@@ -101,7 +101,7 @@ pub struct Args {
     #[arg(long, value_name = "PDF")]
     pub test: Option<PathBuf>,
 
-    /// Render characters using the index-time render_char_normalised() pipeline
+    /// Render characters using the index-time render_glyph_at_ink_height() pipeline
     /// and save as PNGs.  Takes a JSON object: {"font": "/path/to/font.ttf",
     /// "chars": "abc", "output_dir": "/tmp/refs"}.  Each character is saved as
     /// U+XXXX.png (e.g. U+0048.png for 'H').  Exits after rendering.

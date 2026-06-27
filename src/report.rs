@@ -13,7 +13,7 @@ use base64::Engine;
 use image::GrayImage;
 
 use crate::audit::{AuditEntry, Decision};
-use crate::char_index;
+
 use crate::char_render;
 use crate::ground_truth::{self, GroundTruth};
 use crate::font_scan::FontEntry;
@@ -1162,7 +1162,7 @@ fn build_ssim_block(
     let font_size_row = match (gt_font_size_pt, unscan_font_size_pt) {
         (Some(gt_sz), Some(us_sz)) => {
             let delta = us_sz - gt_sz;
-            let pct = if gt_sz.abs() > 0.01 { (delta / gt_sz * 100.0) } else { 0.0 };
+            let pct = if gt_sz.abs() > 0.01 { delta / gt_sz * 100.0 } else { 0.0 };
             let delta_class = if pct.abs() > 5.0 { "bad" } else if pct.abs() > 2.0 { "warn" } else { "ok" };
             format!(
                 "<tr><td class=\"ssim-label\">Size</td>\
