@@ -21,92 +21,114 @@ use crate::char_index::FISHER_WEIGHTS;
 use std::collections::HashMap;
 
 // ---------------------------------------------------------------------------
+// Binary weight-file reader
+// ---------------------------------------------------------------------------
+
+/// Cursor-based reader for binary weight files (f32 LE arrays + u32 LE headers).
+struct BinaryReader<'a> {
+    data: &'a [u8],
+    pos: usize,
+}
+
+impl<'a> BinaryReader<'a> {
+    fn new(data: &'a [u8], pos: usize) -> Self {
+        Self { data, pos }
+    }
+
+    fn read_f32s(&mut self, n: usize) -> Result<Vec<f32>, String> {
+        let need = n * 4;
+        if self.pos + need > self.data.len() {
+            return Err("truncated weight data".into());
+        }
+        let mut v = Vec::with_capacity(n);
+        for _ in 0..n {
+            v.push(f32::from_le_bytes(self.data[self.pos..self.pos + 4].try_into().unwrap()));
+            self.pos += 4;
+        }
+        Ok(v)
+    }
+
+    fn read_u32(&mut self) -> Result<u32, String> {
+        if self.pos + 4 > self.data.len() {
+            return Err("truncated header data".into());
+        }
+        let v = u32::from_le_bytes(self.data[self.pos..self.pos + 4].try_into().unwrap());
+        self.pos += 4;
+        Ok(v)
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Shared dense linear layer
+// ---------------------------------------------------------------------------
+
+/// Inference-only linear layer (no gradients, no optimizer state).
+struct InferenceLinear {
+    rows: usize,
+    cols: usize,
+    w: Vec<f32>, // rows × cols, row-major
+    b: Vec<f32>, // cols
+}
+
+impl InferenceLinear {
+    /// Forward: output[j] = sum_i(input[i] * w[i*cols+j]) + b[j]
+    fn forward(&self, input: &[f32]) -> Vec<f32> {
+        debug_assert_eq!(input.len(), self.rows);
+        let mut out = self.b.clone();
+        for j in 0..self.cols {
+            let mut sum = out[j];
+            for i in 0..self.rows {
+                sum += input[i] * self.w[i * self.cols + j];
+            }
+            out[j] = sum;
+        }
+        out
+    }
+}
+
+/// Dense matrix × vector: y[i] = sum_j(mat[i*FEAT_LEN + j] * x[j]).
+/// Shared by Mahalanobis (square) and LDA (rectangular) classifiers.
+fn dense_project(out_dim: usize, mat: &[f32], x: &[f32]) -> Vec<f32> {
+    let mut y = vec![0.0f32; out_dim];
+    for i in 0..out_dim {
+        let row = &mat[i * FEAT_LEN..(i + 1) * FEAT_LEN];
+        let mut sum = 0.0f32;
+        for j in 0..FEAT_LEN {
+            sum += row[j] * x[j];
+        }
+        y[i] = sum;
+    }
+    y
+}
+
+// ---------------------------------------------------------------------------
 // Trait
 // ---------------------------------------------------------------------------
 
-/// Index-time methods for a classifier.  These are implementation details
-/// of how the character index stores font representations; query-time code
-/// should use [`Classifier::classify`] or [`Classifier::rank`] instead.
-pub(crate) trait ClassifierIndex {
-    /// Dimensionality of the stored representation per font entry.
-    fn prepare_dim(&self) -> usize;
-
-    /// Compute the stored representation for a font entry at index build time.
-    ///
-    /// The `ch` parameter identifies which character the features represent.
-    /// The returned vector is stored in the index and passed to [`Classifier::classify`]
-    /// at query time.
-    fn prepare(&self, ch: char, features: &CharFeatures) -> Vec<f32>;
-}
-
 /// A font classifier that identifies fonts from character glyph images.
 ///
-/// At **index build time**, [`ClassifierIndex::prepare`] computes a stored
-/// representation for each font's rendering of a character.
-///
-/// At **query time**, [`classify`] takes a crop's features and all stored
-/// representations for that character, and returns the best-matching font(s).
-/// When multiple fonts tie at the best score, all are returned.
-///
-/// The default [`classify`] implementation embeds the query via
-/// [`ClassifierIndex::prepare`] and picks the font(s) with the smallest
-/// squared Euclidean distance.  Classifiers that score fonts directly
-/// (e.g. softmax MLP) should override [`classify`] to bypass embedding
-/// entirely.
-pub trait Classifier: ClassifierIndex + Send + Sync {
-    /// Classify a single character crop: return the best-matching font(s).
-    ///
-    /// Returns `(font_id, distance)` for the best match.  When multiple fonts
-    /// are tied at the same best distance, all tied entries are returned.
-    /// Lower distance = better match.
-    ///
-    /// `candidates` contains `(font_id, stored_representation)` pairs from
-    /// the index, where each representation was produced by [`prepare`].
-    ///
-    /// The default implementation embeds the query via [`prepare`], computes
-    /// squared Euclidean distance to every candidate, and returns ties at the
-    /// minimum.  Override this for classifiers that don't use embeddings.
-    fn classify(
-        &self,
-        ch: char,
-        query: &CharFeatures,
-        candidates: &[(usize, Vec<f32>)],
-    ) -> Vec<(usize, f32)> {
-        let q = self.prepare(ch, query);
-        let mut all: Vec<(usize, f32)> = candidates
-            .iter()
-            .map(|(id, stored)| (*id, sq_euclid(&q, stored)))
-            .collect();
-        if all.is_empty() {
-            return Vec::new();
-        }
-        all.sort_by(|a, b| a.1.partial_cmp(&b.1).unwrap_or(std::cmp::Ordering::Equal));
-        // K=10 plus ties: find the distance at rank 10 (or last if fewer),
-        // then return everything up to that distance.
-        let k = 10.min(all.len());
-        let cutoff_dist = all[k - 1].1;
-        let eps = cutoff_dist * 1e-5 + 1e-10;
-        all.into_iter().filter(|(_, d)| *d <= cutoff_dist + eps).collect()
-    }
+/// Each implementation manages its own internal data (font vectors, learned
+/// weights, etc.).  The trait exposes only classification and scoring.
+pub trait Classifier: Send + Sync {
+    /// Return the top `k` font matches for a character crop.
+    /// Returns `(font_id, score)` in best-first order (lowest score = best).
+    fn classify(&self, ch: char, query: &CharFeatures, k: usize) -> Vec<(usize, f32)>;
 
-    /// Rank all candidates for a character against a query glyph.
-    ///
-    /// Returns an iterator of `(font_id, score)` in **best-first order**
-    /// (lowest score = closest match). The caller can pull matches one at
-    /// a time, stopping when one passes downstream verification (e.g. SSIM).
-    ///
-    /// `candidates` contains `(font_id, stored_representation)` pairs from
-    /// the index, where each `stored_representation` was produced by a prior
-    /// call to [`prepare`].
-    fn rank<'a>(
-        &'a self,
-        ch: char,
-        query: &CharFeatures,
-        candidates: &'a [(usize, Vec<f32>)],
-    ) -> Box<dyn Iterator<Item = (usize, f32)> + 'a>;
+    /// Score a specific font against a query for one character.
+    /// Lower = better match.  Returns None if the font has no data for this char.
+    fn distance(&self, ch: char, query: &CharFeatures, font_id: usize) -> Option<f32>;
 
     /// Short name for logging and cache invalidation.
     fn name(&self) -> &str;
+
+    /// Number of distinct fonts loaded.
+    fn font_count(&self) -> usize;
+
+    /// Feed a font's feature vector for a character into the classifier.
+    /// Called once per (font_id, char) pair during index build.
+    /// Default implementation is a no-op (for classifiers like MLP that
+    /// don't use font vectors).
+    fn add_font(&mut self, _font_id: usize, _ch: char, _features: &CharFeatures) {}
 }
 
 // ---------------------------------------------------------------------------
@@ -119,19 +141,103 @@ fn sq_euclid(a: &[f32], b: &[f32]) -> f32 {
     a.iter().zip(b.iter()).map(|(x, y)| { let d = x - y; d * d }).sum()
 }
 
-/// Default rank implementation for embedding-based classifiers:
-/// embed the query, compute squared Euclidean distance to every candidate,
-/// return sorted by distance.
-fn rank_by_embedding(
-    query_embedded: Vec<f32>,
-    candidates: &[(usize, Vec<f32>)],
-) -> Box<dyn Iterator<Item = (usize, f32)> + '_> {
-    let mut scored: Vec<(usize, f32)> = candidates
-        .iter()
-        .map(|(id, stored)| (*id, sq_euclid(&query_embedded, stored)))
-        .collect();
-    scored.sort_by(|a, b| a.1.partial_cmp(&b.1).unwrap_or(std::cmp::Ordering::Equal));
-    Box::new(scored.into_iter())
+
+/// Reusable storage for classifiers that do brute-force distance search
+/// over embedded font vectors. Each embedding-based classifier composes
+/// this internally.
+pub(crate) struct FontVecStore {
+    /// Per-char font vectors: char → [(font_id, embedded_vec)]
+    vecs: HashMap<char, Vec<(usize, Vec<f32>)>>,
+    /// Per-char font_id → index into vecs for O(1) lookup
+    idx: HashMap<char, HashMap<usize, usize>>,
+    count: usize,
+}
+
+impl FontVecStore {
+    fn new() -> Self {
+        Self { vecs: HashMap::new(), idx: HashMap::new(), count: 0 }
+    }
+
+    fn add(&mut self, font_id: usize, ch: char, embedded: Vec<f32>) {
+        let v = self.vecs.entry(ch).or_default();
+        let i = v.len();
+        v.push((font_id, embedded));
+        self.idx.entry(ch).or_default().insert(font_id, i);
+        if font_id >= self.count { self.count = font_id + 1; }
+    }
+
+    fn classify(&self, ch: char, query: &[f32], k: usize) -> Vec<(usize, f32)> {
+        let points = match self.vecs.get(&ch) {
+            Some(p) if !p.is_empty() => p,
+            _ => return Vec::new(),
+        };
+        let mut all: Vec<(usize, f32)> = points.iter()
+            .map(|(id, stored)| (*id, sq_euclid(query, stored)))
+            .collect();
+        all.sort_by(|a, b| a.1.partial_cmp(&b.1).unwrap_or(std::cmp::Ordering::Equal));
+        all.truncate(k);
+        all
+    }
+
+    fn distance(&self, ch: char, query: &[f32], font_id: usize) -> Option<f32> {
+        let points = self.vecs.get(&ch)?;
+        let i = *self.idx.get(&ch)?.get(&font_id)?;
+        let (_, ref stored) = points[i];
+        Some(sq_euclid(query, stored))
+    }
+
+    fn font_count(&self) -> usize { self.count }
+}
+
+
+
+// ---------------------------------------------------------------------------
+// EmbeddingClassifier — shared Classifier impl for embed-then-store classifiers
+// ---------------------------------------------------------------------------
+
+/// Trait for the embedding step: converts raw features into a classifier-specific vector.
+pub trait Embedder: Send + Sync {
+    fn embed(&self, ch: char, features: &CharFeatures) -> Vec<f32>;
+    fn name(&self) -> &str;
+}
+
+/// Generic classifier that embeds features via an [`Embedder`] then searches a [`FontVecStore`].
+/// Collapses the identical classify/distance/add_font boilerplate across Fisher, Triplet,
+/// GlobalTriplet, PerCharFisher, Mahalanobis, and LDA.
+pub struct EmbeddingClassifier {
+    store: FontVecStore,
+    embedder: Box<dyn Embedder>,
+}
+
+impl EmbeddingClassifier {
+    pub fn new(embedder: Box<dyn Embedder>) -> Self {
+        Self { store: FontVecStore::new(), embedder }
+    }
+}
+
+impl Classifier for EmbeddingClassifier {
+    fn classify(&self, ch: char, query: &CharFeatures, k: usize) -> Vec<(usize, f32)> {
+        let q = self.embedder.embed(ch, query);
+        self.store.classify(ch, &q, k)
+    }
+
+    fn distance(&self, ch: char, query: &CharFeatures, font_id: usize) -> Option<f32> {
+        let q = self.embedder.embed(ch, query);
+        self.store.distance(ch, &q, font_id)
+    }
+
+    fn name(&self) -> &str {
+        self.embedder.name()
+    }
+
+    fn font_count(&self) -> usize {
+        self.store.font_count()
+    }
+
+    fn add_font(&mut self, font_id: usize, ch: char, features: &CharFeatures) {
+        let embedded = self.embedder.embed(ch, features);
+        self.store.add(font_id, ch, embedded);
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -143,47 +249,38 @@ fn rank_by_embedding(
 /// Each raw feature dimension is multiplied by its learned Fisher weight
 /// (√(between-font variance / within-font variance), normalised to sum = 1).
 /// Distance is plain squared Euclidean in the weighted space.
-pub struct FisherClassifier;
-
-impl ClassifierIndex for FisherClassifier {
-    fn prepare_dim(&self) -> usize {
-        FEAT_LEN
+///
+/// Fisher stores weighted font vectors internally and performs brute-force
+/// nearest-neighbor search.
+/// Apply global Fisher weighting to raw feature vector.
+fn fisher_embed(raw: &[f32]) -> Vec<f32> {
+    let mut v = vec![0.0f32; FEAT_LEN];
+    for i in 0..FEAT_LEN {
+        v[i] = raw[i] * FISHER_WEIGHTS[i];
     }
-
-    fn prepare(&self, _ch: char, features: &CharFeatures) -> Vec<f32> {
-        let raw = features.as_slice();
-        let mut v = vec![0.0f32; FEAT_LEN];
-        for i in 0..FEAT_LEN {
-            v[i] = raw[i] * FISHER_WEIGHTS[i];
-        }
-        v
-    }
+    v
 }
 
-impl Classifier for FisherClassifier {
-    fn rank<'a>(
-        &'a self,
-        _ch: char,
-        query: &CharFeatures,
-        candidates: &'a [(usize, Vec<f32>)],
-    ) -> Box<dyn Iterator<Item = (usize, f32)> + 'a> {
-        let q = self.prepare(_ch, query);
-        rank_by_embedding(q, candidates)
-    }
+struct FisherEmbedder;
 
-    fn name(&self) -> &str {
-        "fisher"
+impl Embedder for FisherEmbedder {
+    fn embed(&self, _ch: char, features: &CharFeatures) -> Vec<f32> {
+        fisher_embed(&features.as_slice())
     }
+    fn name(&self) -> &str { "fisher" }
 }
 
-// ---------------------------------------------------------------------------
+/// Create a new FisherClassifier.
+pub fn new_fisher() -> EmbeddingClassifier {
+    EmbeddingClassifier::new(Box::new(FisherEmbedder))
+}// ---------------------------------------------------------------------------
 // Triplet network (per-glyph)
 // ---------------------------------------------------------------------------
 
-const L1_IN: usize = FEAT_LEN;
-const L1_OUT: usize = 128;
-const L2_OUT: usize = 64;
-const L3_OUT: usize = 32;
+pub(crate) const L1_IN: usize = FEAT_LEN;
+pub(crate) const L1_OUT: usize = 128;
+pub(crate) const L2_OUT: usize = 64;
+pub(crate) const L3_OUT: usize = 32;
 
 /// Per-character parameter count.
 const PARAMS_PER_CHAR: usize =
@@ -193,48 +290,24 @@ const PARAMS_PER_CHAR: usize =
 
 /// Weights for a single character's MLP.
 struct GlyphNet {
-    w1: Vec<f32>, // L1_IN × 128 row-major
-    b1: Vec<f32>, // 128
-    w2: Vec<f32>, // 128 × 64
-    b2: Vec<f32>, // 64
-    w3: Vec<f32>, // 64 × 32
-    b3: Vec<f32>, // 32
+    fc1: InferenceLinear, // L1_IN → L1_OUT
+    fc2: InferenceLinear, // L1_OUT → L2_OUT
+    fc3: InferenceLinear, // L2_OUT → L3_OUT
 }
 
 impl GlyphNet {
-    /// Forward pass: ReLU(W1*x + b1) → ReLU(W2*h + b2) → W3*h + b3 → L2-normalize
+    /// Forward pass: ReLU(fc1) → ReLU(fc2) → fc3 → L2-normalize
     fn forward(&self, raw: &[f32]) -> Vec<f32> {
-        debug_assert_eq!(raw.len(), L1_IN);
+        // Layer 1: ReLU
+        let mut h1 = self.fc1.forward(raw);
+        for v in &mut h1 { *v = v.max(0.0); }
 
-        // Layer 1: h = ReLU(W1^T * x + b1)
-        let mut h1 = self.b1.clone();
-        for j in 0..L1_OUT {
-            let mut sum = h1[j];
-            for i in 0..L1_IN {
-                sum += raw[i] * self.w1[i * L1_OUT + j];
-            }
-            h1[j] = sum.max(0.0);
-        }
+        // Layer 2: ReLU
+        let mut h2 = self.fc2.forward(&h1);
+        for v in &mut h2 { *v = v.max(0.0); }
 
-        // Layer 2: h = ReLU(W2^T * h1 + b2)
-        let mut h2 = self.b2.clone();
-        for j in 0..L2_OUT {
-            let mut sum = h2[j];
-            for i in 0..L1_OUT {
-                sum += h1[i] * self.w2[i * L2_OUT + j];
-            }
-            h2[j] = sum.max(0.0);
-        }
-
-        // Layer 3: out = W3^T * h2 + b3 (linear, no activation)
-        let mut out = self.b3.clone();
-        for j in 0..L3_OUT {
-            let mut sum = out[j];
-            for i in 0..L2_OUT {
-                sum += h2[i] * self.w3[i * L3_OUT + j];
-            }
-            out[j] = sum;
-        }
+        // Layer 3: linear (no activation)
+        let mut out = self.fc3.forward(&h2);
 
         // L2-normalise to unit sphere
         let norm: f32 = out.iter().map(|x| x * x).sum::<f32>().sqrt();
@@ -243,7 +316,6 @@ impl GlyphNet {
                 *v /= norm;
             }
         }
-
         out
     }
 }
@@ -254,17 +326,8 @@ impl GlyphNet {
 /// Characters not in the weights file fall back to Fisher-weighted embedding
 /// (truncated to 32 dims).
 ///
-/// Binary format:
-/// ```text
-/// magic:   b"TRIP" (4 bytes)
-/// version: u32 LE (1)
-/// n_chars: u32 LE
-/// Per character (repeated n_chars times):
-///   char_code: u32 LE (Unicode codepoint)
-///   W1: L1_IN×128 f32 LE, b1: 128 f32 LE
-///   W2: 128×64 f32 LE,  b2: 64 f32 LE
-///   W3: 64×32 f32 LE,   b3: 32 f32 LE
-/// ```
+/// Stores projected font vectors internally and performs brute-force
+/// nearest-neighbor search in the embedding space.
 pub struct TripletClassifier {
     nets: HashMap<char, GlyphNet>,
 }
@@ -310,32 +373,28 @@ impl TripletClassifier {
             ));
         }
 
-        let mut pos = 12usize;
-        let read_vec = |pos: &mut usize, n: usize| -> Vec<f32> {
-            let mut v = Vec::with_capacity(n);
-            for _ in 0..n {
-                let val = f32::from_le_bytes(data[*pos..*pos + 4].try_into().unwrap());
-                v.push(val);
-                *pos += 4;
-            }
-            v
-        };
+        let mut r = BinaryReader::new(&data, 12);
 
         let mut nets = HashMap::with_capacity(n_chars);
         for _ in 0..n_chars {
-            let codepoint = u32::from_le_bytes(data[pos..pos + 4].try_into().unwrap());
-            pos += 4;
+            let codepoint = r.read_u32()?;
             let ch = char::from_u32(codepoint).ok_or_else(|| {
                 format!("invalid codepoint U+{codepoint:04X} in triplet weights")
             })?;
 
             let net = GlyphNet {
-                w1: read_vec(&mut pos, L1_IN * L1_OUT),
-                b1: read_vec(&mut pos, L1_OUT),
-                w2: read_vec(&mut pos, L1_OUT * L2_OUT),
-                b2: read_vec(&mut pos, L2_OUT),
-                w3: read_vec(&mut pos, L2_OUT * L3_OUT),
-                b3: read_vec(&mut pos, L3_OUT),
+                fc1: InferenceLinear {
+                    rows: L1_IN, cols: L1_OUT,
+                    w: r.read_f32s(L1_IN * L1_OUT)?, b: r.read_f32s(L1_OUT)?,
+                },
+                fc2: InferenceLinear {
+                    rows: L1_OUT, cols: L2_OUT,
+                    w: r.read_f32s(L1_OUT * L2_OUT)?, b: r.read_f32s(L2_OUT)?,
+                },
+                fc3: InferenceLinear {
+                    rows: L2_OUT, cols: L3_OUT,
+                    w: r.read_f32s(L2_OUT * L3_OUT)?, b: r.read_f32s(L3_OUT)?,
+                },
             };
             nets.insert(ch, net);
         }
@@ -343,46 +402,27 @@ impl TripletClassifier {
         Ok(Self { nets })
     }
 
-    /// Fisher-weighted fallback for characters without a trained model.
-    fn fisher_embed(features: &CharFeatures) -> Vec<f32> {
-        let raw = features.as_slice();
-        let mut v = vec![0.0f32; FEAT_LEN];
-        for i in 0..FEAT_LEN {
-            v[i] = raw[i] * FISHER_WEIGHTS[i];
-        }
-        v
-    }
-}
-
-impl ClassifierIndex for TripletClassifier {
-    fn prepare_dim(&self) -> usize {
-        L3_OUT
-    }
-
-    fn prepare(&self, ch: char, features: &CharFeatures) -> Vec<f32> {
+    fn embed(&self, ch: char, features: &CharFeatures) -> Vec<f32> {
         if let Some(net) = self.nets.get(&ch) {
             net.forward(&features.as_slice())
         } else {
-            let fisher = Self::fisher_embed(features);
-            fisher[..L3_OUT.min(fisher.len())].to_vec()
+            let f = fisher_embed(&features.as_slice());
+            f[..L3_OUT.min(f.len())].to_vec()
         }
     }
 }
 
-impl Classifier for TripletClassifier {
-    fn rank<'a>(
-        &'a self,
-        ch: char,
-        query: &CharFeatures,
-        candidates: &'a [(usize, Vec<f32>)],
-    ) -> Box<dyn Iterator<Item = (usize, f32)> + 'a> {
-        let q = self.prepare(ch, query);
-        rank_by_embedding(q, candidates)
+impl Embedder for TripletClassifier {
+    fn embed(&self, ch: char, features: &CharFeatures) -> Vec<f32> {
+        TripletClassifier::embed(self, ch, features)
     }
+    fn name(&self) -> &str { "triplet" }
+}
 
-    fn name(&self) -> &str {
-        "triplet"
-    }
+/// Load a triplet-embedding classifier from weights file.
+pub fn load_triplet(path: &std::path::Path) -> Result<EmbeddingClassifier, String> {
+    let tc = TripletClassifier::load(path)?;
+    Ok(EmbeddingClassifier::new(Box::new(tc)))
 }
 
 // ---------------------------------------------------------------------------
@@ -450,54 +490,38 @@ impl GlobalTripletClassifier {
             return Err(format!("unsupported global-triplet weights version {version}"));
         }
 
-        let mut pos = GLOBAL_HEADER;
-        let read_vec = |pos: &mut usize, n: usize| -> Vec<f32> {
-            let mut v = Vec::with_capacity(n);
-            for _ in 0..n {
-                let val = f32::from_le_bytes(data[*pos..*pos + 4].try_into().unwrap());
-                v.push(val);
-                *pos += 4;
-            }
-            v
-        };
+        let mut r = BinaryReader::new(&data, GLOBAL_HEADER);
 
         let net = GlyphNet {
-            w1: read_vec(&mut pos, L1_IN * L1_OUT),
-            b1: read_vec(&mut pos, L1_OUT),
-            w2: read_vec(&mut pos, L1_OUT * L2_OUT),
-            b2: read_vec(&mut pos, L2_OUT),
-            w3: read_vec(&mut pos, L2_OUT * L3_OUT),
-            b3: read_vec(&mut pos, L3_OUT),
+            fc1: InferenceLinear {
+                rows: L1_IN, cols: L1_OUT,
+                w: r.read_f32s(L1_IN * L1_OUT)?, b: r.read_f32s(L1_OUT)?,
+            },
+            fc2: InferenceLinear {
+                rows: L1_OUT, cols: L2_OUT,
+                w: r.read_f32s(L1_OUT * L2_OUT)?, b: r.read_f32s(L2_OUT)?,
+            },
+            fc3: InferenceLinear {
+                rows: L2_OUT, cols: L3_OUT,
+                w: r.read_f32s(L2_OUT * L3_OUT)?, b: r.read_f32s(L3_OUT)?,
+            },
         };
 
         Ok(Self { net })
     }
 }
 
-impl ClassifierIndex for GlobalTripletClassifier {
-    fn prepare_dim(&self) -> usize {
-        L3_OUT
-    }
-
-    fn prepare(&self, _ch: char, features: &CharFeatures) -> Vec<f32> {
+impl Embedder for GlobalTripletClassifier {
+    fn embed(&self, _ch: char, features: &CharFeatures) -> Vec<f32> {
         self.net.forward(&features.as_slice())
     }
+    fn name(&self) -> &str { "global_triplet" }
 }
 
-impl Classifier for GlobalTripletClassifier {
-    fn rank<'a>(
-        &'a self,
-        ch: char,
-        query: &CharFeatures,
-        candidates: &'a [(usize, Vec<f32>)],
-    ) -> Box<dyn Iterator<Item = (usize, f32)> + 'a> {
-        let q = self.prepare(ch, query);
-        rank_by_embedding(q, candidates)
-    }
-
-    fn name(&self) -> &str {
-        "global-triplet"
-    }
+/// Load a global-triplet-embedding classifier from weights file.
+pub fn load_global_triplet(path: &std::path::Path) -> Result<EmbeddingClassifier, String> {
+    let gt = GlobalTripletClassifier::load(path)?;
+    Ok(EmbeddingClassifier::new(Box::new(gt)))
 }
 
 // ---------------------------------------------------------------------------
@@ -558,17 +582,14 @@ impl PerCharFisherClassifier {
         }
 
         let mut weights = HashMap::with_capacity(n_chars);
-        let mut pos = 16;
+        let mut r = BinaryReader::new(&data, 16);
         for _ in 0..n_chars {
-            let cp = u32::from_le_bytes(data[pos..pos+4].try_into().unwrap());
-            pos += 4;
+            let cp = r.read_u32()?;
             let ch = char::from_u32(cp)
                 .ok_or_else(|| format!("invalid codepoint U+{cp:04X}"))?;
+            let wv = r.read_f32s(FEAT_LEN)?;
             let mut w = [0.0f32; FEAT_LEN];
-            for j in 0..FEAT_LEN {
-                w[j] = f32::from_le_bytes(data[pos..pos+4].try_into().unwrap());
-                pos += 4;
-            }
+            w.copy_from_slice(&wv);
 
             // Normalize: cap f32::MAX, take sqrt, scale to sum=1
             let max_finite = w.iter().filter(|v| v.is_finite()).copied()
@@ -589,14 +610,8 @@ impl PerCharFisherClassifier {
 
         Ok(Self { weights })
     }
-}
 
-impl ClassifierIndex for PerCharFisherClassifier {
-    fn prepare_dim(&self) -> usize {
-        FEAT_LEN
-    }
-
-    fn prepare(&self, ch: char, features: &CharFeatures) -> Vec<f32> {
+    fn embed(&self, ch: char, features: &CharFeatures) -> Vec<f32> {
         let raw = features.as_slice();
         let w = self.weights.get(&ch)
             .map(|w| w.as_slice())
@@ -609,20 +624,17 @@ impl ClassifierIndex for PerCharFisherClassifier {
     }
 }
 
-impl Classifier for PerCharFisherClassifier {
-    fn rank<'a>(
-        &'a self,
-        ch: char,
-        query: &CharFeatures,
-        candidates: &'a [(usize, Vec<f32>)],
-    ) -> Box<dyn Iterator<Item = (usize, f32)> + 'a> {
-        let q = self.prepare(ch, query);
-        rank_by_embedding(q, candidates)
+impl Embedder for PerCharFisherClassifier {
+    fn embed(&self, ch: char, features: &CharFeatures) -> Vec<f32> {
+        PerCharFisherClassifier::embed(self, ch, features)
     }
+    fn name(&self) -> &str { "per_char_fisher" }
+}
 
-    fn name(&self) -> &str {
-        "perchar-fisher"
-    }
+/// Load a per-char Fisher classifier from weights file.
+pub fn load_per_char_fisher(path: &std::path::Path) -> Result<EmbeddingClassifier, String> {
+    let pcf = PerCharFisherClassifier::load(path)?;
+    Ok(EmbeddingClassifier::new(Box::new(pcf)))
 }
 
 // ---------------------------------------------------------------------------
@@ -683,71 +695,45 @@ impl MahalanobisClassifier {
         }
 
         let mut transforms = HashMap::with_capacity(n_chars);
-        let mut pos = 16;
+        let mut r = BinaryReader::new(&data, 16);
         for _ in 0..n_chars {
-            let cp = u32::from_le_bytes(data[pos..pos+4].try_into().unwrap());
-            pos += 4;
+            let cp = r.read_u32()?;
             let ch = char::from_u32(cp)
                 .ok_or_else(|| format!("invalid codepoint U+{cp:04X}"))?;
-            let mut linv = vec![0.0f32; FEAT_LEN * FEAT_LEN];
-            for j in 0..FEAT_LEN * FEAT_LEN {
-                linv[j] = f32::from_le_bytes(data[pos..pos+4].try_into().unwrap());
-                pos += 4;
-            }
+            let linv = r.read_f32s(FEAT_LEN * FEAT_LEN)?;
             transforms.insert(ch, linv);
         }
 
         Ok(Self { transforms })
     }
 
-    /// Apply L_inv transform: y = L_inv * x
+    /// Apply L_inv transform: y = L_inv * x  (square FEAT_LEN×FEAT_LEN matrix multiply)
     fn apply_transform(linv: &[f32], x: &[f32]) -> Vec<f32> {
-        let mut y = vec![0.0f32; FEAT_LEN];
-        for i in 0..FEAT_LEN {
-            let mut sum = 0.0f32;
-            let row = &linv[i * FEAT_LEN..(i + 1) * FEAT_LEN];
-            for j in 0..FEAT_LEN {
-                sum += row[j] * x[j];
-            }
-            y[i] = sum;
-        }
-        y
-    }
-}
-
-impl ClassifierIndex for MahalanobisClassifier {
-    fn prepare_dim(&self) -> usize {
-        FEAT_LEN
+        // Special case of dense_project with out_dim = FEAT_LEN
+        dense_project(FEAT_LEN, linv, x)
     }
 
-    fn prepare(&self, ch: char, features: &CharFeatures) -> Vec<f32> {
+    fn embed(&self, ch: char, features: &CharFeatures) -> Vec<f32> {
         let raw = features.as_slice();
         if let Some(linv) = self.transforms.get(&ch) {
             Self::apply_transform(linv, &raw)
         } else {
-            let mut v = vec![0.0f32; FEAT_LEN];
-            for i in 0..FEAT_LEN {
-                v[i] = raw[i] * FISHER_WEIGHTS[i];
-            }
-            v
+            fisher_embed(&raw)
         }
     }
 }
 
-impl Classifier for MahalanobisClassifier {
-    fn rank<'a>(
-        &'a self,
-        ch: char,
-        query: &CharFeatures,
-        candidates: &'a [(usize, Vec<f32>)],
-    ) -> Box<dyn Iterator<Item = (usize, f32)> + 'a> {
-        let q = self.prepare(ch, query);
-        rank_by_embedding(q, candidates)
+impl Embedder for MahalanobisClassifier {
+    fn embed(&self, ch: char, features: &CharFeatures) -> Vec<f32> {
+        MahalanobisClassifier::embed(self, ch, features)
     }
+    fn name(&self) -> &str { "mahalanobis" }
+}
 
-    fn name(&self) -> &str {
-        "mahalanobis"
-    }
+/// Load a Mahalanobis classifier from weights file.
+pub fn load_mahalanobis(path: &std::path::Path) -> Result<EmbeddingClassifier, String> {
+    let m = MahalanobisClassifier::load(path)?;
+    Ok(EmbeddingClassifier::new(Box::new(m)))
 }
 
 // ---------------------------------------------------------------------------
@@ -803,83 +789,47 @@ impl LdaClassifier {
         let n_chars = u32::from_le_bytes(data[8..12].try_into().unwrap()) as usize;
 
         let mut projections = HashMap::with_capacity(n_chars);
-        let mut pos = 12;
+        let mut r = BinaryReader::new(&data, 12);
         for _ in 0..n_chars {
-            if pos + 8 > data.len() {
-                return Err("truncated LDA file".into());
-            }
-            let cp = u32::from_le_bytes(data[pos..pos+4].try_into().unwrap());
-            pos += 4;
+            let cp = r.read_u32()?;
             let ch = char::from_u32(cp)
                 .ok_or_else(|| format!("invalid codepoint U+{cp:04X}"))?;
-            let out_dim = u32::from_le_bytes(data[pos..pos+4].try_into().unwrap()) as usize;
-            pos += 4;
-            let n_floats = out_dim * FEAT_LEN;
-            if pos + n_floats * 4 > data.len() {
-                return Err("truncated LDA projection data".into());
-            }
-            let mut proj = vec![0.0f32; n_floats];
-            for j in 0..n_floats {
-                proj[j] = f32::from_le_bytes(data[pos..pos+4].try_into().unwrap());
-                pos += 4;
-            }
+            let out_dim = r.read_u32()? as usize;
+            let proj = r.read_f32s(out_dim * FEAT_LEN)?;
             projections.insert(ch, (out_dim, proj));
         }
 
         let dims: Vec<usize> = projections.values().map(|(d, _)| *d).collect();
-        let max_dim = dims.iter().max().copied().unwrap_or(0);
+        let _max_dim = dims.iter().max().copied().unwrap_or(0);
         Ok(Self { projections })
     }
 
     fn project(out_dim: usize, proj: &[f32], x: &[f32]) -> Vec<f32> {
-        let mut y = vec![0.0f32; out_dim];
-        for i in 0..out_dim {
-            let row = &proj[i * FEAT_LEN..(i + 1) * FEAT_LEN];
-            let mut sum = 0.0f32;
-            for j in 0..FEAT_LEN {
-                sum += row[j] * x[j];
-            }
-            y[i] = sum;
-        }
-        y
-    }
-}
-
-impl ClassifierIndex for LdaClassifier {
-    fn prepare_dim(&self) -> usize {
-        // Variable per char; return max across all chars
-        self.projections.values().map(|(d, _)| *d).max().unwrap_or(FEAT_LEN)
+        dense_project(out_dim, proj, x)
     }
 
-    fn prepare(&self, ch: char, features: &CharFeatures) -> Vec<f32> {
+    fn embed(&self, ch: char, features: &CharFeatures) -> Vec<f32> {
         let raw = features.as_slice();
         if let Some((out_dim, proj)) = self.projections.get(&ch) {
             Self::project(*out_dim, proj, &raw)
         } else {
-            // Fallback to Fisher
-            let mut v = vec![0.0f32; FEAT_LEN];
-            for i in 0..FEAT_LEN {
-                v[i] = raw[i] * FISHER_WEIGHTS[i];
-            }
-            v
+            fisher_embed(&raw)
         }
     }
+
 }
 
-impl Classifier for LdaClassifier {
-    fn rank<'a>(
-        &'a self,
-        ch: char,
-        query: &CharFeatures,
-        candidates: &'a [(usize, Vec<f32>)],
-    ) -> Box<dyn Iterator<Item = (usize, f32)> + 'a> {
-        let q = self.prepare(ch, query);
-        rank_by_embedding(q, candidates)
+impl Embedder for LdaClassifier {
+    fn embed(&self, ch: char, features: &CharFeatures) -> Vec<f32> {
+        LdaClassifier::embed(self, ch, features)
     }
+    fn name(&self) -> &str { "lda" }
+}
 
-    fn name(&self) -> &str {
-        "lda"
-    }
+/// Load an LDA classifier from weights file.
+pub fn load_lda(path: &std::path::Path) -> Result<EmbeddingClassifier, String> {
+    let lda = LdaClassifier::load(path)?;
+    Ok(EmbeddingClassifier::new(Box::new(lda)))
 }
 
 // ---------------------------------------------------------------------------
@@ -887,29 +837,6 @@ impl Classifier for LdaClassifier {
 // ---------------------------------------------------------------------------
 
 /// Inference-only linear layer (no gradients, no optimizer state).
-struct InferenceLinear {
-    rows: usize,
-    cols: usize,
-    w: Vec<f32>, // rows × cols, row-major
-    b: Vec<f32>, // cols
-}
-
-impl InferenceLinear {
-    /// Forward: output[j] = sum_i(input[i] * w[i*cols+j]) + b[j]
-    fn forward(&self, input: &[f32]) -> Vec<f32> {
-        debug_assert_eq!(input.len(), self.rows);
-        let mut out = self.b.clone();
-        for j in 0..self.cols {
-            let mut sum = out[j];
-            for i in 0..self.rows {
-                sum += input[i] * self.w[i * self.cols + j];
-            }
-            out[j] = sum;
-        }
-        out
-    }
-}
-
 /// Per-character MLP weights for direct multi-class classification.
 struct MlpCharNet {
     fc1: InferenceLinear, // 100 → 256
@@ -991,35 +918,13 @@ impl MlpClassifier {
         let n_chars = u32::from_le_bytes(data[8..12].try_into().unwrap()) as usize;
 
         let mut nets = HashMap::with_capacity(n_chars);
-        let mut pos = 12;
-
-        let read_f32s = |pos: &mut usize, n: usize, data: &[u8]| -> Result<Vec<f32>, String> {
-            let need = n * 4;
-            if *pos + need > data.len() {
-                return Err("truncated MLP weight data".into());
-            }
-            let mut v = Vec::with_capacity(n);
-            for _ in 0..n {
-                v.push(f32::from_le_bytes(data[*pos..*pos + 4].try_into().unwrap()));
-                *pos += 4;
-            }
-            Ok(v)
-        };
-
-        let read_u32 = |pos: &mut usize, data: &[u8]| -> Result<u32, String> {
-            if *pos + 4 > data.len() {
-                return Err("truncated MLP header data".into());
-            }
-            let v = u32::from_le_bytes(data[*pos..*pos + 4].try_into().unwrap());
-            *pos += 4;
-            Ok(v)
-        };
+        let mut r = BinaryReader::new(data, 12);
 
         for _ in 0..n_chars {
-            let cp = read_u32(&mut pos, data)?;
+            let cp = r.read_u32()?;
             let ch = char::from_u32(cp)
                 .ok_or_else(|| format!("invalid codepoint U+{cp:04X}"))?;
-            let k = read_u32(&mut pos, data)? as usize;
+            let k = r.read_u32()? as usize;
             if k == 0 {
                 return Err(format!("char '{}': zero classes", ch));
             }
@@ -1027,16 +932,16 @@ impl MlpClassifier {
             // class_map: k × u32
             let mut class_map = Vec::with_capacity(k);
             for _ in 0..k {
-                class_map.push(read_u32(&mut pos, data)?);
+                class_map.push(r.read_u32()?);
             }
 
             // Layer weights
-            let w1 = read_f32s(&mut pos, FEAT_LEN * MLP_H1, data)?;
-            let b1 = read_f32s(&mut pos, MLP_H1, data)?;
-            let w2 = read_f32s(&mut pos, MLP_H1 * MLP_H2, data)?;
-            let b2 = read_f32s(&mut pos, MLP_H2, data)?;
-            let w3 = read_f32s(&mut pos, MLP_H2 * k, data)?;
-            let b3 = read_f32s(&mut pos, k, data)?;
+            let w1 = r.read_f32s(FEAT_LEN * MLP_H1)?;
+            let b1 = r.read_f32s(MLP_H1)?;
+            let w2 = r.read_f32s(MLP_H1 * MLP_H2)?;
+            let b2 = r.read_f32s(MLP_H2)?;
+            let w3 = r.read_f32s(MLP_H2 * k)?;
+            let b3 = r.read_f32s(k)?;
 
             nets.insert(ch, MlpCharNet {
                 fc1: InferenceLinear { rows: FEAT_LEN, cols: MLP_H1, w: w1, b: b1 },
@@ -1048,76 +953,62 @@ impl MlpClassifier {
 
         Ok(Self { nets })
     }
+
+    /// Total number of unique font IDs across all character nets.
+    fn count_fonts(&self) -> usize {
+        let mut ids = std::collections::HashSet::new();
+        for net in self.nets.values() {
+            for &fid in &net.class_map {
+                ids.insert(fid);
+            }
+        }
+        ids.len()
+    }
 }
 
-impl ClassifierIndex for MlpClassifier {
-    fn prepare_dim(&self) -> usize {
-        // We store only the font_id (as f32) for each candidate.
-        // The MLP does not use stored embeddings — it classifies the query
-        // directly and maps outputs back to font_ids via the class map.
-        1
-    }
-
-    fn prepare(&self, _ch: char, _features: &CharFeatures) -> Vec<f32> {
-        // Minimal storage: we just need the font_id back from candidates.
-        // The char_index stores font_id as the first element of the tuple,
-        // so we return an empty-ish marker. But since prepare_dim() == 1,
-        // we must return exactly 1 element. We store 0.0 as a placeholder.
-        vec![0.0]
+impl MlpClassifier {
+    /// Compute softmax probabilities for a character query, returning (net, probs) if the char has a net.
+    fn softmax_probs(&self, ch: char, query: &CharFeatures) -> Option<(&MlpCharNet, Vec<f32>)> {
+        let net = self.nets.get(&ch)?;
+        let logits = net.forward(&query.as_slice());
+        let max_logit = logits.iter().copied().fold(f32::NEG_INFINITY, f32::max);
+        let mut probs: Vec<f32> = logits.iter().map(|&l| (l - max_logit).exp()).collect();
+        let sum_exp: f32 = probs.iter().sum();
+        for p in &mut probs { *p /= sum_exp; }
+        Some((net, probs))
     }
 }
 
 impl Classifier for MlpClassifier {
-    fn rank<'a>(
-        &'a self,
-        ch: char,
-        query: &CharFeatures,
-        candidates: &'a [(usize, Vec<f32>)],
-    ) -> Box<dyn Iterator<Item = (usize, f32)> + 'a> {
-        let raw = query.as_slice();
-
-        if let Some(net) = self.nets.get(&ch) {
-            let logits = net.forward(&raw);
-            let k = logits.len();
-
-            // Numerically stable softmax
-            let max_logit = logits.iter().copied().fold(f32::NEG_INFINITY, f32::max);
-            let mut probs = vec![0.0f32; k];
-            let mut sum_exp = 0.0f32;
-            for i in 0..k {
-                probs[i] = (logits[i] - max_logit).exp();
-                sum_exp += probs[i];
-            }
-            for p in &mut probs { *p /= sum_exp; }
-
-            // Build font_id → probability lookup
-            let mut fid_to_prob: HashMap<usize, f32> = HashMap::with_capacity(k);
-            for (ci, &fid) in net.class_map.iter().enumerate() {
-                fid_to_prob.insert(fid as usize, probs[ci]);
-            }
-
-            // Score each candidate: -probability (lower = better)
-            let mut scored: Vec<(usize, f32)> = candidates
-                .iter()
-                .map(|(id, _)| {
-                    let prob = fid_to_prob.get(id).copied().unwrap_or(0.0);
-                    (*id, -prob)
-                })
+    fn classify(&self, ch: char, query: &CharFeatures, k: usize) -> Vec<(usize, f32)> {
+        if let Some((net, probs)) = self.softmax_probs(ch, query) {
+            let mut scored: Vec<(usize, f32)> = net.class_map.iter().enumerate()
+                .map(|(ci, &fid)| (fid as usize, -probs[ci]))
                 .collect();
             scored.sort_by(|a, b| a.1.partial_cmp(&b.1).unwrap_or(std::cmp::Ordering::Equal));
-            Box::new(scored.into_iter())
+            scored.truncate(k);
+            scored
         } else {
-            // Fallback to Fisher for unknown characters
-            let mut v = vec![0.0f32; FEAT_LEN];
-            for i in 0..FEAT_LEN {
-                v[i] = raw[i] * FISHER_WEIGHTS[i];
-            }
-            rank_by_embedding(v, candidates)
+            Vec::new()
         }
+    }
+
+    fn distance(&self, ch: char, query: &CharFeatures, font_id: usize) -> Option<f32> {
+        let (net, probs) = self.softmax_probs(ch, query)?;
+        for (ci, &fid) in net.class_map.iter().enumerate() {
+            if fid as usize == font_id {
+                return Some(-probs[ci]);
+            }
+        }
+        None
     }
 
     fn name(&self) -> &str {
         "mlp"
+    }
+
+    fn font_count(&self) -> usize {
+        self.count_fonts()
     }
 }
 
@@ -1127,10 +1018,8 @@ impl Classifier for MlpClassifier {
 
 /// Rank-fusion classifier that combines scores from multiple child classifiers.
 ///
-/// At index time, stores each child's prepared representation concatenated
-/// with length prefixes. At query time, reconstructs per-child candidate
-/// lists, calls each child's `rank()`, normalizes scores to [0,1], and
-/// computes a weighted average. The fused score determines final ranking.
+/// At query time, calls each child's `classify()`, normalizes scores to [0,1],
+/// and computes a weighted average.  The fused score determines final ranking.
 pub struct FusionClassifier {
     children: Vec<(f32, Box<dyn Classifier>)>, // (weight, classifier)
     /// Cached sum of weights for normalization.
@@ -1146,114 +1035,65 @@ impl FusionClassifier {
     }
 }
 
-impl ClassifierIndex for FusionClassifier {
-    fn prepare_dim(&self) -> usize {
-        // Sum of all children's dims + 1 length header per child
-        self.children.iter()
-            .map(|(_, c)| 1 + c.prepare_dim())
-            .sum()
-    }
-
-    fn prepare(&self, ch: char, features: &CharFeatures) -> Vec<f32> {
-        // Concatenate: [child0_len, child0_data..., child1_len, child1_data..., ...]
-        let mut result = Vec::new();
-        for (_, child) in &self.children {
-            let child_data = child.prepare(ch, features);
-            result.push(child_data.len() as f32);
-            result.extend_from_slice(&child_data);
-        }
-        result
-    }
-}
-
 impl Classifier for FusionClassifier {
-    fn rank<'a>(
-        &'a self,
-        ch: char,
-        query: &CharFeatures,
-        candidates: &'a [(usize, Vec<f32>)],
-    ) -> Box<dyn Iterator<Item = (usize, f32)> + 'a> {
-        let n_children = self.children.len();
+    fn classify(&self, ch: char, query: &CharFeatures, k: usize) -> Vec<(usize, f32)> {
+        // Collect each child's full ranked list
+        let child_results: Vec<Vec<(usize, f32)>> = self.children.iter()
+            .map(|(_, child)| child.classify(ch, query, usize::MAX))
+            .collect();
 
-        // For each child, reconstruct its candidate slice from the concatenated data
-        // and call its rank() to get scores.
-        let mut per_child_scores: Vec<HashMap<usize, f32>> = Vec::with_capacity(n_children);
+        // Normalize each child's scores to [0,1] and compute weighted average
+        let mut fused: HashMap<usize, f32> = HashMap::new();
 
-        for (child_idx, (_, child)) in self.children.iter().enumerate() {
-            // Reconstruct per-child candidates
-            let child_candidates: Vec<(usize, Vec<f32>)> = candidates.iter().map(|(id, stored)| {
-                // Parse stored data to extract this child's portion
-                let mut pos = 0usize;
-                for _ci in 0..child_idx {
-                    if pos >= stored.len() { break; }
-                    let len = stored[pos] as usize;
-                    pos += 1 + len;
-                }
-                let child_data = if pos < stored.len() {
-                    let len = stored[pos] as usize;
-                    pos += 1;
-                    if pos + len <= stored.len() {
-                        stored[pos..pos + len].to_vec()
-                    } else {
-                        Vec::new()
-                    }
-                } else {
-                    Vec::new()
-                };
-                (*id, child_data)
-            }).collect();
-
-            let scores: Vec<(usize, f32)> = child.rank(ch, query, &child_candidates).collect();
-            let score_map: HashMap<usize, f32> = scores.into_iter().collect();
-            per_child_scores.push(score_map);
-        }
-
-        // Normalize each child's scores to [0, 1] range and compute weighted average
-        let mut fused: HashMap<usize, f32> = HashMap::with_capacity(candidates.len());
-
-        // First pass: find min/max per child
-        let mut child_ranges: Vec<(f32, f32)> = Vec::with_capacity(n_children);
-        for scores in &per_child_scores {
-            let min = scores.values().copied().fold(f32::INFINITY, f32::min);
-            let max = scores.values().copied().fold(f32::NEG_INFINITY, f32::max);
-            child_ranges.push((min, max));
-        }
-
-        // Initialize fused scores
-        for (id, _) in candidates {
-            fused.insert(*id, 0.0);
-        }
-
-        // Accumulate weighted normalized scores
-        for (child_idx, ((weight, _), (min, max))) in
-            self.children.iter().zip(child_ranges.iter()).enumerate()
+        for (_ci, ((weight, _), results)) in
+            self.children.iter().zip(child_results.iter()).enumerate()
         {
+            if results.is_empty() { continue; }
+            let min = results.iter().map(|(_, s)| *s).fold(f32::INFINITY, f32::min);
+            let max = results.iter().map(|(_, s)| *s).fold(f32::NEG_INFINITY, f32::max);
             let range = max - min;
             let norm_weight = weight / self.weight_sum;
 
-            for (id, _) in candidates {
-                let raw_score = per_child_scores[child_idx]
-                    .get(id)
-                    .copied()
-                    .unwrap_or(*max); // worst score for missing
-
+            for &(id, score) in results {
                 let normalized = if range > 1e-12 {
-                    (raw_score - min) / range
+                    (score - min) / range
                 } else {
-                    0.5 // all scores equal
+                    0.5
                 };
-
-                *fused.get_mut(id).unwrap() += norm_weight * normalized;
+                *fused.entry(id).or_insert(0.0) += norm_weight * normalized;
             }
         }
 
-        // Sort by fused score (lower = better)
         let mut scored: Vec<(usize, f32)> = fused.into_iter().collect();
         scored.sort_by(|a, b| a.1.partial_cmp(&b.1).unwrap_or(std::cmp::Ordering::Equal));
-        Box::new(scored.into_iter())
+        scored.truncate(k);
+        scored
+    }
+
+    fn distance(&self, ch: char, query: &CharFeatures, font_id: usize) -> Option<f32> {
+        // Weighted average of child distances (unnormalized)
+        let mut total = 0.0f32;
+        let mut any = false;
+        for (weight, child) in &self.children {
+            if let Some(d) = child.distance(ch, query, font_id) {
+                total += (weight / self.weight_sum) * d;
+                any = true;
+            }
+        }
+        if any { Some(total) } else { None }
     }
 
     fn name(&self) -> &str {
         "fusion"
+    }
+
+    fn font_count(&self) -> usize {
+        self.children.iter().map(|(_, c)| c.font_count()).max().unwrap_or(0)
+    }
+
+    fn add_font(&mut self, font_id: usize, ch: char, features: &CharFeatures) {
+        for (_, child) in &mut self.children {
+            child.add_font(font_id, ch, features);
+        }
     }
 }

@@ -34,6 +34,17 @@ pub enum FontClass {
     Unknown,
 }
 
+impl FontClass {
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            FontClass::Serif => "serif",
+            FontClass::Sans => "sans",
+            FontClass::Mono => "mono",
+            FontClass::Unknown => "unknown",
+        }
+    }
+}
+
 #[derive(Debug, Clone)]
 pub struct FontEntry {
     pub path: PathBuf,
@@ -159,7 +170,7 @@ pub fn scan_fonts(dirs: &[PathBuf]) -> Vec<FontEntry> {
                 continue;
             }
             if let Some(fe) = load_font_entry(path, &aliases) {
-                let fig_label = if fe.oldstyle_figures { "OLDSTYLE" } else { "lining" };
+                let _fig_label = if fe.oldstyle_figures { "OLDSTYLE" } else { "lining" };
 
                 // Detect ligature glyphs (liga + dlig)
                 let ligatures = detect_ligature_glyphs(&fe.data);
@@ -516,14 +527,6 @@ fn classify(family: &str) -> FontClass {
     }
 }
 
-fn class_label(c: FontClass) -> &'static str {
-    match c {
-        FontClass::Serif => "serif",
-        FontClass::Sans  => "sans",
-        FontClass::Mono  => "mono",
-        FontClass::Unknown => "?",
-    }
-}
 
 // ---------------------------------------------------------------------------
 // Font loading
@@ -756,6 +759,11 @@ const LIGATURE_PROBES: &[(&str, char)] = &[
     ("ffl", '\u{FB04}'),
 ];
 
+/// Returns true if `c` is a Unicode ligature codepoint (ff, fi, fl, ffi, ffl).
+pub fn is_ligature_char(c: char) -> bool {
+    LIGATURE_PROBES.iter().any(|&(_, lig)| lig == c)
+}
+
 /// Detect ligature glyph IDs by shaping probe strings with liga and dlig
 /// features. Returns a vec of (unicode_ligature_char, glyph_id) for each
 /// ligature the font supports.
@@ -803,31 +811,6 @@ pub fn read_raw_postscript_name_from_file(path: &std::path::Path) -> String {
         Ok(data) => read_postscript_name(&data),
         Err(_) => String::new(),
     }
-}
-
-/// Read the typographic family name from the font's name table.
-///
-/// Prefers nameID 16 (Typographic Family Name), falls back to nameID 1
-/// (Font Family Name).  Returns empty string if neither is available.
-fn read_typographic_family(data: &[u8]) -> String {
-    use rustybuzz::ttf_parser;
-    let face = match ttf_parser::Face::parse(data, 0) {
-        Ok(f) => f,
-        Err(_) => return String::new(),
-    };
-    // nameID 16 first (typographic/preferred family), then nameID 1
-    let mut id1 = None;
-    for name in face.names() {
-        if name.name_id == 16 {
-            if let Some(s) = name.to_string() {
-                return s;
-            }
-        }
-        if name.name_id == 1 && id1.is_none() {
-            id1 = name.to_string();
-        }
-    }
-    id1.unwrap_or_default()
 }
 
 fn read_postscript_name(data: &[u8]) -> String {
@@ -879,6 +862,75 @@ pub fn make_weight_explicit(ps_name: &str, weight: u16) -> String {
     }
 }
 
+// ---------------------------------------------------------------------------
+// Comprehensive font metadata (single-parse reader)
+// ---------------------------------------------------------------------------
+
+/// All name-table IDs, OS/2 weight class, and italic flag in one parse.
+pub struct FontMetadata {
+    pub nid1_family: String,
+    pub nid2_subfamily: String,
+    pub nid4_full_name: String,
+    pub nid6_postscript: String,
+    /// nameID 16 (Typographic Family), falls back to nameID 1 if absent.
+    pub nid16_typographic: String,
+    pub weight_class: u16,
+    pub italic: bool,
+}
+
+/// Read all font metadata in a single ttf_parser parse pass.
+pub fn read_font_metadata(data: &[u8]) -> FontMetadata {
+    use rustybuzz::ttf_parser;
+    let face = match ttf_parser::Face::parse(data, 0) {
+        Ok(f) => f,
+        Err(_) => return FontMetadata {
+            nid1_family: String::new(),
+            nid2_subfamily: String::new(),
+            nid4_full_name: String::new(),
+            nid6_postscript: String::new(),
+            nid16_typographic: String::new(),
+            weight_class: 400,
+            italic: false,
+        },
+    };
+
+    let mut nid1 = String::new();
+    let mut nid2 = String::new();
+    let mut nid4 = String::new();
+    let mut nid6 = String::new();
+    let mut nid16 = String::new();
+
+    for name in face.names() {
+        match name.name_id {
+            1 if nid1.is_empty() => { if let Some(s) = name.to_string() { nid1 = s; } }
+            2 if nid2.is_empty() => { if let Some(s) = name.to_string() { nid2 = s; } }
+            4 if nid4.is_empty() => { if let Some(s) = name.to_string() { nid4 = s; } }
+            6 if nid6.is_empty() => { if let Some(s) = name.to_string() { nid6 = s; } }
+            16 if nid16.is_empty() => { if let Some(s) = name.to_string() { nid16 = s; } }
+            _ => {}
+        }
+    }
+
+    if nid16.is_empty() {
+        nid16 = nid1.clone();
+    }
+
+    let weight_class = face.tables().os2
+        .map(|os2| os2.weight().to_number())
+        .unwrap_or(400);
+    let italic = face.is_italic();
+
+    FontMetadata {
+        nid1_family: nid1,
+        nid2_subfamily: nid2,
+        nid4_full_name: nid4,
+        nid6_postscript: nid6,
+        nid16_typographic: nid16,
+        weight_class,
+        italic,
+    }
+}
+
 /// Font identity for major/minor miss classification.
 /// Read from the font's name table and OS/2 table — no string munging.
 #[derive(Debug, Clone)]
@@ -886,16 +938,12 @@ pub struct FontIdentity {
     /// Typographic family: name ID 16 if present, else name ID 1.
     pub family: String,
     /// OS/2 usWeightClass (400 = Regular, 500 = Medium, 700 = Bold, etc.)
-    pub weight: u16,
+    pub _weight: u16,
     /// OS/2 fsSelection italic bit.
     pub italic: bool,
 }
 
 impl FontIdentity {
-    /// Weight bucket: 100-unit ranges (400–499 = Regular, 500–599 = Medium, etc.)
-    pub fn weight_bucket(&self) -> u16 {
-        self.weight / 100
-    }
 
     /// Two fonts are a "major" difference if family or italic differ.
     /// Weight differences within the same family+italic are always minor.
@@ -927,7 +975,7 @@ pub fn read_font_identity(path: &Path) -> Option<FontIdentity> {
     let weight = face.tables().os2.map(|os2| os2.weight().to_number()).unwrap_or(400);
     let italic = face.is_italic();
 
-    Some(FontIdentity { family, weight, italic })
+    Some(FontIdentity { family, _weight: weight, italic })
 }
 
 fn load_font_entry(path: &Path, aliases: &HashMap<String, Alias>) -> Option<FontEntry> {
@@ -937,19 +985,11 @@ fn load_font_entry(path: &Path, aliases: &HashMap<String, Alias>) -> Option<Font
     let _ = ab_glyph::FontRef::try_from_slice(&data).ok()?;
 
     let oldstyle_figures = detect_oldstyle_figures(&data);
-    let raw_ps_name = read_postscript_name(&data);
-
-    // Read OS/2 weight for make_weight_explicit
-    let os2_weight = {
-        use rustybuzz::ttf_parser;
-        ttf_parser::Face::parse(&data, 0)
-            .ok()
-            .and_then(|face| face.tables().os2)
-            .map(|os2| os2.weight().to_number())
-            .unwrap_or(400)
-    };
+    let meta = read_font_metadata(&data);
+    let raw_ps_name = meta.nid6_postscript;
+    let os2_weight = meta.weight_class;
     let postscript_name = make_weight_explicit(&raw_ps_name, os2_weight);
-    let typographic_family = read_typographic_family(&data);
+    let typographic_family = meta.nid16_typographic;
 
     let stem = path
         .file_stem()

@@ -533,7 +533,7 @@ fn embed_subsetted_font(
             }
             (subsetted, cid_map)
         }
-        Err(e) => {
+        Err(_e) => {
             // Fallback: embed full font, use original GIDs as CIDs
             let mut cid_map = HashMap::new();
             for &(ch, orig_gid) in &char_to_orig_gid {

@@ -52,11 +52,11 @@ pub const NORM_H: u32 = 24;
 /// Number of bins in the column ink density profile.
 /// At NORM_H=24, typical char widths are 10–20 px, so 16 bins avoids
 /// upsampling noise.  (Was 32 when NORM_H=48.)
-const PROFILE_BINS: usize = 16;
+pub const PROFILE_BINS: usize = 16;
 
 /// Number of bins in the row ink density profile (horizontal).
 /// 24 rows → 16 bins keeps roughly 1:1 sampling.  (Was 32.)
-const ROW_PROFILE_BINS: usize = 16;
+pub const ROW_PROFILE_BINS: usize = 16;
 
 /// Anti-aliasing variant for reference character rendering.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
@@ -127,22 +127,74 @@ const CROSSING_BINS: usize = 4;
 /// Number of terminal angle bins (up/right/down/left).
 const TERMINAL_ANGLE_BINS: usize = 4;
 
-/// Number of original scalar features (aspect..xh_cap_ratio).
-const SCALAR_V1: usize = 7;
+/// Number of original scalar features (aspect..stroke_contrast).
+pub const SCALAR_V1: usize = 6;
 
 /// Number of new discriminative scalar features.
-const SCALAR_V2: usize = 4 + TERMINAL_ANGLE_BINS + 2 + CROSSING_BINS;
+pub const SCALAR_V2: usize = 4 + TERMINAL_ANGLE_BINS + 2 + CROSSING_BINS;
 // counter_area_ratio(1) + counter_centroid(2) + counter_aspect(1) = 4
 // terminal_count is folded into terminal_angles normalization
 // terminal_angles(4) + ink_perimeter(1) + compactness(1) = 6
 // h_crossings(4)
 
 /// Number of v3 feature dimensions.
-const SCALAR_V3: usize = 1 + 1 + 1 + 2 + 1 + 4 + 1;
+pub const SCALAR_V3: usize = 1 + 1 + 1 + 2 + 1 + 4 + 1;
 // hole_count(1) + h_symmetry(1) + v_symmetry(1) + skeleton(branch_pts, end_pts = 2) + corner_count(1) + quadrant_density(4) + mean_stroke_width(1)
 
 /// Feature vector length: col_profile + row_profile + original scalars + v2 + v3.
 pub const FEAT_LEN: usize = PROFILE_BINS + ROW_PROFILE_BINS + SCALAR_V1 + SCALAR_V2 + SCALAR_V3;
+
+/// Canonical feature dimension names, one per FEAT_LEN slot, in as_slice() order.
+pub const FEAT_NAMES: [&str; FEAT_LEN] = [
+    // Column profile (16)
+    "col0","col1","col2","col3","col4","col5","col6","col7",
+    "col8","col9","col10","col11","col12","col13","col14","col15",
+    // Scalar v1 (6)
+    "aspect","ink_density","v_center","h_balance","serif_score","stroke_contrast",
+    // Counter features (4)
+    "counter_area","counter_cx","counter_cy","counter_asp",
+    // Terminal angles (4)
+    "term0","term1","term2","term3",
+    // Boundary (2)
+    "ink_perim","compactness",
+    // Horizontal crossings (4)
+    "cross0","cross1","cross2","cross3",
+    // Row profile (16)
+    "row0","row1","row2","row3","row4","row5","row6","row7",
+    "row8","row9","row10","row11","row12","row13","row14","row15",
+    // Scalar v3 (11)
+    "hole_count","h_symmetry","v_symmetry","skeleton_branch","skeleton_end",
+    "corner_count","quad_tl","quad_tr","quad_bl","quad_br","mean_stroke_w",
+];
+
+/// Group boundary offsets for feature dimension ranges.
+pub const GROUP_OFFSETS: [(usize, usize, &str); 5] = [
+    (0, PROFILE_BINS, "Col profile"),
+    (PROFILE_BINS, PROFILE_BINS + SCALAR_V1, "Scalar v1"),
+    (PROFILE_BINS + SCALAR_V1, PROFILE_BINS + SCALAR_V1 + SCALAR_V2, "Scalar v2"),
+    (PROFILE_BINS + SCALAR_V1 + SCALAR_V2, PROFILE_BINS + SCALAR_V1 + SCALAR_V2 + ROW_PROFILE_BINS, "Row profile"),
+    (PROFILE_BINS + SCALAR_V1 + SCALAR_V2 + ROW_PROFILE_BINS, FEAT_LEN, "Scalar v3"),
+];
+
+/// Return the feature-group name for a given feature dimension index.
+pub fn group_name_for_dim(i: usize) -> &'static str {
+    for &(start, end, name) in &GROUP_OFFSETS {
+        if i >= start && i < end {
+            return name;
+        }
+    }
+    "unknown"
+}
+
+/// Downscale an image by `scale_factor` (0..1) and re-normalize to NORM_H.
+/// Shared by learn_weights (DPI simulation) and gen_training_data (native-height simulation).
+pub fn degrade_and_renormalize(img: &GrayImage, scale_factor: f32) -> Option<GrayImage> {
+    let (w, h) = img.dimensions();
+    let small_w = ((w as f32 * scale_factor).round() as u32).max(3);
+    let small_h = ((h as f32 * scale_factor).round() as u32).max(3);
+    let small = image::imageops::resize(img, small_w, small_h, image::imageops::FilterType::Lanczos3);
+    normalize_to_ink_bounds(&small, NORM_H)
+}
 
 /// Minimum word length (characters) for extraction.
 const MIN_WORD_LEN: usize = 3;
@@ -209,8 +261,6 @@ pub struct CharFeatures {
     pub serif_score: f32,
     /// Stroke contrast: ratio of thickest to thinnest strokes.
     pub stroke_contrast: f32,
-    /// x-height to cap-height ratio (per-font metric).
-    pub xh_cap_ratio: f32,
 
     // ── v2 discriminative features ──────────────────────────────────
     /// Counter (enclosed whitespace) area / total bbox area. 0 if no counter.
@@ -261,14 +311,13 @@ impl CharFeatures {
         // Column profile (16)
         v[i..i + PROFILE_BINS].copy_from_slice(&self.profile);
         i += PROFILE_BINS;
-        // Original scalars (7)
+        // Original scalars (6)
         v[i] = self.aspect;           i += 1;
         v[i] = self.ink_density;      i += 1;
         v[i] = self.v_center;         i += 1;
         v[i] = self.h_balance;        i += 1;
         v[i] = self.serif_score;      i += 1;
         v[i] = self.stroke_contrast;  i += 1;
-        v[i] = self.xh_cap_ratio;     i += 1;
         // v2: counter features (4)
         v[i] = self.counter_area_ratio;   i += 1;
         v[i] = self.counter_centroid_x;   i += 1;
@@ -312,58 +361,6 @@ impl CharFeatures {
         v
     }
 }
-
-// ---------------------------------------------------------------------------
-// Brute-force nearest-neighbor search
-// ---------------------------------------------------------------------------
-// At 59+ dimensions, tree-based structures (e.g. k-d trees) degrade to
-// near-linear scan anyway — the single-axis pruning test checks 1/59th of
-// total distance, so the far branch is almost always explored. A flat vector
-// with linear scan is simpler, faster (cache-friendly + LLVM auto-vectorizes
-// the distance loop), and trivially correct.
-
-/// Find the nearest neighbor, then return ALL points within `factor`× that
-/// distance. Returns `(font_id, squared_distance)` pairs sorted by distance.
-fn nearest_within_factor_brute(
-    points: &[(usize, Vec<f32>)],
-    query: &[f32],
-    factor: f32,
-) -> Vec<(usize, f32)> {
-    if points.is_empty() {
-        return Vec::new();
-    }
-    // Single pass: compute all distances, track min, and collect all results.
-    // Then filter at the end, avoiding a second full scan.
-    let factor_sq = factor * factor;
-    let mut best_dist_sq = f32::MAX;
-    let mut all: Vec<(usize, f32)> = Vec::with_capacity(points.len());
-    for &(id, ref coords) in points {
-        let d = squared_distance(coords, query);
-        all.push((id, d));
-        if d < best_dist_sq {
-            best_dist_sq = d;
-        }
-    }
-    let cutoff = factor_sq * best_dist_sq.max(1e-12);
-    all.retain(|&(_, d)| d <= cutoff);
-    all.sort_by(|a, b| a.1.partial_cmp(&b.1).unwrap_or(std::cmp::Ordering::Equal));
-    all
-}
-
-/// Squared Euclidean distance between two feature vectors.
-fn squared_distance(a: &[f32], b: &[f32]) -> f32 {
-    debug_assert_eq!(a.len(), b.len());
-    let mut sum = 0.0f32;
-    for i in 0..a.len() {
-        let d = a[i] - b[i];
-        sum += d * d;
-    }
-    sum
-}
-
-// ---------------------------------------------------------------------------
-// New typographic feature extraction
-// ---------------------------------------------------------------------------
 
 /// Detect whether a glyph image shows serifs.
 fn detect_serif(img: &GrayImage) -> f32 {
@@ -463,26 +460,6 @@ pub fn font_pair_ink_gap<F: Font>(font: &F, scale: PxScale, ch_a: char, ch_b: ch
     (adv_a - bounds_a.max.x + bounds_b.min.x).max(0.0)
 }
 
-/// Compute a per-font serif confidence score.
-pub fn compute_font_serif_score<F: Font>(font: &F) -> f32 {
-    let diag_chars = ['I', 'l'];
-    let mut scores = Vec::new();
-
-    for &c in &diag_chars {
-        if let Some(img) = render_char_normalised(font, c) {
-            let s = detect_serif(&img);
-            scores.push(s);
-        }
-    }
-
-    if scores.is_empty() {
-        return 0.0;
-    }
-
-    let sum: f32 = scores.iter().sum();
-    (sum / scores.len() as f32).clamp(0.0, 1.0)
-}
-
 /// Measure stroke contrast (thick-to-thin ratio) from a glyph image.
 /// Collect all horizontal and vertical ink run lengths (≥2px) from a binarized glyph.
 fn collect_ink_runs(img: &GrayImage) -> Vec<u32> {
@@ -535,7 +512,9 @@ fn measure_stroke_contrast(img: &GrayImage) -> f32 {
     let p10 = sorted[sorted.len() / 10].max(1);
     let p90 = sorted[sorted.len() * 9 / 10].max(1);
 
-    p90 as f32 / p10 as f32
+    let ratio = p90 as f32 / p10 as f32;
+    // Normalize to [0,1]: 1.0 (uniform) → 0.0, high contrast → ~1.0
+    1.0 - 1.0 / ratio
 }
 
 /// Mean stroke width normalised by image height.
@@ -563,31 +542,10 @@ fn measure_mean_stroke_width(img: &GrayImage) -> f32 {
     (mean / h as f64) as f32
 }
 
-/// Compute x-height / cap-height ratio for a font.
-pub fn compute_xh_cap_ratio<F: Font>(font: &F) -> f32 {
-    let scale = PxScale::from(200.0);
-
-    let ink_height_at_scale = |c: char| -> Option<f32> {
-        let gid = font.glyph_id(c);
-        if gid.0 == 0 { return None; }
-        let sf = font.as_scaled(scale);
-        let glyph = gid.with_scale_and_position(scale, point(0.0, sf.ascent()));
-        let outlined = font.outline_glyph(glyph)?;
-        let b = outlined.px_bounds();
-        let ih = b.max.y - b.min.y;
-        if ih > 0.5 { Some(ih) } else { None }
-    };
-
-    match (ink_height_at_scale('x'), ink_height_at_scale('H')) {
-        (Some(xh), Some(ch)) if ch > 0.0 => (xh / ch).clamp(0.0, 1.0),
-        _ => 0.65,
-    }
-}
-
 /// Aggregate per-char weighted log-distances into a single overall CI score.
 /// Used by both `search_candidates` and `score_single_font` — one formula,
 /// one implementation.  Higher = better (smaller distance = better match).
-fn aggregate_ci_score(log_dists: &[(f32, f32)], n_total_chars: usize) -> f32 {
+pub fn aggregate_ci_score(log_dists: &[(f32, f32)], n_total_chars: usize) -> f32 {
     // Missing glyph penalty.  A font that can't render a character is a
     // categorical failure, not a distance calculation.  Infinite penalty
     // ensures it can never win regardless of how well other characters match.
@@ -611,12 +569,19 @@ fn aggregate_ci_score(log_dists: &[(f32, f32)], n_total_chars: usize) -> f32 {
 /// Compute the overall CI score for a single font, using the same aggregation
 /// as `search_candidates`.  Returns `None` if the font has no indexed chars
 /// matching the crops.
-pub fn score_single_font(
-    index: &CharIndex,
-    font_key: &str,
-    crop_feats: &[(usize, char, Vec<f32>)],
+/// Score a single font against crop features using the classifier's internal
+/// distance function — no external font vectors needed.
+fn score_single_font_via_classifier(
+    classifier: &dyn crate::classifier::Classifier,
+    font_id: usize,
+    crop_data: &[(usize, char, CharFeatures)],
 ) -> Option<f32> {
-    let dists = per_char_distances_precomputed(index, font_key, crop_feats);
+    let dists: Vec<(char, usize, f32)> = crop_data.iter()
+        .filter_map(|&(crop_idx, ch, ref feat)| {
+            let d = classifier.distance(ch, feat, font_id)?;
+            Some((ch, crop_idx, d))
+        })
+        .collect();
     if dists.is_empty() {
         return None;
     }
@@ -624,12 +589,12 @@ pub fn score_single_font(
         .iter()
         .map(|(ch, _, d2)| ((*d2 + 1e-10_f32).ln(), char_weight(*ch)))
         .collect();
-    let score = aggregate_ci_score(&log_dists, crop_feats.len());
+    let score = aggregate_ci_score(&log_dists, crop_data.len());
     if score.is_finite() { Some(score) } else { None }
 }
 
 /// Character discriminativeness weight for scoring.
-fn char_weight(c: char) -> f32 {
+pub fn char_weight(c: char) -> f32 {
     match c {
         'g' | 'a' | 'e' | 'R' | 'Q' | 'G' | 'S' | 'f' | 't' | 'y' | '&' | '@' => 1.5,
         'I' | 'l' | '1' | '|' | '!' | '.' | ',' | ':' | ';' | '-' => 0.5,
@@ -776,7 +741,6 @@ pub fn compute_features(img: &GrayImage) -> Option<CharFeatures> {
         h_balance,
         serif_score,
         stroke_contrast: stroke_contrast_val,
-        xh_cap_ratio: 0.0,
         counter_area_ratio,
         counter_centroid_x,
         counter_centroid_y,
@@ -1442,20 +1406,15 @@ pub struct CharIndex {
     /// so we can skip the filesystem font scan on warm runs.
     pub font_meta: HashMap<String, FontMeta>,
     /// Ordered font name table: font_id → font_name
-    font_names_table: Vec<String>,
-    /// Per-character flat vectors: (font_id, embedded_features) for brute-force search
-    flat_vecs: HashMap<char, Vec<(usize, Vec<f32>)>>,
+    pub font_names_table: Vec<String>,
     /// Per-character per-dimension standard deviations (for diagnostics)
     dim_sigmas: HashMap<char, Vec<f32>>,
-    /// Per-character font_id → index into flat_vecs for O(1) backfill lookup
-    flat_vecs_font_idx: HashMap<char, HashMap<usize, usize>>,
 }
 
 impl CharIndex {
     /// Build flat per-character vectors and compute per-dimension σ from entries.
-    pub fn rebuild_vecs(&mut self, classifier: &dyn crate::classifier::Classifier) {
-        // Build font name → id mapping — collect unique names without
-        // cloning every entry's font_name first.
+    pub fn rebuild_vecs(&mut self, classifier: &mut dyn crate::classifier::Classifier) {
+        // Build font name → id mapping
         let mut name_set: std::collections::HashSet<&str> = std::collections::HashSet::new();
         for entries in self.entries.values() {
             for e in entries {
@@ -1470,59 +1429,42 @@ impl CharIndex {
             .map(|(i, n)| (n.as_str(), i))
             .collect();
 
-        self.flat_vecs.clear();
         self.dim_sigmas.clear();
 
-        let prep_dim = classifier.prepare_dim();
-
+        // Feed font vectors into the classifier and compute dim_sigmas
         for (c, char_entries) in &self.entries {
             if char_entries.is_empty() {
                 continue;
             }
 
-            let mut points: Vec<(usize, Vec<f32>)> = Vec::with_capacity(char_entries.len());
-
             for e in char_entries {
-                let embedded = classifier.prepare(*c, &e.features);
                 if let Some(&font_id) = name_to_id.get(e.font_name.as_str()) {
-                    points.push((font_id, embedded));
+                    classifier.add_font(font_id, *c, &e.features);
                 }
             }
 
-            if points.is_empty() {
-                continue;
-            }
-
-            // Compute per-dimension mean and σ
-            let n = points.len() as f32;
-            let mut means = vec![0.0f32; prep_dim];
-            for (_, w) in &points {
-                for d in 0..prep_dim {
-                    means[d] += w[d];
+            // Compute per-dimension σ from raw features (for diagnostics)
+            let feat_dim = FEAT_LEN;
+            let n = char_entries.len() as f32;
+            let mut means = vec![0.0f32; feat_dim];
+            for e in char_entries {
+                let raw = e.features.as_slice();
+                for d in 0..feat_dim {
+                    means[d] += raw[d];
                 }
             }
-            for d in 0..prep_dim {
-                means[d] /= n;
-            }
+            for d in 0..feat_dim { means[d] /= n; }
 
-            let mut sigmas = vec![0.0f32; prep_dim];
-            for (_, w) in &points {
-                for d in 0..prep_dim {
-                    let diff = w[d] - means[d];
+            let mut sigmas = vec![0.0f32; feat_dim];
+            for e in char_entries {
+                let raw = e.features.as_slice();
+                for d in 0..feat_dim {
+                    let diff = raw[d] - means[d];
                     sigmas[d] += diff * diff;
                 }
             }
-            for d in 0..prep_dim {
-                sigmas[d] = (sigmas[d] / n).sqrt();
-            }
-
+            for d in 0..feat_dim { sigmas[d] = (sigmas[d] / n).sqrt(); }
             self.dim_sigmas.insert(*c, sigmas);
-            let font_idx: HashMap<usize, usize> = points.iter()
-                .enumerate()
-                .map(|(idx, (fid, _))| (*fid, idx))
-                .collect();
-            self.flat_vecs.insert(*c, points);
-            self.flat_vecs_font_idx.insert(*c, font_idx);
         }
     }
 
@@ -1589,8 +1531,8 @@ pub fn resolve_glyph<F: ab_glyph::Font>(font: &F, ch: char, overrides: Option<&[
 
 pub fn build_char_index(
     font_paths: &[(String, std::path::PathBuf, GlyphOverrides, Variations)],
-    classifier: &dyn crate::classifier::Classifier,
-    _render_params: &crate::char_render::RenderParams,
+    classifier: &mut dyn crate::classifier::Classifier,
+    render_params: &crate::char_render::RenderParams,
 ) -> CharIndex {
     use rayon::prelude::*;
 
@@ -1639,22 +1581,14 @@ pub fn build_char_index(
             .map(|v| v.iter().cloned().collect())
             .unwrap_or_default();
 
-        let xh_ratio = compute_xh_cap_ratio(&font);
-        let serif = compute_font_serif_score(&font);
-
         let mut char_entries = Vec::with_capacity(chars.len());
         for &c in chars {
-            // Use override glyph ID if this variant changes this character,
-            // otherwise fall back to default glyph.
-            let img = if let Some(&gid) = override_map.get(&c) {
-                render_glyph_normalised(&font, ab_glyph::GlyphId(gid))
-            } else {
-                render_char_normalised(&font, c)
-            };
+            let glyph_override = override_map.get(&c).map(|&gid| ab_glyph::GlyphId(gid));
+            let img = crate::char_render::get_rendered_char(
+                &font, font_name, c, glyph_override, render_params,
+            );
             if let Some(img) = img {
-                if let Some(mut feats) = compute_features(&img) {
-                    feats.xh_cap_ratio = xh_ratio;
-                    feats.serif_score = serif;
+                if let Some(feats) = compute_features(&img) {
                     char_entries.push((c, FontCharEntry {
                         font_name: font_name.clone(),
                         features: feats,
@@ -1688,147 +1622,23 @@ pub fn build_char_index(
         skipped_fonts,
         font_meta: HashMap::new(),
         font_names_table: Vec::new(),
-        flat_vecs: HashMap::new(),
         dim_sigmas: HashMap::new(),
-        flat_vecs_font_idx: HashMap::new(),
     };
     index.rebuild_vecs(classifier);
     index
 }
 
-/// Render a single character in `font` at `NORM_H` ink height.
-pub fn render_char_normalised<F: Font>(font: &F, c: char) -> Option<GrayImage> {
-    render_glyph_normalised(font, font.glyph_id(c))
-}
 
-/// Render a specific glyph ID, normalised to NORM_H with tight ink crop.
-pub fn render_glyph_normalised<F: Font>(font: &F, gid: ab_glyph::GlyphId) -> Option<GrayImage> {
-    if gid.0 == 0 {
-        return None;
-    }
 
-    let ref_h = 200.0f32;
-    let ref_scale = PxScale::from(ref_h);
-    let sf_ref = font.as_scaled(ref_scale);
 
-    let glyph = gid.with_scale_and_position(ref_scale, point(0.0, sf_ref.ascent()));
-    let outlined = font.outline_glyph(glyph)?;
-    let bounds = outlined.px_bounds();
-    let ink_h_ref = bounds.max.y - bounds.min.y;
-    if ink_h_ref < 1.0 {
-        return None;
-    }
-
-    let target_scale = ref_h * (NORM_H as f32 / ink_h_ref);
-    let scale = PxScale::from(target_scale);
-    let sf = font.as_scaled(scale);
-
-    let glyph2 = gid.with_scale_and_position(scale, point(0.0, sf.ascent()));
-    let outlined2 = font.outline_glyph(glyph2)?;
-    let b2 = outlined2.px_bounds();
-
-    let img_w = (b2.max.x - b2.min.x).ceil() as u32 + 2;
-    let img_h = (b2.max.y - b2.min.y).ceil() as u32 + 2;
-    if img_w == 0 || img_h == 0 || img_w > 500 || img_h > 500 {
-        return None;
-    }
-
-    let mut canvas = GrayImage::from_pixel(img_w, img_h, Luma([255u8]));
-    let ox = b2.min.x.floor() as i32;
-    let oy = b2.min.y.floor() as i32;
-
-    outlined2.draw(|gx, gy, cov| {
-        let px = gx as i32 + (b2.min.x.floor() as i32) - ox + 1;
-        let py = gy as i32 + (b2.min.y.floor() as i32) - oy + 1;
-        if px >= 0 && py >= 0 && (px as u32) < img_w && (py as u32) < img_h {
-            let val = (255.0 * (1.0 - cov)) as u8;
-            let cur = canvas.get_pixel(px as u32, py as u32).0[0];
-            canvas.put_pixel(px as u32, py as u32, Luma([cur.min(val)]));
-        }
-    });
-
-    // Run through the same normalize path the scan side uses, so both
-    // index-time and scan-time images have identical geometry (tight ink
-    // crop, 1px padding, resized to exactly NORM_H).
-    normalize_to_ink_bounds(&canvas)
-}
-
-/// Render a glyph at HIGH resolution (200px ink height) and return the raw
-/// high-res image *without* normalizing to NORM_H.  Callers can then
-/// downsample via `normalize_to_ink_bounds()` to get the same Lanczos3
-/// artifact profile that real scan crops exhibit.
-///
-/// The render height is chosen to approximate 300dpi body text conditions:
-/// ink height ~3× NORM_H, giving a realistic downsample ratio when
-/// `normalize_to_ink_bounds` scales to NORM_H.
-///
-/// Used by the trainer so training images match the downsample path of
-/// scanned characters.
-pub fn render_glyph_hires<F: Font>(font: &F, gid: ab_glyph::GlyphId) -> Option<GrayImage> {
-    if gid.0 == 0 {
-        return None;
-    }
-
-    // Step 1: measure ink height at a reference scale.
-    let ref_h = 200.0f32;
-    let ref_scale = PxScale::from(ref_h);
-    let sf_ref = font.as_scaled(ref_scale);
-
-    let glyph = gid.with_scale_and_position(ref_scale, point(0.0, sf_ref.ascent()));
-    let outlined = font.outline_glyph(glyph)?;
-    let bounds = outlined.px_bounds();
-    let ink_h_ref = bounds.max.y - bounds.min.y;
-    if ink_h_ref < 1.0 {
-        return None;
-    }
-
-    // Step 2: pick a target ink height that simulates 300dpi scan conditions.
-    // At 300dpi, 12pt body text has ink ≈ 40–50px, which is roughly 2–3×
-    // NORM_H.  We use 3× NORM_H as the render target; normalize_to_ink_bounds
-    // will downsample from ~3× to 1× via Lanczos3, matching the real-scan
-    // downsample ratio.
-    let hires_ink_h = (NORM_H * 3) as f32;
-    let target_scale = ref_h * (hires_ink_h / ink_h_ref);
-    let scale = PxScale::from(target_scale);
-    let sf = font.as_scaled(scale);
-
-    let glyph2 = gid.with_scale_and_position(scale, point(0.0, sf.ascent()));
-    let outlined2 = font.outline_glyph(glyph2)?;
-    let b2 = outlined2.px_bounds();
-
-    let img_w = (b2.max.x - b2.min.x).ceil() as u32 + 2;
-    let img_h = (b2.max.y - b2.min.y).ceil() as u32 + 2;
-    if img_w == 0 || img_h == 0 || img_w > 2000 || img_h > 2000 {
-        return None;
-    }
-
-    let mut canvas = GrayImage::from_pixel(img_w, img_h, Luma([255u8]));
-    let ox = b2.min.x.floor() as i32;
-    let oy = b2.min.y.floor() as i32;
-
-    outlined2.draw(|gx, gy, cov| {
-        let px = gx as i32 + (b2.min.x.floor() as i32) - ox + 1;
-        let py = gy as i32 + (b2.min.y.floor() as i32) - oy + 1;
-        if px >= 0 && py >= 0 && (px as u32) < img_w && (py as u32) < img_h {
-            let val = (255.0 * (1.0 - cov)) as u8;
-            let cur = canvas.get_pixel(px as u32, py as u32).0[0];
-            canvas.put_pixel(px as u32, py as u32, Luma([cur.min(val)]));
-        }
-    });
-
-    Some(canvas)
-}
 
 /// Convenience: render a character (by char) at high resolution.
-pub fn render_char_hires<F: Font>(font: &F, c: char) -> Option<GrayImage> {
-    render_glyph_hires(font, font.glyph_id(c))
-}
 
 // ---------------------------------------------------------------------------
 // Shared normalisation: tight ink crop → NORM_H scale
 // ---------------------------------------------------------------------------
 
-pub fn normalize_to_ink_bounds(img: &GrayImage) -> Option<GrayImage> {
+pub fn normalize_to_ink_bounds(img: &GrayImage, target_h: u32) -> Option<GrayImage> {
     let (w, h) = img.dimensions();
     if w == 0 || h == 0 {
         return None;
@@ -1872,14 +1682,14 @@ pub fn normalize_to_ink_bounds(img: &GrayImage) -> Option<GrayImage> {
             canvas.put_pixel(x - min_x + pad, y - min_y + pad, *px);
         }
     }
-    let scaled_w = (canvas_w as f32 * NORM_H as f32 / canvas_h as f32).ceil() as u32;
+    let scaled_w = (canvas_w as f32 * target_h as f32 / canvas_h as f32).ceil() as u32;
     if scaled_w < 2 {
         return None;
     }
     Some(image::imageops::resize(
         &canvas,
         scaled_w,
-        NORM_H,
+        target_h,
         image::imageops::FilterType::Lanczos3,
     ))
 }
@@ -1952,7 +1762,7 @@ pub fn extract_line_chars(
             continue;
         }
 
-        // Crop the word at its expanded bbox (ink-expanded by expand_bbox_to_ink).
+        // Crop the word at its expanded bbox (ink-expanded by expand_words_to_ink).
         // Don't ink-trim — trimming picks up stray text from adjacent lines.
         let word_img = image::imageops::crop_imm(page, wx, wy, crop_w, crop_h).to_image();
 
@@ -2130,7 +1940,7 @@ fn extract_chars_from_boundaries(
             }
         }
 
-        let scaled = match normalize_to_ink_bounds(&char_crop) {
+        let scaled = match normalize_to_ink_bounds(&char_crop, NORM_H) {
             Some(img) => img,
             None => continue,
         };
@@ -2222,7 +2032,7 @@ pub fn search_candidates(
     index: &CharIndex,
     char_crops: &[(char, GrayImage)],
     _thoroughness: f32,
-    audit: bool,
+    _audit: bool,
     classifier: &dyn crate::classifier::Classifier,
 ) -> CiSearchResult {
     if char_crops.is_empty() {
@@ -2230,16 +2040,11 @@ pub fn search_candidates(
     }
 
     // ── Pre-compute features ────────────────────────────────────────
-    // Keep both raw CharFeatures (for classifier.classify) and projected
-    // vectors (for score_single_font in stage 2).
-    let crop_data: Vec<(usize, char, CharFeatures, Vec<f32>)> = char_crops
+    let crop_data: Vec<(usize, char, CharFeatures)> = char_crops
         .iter()
         .enumerate()
         .filter_map(|(i, (c, img))| {
-            compute_features(img).map(|f| {
-                let projected = classifier.prepare(*c, &f);
-                (i, *c, f, projected)
-            })
+            compute_features(img).map(|f| (i, *c, f))
         })
         .collect();
 
@@ -2250,20 +2055,18 @@ pub fn search_candidates(
     let n_chars = crop_data.len();
 
     // ── Stage 1: per-crop classification ────────────────────────────
-    // For each crop, the classifier picks the best font(s) (ties allowed).
-    // Union all picks into the candidate set.  Also collect per-char audit
-    // detail (top-3 nearest) via a lightweight distance scan.
+    // For each crop, the classifier picks the best font(s).
+    // Union all picks into the candidate set.
     let mut candidate_set: HashSet<usize> = HashSet::new();
     let mut char_detail: Vec<CharCiDetail> = Vec::with_capacity(n_chars);
 
-    for &(crop_idx, ch, ref raw_feat, ref _projected) in &crop_data {
-        let points = match index.flat_vecs.get(&ch) {
-            Some(p) if !p.is_empty() => p,
-            _ => continue,
-        };
+    for &(crop_idx, ch, ref raw_feat) in &crop_data {
+        // Classifier picks top fonts — it owns the font vectors internally
+        let picks = classifier.classify(ch, raw_feat, 3);
+        if picks.is_empty() {
+            continue;
+        }
 
-        // Classifier picks the best font(s) — black box, ties allowed
-        let picks = classifier.classify(ch, raw_feat, points);
         for &(font_id, _dist) in &picks {
             candidate_set.insert(font_id);
         }
@@ -2272,39 +2075,18 @@ pub fn search_candidates(
             .map(|(_, d)| *d)
             .fold(f32::INFINITY, f32::min);
 
-        // Audit: top-3 nearest fonts by distance.
-        // The classify call already scanned all points internally;
-        // for audit we need the top-3, so do a quick partial sort.
-        let nearest: Vec<(String, f32)> = if audit {
-            // Compute distances to all fonts for this char to get top-3
-            let projected = &crop_data.iter()
-                .find(|(ci, _, _, _)| *ci == crop_idx)
-                .unwrap().3;
-            let mut dists: Vec<(usize, f32)> = points.iter()
-                .map(|(id, ref_vec)| (*id, squared_distance(projected, ref_vec)))
-                .collect();
-            dists.sort_by(|a, b| a.1.partial_cmp(&b.1).unwrap_or(std::cmp::Ordering::Equal));
-            dists.iter()
-                .take(3)
-                .filter_map(|(id, d)| {
-                    Some((index.font_names_table.get(*id)?.clone(), *d))
-                })
-                .collect()
-        } else {
-            // Non-audit: just report the pick(s)
-            picks.iter()
-                .take(3)
-                .filter_map(|(id, d)| {
-                    Some((index.font_names_table.get(*id)?.clone(), *d))
-                })
-                .collect()
-        };
+        let nearest: Vec<(String, f32)> = picks.iter()
+            .take(3)
+            .filter_map(|(id, d)| {
+                Some((index.font_names_table.get(*id)?.clone(), *d))
+            })
+            .collect();
 
         char_detail.push(CharCiDetail {
             ch,
             crop_index: crop_idx,
             min_dist_sq,
-            passed_gate: true, // no gate in new pipeline
+            passed_gate: true,
             nearest,
             ocr_corrected_from: None,
             best_alt_char: None,
@@ -2317,17 +2099,12 @@ pub fn search_candidates(
     }
 
     // ── Stage 2: score each candidate across all crops ──────────────
-    // Use score_single_font which computes the geometric-mean aggregate
-    // of per-char distances (same formula as before, applied to the full
-    // crop set for each candidate font).
-    let crop_feats: Vec<(usize, char, Vec<f32>)> = crop_data.iter()
-        .map(|(i, c, _, proj)| (*i, *c, proj.clone()))
-        .collect();
-
     let mut scores: Vec<(String, f32)> = candidate_set.iter()
         .filter_map(|&font_id| {
             let name = index.font_names_table.get(font_id)?.clone();
-            let score = score_single_font(index, &name, &crop_feats)?;
+            let score = score_single_font_via_classifier(
+                classifier, font_id, &crop_data,
+            )?;
             Some((name, score))
         })
         .collect();
@@ -2360,44 +2137,19 @@ pub fn per_char_distances(
     char_crops: &[(char, &GrayImage)],
     classifier: &dyn crate::classifier::Classifier,
 ) -> Vec<(char, usize, f32)> {
-    let precomputed: Vec<(usize, char, Vec<f32>)> = char_crops
-        .iter()
-        .enumerate()
-        .filter_map(|(i, (c, img))| {
-            compute_features(img).map(|f| (i, *c, classifier.prepare(*c, &f)))
-        })
-        .collect();
-    per_char_distances_precomputed(index, font_key, &precomputed)
-}
-
-/// Like `per_char_distances` but takes precomputed embedded feature vectors.
-/// Use this when computing distances against multiple fonts for the same crops
-/// to avoid redundant `compute_features` calls.
-pub fn per_char_distances_precomputed(
-    index: &CharIndex,
-    font_key: &str,
-    crop_feats: &[(usize, char, Vec<f32>)],
-) -> Vec<(char, usize, f32)> {
-    // Find the font_id for the requested key
     let font_id = match index.font_names_table.iter().position(|n| n == font_key) {
         Some(id) => id,
         None => return Vec::new(),
     };
-
-    let mut result = Vec::with_capacity(crop_feats.len());
-    for (crop_idx, ch, ref query) in crop_feats {
-        // Find this font's embedded vector for this character (O(1) lookup)
-        if let Some(points) = index.flat_vecs.get(ch) {
-            let ref_vec_opt = index.flat_vecs_font_idx.get(ch)
-                .and_then(|idx_map| idx_map.get(&font_id))
-                .map(|&idx| &points[idx].1);
-            if let Some(ref_vec) = ref_vec_opt {
-                let d2 = squared_distance(query, ref_vec);
-                result.push((*ch, *crop_idx, d2));
-            }
-        }
-    }
-    result
+    char_crops
+        .iter()
+        .enumerate()
+        .filter_map(|(i, (c, img))| {
+            let feat = compute_features(img)?;
+            let d = classifier.distance(*c, &feat, font_id)?;
+            Some((*c, i, d))
+        })
+        .collect()
 }
 
 /// For each character crop, compute the 1-based rank of `font_key` among all
@@ -2416,51 +2168,27 @@ pub fn gt_font_ranks(
     };
     let mut result = std::collections::HashMap::new();
     for (crop_idx, ch, _projected) in crop_feats {
-        if let Some(points) = index.flat_vecs.get(ch) {
-            // Check the font is present for this char
-            if index.flat_vecs_font_idx.get(ch)
-                .and_then(|m| m.get(&font_id)).is_none() {
-                continue;
+        // Find the crop image for this character
+        let raw_feat = if let Some((_, img)) = char_crops.get(*crop_idx) {
+            match compute_features(img) {
+                Some(f) => f,
+                None => continue,
             }
-            // Find the crop image for this character
-            let raw_feat = if let Some((_, img)) = char_crops.get(*crop_idx) {
-                match compute_features(img) {
-                    Some(f) => f,
-                    None => continue,
-                }
-            } else {
-                continue;
-            };
-            // Use the classifier's own ranking — same ordering it uses
-            // for font selection.  No direct access to projected vectors.
-            let ranked = classifier.rank(*ch, &raw_feat, points);
-            let mut rank = 0usize;
-            for (fid, _score) in ranked {
-                rank += 1;
-                if fid == font_id {
-                    result.insert(*crop_idx, rank);
-                    break;
-                }
+        } else {
+            continue;
+        };
+        // Use classifier.classify to get ranking — it owns the font vectors
+        let ranked = classifier.classify(*ch, &raw_feat, usize::MAX);
+        let mut rank = 0usize;
+        for (fid, _score) in &ranked {
+            rank += 1;
+            if *fid == font_id {
+                result.insert(*crop_idx, rank);
+                break;
             }
         }
     }
     result
-}
-
-/// Precompute embedded feature vectors for a set of character crops.
-/// Returns `(crop_index, char, embedded_features)` for each crop that
-/// produces valid features.
-pub(crate) fn precompute_crop_features(
-    char_crops: &[(char, &GrayImage)],
-    classifier: &dyn crate::classifier::Classifier,
-) -> Vec<(usize, char, Vec<f32>)> {
-    char_crops
-        .iter()
-        .enumerate()
-        .filter_map(|(i, (c, img))| {
-            compute_features(img).map(|f| (i, *c, classifier.prepare(*c, &f)))
-        })
-        .collect()
 }
 
 // ---------------------------------------------------------------------------
@@ -2469,7 +2197,7 @@ pub(crate) fn precompute_crop_features(
 
 /// Bump this whenever the feature vector, normalization, or serialization
 /// layout changes. Stale caches auto-rebuild on mismatch.
-const INDEX_VERSION: u32 = 11;
+const INDEX_VERSION: u32 = 12;
 const INDEX_MAGIC: &[u8; 4] = b"UCIX";
 
 /// Save the character index to a binary file.
@@ -2591,7 +2319,7 @@ pub fn save_index(index: &CharIndex, path: &Path) -> io::Result<()> {
 }
 
 /// Load a character index from a binary file.
-pub fn load_index(path: &Path, classifier: &dyn crate::classifier::Classifier) -> io::Result<CharIndex> {
+pub fn load_index(path: &Path, classifier: &mut dyn crate::classifier::Classifier) -> io::Result<CharIndex> {
     use std::io::Read;
     let mut data = Vec::new();
     std::fs::File::open(path)?.read_to_end(&mut data)?;
@@ -2665,7 +2393,6 @@ pub fn load_index(path: &Path, classifier: &dyn crate::classifier::Classifier) -
             let h_balance = read_f32(&mut pos)?;
             let serif_score = read_f32(&mut pos)?;
             let stroke_contrast = read_f32(&mut pos)?;
-            let xh_cap_ratio = read_f32(&mut pos)?;
 
             // v2 features
             let counter_area_ratio = read_f32(&mut pos)?;
@@ -2711,7 +2438,6 @@ pub fn load_index(path: &Path, classifier: &dyn crate::classifier::Classifier) -
                     h_balance,
                     serif_score,
                     stroke_contrast,
-                    xh_cap_ratio,
                     counter_area_ratio,
                     counter_centroid_x,
                     counter_centroid_y,
@@ -2866,9 +2592,7 @@ pub fn load_index(path: &Path, classifier: &dyn crate::classifier::Classifier) -
         skipped_fonts,
         font_meta,
         font_names_table: Vec::new(),
-        flat_vecs: HashMap::new(),
         dim_sigmas,
-        flat_vecs_font_idx: HashMap::new(),
     };
     // Build flat vecs from loaded entries
     index.rebuild_vecs(classifier);
@@ -2927,7 +2651,7 @@ impl CharIndex {
     }
 
     /// Merge another index into this one.
-    pub fn merge(&mut self, other: CharIndex, classifier: &dyn crate::classifier::Classifier) {
+    pub fn merge(&mut self, other: CharIndex, classifier: &mut dyn crate::classifier::Classifier) {
         for (c, new_entries) in other.entries {
             let existing = self.entries.entry(c).or_default();
             let existing_names: std::collections::HashSet<String> =
@@ -2944,7 +2668,7 @@ impl CharIndex {
     }
 
     /// Remove all entries for the given font names.
-    pub fn remove_fonts(&mut self, names: &std::collections::HashSet<String>, classifier: &dyn crate::classifier::Classifier) {
+    pub fn remove_fonts(&mut self, names: &std::collections::HashSet<String>, classifier: &mut dyn crate::classifier::Classifier) {
         for entries in self.entries.values_mut() {
             entries.retain(|e| !names.contains(&e.font_name));
         }
@@ -2954,7 +2678,7 @@ impl CharIndex {
     }
 
     /// Drop the raw `entries` HashMap to free memory after the index has been
-    /// saved to disk.  Only `flat_vecs` (used for search) is kept.
+    /// saved to disk and the classifier has been populated via `rebuild_vecs`.
     /// After compaction, `save_index` will no longer work — call this only once
     /// the index is persisted and you're entering the search/match phase.
     pub fn compact(&mut self) {
@@ -2964,11 +2688,11 @@ impl CharIndex {
 
     /// Number of indexed characters.
     pub fn n_chars(&self) -> usize {
-        self.flat_vecs.len()
+        self.entries.len()
     }
 
     /// Total number of (deduplicated) font entries across all characters.
     pub fn n_entries(&self) -> usize {
-        self.flat_vecs.values().map(|v| v.len()).sum()
+        self.entries.values().map(|v| v.len()).sum()
     }
 }

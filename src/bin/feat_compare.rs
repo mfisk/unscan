@@ -3,36 +3,10 @@
 //! Usage: feat_compare <crop.png> <char> <font1.ttf> <font2.ttf>
 
 use ab_glyph::{Font, FontRef};
-use image::GrayImage;
 
-use unscan::char_index::{self, compute_features, FEAT_LEN};
+use unscan::char_index::{self, compute_features, FEAT_LEN, group_name_for_dim};
 
-const FEAT_NAMES: &[&str] = &[
-    // Group 1: Column ink profile (16)
-    "col0","col1","col2","col3","col4","col5","col6","col7",
-    "col8","col9","col10","col11","col12","col13","col14","col15",
-    // Group 2: Scalar v1 (7)
-    "aspect","ink_density","v_center","h_balance","serif_score","stroke_contrast","xh_cap_ratio",
-    // Group 3: Scalar v2 (14)
-    "counter_area","counter_cx","counter_cy","counter_asp",
-    "term0","term1","term2","term3",
-    "ink_perim","compactness",
-    "cross0","cross1","cross2","cross3",
-    // Group 4: Row ink profile (16)
-    "row0","row1","row2","row3","row4","row5","row6","row7",
-    "row8","row9","row10","row11","row12","row13","row14","row15",
-    // Group 5: Scalar v3 (11)
-    "hole_count","h_symmetry","v_symmetry","skel_branch","skel_endpt",
-    "corner_count","quad_tl","quad_tr","quad_bl","quad_br","mean_stroke_w",
-];
-
-fn group_name(i: usize) -> &'static str {
-    if i < 16 { "col_prof" }
-    else if i < 23 { "scal_v1" }
-    else if i < 37 { "scal_v2" }
-    else if i < 53 { "row_prof" }
-    else { "scal_v3" }
-}
+use unscan::char_index::FEAT_NAMES;
 
 fn main() {
     let args: Vec<String> = std::env::args().collect();
@@ -50,7 +24,7 @@ fn main() {
     let crop_img = image::open(crop_path)
         .unwrap_or_else(|e| panic!("Failed to open {}: {}", crop_path, e))
         .into_luma8();
-    let crop_norm = char_index::normalize_to_ink_bounds(&crop_img)
+    let crop_norm = char_index::normalize_to_ink_bounds(&crop_img, char_index::NORM_H)
         .unwrap_or_else(|| panic!("normalize_to_ink_bounds returned None for crop"));
     let crop_feats = compute_features(&crop_norm)
         .unwrap_or_else(|| panic!("compute_features returned None for crop"));
@@ -58,16 +32,18 @@ fn main() {
     // Render char from font 1
     let f1_data = std::fs::read(font1_path).unwrap();
     let f1 = FontRef::try_from_slice(&f1_data).unwrap();
-    let f1_img = char_index::render_char_normalised(&f1, ch)
-        .unwrap_or_else(|| panic!("render_char_normalised returned None for font1 '{}'", ch));
+    let f1_img = unscan::char_render::render_glyph_at_ink_height(&f1, f1.glyph_id(ch), char_index::NORM_H)
+        .and_then(|img| char_index::normalize_to_ink_bounds(&img, char_index::NORM_H))
+        .unwrap_or_else(|| panic!("render returned None for font1 '{}'", ch));
     let f1_feats = compute_features(&f1_img)
         .unwrap_or_else(|| panic!("compute_features returned None for font1"));
 
     // Render char from font 2
     let f2_data = std::fs::read(font2_path).unwrap();
     let f2 = FontRef::try_from_slice(&f2_data).unwrap();
-    let f2_img = char_index::render_char_normalised(&f2, ch)
-        .unwrap_or_else(|| panic!("render_char_normalised returned None for font2 '{}'", ch));
+    let f2_img = unscan::char_render::render_glyph_at_ink_height(&f2, f2.glyph_id(ch), char_index::NORM_H)
+        .and_then(|img| char_index::normalize_to_ink_bounds(&img, char_index::NORM_H))
+        .unwrap_or_else(|| panic!("render returned None for font2 '{}'", ch));
     let f2_feats = compute_features(&f2_img)
         .unwrap_or_else(|| panic!("compute_features returned None for font2"));
 
@@ -89,7 +65,7 @@ fn main() {
         let d2w = (scan_w[i] - r2_w[i]).abs();
         let closer = if d1w < d2w { "font1" } else if d2w < d1w { "font2" } else { "tie" };
         println!("{},{},{},{:.6},{:.6},{:.6},{:.6},{:.6},{:.6},{:.6},{:.6},{:.6},{:.6},{}",
-            i, FEAT_NAMES[i], group_name(i),
+            i, FEAT_NAMES[i], group_name_for_dim(i),
             scan[i], r1[i], r2[i], d1, d2,
             scan_w[i], r1_w[i], r2_w[i], d1w, d2w, closer);
     }

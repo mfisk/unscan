@@ -308,7 +308,7 @@ fn segment_characters_inner(
     let vp_splits = splits.clone();
 
     // Diag: dump VP passes
-    if let (Some(ddir), Some(wtext)) = (diag_dir, word_text) {
+    if let (Some(ddir), Some(_wtext)) = (diag_dir, word_text) {
         let _ = std::fs::create_dir_all(ddir);
         let _ = img.save(ddir.join("word_crop.png"));
 
@@ -713,25 +713,25 @@ fn segment_characters_inner(
 /// DP matrices from a seam candidate search.  Retaining these lets us
 /// trace the optimal path through any mid-row column without recomputing.
 struct SeamDp {
-    cost_fwd: Vec<f32>,   // flat [row * seg_w + col]
-    cost_rev: Vec<f32>,   // flat [row * seg_w + col]
+    _cost_fwd: Vec<f32>,   // flat [row * seg_w + col]
+    _cost_rev: Vec<f32>,   // flat [row * seg_w + col]
     pred_fwd: Vec<u32>,   // flat [row * seg_w + col] — packed (r, c) predecessor
     pred_rev: Vec<u32>,   // flat [row * seg_w + col] — packed (r, c) predecessor
     seg_start: u32,
-    seg_end: u32,
+    _seg_end: u32,
     seg_w: usize,
     h: u32,
-    max_ink: f32,
-    row_ink: Vec<f32>,    // per-row ink fraction for ink_score/delta_ink_score
+    _max_ink: f32,
+    _row_ink: Vec<f32>,    // per-row ink fraction for ink_score/delta_ink_score
 }
 
 impl SeamDp {
 
     /// Backtrace the cheapest path constrained to pass through
     /// `target_col` at mid-row.
-    fn trace_path_through(&self, energy: &[Vec<f32>], target_col: u32, row_ink: &[f32]) -> Vec<u32> {
+    fn trace_path_through(&self, _energy: &[Vec<f32>], target_col: u32, _row_ink: &[f32]) -> Vec<u32> {
         let seg_w = self.seg_w;
-        let base = self.seg_start as usize;
+        let _base = self.seg_start as usize;
         let mid_r = (self.h / 2) as usize;
         let last_r = (self.h - 1) as usize;
         let tc = (target_col - self.seg_start) as usize;
@@ -797,7 +797,7 @@ fn candidate_seams(
 ) -> (Vec<(u32, f32)>, SeamDp, HashSet<u32>) {
     let seg_w = (seg_end - seg_start) as usize;
     if seg_w < 3 || h < 1 {
-        let dp = SeamDp { cost_fwd: Vec::new(), cost_rev: Vec::new(), pred_fwd: Vec::new(), pred_rev: Vec::new(), seg_start, seg_end, seg_w: 0, h, max_ink, row_ink: row_ink.to_vec() };
+        let dp = SeamDp { _cost_fwd: Vec::new(), _cost_rev: Vec::new(), pred_fwd: Vec::new(), pred_rev: Vec::new(), seg_start, _seg_end: seg_end, seg_w: 0, h, _max_ink: max_ink, _row_ink: row_ink.to_vec() };
         return (Vec::new(), dp, HashSet::new());
     }
     let base = seg_start as usize;
@@ -1031,7 +1031,7 @@ fn candidate_seams(
         candidates.push(raw_candidates[mid_idx]);
     }
 
-    let dp = SeamDp { cost_fwd, cost_rev, pred_fwd, pred_rev, seg_start, seg_end, seg_w, h, max_ink, row_ink: row_ink.to_vec() };
+    let dp = SeamDp { _cost_fwd: cost_fwd, _cost_rev: cost_rev, pred_fwd, pred_rev, seg_start, _seg_end: seg_end, seg_w, h, _max_ink: max_ink, _row_ink: row_ink.to_vec() };
     (candidates, dp, vertical_winners)
 }
 
