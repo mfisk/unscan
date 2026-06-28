@@ -23,6 +23,7 @@ mod smooth;
 pub(crate) mod verify;
 pub mod ground_truth;
 pub mod report;
+pub mod zncc_classifier;
 
 use crate::audit::{AuditEntry, AuditLog, BBox, Decision, GeometryEntry, PageSummary};
 
@@ -253,6 +254,9 @@ fn make_classifier(args: &cli::Args) -> Box<dyn classifier::Classifier> {
                         (0.5, Box::new(fisher)),
                     ]))
                 }
+                "zncc" => {
+                    Box::new(zncc_classifier::ZnccClassifier::new())
+                }
                 _ => {
                     let weights_path = args.triplet_weights.as_ref().unwrap_or_else(|| {
                         eprintln!("Error: --triplet-weights is required when using --classifier={other}");
@@ -278,7 +282,7 @@ fn make_classifier(args: &cli::Args) -> Box<dyn classifier::Classifier> {
                             }
                         }
                         _ => {
-                            eprintln!("Error: unknown classifier '{other}'. Use 'lda', 'fisher', 'perchar-fisher', 'triplet', 'global-triplet', 'mahalanobis', 'mlp', or 'fusion'.");
+                            eprintln!("Error: unknown classifier '{other}'. Use 'lda', 'fisher', 'perchar-fisher', 'triplet', 'global-triplet', 'mahalanobis', 'mlp', 'fusion', or 'zncc'.");
                             std::process::exit(1);
                         }
                     }
@@ -334,7 +338,7 @@ fn run_index(args: &cli::Args, classifier: &mut dyn classifier::Classifier) -> R
 
     // Header OK — load the full index for incremental comparison.
     let start = std::time::Instant::now();
-    let mut index = match char_index::load_index(&index_path, classifier) {
+    let mut index = match char_index::load_index(&index_path, classifier, &args.render_params()) {
         Ok(idx) => idx,
         Err(_e) => {
             return do_full_build(&system_fonts, &index_path, classifier, &args.render_params());
@@ -365,7 +369,7 @@ fn run_index(args: &cli::Args, classifier: &mut dyn classifier::Classifier) -> R
         }
         if removed_fonts.len() > 10 {
         }
-        index.remove_fonts(&removed_fonts, classifier);
+        index.remove_fonts(&removed_fonts, classifier, &args.render_params());
     }
 
     // ── Build entries for new fonts only ────────────────────────────
@@ -380,7 +384,7 @@ fn run_index(args: &cli::Args, classifier: &mut dyn classifier::Classifier) -> R
             .collect();
         let _start = std::time::Instant::now();
         let partial = char_index::build_char_index(&pairs, classifier, &args.render_params());
-        index.merge(partial, classifier);
+        index.merge(partial, classifier, &args.render_params());
     }
 
     // ── Save updated index ─────────────────────────────────────────
@@ -497,6 +501,7 @@ fn do_full_build(
 
 /// Load or build the character index with caching.
 fn run(args: &cli::Args, classifier: &mut dyn classifier::Classifier) -> Result<(), ScanTextError> {
+    let run_start = std::time::Instant::now();
     dump_limits();
     let input = args.input.as_ref().expect("input validated");
     let dev_null = std::path::PathBuf::from("/dev/null");
@@ -522,7 +527,7 @@ fn run(args: &cli::Args, classifier: &mut dyn classifier::Classifier) -> Result<
     let index_path = args.resolved_index_path();
     let (char_index, font_catalog) = if !args.rebuild_index && index_path.exists() {
         let _start = std::time::Instant::now();
-        match char_index::load_index(&index_path, classifier) {
+        match char_index::load_index(&index_path, classifier, &args.render_params()) {
             Ok(mut index) if !index.font_meta.is_empty() => {
                 let _n_entries: usize = index.n_entries();
                 let catalog = catalog_from_meta(&index);
@@ -1790,6 +1795,13 @@ fn run(args: &cli::Args, classifier: &mut dyn classifier::Classifier) -> Result<
             } else {
             }
             let report_path = audit_root.join("report.html");
+            let meta = report::ReportMeta {
+                classifier: args.classifier.clone(),
+                render_scale: args.render_scale,
+                render_aa: args.render_aa.clone(),
+                render_binarize: args.render_binarize,
+                elapsed: run_start.elapsed(),
+            };
             if let Err(_e) = report::generate_report(
                 &report_path,
                 audit_root,
@@ -1797,6 +1809,7 @@ fn run(args: &cli::Args, classifier: &mut dyn classifier::Classifier) -> Result<
                 ground_truth.as_ref(),
                 args.dpi,
                 &font_catalog,
+                &meta,
             ) {
             }
         }
@@ -1814,6 +1827,13 @@ fn run(args: &cli::Args, classifier: &mut dyn classifier::Classifier) -> Result<
     // ── 5b. HTML miss report ─────────────────────────────────────────
     if let Some(ref audit_root) = args.audit {
         let report_path = audit_root.join("report.html");
+        let meta = report::ReportMeta {
+            classifier: args.classifier.clone(),
+            render_scale: args.render_scale,
+            render_aa: args.render_aa.clone(),
+            render_binarize: args.render_binarize,
+            elapsed: run_start.elapsed(),
+        };
         if let Err(_e) = report::generate_report(
             &report_path,
             audit_root,
@@ -1821,6 +1841,7 @@ fn run(args: &cli::Args, classifier: &mut dyn classifier::Classifier) -> Result<
             ground_truth.as_ref(),
             args.dpi,
             &font_catalog,
+            &meta,
         ) {
         }
     }

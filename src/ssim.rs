@@ -590,6 +590,11 @@ pub fn zncc_windowed(a: &GrayImage, b: &GrayImage, b_dy: i32, bail_below: Option
 }
 
 /// Global ZNCC between two grayscale images.
+/// Public wrapper for `zncc_global` — used by ZnccClassifier.
+pub fn zncc_global_pub(a: &GrayImage, b: &GrayImage) -> f32 {
+    zncc_global(a, b)
+}
+
 fn zncc_global(a: &GrayImage, b: &GrayImage) -> f32 {
     let w = a.width().max(b.width()) as usize;
     let h = a.height().max(b.height()) as usize;

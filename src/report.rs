@@ -18,6 +18,15 @@ use crate::char_render;
 use crate::ground_truth::{self, GroundTruth};
 use crate::font_scan::FontEntry;
 
+/// Metadata about the run, displayed in the report header.
+pub struct ReportMeta {
+    pub classifier: String,
+    pub render_scale: u32,
+    pub render_aa: String,
+    pub render_binarize: Option<u8>,
+    pub elapsed: std::time::Duration,
+}
+
 // ── Image helpers ───────────────────────────────────────────────────────────
 
 fn img_to_b64_uri(img: &GrayImage) -> String {
@@ -1663,6 +1672,7 @@ pub fn generate_report(
     gt: Option<&GroundTruth>,
     dpi: u32,
     font_catalog: &[FontEntry],
+    meta: &ReportMeta,
 ) -> Result<(), String> {
     let classified = classify_entries(entries, gt, dpi, font_catalog);
 
@@ -1832,6 +1842,26 @@ pub fn generate_report(
         }
     };
 
+    // Run metadata line
+    let elapsed_secs = meta.elapsed.as_secs_f64();
+    let elapsed_str = if elapsed_secs >= 60.0 {
+        format!("{:.0}m {:.0}s", elapsed_secs / 60.0, elapsed_secs % 60.0)
+    } else {
+        format!("{elapsed_secs:.1}s")
+    };
+    let render_opts = {
+        let mut parts = vec![format!("scale={}", meta.render_scale)];
+        parts.push(format!("aa={}", meta.render_aa));
+        if let Some(t) = meta.render_binarize {
+            parts.push(format!("binarize={t}"));
+        }
+        parts.join(", ")
+    };
+    let meta_str = format!(
+        "classifier=<b>{}</b> | render: {} | runtime: <b>{}</b>",
+        meta.classifier, render_opts, elapsed_str,
+    );
+
     let html = format!(
         "<!DOCTYPE html>\n\
          <html>\n\
@@ -1844,6 +1874,7 @@ pub fn generate_report(
          <h2>unscan miss report</h2>\n\
          <div class=\"summary\">{primary_hits}/{compared} correct ({pct:.1}%) — \
          {n_major} major + {n_minor} minor misses{ssim_miss_str}{raster_str}{ocr_corr_str}{ssim_percentile_str}{gt_rank_str}</div>\n\
+         <div class=\"summary\">{meta_str}</div>\n\
          <div class=\"score-legend\">\n\
          <b>Score key:</b>\n\
          <b>CI score</b> (per-line) = mean(log(prob)) across characters, \
