@@ -301,6 +301,11 @@ pub struct CharFeatures {
     /// Mean stroke width normalised by glyph height. Distinguishes weight classes
     /// (Light ≈ 0.08, Regular ≈ 0.12, Medium ≈ 0.14, Bold ≈ 0.18).
     pub mean_stroke_width: f32,
+
+    // ── raster (optional) ──────────────────────────────────────────
+    /// Normalised raster image, carried through for pixel-based classifiers
+    /// (e.g. ZnccClassifier). `None` when the pipeline doesn't need it.
+    pub raster: Option<GrayImage>,
 }
 
 impl CharFeatures {
@@ -749,6 +754,7 @@ pub fn compute_features(img: &GrayImage) -> Option<CharFeatures> {
         corner_count,
         quadrant_density,
         mean_stroke_width: mean_stroke_width_val,
+        raster: None,
     })
 }
 
@@ -1405,7 +1411,11 @@ pub struct CharIndex {
 
 impl CharIndex {
     /// Build flat per-character vectors and compute per-dimension σ from entries.
-    pub fn rebuild_vecs(&mut self, classifier: &mut dyn crate::classifier::Classifier) {
+    pub fn rebuild_vecs(
+        &mut self,
+        classifier: &mut dyn crate::classifier::Classifier,
+        render_params: &crate::char_render::RenderParams,
+    ) {
         // Build font name → id mapping
         let mut name_set: std::collections::HashSet<&str> = std::collections::HashSet::new();
         for entries in self.entries.values() {
@@ -1421,16 +1431,50 @@ impl CharIndex {
             .map(|(i, n)| (n.as_str(), i))
             .collect();
 
+        // When the classifier needs rasters, pre-load fonts so we can
+        // re-render (cache-backed) the glyphs that were not serialized.
+        let want_raster = classifier.needs_raster();
+        let mut font_cache: HashMap<String, Option<ab_glyph::FontVec>> = HashMap::new();
+        if want_raster {
+            for (font_name, meta) in &self.font_meta {
+                let loaded = std::fs::read(&meta.path).ok().and_then(|data| {
+                    let mut fv = ab_glyph::FontVec::try_from_vec(data).ok()?;
+                    if let Some(ref vars) = meta.variations {
+                        use ab_glyph::VariableFont;
+                        for &(ref tag, val) in vars {
+                            fv.set_variation(tag, val);
+                        }
+                    }
+                    Some(fv)
+                });
+                font_cache.insert(font_name.clone(), loaded);
+            }
+        }
+
         self.dim_sigmas.clear();
 
         // Feed font vectors into the classifier and compute dim_sigmas
-        for (c, char_entries) in &self.entries {
+        for (c, char_entries) in &mut self.entries {
             if char_entries.is_empty() {
                 continue;
             }
 
-            for e in char_entries {
+            for e in char_entries.iter_mut() {
                 if let Some(&font_id) = name_to_id.get(e.font_name.as_str()) {
+                    // Populate raster from render cache if needed and missing
+                    if want_raster && e.features.raster.is_none() {
+                        if let Some(Some(font)) = font_cache.get(&e.font_name) {
+                            let overrides = self.font_meta.get(&e.font_name)
+                                .and_then(|m| m.glyph_overrides.as_ref())
+                                .and_then(|ovs| ovs.iter().find(|(ch, _)| *ch == *c))
+                                .map(|&(_, gid)| ab_glyph::GlyphId(gid));
+                            if let Some(img) = crate::char_render::get_rendered_char(
+                                font, &e.font_name, *c, overrides, render_params,
+                            ) {
+                                e.features.raster = Some(img);
+                            }
+                        }
+                    }
                     classifier.add_font(font_id, *c, &e.features);
                 }
             }
@@ -1439,7 +1483,7 @@ impl CharIndex {
             let feat_dim = FEAT_LEN;
             let n = char_entries.len() as f32;
             let mut means = vec![0.0f32; feat_dim];
-            for e in char_entries {
+            for e in char_entries.iter() {
                 let raw = e.features.as_slice();
                 for d in 0..feat_dim {
                     means[d] += raw[d];
@@ -1448,7 +1492,7 @@ impl CharIndex {
             for d in 0..feat_dim { means[d] /= n; }
 
             let mut sigmas = vec![0.0f32; feat_dim];
-            for e in char_entries {
+            for e in char_entries.iter() {
                 let raw = e.features.as_slice();
                 for d in 0..feat_dim {
                     let diff = raw[d] - means[d];
@@ -1580,7 +1624,8 @@ pub fn build_char_index(
                 &font, font_name, c, glyph_override, render_params,
             );
             if let Some(img) = img {
-                if let Some(feats) = compute_features(&img) {
+                if let Some(mut feats) = compute_features(&img) {
+                    feats.raster = Some(img);
                     char_entries.push((c, FontCharEntry {
                         font_name: font_name.clone(),
                         features: feats,
@@ -1616,7 +1661,7 @@ pub fn build_char_index(
         font_names_table: Vec::new(),
         dim_sigmas: HashMap::new(),
     };
-    index.rebuild_vecs(classifier);
+    index.rebuild_vecs(classifier, render_params);
     index
 }
 
@@ -2085,7 +2130,9 @@ pub fn search_candidates(
         .iter()
         .enumerate()
         .filter_map(|(i, (c, img))| {
-            compute_features(img).map(|f| (i, *c, f))
+            let mut f = compute_features(img)?;
+            f.raster = Some(img.clone());
+            Some((i, *c, f))
         })
         .collect();
 
@@ -2296,7 +2343,11 @@ pub fn save_index(index: &CharIndex, path: &Path) -> io::Result<()> {
 }
 
 /// Load a character index from a binary file.
-pub fn load_index(path: &Path, classifier: &mut dyn crate::classifier::Classifier) -> io::Result<CharIndex> {
+pub fn load_index(
+    path: &Path,
+    classifier: &mut dyn crate::classifier::Classifier,
+    render_params: &crate::char_render::RenderParams,
+) -> io::Result<CharIndex> {
     use std::io::Read;
     let mut data = Vec::new();
     std::fs::File::open(path)?.read_to_end(&mut data)?;
@@ -2431,6 +2482,7 @@ pub fn load_index(path: &Path, classifier: &mut dyn crate::classifier::Classifie
                     corner_count,
                     quadrant_density,
                     mean_stroke_width,
+                    raster: None,
                 },
             });
         }
@@ -2572,7 +2624,7 @@ pub fn load_index(path: &Path, classifier: &mut dyn crate::classifier::Classifie
         dim_sigmas,
     };
     // Build flat vecs from loaded entries
-    index.rebuild_vecs(classifier);
+    index.rebuild_vecs(classifier, render_params);
     Ok(index)
 }
 
@@ -2628,7 +2680,12 @@ impl CharIndex {
     }
 
     /// Merge another index into this one.
-    pub fn merge(&mut self, other: CharIndex, classifier: &mut dyn crate::classifier::Classifier) {
+    pub fn merge(
+        &mut self,
+        other: CharIndex,
+        classifier: &mut dyn crate::classifier::Classifier,
+        render_params: &crate::char_render::RenderParams,
+    ) {
         for (c, new_entries) in other.entries {
             let existing = self.entries.entry(c).or_default();
             let existing_names: std::collections::HashSet<String> =
@@ -2641,17 +2698,22 @@ impl CharIndex {
         }
         self.skipped_fonts.extend(other.skipped_fonts);
         // Rebuild vecs after merge
-        self.rebuild_vecs(classifier);
+        self.rebuild_vecs(classifier, render_params);
     }
 
     /// Remove all entries for the given font names.
-    pub fn remove_fonts(&mut self, names: &std::collections::HashSet<String>, classifier: &mut dyn crate::classifier::Classifier) {
+    pub fn remove_fonts(
+        &mut self,
+        names: &std::collections::HashSet<String>,
+        classifier: &mut dyn crate::classifier::Classifier,
+        render_params: &crate::char_render::RenderParams,
+    ) {
         for entries in self.entries.values_mut() {
             entries.retain(|e| !names.contains(&e.font_name));
         }
         self.skipped_fonts.retain(|n| !names.contains(n));
         // Rebuild vecs after removal
-        self.rebuild_vecs(classifier);
+        self.rebuild_vecs(classifier, render_params);
     }
 
     /// Drop the raw `entries` HashMap to free memory after the index has been

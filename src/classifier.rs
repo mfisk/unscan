@@ -190,6 +190,11 @@ pub trait Classifier: Send + Sync {
     /// Number of distinct fonts loaded.
     fn font_count(&self) -> usize;
 
+    /// Whether this classifier requires the raster image (not just feature vectors).
+    /// When true, `rebuild_vecs` will re-render glyphs from the font cache before
+    /// calling `add_font`.
+    fn needs_raster(&self) -> bool { false }
+
     /// Feed a font's feature vector for a character into the classifier.
     /// Called once per (font_id, char) pair during index build.
     /// Default implementation is a no-op (for classifiers like MLP that
