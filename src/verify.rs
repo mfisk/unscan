@@ -129,11 +129,11 @@ pub fn verify_text_region(
         };
 
         let scan_crop = full_scan.clone();
-        let render_for_ssim = full_render.clone();
+        let render_for_score = full_render.clone();
 
-        let scan_blur = crate::ssim::gaussian_blur_3x3(&scan_crop);
-        let render_blur = crate::ssim::gaussian_blur_3x3(&render_for_ssim);
-        let (score, dy) = crate::ssim::ssim_windowed_best_vshift(&scan_blur, &render_blur, 12, bail_below);
+        // ZNCC scoring — no blur or contrast normalization needed,
+        // ZNCC is inherently invariant to mean/contrast differences.
+        let (score, dy) = crate::ssim::zncc_windowed_best_vshift(&scan_crop, &render_for_score, 12, bail_below);
 
         if score > best_score {
             best_score = score;
@@ -148,13 +148,14 @@ pub fn verify_text_region(
             let render_ink = if ink_h >= 3 {
                 image::imageops::crop_imm(&full_render, 0, r_top, rw, ink_h).to_image()
             } else {
-                render_for_ssim
+                render_for_score
             };
 
-            // Diff the displayed pair (compute_abs_diff resizes if heights differ)
-            best_diff = Some(compute_abs_diff(
-                best_scan_crop.as_ref().unwrap(), &render_ink,
-            ));
+            // Contrast-normalize scan crop for the visual diff only
+            let scan_for_diff = crate::char_index::contrast_normalize_char(
+                best_scan_crop.as_ref().unwrap(),
+            );
+            best_diff = Some(compute_abs_diff(&scan_for_diff, &render_ink));
             best_render_ink = Some(render_ink);
         }
 

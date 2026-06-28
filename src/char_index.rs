@@ -542,54 +542,46 @@ fn measure_mean_stroke_width(img: &GrayImage) -> f32 {
     (mean / h as f64) as f32
 }
 
-/// Aggregate per-char weighted log-distances into a single overall CI score.
-/// Used by both `search_candidates` and `score_single_font` — one formula,
-/// one implementation.  Higher = better (smaller distance = better match).
-pub fn aggregate_ci_score(log_dists: &[(f32, f32)], n_total_chars: usize) -> f32 {
-    // Missing glyph penalty.  A font that can't render a character is a
-    // categorical failure, not a distance calculation.  Infinite penalty
-    // ensures it can never win regardless of how well other characters match.
-    const MISSING_GLYPH_PENALTY: f32 = f32::INFINITY;
-
-    let matched = log_dists.len();
+/// Aggregate per-char weighted log-probabilities into a single CI score.
+/// Used by both `search_candidates` and GT-font injection — one formula,
+/// one implementation.  Higher = better (higher probability = better match).
+///
+/// Input: `(ln(prob), char_weight)` pairs for each matched character.
+/// Missing glyphs (matched < n_total_chars) get probability 0 → ln(0) = −∞,
+/// guaranteeing a font that can't render a character can never win.
+pub fn aggregate_ci_score(log_probs: &[(f32, f32)], n_total_chars: usize) -> f32 {
+    let matched = log_probs.len();
     let mut total_weight = 0.0_f32;
     let mut weighted_sum = 0.0_f32;
-    for &(ld, w) in log_dists {
-        weighted_sum += ld * w;
+    for &(lp, w) in log_probs {
+        weighted_sum += lp * w;
         total_weight += w;
     }
-    for _ in matched..n_total_chars {
-        weighted_sum += MISSING_GLYPH_PENALTY * 1.0;
-        total_weight += 1.0;
+    // Missing glyphs: probability 0 → log-prob −∞ → score −∞
+    if matched < n_total_chars {
+        return f32::NEG_INFINITY;
     }
-    let mean_log_dist = weighted_sum / total_weight.max(1e-9);
-    -mean_log_dist
+    weighted_sum / total_weight.max(1e-9)
 }
 
-/// Compute the overall CI score for a single font, using the same aggregation
-/// as `search_candidates`.  Returns `None` if the font has no indexed chars
-/// matching the crops.
-/// Score a single font against crop features using the classifier's internal
-/// distance function — no external font vectors needed.
+/// Compute the overall CI score for a single font using calibrated
+/// probabilities.  Returns `None` if the font has no data for any crop char.
 fn score_single_font_via_classifier(
     classifier: &dyn crate::classifier::Classifier,
     font_id: usize,
     crop_data: &[(usize, char, CharFeatures)],
 ) -> Option<f32> {
-    let dists: Vec<(char, usize, f32)> = crop_data.iter()
-        .filter_map(|&(crop_idx, ch, ref feat)| {
-            let d = classifier.distance(ch, feat, font_id)?;
-            Some((ch, crop_idx, d))
+    let log_probs: Vec<(f32, f32)> = crop_data.iter()
+        .filter_map(|&(_, ch, ref feat)| {
+            let p = classifier.probability(ch, feat, font_id)?;
+            // Clamp to avoid ln(0); 1e-30 is ~−69 in log space
+            Some((p.max(1e-30).ln(), char_weight(ch)))
         })
         .collect();
-    if dists.is_empty() {
+    if log_probs.is_empty() {
         return None;
     }
-    let log_dists: Vec<(f32, f32)> = dists
-        .iter()
-        .map(|(ch, _, d2)| ((*d2 + 1e-10_f32).ln(), char_weight(*ch)))
-        .collect();
-    let score = aggregate_ci_score(&log_dists, crop_data.len());
+    let score = aggregate_ci_score(&log_probs, crop_data.len());
     if score.is_finite() { Some(score) } else { None }
 }
 
@@ -1638,6 +1630,51 @@ pub fn build_char_index(
 // Shared normalisation: tight ink crop → NORM_H scale
 // ---------------------------------------------------------------------------
 
+/// Per-character percentile-based contrast normalization.
+///
+/// Maps the 1st-percentile pixel value → 0 and the 99th-percentile → 255.
+/// Applied to scan-side character crops so their dynamic range matches
+/// the full-range black-on-white rendered index characters, regardless
+/// of how the source PDF was rasterized or compressed.
+pub fn contrast_normalize_char(img: &GrayImage) -> GrayImage {
+    let raw = img.as_raw();
+    if raw.is_empty() {
+        return img.clone();
+    }
+    let mut hist = [0u32; 256];
+    for &px in raw {
+        hist[px as usize] += 1;
+    }
+    let n = raw.len() as u32;
+    let p1_target = n / 100;
+    let p99_target = n * 99 / 100;
+    let mut cum = 0u32;
+    let mut p1: u8 = 0;
+    let mut p99: u8 = 255;
+    let mut found_p1 = false;
+    for (val, &count) in hist.iter().enumerate() {
+        cum += count;
+        if !found_p1 && cum >= p1_target {
+            p1 = val as u8;
+            found_p1 = true;
+        }
+        if cum >= p99_target {
+            p99 = val as u8;
+            break;
+        }
+    }
+    if p1 >= p99 {
+        return img.clone();
+    }
+    let range = (p99 - p1) as f32;
+    let mut out = img.clone();
+    for px in out.as_mut() {
+        let v = ((*px as f32 - p1 as f32) * 255.0 / range).round();
+        *px = v.clamp(0.0, 255.0) as u8;
+    }
+    out
+}
+
 pub fn normalize_to_ink_bounds(img: &GrayImage, target_h: u32) -> Option<GrayImage> {
     let (w, h) = img.dimensions();
     if w == 0 || h == 0 {
@@ -1940,6 +1977,10 @@ fn extract_chars_from_boundaries(
             }
         }
 
+        // Contrast-normalize before scaling: stretch p1–p99 to full 0–255 range
+        // so faint scans and dark scans produce consistent ink intensity.
+        let char_crop = contrast_normalize_char(&char_crop);
+
         let scaled = match normalize_to_ink_bounds(&char_crop, NORM_H) {
             Some(img) => img,
             None => continue,
@@ -2005,16 +2046,16 @@ pub struct CharSearchResult {
 pub struct CharCiDetail {
     pub ch: char,
     pub crop_index: usize,
-    pub min_dist_sq: f32,
+    pub best_prob: f32,
     pub passed_gate: bool,
-    /// Top-3 nearest fonts (name, dist_sq).
+    /// Top-3 fonts by probability (name, prob), highest first.
     pub nearest: Vec<(String, f32)>,
     /// When the OCR correction gate fires, the original OCR character
     /// that was replaced.  `ch` then holds the corrected character,
-    /// and `nearest`/`min_dist_sq` reflect the corrected char's CI.
+    /// and `nearest`/`best_prob` reflect the corrected char's CI.
     pub ocr_corrected_from: Option<char>,
     /// Best alternative character considered (even if correction gate
-    /// didn't fire).  Always the char with the lowest distance among
+    /// didn't fire).  Always the char with the highest probability among
     /// all confusables/alternatives tested, if any were tested.
     pub best_alt_char: Option<char>,
     /// Distance of the best alternative character.
@@ -2067,25 +2108,25 @@ pub fn search_candidates(
             continue;
         }
 
-        for &(font_id, _dist) in &picks {
+        for &(font_id, _prob) in &picks {
             candidate_set.insert(font_id);
         }
 
-        let min_dist_sq = picks.iter()
-            .map(|(_, d)| *d)
-            .fold(f32::INFINITY, f32::min);
+        let best_prob = picks.iter()
+            .map(|(_, p)| *p)
+            .fold(0.0f32, f32::max);
 
         let nearest: Vec<(String, f32)> = picks.iter()
             .take(3)
-            .filter_map(|(id, d)| {
-                Some((index.font_names_table.get(*id)?.clone(), *d))
+            .filter_map(|(id, p)| {
+                Some((index.font_names_table.get(*id)?.clone(), *p))
             })
             .collect();
 
         char_detail.push(CharCiDetail {
             ch,
             crop_index: crop_idx,
-            min_dist_sq,
+            best_prob,
             passed_gate: true,
             nearest,
             ocr_corrected_from: None,
@@ -2126,70 +2167,6 @@ pub fn search_candidates(
 
 /// Compute per-character squared Euclidean distances from crop features to a
 /// specific font's reference glyphs.  Used after the winner is determined so
-/// the audit log can include per-char scores for the chosen font.
-///
-/// Returns `(char, crop_index, dist_sq)` for each crop that has features and
-/// a matching reference glyph in the index.  Crops with no features or no
-/// reference for that font are omitted.
-pub fn per_char_distances(
-    index: &CharIndex,
-    font_key: &str,
-    char_crops: &[(char, &GrayImage)],
-    classifier: &dyn crate::classifier::Classifier,
-) -> Vec<(char, usize, f32)> {
-    let font_id = match index.font_names_table.iter().position(|n| n == font_key) {
-        Some(id) => id,
-        None => return Vec::new(),
-    };
-    char_crops
-        .iter()
-        .enumerate()
-        .filter_map(|(i, (c, img))| {
-            let feat = compute_features(img)?;
-            let d = classifier.distance(*c, &feat, font_id)?;
-            Some((*c, i, d))
-        })
-        .collect()
-}
-
-/// For each character crop, compute the 1-based rank of `font_key` among all
-/// fonts for that character, sorted by squared Euclidean distance (1 = closest).
-/// Returns `(crop_index, rank)` for each crop where the font is present.
-pub fn gt_font_ranks(
-    index: &CharIndex,
-    font_key: &str,
-    crop_feats: &[(usize, char, Vec<f32>)],
-    char_crops: &[(char, &GrayImage)],
-    classifier: &dyn crate::classifier::Classifier,
-) -> std::collections::HashMap<usize, usize> {
-    let font_id = match index.font_names_table.iter().position(|n| n == font_key) {
-        Some(id) => id,
-        None => return std::collections::HashMap::new(),
-    };
-    let mut result = std::collections::HashMap::new();
-    for (crop_idx, ch, _projected) in crop_feats {
-        // Find the crop image for this character
-        let raw_feat = if let Some((_, img)) = char_crops.get(*crop_idx) {
-            match compute_features(img) {
-                Some(f) => f,
-                None => continue,
-            }
-        } else {
-            continue;
-        };
-        // Use classifier.classify to get ranking — it owns the font vectors
-        let ranked = classifier.classify(*ch, &raw_feat, usize::MAX);
-        let mut rank = 0usize;
-        for (fid, _score) in &ranked {
-            rank += 1;
-            if *fid == font_id {
-                result.insert(*crop_idx, rank);
-                break;
-            }
-        }
-    }
-    result
-}
 
 // ---------------------------------------------------------------------------
 // Serialisation (simple binary format)

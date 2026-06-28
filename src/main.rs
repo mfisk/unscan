@@ -665,20 +665,17 @@ fn run(args: &cli::Args, classifier: &mut dyn classifier::Classifier) -> Result<
         // background colour detection, geometry, and raster fragments.
         let orig_gray = page_img.to_luma8();
         let skew_angle = deskew::detect_skew(&orig_gray);
-        let (deskewed_gray, did_deskew) = if skew_angle.abs() > 5.0 {
-            (orig_gray.clone(), false)
+        let deskewed_gray = if skew_angle.abs() > 5.0 {
+            orig_gray.clone()
         } else if skew_angle.abs() > 0.5 {
-            (deskew::rotate_gray(&orig_gray, skew_angle), true)
+            deskew::rotate_gray(&orig_gray, skew_angle)
         } else {
-            (orig_gray, false)
+            orig_gray
         };
 
         // Build a DynamicImage from the deskewed gray for OCR input
-        let ocr_img: std::borrow::Cow<'_, image::DynamicImage> = if did_deskew {
-            std::borrow::Cow::Owned(image::DynamicImage::ImageLuma8(deskewed_gray.clone()))
-        } else {
-            std::borrow::Cow::Borrowed(page_img)
-        };
+        let ocr_img: std::borrow::Cow<'_, image::DynamicImage> =
+            std::borrow::Cow::Owned(image::DynamicImage::ImageLuma8(deskewed_gray.clone()));
 
         // 3a. OCR (with cache) ─────────────────────────────────────────
         let ocr_start = std::time::Instant::now();
@@ -730,12 +727,14 @@ fn run(args: &cli::Args, classifier: &mut dyn classifier::Classifier) -> Result<
             ci_char_detail_lig: Vec<char_index::CharCiDetail>,
             seg_winner: Option<String>,
             diag_seg_dir: Option<std::path::PathBuf>,
-            /// Per-char distances to the chosen font, keyed by crop_index.
-            chosen_char_dists: std::collections::HashMap<usize, f32>,
-            /// Per-char distances to the ground-truth font (--audit mode), keyed by crop_index.
-            gt_font_char_dists: std::collections::HashMap<usize, f32>,
+            /// Per-char rank (1-based) of the chosen font among all fonts, keyed by crop_index.
+            chosen_char_ranks: std::collections::HashMap<usize, usize>,
             /// Per-char rank (1-based) of the ground-truth font among all fonts, keyed by crop_index.
             gt_font_char_ranks: std::collections::HashMap<usize, usize>,
+            /// Per-char calibrated probability of the chosen font, keyed by crop_index.
+            chosen_char_probs: std::collections::HashMap<usize, f32>,
+            /// Per-char calibrated probability of the ground-truth font, keyed by crop_index.
+            gt_font_char_probs: std::collections::HashMap<usize, f32>,
             /// CI tie-break candidates with per-candidate SSIM scores.
             tie_candidates: Vec<audit::TieCandidate>,
         }
@@ -802,9 +801,10 @@ fn run(args: &cli::Args, classifier: &mut dyn classifier::Classifier) -> Result<
                         ci_char_detail_lig: Vec::new(),
                         seg_winner: None,
                         diag_seg_dir: None,
-                        chosen_char_dists: std::collections::HashMap::new(),
-                        gt_font_char_dists: std::collections::HashMap::new(),
+                        chosen_char_ranks: std::collections::HashMap::new(),
                         gt_font_char_ranks: std::collections::HashMap::new(),
+                        chosen_char_probs: std::collections::HashMap::new(),
+                        gt_font_char_probs: std::collections::HashMap::new(),
                         tie_candidates: Vec::new(),
                     };
                 } else if li < 3 {
@@ -1077,8 +1077,8 @@ fn run(args: &cli::Args, classifier: &mut dyn classifier::Classifier) -> Result<
 
             let pcd_t0 = std::time::Instant::now();
 
-            // Per-char distances and audit detail: only for miss lines when full audit is active
-            let (chosen_char_dists, gt_font_char_dists, gt_font_char_ranks) = if is_miss && args.full_audit() {
+            // Per-char probabilities and audit detail: only for miss lines when full audit is active
+            let (chosen_char_ranks, chosen_char_probs, gt_font_char_ranks, gt_font_char_probs) = if is_miss && args.full_audit() {
                 // Compute raw features for each crop
                 let crop_feats: Vec<(usize, char, char_index::CharFeatures)> = corrected_char_crops
                     .iter()
@@ -1088,86 +1088,72 @@ fn run(args: &cli::Args, classifier: &mut dyn classifier::Classifier) -> Result<
                     })
                     .collect();
 
-                let chosen: std::collections::HashMap<usize, f32> = if let Some(ref fr) = font_result {
-                    if !fr.font_key.is_empty() {
-                        if let Some(font_id) = char_index.font_names_table.iter().position(|n| n == &fr.font_key) {
-                            crop_feats.iter()
-                                .filter_map(|&(crop_idx, ch, ref feat)| {
-                                    let d = classifier.distance(ch, feat, font_id)?;
-                                    Some((crop_idx, d))
-                                })
-                                .collect()
-                        } else {
-                            std::collections::HashMap::new()
-                        }
-                    } else {
-                        std::collections::HashMap::new()
-                    }
-                } else {
-                    std::collections::HashMap::new()
-                };
+                // Resolve chosen and GT font IDs once
+                let chosen_font_id = font_result.as_ref()
+                    .filter(|fr| !fr.font_key.is_empty())
+                    .and_then(|fr| char_index.font_names_table.iter().position(|n| n == &fr.font_key));
 
-                // Per-char distances and ranks for the ground-truth font (if known)
-                let (gt_dists, gt_ranks): (std::collections::HashMap<usize, f32>, std::collections::HashMap<usize, usize>) = if let Some(ref gt) = ground_truth {
+                let gt_font_id = ground_truth.as_ref().and_then(|gt| {
                     let bbox_px = [line.x as f32, line.y as f32,
                                    (line.x + line.width) as f32,
                                    (line.y + line.height) as f32];
-                    if let Some(gt_font_name) = gt.lookup_font(page_num, &bbox_px, args.dpi) {
-                        // Inject GT font into ci_top_for_audit so it appears in audit output
-                        let gt_ps = ground_truth::strip_subset_prefix_str(gt_font_name);
-                        let gt_key = font_catalog.iter()
-                            .find(|fe| fe.postscript_name == gt_ps)
-                            .map(|fe| fe.font_key());
-                        if let Some(ref gk) = gt_key {
-                            if !ci_top_for_audit.iter().any(|(n, _)| n == gk) {
-                                // Score the GT font using classifier.distance()
-                                if let Some(gt_font_id) = char_index.font_names_table.iter().position(|n| n == gk) {
-                                    let gt_dists_for_score: Vec<(f32, f32)> = crop_feats.iter()
-                                        .filter_map(|&(_, ch, ref feat)| {
-                                            let d = classifier.distance(ch, feat, gt_font_id)?;
-                                            Some(((d + 1e-10_f32).ln(), char_index::char_weight(ch)))
-                                        })
-                                        .collect();
-                                    if !gt_dists_for_score.is_empty() {
-                                        let score = char_index::aggregate_ci_score(&gt_dists_for_score, crop_feats.len());
-                                        if score.is_finite() {
-                                            ci_top_for_audit.push((gk.clone(), Some(score)));
-                                        }
-                                    }
+                    let gt_font_name = gt.lookup_font(page_num, &bbox_px, args.dpi)?;
+                    let gt_ps = ground_truth::strip_subset_prefix_str(gt_font_name);
+                    let gt_key = font_catalog.iter()
+                        .find(|fe| fe.postscript_name == gt_ps)
+                        .map(|fe| fe.font_key())?;
+                    // Inject GT font into ci_top_for_audit if missing
+                    if !ci_top_for_audit.iter().any(|(n, _)| n == &gt_key) {
+                        if let Some(gfid) = char_index.font_names_table.iter().position(|n| n == &gt_key) {
+                            let gt_log_probs: Vec<(f32, f32)> = crop_feats.iter()
+                                .filter_map(|&(_, ch, ref feat)| {
+                                    let p = classifier.probability(ch, feat, gfid)?;
+                                    Some((p.max(1e-30).ln(), char_index::char_weight(ch)))
+                                })
+                                .collect();
+                            if !gt_log_probs.is_empty() {
+                                let score = char_index::aggregate_ci_score(&gt_log_probs, crop_feats.len());
+                                if score.is_finite() {
+                                    ci_top_for_audit.push((gt_key.clone(), Some(score)));
                                 }
                             }
-                            // Compute per-char distances to the GT font
-                            if let Some(gt_font_id) = char_index.font_names_table.iter().position(|n| n == gk) {
-                                let dists = crop_feats.iter()
-                                    .filter_map(|&(crop_idx, ch, ref feat)| {
-                                        let d = classifier.distance(ch, feat, gt_font_id)?;
-                                        Some((crop_idx, d))
-                                    })
-                                    .collect();
-                                // Ranks: for each crop, classify all fonts and find GT font's rank
-                                let mut ranks = std::collections::HashMap::new();
-                                for &(crop_idx, ch, ref feat) in &crop_feats {
-                                    let ranked = classifier.classify(ch, feat, usize::MAX);
-                                    for (rank_pos, (fid, _)) in ranked.iter().enumerate() {
-                                        if *fid == gt_font_id {
-                                            ranks.insert(crop_idx, rank_pos + 1);
-                                            break;
-                                        }
-                                    }
-                                }
-                                (dists, ranks)
-                            } else {
-                                (std::collections::HashMap::new(), std::collections::HashMap::new())
-                            }
-                        } else {
-                            (std::collections::HashMap::new(), std::collections::HashMap::new())
                         }
-                    } else {
-                        (std::collections::HashMap::new(), std::collections::HashMap::new())
                     }
-                } else {
-                    (std::collections::HashMap::new(), std::collections::HashMap::new())
-                };
+                    char_index.font_names_table.iter().position(|n| n == &gt_key)
+                });
+
+                // One probabilities() call per character; extract
+                // rank and probability for both chosen and GT font IDs.
+                let mut c_ranks = std::collections::HashMap::new();
+                let mut c_probs = std::collections::HashMap::new();
+                let mut g_ranks = std::collections::HashMap::new();
+                let mut g_probs = std::collections::HashMap::new();
+
+                for &(crop_idx, ch, ref feat) in &crop_feats {
+                    let probs = classifier.probabilities(ch, feat);
+                    if probs.is_empty() { continue; }
+
+                    // Extract rank (1-based position in probability-sorted list)
+                    // and probability for any font_id
+                    let lookup = |fid: usize| -> Option<(usize, f32)> {
+                        probs.iter().enumerate()
+                            .find(|(_, (id, _))| *id == fid)
+                            .map(|(pos, (_, p))| (pos + 1, *p))
+                    };
+
+                    if let Some(fid) = chosen_font_id {
+                        if let Some((rank, prob)) = lookup(fid) {
+                            c_ranks.insert(crop_idx, rank);
+                            c_probs.insert(crop_idx, prob);
+                        }
+                    }
+                    if let Some(fid) = gt_font_id {
+                        if let Some((rank, prob)) = lookup(fid) {
+                            g_ranks.insert(crop_idx, rank);
+                            g_probs.insert(crop_idx, prob);
+                        }
+                    }
+                }
 
                 // Save crop PNGs for miss lines
                 if let Some(ref ddir) = diag_seg_dir {
@@ -1265,14 +1251,14 @@ fn run(args: &cli::Args, classifier: &mut dyn classifier::Classifier) -> Result<
                     }
                 }
 
-                (chosen, gt_dists, gt_ranks)
+                (c_ranks, c_probs, g_ranks, g_probs)
             } else {
-                (std::collections::HashMap::new(), std::collections::HashMap::new(), std::collections::HashMap::new())
+                (std::collections::HashMap::new(), std::collections::HashMap::new(), std::collections::HashMap::new(), std::collections::HashMap::new())
             };
             prof_pcd_us.fetch_add(pcd_t0.elapsed().as_micros() as u64, std::sync::atomic::Ordering::Relaxed);
 
             prof_full_us.fetch_add(line_start.elapsed().as_micros() as u64, std::sync::atomic::Ordering::Relaxed);
-            LineMatch { font_result, text_color, ci_top_for_audit, ci_char_detail, ci_top_for_audit_lig, ci_char_detail_lig, seg_winner, diag_seg_dir, chosen_char_dists, gt_font_char_dists, gt_font_char_ranks, tie_candidates: tie_candidates_audit }
+            LineMatch { font_result, text_color, ci_top_for_audit, ci_char_detail, ci_top_for_audit_lig, ci_char_detail_lig, seg_winner, diag_seg_dir, chosen_char_ranks, gt_font_char_ranks, chosen_char_probs, gt_font_char_probs, tie_candidates: tie_candidates_audit }
         }).collect();
 
         // Update dominant font candidate for next page from this page's results
@@ -1475,22 +1461,24 @@ fn run(args: &cli::Args, classifier: &mut dyn classifier::Classifier) -> Result<
                     .collect(),
                 ci_char_votes: lm.ci_char_detail.iter()
                     .map(|d| {
-                        let chosen_d2 = lm.chosen_char_dists.get(&d.crop_index).copied();
-                        let gt_d2 = lm.gt_font_char_dists.get(&d.crop_index).copied();
+                        let chosen_rank = lm.chosen_char_ranks.get(&d.crop_index).copied();
                         let gt_rank = lm.gt_font_char_ranks.get(&d.crop_index).copied();
+                        let chosen_p = lm.chosen_char_probs.get(&d.crop_index).copied();
+                        let gt_p = lm.gt_font_char_probs.get(&d.crop_index).copied();
                         audit::CharCiVote {
                             ch: d.ch,
                             crop_index: d.crop_index,
-                            min_dist_sq: d.min_dist_sq,
+                            best_prob: d.best_prob,
                             passed_gate: d.passed_gate,
                             nearest: d.nearest.clone(),
                             crop_path: None,
-                            chosen_dist_sq: chosen_d2,
+                            chosen_rank,
                             ocr_corrected_from: d.ocr_corrected_from,
                             best_alt_char: d.best_alt_char,
                             best_alt_dist: d.best_alt_dist,
-                            gt_font_dist_sq: gt_d2,
                             gt_font_rank: gt_rank,
+                            chosen_prob: chosen_p,
+                            gt_font_prob: gt_p,
                         }
                     })
                     .collect(),
@@ -1502,16 +1490,17 @@ fn run(args: &cli::Args, classifier: &mut dyn classifier::Classifier) -> Result<
                         audit::CharCiVote {
                             ch: d.ch,
                             crop_index: d.crop_index,
-                            min_dist_sq: d.min_dist_sq,
+                            best_prob: d.best_prob,
                             passed_gate: d.passed_gate,
                             nearest: d.nearest.clone(),
                             crop_path: None,
-                            chosen_dist_sq: None,
+                            chosen_rank: None,
                             ocr_corrected_from: d.ocr_corrected_from,
                             best_alt_char: d.best_alt_char,
                             best_alt_dist: d.best_alt_dist,
-                            gt_font_dist_sq: None,
                             gt_font_rank: None,
+                            chosen_prob: None,
+                            gt_font_prob: None,
                         }
                     })
                     .collect(),
