@@ -63,6 +63,16 @@ fn dist_class(d2: f32) -> &'static str {
     }
 }
 
+fn prob_class(p: f32) -> &'static str {
+    if p < 0.01 {
+        "bad"
+    } else if p < 0.1 {
+        "warn"
+    } else {
+        "ok"
+    }
+}
+
 fn truncate(s: &str, max: usize) -> &str {
     if s.len() <= max {
         s
@@ -113,15 +123,15 @@ fn pick_interesting_chars(
         }
     }
 
-    // 2. Worst characters for the chosen/matched font (highest chosen_dist_sq)
+    // 2. Worst characters for the chosen/matched font (lowest chosen_prob)
     {
         let mut by_chosen: Vec<(usize, &crate::audit::CharCiVote)> =
             chars.iter().enumerate()
-                .filter(|(_, c)| c.chosen_dist_sq.is_some())
+                .filter(|(_, c)| c.chosen_prob.is_some())
                 .collect();
         by_chosen.sort_by(|a, b| {
-            b.1.chosen_dist_sq.unwrap()
-                .partial_cmp(&a.1.chosen_dist_sq.unwrap())
+            a.1.chosen_prob.unwrap()
+                .partial_cmp(&b.1.chosen_prob.unwrap())
                 .unwrap_or(std::cmp::Ordering::Equal)
         });
         for (i, c) in by_chosen.iter().take(n_worst) {
@@ -131,15 +141,15 @@ fn pick_interesting_chars(
         }
     }
 
-    // 3. Worst characters for the ground-truth font (highest gt_font_dist_sq)
+    // 3. Worst characters for the ground-truth font (lowest gt_font_prob)
     {
         let mut by_gt: Vec<(usize, &crate::audit::CharCiVote)> =
             chars.iter().enumerate()
-                .filter(|(_, c)| c.gt_font_dist_sq.is_some())
+                .filter(|(_, c)| c.gt_font_prob.is_some())
                 .collect();
         by_gt.sort_by(|a, b| {
-            b.1.gt_font_dist_sq.unwrap()
-                .partial_cmp(&a.1.gt_font_dist_sq.unwrap())
+            a.1.gt_font_prob.unwrap()
+                .partial_cmp(&b.1.gt_font_prob.unwrap())
                 .unwrap_or(std::cmp::Ordering::Equal)
         });
         for (i, c) in by_gt.iter().take(n_worst) {
@@ -149,37 +159,37 @@ fn pick_interesting_chars(
         }
     }
 
-    // 4. Worst by global min_dist_sq (original behavior — catch remaining outliers)
+    // 4. Worst by best_prob (lowest probability = worst match)
     {
-        let mut by_dist: Vec<(usize, &crate::audit::CharCiVote)> =
+        let mut by_prob: Vec<(usize, &crate::audit::CharCiVote)> =
             chars.iter().enumerate().collect();
-        by_dist.sort_by(|a, b| {
-            b.1.min_dist_sq
-                .partial_cmp(&a.1.min_dist_sq)
+        by_prob.sort_by(|a, b| {
+            a.1.best_prob
+                .partial_cmp(&b.1.best_prob)
                 .unwrap_or(std::cmp::Ordering::Equal)
         });
-        for (i, c) in by_dist.iter().take(n_worst) {
+        for (i, c) in by_prob.iter().take(n_worst) {
             if used.insert(*i) {
                 result.push((*i, c));
             }
         }
     }
 
-    // 5. A few normal characters for contrast
+    // 5. A few normal characters for contrast (highest probability)
     {
-        let mut by_dist: Vec<(usize, &crate::audit::CharCiVote)> =
+        let mut by_prob: Vec<(usize, &crate::audit::CharCiVote)> =
             chars.iter().enumerate().collect();
-        by_dist.sort_by(|a, b| {
-            a.1.min_dist_sq
-                .partial_cmp(&b.1.min_dist_sq)
+        by_prob.sort_by(|a, b| {
+            b.1.best_prob
+                .partial_cmp(&a.1.best_prob)
                 .unwrap_or(std::cmp::Ordering::Equal)
         });
         let mut count = 0;
-        for (i, c) in by_dist.iter() {
+        for (i, c) in by_prob.iter() {
             if count >= n_normal {
                 break;
             }
-            if c.min_dist_sq < 0.008 && used.insert(*i) {
+            if c.best_prob > 0.5 && used.insert(*i) {
                 result.push((*i, c));
                 count += 1;
             }
@@ -538,7 +548,7 @@ fn build_miss_block(
         (Some(score), Some(pass)) => {
             let cls = if pass { "ssim-pass" } else { "ssim-fail" };
             let label = if pass { "pass" } else { "FAIL" };
-            format!(" <span class=\"{cls}\">SSIM {score:.10} ({label})</span>")
+            format!(" <span class=\"{cls}\">ZNCC {score:.10} ({label})</span>")
         }
         _ => String::new(),
     };
@@ -573,7 +583,7 @@ fn build_miss_block(
         MissKind::MinorMiss => {
             format!(" [minor: expected {}, got {}]", actual_font, matched)
         },
-        MissKind::SsimFailure => " [SSIM failure]".to_string(),
+        MissKind::SsimFailure => " [ZNCC failure]".to_string(),
         MissKind::KeptRaster => " [kept raster]".to_string(),
         _ => String::new(),
     };
@@ -999,19 +1009,17 @@ fn render_correct_font_comparison(
 
     let render_uri = img_to_b64_uri(&render_img);
 
-    // Load ssim_scan.png, compute diff and SSIM (same path as verify_text_region)
+    // Load ssim_scan.png, compute diff and ZNCC (same path as verify_text_region)
     let scan_path = dd.join("ssim_scan.png");
     let (diff_uri, correct_ssim) = if scan_path.exists() {
         if let Ok(scan_dyn) = image::open(&scan_path) {
             let scan_gray = scan_dyn.to_luma8();
             let diff_img = crate::verify::compute_abs_diff(&scan_gray, &render_img);
-            // Compute SSIM: same blur + vshift pipeline as verify_text_region
-            let scan_blur = crate::ssim::gaussian_blur_3x3(&scan_gray);
-            let render_blur = crate::ssim::gaussian_blur_3x3(&render_img);
-            let (ssim_val, _dy) = crate::ssim::ssim_windowed_best_vshift(
-                &scan_blur, &render_blur, 12, None,
+            // Compute ZNCC: same pipeline as verify_text_region
+            let (zncc_val, _dy) = crate::ssim::zncc_windowed_best_vshift(
+                &scan_gray, &render_img, 12, None,
             );
-            (Some(img_to_b64_uri(&diff_img)), Some(ssim_val))
+            (Some(img_to_b64_uri(&diff_img)), Some(zncc_val))
         } else {
             (None, None)
         }
@@ -1213,17 +1221,18 @@ fn build_ssim_block(
     format!(
         "<div class=\"ssim-compare-block\">\
          <table class=\"ssim-compare-table\">\
-         <tr><th></th><th>Correct</th><th>Picked (SSIM verified)</th></tr>\
+         <tr><th></th><th>Correct</th><th>Picked (ZNCC verified)</th></tr>\
          <tr><td class=\"ssim-label\">Font</td>\
          <td class=\"correct\">{correct_font}</td>\
          <td class=\"chosen\">{chosen_font}</td></tr>\
          {font_size_row}\
          {per_word_row}\
          <tr><td class=\"ssim-label\">Scan</td>\
-         <td colspan=\"2\"><img src=\"{scan_uri}\" class=\"ssim-compare-img\"></td></tr>\
+         <td><img src=\"{scan_uri}\" class=\"ssim-compare-img\"></td>\
+         <td><img src=\"{scan_uri}\" class=\"ssim-compare-img\"></td></tr>\
          {render_row}\
          {diff_row_html}\
-         <tr><td class=\"ssim-label\">SSIM</td>\
+         <tr><td class=\"ssim-label\">ZNCC</td>\
          <td class=\"correct\">{correct_ssim_str}</td>\
          <td class=\"chosen\">{ssim_str}</td></tr>\
          </table></div>"
@@ -1298,19 +1307,19 @@ fn build_tie_break_block(
     }
     rows.push_str("</tr>");
 
-    // SSIM score row
-    rows.push_str("<tr><td class=\"ssim-label\">SSIM</td>");
+    // ZNCC score row
+    rows.push_str("<tr><td class=\"ssim-label\">ZNCC</td>");
     for tc in &entry.tie_candidates {
         let class = if tc.winner { "tie-winner" } else { "tie-loser" };
         rows.push_str(&format!(
-            "<td class=\"{}\">{:.4}</td>", class, tc.ssim_score
+            "<td class=\"{}\">{:.6}</td>", class, tc.ssim_score
         ));
     }
     rows.push_str("</tr>");
 
     format!(
         "<div class=\"tie-break-block\">\
-         <div class=\"tie-break-title\">CI Tie-Break ({} candidates, SSIM decides)</div>\
+         <div class=\"tie-break-title\">CI Tie-Break ({} candidates, ZNCC decides)</div>\
          <table class=\"ssim-compare-table\">{}</table></div>",
         entry.tie_candidates.len(), rows
     )
@@ -1330,12 +1339,13 @@ fn build_char_table(
     diag_dir: Option<&Path>,
     font_catalog: &[FontEntry],
 ) -> String {
+    let _ = font_catalog; // retained for future use
     let mut rows = String::new();
 
     for &(_idx, cv) in chars_to_show {
         let ch = cv.ch;
         let original_ocr = cv.ocr_corrected_from.unwrap_or(ch);
-        let d2 = cv.min_dist_sq;
+        let best_p = cv.best_prob;
 
         // Crop image from disk
         let crop_uri = diag_dir.and_then(|dd| {
@@ -1382,24 +1392,6 @@ fn build_char_table(
             Some(img_to_b64_uri(&img))
         });
 
-        // Per-char distance for correct font
-        let correct_char_dist: Option<f32> = correct_fe.and_then(|_fe| {
-            // Check gt_font_dist_sq (from --audit GT font injection)
-            if let Some(d) = cv.gt_font_dist_sq {
-                return Some(d);
-            }
-            // Check nearest via PostScript name match
-            let gt_ps = ground_truth::strip_subset_prefix_str(correct_font_name);
-            for (nf, nd) in &cv.nearest {
-                if let Some(fe) = find_font_by_key(font_catalog, nf) {
-                    if fe.postscript_name == gt_ps {
-                        return Some(*nd);
-                    }
-                }
-            }
-            None
-        });
-
         // OCR cell
         let ocr_label = if cv.ocr_corrected_from.is_some() {
             format!(
@@ -1411,13 +1403,11 @@ fn build_char_table(
 
         let mut ocr_parts = vec![format!("OCR: <b>{ocr_label}</b>")];
 
-        // Best-scoring font for the OCR char
-        if let Some((ref nf, nd)) = cv.nearest.first() {
+        // Best-scoring font for the OCR char (stage-1 diagnostic)
+        if let Some((ref nf, _np)) = cv.nearest.first() {
             let font_name = nf.rsplit('/').next().unwrap_or(nf);
-            let dc = dist_class(*nd);
             ocr_parts.push(format!(
-                "<span class='font-mini'>{font_name}</span><br>\
-                 <span class='num {dc}'>{nd:.6}</span>"
+                "<span class='font-mini'>{font_name}</span>"
             ));
         }
 
@@ -1431,26 +1421,28 @@ fn build_char_table(
 
         let ocr_cell = ocr_parts.join("<br>");
 
-        // Per-char distance labels
-        let chosen_score_label = cv
-            .chosen_dist_sq
-            .map(|d| {
-                let dc = dist_class(d);
-                format!("<div class='sub'><span class='num {dc}'>{d:.6}</span></div>")
-            })
-            .unwrap_or_default();
+        // Per-char probability labels
+        let chosen_score_label = if let Some(p) = cv.chosen_prob {
+            let pc = prob_class(p);
+            let rank_part = cv.chosen_rank
+                .map(|r| format!(" <span class='font-mini'>rank {r}</span>"))
+                .unwrap_or_default();
+            format!("<div class='sub'><span class='num {pc}'>{p:.6}</span>{rank_part}</div>")
+        } else {
+            String::new()
+        };
 
-        let correct_score_label = correct_char_dist
-            .map(|d| {
-                let dc = dist_class(d);
-                let rank_part = cv.gt_font_rank
-                    .map(|r| format!(" <span class='font-mini'>rank {r}</span>"))
-                    .unwrap_or_default();
-                format!("<div class='sub'><span class='num {dc}'>{d:.6}</span>{rank_part}</div>")
-            })
-            .unwrap_or_default();
+        let correct_score_label = if let Some(p) = cv.gt_font_prob {
+            let pc = prob_class(p);
+            let rank_part = cv.gt_font_rank
+                .map(|r| format!(" <span class='font-mini'>rank {r}</span>"))
+                .unwrap_or_default();
+            format!("<div class='sub'><span class='num {pc}'>{p:.6}</span>{rank_part}</div>")
+        } else {
+            String::new()
+        };
 
-        let _dc = dist_class(d2);
+        let _pc = prob_class(best_p);
 
         rows.push_str(&format!(
             "<tr>\
@@ -1765,7 +1757,7 @@ pub fn generate_report(
     let ssim_section = if !ssim_blocks.is_empty() {
         format!(
             "<h2 style=\"margin-top:2em; color:#c55;\">\
-             SSIM Failures (correct font, SSIM rejected)</h2>{ssim_blocks}"
+             ZNCC Failures (correct font, ZNCC rejected)</h2>{ssim_blocks}"
         )
     } else {
         String::new()
@@ -1799,7 +1791,7 @@ pub fn generate_report(
         String::new()
     };
 
-    // SSIM percentiles across all lines that have an SSIM score
+    // ZNCC percentiles across all lines that have a ZNCC score
     let ssim_percentile_str = {
         let mut ssim_vals: Vec<f32> = entries.iter()
             .filter_map(|e| e.ssim_score)
@@ -1812,7 +1804,7 @@ pub fn generate_report(
             let p50 = ssim_vals[n / 2];
             let p90_idx = (n as f64 * 0.9).ceil() as usize;
             let p90 = ssim_vals[p90_idx.min(n - 1)];
-            format!(" | SSIM p50={p50:.4} p90={p90:.4} (n={n})")
+            format!(" | ZNCC p50={p50:.6} p90={p90:.6} (n={n})")
         }
     };
 
@@ -1854,13 +1846,14 @@ pub fn generate_report(
          {n_major} major + {n_minor} minor misses{ssim_miss_str}{raster_str}{ocr_corr_str}{ssim_percentile_str}{gt_rank_str}</div>\n\
          <div class=\"score-legend\">\n\
          <b>Score key:</b>\n\
-         <b>CI score</b> (per-line) = −mean(log(dist²)) across characters; \
+         <b>CI score</b> (per-line) = mean(log(prob)) across characters, \
+         weighted by character discriminativeness; \
          <b>higher = better match</b>.\n\
-         <b>CI dist²</b> (per-character) = squared Euclidean distance in \
-         normalized feature space between scan crop and rendered glyph; \
-         <b>lower = better</b> (good: &lt;1e-4, suspect: &gt;1e-3).\n\
-         <b>SSIM</b> (per-line) = structural similarity between scanned line \
-         and re-render; <b>0–1, higher = more similar</b>.\n\
+         <b>CI prob</b> (per-character) = calibrated posterior probability \
+         via Gaussian kernel over embedding distances; \
+         <b>0–1, higher = better</b>.\n\
+         <b>ZNCC</b> (per-line) = zero-mean normalized cross-correlation between scanned line \
+         and re-render; <b>-1–1, higher = more similar</b>.\n\
          </div>\n\
          <h2>Major Misses ({n_major})</h2>\n\
          {major_miss_blocks}\n\

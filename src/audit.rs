@@ -86,16 +86,14 @@ pub struct TieCandidate {
 pub struct CharCiVote {
     pub ch: char,
     pub crop_index: usize,
-    pub min_dist_sq: f32,
+    pub best_prob: f32,
     pub passed_gate: bool,
     pub nearest: Vec<(String, f32)>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub crop_path: Option<String>,
-    /// Squared distance to the chosen (font_matched) font's reference glyph.
-    /// Populated after the winner is determined so the report can show
-    /// per-character match quality for the unscan pick.
+    /// 1-based rank of the chosen font among all fonts for this character.
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub chosen_dist_sq: Option<f32>,
+    pub chosen_rank: Option<usize>,
     /// When the OCR correction gate fires, the original OCR character.
     /// `ch` holds the corrected (better-matching) character.
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -106,15 +104,17 @@ pub struct CharCiVote {
     /// Distance of the best alternative character.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub best_alt_dist: Option<f32>,
-    /// Per-char squared distance to the ground-truth font (--audit mode).
-    /// Only populated when --audit is provided and --audit is active.
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub gt_font_dist_sq: Option<f32>,
     /// 1-based rank of the ground-truth font among all fonts for this
-    /// character, sorted by distance (1 = closest).  `None` when GT font
+    /// character, sorted by probability (1 = highest).  `None` when GT font
     /// is unknown or not in the index for this character.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub gt_font_rank: Option<usize>,
+    /// Calibrated posterior probability of the chosen font for this character.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub chosen_prob: Option<f32>,
+    /// Calibrated posterior probability of the ground-truth font for this character.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub gt_font_prob: Option<f32>,
 }
 
 #[derive(Debug, Serialize, Clone)]

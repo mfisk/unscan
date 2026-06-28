@@ -48,6 +48,15 @@ impl<'a> BinaryReader<'a> {
         Ok(v)
     }
 
+    fn read_f32(&mut self) -> Result<f32, String> {
+        if self.pos + 4 > self.data.len() {
+            return Err("truncated weight data".into());
+        }
+        let v = f32::from_le_bytes(self.data[self.pos..self.pos + 4].try_into().unwrap());
+        self.pos += 4;
+        Ok(v)
+    }
+
     fn read_u32(&mut self) -> Result<u32, String> {
         if self.pos + 4 > self.data.len() {
             return Err("truncated header data".into());
@@ -107,16 +116,73 @@ fn dense_project(out_dim: usize, mat: &[f32], x: &[f32]) -> Vec<f32> {
 
 /// A font classifier that identifies fonts from character glyph images.
 ///
-/// Each implementation manages its own internal data (font vectors, learned
-/// weights, etc.).  The trait exposes only classification and scoring.
+/// # Scoring model
+///
+/// All classifiers expose a single score space: calibrated posterior
+/// probabilities `p(font | query, char)` in `[0, 1]`, summing to 1 across
+/// all fonts for a given query.  These are comparable across classifiers,
+/// characters, and queries.
+///
+/// `classify()` returns the top-k fonts by probability.  `probabilities()`
+/// returns all fonts.  `probability()` returns a single font's posterior.
+///
+/// # Computing probabilities
+///
+/// Embedding-based classifiers (LDA, Fisher, Triplet, Mahalanobis) model
+/// each font as a point in a learned embedding space.  The posterior is
+/// derived via a Gaussian (RBF) kernel:
+///
+/// ```text
+///   p(font_i | query, ch) = exp(-d_i / 2σ²_ch) / Σ_j exp(-d_j / 2σ²_ch)
+/// ```
+///
+/// where `d_i` is the squared Euclidean distance from the query embedding to
+/// font i's centroid, and `σ²_ch` is a per-character bandwidth parameter.
+///
+/// The bandwidth `σ²` is set to the **median pairwise squared distance**
+/// between all font centroids for that character (the "median heuristic"
+/// from kernel density estimation).  This choice maximizes the entropy of
+/// the resulting kernel matrix, ensuring the probability distribution is
+/// neither too peaked (only the nearest font gets any mass) nor too flat
+/// (all fonts are equally likely).  It is computed at training time from the
+/// projected class centroids and stored in the weight file.
+///
+/// MLP classifiers produce probabilities directly via softmax over learned
+/// logits — no bandwidth parameter is needed.
+///
+/// Fusion classifiers compute probabilities from each child's probability
+/// distribution, combined via a weighted geometric mean (equivalent to
+/// weighted log-probability averaging), then renormalized.
+///
+/// # σ² storage
+///
+/// For embedding classifiers, `σ²` is computed during training and stored
+/// per-character in the weight file (LDAC v2).  At runtime, `sigma_sq(ch)`
+/// returns the stored value.  If the weight file predates v2, `σ²` is
+/// computed on first access from the stored FontVecStore centroids as a
+/// fallback.
 pub trait Classifier: Send + Sync {
     /// Return the top `k` font matches for a character crop.
-    /// Returns `(font_id, score)` in best-first order (lowest score = best).
+    /// Returns `(font_id, probability)` sorted descending (highest = best).
     fn classify(&self, ch: char, query: &CharFeatures, k: usize) -> Vec<(usize, f32)>;
 
-    /// Score a specific font against a query for one character.
-    /// Lower = better match.  Returns None if the font has no data for this char.
-    fn distance(&self, ch: char, query: &CharFeatures, font_id: usize) -> Option<f32>;
+    /// Return calibrated posterior probabilities for all fonts, sorted
+    /// descending by probability.  Probabilities sum to 1.
+    ///
+    /// Default implementation delegates to `classify(ch, query, font_count())`.
+    fn probabilities(&self, ch: char, query: &CharFeatures) -> Vec<(usize, f32)> {
+        self.classify(ch, query, self.font_count())
+    }
+
+    /// Posterior probability of a specific font given a query.
+    /// Equivalent to finding `font_id` in `probabilities()`.
+    ///
+    /// Default calls `probabilities` and scans.
+    fn probability(&self, ch: char, query: &CharFeatures, font_id: usize) -> Option<f32> {
+        self.probabilities(ch, query).iter()
+            .find(|(id, _)| *id == font_id)
+            .map(|(_, p)| *p)
+    }
 
     /// Short name for logging and cache invalidation.
     fn name(&self) -> &str;
@@ -129,6 +195,30 @@ pub trait Classifier: Send + Sync {
     /// Default implementation is a no-op (for classifiers like MLP that
     /// don't use font vectors).
     fn add_font(&mut self, _font_id: usize, _ch: char, _features: &CharFeatures) {}
+}
+
+/// Convert `(font_id, sq_dist)` pairs to `(font_id, prob)` pairs using a
+/// Gaussian kernel with bandwidth `sigma_sq`.  Mutates in place — no extra
+/// allocation beyond the input vector.
+///
+/// `p_i = exp(-d_i / 2σ²) / Σ_j exp(-d_j / 2σ²)`
+pub fn distances_to_probs(mut ranked: Vec<(usize, f32)>, sigma_sq: f32) -> Vec<(usize, f32)> {
+    let inv2s = 1.0 / (2.0 * sigma_sq);
+    // Numerically stable softmax: subtract max score before exp
+    let max_score = ranked.iter().map(|(_, d)| -d * inv2s)
+        .fold(f32::NEG_INFINITY, f32::max);
+    // Convert distances → unnormalized probabilities in place
+    let mut sum = 0.0f32;
+    for (_, d) in &mut ranked {
+        let e = (-*d * inv2s - max_score).exp();
+        *d = e;
+        sum += e;
+    }
+    let inv_sum = if sum > 0.0 { 1.0 / sum } else { 0.0 };
+    for (_, p) in &mut ranked {
+        *p *= inv_sum;
+    }
+    ranked
 }
 
 // ---------------------------------------------------------------------------
@@ -151,11 +241,20 @@ pub(crate) struct FontVecStore {
     /// Per-char font_id → index into vecs for O(1) lookup
     idx: HashMap<char, HashMap<usize, usize>>,
     count: usize,
+    /// Per-char Gaussian bandwidth (median pairwise squared distance).
+    /// Loaded from weights if available; otherwise computed lazily from
+    /// stored centroids on first `sigma_sq()` call.
+    sigma_sq_cache: std::sync::RwLock<HashMap<char, f32>>,
 }
 
 impl FontVecStore {
     fn new() -> Self {
-        Self { vecs: HashMap::new(), idx: HashMap::new(), count: 0 }
+        Self {
+            vecs: HashMap::new(),
+            idx: HashMap::new(),
+            count: 0,
+            sigma_sq_cache: std::sync::RwLock::new(HashMap::new()),
+        }
     }
 
     fn add(&mut self, font_id: usize, ch: char, embedded: Vec<f32>) {
@@ -166,27 +265,76 @@ impl FontVecStore {
         if font_id >= self.count { self.count = font_id + 1; }
     }
 
+    /// Return the top `k` fonts by probability (highest first).
     fn classify(&self, ch: char, query: &[f32], k: usize) -> Vec<(usize, f32)> {
+        let mut probs = self.probabilities(ch, query);
+        probs.truncate(k);
+        probs
+    }
+
+    /// Return all fonts with calibrated probabilities, sorted descending.
+    fn probabilities(&self, ch: char, query: &[f32]) -> Vec<(usize, f32)> {
         let points = match self.vecs.get(&ch) {
             Some(p) if !p.is_empty() => p,
             _ => return Vec::new(),
         };
-        let mut all: Vec<(usize, f32)> = points.iter()
+        let dists: Vec<(usize, f32)> = points.iter()
             .map(|(id, stored)| (*id, sq_euclid(query, stored)))
             .collect();
-        all.sort_by(|a, b| a.1.partial_cmp(&b.1).unwrap_or(std::cmp::Ordering::Equal));
-        all.truncate(k);
-        all
+        let sigma = match self.sigma_sq(ch) {
+            Some(s) if s > 1e-30 => s,
+            _ => {
+                // No σ² — fall back to uniform
+                let p = 1.0 / dists.len() as f32;
+                return dists.into_iter().map(|(id, _)| (id, p)).collect();
+            }
+        };
+        let mut probs = distances_to_probs(dists, sigma);
+        probs.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
+        probs
     }
 
-    fn distance(&self, ch: char, query: &[f32], font_id: usize) -> Option<f32> {
-        let points = self.vecs.get(&ch)?;
-        let i = *self.idx.get(&ch)?.get(&font_id)?;
-        let (_, ref stored) = points[i];
-        Some(sq_euclid(query, stored))
+    /// Probability of a specific font for a character.
+    fn probability(&self, ch: char, query: &[f32], font_id: usize) -> Option<f32> {
+        self.probabilities(ch, query).into_iter()
+            .find(|(id, _)| *id == font_id)
+            .map(|(_, p)| p)
     }
 
     fn font_count(&self) -> usize { self.count }
+
+    /// Set a pre-computed σ² for a character (from training-time weights).
+    fn set_sigma_sq(&self, ch: char, val: f32) {
+        self.sigma_sq_cache.write().unwrap().insert(ch, val);
+    }
+
+    /// Get σ² for a character.  Returns the training-time value if set,
+    /// otherwise computes it from stored centroids (median pairwise squared
+    /// distance) and caches the result.
+    fn sigma_sq(&self, ch: char) -> Option<f32> {
+        // Fast path: already cached
+        if let Some(&s) = self.sigma_sq_cache.read().unwrap().get(&ch) {
+            return Some(s);
+        }
+        // Compute from stored centroids
+        let points = self.vecs.get(&ch)?;
+        let n = points.len();
+        if n < 2 { return None; }
+        let mut dists: Vec<f32> = Vec::with_capacity(n * (n - 1) / 2);
+        for i in 0..n {
+            for j in (i + 1)..n {
+                dists.push(sq_euclid(&points[i].1, &points[j].1));
+            }
+        }
+        dists.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
+        let median = dists[dists.len() / 2];
+        if median > 1e-30 {
+            self.sigma_sq_cache.write().unwrap().insert(ch, median);
+            Some(median)
+        } else {
+            None
+        }
+    }
 }
 
 
@@ -221,9 +369,14 @@ impl Classifier for EmbeddingClassifier {
         self.store.classify(ch, &q, k)
     }
 
-    fn distance(&self, ch: char, query: &CharFeatures, font_id: usize) -> Option<f32> {
+    fn probabilities(&self, ch: char, query: &CharFeatures) -> Vec<(usize, f32)> {
         let q = self.embedder.embed(ch, query);
-        self.store.distance(ch, &q, font_id)
+        self.store.probabilities(ch, &q)
+    }
+
+    fn probability(&self, ch: char, query: &CharFeatures, font_id: usize) -> Option<f32> {
+        let q = self.embedder.embed(ch, query);
+        self.store.probability(ch, &q, font_id)
     }
 
     fn name(&self) -> &str {
@@ -758,6 +911,9 @@ pub fn load_mahalanobis(path: &std::path::Path) -> Result<EmbeddingClassifier, S
 /// ```
 pub struct LdaClassifier {
     projections: HashMap<char, (usize, Vec<f32>)>, // (out_dim, proj matrix)
+    /// Per-character σ² from training (LDAC v2+).  Empty for v1 files;
+    /// FontVecStore will compute from centroids as fallback.
+    pub(crate) sigma_sq: HashMap<char, f32>,
 }
 
 impl LdaClassifier {
@@ -783,12 +939,13 @@ impl LdaClassifier {
             return Err(format!("bad magic (expected LDAC, got {:?})", &data[0..4]));
         }
         let version = u32::from_le_bytes(data[4..8].try_into().unwrap());
-        if version != 1 {
+        if version != 1 && version != 2 {
             return Err(format!("unsupported version {version}"));
         }
         let n_chars = u32::from_le_bytes(data[8..12].try_into().unwrap()) as usize;
 
         let mut projections = HashMap::with_capacity(n_chars);
+        let mut sigma_sq = HashMap::with_capacity(n_chars);
         let mut r = BinaryReader::new(&data, 12);
         for _ in 0..n_chars {
             let cp = r.read_u32()?;
@@ -796,12 +953,18 @@ impl LdaClassifier {
                 .ok_or_else(|| format!("invalid codepoint U+{cp:04X}"))?;
             let out_dim = r.read_u32()? as usize;
             let proj = r.read_f32s(out_dim * FEAT_LEN)?;
+            if version >= 2 {
+                let s = r.read_f32()?;
+                if s > 1e-30 {
+                    sigma_sq.insert(ch, s);
+                }
+            }
             projections.insert(ch, (out_dim, proj));
         }
 
         let dims: Vec<usize> = projections.values().map(|(d, _)| *d).collect();
         let _max_dim = dims.iter().max().copied().unwrap_or(0);
-        Ok(Self { projections })
+        Ok(Self { projections, sigma_sq })
     }
 
     fn project(out_dim: usize, proj: &[f32], x: &[f32]) -> Vec<f32> {
@@ -827,9 +990,19 @@ impl Embedder for LdaClassifier {
 }
 
 /// Load an LDA classifier from weights file.
+/// If the LDAC file contains per-character σ² (v2), seeds them into
+/// the FontVecStore so `sigma_sq()` returns training-time values.
 pub fn load_lda(path: &std::path::Path) -> Result<EmbeddingClassifier, String> {
     let lda = LdaClassifier::load(path)?;
-    Ok(EmbeddingClassifier::new(Box::new(lda)))
+    let sigmas = lda.sigma_sq.clone();
+    let ec = EmbeddingClassifier::new(Box::new(lda));
+    // Pre-seed σ² values — they become effective once FontVecStore
+    // is populated during index build (the store still serves as the
+    // fallback if no training-time σ² is available for a character).
+    for (ch, s) in sigmas {
+        ec.store.set_sigma_sq(ch, s);
+    }
+    Ok(ec)
 }
 
 // ---------------------------------------------------------------------------
@@ -983,9 +1156,9 @@ impl Classifier for MlpClassifier {
     fn classify(&self, ch: char, query: &CharFeatures, k: usize) -> Vec<(usize, f32)> {
         if let Some((net, probs)) = self.softmax_probs(ch, query) {
             let mut scored: Vec<(usize, f32)> = net.class_map.iter().enumerate()
-                .map(|(ci, &fid)| (fid as usize, -probs[ci]))
+                .map(|(ci, &fid)| (fid as usize, probs[ci]))
                 .collect();
-            scored.sort_by(|a, b| a.1.partial_cmp(&b.1).unwrap_or(std::cmp::Ordering::Equal));
+            scored.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
             scored.truncate(k);
             scored
         } else {
@@ -993,11 +1166,25 @@ impl Classifier for MlpClassifier {
         }
     }
 
-    fn distance(&self, ch: char, query: &CharFeatures, font_id: usize) -> Option<f32> {
+    /// MLP produces probabilities natively via softmax — no σ² needed.
+    fn probabilities(&self, ch: char, query: &CharFeatures) -> Vec<(usize, f32)> {
+        if let Some((net, probs)) = self.softmax_probs(ch, query) {
+            let mut scored: Vec<(usize, f32)> = net.class_map.iter().enumerate()
+                .map(|(ci, &fid)| (fid as usize, probs[ci]))
+                .collect();
+            // Sort descending by probability (highest first)
+            scored.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
+            scored
+        } else {
+            Vec::new()
+        }
+    }
+
+    fn probability(&self, ch: char, query: &CharFeatures, font_id: usize) -> Option<f32> {
         let (net, probs) = self.softmax_probs(ch, query)?;
         for (ci, &fid) in net.class_map.iter().enumerate() {
             if fid as usize == font_id {
-                return Some(-probs[ci]);
+                return Some(probs[ci]);
             }
         }
         None
@@ -1037,50 +1224,55 @@ impl FusionClassifier {
 
 impl Classifier for FusionClassifier {
     fn classify(&self, ch: char, query: &CharFeatures, k: usize) -> Vec<(usize, f32)> {
-        // Collect each child's full ranked list
-        let child_results: Vec<Vec<(usize, f32)>> = self.children.iter()
-            .map(|(_, child)| child.classify(ch, query, usize::MAX))
-            .collect();
-
-        // Normalize each child's scores to [0,1] and compute weighted average
-        let mut fused: HashMap<usize, f32> = HashMap::new();
-
-        for (_ci, ((weight, _), results)) in
-            self.children.iter().zip(child_results.iter()).enumerate()
-        {
-            if results.is_empty() { continue; }
-            let min = results.iter().map(|(_, s)| *s).fold(f32::INFINITY, f32::min);
-            let max = results.iter().map(|(_, s)| *s).fold(f32::NEG_INFINITY, f32::max);
-            let range = max - min;
-            let norm_weight = weight / self.weight_sum;
-
-            for &(id, score) in results {
-                let normalized = if range > 1e-12 {
-                    (score - min) / range
-                } else {
-                    0.5
-                };
-                *fused.entry(id).or_insert(0.0) += norm_weight * normalized;
-            }
-        }
-
-        let mut scored: Vec<(usize, f32)> = fused.into_iter().collect();
-        scored.sort_by(|a, b| a.1.partial_cmp(&b.1).unwrap_or(std::cmp::Ordering::Equal));
-        scored.truncate(k);
-        scored
+        let mut probs = self.probabilities(ch, query);
+        probs.truncate(k);
+        probs
     }
 
-    fn distance(&self, ch: char, query: &CharFeatures, font_id: usize) -> Option<f32> {
-        // Weighted average of child distances (unnormalized)
-        let mut total = 0.0f32;
-        let mut any = false;
-        for (weight, child) in &self.children {
-            if let Some(d) = child.distance(ch, query, font_id) {
-                total += (weight / self.weight_sum) * d;
-                any = true;
-            }
+    /// Fusion probabilities via weighted geometric mean of child posteriors.
+    ///
+    /// For each font, computes `exp(Σ w_i * ln(p_i)) / Z` where `p_i` is
+    /// child i's probability and `w_i` is its normalized weight.  This is
+    /// equivalent to `(∏ p_i^w_i) / Z`, the weighted geometric mean of
+    /// individual posteriors, renormalized.
+    fn probabilities(&self, ch: char, query: &CharFeatures) -> Vec<(usize, f32)> {
+        // Collect child probability distributions
+        let child_probs: Vec<(f32, HashMap<usize, f32>)> = self.children.iter()
+            .map(|(weight, child)| {
+                let probs = child.probabilities(ch, query);
+                let map: HashMap<usize, f32> = probs.into_iter().collect();
+                (*weight / self.weight_sum, map)
+            })
+            .collect();
+
+        // Union of all font_ids
+        let mut all_ids: std::collections::HashSet<usize> = std::collections::HashSet::new();
+        for (_, map) in &child_probs {
+            for &id in map.keys() { all_ids.insert(id); }
         }
-        if any { Some(total) } else { None }
+
+        // Weighted sum of log-probabilities (geometric mean in log space)
+        let log_scores: Vec<(usize, f32)> = all_ids.into_iter().map(|id| {
+            let mut log_p = 0.0f32;
+            for (w, map) in &child_probs {
+                let p = map.get(&id).copied().unwrap_or(1e-30);
+                log_p += w * p.max(1e-30).ln();
+            }
+            (id, log_p)
+        }).collect();
+
+        // Softmax normalization
+        let max_lp = log_scores.iter().map(|(_, lp)| *lp)
+            .fold(f32::NEG_INFINITY, f32::max);
+        let exps: Vec<f32> = log_scores.iter().map(|(_, lp)| (lp - max_lp).exp()).collect();
+        let sum: f32 = exps.iter().sum();
+        let inv_sum = if sum > 0.0 { 1.0 / sum } else { 0.0 };
+
+        let mut result: Vec<(usize, f32)> = log_scores.iter().zip(exps)
+            .map(|(&(id, _), e)| (id, e * inv_sum))
+            .collect();
+        result.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
+        result
     }
 
     fn name(&self) -> &str {

@@ -1,7 +1,10 @@
-//! Shared SSIM (Structural Similarity Index) implementations for grayscale images.
+//! Shared image‐comparison implementations for grayscale images.
 //!
-//! Provides both a simple global SSIM and a Gaussian-windowed ink-aware SSIM
-//! with vertical shift search (used for font verification).
+//! Provides SSIM (legacy), Gaussian-windowed ink-aware SSIM with vertical
+//! shift search, and ZNCC (Zero-mean Normalised Cross-Correlation).
+//! ZNCC is the primary scoring metric for font verification — it is
+//! inherently invariant to linear brightness/contrast differences between
+//! scan and render.
 
 use image::GrayImage;
 
@@ -439,4 +442,185 @@ pub fn ssim_compare(crop: &GrayImage, render: &GrayImage) -> SsimResult {
         crop_compared: a_resized,
         render_compared: b_resized,
     }
+}
+
+// ---------------------------------------------------------------------------
+// ZNCC — Zero-mean Normalised Cross-Correlation
+// ---------------------------------------------------------------------------
+
+/// Windowed ZNCC between two grayscale images with vertical shift search.
+///
+/// Mirrors `ssim_windowed_best_vshift`: tries vertical offsets from
+/// 0 outward, keeps the best score, and exits early when a strong
+/// match is found.  ZNCC is inherently invariant to per-window mean
+/// and contrast differences, so no pre-normalisation is needed.
+pub fn zncc_windowed_best_vshift(
+    a: &GrayImage,
+    b: &GrayImage,
+    max_shift: i32,
+    bail_below: Option<f32>,
+) -> (f32, i32) {
+    const EARLY_EXIT: f32 = 0.96;
+    let mut best = -1.0f32;
+    let mut best_dy = 0i32;
+
+    let mut shifts = Vec::with_capacity((2 * max_shift + 1) as usize);
+    shifts.push(0i32);
+    for d in 1..=max_shift {
+        shifts.push(-d);
+        shifts.push(d);
+    }
+
+    for dy in shifts {
+        let score = zncc_windowed(a, b, dy, bail_below);
+        if score > best {
+            best = score;
+            best_dy = dy;
+            if best >= EARLY_EXIT {
+                break;
+            }
+        }
+    }
+    // Map from [-1, 1] to [0, 1] for compatibility with SSIM thresholds
+    let clamped = best.clamp(-1.0, 1.0);
+    let normalized = (clamped + 1.0) / 2.0;
+    (normalized, best_dy)
+}
+
+/// Windowed ZNCC on grayscale images with a vertical shift applied to b.
+///
+/// Uses 11×11 Gaussian-weighted windows stepped by 4 pixels, only counting
+/// windows that contain ink in either image.
+///
+/// ZNCC per window: Σ w·(a-μa)·(b-μb) / sqrt(Σ w·(a-μa)² · Σ w·(b-μb)²)
+pub fn zncc_windowed(a: &GrayImage, b: &GrayImage, b_dy: i32, bail_below: Option<f32>) -> f32 {
+    let (w, h) = a.dimensions();
+    if w < 11 || h < 11 {
+        return zncc_global(a, b);
+    }
+
+    let kernel = gaussian_kernel_11x11();
+    const INK_THRESHOLD: u8 = 240;
+    const MIN_INK_PIXELS: u32 = 3;
+
+    let half = 5i32;
+    let bw = b.width() as i32;
+    let bh = b.height() as i32;
+
+    let mut zncc_sum = 0.0f64;
+    let mut window_count = 0u64;
+    let step = 4u32;
+
+    let mut cy = half as u32;
+    while cy + (half as u32) < h {
+        let mut cx = half as u32;
+        while cx + (half as u32) < w {
+            let mut ink_count = 0u32;
+            let mut mu_a = 0.0f64;
+            let mut mu_b = 0.0f64;
+            let mut sum_wa2 = 0.0f64;
+            let mut sum_wb2 = 0.0f64;
+            let mut sum_wab = 0.0f64;
+
+            for ky in 0..11u32 {
+                let py = (cy as i32 - half + ky as i32) as u32;
+                let by = py as i32 + b_dy;
+                for kx in 0..11u32 {
+                    let px = (cx as i32 - half + kx as i32) as u32;
+                    let va_u8 = a.get_pixel(px, py).0[0];
+                    let vb_u8 = if by >= 0 && by < bh && (px as i32) < bw {
+                        b.get_pixel(px, by as u32).0[0]
+                    } else {
+                        255u8
+                    };
+
+                    if va_u8 < INK_THRESHOLD || vb_u8 < INK_THRESHOLD {
+                        ink_count += 1;
+                    }
+
+                    let wt = kernel[ky as usize][kx as usize];
+                    let va = va_u8 as f64;
+                    let vb = vb_u8 as f64;
+                    mu_a += wt * va;
+                    mu_b += wt * vb;
+                    sum_wa2 += wt * va * va;
+                    sum_wb2 += wt * vb * vb;
+                    sum_wab += wt * va * vb;
+                }
+            }
+
+            if ink_count >= MIN_INK_PIXELS {
+                // Weighted variance/covariance via one-pass: sig² = E[x²] - E[x]²
+                let var_a = sum_wa2 - mu_a * mu_a;
+                let var_b = sum_wb2 - mu_b * mu_b;
+                let cov_ab = sum_wab - mu_a * mu_b;
+
+                let denom = (var_a * var_b).sqrt();
+                let local_zncc = if denom < 1e-10 {
+                    // Both images constant in this window → perfect match
+                    1.0
+                } else {
+                    cov_ab / denom
+                };
+
+                zncc_sum += local_zncc;
+                window_count += 1;
+            }
+
+            cx += step;
+        }
+
+        if let Some(bail_thresh) = bail_below {
+            if window_count >= 8 {
+                let running = (zncc_sum / window_count as f64) as f32;
+                if running < bail_thresh {
+                    return running.clamp(-1.0, 1.0);
+                }
+            }
+        }
+
+        cy += step;
+    }
+
+    if window_count == 0 {
+        return zncc_global(a, b);
+    }
+
+    (zncc_sum / window_count as f64).clamp(-1.0, 1.0) as f32
+}
+
+/// Global ZNCC between two grayscale images.
+fn zncc_global(a: &GrayImage, b: &GrayImage) -> f32 {
+    let w = a.width().max(b.width()) as usize;
+    let h = a.height().max(b.height()) as usize;
+    let n = (w * h) as f64;
+    if n < 1.0 { return 0.0; }
+
+    let mut sum_a = 0.0f64;
+    let mut sum_b = 0.0f64;
+    let mut sum_a2 = 0.0f64;
+    let mut sum_b2 = 0.0f64;
+    let mut sum_ab = 0.0f64;
+
+    for y in 0..h {
+        for x in 0..w {
+            let va = if (x as u32) < a.width() && (y as u32) < a.height() {
+                a.get_pixel(x as u32, y as u32).0[0] as f64
+            } else { 255.0 };
+            let vb = if (x as u32) < b.width() && (y as u32) < b.height() {
+                b.get_pixel(x as u32, y as u32).0[0] as f64
+            } else { 255.0 };
+            sum_a += va;
+            sum_b += vb;
+            sum_a2 += va * va;
+            sum_b2 += vb * vb;
+            sum_ab += va * vb;
+        }
+    }
+
+    let var_a = sum_a2 / n - (sum_a / n).powi(2);
+    let var_b = sum_b2 / n - (sum_b / n).powi(2);
+    let cov = sum_ab / n - (sum_a / n) * (sum_b / n);
+    let denom = (var_a * var_b).sqrt();
+    if denom < 1e-10 { 1.0 } else { (cov / denom).clamp(-1.0, 1.0) as f32 }
 }
