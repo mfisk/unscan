@@ -1847,6 +1847,7 @@ pub fn extract_line_chars(
         // Crop the word at its expanded bbox (ink-expanded by expand_words_to_ink).
         // Don't ink-trim — trimming picks up stray text from adjacent lines.
         let word_img = image::imageops::crop_imm(page, wx, wy, crop_w, crop_h).to_image();
+        let word_img = contrast_normalize_char(&word_img);
 
         let (_word_w, word_h) = word_img.dimensions();
         let all_chars: Vec<char> = word.text.chars().collect();
