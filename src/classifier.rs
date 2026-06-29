@@ -242,23 +242,11 @@ impl CharModel {
             let p = 1.0 / dists.len() as f32;
             return dists.into_iter().map(|(id, _)| (id, p)).collect();
         };
+        let inv2s = 1.0 / (2.0 * sigma);
         let mut probs: Vec<(u32, f32)> = {
+            // Standard Gaussian kernel with softmax max-subtraction for numerical stability
             let min_d = dists.iter().map(|(_, d)| *d).fold(f32::INFINITY, f32::min);
-            let max_d = dists.iter().map(|(_, d)| *d).fold(f32::NEG_INFINITY, f32::max);
-            // DIAGNOSTIC: print once per 500 calls
-            use std::sync::atomic::{AtomicU64, Ordering};
-            static DIAG_COUNT: AtomicU64 = AtomicU64::new(0);
-            let count = DIAG_COUNT.fetch_add(1, Ordering::Relaxed);
-            if count < 20 {
-                let top5: Vec<(u32, f32)> = {
-                    let mut d2 = dists.clone();
-                    d2.sort_by(|a, b| a.1.partial_cmp(&b.1).unwrap());
-                    d2[..5.min(d2.len())].to_vec()
-                };
-                eprintln!("DIAG probabilities: n_centroids={} sigma_sq={:.4} min_d={:.4} max_d={:.4} range={:.4} top5_dists={:?}",
-                    self.centroids.len(), sigma, min_d, max_d, max_d - min_d, top5);
-            }
-            let raw: Vec<f32> = dists.iter().map(|(_, d)| (-(d - min_d) / sigma).exp()).collect();
+            let raw: Vec<f32> = dists.iter().map(|(_, d)| (-(d - min_d) * inv2s).exp()).collect();
             let sum: f32 = raw.iter().sum();
             if sum < 1e-30 {
                 let p = 1.0 / dists.len() as f32;
