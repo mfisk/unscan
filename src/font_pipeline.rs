@@ -22,6 +22,7 @@ use crate::font_match;
 use crate::font_scan;
 use crate::ground_truth;
 use crate::ocr::{TextLine, TextRegion};
+use crate::glyph_map::GlyphMap;
 use crate::segment;
 use crate::verify;
 
@@ -65,6 +66,7 @@ pub fn match_lines(
     font_registry: &font_scan::FontRegistry,
     font_cache: &font_cache::FontCache,
     classifier: &dyn classifier::Classifier,
+    glyph_map: &GlyphMap,
     ground_truth: Option<&ground_truth::GroundTruth>,
     dominant_font_candidate: Option<&font_match::FontMatchResult>,
     args: &cli::Args,
@@ -209,11 +211,11 @@ pub fn match_lines(
 
             // ── Score plain path ─────────────────────────────────
             let ci_t0 = std::time::Instant::now();
-            let ci_result_plain = font_match::identify_font(char_crops, args.thoroughness, args.full_audit(), classifier);
+            let ci_result_plain = font_match::identify_glyph(char_crops, args.thoroughness, args.full_audit(), classifier, glyph_map);
 
             // ── Score ligature path (if present) ─────────────────
             let ci_result_lig = line_crops.ligature.as_ref().map(|lig_crops| {
-                font_match::identify_font(lig_crops, args.thoroughness, args.full_audit(), classifier)
+                font_match::identify_glyph(lig_crops, args.thoroughness, args.full_audit(), classifier, glyph_map)
             });
             prof_ci_us.fetch_add(ci_t0.elapsed().as_micros() as u64, Ordering::Relaxed);
             // ── Pick the winner: higher top score wins ───────────
@@ -231,18 +233,18 @@ pub fn match_lines(
 
             // Store both paths for audit
             ci_top_for_audit = ci_result.scores.iter()
-                .map(|(name, score)| (name.clone(), Some(*score))).collect();
+                .map(|(fk, score)| (fk.clone(), Some(*score))).collect();
             ci_char_detail = ci_result.char_detail.clone();
 
             // Store the alternate path for audit
             let (ci_top_lig_audit, ci_char_lig_audit) = if let Some(ref lig_result) = ci_result_lig {
-                (lig_result.scores.iter().map(|(n, s)| (n.clone(), Some(*s))).collect(),
+                (lig_result.scores.iter().map(|(fk, s)| (fk.clone(), Some(*s))).collect::<Vec<_>>(),
                  lig_result.char_detail.clone())
             } else {
                 (Vec::new(), Vec::new())
             };
             let (ci_top_plain_audit, ci_char_plain_audit) = (
-                ci_result_plain.scores.iter().map(|(n, s)| (n.clone(), Some(*s))).collect::<Vec<_>>(),
+                ci_result_plain.scores.iter().map(|(fk, s)| (fk.clone(), Some(*s))).collect::<Vec<_>>(),
                 ci_result_plain.char_detail.clone(),
             );
 
@@ -262,19 +264,21 @@ pub fn match_lines(
 
             // ── Font selection: CI #1, with SSIM tie-break ───────
             let mut tie_candidates_audit: Vec<audit::TieCandidate> = Vec::new();
-            if let Some((_top_key, top_score)) = ci_result.scores.first() {
+            if let Some((ref _top_key, top_score)) = ci_result.scores.first() {
+                let top_score = *top_score;
                 // Collect all candidates that share the top CI score
                 let tied: Vec<&(String, f32)> = ci_result.scores.iter()
-                    .take_while(|(_, s)| *s == *top_score)
+                    .take_while(|(_, s)| *s == top_score)
                     .collect();
 
                 if tied.len() >= 2 {
-                    // Multiple candidates tied — SSIM decides
+                    // Multiple fonts tied — SSIM decides
                     let mut best: Option<(font_match::FontMatchResult, f32)> = None;
                     let mut log_parts: Vec<String> = Vec::new();
                     let mut tie_ssim_results: Vec<(String, String, f32)> = Vec::new();
-                    for (ti, (key, _)) in tied.iter().enumerate() {
-                        let fe = match font_registry.by_key(key) {
+                    let mut ti = 0usize;
+                    for (font_key, _) in tied.iter().map(|&&(ref fk, s)| (fk, s)) {
+                        let fe = match font_registry.by_key(font_key) {
                             Some(fe) => fe,
                             None => continue,
                         };
@@ -306,10 +310,11 @@ pub fn match_lines(
                                 variant_tag: fe.variant_tag.clone(),
                                 glyph_overrides: fe.glyph_overrides.clone(),
                                 variations: fe.variations.clone(),
-                                score: *top_score,
+                                score: top_score,
                                 best_dy: dy,
                             }, ssim));
                         }
+                        ti += 1;
                     }
                     // Build tie_candidates for audit
                     let winner_key = best.as_ref().map(|(fm, _)| fm.font_key.clone());
@@ -325,9 +330,9 @@ pub fn match_lines(
                     }
                     (best.map(|(fm, _)| fm), tie_candidates_audit)
                 } else {
-                    // No tie — use CI #1 directly
-                    let (ref key, score) = *tied[0];
-                    (font_registry.by_key(key)
+                    // No tie — use CI #1 directly, font_key already resolved
+                    let (ref font_key, score) = *tied[0];
+                    let fm = font_registry.by_key(font_key)
                         .map(|fe| font_match::FontMatchResult {
                             font_name: fe.family_name.clone(),
                             font_path: fe.path.clone(),
@@ -337,7 +342,8 @@ pub fn match_lines(
                             variations: fe.variations.clone(),
                             score,
                             best_dy: 0,
-                        }), Vec::new())
+                        });
+                    (fm, Vec::new())
                 }
             } else {
                 (None, Vec::new())
@@ -406,12 +412,12 @@ pub fn match_lines(
                 })
                 .collect();
 
-            // Resolve chosen and GT font IDs once
-            let chosen_font_id = font_result.as_ref()
+            // Resolve chosen and GT font keys
+            let chosen_font_key: Option<String> = font_result.as_ref()
                 .filter(|fr| !fr.font_key.is_empty())
-                .and_then(|fr| classifier.font_id(&fr.font_key));
+                .map(|fr| fr.font_key.clone());
 
-            let gt_font_id = ground_truth.as_ref().and_then(|gt| {
+            let gt_font_key: Option<String> = ground_truth.as_ref().and_then(|gt| {
                 let bbox_px = [line.x as f32, line.y as f32,
                                (line.x + line.width) as f32,
                                (line.y + line.height) as f32];
@@ -420,13 +426,14 @@ pub fn match_lines(
                 let gt_key = font_registry.iter()
                     .find(|fe| fe.postscript_name == gt_ps)
                     .map(|fe| fe.font_key())?;
-                // Inject GT font into ci_top_for_audit if missing
-                if !ci_top_for_audit.iter().any(|(n, _)| n == &gt_key) {
-                    if let Some(gfid) = classifier.font_id(&gt_key) {
+                // Inject GT font into ci_top_for_audit if its font_key is missing
+                if !ci_top_for_audit.iter().any(|(fk, _)| *fk == gt_key) {
+                    if let Some(&(_, _ch, _)) = crop_feats.first() {
                         let gt_log_probs: Vec<(f32, f32)> = crop_feats.iter()
-                            .filter_map(|&(_, ch, ref feat)| {
-                                let p = classifier.probability(ch, feat, gfid)?;
-                                Some((p.max(1e-30).ln(), font_match::char_weight(ch)))
+                            .filter_map(|&(_, ch2, ref feat)| {
+                                let gid = glyph_map.glyph_id_for_font(ch2, &gt_key)?;
+                                let p = classifier.probability(ch2, feat, gid)?;
+                                Some((p.max(1e-30).ln(), font_match::char_weight(ch2)))
                             })
                             .collect();
                         if !gt_log_probs.is_empty() {
@@ -437,11 +444,11 @@ pub fn match_lines(
                         }
                     }
                 }
-                classifier.font_id(&gt_key)
+                Some(gt_key)
             });
 
             // One probabilities() call per character; extract
-            // rank and probability for both chosen and GT font IDs.
+            // rank and probability for chosen and GT glyph IDs (per-char via GlyphMap).
             let mut c_ranks = HashMap::new();
             let mut c_probs = HashMap::new();
             let mut g_ranks = HashMap::new();
@@ -452,23 +459,27 @@ pub fn match_lines(
                 if probs.is_empty() { continue; }
 
                 // Extract rank (1-based position in probability-sorted list)
-                // and probability for any font_id
-                let lookup = |fid: usize| -> Option<(usize, f32)> {
+                // and probability for a glyph_id
+                let lookup = |gid: usize| -> Option<(usize, f32)> {
                     probs.iter().enumerate()
-                        .find(|(_, (id, _))| *id == fid)
+                        .find(|(_, (id, _))| *id == gid)
                         .map(|(pos, (_, p))| (pos + 1, *p))
                 };
 
-                if let Some(fid) = chosen_font_id {
-                    if let Some((rank, prob)) = lookup(fid) {
-                        c_ranks.insert(crop_idx, rank);
-                        c_probs.insert(crop_idx, prob);
+                if let Some(ref fk) = chosen_font_key {
+                    if let Some(gid) = glyph_map.glyph_id_for_font(ch, fk) {
+                        if let Some((rank, prob)) = lookup(gid) {
+                            c_ranks.insert(crop_idx, rank);
+                            c_probs.insert(crop_idx, prob);
+                        }
                     }
                 }
-                if let Some(fid) = gt_font_id {
-                    if let Some((rank, prob)) = lookup(fid) {
-                        g_ranks.insert(crop_idx, rank);
-                        g_probs.insert(crop_idx, prob);
+                if let Some(ref gtk) = gt_font_key {
+                    if let Some(gid) = glyph_map.glyph_id_for_font(ch, gtk) {
+                        if let Some((rank, prob)) = lookup(gid) {
+                            g_ranks.insert(crop_idx, rank);
+                            g_probs.insert(crop_idx, prob);
+                        }
                     }
                 }
             }
@@ -559,9 +570,8 @@ pub fn match_lines(
                             let path = font_ref_dir.join(&fname);
                             if path.exists() { continue; }
                             let gid_override = override_map.get(ch).map(|&gid| ab_glyph::GlyphId(gid));
-                            let font_key = fr.font_key.clone();
-                            let ref_img = char_render::get_rendered_char_default(&font, &font_key, *ch, gid_override);
-                            if let Some(img) = ref_img {
+                            let ref_img = char_render::get_rendered_char_default(&font, *ch, gid_override);
+                            if let Some((_hash, img)) = ref_img {
                                 let _ = img.save(&path);
                             }
                         }

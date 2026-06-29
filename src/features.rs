@@ -1307,7 +1307,7 @@ fn measure_mean_stroke_width(img: &GrayImage) -> f32 {
 }
 
 /// Aggregate per-char weighted log-probabilities into a single CI score.
-/// Used by both `identify_font` and GT-font injection — one formula,
+/// Used by both `identify_glyph` and GT-font injection — one formula,
 /// one implementation.  Higher = better (higher probability = better match).
 ///
 /// Input: `(ln(prob), char_weight)` pairs for each matched character.

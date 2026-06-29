@@ -2,38 +2,99 @@
 // ZnccClassifier — pixel-level raster comparison via ZNCC
 // ---------------------------------------------------------------------------
 //
-// Bypasses the feature vector entirely.  Stores the normalised reference
-// glyph raster for each (char, font) pair and compares query crops
-// directly using zero-mean normalised cross-correlation.
+// No training step.  At classification time, iterates unique glyph
+// images from the GlyphMap and computes pairwise ZNCC against the
+// query crop.  Since images are hash-addressed, each unique render is
+// compared exactly once regardless of how many fonts share it.
 //
 // ZNCC scores (in [−1, 1]) are converted to probabilities via softmax
 // with a temperature parameter, so the output conforms to the Classifier
 // trait's probability interface.
+//
+// Returns glyph_ids (indices into GlyphMap groups for the given char),
+// not font_ids.
 
-use std::collections::HashMap;
-use image::GrayImage;
 use crate::features::CharFeatures;
 use crate::classifier::Classifier;
 use crate::compare_rasters::zncc_global_pub;
+use crate::glyph_map::GlyphMap;
+use crate::char_render::RenderParams;
 
 /// Temperature for ZNCC→probability conversion.
-/// Higher = flatter distribution; lower = more peaked.
-/// Tuned so that a ZNCC gap of ~0.05 produces a meaningful probability gap.
 const ZNCC_TEMPERATURE: f32 = 10.0;
 
 pub struct ZnccClassifier {
-    /// Per-char reference rasters: char → [(font_id, raster)]
-    refs: HashMap<char, Vec<(usize, GrayImage)>>,
-    /// Number of distinct font IDs seen.
-    n_fonts: usize,
+    /// Shared glyph equivalence map (glyph_id → font_keys per char).
+    glyph_map: GlyphMap,
+    /// Render parameters for loading cached glyphs.
+    render_params: RenderParams,
+    /// Per-char: glyph_id → image hash, for loading cached PNGs.
+    /// Built on first access per char from GlyphMap + cache probing.
+    glyph_hashes: std::collections::HashMap<char, Vec<u64>>,
 }
 
 impl ZnccClassifier {
-    pub fn new() -> Self {
+    /// Build from a pre-built GlyphMap.  No training — reference rasters
+    /// are loaded from the hash-addressed cache at classification time.
+    pub fn from_glyph_map(
+        glyph_map: GlyphMap,
+        render_params: &RenderParams,
+    ) -> Self {
+        let total = glyph_map.groups.values().map(|g| g.len()).sum::<usize>();
+        let n_chars = glyph_map.groups.len();
+        eprintln!("ZNCC: {total} unique glyphs across {n_chars} chars (lazy render)");
         Self {
-            refs: HashMap::new(),
-            n_fonts: 0,
+            glyph_map,
+            render_params: render_params.clone(),
+            glyph_hashes: std::collections::HashMap::new(),
         }
+    }
+
+    /// Ensure glyph_hashes are populated for a character.
+    /// We need the image hash to load from the hash-addressed cache.
+    /// On first call per char, render one representative font per group
+    /// to get the hash.
+    fn ensure_hashes(&mut self, ch: char) {
+        if self.glyph_hashes.contains_key(&ch) {
+            return;
+        }
+        let groups = match self.glyph_map.groups.get(&ch) {
+            Some(g) => g,
+            None => return,
+        };
+        let mut hashes = Vec::with_capacity(groups.len());
+        for group in groups {
+            // Try to render via the first font in the group to get the hash
+            let mut found_hash = 0u64;
+            for font_key in group {
+                // Extract path from font_key (before any | variant tag)
+                let path = font_key.split('|').next().unwrap_or(font_key);
+                let font_data = match std::fs::read(path) {
+                    Ok(d) => d,
+                    Err(_) => continue,
+                };
+                let font = match ab_glyph::FontRef::try_from_slice(&font_data) {
+                    Ok(f) => f,
+                    Err(_) => continue,
+                };
+                // Extract glyph overrides from variant tag if present
+                let gid_override = if font_key.contains('|') {
+                    // For variant fonts, we'd need the glyph overrides
+                    // For now, use default glyph mapping
+                    None
+                } else {
+                    None
+                };
+                if let Some((hash, _img)) = crate::char_render::get_rendered_char(
+                    &font, ch, gid_override, &self.render_params,
+                ) {
+                    found_hash = hash;
+                    break;
+                }
+            }
+            hashes.push(found_hash);
+        }
+        self.glyph_hashes.insert(ch, hashes);
     }
 }
 
@@ -49,24 +110,65 @@ impl Classifier for ZnccClassifier {
             Some(img) => img,
             None => return Vec::new(),
         };
-        let entries = match self.refs.get(&ch) {
-            Some(e) => e,
+
+        // Need mutable self for ensure_hashes — but trait says &self.
+        // Work around: load from cache directly using the glyph_map.
+        let groups = match self.glyph_map.groups.get(&ch) {
+            Some(g) => g,
             None => return Vec::new(),
         };
-        if entries.is_empty() {
+        let hashes = self.glyph_hashes.get(&ch);
+
+        let mut scored: Vec<(usize, f32)> = Vec::new();
+        for (glyph_id, group) in groups.iter().enumerate() {
+            // Try to get cached image via hash
+            let ref_img = if let Some(hs) = hashes {
+                if let Some(&h) = hs.get(glyph_id) {
+                    if h != 0 {
+                        crate::char_render::load_cached_glyph(ch, h, &self.render_params)
+                    } else {
+                        None
+                    }
+                } else {
+                    None
+                }
+            } else {
+                // Hashes not loaded yet — render from first font in group
+                let mut img_opt = None;
+                for font_key in group {
+                    let path = font_key.split('|').next().unwrap_or(font_key);
+                    let font_data = match std::fs::read(path) {
+                        Ok(d) => d,
+                        Err(_) => continue,
+                    };
+                    let font = match ab_glyph::FontRef::try_from_slice(&font_data) {
+                        Ok(f) => f,
+                        Err(_) => continue,
+                    };
+                    if let Some((_hash, img)) = crate::char_render::get_rendered_char(
+                        &font, ch, None, &self.render_params,
+                    ) {
+                        img_opt = Some(img);
+                        break;
+                    }
+                }
+                img_opt
+            };
+
+            let ref_img = match ref_img {
+                Some(img) => img,
+                None => continue,
+            };
+
+            let z = zncc_global_pub(query_img, &ref_img);
+            scored.push((glyph_id, z));
+        }
+
+        if scored.is_empty() {
             return Vec::new();
         }
 
-        // Compute ZNCC for each reference
-        let mut scored: Vec<(usize, f32)> = entries.iter()
-            .map(|(font_id, ref_img)| {
-                let z = zncc_global_pub(query_img, ref_img);
-                (*font_id, z)
-            })
-            .collect();
-
         // Softmax: convert ZNCC scores to probabilities
-        // Numerically stable: subtract max before exp
         let max_z = scored.iter().map(|(_, z)| *z)
             .fold(f32::NEG_INFINITY, f32::max);
         let mut sum = 0.0f32;
@@ -85,11 +187,9 @@ impl Classifier for ZnccClassifier {
         scored
     }
 
-    fn probability(&self, ch: char, query: &CharFeatures, font_id: usize) -> Option<f32> {
-        // For a single font lookup, compute full probabilities and find the one.
-        // Could be optimised to skip sort, but correctness first.
+    fn probability(&self, ch: char, query: &CharFeatures, glyph_id: usize) -> Option<f32> {
         self.probabilities(ch, query).iter()
-            .find(|(id, _)| *id == font_id)
+            .find(|(id, _)| *id == glyph_id)
             .map(|(_, p)| *p)
     }
 
@@ -97,20 +197,11 @@ impl Classifier for ZnccClassifier {
         "zncc"
     }
 
-    fn font_count(&self) -> usize {
-        self.n_fonts
+    fn glyph_count(&self, ch: char) -> usize {
+        self.glyph_map.glyph_count(ch)
     }
 
-    fn font_name(&self, _font_id: usize) -> Option<&str> {
-        None // ZNCC doesn't track font names
-    }
-
-    fn add_font(&mut self, font_id: usize, _font_name: &str, ch: char, features: &CharFeatures) {
-        if let Some(ref img) = features.raster {
-            self.refs.entry(ch).or_default().push((font_id, img.clone()));
-            if font_id >= self.n_fonts {
-                self.n_fonts = font_id + 1;
-            }
-        }
+    fn add_glyph(&mut self, _glyph_id: usize, _ch: char, _features: &CharFeatures) {
+        // No-op: ZNCC works from glyph_map + cached renders.
     }
 }

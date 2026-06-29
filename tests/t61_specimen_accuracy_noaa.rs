@@ -7,7 +7,7 @@
 //! Prerequisites: run t55_specimen_gen first to generate all test fixtures.
 //!
 //! Run with:
-//!   cargo test --test t61_specimen_accuracy_noaa -- --nocapture
+//!   cargo test --release --test t61_specimen_accuracy_noaa -- --nocapture
 
 mod common;
 

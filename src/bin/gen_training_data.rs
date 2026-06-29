@@ -89,7 +89,7 @@ struct Args {
 /// When `overrides` is provided (OT variant entries), uses resolve_glyph to
 /// pick the variant-specific glyph ID instead of the default cmap.
 fn render_char_at_native_height<F: Font>(
-    font: &F, font_key: &str, c: char, target_height: u32, aa: AaVariant,
+    font: &F, c: char, target_height: u32, aa: AaVariant,
     overrides: Option<&[(char, u16)]>,
 ) -> Option<GrayImage> {
     // Resolve glyph override for this character
@@ -104,7 +104,7 @@ fn render_char_at_native_height<F: Font>(
         aa,
         binarize_threshold: None,
     };
-    let full = unprint::char_render::get_rendered_char(font, font_key, c, glyph_override, &params)?;
+    let (_hash, full) = unprint::char_render::get_rendered_char(font, c, glyph_override, &params)?;
 
     let (_w, h) = full.dimensions();
 
@@ -294,7 +294,7 @@ fn main() {
         for &c in chars {
             for &ht in &args.heights {
                 for &aa in &aa_variants {
-                    let img = match render_char_at_native_height(&font, &font_key, c, ht, aa, overrides) {
+                    let img = match render_char_at_native_height(&font, c, ht, aa, overrides) {
                         Some(img) => img,
                         None => continue,
                     };

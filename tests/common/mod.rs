@@ -1,7 +1,9 @@
-//! Shared helpers for unscan integration tests (t30, t40, t50).
+//! Shared helpers for unprint integration tests.
 //!
 //! Contains CLI binary resolution, fixture generation, output parsers,
 //! and run wrappers used across the end-to-end test suites.
+
+#![allow(dead_code)]
 
 use std::path::{Path, PathBuf};
 use std::process::Command;
@@ -13,35 +15,18 @@ pub const EB_GARAMOND: &str = "/usr/share/fonts/opentype/ebgaramond/EBGaramond12
 
 static INDEX_ONCE: Once = Once::new();
 
-/// Ensure the character index exists before any test spawns unscan.
-/// Uses `Once` so parallel test threads only build it once; the rest block
-/// until it's ready, then all hit the cached file.
+/// Ensure the classifier weights exist before any test spawns unprint.
+/// With the PerCharModel architecture, the binary auto-trains if weights
+/// are missing, so this is now a no-op.
 pub fn ensure_index() {
-    INDEX_ONCE.call_once(|| {
-        let bin = unscan_bin();
-        eprintln!("[test setup] Pre-building character index via {:?} --index", bin);
-        let output = Command::new(&bin)
-            .arg("--index")
-            .env("RUST_LOG", "info")
-            .output()
-            .unwrap_or_else(|e| panic!("failed to run {:?} --index: {}", bin, e));
-        if !output.status.success() {
-            panic!(
-                "Index pre-build failed (exit {}):\n{}{}",
-                output.status,
-                String::from_utf8_lossy(&output.stdout),
-                String::from_utf8_lossy(&output.stderr),
-            );
-        }
-        eprintln!("[test setup] Index ready.");
-    });
+    // No-op: LDA weights at ~/.cache/unprint/lda-weights.bin are auto-trained.
 }
 
 // ── Binary & path helpers ────────────────────────────────────────────
 
 /// Locate the built `unscan` binary (release or debug).
 pub fn unscan_bin() -> PathBuf {
-    PathBuf::from(env!("CARGO_BIN_EXE_unscan"))
+    PathBuf::from(env!("CARGO_BIN_EXE_unprint"))
 }
 
 /// Path into the test-docs directory.
@@ -344,9 +329,9 @@ pub struct AccuracyResult {
     pub report_path: PathBuf,
 }
 
-/// Run unscan with --audit and --audit-vector for spatial ground-truth
-/// comparison against the vector PDF.  The built-in report.rs generates
-/// report.html and prints the summary line to stderr.
+/// Run unprint with --audit and --test for spatial ground-truth
+/// comparison against the vector PDF.  The --test flag outputs JSON
+/// results to stdout; --audit writes audit.json and report.html.
 ///
 /// `raster` is the rasterized input PDF.
 /// `vector` is the original vector PDF (ground truth).
@@ -365,9 +350,7 @@ pub fn measure_accuracy(raster: &Path, vector: &Path, label: &str) -> AccuracyRe
     }
     std::fs::create_dir_all(&audit_dir).expect("create audit dir");
 
-    let output_pdf = audit_dir.join("out.pdf");
-
-    // Run unscan with --audit and --test (ground-truth vector PDF)
+    // Run unprint with --audit and --test (ground-truth vector PDF)
     let bin = unscan_bin();
     let output = Command::new(&bin)
         .arg(raster)
@@ -375,9 +358,9 @@ pub fn measure_accuracy(raster: &Path, vector: &Path, label: &str) -> AccuracyRe
         .args(["--test", vector.to_str().unwrap()])
         .env("RUST_LOG", "info")
         .output()
-        .unwrap_or_else(|e| panic!("failed to run unscan: {}", e));
+        .unwrap_or_else(|e| panic!("failed to run unprint: {}", e));
 
-    assert!(output.status.success(), "unscan failed (exit {:?}):\n{}",
+    assert!(output.status.success(), "unprint failed (exit {:?}):\n{}",
         output.status.code(),
         String::from_utf8_lossy(&output.stderr));
 
@@ -386,44 +369,28 @@ pub fn measure_accuracy(raster: &Path, vector: &Path, label: &str) -> AccuracyRe
 
     let report_path = audit_dir.join("report.html");
     assert!(report_path.exists(),
-        "report.html not written — --audit-vector may not have triggered report generation");
+        "report.html not written — --test may not have triggered report generation");
 
-    let stderr = String::from_utf8_lossy(&output.stderr);
-    let (hits, misses, unmatched, skipped, total) = parse_report_summary(&stderr);
-    let compared = hits + misses;
+    // Parse the JSON test summary from stdout.
+    // Format: {"compared":N, "primary_hits":N, "hits":N, "pct":F, ...}
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let json: serde_json::Value = serde_json::from_str(stdout.trim())
+        .unwrap_or_else(|e| panic!(
+            "Failed to parse --test JSON from stdout: {}\nstdout was: {}",
+            e, stdout
+        ));
+
+    let compared = json["compared"].as_u64().unwrap_or(0) as usize;
+    let hits = json["primary_hits"].as_u64().unwrap_or(0) as usize;
+    let major_misses = json["major_misses"].as_u64().unwrap_or(0) as usize;
+    let _minor_misses = json["minor_misses"].as_u64().unwrap_or(0) as usize;
+    let ssim_failures = json["ssim_failures"].as_u64().unwrap_or(0) as usize;
+
+    let misses = compared.saturating_sub(hits);
+    let unmatched = major_misses;
+    let skipped = ssim_failures;
+    let total = compared;
     let accuracy = if compared > 0 { hits as f64 / compared as f64 } else { 0.0 };
 
     AccuracyResult { hits, misses, unmatched, skipped, total, compared, accuracy, report_path }
-}
-
-/// Parse: "Report: H/C (P%) — M misses ..."
-/// from unscan's stderr (generated by report.rs).
-pub fn parse_report_summary(output: &str) -> (usize, usize, usize, usize, usize) {
-    let mut hits = 0;
-    let mut misses = 0;
-    let unmatched = 0; // not separately reported by report.rs
-    let skipped = 0;   // not separately reported by report.rs
-
-    for line in output.lines() {
-        if !line.contains("Report:") || !line.contains("misses") {
-            continue;
-        }
-        // Parse "Report: H/C"
-        if let Some(after_report) = line.split("Report:").nth(1) {
-            let trimmed = after_report.trim();
-            if let Some(slash_pos) = trimmed.find('/') {
-                hits = trimmed[..slash_pos].trim().parse().unwrap_or(0);
-                // compared is everything between '/' and ' '
-                let after_slash = &trimmed[slash_pos + 1..];
-                if let Some(space_pos) = after_slash.find(' ') {
-                    let compared: usize = after_slash[..space_pos].trim().parse().unwrap_or(0);
-                    misses = compared.saturating_sub(hits);
-                }
-            }
-        }
-        break;
-    }
-
-    let total = hits + misses + skipped;
-    (hits, misses, unmatched, skipped, total)
 }

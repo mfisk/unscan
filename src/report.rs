@@ -17,6 +17,7 @@ use crate::audit::{AuditEntry, Decision};
 use crate::char_render;
 use crate::ground_truth::{self, GroundTruth};
 use crate::font_scan::FontEntry;
+use crate::glyph_map::GlyphMap;
 
 /// Metadata about the run, displayed in the report header.
 pub struct ReportMeta {
@@ -25,6 +26,17 @@ pub struct ReportMeta {
     pub render_aa: String,
     pub render_binarize: Option<u8>,
     pub elapsed: std::time::Duration,
+}
+
+// ── Glyph helpers ───────────────────────────────────────────────────────────
+
+/// Resolve a glyph_id for a character to a display-friendly font key.
+/// Falls back to "glyph#{id}" when the map has no entry.
+fn glyph_display_key(glyph_map: &GlyphMap, ch: char, glyph_id: usize) -> String {
+    glyph_map.fonts_for_glyph(ch, glyph_id)
+        .first()
+        .cloned()
+        .unwrap_or_else(|| format!("glyph#{glyph_id}"))
 }
 
 // ── Image helpers ───────────────────────────────────────────────────────────
@@ -329,6 +341,7 @@ fn classify_entries<'a>(
     gt: Option<&GroundTruth>,
     dpi: u32,
     font_catalog: &[FontEntry],
+    _glyph_map: &GlyphMap,
 ) -> Vec<ClassifiedEntry<'a>> {
     entries
         .iter()
@@ -427,10 +440,11 @@ pub fn enrich_audit_entries(
     gt: Option<&GroundTruth>,
     dpi: u32,
     font_catalog: &[FontEntry],
+    glyph_map: &GlyphMap,
 ) {
     // classify_entries produces a 1:1 parallel vec.
     let results: Vec<(String, Option<String>)> = {
-        let classified = classify_entries(entries, gt, dpi, font_catalog);
+        let classified = classify_entries(entries, gt, dpi, font_catalog, glyph_map);
         classified
             .iter()
             .map(|ce| (ce.kind.as_str().to_string(), ce.actual_font.clone()))
@@ -449,6 +463,7 @@ fn find_correct_ci_candidate(
     entry: &AuditEntry,
     actual_font: &str,
     font_catalog: &[FontEntry],
+    _glyph_map: &GlyphMap,
 ) -> (Option<String>, Option<f32>, Option<usize>) {
     let gt_ps = ground_truth::strip_subset_prefix_str(actual_font);
 
@@ -471,6 +486,7 @@ fn build_miss_block(
     ce: &ClassifiedEntry,
     audit_root: &Path,
     font_catalog: &[FontEntry],
+    glyph_map: &GlyphMap,
     font_data_cache: &mut FontDataCache,
     dpi: u32,
 ) -> String {
@@ -481,7 +497,7 @@ fn build_miss_block(
     // Find correct font CI candidate
     let (gt_key, gt_score, gt_rank) =
         if let Some(ref af) = ce.actual_font {
-            find_correct_ci_candidate(entry, af, font_catalog)
+            find_correct_ci_candidate(entry, af, font_catalog, glyph_map)
         } else {
             (None, None, None)
         };
@@ -580,6 +596,7 @@ fn build_miss_block(
             font_data_cache,
             diag_dir.as_deref(),
             font_catalog,
+            glyph_map,
         )
     };
 
@@ -1346,6 +1363,7 @@ fn build_char_table(
     font_data_cache: &mut FontDataCache,
     diag_dir: Option<&Path>,
     font_catalog: &[FontEntry],
+    glyph_map: &GlyphMap,
 ) -> String {
     let _ = font_catalog; // retained for future use
     let mut rows = String::new();
@@ -1373,8 +1391,7 @@ fn build_char_table(
             }
             let gid_override = fe.glyph_overrides.as_ref()
                 .and_then(|ovs| ovs.iter().find(|(c, _)| *c == ch).map(|(_, g)| ab_glyph::GlyphId(*g)));
-            let font_key = fe.path.to_string_lossy();
-            let img = char_render::get_rendered_char_default(&font, &font_key, ch, gid_override)?;
+            let (_hash, img) = char_render::get_rendered_char_default(&font, ch, gid_override)?;
             Some(img_to_b64_uri(&img))
         });
 
@@ -1395,8 +1412,7 @@ fn build_char_table(
             }
             let gid_override = fe.glyph_overrides.as_ref()
                 .and_then(|ovs| ovs.iter().find(|(c, _)| *c == ch).map(|(_, g)| ab_glyph::GlyphId(*g)));
-            let font_key = fe.path.to_string_lossy();
-            let img = char_render::get_rendered_char_default(&font, &font_key, ch, gid_override)?;
+            let (_hash, img) = char_render::get_rendered_char_default(&font, ch, gid_override)?;
             Some(img_to_b64_uri(&img))
         });
 
@@ -1412,10 +1428,11 @@ fn build_char_table(
         let mut ocr_parts = vec![format!("OCR: <b>{ocr_label}</b>")];
 
         // Best-scoring font for the OCR char (stage-1 diagnostic)
-        if let Some((ref nf, _np)) = cv.nearest.first() {
-            let font_name = nf.rsplit('/').next().unwrap_or(nf);
+        if let Some(&(gid, _np)) = cv.nearest.first() {
+            let font_name = glyph_display_key(glyph_map, cv.ch, gid);
+            let short = font_name.rsplit('/').next().unwrap_or(&font_name);
             ocr_parts.push(format!(
-                "<span class='font-mini'>{font_name}</span>"
+                "<span class='font-mini'>{short}</span>"
             ));
         }
 
@@ -1622,8 +1639,9 @@ pub fn compute_accuracy(
     gt: Option<&GroundTruth>,
     dpi: u32,
     font_catalog: &[FontEntry],
+    glyph_map: &GlyphMap,
 ) -> AccuracyResult {
-    let classified = classify_entries(entries, gt, dpi, font_catalog);
+    let classified = classify_entries(entries, gt, dpi, font_catalog, glyph_map);
 
     let mut hits = 0usize;
     let mut major_misses = 0usize;
@@ -1671,9 +1689,10 @@ pub fn generate_report(
     gt: Option<&GroundTruth>,
     dpi: u32,
     font_catalog: &[FontEntry],
+    glyph_map: &GlyphMap,
     meta: &ReportMeta,
 ) -> Result<(), String> {
-    let classified = classify_entries(entries, gt, dpi, font_catalog);
+    let classified = classify_entries(entries, gt, dpi, font_catalog, glyph_map);
 
     let mut hits = 0usize;
     let mut major_misses: Vec<&ClassifiedEntry> = Vec::new();
@@ -1722,6 +1741,7 @@ pub fn generate_report(
             ce,
             audit_root,
             font_catalog,
+            glyph_map,
             &mut font_data_cache,
             dpi,
         ));
@@ -1734,6 +1754,7 @@ pub fn generate_report(
             ce,
             audit_root,
             font_catalog,
+            glyph_map,
             &mut font_data_cache,
             dpi,
         ));
@@ -1746,6 +1767,7 @@ pub fn generate_report(
             ce,
             audit_root,
             font_catalog,
+            glyph_map,
             &mut font_data_cache,
             dpi,
         ));
@@ -1758,6 +1780,7 @@ pub fn generate_report(
             ce,
             audit_root,
             font_catalog,
+            glyph_map,
             &mut font_data_cache,
             dpi,
         ));

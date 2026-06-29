@@ -88,7 +88,7 @@ pub struct CharCiVote {
     pub crop_index: usize,
     pub best_prob: f32,
     pub passed_gate: bool,
-    pub nearest: Vec<(String, f32)>,
+    pub nearest: Vec<(usize, f32)>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub crop_path: Option<String>,
     /// 1-based rank of the chosen font among all fonts for this character.

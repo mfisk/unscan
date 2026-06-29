@@ -151,47 +151,33 @@ fn dense_project(out_dim: usize, mat: &[f32], x: &[f32]) -> Vec<f32> {
 /// fallback.
 #[allow(dead_code)]
 pub trait Classifier: Send + Sync {
-    /// Return the top `k` font matches for a character crop.
-    /// Returns `(font_id, probability)` sorted descending (highest = best).
+    /// Return the top `k` glyph matches for a character crop.
+    /// Returns `(glyph_id, probability)` sorted descending (highest = best).
+    /// glyph_id indexes into the GlyphMap for the given character.
     fn classify(&self, ch: char, query: &CharFeatures, k: usize) -> Vec<(usize, f32)>;
 
-    /// Return calibrated posterior probabilities for all fonts, sorted
+    /// Return calibrated posterior probabilities for all glyphs, sorted
     /// descending by probability.  Probabilities sum to 1.
-    ///
-    /// Default implementation delegates to `classify(ch, query, font_count())`.
     fn probabilities(&self, ch: char, query: &CharFeatures) -> Vec<(usize, f32)> {
-        self.classify(ch, query, self.font_count())
+        self.classify(ch, query, self.glyph_count(ch))
     }
 
-    /// Posterior probability of a specific font given a query.
-    /// Equivalent to finding `font_id` in `probabilities()`.
-    ///
-    /// Default calls `probabilities` and scans.
-    fn probability(&self, ch: char, query: &CharFeatures, font_id: usize) -> Option<f32> {
+    /// Posterior probability of a specific glyph given a query.
+    fn probability(&self, ch: char, query: &CharFeatures, glyph_id: usize) -> Option<f32> {
         self.probabilities(ch, query).iter()
-            .find(|(id, _)| *id == font_id)
+            .find(|(id, _)| *id == glyph_id)
             .map(|(_, p)| *p)
     }
 
     /// Short name for logging and cache invalidation.
     fn name(&self) -> &str;
 
-    /// Number of distinct fonts loaded.
-    fn font_count(&self) -> usize;
+    /// Number of distinct glyphs for a character.
+    fn glyph_count(&self, ch: char) -> usize;
 
-    /// Map a font_id back to its name.  Returns None for invalid ids.
-    fn font_name(&self, font_id: usize) -> Option<&str>;
-
-    /// Look up a font_id by name.  Returns None if the name is unknown.
-    fn font_id(&self, name: &str) -> Option<usize> {
-        (0..self.font_count()).find(|&id| self.font_name(id).map_or(false, |n| n == name))
-    }
-
-    /// Feed a font's feature vector for a character into the classifier.
-    /// Called once per (font_id, char) pair during index build.
-    /// Default implementation is a no-op (for classifiers like MLP that
-    /// don't use font vectors).
-    fn add_font(&mut self, _font_id: usize, _font_name: &str, _ch: char, _features: &CharFeatures) {}
+    /// Feed a glyph's feature vector for a character into the classifier.
+    /// Called once per (glyph_id, char) pair during index build.
+    fn add_glyph(&mut self, _glyph_id: usize, _ch: char, _features: &CharFeatures) {}
 }
 
 /// Convert `(font_id, sq_dist)` pairs to `(font_id, prob)` pairs using a
@@ -287,8 +273,6 @@ impl CharModel {
 /// by font_id (index into `font_names` / catalog).
 pub struct PerCharModel {
     pub chars: HashMap<char, CharModel>,
-    /// font_id → font_key.  Shared across all characters.
-    pub font_names: Vec<String>,
     /// Catalog hash at training time.  Used to reject stale .bin files
     /// when the font catalog changes.
     pub catalog_hash: u64,
@@ -296,7 +280,7 @@ pub struct PerCharModel {
 
 impl PerCharModel {
     pub fn new(catalog_hash: u64) -> Self {
-        Self { chars: HashMap::new(), font_names: Vec::new(), catalog_hash }
+        Self { chars: HashMap::new(), catalog_hash }
     }
 
     /// Serialize to the unified per-char .bin format.
@@ -329,14 +313,6 @@ impl PerCharModel {
         w.write_all(&version.to_le_bytes())?;
         w.write_all(&self.catalog_hash.to_le_bytes())?;
 
-        // Font names
-        w.write_all(&(self.font_names.len() as u32).to_le_bytes())?;
-        for name in &self.font_names {
-            let b = name.as_bytes();
-            w.write_all(&(b.len() as u32).to_le_bytes())?;
-            w.write_all(b)?;
-        }
-
         // Per-char models
         w.write_all(&(self.chars.len() as u32).to_le_bytes())?;
         for (&ch, model) in &self.chars {
@@ -348,8 +324,8 @@ impl PerCharModel {
 
             // Centroids
             w.write_all(&(model.centroids.len() as u32).to_le_bytes())?;
-            for (font_id, vec) in &model.centroids {
-                w.write_all(&font_id.to_le_bytes())?;
+            for (glyph_id, vec) in &model.centroids {
+                w.write_all(&glyph_id.to_le_bytes())?;
                 w.write_all(&(vec.len() as u32).to_le_bytes())?;
                 for &v in vec { w.write_all(&v.to_le_bytes())?; }
             }
@@ -388,19 +364,6 @@ impl PerCharModel {
 
         let mut pos = 16;
 
-        // Font names
-        let n_fonts = read_u32(data, &mut pos)? as usize;
-        let mut font_names = Vec::with_capacity(n_fonts);
-        for _ in 0..n_fonts {
-            let len = read_u32(data, &mut pos)? as usize;
-            if pos + len > data.len() { return Err("truncated font name".into()); }
-            let name = std::str::from_utf8(&data[pos..pos + len])
-                .map_err(|e| format!("bad font name UTF-8: {e}"))?
-                .to_string();
-            pos += len;
-            font_names.push(name);
-        }
-
         // Per-char models
         let n_chars = read_u32(data, &mut pos)? as usize;
         let mut chars = HashMap::with_capacity(n_chars);
@@ -417,10 +380,10 @@ impl PerCharModel {
             let n_centroids = read_u32(data, &mut pos)? as usize;
             let mut centroids = Vec::with_capacity(n_centroids);
             for _ in 0..n_centroids {
-                let font_id = read_u32(data, &mut pos)?;
+                let glyph_id = read_u32(data, &mut pos)?;
                 let vec_len = read_u32(data, &mut pos)? as usize;
                 let vec = read_f32s(data, &mut pos, vec_len)?;
-                centroids.push((font_id, vec));
+                centroids.push((glyph_id, vec));
             }
 
             // σ²
@@ -431,7 +394,7 @@ impl PerCharModel {
             chars.insert(ch, CharModel { weights, centroids, sigma_sq });
         }
 
-        Ok(Self { chars, font_names, catalog_hash })
+        Ok(Self { chars, catalog_hash })
     }
 }
 
@@ -562,12 +525,12 @@ impl Classifier for EmbeddingClassifier {
         }
     }
 
-    fn probability(&self, ch: char, query: &CharFeatures, font_id: usize) -> Option<f32> {
+    fn probability(&self, ch: char, query: &CharFeatures, glyph_id: usize) -> Option<f32> {
         let q = self.embedder.embed(ch, query);
         let cm = self.model.chars.get(&ch)?;
         let probs = cm.probabilities(&q);
         probs.into_iter()
-            .find(|(id, _)| *id as usize == font_id)
+            .find(|(id, _)| *id as usize == glyph_id)
             .map(|(_, p)| p)
     }
 
@@ -575,26 +538,18 @@ impl Classifier for EmbeddingClassifier {
         self.embedder.name()
     }
 
-    fn font_count(&self) -> usize {
-        self.model.font_names.len()
+    fn glyph_count(&self, ch: char) -> usize {
+        self.model.chars.get(&ch).map_or(0, |cm| cm.centroids.len())
     }
 
-    fn font_name(&self, font_id: usize) -> Option<&str> {
-        self.model.font_names.get(font_id).map(|s| s.as_str())
-    }
-
-    fn add_font(&mut self, font_id: usize, font_name: &str, ch: char, features: &CharFeatures) {
-        if font_id >= self.model.font_names.len() {
-            self.model.font_names.resize(font_id + 1, String::new());
-        }
-        self.model.font_names[font_id] = font_name.to_string();
+    fn add_glyph(&mut self, glyph_id: usize, ch: char, features: &CharFeatures) {
         let embedded = self.embedder.embed(ch, features);
         let cm = self.model.chars.entry(ch).or_insert_with(|| CharModel {
             weights: Vec::new(),
             centroids: Vec::new(),
             sigma_sq: 0.0,
         });
-        cm.centroids.push((font_id as u32, embedded));
+        cm.centroids.push((glyph_id as u32, embedded));
     }
 }
 
@@ -772,7 +727,7 @@ impl TripletClassifier {
             if ctx.char_counts[ci] == 0 { skipped += 1; continue; }
             let samples = ctx.load_samples(ci);
 
-            let mut font_set: Vec<u32> = samples.iter().map(|s| s.font_id).collect();
+            let mut font_set: Vec<u32> = samples.iter().map(|s| s.glyph_id).collect();
             font_set.sort_unstable();
             font_set.dedup();
             if font_set.len() < ctx.min_fonts.max(2) { skipped += 1; continue; }
@@ -782,7 +737,7 @@ impl TripletClassifier {
 
             let mut font_samples: HashMap<u32, Vec<usize>> = HashMap::new();
             for (i, s) in samples.iter().enumerate() {
-                font_samples.entry(s.font_id).or_default().push(i);
+                font_samples.entry(s.glyph_id).or_default().push(i);
             }
             let font_ids: Vec<u32> = font_samples.keys().copied().collect();
             let mut adam_t = 0usize;
@@ -860,9 +815,9 @@ impl TripletClassifier {
                 let mut centroid_sums: HashMap<u32, Vec<f32>> = HashMap::new();
                 let mut centroid_counts: HashMap<u32, usize> = HashMap::new();
                 for (i, s) in samples.iter().enumerate() {
-                    let entry = centroid_sums.entry(s.font_id).or_insert_with(|| vec![0.0; L3_OUT]);
+                    let entry = centroid_sums.entry(s.glyph_id).or_insert_with(|| vec![0.0; L3_OUT]);
                     for (j, &v) in embeddings[i].iter().enumerate() { entry[j] += v; }
-                    *centroid_counts.entry(s.font_id).or_insert(0) += 1;
+                    *centroid_counts.entry(s.glyph_id).or_insert(0) += 1;
                 }
                 let centroid_fids: Vec<u32> = centroid_sums.keys().copied().collect();
                 let centroid_vecs: Vec<Vec<f32>> = centroid_fids.iter().map(|fid| {
@@ -890,7 +845,7 @@ impl TripletClassifier {
                 let mut char_top1 = 0usize;
                 let mut char_top5 = 0usize;
                 for &i in &eval_indices {
-                    let correct_font = samples[i].font_id;
+                    let correct_font = samples[i].glyph_id;
                     let ci_pos = centroid_fids.iter().position(|&f| f == correct_font).unwrap();
                     let d_correct = dist_sq(&embeddings[i], &centroid_vecs[ci_pos]);
 
@@ -932,12 +887,6 @@ impl TripletClassifier {
         // Write TRIP v3 binary (per-char model: weights + centroids + σ²)
         if let Some(parent) = output.parent() { let _ = std::fs::create_dir_all(parent); }
         let mut model = PerCharModel::new(ctx.catalog_hash);
-        for (font_id, fe) in ctx.catalog.iter().enumerate() {
-            if font_id >= model.font_names.len() {
-                model.font_names.resize(font_id + 1, String::new());
-            }
-            model.font_names[font_id] = fe.font_key();
-        }
         for (tc_idx, (c, net)) in trained_chars.iter().enumerate() {
             // Flatten net params into weights blob
             let mut weights = Vec::with_capacity(PARAMS_PER_CHAR);
@@ -954,9 +903,9 @@ impl TripletClassifier {
             let mut counts: HashMap<u32, usize> = HashMap::new();
             for s in samples {
                 let emb = net.forward(&s.features).out;
-                let entry = sums.entry(s.font_id).or_insert_with(|| vec![0.0; emb.len()]);
+                let entry = sums.entry(s.glyph_id).or_insert_with(|| vec![0.0; emb.len()]);
                 for (j, &v) in emb.iter().enumerate() { entry[j] += v; }
-                *counts.entry(s.font_id).or_insert(0) += 1;
+                *counts.entry(s.glyph_id).or_insert(0) += 1;
             }
             let mut centroids: Vec<(u32, Vec<f32>)> = Vec::with_capacity(sums.len());
             for (&fid, sum) in &sums {
@@ -1080,7 +1029,6 @@ impl GlobalTripletClassifier {
             let mut cursor = Cursor::new(&data[weights_end..]);
             let store = FontVecStore::read_from(&mut cursor)?;
             let mut pcm = PerCharModel::new(0);
-            pcm.font_names = store.font_names;
             for (ch, entries) in &store.vecs {
                 let centroids: Vec<(u32, Vec<f32>)> = entries.iter()
                     .map(|(fid, v)| (*fid as u32, v.clone()))
@@ -1242,7 +1190,7 @@ impl PerCharFisherClassifier {
 
             let mut font_indices: HashMap<u32, Vec<usize>> = HashMap::new();
             for (i, s) in samples.iter().enumerate() {
-                font_indices.entry(s.font_id).or_default().push(i);
+                font_indices.entry(s.glyph_id).or_default().push(i);
             }
             if font_indices.len() < ctx.min_fonts.max(2) { skipped += 1; continue; }
 
@@ -1312,7 +1260,7 @@ impl PerCharFisherClassifier {
 
             let char_stats = crate::train::eval_mrr(
                 &samples, &eval_indices, &class_means, &centroid_fids,
-                ctx.font_family,
+                &ctx.glyph_family_for_char(c),
                 &|i| {
                     centroid_fids.iter().enumerate().map(|(ci2, &fid)| {
                         let mut d = 0.0f64;
@@ -1350,12 +1298,6 @@ impl PerCharFisherClassifier {
             let _ = std::fs::create_dir_all(parent);
         }
         let mut model = PerCharModel::new(ctx.catalog_hash);
-        for (font_id, fe) in ctx.catalog.iter().enumerate() {
-            if font_id >= model.font_names.len() {
-                model.font_names.resize(font_id + 1, String::new());
-            }
-            model.font_names[font_id] = fe.font_key();
-        }
         for (c, scores, class_means) in &fisher_chars {
             let nw = Self::normalize_scores(scores);
             let mut centroids: Vec<(u32, Vec<f32>)> = Vec::with_capacity(class_means.len());
@@ -1501,7 +1443,7 @@ impl MahalanobisClassifier {
 
             let mut font_indices: HashMap<u32, Vec<usize>> = HashMap::new();
             for (i, s) in samples.iter().enumerate() {
-                font_indices.entry(s.font_id).or_default().push(i);
+                font_indices.entry(s.glyph_id).or_default().push(i);
             }
             if font_indices.len() < ctx.min_fonts.max(2) { skipped += 1; continue; }
 
@@ -1630,7 +1572,7 @@ impl MahalanobisClassifier {
 
             let char_stats = crate::train::eval_mrr(
                 &samples, &eval_indices, &class_means, &centroid_fids,
-                ctx.font_family,
+                &ctx.glyph_family_for_char(c),
                 &|i| {
                     let mut emb = vec![0.0f64; FEAT_LEN];
                     for a in 0..FEAT_LEN {
@@ -1673,12 +1615,6 @@ impl MahalanobisClassifier {
         // Write MAHA v3 binary (per-char model: weights + centroids + σ²)
         if let Some(parent) = output.parent() { let _ = std::fs::create_dir_all(parent); }
         let mut model = PerCharModel::new(ctx.catalog_hash);
-        for (font_id, fe) in ctx.catalog.iter().enumerate() {
-            if font_id >= model.font_names.len() {
-                model.font_names.resize(font_id + 1, String::new());
-            }
-            model.font_names[font_id] = fe.font_key();
-        }
         for (c, linv, class_means) in &maha_chars {
             let mut centroids: Vec<(u32, Vec<f32>)> = Vec::with_capacity(class_means.len());
             for (&fid, mean) in class_means {
@@ -1848,7 +1784,7 @@ impl LdaClassifier {
 
             let mut font_indices: HashMap<u32, Vec<usize>> = HashMap::new();
             for (i, s) in samples.iter().enumerate() {
-                font_indices.entry(s.font_id).or_default().push(i);
+                font_indices.entry(s.glyph_id).or_default().push(i);
             }
             if font_indices.len() < ctx.min_fonts.max(2) { skipped += 1; continue; }
 
@@ -2039,7 +1975,7 @@ impl LdaClassifier {
 
             let char_stats = crate::train::eval_mrr(
                 &samples, &eval_indices, &class_means, &centroid_fids,
-                ctx.font_family,
+                &ctx.glyph_family_for_char(c),
                 &|i| {
                     let mut emb = vec![0.0f64; actual_dim];
                     for d in 0..actual_dim {
@@ -2080,12 +2016,6 @@ impl LdaClassifier {
         // Write LDAC v4 binary (per-char model: weights + centroids + σ²)
         if let Some(parent) = output.parent() { let _ = std::fs::create_dir_all(parent); }
         let mut model = PerCharModel::new(ctx.catalog_hash);
-        for (font_id, fe) in ctx.catalog.iter().enumerate() {
-            if font_id >= model.font_names.len() {
-                model.font_names.resize(font_id + 1, String::new());
-            }
-            model.font_names[font_id] = fe.font_key();
-        }
         for (c, actual_dim, proj, sigma, class_means) in &lda_chars {
             let mut centroids: Vec<(u32, Vec<f32>)> = Vec::with_capacity(class_means.len());
             for (&fid, mean) in class_means {
@@ -2388,7 +2318,7 @@ impl MlpClassifier {
 
             let mut font_indices: HashMap<u32, Vec<usize>> = HashMap::new();
             for (i, s) in samples.iter().enumerate() {
-                font_indices.entry(s.font_id).or_default().push(i);
+                font_indices.entry(s.glyph_id).or_default().push(i);
             }
             if font_indices.len() < ctx.min_fonts.max(2) { skipped += 1; continue; }
 
@@ -2415,7 +2345,7 @@ impl MlpClassifier {
                     let batch_len = batch_end - batch_start;
 
                     for &si in &sample_order[batch_start..batch_end] {
-                        let label = fid_to_class[&samples[si].font_id];
+                        let label = fid_to_class[&samples[si].glyph_id];
                         let mut noisy = samples[si].features;
                         if mlp_noise > 0.0 {
                             for f in &mut noisy {
@@ -2467,7 +2397,7 @@ impl MlpClassifier {
 
             let char_stats = crate::train::eval_mrr(
                 &samples, &eval_indices, &class_means, &centroid_fids,
-                ctx.font_family,
+                &ctx.glyph_family_for_char(c),
                 &|i| {
                     let logits = net.forward_eval(&samples[i].features);
                     let max_logit = logits.iter().copied().fold(f32::NEG_INFINITY, f32::max);
@@ -2571,10 +2501,10 @@ impl Classifier for MlpClassifier {
         }
     }
 
-    fn probability(&self, ch: char, query: &CharFeatures, font_id: usize) -> Option<f32> {
+    fn probability(&self, ch: char, query: &CharFeatures, glyph_id: usize) -> Option<f32> {
         let (net, probs) = self.softmax_probs(ch, query)?;
         for (ci, &fid) in net.class_map.iter().enumerate() {
-            if fid as usize == font_id {
+            if fid as usize == glyph_id {
                 return Some(probs[ci]);
             }
         }
@@ -2585,12 +2515,9 @@ impl Classifier for MlpClassifier {
         "mlp"
     }
 
-    fn font_count(&self) -> usize {
-        self.count_fonts()
-    }
-
-    fn font_name(&self, font_id: usize) -> Option<&str> {
-        self.font_names.get(font_id).map(|s| s.as_str())
+    fn glyph_count(&self, ch: char) -> usize {
+        // MLP class_map length for the char's network
+        self.nets.get(&ch).map_or(0, |net| net.class_map.len())
     }
 }
 
@@ -2674,17 +2601,13 @@ impl Classifier for FusionClassifier {
         "fusion"
     }
 
-    fn font_count(&self) -> usize {
-        self.children.iter().map(|(_, c)| c.font_count()).max().unwrap_or(0)
+    fn glyph_count(&self, ch: char) -> usize {
+        self.children.iter().map(|(_, c)| c.glyph_count(ch)).max().unwrap_or(0)
     }
 
-    fn font_name(&self, font_id: usize) -> Option<&str> {
-        self.children.first().and_then(|(_, c)| c.font_name(font_id))
-    }
-
-    fn add_font(&mut self, font_id: usize, font_name: &str, ch: char, features: &CharFeatures) {
+    fn add_glyph(&mut self, glyph_id: usize, ch: char, features: &CharFeatures) {
         for (_, child) in &mut self.children {
-            child.add_font(font_id, font_name, ch, features);
+            child.add_glyph(glyph_id, ch, features);
         }
     }
 }
@@ -2897,7 +2820,21 @@ pub fn build_classifier(
                 (0.5, fisher),
             ]))
         }
-        "zncc" => Box::new(crate::zncc_classifier::ZnccClassifier::new()),
+        "zncc" => {
+            if let Some((_font_dir, render_params)) = auto_train {
+                let gmap_path = crate::glyph_map::GlyphMap::default_path();
+                let glyph_map = crate::glyph_map::GlyphMap::load(&gmap_path)
+                    .unwrap_or_else(|e| {
+                        eprintln!("Cannot load glyph map from {}: {e}", gmap_path.display());
+                        eprintln!("Run with --train-lda first to build the glyph map.");
+                        std::process::exit(1);
+                    });
+                Box::new(crate::zncc_classifier::ZnccClassifier::from_glyph_map(glyph_map, render_params))
+            } else {
+                eprintln!("ZNCC classifier requires font directories");
+                std::process::exit(1);
+            }
+        }
         other => {
             eprintln!("Error: unknown classifier '{other}'. Use 'lda', 'perchar-fisher', 'triplet', 'global-triplet', 'mahalanobis', 'mlp', 'fusion', or 'zncc'.");
             std::process::exit(1);

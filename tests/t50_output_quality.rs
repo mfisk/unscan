@@ -139,8 +139,8 @@ fn output_smaller_than_input() {
     }
 
     let cases: &[(&str, &[&str])] = &[
-        ("punch-hires.pdf", &["--min-font-confidence", "0.0", "--min-ocr-confidence", "0"]),
-        ("punch-100dpi-big.pdf", &["--dpi", "100", "--min-font-confidence", "0.0", "--min-ocr-confidence", "0"]),
+        ("punch-hires.pdf", &["--min-ocr-confidence", "0"]),
+        ("punch-100dpi-big.pdf", &["--dpi", "100", "--min-ocr-confidence", "0"]),
     ];
 
     for (name, args) in cases {
@@ -175,10 +175,10 @@ fn visual_regression_output_matches_input() {
 
     let cases: &[(&str, u32, &[&str], f64)] = &[
         ("punch-hires.pdf", 300,
-         &["--min-font-confidence", "0.0", "--min-ocr-confidence", "0"],
+         &["--min-ocr-confidence", "0"],
          0.88),
         ("punch-100dpi-big.pdf", 100,
-         &["--dpi", "100", "--min-font-confidence", "0.0", "--min-ocr-confidence", "0"],
+         &["--dpi", "100", "--min-ocr-confidence", "0"],
          0.85),
     ];
 

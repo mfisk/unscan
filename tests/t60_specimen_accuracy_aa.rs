@@ -1,8 +1,8 @@
 //! Specimen accuracy — 300 dpi, anti-aliased.
 //!
-//! Runs unscan with --audit and --audit-vector against the AA-rasterized
-//! specimen.  The built-in report.rs compares each matched font against
-//! the vector PDF's spatial ground truth.
+//! Runs unprint with --audit and --test against the AA-rasterized
+//! specimen.  The --test flag compares each matched font against the
+//! vector PDF's spatial ground truth and outputs JSON results to stdout.
 //!
 //! Prerequisites: run t55_specimen_gen first to generate all test fixtures.
 //!
@@ -13,7 +13,7 @@ mod common;
 
 use common::{test_doc, ensure_index};
 
-/// Minimum acceptable accuracy (hits / compared).
+/// Minimum acceptable accuracy (primary_hits / compared).
 const MIN_ACCURACY: f64 = 0.93;
 
 #[test]
@@ -56,9 +56,37 @@ fn specimen_vectorizes_enough_lines() {
         "AA raster missing — run t55_specimen_gen first: {}",
         input.display());
 
-    let output = common::run_unscan(&input, &[]);
-    let count = common::parse_vectorized_count(&output)
-        .expect("could not parse vectorized count");
+    // Run with --audit to get audit.json, then count vectorized lines
+    let audit_dir = std::env::temp_dir().join("unscan-audit-t60-vec-count");
+    if audit_dir.exists() {
+        let _ = std::fs::remove_dir_all(&audit_dir);
+    }
+    std::fs::create_dir_all(&audit_dir).expect("create audit dir");
+
+    let bin = common::unscan_bin();
+    let result = std::process::Command::new(&bin)
+        .arg(&input)
+        .args(["--audit", audit_dir.to_str().unwrap()])
+        .env("RUST_LOG", "info")
+        .output()
+        .expect("failed to run unprint");
+
+    assert!(result.status.success(), "unprint failed: {}",
+        String::from_utf8_lossy(&result.stderr));
+
+    let audit_path = audit_dir.join("audit.json");
+    assert!(audit_path.exists(), "audit.json not written");
+
+    let audit_data = std::fs::read_to_string(&audit_path).expect("read audit.json");
+    let json: serde_json::Value = serde_json::from_str(&audit_data)
+        .expect("parse audit.json");
+
+    // Count vectorized entries from text_entries
+    let count = json["text_entries"].as_array()
+        .map(|entries| entries.iter()
+            .filter(|e| e["decision"].as_str() == Some("vectorized"))
+            .count())
+        .unwrap_or(0);
 
     eprintln!("specimen vectorized = {}", count);
     assert!(count >= 350, "specimen vectorized {} lines, expected >= 350", count);

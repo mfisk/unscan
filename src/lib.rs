@@ -19,5 +19,6 @@ pub mod classifier;
 pub mod seg_diag;
 pub mod compare_rasters;
 pub mod zncc_classifier;
+pub mod glyph_map;
 pub mod char_render;
 pub mod train;

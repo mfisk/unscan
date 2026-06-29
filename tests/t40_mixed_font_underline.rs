@@ -84,7 +84,6 @@ fn mixed_font_recovers_italic_and_bold_spans() {
     let result = std::process::Command::new(&bin)
         .arg(&input)
         .args(["-o", output_pdf.to_str().unwrap()])
-        .args(["--min-font-confidence", "0.0"])
         .args(["--min-ocr-confidence", "0"])
         .env("RUST_LOG", "info")
         .output()
