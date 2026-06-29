@@ -67,31 +67,25 @@ pub struct WordPlacement {
 /// 3. Computing windowed SSIM on the width-scaled render
 /// 4. Returning `ssim * aspect_penalty`
 pub fn verify_text_region(
-    original_gray: &GrayImage,
+    scan_crop: &GrayImage,
     font_data: &[u8],
     _text: &str,
-    x: u32,
-    y: u32,
-    width: u32,
-    height: u32,
     words: &[TextRegion],
+    crop_x: u32,
+    crop_y: u32,
     overrides: Option<&[(char, u16)]>,
     variant_tag: &str,
     variations: Option<&[([u8; 4], f32)]>,
     audit_dir: Option<&std::path::Path>,
     bail_below: Option<f32>,
 ) -> (f32, i32) {
-    let (iw, ih) = original_gray.dimensions();
-    let x = x.min(iw.saturating_sub(1));
-    let y = y.min(ih.saturating_sub(1));
-    let w = width.min(iw - x);
-    let h = height.min(ih - y);
+    let (w, h) = scan_crop.dimensions();
 
     if w < 3 || h < 3 {
         return (0.0, 0);
     }
 
-    let full_scan = image::imageops::crop_imm(original_gray, x, y, w, h).to_image();
+    let full_scan = scan_crop;
 
     // Page-level Hough deskew already corrected the full page before we get
     // here, so no per-line rotation needed.
@@ -99,8 +93,8 @@ pub fn verify_text_region(
         .iter()
         .map(|wr| WordPlacement {
             text: wr.text.clone(),
-            x_off: wr.x.saturating_sub(x),
-            y_off: wr.y.saturating_sub(y),
+            x_off: wr.x.saturating_sub(crop_x),
+            y_off: wr.y.saturating_sub(crop_y),
             width: wr.width,
             height: wr.height,
         })
@@ -149,11 +143,7 @@ pub fn verify_text_region(
                 render_for_score
             };
 
-            // Contrast-normalize scan crop for the visual diff only
-            let scan_for_diff = crate::features::contrast_normalize_char(
-                best_scan_crop.as_ref().unwrap(),
-            );
-            best_diff = Some(compute_abs_diff(&scan_for_diff, &render_ink));
+            best_diff = Some(compute_abs_diff(best_scan_crop.as_ref().unwrap(), &render_ink));
             best_render_ink = Some(render_ink);
         }
 

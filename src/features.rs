@@ -1185,43 +1185,64 @@ fn resample(src: &[f32], n: usize) -> [f32; PROFILE_BINS] {
 ///
 /// Maps the 1st-percentile pixel value → 0 and the 99th-percentile → 255.
 /// Applied to scan-side character crops so their dynamic range matches
-/// the full-range black-on-white rendered index characters, regardless
-/// of how the source PDF was rasterized or compressed.
-pub fn contrast_normalize_char(img: &GrayImage) -> GrayImage {
-    let raw = img.as_raw();
-    if raw.is_empty() {
-        return img.clone();
-    }
+/// Compute the p1/p99 percentile stretch range from a luminance histogram.
+/// Returns `Some((p1, p99))` when a valid stretch exists, `None` when flat.
+fn contrast_percentiles(luma: &[u8]) -> Option<(u8, u8)> {
+    if luma.is_empty() { return None; }
     let mut hist = [0u32; 256];
-    for &px in raw {
-        hist[px as usize] += 1;
-    }
-    let n = raw.len() as u32;
+    for &px in luma { hist[px as usize] += 1; }
+    let n = luma.len() as u32;
     let p1_target = n / 100;
     let p99_target = n * 99 / 100;
     let mut cum = 0u32;
-    let mut p1: u8 = 0;
-    let mut p99: u8 = 255;
+    let (mut p1, mut p99) = (0u8, 255u8);
     let mut found_p1 = false;
     for (val, &count) in hist.iter().enumerate() {
         cum += count;
-        if !found_p1 && cum >= p1_target {
-            p1 = val as u8;
-            found_p1 = true;
-        }
-        if cum >= p99_target {
-            p99 = val as u8;
-            break;
-        }
+        if !found_p1 && cum >= p1_target { p1 = val as u8; found_p1 = true; }
+        if cum >= p99_target { p99 = val as u8; break; }
     }
-    if p1 >= p99 {
+    if p1 < p99 { Some((p1, p99)) } else { None }
+}
+
+/// Apply a p1/p99 stretch to a single channel value.
+#[inline]
+fn stretch(v: u8, p1: u8, range: f32) -> u8 {
+    ((v as f32 - p1 as f32) * 255.0 / range).round().clamp(0.0, 255.0) as u8
+}
+
+/// Contrast-normalize a grayscale image via p1/p99 percentile stretch.
+/// This ensures symmetric treatment between training renders and inference
+/// crops: clean renders are effectively a no-op (p1≈0, p99≈255), while
+/// scanned/compressed pages get stretched to match
+/// the full-range black-on-white rendered index characters, regardless
+/// of how the source PDF was rasterized or compressed.
+pub fn contrast_normalize_char(img: &GrayImage) -> GrayImage {
+    let Some((p1, p99)) = contrast_percentiles(img.as_raw()) else {
         return img.clone();
-    }
+    };
     let range = (p99 - p1) as f32;
     let mut out = img.clone();
     for px in out.as_mut() {
-        let v = ((*px as f32 - p1 as f32) * 255.0 / range).round();
-        *px = v.clamp(0.0, 255.0) as u8;
+        *px = stretch(*px, p1, range);
+    }
+    out
+}
+
+/// Contrast-normalize an RGBA image, preserving colour.
+/// Computes the stretch from luminance, applies it to R/G/B channels.
+pub fn contrast_normalize_rgba(img: &image::RgbaImage) -> image::RgbaImage {
+    use image::DynamicImage;
+    let gray = DynamicImage::ImageRgba8(img.clone()).into_luma8();
+    let Some((p1, p99)) = contrast_percentiles(gray.as_raw()) else {
+        return img.clone();
+    };
+    let range = (p99 - p1) as f32;
+    let mut out = img.clone();
+    for px in out.pixels_mut() {
+        for c in 0..3 {
+            px[c] = stretch(px[c], p1, range);
+        }
     }
     out
 }
