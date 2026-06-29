@@ -521,6 +521,38 @@ pub fn match_lines(
                     let surr_h = surr_b - surr_y;
                     if surr_w >= 3 && surr_h >= 3 {
                         let crop = image::imageops::crop_imm(page_img, surr_x, surr_y, surr_w, surr_h).to_image();
+                        // Contrast-normalize to match what the segmenter sees.
+                        // Compute p1/p99 from luminance, stretch RGB channels.
+                        let crop = {
+                            let gray = image::DynamicImage::ImageRgba8(crop.clone()).into_luma8();
+                            let raw = gray.as_raw();
+                            let n = raw.len() as u32;
+                            let mut hist = [0u32; 256];
+                            for &px in raw { hist[px as usize] += 1; }
+                            let p1_target = n / 100;
+                            let p99_target = n * 99 / 100;
+                            let mut cum = 0u32;
+                            let (mut p1, mut p99) = (0u8, 255u8);
+                            let mut found_p1 = false;
+                            for (val, &count) in hist.iter().enumerate() {
+                                cum += count;
+                                if !found_p1 && cum >= p1_target { p1 = val as u8; found_p1 = true; }
+                                if cum >= p99_target { p99 = val as u8; break; }
+                            }
+                            if p1 < p99 {
+                                let range = (p99 - p1) as f32;
+                                let mut out = crop;
+                                for px in out.pixels_mut() {
+                                    for c in 0..3 {
+                                        let v = ((px[c] as f32 - p1 as f32) * 255.0 / range).round();
+                                        px[c] = v.clamp(0.0, 255.0) as u8;
+                                    }
+                                }
+                                out
+                            } else {
+                                crop
+                            }
+                        };
                         let _ = crop.save(ddir.join("scan_line.png"));
                         let _ = std::fs::write(
                             ddir.join("scan_line_origin.json"),
