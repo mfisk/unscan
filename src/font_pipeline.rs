@@ -84,14 +84,27 @@ pub fn match_lines(
     let line_matches: Vec<LineMatch> = lines.par_iter().enumerate().map(|(li, line)| {
         let line_num = li + 1; // 1-indexed for output
         let line_start = std::time::Instant::now();
+
+        // Crop and contrast-normalize the word-union bbox once for all verify calls.
+        let norm_crop = {
+            let iw = gray_page.width();
+            let ih = gray_page.height();
+            let cx = line.x.min(iw.saturating_sub(1));
+            let cy = line.y.min(ih.saturating_sub(1));
+            let cw = line.width.min(iw - cx);
+            let ch = line.height.min(ih - cy);
+            let raw = image::imageops::crop_imm(gray_page, cx, cy, cw, ch).to_image();
+            features::contrast_normalize_char(&raw)
+        };
+
         // ── Fast path: try dominant font via SSIM ────────────────
         if let (Some(fm), Some(ref fd)) = (dominant_font_candidate, &fast_path_font_data) {
             let (score, _dy) = verify::verify_text_region(
-                gray_page,
+                &norm_crop,
                 fd.as_slice(),
                 &line.text,
-                line.x, line.y, line.width, line.height,
                 &line.words,
+                line.x, line.y,
                 fm.glyph_overrides.as_deref(),
                 &fm.variant_tag,
                 fm.variations.as_deref(),
@@ -293,9 +306,9 @@ pub fn match_lines(
                             p
                         });
                         let (ssim, dy) = verify::verify_text_region(
-                            gray_page, &fd, &line.text,
-                            line.x, line.y, line.width, line.height,
+                            &norm_crop, &fd, &line.text,
                             &line.words,
+                            line.x, line.y,
                             fe.glyph_overrides.as_deref(), &fe.variant_tag,
                             fe.variations.as_deref(),
                             tie_audit_dir.as_deref(), None,
@@ -521,38 +534,7 @@ pub fn match_lines(
                     let surr_h = surr_b - surr_y;
                     if surr_w >= 3 && surr_h >= 3 {
                         let crop = image::imageops::crop_imm(page_img, surr_x, surr_y, surr_w, surr_h).to_image();
-                        // Contrast-normalize to match what the segmenter sees.
-                        // Compute p1/p99 from luminance, stretch RGB channels.
-                        let crop = {
-                            let gray = image::DynamicImage::ImageRgba8(crop.clone()).into_luma8();
-                            let raw = gray.as_raw();
-                            let n = raw.len() as u32;
-                            let mut hist = [0u32; 256];
-                            for &px in raw { hist[px as usize] += 1; }
-                            let p1_target = n / 100;
-                            let p99_target = n * 99 / 100;
-                            let mut cum = 0u32;
-                            let (mut p1, mut p99) = (0u8, 255u8);
-                            let mut found_p1 = false;
-                            for (val, &count) in hist.iter().enumerate() {
-                                cum += count;
-                                if !found_p1 && cum >= p1_target { p1 = val as u8; found_p1 = true; }
-                                if cum >= p99_target { p99 = val as u8; break; }
-                            }
-                            if p1 < p99 {
-                                let range = (p99 - p1) as f32;
-                                let mut out = crop;
-                                for px in out.pixels_mut() {
-                                    for c in 0..3 {
-                                        let v = ((px[c] as f32 - p1 as f32) * 255.0 / range).round();
-                                        px[c] = v.clamp(0.0, 255.0) as u8;
-                                    }
-                                }
-                                out
-                            } else {
-                                crop
-                            }
-                        };
+                        let crop = features::contrast_normalize_rgba(&crop);
                         let _ = crop.save(ddir.join("scan_line.png"));
                         let _ = std::fs::write(
                             ddir.join("scan_line_origin.json"),

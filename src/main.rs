@@ -397,12 +397,22 @@ fn run(args: &cli::Args, classifier: &mut dyn classifier::Classifier) -> Result<
                 if let Some(ref fm) = font_result {
                     let font_data = font_cache.load(&fm.font_path).ok();
                     if let Some(ref fd) = font_data {
+                        let norm_crop = {
+                            let iw = gray_page.width();
+                            let ih = gray_page.height();
+                            let cx = line.x.min(iw.saturating_sub(1));
+                            let cy = line.y.min(ih.saturating_sub(1));
+                            let cw = line.width.min(iw - cx);
+                            let ch = line.height.min(ih - cy);
+                            let raw = image::imageops::crop_imm(&gray_page, cx, cy, cw, ch).to_image();
+                            features::contrast_normalize_char(&raw)
+                        };
                         let (score, _dy) = verify::verify_text_region(
-                            &gray_page,
+                            &norm_crop,
                             fd.as_slice(),
                             &line.text,
-                            line.x, line.y, line.width, line.height,
                             &line.words,
+                            line.x, line.y,
                             fm.glyph_overrides.as_deref(),
                             &fm.variant_tag,
                             fm.variations.as_deref(),
