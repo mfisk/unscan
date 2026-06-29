@@ -524,14 +524,14 @@ fn build_miss_block(
         let data = font_data_cache.load(&fe.path)?;
         compute_inferred_font_size(data, &entry.word_bboxes, &fe.variant_tag, fe.variations.as_deref(), dpi)
     });
-    let unscan_font_size_pt = inferred_size.as_ref().map(|s| s.median_pt);
+    let unprint_font_size_pt = inferred_size.as_ref().map(|s| s.median_pt);
 
     let ssim_compare_html = if let Some(ref dd) = diag_dir {
         build_ssim_block(
             dd, actual_font, matched, entry.ssim_score,
             gt_render_uri.as_deref(), gt_diff_uri.as_deref(),
             gt_ssim,
-            gt_font_size_pt, unscan_font_size_pt,
+            gt_font_size_pt, unprint_font_size_pt,
             inferred_size.as_ref().map(|s| s.per_word.as_slice()),
         )
     } else {
@@ -989,7 +989,6 @@ fn render_correct_font_comparison(
             y_off: wb.y.saturating_sub(entry.bbox.y),
             width: wb.width,
             height: wb.height,
-            confidence: wb.confidence,
         })
         .collect();
 
@@ -1025,7 +1024,7 @@ fn render_correct_font_comparison(
             let scan_gray = scan_dyn.to_luma8();
             let diff_img = crate::verify::compute_abs_diff(&scan_gray, &render_img);
             // Compute ZNCC: same pipeline as verify_text_region
-            let (zncc_val, _dy) = crate::ssim::zncc_windowed_best_vshift(
+            let (zncc_val, _dy) = crate::compare_rasters::zncc_windowed_best_vshift(
                 &scan_gray, &render_img, 12, None,
             );
             (Some(img_to_b64_uri(&diff_img)), Some(zncc_val))
@@ -1039,7 +1038,7 @@ fn render_correct_font_comparison(
     (Some(render_uri), diff_uri, correct_ssim)
 }
 
-/// Compute the font size (in PDF points) that unscan would infer for the
+/// Compute the font size (in PDF points) that unprint would infer for the
 /// picked font, based on word-width matching.
 /// Per-word font-size detail for the audit report.
 #[derive(Clone)]
@@ -1104,7 +1103,7 @@ fn build_ssim_block(
     correct_diff_uri: Option<&str>,
     correct_ssim: Option<f32>,
     gt_font_size_pt: Option<f32>,
-    unscan_font_size_pt: Option<f32>,
+    unprint_font_size_pt: Option<f32>,
     per_word_sizes: Option<&[WordSizeDetail]>,
 ) -> String {
     let scan_path = diag_dir.join("ssim_scan.png");
@@ -1176,7 +1175,7 @@ fn build_ssim_block(
     };
 
     // Font size comparison row
-    let font_size_row = match (gt_font_size_pt, unscan_font_size_pt) {
+    let font_size_row = match (gt_font_size_pt, unprint_font_size_pt) {
         (Some(gt_sz), Some(us_sz)) => {
             let delta = us_sz - gt_sz;
             let pct = if gt_sz.abs() > 0.01 { delta / gt_sz * 100.0 } else { 0.0 };
@@ -1204,7 +1203,7 @@ fn build_ssim_block(
     // Per-word size breakdown row
     let per_word_row = if let Some(words) = per_word_sizes {
         if words.len() > 1 {
-            let median_pt = unscan_font_size_pt.unwrap_or(0.0);
+            let median_pt = unprint_font_size_pt.unwrap_or(0.0);
             let mut cells: Vec<String> = Vec::new();
             for w in words {
                 let pct = if median_pt.abs() > 0.01 { (w.pt - median_pt) / median_pt * 100.0 } else { 0.0 };
@@ -1867,11 +1866,11 @@ pub fn generate_report(
          <html>\n\
          <head>\n\
          <meta charset=\"utf-8\">\n\
-         <title>unscan miss report — {primary_hits}/{compared} ({pct:.1}%)</title>\n\
+         <title>unprint miss report — {primary_hits}/{compared} ({pct:.1}%)</title>\n\
          </head>\n\
          <body style=\"background: white; color: #222;\">\n\
          {CSS}\n\
-         <h2>unscan miss report</h2>\n\
+         <h2>unprint miss report</h2>\n\
          <div class=\"summary\">{primary_hits}/{compared} correct ({pct:.1}%) — \
          {n_major} major + {n_minor} minor misses{ssim_miss_str}{raster_str}{ocr_corr_str}{ssim_percentile_str}{gt_rank_str}</div>\n\
          <div class=\"summary\">{meta_str}</div>\n\

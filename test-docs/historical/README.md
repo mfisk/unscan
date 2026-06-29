@@ -1,7 +1,7 @@
 # Historical Typography Test Documents
 
 Scanned documents spanning ~500 years of typographic history, assembled as
-ground-truth test cases for unscan's font detection pipeline. Each file
+ground-truth test cases for unprint's font detection pipeline. Each file
 represents a distinct typeface era, with known provenance and high-confidence
 font identification.
 
@@ -95,7 +95,7 @@ font identification.
 - **URL:** https://archive.org/details/cia-readingroom-document-cia-rdp83-00586r000300210006-2
 - **Pages:** 4 pages — classified-then-declassified typewritten memo
 - **Confidence:** ★★★★☆ HIGH — CIA documents from 1961 were produced on standard government-issue IBM typewriters. Declassified in 2013, scanned from original typewritten pages.
-- **Notes:** "Declassified in Part — Sanitized Copy Approved for Release 2013/07/15." The classification stamps and redaction marks are also useful test features for unscan's OCR pipeline.
+- **Notes:** "Declassified in Part — Sanitized Copy Approved for Release 2013/07/15." The classification stamps and redaction marks are also useful test features for unprint's OCR pipeline.
 
 ### 10. `1970-tnr-irs-1040.pdf`
 - **Era:** Times New Roman / Government forms, 1970
@@ -105,7 +105,7 @@ font identification.
 - **URL:** https://www.irs.gov/pub/irs-prior/f1040--1970.pdf
 - **Pages:** 2 pages
 - **Confidence:** ★★★☆☆ MEDIUM — IRS forms have historically used variants of Times New Roman and Helvetica. The exact typeface used for 1970 forms may be a proprietary IRS variant, but the roman body text is TNR-adjacent.
-- **Notes:** Government forms are excellent unscan test cases because they mix multiple font sizes, bold/regular, form fields, and fine print — all challenges for font detection.
+- **Notes:** Government forms are excellent unprint test cases because they mix multiple font sizes, bold/regular, form fields, and fine print — all challenges for font detection.
 
 ### 11. `1976-helvetica-nasa-standards.pdf`
 - **Era:** Helvetica/Swiss Style, 1976

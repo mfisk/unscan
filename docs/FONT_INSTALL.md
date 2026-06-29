@@ -1,6 +1,6 @@
-# Font Installation for unscan
+# Font Installation for unprint
 
-`unscan` is a font-accurate OCR-to-vector pipeline. It **must** have the exact fonts installed that appear in test documents, otherwise font matching and accuracy tests will fail.
+`unprint` is a font-accurate OCR-to-vector pipeline. It **must** have the exact fonts installed that appear in test documents, otherwise font matching and accuracy tests will fail.
 
 ## Never stub fonts
 

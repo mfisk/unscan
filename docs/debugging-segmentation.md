@@ -1,7 +1,7 @@
 # Debugging Character Segmentation & Font Identification
 
 How to diagnose and fix character segmentation failures and font
-identification misses in unscan.
+identification misses in unprint.
 
 **See also:** `docs/char-index-methodology.md` (CI feature vectors).
 
@@ -20,7 +20,7 @@ The single flag for all diagnostic data.  Produces:
 3. Per-line `crops/` directories (the exact character images CI scores)
 
 ```bash
-./target/release/unscan INPUT.pdf -o /dev/null --audit /tmp/audit-out
+./target/release/unprint INPUT.pdf -o /dev/null --audit /tmp/audit-out
 ```
 
 There is **no separate `--diag-seg` flag** — `--audit` enables everything.
@@ -160,7 +160,7 @@ normalization path, saved as `NN_c_ref.png` alongside the scan crop
 | Tool | Purpose | Usage |
 |------|---------|-------|
 | `tools/verify-accuracy.py` | Span-level accuracy vs vector PDF ground truth | `python3 tools/verify-accuracy.py <audit_dir>/audit.json VECTOR.pdf [--verbose]` |
-| Built-in report (`report.rs`) | Visual HTML miss report with inline crop images, scan line overlays, and per-char distance tables | `unscan RASTER.pdf --audit DIR --test VECTOR.pdf` → `DIR/report.html` |
+| Built-in report (`report.rs`) | Visual HTML miss report with inline crop images, scan line overlays, and per-char distance tables | `unprint RASTER.pdf --audit DIR --test VECTOR.pdf` → `DIR/report.html` |
 
 **After any accuracy test that is not 100%:** run `tools/verify-accuracy.py`
 **After any accuracy test that is not 100%:** examine the miss report.
@@ -185,8 +185,8 @@ Segmentation lives in `src/segment.rs`, functions `segment_characters()`
 and `segment_characters_inner()`.
 
 Character extraction (cropping words from the page, calling segmentation,
-producing normalized character images for CI) is in `src/char_index.rs`,
-function `extract_line_chars()`.
+producing normalized character images for CI) is in `src/segment.rs`,
+function `segment_characters()`.
 
 ### Input
 
@@ -260,7 +260,7 @@ will fail because the word image only has 6 visual units
 
 ### Dual-path approach
 
-`extract_line_chars()` in `src/char_index.rs` handles this by segmenting
+`segment_characters()` in `src/segment.rs` handles this by segmenting
 each word **twice** when ligature-eligible character sequences are present:
 
 1. **Plain path** (`seg_plain/`): segment targeting `n_chars = len(all_chars)`
@@ -331,7 +331,7 @@ modify the word bounding boxes:
 
 The audit JSON stores both `word_bboxes_raw` (after step 1, before
 post-processing) and `word_bboxes` (after all steps) so the miss report
-can show what Tesseract saw vs what unscan used.
+can show what Tesseract saw vs what unprint used.
 
 ---
 
@@ -409,10 +409,10 @@ entry.  Check height and confidence of the dropped word.
 
 ```bash
 RUST_LOG=info \
-  ./target/release/unscan INPUT.pdf \
+  ./target/release/unprint INPUT.pdf \
     -o /dev/null \
     --audit /tmp/audit-out \
-    2>&1 | tee /tmp/unscan.log
+    2>&1 | tee /tmp/unprint.log
 ```
 
 This produces everything: `audit.json`, character crops, segmentation
@@ -522,18 +522,17 @@ force it into CI candidate list.
 | Audit data structures | `src/audit.rs` | `AuditEntry`, `CharCiVote`, `WordAudit` |
 | OCR + post-processing | `src/ocr.rs` | `extract_text_regions()`, `assemble_lines()`, `merge_overlapping_lines()`, `clip_word_overlaps()`, `drop_outlier_words()`, `expand_words_to_ink()` |
 | Font-metric word splitting | `src/ocr.rs` | `split_wide_whitespace_words()` |
-| Character extraction | `src/char_index.rs` | `extract_line_chars()` |
+| Character extraction | `src/segment.rs` | `extract_line_chars()` |
 | Segmentation algorithm | `src/segment.rs` | `segment_characters_inner()` |
 | Valley-finding (VP) | `src/segment.rs` | `best_low_ink_valley()` |
 | Seam carving | `src/segment.rs` | Pass 2 in `segment_characters_inner()` |
-| normalize_to_ink_bounds | `src/char_index.rs` | `normalize_to_ink_bounds()` |
-| Boundary→crop extraction | `src/char_index.rs` | `extract_chars_from_boundaries()` |
-| CI search + scoring | `src/char_index.rs` | `search_candidates()` |
-| Feature computation | `src/char_index.rs` | `compute_features()` |
-| Font-metric gap functions | `src/char_index.rs` | `font_ink_width()`, `font_pair_ink_gap()` |
+| normalize_to_ink_bounds | `src/features.rs` | `normalize_to_ink_bounds()` |
+| Boundary→crop extraction | `src/segment.rs` | `extract_chars_from_boundaries()` |
+| CI search + scoring | `src/font_match.rs` | `identify_font()` |
+| Feature computation | `src/features.rs` | `compute_features()` |
+| Font-metric gap functions | `src/ocr.rs` | `font_ink_width()`, `font_pair_ink_gap()` |
 | Font cache (shared LRU) | `src/font_cache.rs` | `FontCache` |
 | SSIM verification | `src/verify.rs` | `verify_text_region()` |
-| Word SSIM reranking (disabled) | `src/word_match.rs` | `word_level_rerank()` |
 | Segmentation diag overlay | `src/seg_diag.rs` | `save_split_overlay()` |
 | Span-level accuracy | `tools/verify-accuracy.py` | — |
 | Line-level miss report | Built-in `report.rs` (via `--test`) | `DIR/report.html` |

@@ -1,6 +1,6 @@
 # Scaling & Alignment Methodology
 
-How unscan scales and positions a candidate font to match an input raster line,
+How unprint scales and positions a candidate font to match an input raster line,
 assessed for correctness, robustness, and efficiency.
 
 ---

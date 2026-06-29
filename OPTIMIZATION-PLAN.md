@@ -1,8 +1,12 @@
-# Unscan Optimization Plan
+# Unprint Optimization Plan
 
 Analysis of `src/` for performance improvements with **no algorithm changes**
 and **no regressions**. Focus: caching, precomputation, memory reuse,
 complexity reduction.
+
+**Note (June 2026):** `char_index.rs` has been eliminated. References below
+to that module are historical. `ssim.rs` was renamed to `compare_rasters.rs`.
+Feature computation now lives in `features.rs` and `classifier.rs`.
 
 ## Implementation Status
 
@@ -54,7 +58,9 @@ Many of the optimizations identified below have been implemented. Status markers
 
 ---
 
-## 1. char_index.rs — Hot Path: Feature Computation & Search
+## 1. features.rs / classifier.rs — Hot Path: Feature Computation & Search
+
+*(Formerly `char_index.rs` — module eliminated and split)*
 
 ### 1.1 Duplicate flood-fill in `compute_counter_features` + `compute_hole_count`
 - **File:** `src/char_index.rs`, lines ~520–600 (`compute_counter_features`) and ~680–750 (`compute_hole_count`)
@@ -240,16 +246,18 @@ Many of the optimizations identified below have been implemented. Status markers
 
 ---
 
-## 6. ssim.rs — SSIM Computation
+## 6. compare_rasters.rs — SSIM Computation
+
+*(Formerly `ssim.rs` — renamed)*
 
 ### 6.1 `gaussian_kernel_11x11` — recomputed on every call
-- **File:** `src/ssim.rs`, line ~100
+- **File:** `src/compare_rasters.rs`
 - **Pattern:** `fn gaussian_kernel_11x11() -> [[f64; 11]; 11]` — computes the kernel from scratch each time, including exp() calls and normalization.
 - **Proposed optimization:** Use a `const` or `LazyLock` for the kernel. Pre-compute at compile time or at first use.
 - **Expected impact:** **Low** — the kernel computation itself is trivial (121 elements), but it's called per SSIM evaluation.
 
 ### 6.2 `gaussian_blur_3x3` — two-pass separable blur with per-pixel bounds checking
-- **File:** `src/ssim.rs`, lines ~60–90
+- **File:** `src/compare_rasters.rs`
 - **Pattern:** Separable 1D blur with `.clamp()` per pixel for boundary handling. Allocates two fresh `GrayImage`s.
 - **Proposed optimization:** Skip boundary clamping for interior pixels (the vast majority). Process edges separately with clamping, interior without. Also reuse the tmp buffer.
 - **Expected impact:** **Low** — blur runs twice per SSIM call (scan + render), but images are small (one line bbox).
@@ -303,7 +311,7 @@ Many of the optimizations identified below have been implemented. Status markers
 |----------|-------------|------------------|------|--------|
 | **P0** | 4.1: Eliminate duplicate CI search (word split vs Pass 1) | 30-50% total time | Medium | ✅ Done — line-level CI in word splitter |
 | **P0** | 3.1: Use FontCache in `split_wide_whitespace_words` | 10-20% total time | Low | ✅ Done |
-| **P1** | 1.1: Merge duplicate flood-fills in char_index | 5-10% index build time | Low | ✅ Done — shared `flood_fill_from_edges()` |
+| **P1** | 1.1: Merge duplicate flood-fills | 5-10% index build time | Low | ✅ Done — shared `flood_fill_from_edges()` |
 | **P1** | 1.2: Single-pass pixel scan in `compute_features` | 5-10% index build time | Low | ✅ Done — merged pixel scans |
 | **P1** | 5.1: Skip 4× SSIM render when 2× is good | 5-15% per-page time | Low | ❌ Not started |
 | **P2** | 1.5: Optimize Zhang-Suen thinning | 3-5% index build time | Low | ✅ Done — LUT-based |
@@ -312,7 +320,7 @@ Many of the optimizations identified below have been implemented. Status markers
 | **P2** | 2.3: Precompute horizontal dark-run lengths | 1-3% on connected chars | Low | ❌ Not started |
 | **P2** | 3.2: Precompute column ink for word expansion | 1-2% per-page | Low | ❌ Not started |
 | **P3** | 4.2: Avoid GrayImage clones for char corrections | <1% | Low | ❌ Not started |
-| **P3** | 4.4: Gate mem_info() behind debug flag | <1% | None | ✅ Done — gated behind UNSCAN_DEBUG_MEM |
+| **P3** | 4.4: Gate mem_info() behind debug flag | <1% | None | ✅ Done — gated behind UNPRINT_DEBUG_MEM |
 | **P3** | 6.1: Const gaussian kernel | <0.1% | None | ✅ Done — OnceLock |
 | **P3** | 8.1: Bitfield for text_mask | <0.5% | Low | ❌ Not started |
 | **NEW** | SSIM fast path (dominant font from prev page) | High on typical docs | Low | ✅ Done |
@@ -332,10 +340,10 @@ Many of the optimizations identified below have been implemented. Status markers
    - Pass the line-level CI winner into `split_wide_whitespace_words` instead of re-running CI per word
    - OR reorder pipeline: do word splitting after line-level CI match
 
-3. **P1: Merge flood-fills** (src/char_index.rs)
+3. **P1: Merge flood-fills** (src/features.rs)
    - Combine `compute_counter_features` and `compute_hole_count` to share `reachable` array
 
-4. **P1: Single-pass features** (src/char_index.rs)
+4. **P1: Single-pass features** (src/features.rs)
    - Merge the 5 pixel scans in `compute_features` into 1
 
 5. **P1: Early-exit SSIM** (src/verify.rs)
@@ -350,7 +358,7 @@ Many of the optimizations identified below have been implemented. Status markers
 After each change:
 ```bash
 source ~/.cargo/env
-cd ~/workspace/repos/unscan
+cd ~/workspace/repos/unprint
 cargo build 2>&1 | tail -5
 cargo test --test t60_specimen_accuracy_aa -- --nocapture 2>&1 | tail -20
 ```

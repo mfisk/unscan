@@ -1,6 +1,6 @@
 //! Page-level cache for rasterized images and OCR results.
 //!
-//! Cache location: `/tmp/unscan-page-cache/<key>/`
+//! Cache location: `/tmp/unprint-page-cache/<key>/`
 //! Key: `<filename>-<file_size>-<dpi>`
 //!
 //! Staleness: if the source PDF is newer than the cached page-0 image,
@@ -52,7 +52,7 @@ pub fn is_cache_stale(cache_dir: &Path, source: &Path) -> bool {
 
 /// Return the cache directory for a given key.
 pub fn cache_dir(key: &str) -> Option<PathBuf> {
-    Some(PathBuf::from("/tmp/unscan-page-cache").join(key))
+    Some(PathBuf::from("/tmp/unprint-page-cache").join(key))
 }
 
 /// Try to load a cached page image from disk.
@@ -96,4 +96,168 @@ pub fn save_cached_ocr(
     if let Ok(data) = serde_json::to_string(&cached) {
         let _ = std::fs::write(&json_path, data);
     }
+}
+
+// ---------------------------------------------------------------------------
+// Rasterize stage entry point
+// ---------------------------------------------------------------------------
+
+/// Load rasterized page images for an input file, with transparent caching.
+///
+/// Returns `(pages, cached)` where `cached` is true when all pages came
+/// from the on-disk cache.  Handles staleness checks, cache miss
+/// rasterization, and write-back automatically.
+pub fn get_pages(
+    input: &Path,
+    dpi: u32,
+) -> Result<(Vec<DynamicImage>, bool), crate::error::ScanTextError> {
+    let cdir = cache_key(input, dpi).and_then(|key| cache_dir(&key));
+
+    if let Some(ref dir) = cdir {
+        if !is_cache_stale(dir, input) {
+            if let Some(first) = load_cached_image(dir, 0) {
+                let mut pages = vec![first];
+                let mut idx = 1;
+                while let Some(img) = load_cached_image(dir, idx) {
+                    pages.push(img);
+                    idx += 1;
+                }
+                return Ok((pages, true));
+            }
+        }
+    }
+
+    // Cache miss — rasterize fresh.
+    let pages = rasterize(input, dpi)?;
+
+    // Write back to cache.
+    if let Some(ref dir) = cdir {
+        for (i, img) in pages.iter().enumerate() {
+            save_cached_image(dir, i, img);
+        }
+    }
+
+    Ok((pages, false))
+}
+
+/// Rasterize an input file (PDF or image) into page images.
+fn rasterize(path: &Path, dpi: u32) -> Result<Vec<DynamicImage>, crate::error::ScanTextError> {
+    use crate::error::ScanTextError;
+
+    let ext = path
+        .extension()
+        .and_then(|e| e.to_str())
+        .unwrap_or("")
+        .to_lowercase();
+    match ext.as_str() {
+        "pdf" => rasterize_pdf(path, dpi),
+        "png" | "jpg" | "jpeg" | "tiff" | "tif" | "bmp" | "gif" | "webp" => {
+            let img = image::open(path).map_err(|e| ScanTextError::ImageLoad(e.to_string()))?;
+            Ok(vec![img])
+        }
+        _ => Err(ScanTextError::UnsupportedFormat(ext)),
+    }
+}
+
+fn rasterize_pdf(path: &Path, dpi: u32) -> Result<Vec<DynamicImage>, crate::error::ScanTextError> {
+    use crate::error::ScanTextError;
+    use std::process::Command;
+
+    let tmp_dir = tempfile::tempdir().map_err(ScanTextError::Io)?;
+    let prefix = tmp_dir.path().join("page");
+
+    let status = Command::new("pdftoppm")
+        .args([
+            "-r",
+            &dpi.to_string(),
+            "-png",
+            &path.to_string_lossy(),
+            &prefix.to_string_lossy(),
+        ])
+        .status()
+        .map_err(|e| {
+            ScanTextError::ImageLoad(format!("Failed to run pdftoppm (install poppler-utils): {e}"))
+        })?;
+    if !status.success() {
+        return Err(ScanTextError::ImageLoad("pdftoppm exited with error".into()));
+    }
+
+    let mut pngs: Vec<_> = std::fs::read_dir(tmp_dir.path())
+        .map_err(ScanTextError::Io)?
+        .filter_map(|e| e.ok())
+        .map(|e| e.path())
+        .filter(|p| p.extension().and_then(|e| e.to_str()) == Some("png"))
+        .collect();
+    pngs.sort();
+
+    let mut pages = Vec::new();
+    for png_path in &pngs {
+        pages.push(image::open(png_path).map_err(|e| ScanTextError::ImageLoad(e.to_string()))?);
+    }
+    if pages.is_empty() {
+        return Err(ScanTextError::ImageLoad("pdftoppm produced no pages".into()));
+    }
+    Ok(pages)
+}
+
+
+// ---------------------------------------------------------------------------
+// Page preparation: deskew → OCR (cached) → background colour → ink expansion
+// ---------------------------------------------------------------------------
+
+/// Result of preparing a single page for font matching.
+pub struct PreparedPage {
+    /// OCR text lines with word bboxes expanded to actual ink.
+    pub lines: Vec<crate::ocr::TextLine>,
+    /// Deskewed grayscale image for character segmentation / matching.
+    pub gray: image::GrayImage,
+    /// Dominant background colour.
+    pub bg_color: crate::color::Rgb,
+    /// Ink threshold (bg − 56, saturating) used for binarisation.
+    pub ink_thresh: u8,
+}
+
+/// Deskew the page, run OCR (with disk cache), detect background colour,
+/// and expand word bounding boxes to actual ink extent.
+pub fn prepare_page(
+    page_img: &DynamicImage,
+    page_idx: usize,
+    dpi: u32,
+    cache_dir: Option<&std::path::Path>,
+) -> Result<PreparedPage, crate::error::ScanTextError> {
+    // Deskew
+    let orig_gray = page_img.to_luma8();
+    let skew_angle = crate::deskew::detect_skew(&orig_gray);
+    let deskewed_gray = if skew_angle.abs() > 5.0 {
+        orig_gray.clone()
+    } else if skew_angle.abs() > 0.5 {
+        crate::deskew::rotate_gray(&orig_gray, skew_angle)
+    } else {
+        orig_gray
+    };
+
+    // OCR (with cache)
+    let ocr_img = DynamicImage::ImageLuma8(deskewed_gray.clone());
+    let word_regions = if let Some((wr, _cb)) =
+        cache_dir.and_then(|d| load_cached_ocr(d, page_idx))
+    {
+        wr
+    } else {
+        let (wr, cb) = crate::ocr::extract_text_regions(&ocr_img, dpi)?;
+        if let Some(cdir) = cache_dir {
+            save_cached_ocr(cdir, page_idx, &wr, &cb);
+        }
+        wr
+    };
+    let mut lines = crate::ocr::postprocess_words(&word_regions);
+
+    // Background colour
+    let bg_color = crate::color::detect_background_color(page_img);
+
+    // Expand word bboxes to actual ink
+    let ink_thresh = bg_color.0.saturating_sub(56);
+    let blur_thresh = bg_color.0.saturating_sub(15);
+    crate::ocr::expand_words_to_ink(&mut lines, &deskewed_gray, ink_thresh, blur_thresh, 20);
+
+    Ok(PreparedPage { lines, gray: deskewed_gray, bg_color, ink_thresh })
 }

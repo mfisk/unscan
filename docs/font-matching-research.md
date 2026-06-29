@@ -1,6 +1,6 @@
 # Font Matching & Identification: State of the Art Survey
 
-> Research survey for the `unscan` project — converting scanned PDFs back to vector text by identifying which fonts were used.
+> Research survey for the `unprint` project — converting scanned PDFs back to vector text by identifying which fonts were used.
 >
 > Last updated: 2025-07-14  
 > **Status note (June 2026):** Since this survey was written, the architecture
@@ -38,15 +38,15 @@
    - 4.5 Learned Embeddings + ANN
 5. [Evaluation Benchmarks & Datasets](#5-evaluation-benchmarks--datasets)
 6. [Comparison with Our Approach](#6-comparison-with-our-approach)
-7. [Recommendations for unscan](#7-recommendations-for-unscan)
+7. [Recommendations for unprint](#7-recommendations-for-unprint)
 
 ---
 
 ## 1. Our Current Approach
 
-For context, here's what unscan currently does for font matching (updated June 2026):
+For context, here's what unprint currently does for font matching (updated June 2026):
 
-**Per-character feature index** (`char_index.rs`):
+**Per-character feature classification** (`classifier.rs`, `features.rs`):
 - Renders ~106 printable characters in each of ~5048 fonts at 48px (NORM_H)
 - Extracts a **99-float feature vector** per character, in 5 weighted groups:
   - Column ink profile (32 bins, weight 0.40)
@@ -104,7 +104,7 @@ The seminal work on deep-learning font recognition. Key details:
 - **6× model compression** via low-rank factorization without accuracy loss
 - Training data augmentation: noise, blur, perspective distortion, varied backgrounds, different text strings
 
-**Relevance to unscan**: ⭐⭐⭐ (High for ideas, medium for direct use)
+**Relevance to unprint**: ⭐⭐⭐ (High for ideas, medium for direct use)
 - DeepFont targets "wild" text in photos — much harder than our 300 DPI scans
 - The domain adaptation problem barely applies to us since we can render reference glyphs under the same conditions as the scan
 - The **penultimate-layer CNN embedding as a similarity measure** is directly relevant — we could train a small CNN to produce per-character embeddings that capture font style better than hand-crafted features
@@ -129,7 +129,7 @@ The seminal work on deep-learning font recognition. Key details:
 - Confusion primarily between genuinely similar fonts (Helvetica vs Arial, Trebuchet vs Verdana)
 - Dataset: synthetic rendered images per font on HuggingFace
 
-**Relevance to unscan**: ⭐⭐⭐⭐ (High)
+**Relevance to unprint**: ⭐⭐⭐⭐ (High)
 - A small CNN (even ResNet18) achieves remarkably high accuracy on rendered font classification
 - For our use case, we could train a CNN on our exact 5,048 fonts with rendered text and use it as the primary pre-filter
 - The "average over many patches" insight from Tensmeyer maps directly to our per-line matching — score multiple characters and aggregate
@@ -160,7 +160,7 @@ The seminal work on deep-learning font recognition. Key details:
 - Contrastive learning achieves comparable results to fully supervised methods with fewer labeled examples and training epochs
 - Demonstrates robustness across Latin, Arabic, and other scripts
 
-**Relevance to unscan**: ⭐⭐⭐⭐⭐ (Very high)
+**Relevance to unprint**: ⭐⭐⭐⭐⭐ (Very high)
 - **This is probably the most promising direction for improving our pre-filter**
 - Train a CNN with triplet/contrastive loss on rendered characters from our 5,048 fonts
 - Produces a fixed-dimensional embedding per rendered character
@@ -178,7 +178,7 @@ The seminal work on deep-learning font recognition. Key details:
 - Trains on 200 font classes, tests on 100 novel classes
 - Learns an embedding space where class prototypes are centroids
 
-**Relevance to unscan**: ⭐⭐ (Limited)
+**Relevance to unprint**: ⭐⭐ (Limited)
 - Few-shot is less relevant since we have unlimited synthetic data for all our fonts
 - The prototypical network concept is useful though: represent each font as a centroid in embedding space, classify by nearest centroid
 - The accuracy numbers are lower than classification-based approaches because of the extreme few-shot constraint
@@ -210,7 +210,7 @@ Classic paper establishing the typographic features that discriminate fonts:
 - Achieves higher accuracy than Gabor-based approaches
 - Applied to Ottoman manuscript classification
 
-**Relevance to unscan**: ⭐⭐⭐ (Medium-high for specific features)
+**Relevance to unprint**: ⭐⭐⭐ (Medium-high for specific features)
 - We're already using some of these concepts (ink density ≈ weight, aspect ratio ≈ width)
 - **Missing from our features**: serif detection, stroke contrast, x-height/cap-height ratio, counter shapes
 - Adding serif detection and stroke contrast as discrete features could dramatically improve coarse filtering
@@ -227,7 +227,7 @@ Classic paper establishing the typographic features that discriminate fonts:
 - Only tested on 3 fonts (Comic Sans, DejaVu Sans Condensed, Times New Roman)
 - Uses Euclidean distance in eigenspace for classification
 
-**Relevance to unscan**: ⭐⭐⭐ (Medium)
+**Relevance to unprint**: ⭐⭐⭐ (Medium)
 - PCA on rendered character images is essentially what we'd get from a linear dimensionality reduction of pixel data
 - The 97% on degraded data is impressive but on only 3 fonts — doesn't tell us about 5,048-font discrimination
 - Our column ink density profile is a hand-designed version of this — PCA would find the optimal projection automatically
@@ -248,7 +248,7 @@ Classic paper establishing the typographic features that discriminate fonts:
 - Font style accuracy peaks at 23-34% vs 25% random baseline on style classification
 - VLMs can read text perfectly but can't identify how it's rendered
 
-**Relevance to unscan**: ⭐ (Low)
+**Relevance to unprint**: ⭐ (Low)
 - VLMs are not useful for our task
 - FontCLIP is interesting for semantic search but overkill for our exact-match identification problem
 
@@ -269,7 +269,7 @@ Tesseract's approach to fonts:
 - Look for **clusters of consistent scaling factors** — the correct typeface produces a tight cluster at the true font size
 - Uses plausible size ranges to handle measurement noise
 
-**Relevance to unscan**: ⭐⭐⭐⭐ (High — the width clustering insight)
+**Relevance to unprint**: ⭐⭐⭐⭐ (High — the width clustering insight)
 - We already do width-matched scaling, but the **clustering of scaling factors** insight is powerful
 - If the correct font is used, the font-size needed to match each word should be consistent across words in the same paragraph
 - We could use **consistency of required font size** as an additional signal: the correct font should require the same pt size for every word, while wrong fonts will need varying scale factors
@@ -298,7 +298,7 @@ Tesseract's approach to fonts:
 - Requires reasonably clean, isolated text
 - Black-box — no published technical details on current architecture
 
-**Relevance to unscan**: ⭐⭐ (Their problem is harder than ours)
+**Relevance to unprint**: ⭐⭐ (Their problem is harder than ours)
 - WhatTheFont solves a harder problem (wild images, huge font space) but we need higher accuracy on a narrower problem
 - Our advantage: we know exactly what characters we're matching, have 300 DPI input, and only need to search 5,048 fonts
 
@@ -319,7 +319,7 @@ Tesseract's approach to fonts:
   - CNN trained with triplet loss produces an embedding vector per text image
   - Similar fonts map to nearby points in embedding space
 
-**Relevance to unscan**: ⭐⭐⭐⭐ (The patent details are directly applicable)
+**Relevance to unprint**: ⭐⭐⭐⭐ (The patent details are directly applicable)
 - The visual descriptor model (US10127199B2) is essentially a refined version of typographic features — we could implement the same keypoint + detail shape + measurement approach
 - The triplet loss embedding (US10515295B2) is the most directly relevant approach
 
@@ -345,7 +345,7 @@ Tesseract's approach to fonts:
 - Contrast: none / low / medium / high / extreme
 - Specific characters: 'a' stories, 'g' form, 'J' descender, 'Q' tail, etc.
 
-**Relevance to unscan**: ⭐⭐⭐ (Feature taxonomy is gold)
+**Relevance to unprint**: ⭐⭐⭐ (Feature taxonomy is gold)
 - The specific **categorical features** Identifont uses are the distilled wisdom of typographers
 - Many of these could be computed automatically from rendered glyphs:
   - Serif detection: render 'I' or 'l', check for horizontal protrusions at baseline and cap line
@@ -368,7 +368,7 @@ Tesseract's approach to fonts:
 - Template matching against rendered glyph database
 - May use outline/contour comparison rather than pixel comparison
 
-**Relevance to unscan**: ⭐⭐ (Similar to our approach, but less documented)
+**Relevance to unprint**: ⭐⭐ (Similar to our approach, but less documented)
 
 ### 3.5 IDEO Font Map (Google Fonts)
 
@@ -383,7 +383,7 @@ Tesseract's approach to fonts:
 - These activations serve as a "font fingerprint"
 - t-SNE or UMAP for visualization; cosine similarity for retrieval
 
-**Relevance to unscan**: ⭐⭐⭐ (The pretrained-CNN-as-feature-extractor idea)
+**Relevance to unprint**: ⭐⭐⭐ (The pretrained-CNN-as-feature-extractor idea)
 - Using a pretrained image CNN (VGG16, ResNet) as a feature extractor is simple and effective
 - No font-specific training needed — just forward pass through the network
 - Could replace our hand-crafted 99-float vector with a ~512-float CNN feature vector
@@ -414,7 +414,7 @@ Tesseract's approach to fonts:
 - Problem: perceptual hashes are designed for near-duplicate detection, not fine-grained similarity
 - **pHash is the most promising** — DCT captures frequency information similar to our column profiles
 
-**Relevance to unscan**: ⭐⭐⭐ (Good for fast coarse filtering)
+**Relevance to unprint**: ⭐⭐⭐ (Good for fast coarse filtering)
 - pHash of rendered glyphs at standard size could serve as an ultra-fast first-pass filter
 - Hamming distance is trivially fast (XOR + popcount)
 - Could reduce 5,048 → ~200 candidates in microseconds
@@ -466,7 +466,7 @@ Stage 4: Verification (10s of ms)
 ├── SSIM reranking
 ```
 
-**Relevance to unscan**: ⭐⭐⭐⭐⭐ (Very high — directly implementable)
+**Relevance to unprint**: ⭐⭐⭐⭐⭐ (Very high — directly implementable)
 - This maps perfectly to our pipeline: coarse → fine → verify
 - We're missing Stage 1 and Stage 2 entirely — jumping straight to fine matching across all 5,048 fonts
 - Adding even basic serif/sans-serif + weight classification could cut our search space in half
@@ -489,7 +489,7 @@ Stage 4: Verification (10s of ms)
 
 **Performance**: For 5,048 fonts × ~80 characters = ~400K vectors, ANN search returns top-K in <1ms even with brute force. LSH becomes more valuable at millions of vectors.
 
-**Relevance to unscan**: ⭐⭐ (Marginal benefit at our scale)
+**Relevance to unprint**: ⭐⭐ (Marginal benefit at our scale)
 - With only 5,048 fonts, brute-force linear scan across all fonts is already fast enough (~microseconds for 99-float vectors with SIMD auto-vectorization)
 - LSH/ANN would be more useful if we had 100K+ fonts or if we moved to higher-dimensional embeddings (e.g., 256-dim CNN features)
 - FAISS could be useful if we adopt CNN embeddings — but the query overhead of running the CNN dominates anyway
@@ -508,7 +508,7 @@ Stage 4: Verification (10s of ms)
 - **CNN architecture**: Even MobileNet-scale CNNs suffice for this task
 - **ANN structure**: Flat index (brute force) is fine for 400K vectors; IVF or HNSW for larger
 
-**Relevance to unscan**: ⭐⭐⭐⭐ (High, but requires ML infrastructure)
+**Relevance to unprint**: ⭐⭐⭐⭐ (High, but requires ML infrastructure)
 - This is the "modern" approach and likely the most accurate pre-filter possible
 - Trade-off: requires training a CNN (one-time cost) and running inference per character (the hot path bottleneck)
 - Could potentially be done in Rust via ONNX Runtime, but adds a dependency
@@ -588,7 +588,7 @@ Stage 4: Verification (10s of ms)
 
 ---
 
-## 7. Recommendations for unscan
+## 7. Recommendations for unprint
 
 Ranked by **expected improvement / implementation effort**:
 

@@ -1,6 +1,7 @@
 //! OCR module — runs Tesseract via CLI to extract text with bounding boxes.
 
 use crate::error::ScanTextError;
+use ab_glyph::{Font, PxScale, ScaleFont, point};
 use image::{DynamicImage, GrayImage};
 use std::process::Command;
 
@@ -689,10 +690,10 @@ pub fn expand_words_to_ink(lines: &mut [TextLine], gray: &GrayImage, ink_thresho
 /// word's image for zero-ink column runs wider than a threshold and splits
 /// the word at each gap.
 ///
-/// When `char_index` is provided, we do a quick CI font lookup on each word
+/// When a `classifier` is provided, we do a quick CI font lookup on each word
 /// and use the matched font's advance widths to determine the expected
 /// inter-character gap.  We only split where the observed ink-to-ink gap
-/// exceeds the font's natural spacing.  When no char_index is available,
+/// exceeds the font's natural spacing.  When no classifier is available,
 /// falls back to a fixed threshold of 18% of line height.
 ///
 /// Must run AFTER `expand_words_to_ink` so bboxes are ink-tight.
@@ -812,11 +813,11 @@ pub fn split_wide_whitespace_words(
                         };
                         let ref_scale = 100.0_f32;
                         let ref_px = ab_glyph::PxScale { x: ref_scale, y: ref_scale };
-                        let font_ink_w = crate::char_index::font_ink_width(font, ref_px, chars[i])?;
+                        let font_ink_w = font_ink_width(font, ref_px, chars[i])?;
                         if font_ink_w <= 0.0 { return None; }
                         let s = observed_ink_w / font_ink_w * ref_scale;
                         let scale = ab_glyph::PxScale { x: s, y: s };
-                        let expected = crate::char_index::font_pair_ink_gap(font, scale, chars[i], chars[i + 1]);
+                        let expected = font_pair_ink_gap(font, scale, chars[i], chars[i + 1]);
                         let threshold = expected.round() as u32 + 5;
                         Some(threshold)
                     })
@@ -1152,4 +1153,61 @@ fn resolve_hocr_overlaps(boxes: &mut [CharBox], hocr: &str) {
 
         offset += wc;
     }
+}
+
+/// Return the ink width of a glyph in pixels from outline bounds (no rasterization).
+fn font_ink_width<F: Font>(font: &F, scale: PxScale, ch: char) -> Option<f32> {
+    let gid = font.glyph_id(ch);
+    let glyph = gid.with_scale_and_position(scale, point(0.0, 0.0));
+    let outlined = font.outline_glyph(glyph)?;
+    let b = outlined.px_bounds();
+    Some(b.max.x - b.min.x)
+}
+
+/// Return the expected ink-to-ink gap between two adjacent glyphs from outline bounds.
+fn font_pair_ink_gap<F: Font>(font: &F, scale: PxScale, ch_a: char, ch_b: char) -> f32 {
+    let sf = font.as_scaled(scale);
+    let gid_a = font.glyph_id(ch_a);
+    let gid_b = font.glyph_id(ch_b);
+    let adv_a = sf.h_advance(gid_a);
+
+    let glyph_a = gid_a.with_scale_and_position(scale, point(0.0, 0.0));
+    let glyph_b = gid_b.with_scale_and_position(scale, point(0.0, 0.0));
+
+    let outlined_a = match font.outline_glyph(glyph_a) {
+        Some(o) => o,
+        None => return 0.0,
+    };
+    let outlined_b = match font.outline_glyph(glyph_b) {
+        Some(o) => o,
+        None => return 0.0,
+    };
+
+    let bounds_a = outlined_a.px_bounds();
+    let bounds_b = outlined_b.px_bounds();
+
+    // gap = advance_a - ink_right_a + ink_left_b
+    (adv_a - bounds_a.max.x + bounds_b.min.x).max(0.0)
+}
+
+
+// ---------------------------------------------------------------------------
+// Detect stage entry point
+// ---------------------------------------------------------------------------
+
+/// Assemble and post-process text lines from raw OCR word regions.
+///
+/// Performs: line assembly → raw-bbox snapshot → overlap merging →
+/// word-overlap clipping → outlier removal.
+///
+/// Does NOT include `expand_words_to_ink` (needs ink threshold from
+/// background-colour detection) or `split_wide_whitespace_words` (needs
+/// matched font data).  Those run as separate refinement passes.
+pub fn postprocess_words(word_regions: &[TextRegion]) -> Vec<TextLine> {
+    let mut lines = assemble_lines(word_regions);
+    snapshot_raw_bboxes(&mut lines);
+    merge_overlapping_lines(&mut lines);
+    clip_word_overlaps(&mut lines);
+    drop_outlier_words(&mut lines);
+    lines
 }

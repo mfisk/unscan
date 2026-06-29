@@ -3,7 +3,7 @@
 ## Executive Summary
 
 **Bottom line: Word-level classification is worth pursuing as a re-ranker, but
-its ceiling is constrained by the nature of unscan's actual error modes.**
+its ceiling is constrained by the nature of unprint's actual error modes.**
 
 Unscan's current 84.3% accuracy (404/479) has a specific failure profile that
 reframes the word-level question:
@@ -349,7 +349,7 @@ The seminal work in visual font recognition:
 - **Key insight:** Domain adaptation (synthetic → real) is critical. Direct
   CNN training on synthetic data alone degrades on real scanned images.
 
-**Relevance to unscan:** DeepFont operates at word level, not character level.
+**Relevance to unprint:** DeepFont operates at word level, not character level.
 Its architecture validates word-level classification is viable, but the domain
 gap problem (clean renders vs. noisy scans) requires explicit handling.
 
@@ -364,7 +364,7 @@ Updated font recognition with modern architecture:
 
 **Relevance:** Shows that modern architectures significantly outperform
 DeepFont (87.4% vs 62.3% top-1). However, this is open-world classification
-(2,700 fonts); unscan's closed-world setting (500 installed fonts) is simpler.
+(2,700 fonts); unprint's closed-world setting (500 installed fonts) is simpler.
 
 ### 5.3 DINOv2 + LoRA (Chen et al., 2026)
 
@@ -384,10 +384,10 @@ State-of-the-art parameter-efficient font classification:
 
 **Relevance:** Validates that fine-tuning pre-trained vision models is
 extremely effective for font classification. However:
-- 394 variants is much smaller than unscan's ~2,353 font files
+- 394 variants is much smaller than unprint's ~2,353 font files
 - Synthetic test only — no real scan evaluation
 - The backbone alone (DINOv2-Base) is 87M parameters — way too large to embed
-  in unscan's Rust binary
+  in unprint's Rust binary
 
 ### 5.4 Contrastive Learning for Fonts (Memon et al., 2023)
 
@@ -402,7 +402,7 @@ Contrastive learning (triplet loss) applied to font style classification:
 
 **Relevance:** Validates triplet loss for font embedding spaces. The hard
 negative mining strategy (same character, different font) is directly
-applicable to unscan's training data generator.
+applicable to unprint's training data generator.
 
 ### 5.5 Font Group Identification Using Reconstructed Fonts
 
@@ -411,7 +411,7 @@ An interesting unsupervised approach:
 - Uses graph partitioning to assign tokens to candidate fonts
 - Works without labeled data
 
-**Relevance:** Limited — unscan has labeled ground truth and a known font catalog.
+**Relevance:** Limited — unprint has labeled ground truth and a known font catalog.
 
 ---
 
@@ -602,7 +602,7 @@ If handcrafted word features show promise:
 2. **Don't use the existing word_index.rs as-is.** Its 576-dim pixel thumbnail
    is too crude and the common-word restriction is limiting.
 3. **Don't use large vision models (DINOv2, FasterViT-2).** They're 87M+
-   parameters; unscan needs to stay as a lean CLI tool. A 500K-param CNN is
+   parameters; unprint needs to stay as a lean CLI tool. A 500K-param CNN is
    the ceiling.
 4. **Don't optimize word-level before fixing variant confusion.** It's solving
    10 errors when 120 are solvable with naming logic.

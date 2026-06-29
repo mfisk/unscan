@@ -30,3 +30,24 @@ test-docs/triplet-audit/
 hillclimb_best.txt
 hillclimb_log.jsonl
 Cargo.toml.bak
+
+# Extracted character crops
+p*_L*
+# Audit output
+audit/
+report.html
+# Test results
+test-results-*.md
+# Weight binaries (except committed ones)
+*.bin
+# Debug dirs
+debug-*/
+# Audit subdirs
+test-docs/*-audit/
+test-docs/*-verify/
+# Backup files
+*.bak
+# Training data
+training-data/
+audit.json
+hill-climb-test.sh

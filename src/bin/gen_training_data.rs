@@ -26,14 +26,13 @@ use std::io::{BufWriter, Write};
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicUsize, Ordering};
 
-use unscan::char_index::{self, compute_features, FEAT_LEN};
-use unscan::font_scan::{self, read_font_metadata, is_ligature_char};
+use unprint::font_scan::{self, read_font_metadata, is_ligature_char};
 
 // ---------------------------------------------------------------------------
 // Feature names (copied from learn_weights.rs)
 // ---------------------------------------------------------------------------
 
-use unscan::char_index::FEAT_NAMES;
+use unprint::features::{compute_features, FEAT_LEN, FEAT_NAMES, AaVariant};
 
 // ---------------------------------------------------------------------------
 // CLI
@@ -66,10 +65,9 @@ struct Args {
 }
 
 // ---------------------------------------------------------------------------
-// AA variant — use shared definition from char_index
+// AA variant — shared definition
 // ---------------------------------------------------------------------------
 
-use unscan::char_index::AaVariant;
 
 // ---------------------------------------------------------------------------
 // Native-height simulation
@@ -100,13 +98,13 @@ fn render_char_at_native_height<F: Font>(
         .map(|&(_, gid)| ab_glyph::GlyphId(gid));
 
     // Render through the canonical pipeline — same code path as index-time
-    let params = unscan::char_render::RenderParams {
-        height: char_index::NORM_H,
+    let params = unprint::char_render::RenderParams {
+        height: unprint::features::NORM_H,
         render_scale: 1,
         aa,
         binarize_threshold: None,
     };
-    let full = unscan::char_render::get_rendered_char(font, font_key, c, glyph_override, &params)?;
+    let full = unprint::char_render::get_rendered_char(font, font_key, c, glyph_override, &params)?;
 
     let (_w, h) = full.dimensions();
 
@@ -116,7 +114,7 @@ fn render_char_at_native_height<F: Font>(
     }
 
     // Downscale + re-normalize (simulates a natively small glyph)
-    char_index::degrade_and_renormalize(&full, target_height as f32 / h as f32)
+    unprint::features::degrade_and_renormalize(&full, target_height as f32 / h as f32)
 }
 
 // ---------------------------------------------------------------------------
@@ -189,7 +187,7 @@ struct Manifest {
 fn main() {
     let mut args = Args::parse();
     if args.heights.is_empty() {
-        args.heights = vec![char_index::NORM_H];
+        args.heights = vec![unprint::features::NORM_H];
     }
 
     let aa_variants: Vec<AaVariant> = args.aa.iter()
@@ -200,7 +198,7 @@ fn main() {
         std::process::exit(1);
     }
 
-    eprintln!("=== unscan training data generator ===");
+    eprintln!("=== unprint training data generator ===");
     eprintln!("Output dir: {}", args.output_dir.display());
     eprintln!("Native heights: {:?}", args.heights);
     eprintln!("AA variants: {:?}", aa_variants.iter().map(|a| a.name()).collect::<Vec<_>>());
@@ -219,7 +217,7 @@ fn main() {
         catalog.truncate(args.max_fonts);
     }
 
-    let chars: &[char] = char_index::indexed_chars();
+    let chars: &[char] = unprint::features::supported_chars();
     eprintln!("  {} indexed characters", chars.len());
 
     let total_renders = catalog.len() * chars.len() * args.heights.len() * aa_variants.len();
@@ -301,7 +299,7 @@ fn main() {
                         None => continue,
                     };
 
-                    let feats = match compute_features(&img) {
+                    let feats = match compute_features(&img, false) {
                         Some(f) => f.as_slice(),
                         None => continue,
                     };
@@ -400,7 +398,7 @@ fn main() {
         heights: args.heights.clone(),
         aa_variants: aa_variants.iter().map(|a| a.name().to_string()).collect(),
         chars: chars_strs,
-        norm_h: char_index::NORM_H,  // NORM_H from char_index
+        norm_h: unprint::features::NORM_H,  // NORM_H
         generated_at: chrono_now(),
         git_commit,
     };

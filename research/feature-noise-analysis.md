@@ -1,6 +1,6 @@
 # CI Feature Noise Analysis
 
-Analysis of unscan's 100-dimensional character index (CI) feature space to identify
+Analysis of unprint's 100-dimensional character index (CI) feature space to identify
 noisy, harmful, or underperforming features. Based on the enriched audit of
 `font-timeline-specimen-scanned.pdf` (490 text entries, 130 misses).
 

@@ -1,6 +1,6 @@
 # Text Matching Approach
 
-How unscan identifies fonts and places vector text to match the original scan.
+How unprint identifies fonts and places vector text to match the original scan.
 
 ## Pipeline Overview
 
@@ -20,18 +20,17 @@ Scanned PDF
 
 ## 1. Character Index (CI) — Font Identification
 
-**File:** `src/char_index.rs`
+**Files:** `src/classifier.rs`, `src/font_match.rs`, `src/features.rs`
 
 Each installed font (~5000+) is rendered at a reference size for ~106
-printable characters. A 99-dimensional feature vector is extracted per glyph
-(see [`FEATURES.md`](../FEATURES.md)). The index is serialized to
-`~/.cache/unscan/char-index.bin` (INDEX_VERSION = 8) and rebuilt
-automatically when feature computation changes.
+printable characters. A 63-dimensional feature vector is extracted per glyph
+(see [`FEATURES.md`](../FEATURES.md)). The LDA classifier weights are
+cached to `~/.cache/unprint/lda-weights.bin` and retrained automatically
+when feature computation changes.
 
-At query time, each OCR'd character's crop is feature-extracted and compared
-against the index via brute-force linear scan (flat `Vec` per character — at
-99 dims, tree-based structures provide no pruning benefit). All fonts within
-`factor²` of the nearest distance are returned as candidates.
+At query time, each OCR'd character's crop is feature-extracted and classified
+via the LDA classifier, which projects features into a discriminant space and
+identifies the best-matching font.
 
 **Role:** The CI is the sole font identification stage. There is no separate
 word-level SSIM reranking step — the CI #1 candidate wins directly. The SSIM
@@ -258,7 +257,7 @@ blank pages produce zero raster fragments.
 
 ## 12. Audit Mode — Per-Character Distances
 
-**File:** `src/main.rs`, `src/char_index.rs`
+**File:** `src/main.rs`, `src/font_pipeline.rs`
 
 When `--audit` is enabled, the pipeline computes per-character feature-space
 distances between each line's character crops and both:

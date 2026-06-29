@@ -8,13 +8,13 @@ mod font_cache;
 mod font_match;
 mod font_scan;
 mod geometry;
-pub mod char_index;
+pub mod features;
 pub mod char_render;
 pub mod train;
 pub mod layout;
 mod compare;
 pub mod seg_diag;
-pub mod ssim;
+pub mod compare_rasters;
 mod ocr;
 mod page_cache;
 mod pdf_out;
@@ -23,88 +23,19 @@ mod smooth;
 pub(crate) mod verify;
 pub mod ground_truth;
 pub mod report;
-pub mod zncc_classifier;
+mod font_pipeline;
+mod zncc_classifier;
 
-use crate::audit::{AuditEntry, AuditLog, BBox, Decision, GeometryEntry, PageSummary};
+use crate::audit::{AuditEntry, AuditLog, BBox, GeometryEntry, PageSummary};
 
-
-fn dump_limits() {
-    if let Ok(s) = std::fs::read_to_string("/proc/self/limits") {
-        for l in s.lines() {
-            if l.contains("address space") || l.contains("data size") || l.contains("stack size") {
-            }
-        }
-    }
-    // Check overcommit and committed memory
-    if let Ok(s) = std::fs::read_to_string("/proc/meminfo") {
-        for l in s.lines() {
-            if l.starts_with("CommitLimit:") || l.starts_with("Committed_AS:") || l.starts_with("MemAvailable:") {
-            }
-        }
-    }
-    if let Ok(_s) = std::fs::read_to_string("/proc/sys/vm/overcommit_memory") {
-    }
-    // cgroup memory limit
-    for path in &["/sys/fs/cgroup/memory/memory.limit_in_bytes",
-                   "/sys/fs/cgroup/memory.max"] {
-        if let Ok(_s) = std::fs::read_to_string(path) {
-        }
-    }
-}
 use crate::error::ScanTextError;
-use crate::ocr::TextRegion;
-use image::DynamicImage;
 use rayon::prelude::*;
-use std::path::{Path, PathBuf};
 
 /// Minimum SSIM score for SSIM verification to consider a font match acceptable.
 const MIN_VERIFY_SSIM: f32 = 0.8;
 
 /// Standalone char rendering: render characters using the index-time
 /// render_glyph_at_ink_height() pipeline and save as PNGs.
-fn render_ref_chars_and_exit(json_str: &str) -> ! {
-    use ab_glyph::{Font, FontVec};
-
-    #[derive(serde::Deserialize)]
-    struct Req {
-        font: String,
-        chars: String,
-        output_dir: String,
-    }
-
-    let req: Req = serde_json::from_str(json_str).unwrap_or_else(|e| {
-        eprintln!("Invalid --render-ref-chars JSON: {e}");
-        std::process::exit(1);
-    });
-
-    let font_data = std::fs::read(&req.font).unwrap_or_else(|e| {
-        eprintln!("Cannot read font {:?}: {e}", req.font);
-        std::process::exit(1);
-    });
-    let font = FontVec::try_from_vec(font_data).unwrap_or_else(|e| {
-        eprintln!("Cannot parse font {:?}: {e}", req.font);
-        std::process::exit(1);
-    });
-
-    let out = std::path::Path::new(&req.output_dir);
-    std::fs::create_dir_all(out).unwrap_or_else(|e| {
-        eprintln!("Cannot create output dir {:?}: {e}", req.output_dir);
-        std::process::exit(1);
-    });
-
-    let mut _rendered = 0u32;
-    for c in req.chars.chars() {
-        if font.glyph_id(c).0 == 0 {
-            continue; // no glyph for this char
-        }
-        if let Some(img) = char_render::get_rendered_char_default(&font, &req.font, c, None) {
-            let fname = format!("U+{:04X}.png", c as u32);
-            let _ = img.save(out.join(&fname));
-            _rendered += 1;
-        }
-    }
-    std::process::exit(0);
-}
 
 fn main() {
     let args = cli::parse();
@@ -115,7 +46,7 @@ fn main() {
 
     // ── render-ref-chars: standalone char rendering, no PDF needed ───
     if let Some(ref json_str) = args.render_ref_chars {
-        render_ref_chars_and_exit(json_str);
+        char_render::render_ref_chars_and_exit(json_str);
     }
 
     // ── train-lda: train LDA classifier and exit ────────────────────
@@ -148,361 +79,136 @@ fn main() {
     }
 
     // ── Build the classifier based on --classifier flag ──────────────
-    let mut clf: Box<dyn classifier::Classifier> = make_classifier(&args);
+    let mut clf: Box<dyn classifier::Classifier> = classifier::build_classifier(
+        &args.classifier,
+        args.triplet_weights.as_deref(),
+        Some((&args.font_dir, &args.render_params())),
+    );
 
-    if args.index {
-        if let Err(e) = run_index(&args, &mut *clf) {
-            eprintln!("Error: {e}");
-            std::process::exit(1);
-        }
-    } else {
-        if let Err(e) = run(&args, &mut *clf) {
-            eprintln!("Error: {e}");
-            std::process::exit(1);
-        }
+    if let Err(e) = run(&args, &mut *clf) {
+        eprintln!("Error: {e}");
+        std::process::exit(1);
     }
 }
 
-/// Default path for cached LDA weights.
-fn default_lda_weights_path() -> PathBuf {
-    let home = std::env::var("HOME").unwrap_or_else(|_| ".".to_string());
-    PathBuf::from(home).join(".cache").join("unscan").join("lda-weights.bin")
-}
 
-/// Load LDA classifier from --triplet-weights override or cached default.
-/// If no weights exist, auto-trains them first.
-fn load_lda_classifier(args: &cli::Args) -> Box<dyn classifier::Classifier> {
-    if let Some(ref weights_path) = args.triplet_weights {
-        match classifier::load_lda(weights_path) {
-            Ok(c) => Box::new(c),
-            Err(e) => { eprintln!("Error loading LDA weights from {:?}: {e}", weights_path); std::process::exit(1); }
-        }
-    } else {
-        let default_path = default_lda_weights_path();
-        if !default_path.exists() {
-            eprintln!("No LDA weights found, training automatically...");
-            let train_args = train::TrainArgs {
-                font_dir: args.font_dir.clone(),
-                no_index: true, // skip index build during auto-train; we'll build it right after
-                render_params: args.render_params(),
-                ..train::TrainArgs::default()
-            };
-            train::run_train(train_args);
-            if !default_path.exists() {
-                eprintln!("Auto-training failed to produce weights at {:?}", default_path);
-                std::process::exit(1);
-            }
-            eprintln!("Auto-training complete, continuing with scan...");
-        }
-        match classifier::load_lda(&default_path) {
-            Ok(c) => Box::new(c),
-            Err(e) => { eprintln!("Error loading LDA weights from {:?}: {e}", default_path); std::process::exit(1); }
-        }
-    }
-}
-
-/// Create the classifier selected by CLI args.
-fn make_classifier(args: &cli::Args) -> Box<dyn classifier::Classifier> {
-    match args.classifier.as_str() {
-        "fisher" => Box::new(classifier::new_fisher()),
-        "triplet" => {
-            let weights_path = args.triplet_weights.as_ref().unwrap_or_else(|| {
-                eprintln!("Error: --triplet-weights is required when using --classifier=triplet");
-                std::process::exit(1);
-            });
-            match classifier::load_triplet(weights_path) {
-                Ok(c) => Box::new(c),
-                Err(e) => {
-                    eprintln!("Error: {e}");
-                    std::process::exit(1);
-                }
-            }
-        }
-        "global-triplet" => {
-            let weights_path = args.triplet_weights.as_ref().unwrap_or_else(|| {
-                eprintln!("Error: --triplet-weights is required when using --classifier=global-triplet");
-                std::process::exit(1);
-            });
-            match classifier::load_global_triplet(weights_path) {
-                Ok(c) => Box::new(c),
-                Err(e) => {
-                    eprintln!("Error: {e}");
-                    std::process::exit(1);
-                }
-            }
-        }
-        other => {
-            // Check for weight-file-based classifiers
-            match other {
-                "lda" => load_lda_classifier(args),
-                "fusion" => {
-                    // Rank-fusion of LDA + Fisher
-                    // load_lda_classifier handles auto-training if needed
-                    let _ = load_lda_classifier(args); // triggers auto-train if weights missing
-                    let default_path = if let Some(ref p) = args.triplet_weights {
-                        p.clone()
-                    } else {
-                        default_lda_weights_path()
-                    };
-                    let lda = match classifier::load_lda(&default_path) {
-                        Ok(c) => c,
-                        Err(e) => { eprintln!("Error loading LDA for fusion: {e}"); std::process::exit(1); }
-                    };
-                    let fisher = classifier::new_fisher();
-                    Box::new(classifier::FusionClassifier::new(vec![
-                        (0.5, Box::new(lda)),
-                        (0.5, Box::new(fisher)),
-                    ]))
-                }
-                "zncc" => {
-                    Box::new(zncc_classifier::ZnccClassifier::new())
-                }
-                _ => {
-                    let weights_path = args.triplet_weights.as_ref().unwrap_or_else(|| {
-                        eprintln!("Error: --triplet-weights is required when using --classifier={other}");
-                        std::process::exit(1);
-                    });
-                    match other {
-                        "perchar-fisher" => {
-                            match classifier::load_per_char_fisher(weights_path) {
-                                Ok(c) => Box::new(c),
-                                Err(e) => { eprintln!("Error: {e}"); std::process::exit(1); }
-                            }
-                        }
-                        "mahalanobis" => {
-                            match classifier::load_mahalanobis(weights_path) {
-                                Ok(c) => Box::new(c),
-                                Err(e) => { eprintln!("Error: {e}"); std::process::exit(1); }
-                            }
-                        }
-                        "mlp" => {
-                            match classifier::MlpClassifier::load(weights_path) {
-                                Ok(c) => Box::new(c),
-                                Err(e) => { eprintln!("Error: {e}"); std::process::exit(1); }
-                            }
-                        }
-                        _ => {
-                            eprintln!("Error: unknown classifier '{other}'. Use 'lda', 'fisher', 'perchar-fisher', 'triplet', 'global-triplet', 'mahalanobis', 'mlp', 'fusion', or 'zncc'.");
-                            std::process::exit(1);
-                        }
-                    }
-                }
-            }
-        }
-    }
-}
-
-/// Scan available fonts, compare against the cached index, and incrementally
-/// update: add new fonts, remove stale fonts, or report "Index is current".
-/// With `--rebuild-index`, forces a full rebuild.
-fn run_index(args: &cli::Args, classifier: &mut dyn classifier::Classifier) -> Result<(), ScanTextError> {
+/// Scan available fonts and return a FontRegistry.
+/// Writes catalog.bin so classifier loaders can validate catalog_hash.
+/// Centroids are already baked into classifier .bin files from training,
+/// so no runtime render+embed step is needed.
+fn load_fonts(args: &cli::Args, _classifier: &mut dyn classifier::Classifier) -> Result<font_scan::FontRegistry, ScanTextError> {
     let font_dirs = font_scan::default_font_dirs(&args.font_dir);
-    let font_catalog = font_scan::scan_fonts(&font_dirs);
-    if font_catalog.is_empty() {
+    let entries = font_scan::scan_fonts(&font_dirs);
+    if entries.is_empty() {
         return Err(ScanTextError::NoFonts);
     }
 
-    let index_path = args.resolved_index_path();
+    let registry = font_scan::FontRegistry::new(entries);
 
-    // Collect system font keys → paths + glyph overrides + variations for lookup.
-    // Keys are unique per weight/style/variant (path + optional variant tag).
-    let system_fonts: std::collections::HashMap<String, (PathBuf, char_index::GlyphOverrides, char_index::Variations)> = font_catalog
-        .iter()
-        .map(|e| (e.font_key(), (e.path.clone(), e.glyph_overrides.clone(), e.variations.clone())))
-        .collect();
-    let system_names: std::collections::HashSet<String> =
-        system_fonts.keys().cloned().collect();
-
-    // ── Full rebuild path ──────────────────────────────────────────
-    if args.rebuild_index {
-        return do_full_build(&system_fonts, &index_path, classifier, &args.render_params());
+    // Write catalog.bin so classifier loaders can validate against it.
+    let catalog_path = classifier::default_catalog_path();
+    if let Err(e) = registry.write_fonts_bin(&catalog_path) {
+        eprintln!("warning: could not write {}: {e}", catalog_path.display());
     }
 
-    // ── Try loading existing index ─────────────────────────────────
-    if !index_path.exists() {
-        return do_full_build(&system_fonts, &index_path, classifier, &args.render_params());
-    }
-
-    // Fast header check first (12 bytes, no full deserialize).
-    match char_index::peek_header(&index_path) {
-        Ok((version, feat_len)) => {
-            let (exp_ver, exp_fl) = char_index::expected_header();
-            if version != exp_ver || feat_len != exp_fl {
-                return do_full_build(&system_fonts, &index_path, classifier, &args.render_params());
-            }
-        }
-        Err(_e) => {
-            return do_full_build(&system_fonts, &index_path, classifier, &args.render_params());
-        }
-    }
-
-    // Header OK — load the full index for incremental comparison.
-    let start = std::time::Instant::now();
-    let mut index = match char_index::load_index(&index_path, classifier, &args.render_params()) {
-        Ok(idx) => idx,
-        Err(_e) => {
-            return do_full_build(&system_fonts, &index_path, classifier, &args.render_params());
-        }
-    };
-    let _load_time = start.elapsed();
-    let indexed_names = index.font_names(); // includes both indexed + skipped
-    let _indexed_count = index.indexed_font_names().len();
-    let _skipped_count = index.skipped_fonts.len();
-
-    // ── Diff: new vs removed ───────────────────────────────────────
-    let new_fonts: Vec<String> = system_names
-        .difference(&indexed_names)
-        .cloned()
-        .collect();
-    let removed_fonts: std::collections::HashSet<String> = indexed_names
-        .difference(&system_names)
-        .cloned()
-        .collect();
-
-    if new_fonts.is_empty() && removed_fonts.is_empty() {
-        return Ok(());
-    }
-
-    // ── Remove stale fonts ─────────────────────────────────────────
-    if !removed_fonts.is_empty() {
-        for _name in removed_fonts.iter().take(10) {
-        }
-        if removed_fonts.len() > 10 {
-        }
-        index.remove_fonts(&removed_fonts, classifier, &args.render_params());
-    }
-
-    // ── Build entries for new fonts only ────────────────────────────
-    if !new_fonts.is_empty() {
-        for _name in new_fonts.iter().take(10) {
-        }
-        if new_fonts.len() > 10 {
-        }
-        let pairs: Vec<(String, PathBuf, char_index::GlyphOverrides, char_index::Variations)> = new_fonts
-            .iter()
-            .filter_map(|name| system_fonts.get(name).map(|(p, g, v)| (name.clone(), p.clone(), g.clone(), v.clone())))
-            .collect();
-        let _start = std::time::Instant::now();
-        let partial = char_index::build_char_index(&pairs, classifier, &args.render_params());
-        index.merge(partial, classifier, &args.render_params());
-    }
-
-    // ── Save updated index ─────────────────────────────────────────
-    if let Some(parent) = index_path.parent() {
-        let _ = std::fs::create_dir_all(parent);
-    }
-    char_index::save_index(&index, &index_path).map_err(ScanTextError::Io)?;
-    index.compact(); // drop raw entries — classifier holds the search vectors now
-    let _file_size = std::fs::metadata(&index_path).map(|m| m.len()).unwrap_or(0);
-    let _final_count = char_index::count_fonts(&index);
-
-    if !new_fonts.is_empty() {
-    }
-    if !removed_fonts.is_empty() {
-    }
-
-    Ok(())
-}
-
-/// Reconstruct a font catalog from cached index metadata.
-fn catalog_from_meta(index: &char_index::CharIndex) -> Vec<font_scan::FontEntry> {
-    index.font_meta.iter().map(|(_key, meta)| {
-        font_scan::FontEntry {
-            path: meta.path.clone(),
-            family_name: meta.family_name.clone(),
-            postscript_name: meta.postscript_name.clone(),
-            raw_postscript_name: font_scan::read_raw_postscript_name_from_file(&meta.path),
-            is_bold: meta.is_bold,
-            is_italic: meta.is_italic,
-            class: match meta.class {
-                0 => font_scan::FontClass::Serif,
-                1 => font_scan::FontClass::Sans,
-                2 => font_scan::FontClass::Mono,
-                _ => font_scan::FontClass::Unknown,
-            },
-            data: Vec::new(),
-            oldstyle_figures: meta.oldstyle_figures,
-            variant_tag: meta.variant_tag.clone(),
-            glyph_overrides: meta.glyph_overrides.clone(),
-            variations: meta.variations.clone(),
-            typographic_family: String::new(), // not serialized; only needed during scan_fonts dedup
-        }
-    }).collect()
-}
-
-/// Scan fonts from filesystem, build char index, and return both.
-fn scan_and_build_index(
-    args: &cli::Args,
-    classifier: &mut dyn classifier::Classifier,
-) -> Result<(char_index::CharIndex, Vec<font_scan::FontEntry>), ScanTextError> {
-    let font_dirs = font_scan::default_font_dirs(&args.font_dir);
-    let _t_scan = std::time::Instant::now();
-    let font_catalog = font_scan::scan_fonts(&font_dirs);
-    if font_catalog.is_empty() {
-        return Err(ScanTextError::NoFonts);
-    }
-
-    let index_path = args.resolved_index_path();
-    let start = std::time::Instant::now();
-    let pairs: Vec<(String, PathBuf, char_index::GlyphOverrides, char_index::Variations)> = font_catalog
-        .iter()
-        .map(|e| (e.font_key(), e.path.clone(), e.glyph_overrides.clone(), e.variations.clone()))
-        .collect();
-
-    let mut index = char_index::build_char_index(&pairs, classifier, &args.render_params());
-    let _elapsed = start.elapsed();
-
-    index.populate_font_meta(&font_catalog);
-
-    if let Some(parent) = index_path.parent() {
-        let _ = std::fs::create_dir_all(parent);
-    }
-    match char_index::save_index(&index, &index_path) {
-        Ok(()) => {
-            let _sz = std::fs::metadata(&index_path).map(|m| m.len()).unwrap_or(0);
-        }
-        Err(_e) => {
-        }
-    }
-    index.compact();
-
-    Ok((index, font_catalog))
-}
-
-/// Full index build from scratch (used for first build, format changes, --rebuild-index).
-fn do_full_build(
-    system_fonts: &std::collections::HashMap<String, (PathBuf, char_index::GlyphOverrides, char_index::Variations)>,
-    index_path: &Path,
-    classifier: &mut dyn classifier::Classifier,
-    render_params: &char_render::RenderParams,
-) -> Result<(), ScanTextError> {
-    let pairs: Vec<(String, PathBuf, char_index::GlyphOverrides, char_index::Variations)> = system_fonts
-        .iter()
-        .map(|(n, (p, g, v))| (n.clone(), p.clone(), g.clone(), v.clone()))
-        .collect();
-
-
-    let start = std::time::Instant::now();
-    let mut index = char_index::build_char_index(&pairs, classifier, render_params);
-    let _elapsed = start.elapsed();
-
-    if let Some(parent) = index_path.parent() {
-        std::fs::create_dir_all(parent).map_err(ScanTextError::Io)?;
-    }
-    char_index::save_index(&index, index_path).map_err(ScanTextError::Io)?;
-
-    let _file_size = std::fs::metadata(index_path).map(|m| m.len()).unwrap_or(0);
-    let _n_entries: usize = index.n_entries();
-    index.compact();
-
-
-    Ok(())
+    Ok(registry)
 }
 
 /// Load or build the character index with caching.
+/// Build an [`AuditEntry`] from a line match, OCR line, and decision results.
+fn build_audit_entry(
+    lm: &font_pipeline::LineMatch,
+    line: &ocr::TextLine,
+    page_num: usize,
+    line_num: usize,
+    ssim_score: Option<f32>,
+    ssim_pass: Option<bool>,
+    keep_raster: bool,
+    reason: &str,
+) -> AuditEntry {
+    use audit::{BBox, CiCandidate, CharCiVote, Decision, WordBBox};
+    let font_result = &lm.font_result;
+    let char_vote = |d: &font_match::CharMatchDetail, with_ranks: bool| {
+        CharCiVote {
+            ch: d.ch,
+            crop_index: d.crop_index,
+            best_prob: d.best_prob,
+            passed_gate: d.passed_gate,
+            nearest: d.nearest.clone(),
+            crop_path: None,
+            chosen_rank: if with_ranks { lm.chosen_char_ranks.get(&d.crop_index).copied() } else { None },
+            ocr_corrected_from: d.ocr_corrected_from,
+            best_alt_char: d.best_alt_char,
+            best_alt_dist: d.best_alt_dist,
+            gt_font_rank: if with_ranks { lm.gt_font_char_ranks.get(&d.crop_index).copied() } else { None },
+            chosen_prob: if with_ranks { lm.chosen_char_probs.get(&d.crop_index).copied() } else { None },
+            gt_font_prob: if with_ranks { lm.gt_font_char_probs.get(&d.crop_index).copied() } else { None },
+        }
+    };
+    AuditEntry {
+        page: page_num,
+        line_index: line_num,
+        text: line.text.clone(),
+        ocr_confidence: line.confidence,
+        font_matched: font_result.as_ref().map(|f| f.font_name.clone()),
+        font_confidence: font_result.as_ref().map(|f| f.score),
+        ssim_score,
+        ssim_pass,
+        decision: if keep_raster { Decision::KeptRaster } else { Decision::Vectorized },
+        reason: reason.to_string(),
+        bbox: BBox { x: line.x, y: line.y, width: line.width, height: line.height },
+        ci_candidates: lm.ci_top_for_audit.iter()
+            .map(|(k, s)| CiCandidate { font_key: k.clone(), score: *s })
+            .collect(),
+        ci_char_votes: lm.ci_char_detail.iter().map(|d| char_vote(d, true)).collect(),
+        ci_candidates_lig: lm.ci_top_for_audit_lig.iter()
+            .map(|(k, s)| CiCandidate { font_key: k.clone(), score: *s })
+            .collect(),
+        ci_char_votes_lig: lm.ci_char_detail_lig.iter().map(|d| char_vote(d, false)).collect(),
+        seg_winner: lm.seg_winner.clone(),
+        word_bboxes: line.words.iter().map(|w| WordBBox {
+            text: w.text.clone(), x: w.x, y: w.y, width: w.width, height: w.height, confidence: w.confidence,
+        }).collect(),
+        word_bboxes_raw: line.raw_words.iter().map(|w| WordBBox {
+            text: w.text.clone(), x: w.x, y: w.y, width: w.width, height: w.height, confidence: w.confidence,
+        }).collect(),
+        tie_candidates: lm.tie_candidates.clone(),
+        miss_type: None,
+        expected_font: None,
+    }
+}
+
+/// Write the HTML audit report to `<audit_root>/report.html`.
+fn write_audit_report(
+    audit_root: &std::path::Path,
+    entries: &[AuditEntry],
+    ground_truth: Option<&ground_truth::GroundTruth>,
+    dpi: u32,
+    font_entries: &[font_scan::FontEntry],
+    args: &cli::Args,
+    elapsed: std::time::Duration,
+) {
+    let report_path = audit_root.join("report.html");
+    let meta = report::ReportMeta {
+        classifier: args.classifier.clone(),
+        render_scale: args.render_scale,
+        render_aa: args.render_aa.clone(),
+        render_binarize: args.render_binarize,
+        elapsed,
+    };
+    let _ = report::generate_report(
+        &report_path,
+        audit_root,
+        entries,
+        ground_truth,
+        dpi,
+        font_entries,
+        &meta,
+    );
+}
+
 fn run(args: &cli::Args, classifier: &mut dyn classifier::Classifier) -> Result<(), ScanTextError> {
     let run_start = std::time::Instant::now();
-    dump_limits();
     let input = args.input.as_ref().expect("input validated");
     let dev_null = std::path::PathBuf::from("/dev/null");
     let output = args.output.as_ref().unwrap_or(&dev_null);
@@ -523,30 +229,9 @@ fn run(args: &cli::Args, classifier: &mut dyn classifier::Classifier) -> Result<
 
     let input_size = std::fs::metadata(input).map(|m| m.len()).unwrap_or(0);
 
-    // ── 1. Load or build character index + font catalog ────────────
-    let index_path = args.resolved_index_path();
-    let (char_index, font_catalog) = if !args.rebuild_index && index_path.exists() {
-        let _start = std::time::Instant::now();
-        match char_index::load_index(&index_path, classifier, &args.render_params()) {
-            Ok(mut index) if !index.font_meta.is_empty() => {
-                let _n_entries: usize = index.n_entries();
-                let catalog = catalog_from_meta(&index);
-                index.compact();
-                (index, catalog)
-            }
-            Ok(_) => {
-                let (idx, cat) = scan_and_build_index(args, classifier)?;
-                (idx, cat)
-            }
-            Err(_e) => {
-                let (idx, cat) = scan_and_build_index(args, classifier)?;
-                (idx, cat)
-            }
-        }
-    } else {
-        scan_and_build_index(args, classifier)?
-    };
-    if font_catalog.is_empty() {
+    // ── 1. Scan fonts and populate classifier ──────────────────────
+    let font_registry = load_fonts(args, classifier)?;
+    if font_registry.is_empty() {
         return Err(ScanTextError::NoFonts);
     }
 
@@ -560,47 +245,14 @@ fn run(args: &cli::Args, classifier: &mut dyn classifier::Classifier) -> Result<
         .and_then(|key| page_cache::cache_dir(&key));
 
     let raster_start = std::time::Instant::now();
-
-    // Try loading all pages from cache first.
-    let (pages, raster_cached) = if let Some(ref cdir) = cache_dir {
-        // Check if cache is stale (source PDF newer than cached images).
-        if page_cache::is_cache_stale(cdir, input) {
-            (load_pages(input, args.dpi)?, false)
-        } else if page_cache::load_cached_image(cdir, 0).is_some() {
-            let mut cached_pages = Vec::new();
-            let mut idx = 0;
-            while let Some(img) = page_cache::load_cached_image(cdir, idx) {
-                cached_pages.push(img);
-                idx += 1;
-            }
-            if !cached_pages.is_empty() {
-                (cached_pages, true)
-            } else {
-                (load_pages(input, args.dpi)?, false)
-            }
-        } else {
-            (load_pages(input, args.dpi)?, false)
-        }
-    } else {
-        (load_pages(input, args.dpi)?, false)
-    };
-
-    // If we rasterized fresh, save to cache for next time.
-    if !raster_cached {
-        if let Some(ref cdir) = cache_dir {
-            for (i, img) in pages.iter().enumerate() {
-                page_cache::save_cached_image(cdir, i, img);
-            }
-        }
-    }
-
+    let (pages, _raster_cached) = page_cache::get_pages(input, args.dpi)?;
     let _raster_elapsed = raster_start.elapsed();
-    if std::env::var("UNSCAN_DEBUG_MEM").is_ok() {
+    if std::env::var("UNPRINT_DEBUG_MEM").is_ok() {
     }
 
     // ── 2b. Extract source image data for pass-through ───────────────
     let source_images = if input.extension().and_then(|e| e.to_str()) == Some("pdf") {
-        extract_source_images(input)
+        pdf_out::extract_source_images(input)
     } else {
         Vec::new()
     };
@@ -622,7 +274,7 @@ fn run(args: &cli::Args, classifier: &mut dyn classifier::Classifier) -> Result<
     let ground_truth: Option<ground_truth::GroundTruth> = if let Some(vpath) = args.gt_vector_pdf() {
         match ground_truth::GroundTruth::load(vpath) {
             Ok(mut gt) => {
-                gt.canonicalize_names(&font_catalog);
+                gt.canonicalize_names(font_registry.entries());
                 Some(gt)
             },
             Err(_e) => {
@@ -664,625 +316,31 @@ fn run(args: &cli::Args, classifier: &mut dyn classifier::Classifier) -> Result<
         }
 
 
-        // 3a-pre. Deskew ──────────────────────────────────────────────
-        // Detect and correct skew on the grayscale image used for OCR
-        // and font matching. The original colour page_img is kept for
-        // background colour detection, geometry, and raster fragments.
-        let orig_gray = page_img.to_luma8();
-        let skew_angle = deskew::detect_skew(&orig_gray);
-        let deskewed_gray = if skew_angle.abs() > 5.0 {
-            orig_gray.clone()
-        } else if skew_angle.abs() > 0.5 {
-            deskew::rotate_gray(&orig_gray, skew_angle)
-        } else {
-            orig_gray
-        };
+        let prepared = page_cache::prepare_page(page_img, page_idx, args.dpi, cache_dir.as_deref())?;
+        let mut lines = prepared.lines;
+        let gray_page = prepared.gray;
+        let bg_color = prepared.bg_color;
+        let ink_thresh = prepared.ink_thresh;
 
-        // Build a DynamicImage from the deskewed gray for OCR input
-        let ocr_img: std::borrow::Cow<'_, image::DynamicImage> =
-            std::borrow::Cow::Owned(image::DynamicImage::ImageLuma8(deskewed_gray.clone()));
-
-        // 3a. OCR (with cache) ─────────────────────────────────────────
-        let ocr_start = std::time::Instant::now();
-        let (word_regions, _page_char_boxes, _ocr_cached) =
-            if let Some((wr, cb)) = cache_dir.as_ref().and_then(|d| page_cache::load_cached_ocr(d, page_idx)) {
-                (wr, cb, true)
-            } else {
-                let (wr, cb) = ocr::extract_text_regions(&ocr_img, args.dpi)?;
-                if let Some(ref cdir) = cache_dir {
-                    page_cache::save_cached_ocr(cdir, page_idx, &wr, &cb);
-                }
-                (wr, cb, false)
-            };
-        let mut lines = ocr::assemble_lines(&word_regions);
-        // Snapshot raw Tesseract word bboxes before post-processing
-        ocr::snapshot_raw_bboxes(&mut lines);
-        ocr::merge_overlapping_lines(&mut lines);
-        ocr::clip_word_overlaps(&mut lines);
-        ocr::drop_outlier_words(&mut lines);
-        let _ocr_elapsed = ocr_start.elapsed();
-
-        // 3b. Background colour ───────────────────────────────────────
-        let bg_color = color::detect_background_color(page_img);
-
-        // 3c. Font match + decision matrix ────────────────────────────
-        // Use the deskewed grayscale for character segmentation and matching
-        let gray_page = deskewed_gray;
-
-        // Expand OCR bboxes to actual ink extent — Tesseract often clips
-        // descenders, under-reporting line height by up to 10 px.
-        // Use a threshold relative to the background: anything darker than
-        // (bg - 56) counts as ink (works for both light and dark backgrounds).
-        let ink_thresh = bg_color.0.saturating_sub(56);
-        let blur_thresh = bg_color.0.saturating_sub(15);
-        let _t_pre = std::time::Instant::now();
-        // Expand word bboxes to actual ink, then union into line bboxes.
-        ocr::expand_words_to_ink(&mut lines, &gray_page, ink_thresh, blur_thresh, 20);
         let mut placed_texts: Vec<pdf_out::PlacedText> = Vec::new();
         let mut pg_vec = 0u32;
         let mut pg_raster = 0u32;
 
         // ── Pass 1: Match all lines ──────────────────────────────────
-        struct LineMatch {
-            font_result: Option<font_match::FontMatchResult>,
-            text_color: (u8, u8, u8),
-            ci_top_for_audit: Vec<(String, Option<f32>)>,
-            ci_char_detail: Vec<char_index::CharCiDetail>,
-            ci_top_for_audit_lig: Vec<(String, Option<f32>)>,
-            ci_char_detail_lig: Vec<char_index::CharCiDetail>,
-            seg_winner: Option<String>,
-            diag_seg_dir: Option<std::path::PathBuf>,
-            /// Per-char rank (1-based) of the chosen font among all fonts, keyed by crop_index.
-            chosen_char_ranks: std::collections::HashMap<usize, usize>,
-            /// Per-char rank (1-based) of the ground-truth font among all fonts, keyed by crop_index.
-            gt_font_char_ranks: std::collections::HashMap<usize, usize>,
-            /// Per-char calibrated probability of the chosen font, keyed by crop_index.
-            chosen_char_probs: std::collections::HashMap<usize, f32>,
-            /// Per-char calibrated probability of the ground-truth font, keyed by crop_index.
-            gt_font_char_probs: std::collections::HashMap<usize, f32>,
-            /// CI tie-break candidates with per-candidate SSIM scores.
-            tie_candidates: Vec<audit::TieCandidate>,
-        }
-
         let fontmatch_start = std::time::Instant::now();
+        let (line_matches, fp_hits) = font_pipeline::match_lines(
+            &lines, &gray_page, page_img, page_num,
+            &font_registry, &font_cache, classifier,
+            ground_truth.as_ref(),
+            dominant_font_candidate.as_ref(),
+            args,
+        );
 
-        // ── Parallel font matching with SSIM fast path ───────────────
-        // If we have a dominant font candidate (from a previous page or
-        // seeded from this page), each thread tries it via SSIM first.
-        // Lines that pass skip segmentation and CI entirely; misses fall
-        // through to the full pipeline.  Everything runs in parallel.
-        const FAST_PATH_MIN_SSIM: f32 = 0.90;
-        let fast_path_candidate: Option<&font_match::FontMatchResult> =
-            dominant_font_candidate.as_ref();
-        let fast_path_font_data: Option<std::sync::Arc<Vec<u8>>> = fast_path_candidate
-            .and_then(|fm| font_cache.load(&fm.font_path).ok());
-        let fast_path_hits = std::sync::atomic::AtomicU64::new(0);
-
-        // Profiling accumulators (microseconds, atomic for par_iter)
-        let prof_seg_us = std::sync::atomic::AtomicU64::new(0);
-        let prof_ci_us = std::sync::atomic::AtomicU64::new(0);
-        let prof_pcd_us = std::sync::atomic::AtomicU64::new(0);
-        let prof_fp_us = std::sync::atomic::AtomicU64::new(0);
-        let prof_full_us = std::sync::atomic::AtomicU64::new(0);
-        let line_matches: Vec<LineMatch> = lines.par_iter().enumerate().map(|(li, line)| {
-            let line_num = li + 1; // 1-indexed for output
-            let line_start = std::time::Instant::now();
-            // ── Fast path: try dominant font via SSIM ────────────────
-            if let (Some(fm), Some(ref fd)) = (fast_path_candidate, &fast_path_font_data) {
-                let (score, _dy) = verify::verify_text_region(
-                    &gray_page,
-                    fd.as_slice(),
-                    &line.text,
-                    line.x, line.y, line.width, line.height,
-                    &line.words,
-                    fm.glyph_overrides.as_deref(),
-                    &fm.variant_tag,
-                    fm.variations.as_deref(),
-                    None,
-                    Some(FAST_PATH_MIN_SSIM),
-                );
-                if score >= FAST_PATH_MIN_SSIM {
-                    fast_path_hits.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-                    prof_fp_us.fetch_add(line_start.elapsed().as_micros() as u64, std::sync::atomic::Ordering::Relaxed);
-                    let text_color = color::detect_text_color(
-                        page_img,
-                        &TextRegion {
-                            text: line.text.clone(),
-                            x: line.x, y: line.y,
-                            width: line.width, height: line.height,
-                            font_size_pt: line.font_size_pt,
-                            confidence: line.confidence,
-                            level: 5, block_num: 0, par_num: 0, line_num: 0, word_num: 0,
-                        },
-                    );
-                    let mut result = fm.clone();
-                    result.best_dy = _dy;
-                    return LineMatch {
-                        font_result: Some(result),
-                        text_color,
-                        ci_top_for_audit: Vec::new(),
-                        ci_char_detail: Vec::new(),
-                        ci_top_for_audit_lig: Vec::new(),
-                        ci_char_detail_lig: Vec::new(),
-                        seg_winner: None,
-                        diag_seg_dir: None,
-                        chosen_char_ranks: std::collections::HashMap::new(),
-                        gt_font_char_ranks: std::collections::HashMap::new(),
-                        chosen_char_probs: std::collections::HashMap::new(),
-                        gt_font_char_probs: std::collections::HashMap::new(),
-                        tie_candidates: Vec::new(),
-                    };
-                } else if li < 3 {
-                }
-            }
-
-            // ── Full pipeline: segmentation → CI search → font match ─
-            let _preview_end = {
-                let mut end = line.text.len().min(30);
-                while end > 0 && !line.text.is_char_boundary(end) { end -= 1; }
-                end
-            };
-            let debug_mem = std::env::var("UNSCAN_DEBUG_MEM").is_ok();
-            if debug_mem {
-            }
-            // Dump total mapped size from /proc/self/maps
-            if debug_mem && (li == 2 || li == 45) {
-                if let Ok(maps) = std::fs::read_to_string("/proc/self/maps") {
-                    let mut _total: u64 = 0;
-                    for l in maps.lines() {
-                        if let Some(range) = l.split_whitespace().next() {
-                            if let Some((start_s, end_s)) = range.split_once('-') {
-                                if let (Ok(s), Ok(e)) = (u64::from_str_radix(start_s, 16), u64::from_str_radix(end_s, 16)) {
-                                    _total += e - s;
-                                }
-                            }
-                        }
-                    }
-                }
-            }
-            let line_start = std::time::Instant::now();
-            let text_color = color::detect_text_color(
-                page_img,
-                &TextRegion {
-                    text: line.text.clone(),
-                    x: line.x, y: line.y,
-                    width: line.width, height: line.height,
-                    font_size_pt: line.font_size_pt,
-                    confidence: line.confidence,
-                    level: 5, block_num: 0, par_num: 0, line_num: 0, word_num: 0,
-                },
-            );
-            let mut ci_top_for_audit: Vec<(String, Option<f32>)>;
-            let ci_char_detail: Vec<char_index::CharCiDetail>;
-            let ci_top_for_audit_lig: Vec<(String, Option<f32>)>;
-            let ci_char_detail_lig: Vec<char_index::CharCiDetail>;
-            let seg_winner: Option<String>;
-            let diag_seg_dir: Option<std::path::PathBuf> = args.diag_seg_dir().map(|d| {
-                let line_slug: String = line.text.chars().take(30)
-                    .map(|c| if c.is_alphanumeric() { c } else { '_' })
-                    .collect();
-                let p = d.join(format!("p{}_L{:03}_{}", page_num, line_num, line_slug));
-                let _ = std::fs::create_dir_all(&p);
-                p
-            });
-            // Extract char crops (before font matching block so they're available after)
-            let word_placements: Vec<crate::verify::WordPlacement> = line.words.iter()
-                .map(|w| crate::verify::WordPlacement {
-                    text: w.text.clone(),
-                    x_off: w.x,
-                    y_off: w.y,
-                    width: w.width,
-                    height: w.height,
-                    confidence: w.confidence,
-                })
-                .collect();
-            let word_height = line.words.iter().map(|w| w.height).max().unwrap_or(0);
-            let seg_t0 = std::time::Instant::now();
-            let line_crops = char_index::extract_line_chars(
-                &gray_page, &word_placements, word_height,
-                diag_seg_dir.as_deref(),
-                &args.render_params(),
-            );
-            prof_seg_us.fetch_add(seg_t0.elapsed().as_micros() as u64, std::sync::atomic::Ordering::Relaxed);
-            let char_crops = &line_crops.plain;
-            if debug_mem {
-            }
-
-            let (font_result, tie_candidates_audit) = {
-
-                // Crop PNGs are saved after font matching, gated by ground-truth
-                // miss detection when --audit is set (see below).
-
-                // ── Score plain path ─────────────────────────────────
-                let ci_t0 = std::time::Instant::now();
-                let ci_result_plain = char_index::search_candidates(&char_index, char_crops, args.thoroughness, args.full_audit(), classifier);
-
-                // ── Score ligature path (if present) ─────────────────
-                let ci_result_lig = line_crops.ligature.as_ref().map(|lig_crops| {
-                    char_index::search_candidates(&char_index, lig_crops, args.thoroughness, args.full_audit(), classifier)
-                });
-                prof_ci_us.fetch_add(ci_t0.elapsed().as_micros() as u64, std::sync::atomic::Ordering::Relaxed);
-                // ── Pick the winner: higher top score wins ───────────
-                let plain_top = ci_result_plain.scores.first().map(|(_, s)| *s).unwrap_or(f32::MIN);
-                let lig_top = ci_result_lig.as_ref()
-                    .and_then(|r| r.scores.first().map(|(_, s)| *s))
-                    .unwrap_or(f32::MIN);
-                let use_lig = ci_result_lig.is_some() && lig_top > plain_top;
-
-                let (ci_result, _winning_crops) = if use_lig {
-                    (ci_result_lig.as_ref().unwrap(), line_crops.ligature.as_ref().unwrap().as_slice())
-                } else {
-                    (&ci_result_plain, char_crops.as_slice())
-                };
-
-                // Store both paths for audit
-                ci_top_for_audit = ci_result.scores.iter()
-                    .map(|(name, score)| (name.clone(), Some(*score))).collect();
-                ci_char_detail = ci_result.char_detail.clone();
-
-                // Store the alternate path for audit
-                let (ci_top_lig_audit, ci_char_lig_audit) = if let Some(ref lig_result) = ci_result_lig {
-                    (lig_result.scores.iter().map(|(n, s)| (n.clone(), Some(*s))).collect(),
-                     lig_result.char_detail.clone())
-                } else {
-                    (Vec::new(), Vec::new())
-                };
-                let (ci_top_plain_audit, ci_char_plain_audit) = (
-                    ci_result_plain.scores.iter().map(|(n, s)| (n.clone(), Some(*s))).collect::<Vec<_>>(),
-                    ci_result_plain.char_detail.clone(),
-                );
-
-                // Store both in the LineMatch for audit output
-                ci_top_for_audit_lig = if use_lig { ci_top_plain_audit } else { ci_top_lig_audit };
-                ci_char_detail_lig = if use_lig { ci_char_plain_audit } else { ci_char_lig_audit };
-                seg_winner = if ci_result_lig.is_some() {
-                    Some(if use_lig { "ligature".to_string() } else { "plain".to_string() })
-                } else {
-                    None
-                };
-
-                if debug_mem {
-                }
-
-                // Crop PNGs saved after font matching (see below).
-
-                // ── Font selection: CI #1, with SSIM tie-break ───────
-                let mut tie_candidates_audit: Vec<audit::TieCandidate> = Vec::new();
-                if let Some((_top_key, top_score)) = ci_result.scores.first() {
-                    // Collect all candidates that share the top CI score
-                    let tied: Vec<&(String, f32)> = ci_result.scores.iter()
-                        .take_while(|(_, s)| *s == *top_score)
-                        .collect();
-
-                    if tied.len() >= 2 {
-                        // Multiple candidates tied — SSIM decides
-                        let mut best: Option<(font_match::FontMatchResult, f32)> = None;
-                        let mut log_parts: Vec<String> = Vec::new();
-                        let mut tie_ssim_results: Vec<(String, String, f32)> = Vec::new();
-                        for (ti, (key, _)) in tied.iter().enumerate() {
-                            let fe = match font_catalog.iter().find(|fe| fe.font_key() == *key) {
-                                Some(fe) => fe,
-                                None => continue,
-                            };
-                            let fd = match font_cache.load(&fe.path).ok() {
-                                Some(fd) => fd,
-                                None => continue,
-                            };
-                            // Save per-candidate SSIM images when audit dir exists
-                            let tie_audit_dir = diag_seg_dir.as_ref().map(|d| {
-                                let p = d.join(format!("tie_{}", ti));
-                                let _ = std::fs::create_dir_all(&p);
-                                p
-                            });
-                            let (ssim, dy) = verify::verify_text_region(
-                                &gray_page, &fd, &line.text,
-                                line.x, line.y, line.width, line.height,
-                                &line.words,
-                                fe.glyph_overrides.as_deref(), &fe.variant_tag,
-                                fe.variations.as_deref(),
-                                tie_audit_dir.as_deref(), None,
-                            );
-                            log_parts.push(format!("{:.4}({})", ssim, fe.family_name));
-                            tie_ssim_results.push((fe.font_key(), fe.family_name.clone(), ssim));
-                            if best.as_ref().map_or(true, |(_, bs)| ssim > *bs) {
-                                best = Some((font_match::FontMatchResult {
-                                    font_name: fe.family_name.clone(),
-                                    font_path: fe.path.clone(),
-                                    font_key: fe.font_key(),
-                                    variant_tag: fe.variant_tag.clone(),
-                                    glyph_overrides: fe.glyph_overrides.clone(),
-                                    variations: fe.variations.clone(),
-                                    score: *top_score,
-                                    best_dy: dy,
-                                }, ssim));
-                            }
-                        }
-                        // Build tie_candidates for audit
-                        let winner_key = best.as_ref().map(|(fm, _)| fm.font_key.clone());
-                        for (fk, fname, ssim) in tie_ssim_results {
-                            tie_candidates_audit.push(audit::TieCandidate {
-                                font_key: fk.clone(),
-                                family_name: fname,
-                                ssim_score: ssim,
-                                winner: Some(&fk) == winner_key.as_ref(),
-                            });
-                        }
-                        if let Some((ref _winner, _)) = best {
-                        }
-                        (best.map(|(fm, _)| fm), tie_candidates_audit)
-                    } else {
-                        // No tie — use CI #1 directly
-                        let (ref key, score) = *tied[0];
-                        (font_catalog.iter().find(|fe| fe.font_key() == *key)
-                            .map(|fe| font_match::FontMatchResult {
-                                font_name: fe.family_name.clone(),
-                                font_path: fe.path.clone(),
-                                font_key: fe.font_key(),
-                                variant_tag: fe.variant_tag.clone(),
-                                glyph_overrides: fe.glyph_overrides.clone(),
-                                variations: fe.variations.clone(),
-                                score,
-                                best_dy: 0,
-                            }), Vec::new())
-                    }
-                } else {
-                    (None, Vec::new())
-                }
-            };
-            let line_elapsed = line_start.elapsed();
-            if line_elapsed.as_millis() > 500 {
-            }
-            // ── Ground-truth gated audit detail ─────────────────────────
-            // When --audit is set, check if this line is a miss before
-            // doing expensive audit I/O.  Without --audit, all lines
-            // get full audit.  "Miss" means: ground-truth font mismatch, no
-            // font matched, OCR too low, or font confidence too low.
-            let is_miss = if let Some(ref gt) = ground_truth {
-                // OCR too low → line will be kept raster, treat as miss
-                let ocr_ok = line.confidence >= args.min_ocr_confidence as f32
-                    && !line.text.trim().is_empty();
-                if !ocr_ok {
-                    true
-                } else if let Some(ref fr) = font_result {
-                        let bbox_px = [line.x as f32, line.y as f32,
-                                       (line.x + line.width) as f32,
-                                       (line.y + line.height) as f32];
-                        // Look up chosen font's PostScript name for exact comparison
-                        let chosen_ps = font_catalog.iter()
-                            .find(|fe| fe.font_key() == fr.font_key)
-                            .map(|fe| fe.postscript_name.as_str())
-                            .unwrap_or("");
-                        !gt.is_hit(page_num, &bbox_px, args.dpi, chosen_ps)
-                } else {
-                    true // no font matched → treat as miss
-                }
-            } else {
-                true // no ground truth → full audit for all lines
-            };
-
-            // Compute per-char distances for the chosen font.
-            // Use corrected characters when the OCR correction gate fired.
-            // Use winning path's crops (plain or ligature).
-            let effective_crops: &[(char, image::GrayImage)] = if seg_winner.as_deref() == Some("ligature") {
-                line_crops.ligature.as_ref().map(|v| v.as_slice()).unwrap_or(char_crops)
-            } else {
-                char_crops
-            };
-            // Build a correction map: crop_index → corrected char, without cloning images
-            let char_corrections: std::collections::HashMap<usize, char> = ci_char_detail.iter()
-                .filter_map(|d| d.ocr_corrected_from.as_ref().map(|_| (d.crop_index, d.ch)))
-                .collect();
-            let corrected_char_crops: Vec<(char, &image::GrayImage)> = effective_crops.iter()
-                .enumerate()
-                .map(|(i, (ch, img))| {
-                    let effective_ch = char_corrections.get(&i).copied().unwrap_or(*ch);
-                    (effective_ch, img)
-                })
-                .collect();
-
-            let pcd_t0 = std::time::Instant::now();
-
-            // Per-char probabilities and audit detail: only for miss lines when full audit is active
-            let (chosen_char_ranks, chosen_char_probs, gt_font_char_ranks, gt_font_char_probs) = if is_miss && args.full_audit() {
-                // Compute raw features for each crop
-                let crop_feats: Vec<(usize, char, char_index::CharFeatures)> = corrected_char_crops
-                    .iter()
-                    .enumerate()
-                    .filter_map(|(i, (c, img))| {
-                        char_index::compute_features(img).map(|f| (i, *c, f))
-                    })
-                    .collect();
-
-                // Resolve chosen and GT font IDs once
-                let chosen_font_id = font_result.as_ref()
-                    .filter(|fr| !fr.font_key.is_empty())
-                    .and_then(|fr| char_index.font_names_table.iter().position(|n| n == &fr.font_key));
-
-                let gt_font_id = ground_truth.as_ref().and_then(|gt| {
-                    let bbox_px = [line.x as f32, line.y as f32,
-                                   (line.x + line.width) as f32,
-                                   (line.y + line.height) as f32];
-                    let gt_font_name = gt.lookup_font(page_num, &bbox_px, args.dpi)?;
-                    let gt_ps = ground_truth::strip_subset_prefix_str(gt_font_name);
-                    let gt_key = font_catalog.iter()
-                        .find(|fe| fe.postscript_name == gt_ps)
-                        .map(|fe| fe.font_key())?;
-                    // Inject GT font into ci_top_for_audit if missing
-                    if !ci_top_for_audit.iter().any(|(n, _)| n == &gt_key) {
-                        if let Some(gfid) = char_index.font_names_table.iter().position(|n| n == &gt_key) {
-                            let gt_log_probs: Vec<(f32, f32)> = crop_feats.iter()
-                                .filter_map(|&(_, ch, ref feat)| {
-                                    let p = classifier.probability(ch, feat, gfid)?;
-                                    Some((p.max(1e-30).ln(), char_index::char_weight(ch)))
-                                })
-                                .collect();
-                            if !gt_log_probs.is_empty() {
-                                let score = char_index::aggregate_ci_score(&gt_log_probs, crop_feats.len());
-                                if score.is_finite() {
-                                    ci_top_for_audit.push((gt_key.clone(), Some(score)));
-                                }
-                            }
-                        }
-                    }
-                    char_index.font_names_table.iter().position(|n| n == &gt_key)
-                });
-
-                // One probabilities() call per character; extract
-                // rank and probability for both chosen and GT font IDs.
-                let mut c_ranks = std::collections::HashMap::new();
-                let mut c_probs = std::collections::HashMap::new();
-                let mut g_ranks = std::collections::HashMap::new();
-                let mut g_probs = std::collections::HashMap::new();
-
-                for &(crop_idx, ch, ref feat) in &crop_feats {
-                    let probs = classifier.probabilities(ch, feat);
-                    if probs.is_empty() { continue; }
-
-                    // Extract rank (1-based position in probability-sorted list)
-                    // and probability for any font_id
-                    let lookup = |fid: usize| -> Option<(usize, f32)> {
-                        probs.iter().enumerate()
-                            .find(|(_, (id, _))| *id == fid)
-                            .map(|(pos, (_, p))| (pos + 1, *p))
-                    };
-
-                    if let Some(fid) = chosen_font_id {
-                        if let Some((rank, prob)) = lookup(fid) {
-                            c_ranks.insert(crop_idx, rank);
-                            c_probs.insert(crop_idx, prob);
-                        }
-                    }
-                    if let Some(fid) = gt_font_id {
-                        if let Some((rank, prob)) = lookup(fid) {
-                            g_ranks.insert(crop_idx, rank);
-                            g_probs.insert(crop_idx, prob);
-                        }
-                    }
-                }
-
-                // Save crop PNGs for miss lines
-                if let Some(ref ddir) = diag_seg_dir {
-                    if !effective_crops.is_empty() {
-                        let crop_dir = ddir.join("crops");
-                        let _ = std::fs::create_dir_all(&crop_dir);
-                        for (i, (ch, img)) in effective_crops.iter().enumerate() {
-                            let path = crop_dir.join(format!("crop_{:02}_{}.png", i,
-                                if ch.is_alphanumeric() { format!("{}", ch) }
-                                else { format!("U{:04X}", *ch as u32) }));
-                            let _ = img.save(&path);
-                        }
-                    }
-
-                    // Save full-colour scan line crop for report overlay.
-                    // "Surroundings" bbox: union of line bbox (= word-union)
-                    // and raw word bboxes, plus 4px padding, so the report
-                    // can show both original and expanded bbox sets.
-                    {
-                        let pad = 4u32;
-                        let mut sx0 = line.x;
-                        let mut sy0 = line.y;
-                        let mut sx1 = line.x + line.width;
-                        let mut sy1 = line.y + line.height;
-                        for rw in &line.raw_words {
-                            sx0 = sx0.min(rw.x);
-                            sy0 = sy0.min(rw.y);
-                            sx1 = sx1.max(rw.x + rw.width);
-                            sy1 = sy1.max(rw.y + rw.height);
-                        }
-                        let surr_x = sx0.saturating_sub(pad).min(page_img.width().saturating_sub(1));
-                        let surr_y = sy0.saturating_sub(pad).min(page_img.height().saturating_sub(1));
-                        let surr_r = sx1.saturating_add(pad).min(page_img.width());
-                        let surr_b = sy1.saturating_add(pad).min(page_img.height());
-                        let surr_w = surr_r - surr_x;
-                        let surr_h = surr_b - surr_y;
-                        if surr_w >= 3 && surr_h >= 3 {
-                            let crop = image::imageops::crop_imm(page_img, surr_x, surr_y, surr_w, surr_h).to_image();
-                            let _ = crop.save(ddir.join("scan_line.png"));
-                            let _ = std::fs::write(
-                                ddir.join("scan_line_origin.json"),
-                                format!("{{\"x\":{},\"y\":{}}}", surr_x, surr_y),
-                            );
-                        }
-                    }
-                }
-
-                // Render font ref glyphs for miss lines
-                if let (Some(ref audit_root), Some(ref fr)) = (&args.audit, &font_result) {
-                    let fe_opt = font_catalog.iter().find(|e| e.font_key() == fr.font_key);
-                    let label = fe_opt.map(|fe| {
-                        let mut s = fe.family_name.replace(' ', "");
-                        if fe.is_bold { s.push_str("-Bold"); }
-                        if fe.is_italic { s.push_str("-Italic"); }
-                        if !fe.variant_tag.is_empty() {
-                            s.push('_');
-                            s.push_str(&fe.variant_tag);
-                        }
-                        s
-                    }).unwrap_or_else(|| {
-                        fr.font_path.file_stem()
-                            .and_then(|s| s.to_str())
-                            .unwrap_or("unknown")
-                            .to_string()
-                    });
-                    let font_ref_dir = audit_root.join("font_refs").join(&label);
-                    let _ = std::fs::create_dir_all(&font_ref_dir);
-
-                    let override_map: std::collections::HashMap<char, u16> = fe_opt
-                        .and_then(|fe| fe.glyph_overrides.as_ref())
-                        .map(|v| v.iter().cloned().collect())
-                        .unwrap_or_default();
-                    let font_data = font_cache.load(&fr.font_path).ok();
-                    if let Some(ref fdata) = font_data {
-                        if let Ok(mut font) = ab_glyph::FontRef::try_from_slice(fdata) {
-                            // Apply variable-font axis coordinates
-                            if let Some(vars) = fe_opt.and_then(|fe| fe.variations.as_ref()) {
-                                use ab_glyph::VariableFont;
-                                for (tag, val) in vars {
-                                    font.set_variation(tag, *val);
-                                }
-                            }
-                            for (ch, _crop) in corrected_char_crops.iter() {
-                                let fname = format!("U+{:04X}.png", *ch as u32);
-                                let path = font_ref_dir.join(&fname);
-                                if path.exists() { continue; }
-                                let gid_override = override_map.get(ch).map(|&gid| ab_glyph::GlyphId(gid));
-                                let font_key = fr.font_key.clone();
-                                let ref_img = char_render::get_rendered_char_default(&font, &font_key, *ch, gid_override);
-                                if let Some(img) = ref_img {
-                                    let _ = img.save(&path);
-                                }
-                            }
-                        }
-                    }
-                }
-
-                (c_ranks, c_probs, g_ranks, g_probs)
-            } else {
-                (std::collections::HashMap::new(), std::collections::HashMap::new(), std::collections::HashMap::new(), std::collections::HashMap::new())
-            };
-            prof_pcd_us.fetch_add(pcd_t0.elapsed().as_micros() as u64, std::sync::atomic::Ordering::Relaxed);
-
-            prof_full_us.fetch_add(line_start.elapsed().as_micros() as u64, std::sync::atomic::Ordering::Relaxed);
-            LineMatch { font_result, text_color, ci_top_for_audit, ci_char_detail, ci_top_for_audit_lig, ci_char_detail_lig, seg_winner, diag_seg_dir, chosen_char_ranks, gt_font_char_ranks, chosen_char_probs, gt_font_char_probs, tie_candidates: tie_candidates_audit }
-        }).collect();
-
-        // Update dominant font candidate for next page from this page's results
-        {
-            let mut font_freq: std::collections::HashMap<String, usize> = std::collections::HashMap::new();
-            for lm in &line_matches {
-                if let Some(ref fr) = lm.font_result {
-                    *font_freq.entry(fr.font_key.clone()).or_insert(0) += 1;
-                }
-            }
-            if let Some((top_key, _count)) = font_freq.iter().max_by_key(|(_, c)| *c) {
-                dominant_font_candidate = line_matches.iter()
-                    .find_map(|lm| lm.font_result.as_ref()
-                        .filter(|fr| fr.font_key == *top_key)
-                        .cloned());
-            }
+        // Update dominant font candidate for next page
+        if let Some(new_dom) = font_pipeline::update_dominant_font(&line_matches) {
+            dominant_font_candidate = Some(new_dom);
         }
 
-        let fp_hits = fast_path_hits.load(std::sync::atomic::Ordering::Relaxed);
         let ci_lines = lines.len() as u64 - fp_hits;
         let _fontmatch_elapsed = fontmatch_start.elapsed();
         if fp_hits > 0 {
@@ -1291,45 +349,7 @@ fn run(args: &cli::Args, classifier: &mut dyn classifier::Classifier) -> Result<
         }
 
         // ── Pass 1.5: Paragraph-level font grouping ─────────────────
-        // Find the dominant body font: most common font among matched lines
-        // at the most common font size (±1pt tolerance).
-        {
-            use std::collections::HashMap;
-            // Collect (font_name, font_size_bucket) frequencies
-            let mut size_freq: HashMap<i32, u32> = std::collections::HashMap::new();
-            for (i, lm) in line_matches.iter().enumerate() {
-                if lm.font_result.is_some() {
-                    let bucket = lines[i].font_size_pt.round() as i32;
-                    *size_freq.entry(bucket).or_default() += 1;
-                }
-            }
-            // Find most common size bucket
-            let body_size = size_freq.iter()
-                .max_by_key(|(_, &v)| v)
-                .map(|(&k, _)| k);
-
-
-            if let Some(body_size) = body_size {
-                // Count fonts at body size (±1pt)
-                let mut font_freq: HashMap<String, (u32, PathBuf)> = std::collections::HashMap::new();
-                for (i, lm) in line_matches.iter().enumerate() {
-                    let sz = lines[i].font_size_pt.round() as i32;
-                    if (sz - body_size).abs() <= 1 {
-                        if let Some(ref fm) = lm.font_result {
-                                let entry = font_freq.entry(fm.font_name.clone())
-                                    .or_insert_with(|| (0, fm.font_path.clone()));
-                                entry.0 += 1;
-                        }
-                    }
-                }
-                // Find majority font
-                if let Some((_majority_name, (_majority_count, _majority_path))) = font_freq.iter()
-                    .max_by_key(|(_, (count, _))| *count)
-                {
-                    let _total_body: u32 = font_freq.values().map(|(c, _)| c).sum();
-                }
-            }
-        }
+        font_pipeline::paragraph_font_grouping(&lines, &line_matches);
 
         // ── Word split: split wide whitespace using matched fonts ──
         let _t_split = std::time::Instant::now();
@@ -1444,92 +464,9 @@ fn run(args: &cli::Args, classifier: &mut dyn classifier::Classifier) -> Result<
             }
 
             // ── Audit entry ──────────────────────────────────────────
-            audit_text.push(AuditEntry {
-                page: page_num,
-                line_index: line_num,
-                text: line.text.clone(),
-                ocr_confidence: line.confidence,
-                font_matched: font_result.as_ref().map(|f| f.font_name.clone()),
-                font_confidence: font_result.as_ref().map(|f| f.score),
-                ssim_score,
-                ssim_pass,
-                decision: if keep_raster { Decision::KeptRaster } else { Decision::Vectorized },
-                reason: reason.clone(),
-                bbox: BBox {
-                    x: line.x,
-                    y: line.y,
-                    width: line.width,
-                    height: line.height,
-                },
-                ci_candidates: lm.ci_top_for_audit.iter()
-                    .map(|(k, s)| audit::CiCandidate { font_key: k.clone(), score: *s })
-                    .collect(),
-                ci_char_votes: lm.ci_char_detail.iter()
-                    .map(|d| {
-                        let chosen_rank = lm.chosen_char_ranks.get(&d.crop_index).copied();
-                        let gt_rank = lm.gt_font_char_ranks.get(&d.crop_index).copied();
-                        let chosen_p = lm.chosen_char_probs.get(&d.crop_index).copied();
-                        let gt_p = lm.gt_font_char_probs.get(&d.crop_index).copied();
-                        audit::CharCiVote {
-                            ch: d.ch,
-                            crop_index: d.crop_index,
-                            best_prob: d.best_prob,
-                            passed_gate: d.passed_gate,
-                            nearest: d.nearest.clone(),
-                            crop_path: None,
-                            chosen_rank,
-                            ocr_corrected_from: d.ocr_corrected_from,
-                            best_alt_char: d.best_alt_char,
-                            best_alt_dist: d.best_alt_dist,
-                            gt_font_rank: gt_rank,
-                            chosen_prob: chosen_p,
-                            gt_font_prob: gt_p,
-                        }
-                    })
-                    .collect(),
-                ci_candidates_lig: lm.ci_top_for_audit_lig.iter()
-                    .map(|(k, s)| audit::CiCandidate { font_key: k.clone(), score: *s })
-                    .collect(),
-                ci_char_votes_lig: lm.ci_char_detail_lig.iter()
-                    .map(|d| {
-                        audit::CharCiVote {
-                            ch: d.ch,
-                            crop_index: d.crop_index,
-                            best_prob: d.best_prob,
-                            passed_gate: d.passed_gate,
-                            nearest: d.nearest.clone(),
-                            crop_path: None,
-                            chosen_rank: None,
-                            ocr_corrected_from: d.ocr_corrected_from,
-                            best_alt_char: d.best_alt_char,
-                            best_alt_dist: d.best_alt_dist,
-                            gt_font_rank: None,
-                            chosen_prob: None,
-                            gt_font_prob: None,
-                        }
-                    })
-                    .collect(),
-                seg_winner: lm.seg_winner.clone(),
-                word_bboxes: line.words.iter().map(|w| audit::WordBBox {
-                    text: w.text.clone(),
-                    x: w.x,
-                    y: w.y,
-                    width: w.width,
-                    height: w.height,
-                    confidence: w.confidence,
-                }).collect(),
-                word_bboxes_raw: line.raw_words.iter().map(|w| audit::WordBBox {
-                    text: w.text.clone(),
-                    x: w.x,
-                    y: w.y,
-                    width: w.width,
-                    height: w.height,
-                    confidence: w.confidence,
-                }).collect(),
-                tie_candidates: lm.tie_candidates.clone(),
-                miss_type: None,
-                expected_font: None,
-            });
+            audit_text.push(build_audit_entry(
+                lm, line, page_num, line_num, ssim_score, ssim_pass, keep_raster, &reason,
+            ));
 
             placed_texts.push(pdf_out::PlacedText {
                 text: line.text.clone(),
@@ -1537,43 +474,9 @@ fn run(args: &cli::Args, classifier: &mut dyn classifier::Classifier) -> Result<
                 y: line.y as f32,
                 width: line.width as f32,
                 height: line.height as f32,
-                font_size_pt: {
-                    // Height-based sizing: map OCR bbox height to em-square
-                    // using the font's ink height ratio (ascent - descent).
-                    let dpi_f = args.dpi as f32;
-                    let fallback_pt = line.height as f32 * 72.0 / dpi_f;
-                    if let Some(ref fm) = font_result {
-                        let font_bytes = font_cache.load(&fm.font_path).ok();
-                        if let Some(ref fb) = font_bytes {
-                        if let Ok(mut f) = ab_glyph::FontRef::try_from_slice(fb.as_slice()) {
-                            // Apply variable-font axis coordinates
-                            if let Some(ref vars) = fm.variations {
-                                use ab_glyph::VariableFont;
-                                for (tag, val) in vars {
-                                    f.set_variation(tag, *val);
-                                }
-                            }
-                            use ab_glyph::{Font, PxScale, ScaleFont};
-                            let ref_h = 100.0f32;
-                            let sf_ref = f.as_scaled(PxScale::from(ref_h));
-                            let ref_ink = sf_ref.ascent() - sf_ref.descent();
-                            let line_h = line.height as f32;
-                            if line_h > 1.0 {
-                                let em_px = ref_h * (line_h / ref_ink);
-                                em_px * 72.0 / dpi_f
-                            } else {
-                                fallback_pt
-                            }
-                        } else {
-                            fallback_pt
-                        }
-                        } else {
-                            fallback_pt
-                        }
-                    } else {
-                        fallback_pt
-                    }
-                },
+                font_size_pt: font_pipeline::compute_font_size_pt(
+                    font_result, line.height, args.dpi, &font_cache,
+                ),
                 font_match: font_result.clone(),
                 keep_raster,
                 color: text_color,
@@ -1677,7 +580,7 @@ fn run(args: &cli::Args, classifier: &mut dyn classifier::Classifier) -> Result<
             }]
         } else {
             // Something was vectorized — we modified the image, must re-encode
-            extract_raster_fragments(
+            pdf_out::extract_raster_fragments(
                 &cleaned_img,
                 args.dpi,
                 page_img.height(),
@@ -1764,7 +667,7 @@ fn run(args: &cli::Args, classifier: &mut dyn classifier::Classifier) -> Result<
         &mut audit.text_entries,
         ground_truth.as_ref(),
         args.dpi,
-        &font_catalog,
+        font_registry.entries(),
     );
 
     if test_mode {
@@ -1773,7 +676,7 @@ fn run(args: &cli::Args, classifier: &mut dyn classifier::Classifier) -> Result<
             &audit.text_entries,
             ground_truth.as_ref(),
             args.dpi,
-            &font_catalog,
+            font_registry.entries(),
         );
         // JSON output to stdout
         let test_json = serde_json::json!({
@@ -1794,24 +697,10 @@ fn run(args: &cli::Args, classifier: &mut dyn classifier::Classifier) -> Result<
             if let Err(_e) = audit.write_to_file(&audit_path) {
             } else {
             }
-            let report_path = audit_root.join("report.html");
-            let meta = report::ReportMeta {
-                classifier: args.classifier.clone(),
-                render_scale: args.render_scale,
-                render_aa: args.render_aa.clone(),
-                render_binarize: args.render_binarize,
-                elapsed: run_start.elapsed(),
-            };
-            if let Err(_e) = report::generate_report(
-                &report_path,
-                audit_root,
-                &audit.text_entries,
-                ground_truth.as_ref(),
-                args.dpi,
-                &font_catalog,
-                &meta,
-            ) {
-            }
+            write_audit_report(
+                audit_root, &audit.text_entries, ground_truth.as_ref(),
+                args.dpi, font_registry.entries(), args, run_start.elapsed(),
+            );
         }
         return Ok(());
     }
@@ -1826,24 +715,10 @@ fn run(args: &cli::Args, classifier: &mut dyn classifier::Classifier) -> Result<
 
     // ── 5b. HTML miss report ─────────────────────────────────────────
     if let Some(ref audit_root) = args.audit {
-        let report_path = audit_root.join("report.html");
-        let meta = report::ReportMeta {
-            classifier: args.classifier.clone(),
-            render_scale: args.render_scale,
-            render_aa: args.render_aa.clone(),
-            render_binarize: args.render_binarize,
-            elapsed: run_start.elapsed(),
-        };
-        if let Err(_e) = report::generate_report(
-            &report_path,
-            audit_root,
-            &audit.text_entries,
-            ground_truth.as_ref(),
-            args.dpi,
-            &font_catalog,
-            &meta,
-        ) {
-        }
+        write_audit_report(
+            audit_root, &audit.text_entries, ground_truth.as_ref(),
+            args.dpi, font_registry.entries(), args, run_start.elapsed(),
+        );
     }
 
     // ── 6. Report ────────────────────────────────────────────────────
@@ -1856,321 +731,9 @@ fn run(args: &cli::Args, classifier: &mut dyn classifier::Classifier) -> Result<
 // Page loading
 // ---------------------------------------------------------------------------
 
-fn load_pages(path: &Path, dpi: u32) -> Result<Vec<DynamicImage>, ScanTextError> {
-    let ext = path
-        .extension()
-        .and_then(|e| e.to_str())
-        .unwrap_or("")
-        .to_lowercase();
-    match ext.as_str() {
-        "pdf" => load_pdf_pages(path, dpi),
-        "png" | "jpg" | "jpeg" | "tiff" | "tif" | "bmp" | "gif" | "webp" => {
-            let img = image::open(path).map_err(|e| ScanTextError::ImageLoad(e.to_string()))?;
-            Ok(vec![img])
-        }
-        _ => Err(ScanTextError::UnsupportedFormat(ext)),
-    }
-}
-
-fn load_pdf_pages(path: &Path, dpi: u32) -> Result<Vec<DynamicImage>, ScanTextError> {
-    use std::process::Command;
-    let tmp_dir = tempfile::tempdir().map_err(ScanTextError::Io)?;
-    let prefix = tmp_dir.path().join("page");
-
-    let status = Command::new("pdftoppm")
-        .args([
-            "-r",
-            &dpi.to_string(),
-            "-png",
-            &path.to_string_lossy(),
-            &prefix.to_string_lossy(),
-        ])
-        .status()
-        .map_err(|e| {
-            ScanTextError::ImageLoad(format!("Failed to run pdftoppm (install poppler-utils): {e}"))
-        })?;
-    if !status.success() {
-        return Err(ScanTextError::ImageLoad("pdftoppm exited with error".into()));
-    }
-
-    let mut pngs: Vec<_> = std::fs::read_dir(tmp_dir.path())
-        .map_err(ScanTextError::Io)?
-        .filter_map(|e| e.ok())
-        .map(|e| e.path())
-        .filter(|p| p.extension().and_then(|e| e.to_str()) == Some("png"))
-        .collect();
-    pngs.sort();
-
-    let mut pages = Vec::new();
-    for png_path in &pngs {
-        pages.push(image::open(png_path).map_err(|e| ScanTextError::ImageLoad(e.to_string()))?);
-    }
-    if pages.is_empty() {
-        return Err(ScanTextError::ImageLoad("pdftoppm produced no pages".into()));
-    }
-    Ok(pages)
-}
 
 // ---------------------------------------------------------------------------
 // Raster fragment extraction (lossless)
 // ---------------------------------------------------------------------------
 
-fn extract_raster_fragments(
-    cleaned_img: &DynamicImage,
-    dpi: u32,
-    page_height_px: u32,
-) -> Vec<pdf_out::RasterFragment> {
-    let w = cleaned_img.width();
-    let h = cleaned_img.height();
-    let cell = 100u32;
-    let cols = (w + cell - 1) / cell;
-    let rows = (h + cell - 1) / cell;
-
-    let mut interesting = vec![false; (cols * rows) as usize];
-    let gray = cleaned_img.to_luma8();
-    for row in 0..rows {
-        for col in 0..cols {
-            let cx = col * cell;
-            let cy = row * cell;
-            let cw = cell.min(w - cx);
-            let ch = cell.min(h - cy);
-            if color::region_has_content(&gray, cx, cy, cw, ch) {
-                interesting[(row * cols + col) as usize] = true;
-            }
-        }
-    }
-
-    let mut visited = vec![false; (cols * rows) as usize];
-    let mut fragments = Vec::new();
-
-    for row in 0..rows {
-        for col in 0..cols {
-            let idx = (row * cols + col) as usize;
-            if !interesting[idx] || visited[idx] {
-                continue;
-            }
-            visited[idx] = true;
-            let mut queue = vec![(row, col)];
-            let (mut min_r, mut max_r, mut min_c, mut max_c) = (row, row, col, col);
-
-            while let Some((r, c)) = queue.pop() {
-                min_r = min_r.min(r);
-                max_r = max_r.max(r);
-                min_c = min_c.min(c);
-                max_c = max_c.max(c);
-                for (dr, dc) in &[(0i32, 1i32), (0, -1), (1, 0), (-1, 0)] {
-                    let nr = r as i32 + dr;
-                    let nc = c as i32 + dc;
-                    if nr < 0 || nc < 0 || nr >= rows as i32 || nc >= cols as i32 {
-                        continue;
-                    }
-                    let ni = (nr as u32 * cols + nc as u32) as usize;
-                    if !interesting[ni] || visited[ni] {
-                        continue;
-                    }
-                    visited[ni] = true;
-                    queue.push((nr as u32, nc as u32));
-                }
-            }
-
-            let fx = min_c * cell;
-            let fy = min_r * cell;
-            let fw = ((max_c + 1) * cell).min(w) - fx;
-            let fh = ((max_r + 1) * cell).min(h) - fy;
-
-            if let Some(frag) =
-                pdf_out::extract_raster_fragment(cleaned_img, fx, fy, fw, fh, dpi, page_height_px)
-            {
-                fragments.push(frag);
-            }
-        }
-    }
-    fragments
-}
-
-
-// ---------------------------------------------------------------------------
-// Source image extraction — preserve original encoding
-// ---------------------------------------------------------------------------
-
-/// Extract the original compressed image stream from each page of the input PDF.
-/// Returns one `SourceImageInfo` per page, or `None` if extraction fails for
-/// that page (multiple images, unsupported structure, etc.).
-fn extract_source_images(path: &Path) -> Vec<Option<pdf_out::SourceImageInfo>> {
-    let doc = match lopdf::Document::load(path) {
-        Ok(d) => d,
-        Err(_e) => {
-            return Vec::new();
-        }
-    };
-
-    let page_map = doc.get_pages(); // BTreeMap<u32, ObjectId>
-    let mut results: Vec<Option<pdf_out::SourceImageInfo>> = Vec::new();
-
-    for page_num in 1..=(page_map.len() as u32) {
-        let info = (|| -> Option<pdf_out::SourceImageInfo> {
-            let &page_id = page_map.get(&page_num)?;
-            let page_obj = doc.get_object(page_id).ok()?;
-            let page_dict = page_obj.as_dict().ok()?;
-
-            let resources = page_dict.get(b"Resources").ok()?;
-            let res_dict = resolve_dict(&doc, resources)?;
-
-            let xobj = res_dict.get(b"XObject").ok()?;
-            let xobj_dict = resolve_dict(&doc, xobj)?;
-
-            // We only handle the simple case: exactly one image XObject per page
-            let entries: Vec<_> = xobj_dict.iter().collect();
-            if entries.len() != 1 {
-                return None;
-            }
-
-            let (_name, obj) = entries[0];
-            let stream_id = match obj {
-                lopdf::Object::Reference(r) => *r,
-                _ => return None,
-            };
-
-            let stream_obj = doc.get_object(stream_id).ok()?;
-            let stream = match stream_obj {
-                lopdf::Object::Stream(ref s) => s,
-                _ => return None,
-            };
-
-            // Verify it's an Image XObject
-            let subtype = stream.dict.get(b"Subtype").ok()?;
-            match subtype {
-                lopdf::Object::Name(ref n) if n == b"Image" => {}
-                _ => return None,
-            }
-
-            // Extract filter
-            let filter = match stream.dict.get(b"Filter") {
-                Ok(lopdf::Object::Name(ref n)) => filter_from_name(n),
-                Ok(lopdf::Object::Array(ref arr)) => {
-                    // Single-element filter array (common)
-                    if arr.len() == 1 {
-                        if let lopdf::Object::Name(ref n) = arr[0] {
-                            filter_from_name(n)
-                        } else {
-                            pdf_out::ImageFilter::Other("unknown".into())
-                        }
-                    } else {
-                        // Chained filters — too complex to pass through
-                        return None;
-                    }
-                }
-                _ => pdf_out::ImageFilter::None,
-            };
-
-            let width = get_integer(&stream.dict, b"Width")? as u32;
-            let height = get_integer(&stream.dict, b"Height")? as u32;
-            let bpc = get_integer(&stream.dict, b"BitsPerComponent").unwrap_or(8) as u32;
-
-            // Resolve ColorSpace to a name string
-            let color_space = match stream.dict.get(b"ColorSpace") {
-                Ok(lopdf::Object::Name(ref n)) => {
-                    String::from_utf8_lossy(n).to_string()
-                }
-                Ok(lopdf::Object::Reference(r)) => {
-                    match doc.get_object(*r) {
-                        Ok(lopdf::Object::Name(ref n)) => {
-                            String::from_utf8_lossy(n).to_string()
-                        }
-                        // ICCBased or other array-style colorspace — fall back
-                        // to DeviceRGB/DeviceGray based on BPC heuristic
-                        _ => {
-                            // Try to infer from stream size
-                            let expected_rgb = (width * height * 3) as usize;
-                            let expected_gray = (width * height) as usize;
-                            if filter == pdf_out::ImageFilter::None
-                                || filter == pdf_out::ImageFilter::FlateDecode
-                            {
-                                // Can't reliably determine from compressed size,
-                                // but for FlateDecode the uncompressed size would
-                                // tell us.  Use the referenced object's structure
-                                // if it's an ICCBased array.
-                                if let Ok(lopdf::Object::Array(ref arr)) = doc.get_object(*r) {
-                                    if arr.len() >= 1 {
-                                        if let lopdf::Object::Name(ref n) = arr[0] {
-                                            if n == b"ICCBased" {
-                                                // Check the ICC profile stream's N value
-                                                if arr.len() >= 2 {
-                                                    if let lopdf::Object::Reference(icc_ref) = arr[1] {
-                                                        if let Ok(lopdf::Object::Stream(ref icc_stream)) = doc.get_object(icc_ref) {
-                                                            let n_val = get_integer(&icc_stream.dict, b"N").unwrap_or(3);
-                                                            return Some(pdf_out::SourceImageInfo {
-                                                                stream_bytes: stream.content.clone(),
-                                                                filter,
-                                                                width,
-                                                                height,
-                                                                color_space: if n_val == 1 {
-                                                                    "DeviceGray".into()
-                                                                } else {
-                                                                    "DeviceRGB".into()
-                                                                },
-                                                                bits_per_component: bpc,
-                                                            });
-                                                        }
-                                                    }
-                                                }
-                                            }
-                                        }
-                                    }
-                                }
-                            }
-                            // Default fallback
-                            let _ = (expected_rgb, expected_gray);
-                            "DeviceRGB".into()
-                        }
-                    }
-                }
-                _ => "DeviceRGB".into(),
-            };
-
-
-            Some(pdf_out::SourceImageInfo {
-                stream_bytes: stream.content.clone(),
-                filter,
-                width,
-                height,
-                color_space,
-                bits_per_component: bpc,
-            })
-        })();
-
-        results.push(info);
-    }
-
-    results
-}
-
-fn filter_from_name(name: &[u8]) -> pdf_out::ImageFilter {
-    match name {
-        b"DCTDecode" => pdf_out::ImageFilter::DCTDecode,
-        b"FlateDecode" => pdf_out::ImageFilter::FlateDecode,
-        _ => pdf_out::ImageFilter::Other(String::from_utf8_lossy(name).to_string()),
-    }
-}
-
-fn resolve_dict<'a>(
-    doc: &'a lopdf::Document,
-    obj: &'a lopdf::Object,
-) -> Option<lopdf::Dictionary> {
-    match obj {
-        lopdf::Object::Reference(r) => doc
-            .get_object(*r)
-            .ok()
-            .and_then(|o| o.as_dict().ok().cloned()),
-        lopdf::Object::Dictionary(d) => Some(d.clone()),
-        _ => None,
-    }
-}
-
-fn get_integer(dict: &lopdf::Dictionary, key: &[u8]) -> Option<i64> {
-    match dict.get(key).ok()? {
-        lopdf::Object::Integer(i) => Some(*i),
-        _ => None,
-    }
-}
 

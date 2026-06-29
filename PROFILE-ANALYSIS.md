@@ -1,4 +1,4 @@
-# Unscan Profiling Analysis — LDA Classifier
+# Unprint Profiling Analysis — LDA Classifier
 **Date**: 2026-06-14  
 **Test document**: berkeley-output.pdf (1 page, 34 text lines, 31 vectorised)  
 **Release build**, AMD EPYC 9D25
@@ -96,5 +96,5 @@ This function identifies word breaks within Tesseract lines. It does **per-line 
 | OCR alt centroid pre-filter | 8-10s | Medium |
 | Font scan caching | 4s | Medium |
 | Backfill SIMD batching | 1-2s | Medium |
-| Mmap char-index | 1.7s | Medium |
+| ~~Mmap char-index~~ | ~~1.7s~~ | ~~Done (index eliminated)~~ |
 | Total potential | ~20s → 6-7s wall | |

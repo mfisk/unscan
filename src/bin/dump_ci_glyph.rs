@@ -1,7 +1,7 @@
 //! Dump CI index render for a specific char in a specific font
 use ab_glyph::{Font, FontRef};
-use unscan::char_render::render_glyph_at_ink_height;
-use unscan::char_index::{normalize_to_ink_bounds, NORM_H};
+use unprint::char_render::render_glyph_at_ink_height;
+use unprint::features::{normalize_to_ink_bounds, NORM_H};
 
 fn main() {
     let font_path = std::env::args().nth(1).expect("usage: dump_ci_glyph <font_path> <char_hex>");

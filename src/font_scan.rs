@@ -77,12 +77,12 @@ pub struct FontEntry {
     /// Typographic family name from the font's name table (nameID 16,
     /// falling back to nameID 1).  Used for dedup: when a static font and
     /// a variable-font weight instance share the same family+weight, the
-    /// static one wins.  Not serialized in the char index.
+    /// static one wins.  Not serialized in the font registry.
     pub typographic_family: String,
 }
 
 impl FontEntry {
-    /// Unique key for this font entry in the char index.
+    /// Unique key for this font entry in the font registry.
     /// Encodes path + variant tag so each weight/style/OT-variant gets its own slot.
     pub fn font_key(&self) -> String {
         let p = self.path.display().to_string();
@@ -93,6 +93,103 @@ impl FontEntry {
         }
     }
 }
+
+/// Indexed collection of discovered fonts, keyed by `font_key()`.
+pub struct FontRegistry {
+    entries: Vec<FontEntry>,
+    by_key: HashMap<String, usize>,
+    catalog_hash: u64,
+}
+
+impl FontRegistry {
+    pub fn new(mut entries: Vec<FontEntry>) -> Self {
+        // Sort by font_key for deterministic ordering and stable font_ids.
+        entries.sort_by(|a, b| a.font_key().cmp(&b.font_key()));
+        let by_key = entries.iter().enumerate()
+            .map(|(i, e)| (e.font_key(), i))
+            .collect();
+        let catalog_hash = Self::compute_hash(&entries);
+        Self { entries, by_key, catalog_hash }
+    }
+
+    /// Content hash of the catalog: hash of sorted font_keys.
+    /// Changes when fonts are added, removed, or renamed.
+    fn compute_hash(entries: &[FontEntry]) -> u64 {
+        use std::hash::{Hash, Hasher};
+        let mut hasher = std::collections::hash_map::DefaultHasher::new();
+        for e in entries {
+            e.font_key().hash(&mut hasher);
+        }
+        hasher.finish()
+    }
+
+    pub fn by_key(&self, key: &str) -> Option<&FontEntry> {
+        self.by_key.get(key).map(|&i| &self.entries[i])
+    }
+
+    pub fn entries(&self) -> &[FontEntry] {
+        &self.entries
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.entries.is_empty()
+    }
+
+    pub fn iter(&self) -> std::slice::Iter<'_, FontEntry> {
+        self.entries.iter()
+    }
+
+    // -------------------------------------------------------------------
+    // fonts.bin serialization
+    // -------------------------------------------------------------------
+    //
+    // Format:
+    //   magic:    b"FONT" (4 bytes)
+    //   version:  u32 le  (currently 1)
+    //   hash:     u64 le  (catalog content hash)
+    //   n_fonts:  u32 le
+    //   per font:
+    //     font_id:      u32 le  (index in sorted catalog)
+    //     font_key_len: u32 le
+    //     font_key:     [u8; font_key_len]  (UTF-8)
+    //
+    // font_id is the font's position in the sorted catalog.  Classifier
+    // .bin files reference fonts by this index.  The hash lets loaders
+    // detect when the catalog has changed and reject stale classifiers.
+
+    /// Write the catalog identity to a fonts.bin file.
+    pub fn write_fonts_bin(&self, path: &std::path::Path) -> std::io::Result<()> {
+        use std::io::{BufWriter, Write};
+
+        if let Some(parent) = path.parent() {
+            std::fs::create_dir_all(parent)?;
+        }
+        let f = std::fs::File::create(path)?;
+        let mut w = BufWriter::new(f);
+
+        w.write_all(b"FONT")?;
+        w.write_all(&1u32.to_le_bytes())?;
+        w.write_all(&self.catalog_hash.to_le_bytes())?;
+        w.write_all(&(self.entries.len() as u32).to_le_bytes())?;
+
+        for (id, e) in self.entries.iter().enumerate() {
+            w.write_all(&(id as u32).to_le_bytes())?;
+            let key = e.font_key();
+            w.write_all(&(key.len() as u32).to_le_bytes())?;
+            w.write_all(key.as_bytes())?;
+        }
+        w.flush()?;
+        Ok(())
+    }
+}
+
+/// Glyph override map for OT variant entries (e.g. smcp, onum).
+/// Maps character → overridden glyph ID so the CI renders the correct variant glyph.
+pub type GlyphOverrides = Option<Vec<(char, u16)>>;
+
+/// Variable-font axis coordinates to apply before rendering.
+pub type Variations = Option<Vec<([u8; 4], f32)>>;
+
 
 // ---------------------------------------------------------------------------
 // Public API
@@ -760,6 +857,7 @@ const LIGATURE_PROBES: &[(&str, char)] = &[
 ];
 
 /// Returns true if `c` is a Unicode ligature codepoint (ff, fi, fl, ffi, ffl).
+#[allow(dead_code)]
 pub fn is_ligature_char(c: char) -> bool {
     LIGATURE_PROBES.iter().any(|&(_, lig)| lig == c)
 }
@@ -803,34 +901,6 @@ fn detect_ligature_glyphs(data: &[u8]) -> Vec<(char, u16)> {
     result
 }
 
-/// Read the PostScript name (name ID 6) from the font's name table.
-/// Returns empty string if unavailable.
-/// Read the raw PostScript name (nameID 6) from a font file on disk.
-pub fn read_raw_postscript_name_from_file(path: &std::path::Path) -> String {
-    match std::fs::read(path) {
-        Ok(data) => read_postscript_name(&data),
-        Err(_) => String::new(),
-    }
-}
-
-fn read_postscript_name(data: &[u8]) -> String {
-    use rustybuzz::ttf_parser;
-    let face = match ttf_parser::Face::parse(data, 0) {
-        Ok(f) => f,
-        Err(_) => return String::new(),
-    };
-    // name ID 6 = PostScript name. Prefer platformID 3 (Windows) / encodingID 1 (Unicode BMP),
-    // fall back to platformID 1 (Macintosh) / encodingID 0 (Roman).
-    for name in face.names() {
-        if name.name_id == 6 {
-            if let Some(s) = name.to_string() {
-                return s;
-            }
-        }
-    }
-    String::new()
-}
-
 /// Ensure the PostScript name contains an explicit weight keyword.
 ///
 /// If the PS name already contains a weight marker (Regular, Bold, Light, etc.),
@@ -867,6 +937,7 @@ pub fn make_weight_explicit(ps_name: &str, weight: u16) -> String {
 // ---------------------------------------------------------------------------
 
 /// All name-table IDs, OS/2 weight class, and italic flag in one parse.
+#[allow(dead_code)]
 pub struct FontMetadata {
     pub nid1_family: String,
     pub nid2_subfamily: String,

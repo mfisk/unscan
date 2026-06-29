@@ -335,7 +335,7 @@ Using the `rustdct` crate or manual DCT implementation (straightforward for smal
 - **FontCLIP (2024):** Vision-language model connecting CLIP embeddings with typographic attributes.
 - **Total Disentanglement of Font Images (2024):** Separates style from character class, achieving font-agnostic style vectors.
 
-**The approach for unscan:**
+**The approach for unprint:**
 1. Render all 101 indexed characters × ~4900 fonts = ~495K training images
 2. Train a small CNN (e.g., 3-layer ConvNet) with triplet loss:
    - Anchor: glyph 'a' in Garamond
@@ -354,7 +354,7 @@ The model would learn exactly what distinguishes close serif cousins at the pixe
 - Inference integration (ONNX runtime or embedded weights)
 - Ongoing maintenance when font catalog changes
 
-**Practical concern for unscan:** The tool is a Rust CLI that processes scanned PDFs. Adding a neural network dependency (ONNX runtime, libtorch, etc.) significantly increases binary size and build complexity. 
+**Practical concern for unprint:** The tool is a Rust CLI that processes scanned PDFs. Adding a neural network dependency (ONNX runtime, libtorch, etc.) significantly increases binary size and build complexity. 
 
 **Alternative: Offline pre-computation.** Train the model offline, extract embeddings for all fonts, store in the char index. At match time, you'd need to run inference on the scan crop — which requires the model at runtime. Unless you can use the learned embedding as a *training signal* to weight the handcrafted features...
 
@@ -458,7 +458,7 @@ rendering.
 
 3. **Font Representation Learning via Paired-Glyph Matching** (2022, arXiv:2211.10967) — Contrastive learning on glyph pairs produces generalizable font embeddings.
 
-4. **TrueType Transformer (T3)** (2022, arXiv:2203.05338) — Processes TrueType outlines directly (not rasterized) for font classification. Interesting for unscan since we have the font files.
+4. **TrueType Transformer (T3)** (2022, arXiv:2203.05338) — Processes TrueType outlines directly (not rasterized) for font classification. Interesting for unprint since we have the font files.
 
 5. **Total Disentanglement of Font Images** (2024, arXiv:2403.12784) — Separates style from character, achieving font-independent style vectors.
 

@@ -233,7 +233,7 @@ fn render_font_crop(
             let mut prev: Option<ab_glyph::GlyphId> = None;
 
             for c in word.text.chars() {
-                let gid = crate::char_index::resolve_glyph(&font, c, overrides);
+                let gid = crate::char_render::resolve_glyph(&font, c, overrides);
                 if let Some(p) = prev {
                     cx += sf.kern(p, gid);
                 }
@@ -285,7 +285,7 @@ fn render_font_crop(
         let mut prev: Option<ab_glyph::GlyphId> = None;
 
         for c in line_text.chars() {
-            let gid = crate::char_index::resolve_glyph(&font, c, overrides);
+            let gid = crate::char_render::resolve_glyph(&font, c, overrides);
             if let Some(p) = prev {
                 cx += sf.kern(p, gid);
             }
