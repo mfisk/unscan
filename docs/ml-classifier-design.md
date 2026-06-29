@@ -2,14 +2,13 @@
 
 **Date:** 2025-07-05
 **Status:** Implemented + benchmarked
-**Replaces:** per-character lookup in `char_index.rs`
+**Replaces:** per-character lookup in former `char_index.rs` (eliminated)
 
 ## Problem
 
 The char index previously used `nearest_within_factor(1.5)` per-character
-range search in feature space. The correct font fails to reach the
-top-50 candidates on ~12% of lines. (Note: this was written when the
-feature vector was 59 dimensions; it has since been expanded to 99.)
+range search in feature space. This has since been replaced by the LDA
+classifier in `classifier.rs`.
 
 ## Constraints
 
@@ -83,15 +82,17 @@ the gap. The real payoff is accuracy: BF guarantees exact NN (no pruning misses)
 
 ## Implementation
 
-### Files
+### Files (historical — architecture has changed)
 
-1. **`src/brute_force.rs`** — `BruteForceIndex` struct with `build()`,
-   `query_topk()`, `query_within_factor()`, feature weighting
-2. **`src/char_index.rs`** — `CharIndex` now holds `bf_index: Option<BruteForceIndex>`,
-   built alongside search vectors in `rebuild_trees()`.
-   New `search_candidates_bf()` function mirrors `search_candidates()` using BF.
-3. **`src/lib.rs`** + **`src/main.rs`** — `mod brute_force` declarations
-4. **`tests/bf_vs_kd.rs`** — A/B benchmark comparing both backends
+**Note:** The `char_index.rs` module and `BruteForceIndex` have been eliminated.
+Font identification is now handled by the LDA classifier in `src/classifier.rs`
+with search logic in `src/font_match.rs`. The design notes below document the
+intermediate brute-force approach that preceded the LDA classifier.
+
+1. ~~**`src/brute_force.rs`**~~ — eliminated
+2. ~~**`src/char_index.rs`**~~ — eliminated; functionality split across `classifier.rs`, `font_match.rs`, `features.rs`, `segment.rs`
+3. **`src/classifier.rs`** — LDA classifier with runtime-trained weights
+4. **`src/font_match.rs`** — CI search + font selection with tie-break
 
 ### API
 

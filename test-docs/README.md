@@ -1,6 +1,6 @@
 # Scantext Test Documents
 
-Ground-truth test corpus for **unscan** — a tool that reconstructs
+Ground-truth test corpus for **unprint** — a tool that reconstructs
 vector PDFs from scanned/raster originals by identifying fonts, matching
 glyphs, and re-setting text as native outlines.
 
@@ -15,12 +15,12 @@ The test suite works like a round-trip fidelity test:
 2. **Degrade it** through a gauntlet of increasingly hostile scan simulations —
    from 600 dpi archival quality down to 98-dpi fax with 1-bit dithering.
 
-3. **Run unscan** on each degraded version and measure how accurately it
+3. **Run unprint** on each degraded version and measure how accurately it
    reconstructs the original vector document.
 
 The goal is **zero information loss at reasonable scan quality** and
 **graceful degradation** as conditions worsen. A perfect score means
-unscan identified every font (including OpenType variants like old-style
+unprint identified every font (including OpenType variants like old-style
 figures), placed every glyph correctly, and produced a PDF that's
 byte-for-byte identical in text content to the original.
 
@@ -96,7 +96,7 @@ This produces:
   artifacts: ~2° skew, Gaussian blur, speckle noise, off-white paper.
   **This is the canonical rasterized input** for accuracy testing (6 pages).
 - `font-timeline-specimen-fontmap.json` — maps font names to the exact
-  TTF/OTF font file paths on disk. Used by `unscan --include-fontmap` for
+  TTF/OTF font file paths on disk. Used by `unprint --include-fontmap` for
   CI audit injection.
 - `font-timeline-specimen.json` — machine-readable ground truth mapping each
   section index to its font family, pango font name, source URL, and which
@@ -139,10 +139,10 @@ of Congress, IRS, CIA FOIA, NASA, and presidential libraries.
 ### Basic round-trip test
 
 ```bash
-# Run unscan on each degraded version
+# Run unprint on each degraded version
 for pdf in resolution-series/specimen-*.pdf; do
     name=$(basename "$pdf" .pdf)
-    unscan "$pdf" -o "resolution-series/output-${name}.pdf"
+    unprint "$pdf" -o "resolution-series/output-${name}.pdf"
 done
 ```
 
@@ -184,7 +184,7 @@ accuracy at each resolution tier.
 
 Historical scans have no synthetic degradation — they have *real* degradation:
 200-year-old ink bleed, uneven paper, binding shadows, foxing stains. These
-test unscan's robustness against conditions no simulator can replicate.
+test unprint's robustness against conditions no simulator can replicate.
 
 See `historical/ground-truth.json` for expected fonts and confidence levels.
 
@@ -223,7 +223,7 @@ Good test documents have:
 2. **Real scan artifacts** — actual scanner output, not synthetic degradation.
 3. **Public domain or freely licensed** — government documents, expired
    copyright, Creative Commons, etc.
-4. **Latin script** — unscan currently targets Latin-alphabet text.
+4. **Latin script** — unprint currently targets Latin-alphabet text.
 
 Add new documents to `historical/` with an entry in `README.md` and
 `ground-truth.json`. Include the source URL so others can verify provenance.

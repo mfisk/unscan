@@ -1,4 +1,4 @@
-# unscan
+# unprint
 
 Replace scanned (raster) text in documents with native **vector** text —
 dramatic file-size reduction and quality improvement while maintaining
@@ -56,7 +56,7 @@ dramatic file-size reduction and quality improvement while maintaining
 # Build
 cargo build --release
 
-# The binary is at target/release/unscan
+# The binary is at target/release/unprint
 ```
 
 ### Runtime dependencies
@@ -80,7 +80,7 @@ install instructions.
 
 ## Ground-truth audit
 
-When `--test VECTOR.pdf` is supplied alongside `--audit DIR`, unscan
+When `--test VECTOR.pdf` is supplied alongside `--audit DIR`, unprint
 reads `/Widths` and `Tw` (word spacing) directly from the vector PDF's font
 dictionaries to compute accurate span bounding boxes. Each OCR line is matched
 against the overlapping vector span to determine the ground-truth font. Lines
@@ -91,8 +91,8 @@ candidate list and per-char distances to it are computed, so the HTML report
 shows exactly how far each character was from the correct font.
 
 ```bash
-# Run unscan with ground-truth audit
-unscan test-docs/font-timeline-specimen-scanned.pdf \
+# Run unprint with ground-truth audit
+unprint test-docs/font-timeline-specimen-scanned.pdf \
   -o /tmp/out.pdf --audit /tmp/audit-out \
   --test test-docs/font-timeline-specimen.pdf
 ```
@@ -102,27 +102,27 @@ The HTML miss report is generated automatically at `DIR/report.html`.
 ## Usage
 
 ```bash
-unscan input.pdf -o output.pdf
+unprint input.pdf -o output.pdf
 
 # Override confidence thresholds
-unscan input.pdf -o output.pdf \
+unprint input.pdf -o output.pdf \
   --min-ocr-confidence 85 \
   --min-font-confidence 0.65
 
 # Supply extra fonts
-unscan input.pdf -o output.pdf --font-dir ~/my-fonts --font-dir /mnt/win/Windows/Fonts
+unprint input.pdf -o output.pdf --font-dir ~/my-fonts --font-dir /mnt/win/Windows/Fonts
 
 # Skip geometry detection
-unscan input.pdf -o output.pdf --no-geometry
+unprint input.pdf -o output.pdf --no-geometry
 
 # Audit + diagnostics (writes audit.json and segmentation images to DIR)
-unscan input.pdf -o output.pdf --audit /tmp/audit-out
+unprint input.pdf -o output.pdf --audit /tmp/audit-out
 
 # Debug overlay (semitransparent red vector text over original raster)
-unscan input.pdf -o output.pdf --overlay
+unprint input.pdf -o output.pdf --overlay
 
 # Image input (PNG, JPEG, TIFF, BMP, GIF, WebP)
-unscan scan.png -o output.pdf
+unprint scan.png -o output.pdf
 ```
 
 ### Flags
@@ -141,14 +141,12 @@ unscan scan.png -o output.pdf
 | `--compare` | off | Generate side-by-side scan vs. render comparison images |
 | `--include-font` | *(none)* | Force a font (case-insensitive substring) into CI candidate list for every line |
 | `--thoroughness` | 1.0 | Scale CI thresholds — higher = more candidates survive, slower |
-| `--index` | off | Scan fonts, update the character index cache, and exit |
-| `--index-path` | `~/.cache/unscan/char-index.bin` | Path to the character index cache file |
-| `--rebuild-index` | off | Force a full rebuild of the character index, ignoring cache |
+
 | `--diag-ref-font` | *(none)* | Render each extracted character from this font file for comparison (requires `--audit`) |
 
 ## Font search paths
 
-`unscan` searches these directories automatically:
+`unprint` searches these directories automatically:
 
 **Linux:**
 - `/usr/share/fonts/`
@@ -192,7 +190,7 @@ PDFs reference standard names all viewers understand. See
 
 ## Audit log
 
-When `--audit DIR` is set, unscan writes `DIR/audit.json` with full pipeline
+When `--audit DIR` is set, unprint writes `DIR/audit.json` with full pipeline
 decisions, plus per-line directories containing per-word subdirectories with
 segmentation overlays, character crops, and summary JSONs. When `--test`
 is also set, a visual HTML miss report is generated at `DIR/report.html`.
@@ -268,7 +266,7 @@ Tests live in the `tests/` directory:
 
 | Test | What it tests |
 |------|---------------|
-| `t10_char_index_roundtrip.rs` | Character index build + query roundtrip |
+| `t10_char_index_roundtrip.rs` | *(stale — references eliminated `char_index` module)* |
 | `t20_distance_analysis.rs` | Feature-space distance analysis |
 | `t30_regression_ssim.rs` | SSIM regression checks |
 | `t40_mixed_font_underline.rs` | Mixed-font (intra-line italic/bold) regression test |
@@ -350,7 +348,7 @@ for (tag, overrides) in &variants {
 }
 ```
 
-Glyph override resolution is in `src/char_index.rs`:
+Glyph override resolution is in `src/char_render.rs`:
 
 ```rust
 // resolve_glyph() checks the override map before falling back to cmap

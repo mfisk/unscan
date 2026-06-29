@@ -1,14 +1,14 @@
-# Fast Compile Guide for unscan
+# Fast Compile Guide for unprint
 
 ## TL;DR — Iteration Workflow
 
 ```bash
 # Edit code, then:
-cargo build --bin unscan        # ~30s incremental debug build
-./target/debug/unscan ...       # run with debug binary (opt-level=1)
+cargo build --bin unprint        # ~30s incremental debug build
+./target/debug/unprint ...       # run with debug binary (opt-level=1)
 ```
 
-**Use `cargo build --bin unscan`** (not bare `cargo build`). The project has 4+ binaries;
+**Use `cargo build --bin unprint`** (not bare `cargo build`). The project has 4+ binaries;
 building them all takes ~6 minutes because each re-links the full library. Building just
 the main binary skips that.
 
@@ -17,8 +17,8 @@ Use `cargo build --release` only for final accuracy runs where runtime performan
 ### Typical test cycle
 
 ```bash
-cargo build --bin unscan                      # ~30s debug build
-./target/debug/unscan test-docs/font-timeline-specimen-scanned.pdf \
+cargo build --bin unprint                      # ~30s debug build
+./target/debug/unprint test-docs/font-timeline-specimen-scanned.pdf \
     --audit /tmp/audit-out -o /tmp/out.pdf \
     --test test-docs/font-timeline-specimen.pdf
 # Report at /tmp/audit-out/report.html
@@ -28,7 +28,7 @@ cargo build --bin unscan                      # ~30s debug build
 
 | Scenario | Command | Time |
 |----------|---------|------|
-| **Incremental, main bin only** | `cargo build --bin unscan` | **30s** |
+| **Incremental, main bin only** | `cargo build --bin unprint` | **30s** |
 | Incremental, all bins | `cargo build` | 5m 52s |
 | Clean, all bins (debug) | `cargo clean && cargo build` | 33m 32s |
 | Release (full) | `cargo build --release` | ~4m |
@@ -72,8 +72,8 @@ RUSTC_WRAPPER=sccache cargo build
 
 ## Tips
 
-- **Touch only what you need**: `touch src/char_index.rs` then `cargo build --bin unscan`
-  recompiles only the unscan crate and re-links only the main binary.
+- **Touch only what you need**: `touch src/classifier.rs` then `cargo build --bin unprint`
+  recompiles only the unprint crate and re-links only the main binary.
 - **Don't `cargo clean`** unless you need to. Incremental compilation is the win.
-- **Debug binary location**: `./target/debug/unscan`
-- **Release binary location**: `./target/release/unscan`
+- **Debug binary location**: `./target/debug/unprint`
+- **Release binary location**: `./target/release/unprint`

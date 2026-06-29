@@ -1,6 +1,6 @@
 # End-to-End Font Testing
 
-unscan's accuracy is measured by comparing its output against a vector PDF whose fonts are known. This document explains the testing pipeline, the tools, and how to run everything.
+unprint's accuracy is measured by comparing its output against a vector PDF whose fonts are known. This document explains the testing pipeline, the tools, and how to run everything.
 
 ## Pipeline Overview
 
@@ -10,14 +10,14 @@ gen-specimen.py          →  font-timeline-specimen.pdf          (vector, sourc
 
 rasterize.py rasterize   →  rasterized PDF from any vector PDF
 
-unscan --audit           →  audit.json + SSIM images
+unprint --audit           →  audit.json + SSIM images
        --test    →  ground-truth comparison + report.html
 ```
 
 1. **gen-specimen.py** builds a multi-page vector PDF using 30+ font families. It calls `rasterize.py` to rasterize.
 2. **rasterize.py** handles rasterization (with optional scan artifacts).
-3. **unscan** processes the rasterized PDF, producing an audit log with per-line font matches.
-4. **report.rs** (built into unscan) compares matches against the vector PDF's ground truth and generates `report.html`.
+3. **unprint** processes the rasterized PDF, producing an audit log with per-line font matches.
+4. **report.rs** (built into unprint) compares matches against the vector PDF's ground truth and generates `report.html`.
 
 ## Tools
 
@@ -47,7 +47,7 @@ python3 tools/rasterize.py prepare INPUT.pdf [-d output_dir] [--dpi 300] [--no-a
 
 ### Built-in miss report
 
-unscan generates a self-contained HTML miss report at `DIR/report.html` when
+unprint generates a self-contained HTML miss report at `DIR/report.html` when
 both `--audit DIR` and `--test VECTOR.pdf` are set. No separate script
 needed.
 
@@ -66,7 +66,7 @@ Tests have strict ordering — **t55 must run before t60/t61/t62**:
 # Build
 cargo build --release
 
-# Generate all fixtures (vector PDF, AA + no-AA rasters, char index)
+# Generate all fixtures (vector PDF, AA + no-AA rasters)
 cargo test --test t55_specimen_gen -- --nocapture
 
 # Run accuracy tests (these assert fixtures exist, no fallback generation)
@@ -87,8 +87,8 @@ The tools work on any vector PDF:
 # 1. Rasterize
 python3 tools/rasterize.py rasterize original.pdf /tmp/rasterized.pdf
 
-# 2. Run unscan with audit + ground-truth comparison
-./target/release/unscan /tmp/rasterized.pdf \
+# 2. Run unprint with audit + ground-truth comparison
+./target/release/unprint /tmp/rasterized.pdf \
   -o /tmp/out.pdf --audit /tmp/audit \
   --test original.pdf
 
@@ -106,8 +106,8 @@ cd test-docs && python3 gen-specimen.py && cd ..
 # Build
 cargo build --release
 
-# Run unscan with audit
-./target/release/unscan test-docs/font-timeline-specimen-scanned.pdf \
+# Run unprint with audit
+./target/release/unprint test-docs/font-timeline-specimen-scanned.pdf \
   -o /tmp/out.pdf --audit /tmp/audit \
   --test test-docs/font-timeline-specimen.pdf
 
@@ -116,12 +116,12 @@ cargo build --release
 
 ## Reading the Miss Report
 
-The HTML report shows every line where unscan's match disagrees with the vector PDF. For each miss:
+The HTML report shows every line where unprint's match disagrees with the vector PDF. For each miss:
 
 - **Page/Line**: Location in the document
 - **Text**: The OCR'd text content
 - **Expected**: Font from the vector PDF (determined by spatial overlap with ground-truth spans)
-- **Got**: Font unscan matched
+- **Got**: Font unprint matched
 - **Per-char distances**: How far each character crop was from the correct font vs. the chosen font
 - **SSIM images**: Side-by-side scan crop, render crop, and diff
 
@@ -129,7 +129,7 @@ The HTML report shows every line where unscan's match disagrees with the vector 
 
 The summary line `Report: H/C (P%) — M misses (S SSIM)` is the headline metric.
 
-- **Hit**: unscan's matched font agrees with the ground-truth font
+- **Hit**: unprint's matched font agrees with the ground-truth font
 - **Miss**: different font (font miss or SSIM failure)
 - **NoGT**: lines where no ground-truth span overlaps the OCR bbox (excluded from denominator)
 
@@ -154,7 +154,7 @@ SSIM scoring uses `ssim_windowed_best_vshift` with ±12px vertical shift to hand
 
 ## Font Resolution Pitfalls
 
-`gen-specimen.py` resolves fonts via fontconfig (`fc-list`), the same system unscan uses. This section documents known pitfalls and how `fc_find()` handles them.
+`gen-specimen.py` resolves fonts via fontconfig (`fc-list`), the same system unprint uses. This section documents known pitfalls and how `fc_find()` handles them.
 
 ### Weight Mismatch (4-Font-Family Naming)
 

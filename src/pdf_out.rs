@@ -506,7 +506,7 @@ fn embed_subsetted_font(
     // Map chars → original glyph IDs (with variant overrides)
     let mut char_to_orig_gid: Vec<(char, u16)> = Vec::new();
     for &ch in used_chars {
-        let gid = crate::char_index::resolve_glyph(&ab_font, ch, overrides);
+        let gid = crate::char_render::resolve_glyph(&ab_font, ch, overrides);
         let gid_val = gid.0;
         if gid_val != 0 {
             char_to_orig_gid.push((ch, gid_val));
@@ -568,7 +568,7 @@ fn embed_subsetted_font(
     let mut w_entries: Vec<Object> = Vec::new();
     let mut cid_widths: Vec<(u16, i64)> = char_to_cid.iter()
         .map(|(&ch, &cid)| {
-            let gid = crate::char_index::resolve_glyph(&ab_font, ch, overrides);
+            let gid = crate::char_render::resolve_glyph(&ab_font, ch, overrides);
             let w = sf.h_advance(gid).round() as i64;
             (cid, w)
         })
@@ -823,4 +823,251 @@ fn unicode_to_winansi(ch: char) -> Option<u8> {
         0x0178 => Some(0x9F), // Ÿ
         _ => None,
     }
+}
+
+// ---------------------------------------------------------------------------
+// Raster fragment tiling
+// ---------------------------------------------------------------------------
+
+/// Tile a cleaned page image into connected raster fragments.
+///
+/// Divides the image into a grid of 100×100-px cells, finds connected
+/// components of cells that contain content, and extracts one
+/// `RasterFragment` per component.
+pub fn extract_raster_fragments(
+    cleaned_img: &image::DynamicImage,
+    dpi: u32,
+    page_height_px: u32,
+) -> Vec<RasterFragment> {
+    let w = cleaned_img.width();
+    let h = cleaned_img.height();
+    let cell = 100u32;
+    let cols = (w + cell - 1) / cell;
+    let rows = (h + cell - 1) / cell;
+
+    let mut interesting = vec![false; (cols * rows) as usize];
+    let gray = cleaned_img.to_luma8();
+    for row in 0..rows {
+        for col in 0..cols {
+            let cx = col * cell;
+            let cy = row * cell;
+            let cw = cell.min(w - cx);
+            let ch = cell.min(h - cy);
+            if crate::color::region_has_content(&gray, cx, cy, cw, ch) {
+                interesting[(row * cols + col) as usize] = true;
+            }
+        }
+    }
+
+    let mut visited = vec![false; (cols * rows) as usize];
+    let mut fragments = Vec::new();
+
+    for row in 0..rows {
+        for col in 0..cols {
+            let idx = (row * cols + col) as usize;
+            if !interesting[idx] || visited[idx] {
+                continue;
+            }
+            visited[idx] = true;
+            let mut queue = vec![(row, col)];
+            let (mut min_r, mut max_r, mut min_c, mut max_c) = (row, row, col, col);
+
+            while let Some((r, c)) = queue.pop() {
+                min_r = min_r.min(r);
+                max_r = max_r.max(r);
+                min_c = min_c.min(c);
+                max_c = max_c.max(c);
+                for (dr, dc) in &[(0i32, 1i32), (0, -1), (1, 0), (-1, 0)] {
+                    let nr = r as i32 + dr;
+                    let nc = c as i32 + dc;
+                    if nr < 0 || nc < 0 || nr >= rows as i32 || nc >= cols as i32 {
+                        continue;
+                    }
+                    let ni = (nr as u32 * cols + nc as u32) as usize;
+                    if !interesting[ni] || visited[ni] {
+                        continue;
+                    }
+                    visited[ni] = true;
+                    queue.push((nr as u32, nc as u32));
+                }
+            }
+
+            let fx = min_c * cell;
+            let fy = min_r * cell;
+            let fw = ((max_c + 1) * cell).min(w) - fx;
+            let fh = ((max_r + 1) * cell).min(h) - fy;
+
+            if let Some(frag) =
+                extract_raster_fragment(cleaned_img, fx, fy, fw, fh, dpi, page_height_px)
+            {
+                fragments.push(frag);
+            }
+        }
+    }
+    fragments
+}
+
+// ---------------------------------------------------------------------------
+// Source image extraction — preserve original encoding
+// ---------------------------------------------------------------------------
+
+fn filter_from_name(name: &[u8]) -> ImageFilter {
+    match name {
+        b"DCTDecode" => ImageFilter::DCTDecode,
+        b"FlateDecode" => ImageFilter::FlateDecode,
+        _ => ImageFilter::Other(String::from_utf8_lossy(name).to_string()),
+    }
+}
+
+fn resolve_dict(
+    doc: &lopdf::Document,
+    obj: &lopdf::Object,
+) -> Option<lopdf::Dictionary> {
+    match obj {
+        lopdf::Object::Reference(r) => doc
+            .get_object(*r)
+            .ok()
+            .and_then(|o| o.as_dict().ok().cloned()),
+        lopdf::Object::Dictionary(d) => Some(d.clone()),
+        _ => None,
+    }
+}
+
+fn get_integer(dict: &lopdf::Dictionary, key: &[u8]) -> Option<i64> {
+    match dict.get(key).ok()? {
+        lopdf::Object::Integer(i) => Some(*i),
+        _ => None,
+    }
+}
+
+/// Extract the original compressed image stream from each page of the input PDF.
+///
+/// Returns one `SourceImageInfo` per page, or `None` if extraction fails for
+/// that page (multiple images, unsupported structure, etc.).
+pub fn extract_source_images(path: &std::path::Path) -> Vec<Option<SourceImageInfo>> {
+    let doc = match lopdf::Document::load(path) {
+        Ok(d) => d,
+        Err(_e) => {
+            return Vec::new();
+        }
+    };
+
+    let page_map = doc.get_pages();
+    let mut results: Vec<Option<SourceImageInfo>> = Vec::new();
+
+    for page_num in 1..=(page_map.len() as u32) {
+        let info = (|| -> Option<SourceImageInfo> {
+            let &page_id = page_map.get(&page_num)?;
+            let page_obj = doc.get_object(page_id).ok()?;
+            let page_dict = page_obj.as_dict().ok()?;
+
+            let resources = page_dict.get(b"Resources").ok()?;
+            let res_dict = resolve_dict(&doc, resources)?;
+
+            let xobj = res_dict.get(b"XObject").ok()?;
+            let xobj_dict = resolve_dict(&doc, xobj)?;
+
+            // We only handle the simple case: exactly one image XObject per page
+            let entries: Vec<_> = xobj_dict.iter().collect();
+            if entries.len() != 1 {
+                return None;
+            }
+
+            let (_name, obj) = entries[0];
+            let stream_id = match obj {
+                lopdf::Object::Reference(r) => *r,
+                _ => return None,
+            };
+
+            let stream_obj = doc.get_object(stream_id).ok()?;
+            let stream = match stream_obj {
+                lopdf::Object::Stream(ref s) => s,
+                _ => return None,
+            };
+
+            // Verify it's an Image XObject
+            let subtype = stream.dict.get(b"Subtype").ok()?;
+            match subtype {
+                lopdf::Object::Name(ref n) if n == b"Image" => {}
+                _ => return None,
+            }
+
+            // Extract filter
+            let filter = match stream.dict.get(b"Filter") {
+                Ok(lopdf::Object::Name(ref n)) => filter_from_name(n),
+                Ok(lopdf::Object::Array(ref arr)) => {
+                    if arr.len() == 1 {
+                        if let lopdf::Object::Name(ref n) = arr[0] {
+                            filter_from_name(n)
+                        } else {
+                            ImageFilter::Other("unknown".into())
+                        }
+                    } else {
+                        return None;
+                    }
+                }
+                _ => ImageFilter::None,
+            };
+
+            let width = get_integer(&stream.dict, b"Width")? as u32;
+            let height = get_integer(&stream.dict, b"Height")? as u32;
+            let bpc = get_integer(&stream.dict, b"BitsPerComponent").unwrap_or(8) as u32;
+
+            // Resolve ColorSpace to a name string
+            let color_space = match stream.dict.get(b"ColorSpace") {
+                Ok(lopdf::Object::Name(ref n)) => {
+                    String::from_utf8_lossy(n).to_string()
+                }
+                Ok(lopdf::Object::Reference(r)) => {
+                    match doc.get_object(*r) {
+                        Ok(lopdf::Object::Name(ref n)) => {
+                            String::from_utf8_lossy(n).to_string()
+                        }
+                        _ => {
+                            if let Ok(lopdf::Object::Array(ref arr)) = doc.get_object(*r) {
+                                if !arr.is_empty() {
+                                    if let lopdf::Object::Name(ref n) = arr[0] {
+                                        if n == b"ICCBased" && arr.len() >= 2 {
+                                            if let lopdf::Object::Reference(icc_ref) = arr[1] {
+                                                if let Ok(lopdf::Object::Stream(ref icc_stream)) = doc.get_object(icc_ref) {
+                                                    let n_val = get_integer(&icc_stream.dict, b"N").unwrap_or(3);
+                                                    return Some(SourceImageInfo {
+                                                        stream_bytes: stream.content.clone(),
+                                                        filter,
+                                                        width,
+                                                        height,
+                                                        color_space: if n_val == 1 {
+                                                            "DeviceGray".into()
+                                                        } else {
+                                                            "DeviceRGB".into()
+                                                        },
+                                                        bits_per_component: bpc,
+                                                    });
+                                                }
+                                            }
+                                        }
+                                    }
+                                }
+                            }
+                            "DeviceRGB".into()
+                        }
+                    }
+                }
+                _ => "DeviceRGB".into(),
+            };
+
+            Some(SourceImageInfo {
+                stream_bytes: stream.content.clone(),
+                filter,
+                width,
+                height,
+                color_space,
+                bits_per_component: bpc,
+            })
+        })();
+
+        results.push(info);
+    }
+
+    results
 }

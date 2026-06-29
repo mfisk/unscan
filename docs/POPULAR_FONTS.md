@@ -1,7 +1,7 @@
-# Popular Fonts for unscan
+# Popular Fonts for unprint
 
 This guide covers the most common font families you'll encounter in scanned
-documents, organised by document type. Install the right fonts and unscan
+documents, organised by document type. Install the right fonts and unprint
 will match them accurately; miss one and that text stays raster.
 
 > **Quick install:** `bash scripts/install-all-fonts.sh` handles everything
@@ -42,7 +42,7 @@ These proprietary fonts are **not** included in the free package. Options:
    cp /mnt/c/Windows/Fonts/consola*.ttf ~/ms-fonts/
    cp /mnt/c/Windows/Fonts/segoeui*.ttf ~/ms-fonts/
    # Then:
-   unscan input.pdf -o out.pdf --font-dir ~/ms-fonts
+   unprint input.pdf -o out.pdf --font-dir ~/ms-fonts
    ```
 
 2. **Extract from a Microsoft Office installer** (if licensed).
@@ -179,7 +179,7 @@ These are installed to `~/.local/share/fonts/` preserving the upstream
 
 ## Font Search Paths
 
-`unscan` searches these directories automatically:
+`unprint` searches these directories automatically:
 
 **Linux:**
 - `/usr/share/fonts/`

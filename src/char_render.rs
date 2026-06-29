@@ -9,7 +9,7 @@
 //! 3. If `binarize_threshold` is Some(t): `binarize(&img, t)` — AFTER normalize
 //! 4. Return image
 //!
-//! Rendered images are cached as individual PNGs under `~/.cache/unscan/chars/`.
+//! Rendered images are cached as individual PNGs under `~/.cache/unprint/chars/`.
 
 use std::fmt::Write as FmtWrite;
 use std::path::PathBuf;
@@ -17,7 +17,8 @@ use std::path::PathBuf;
 use ab_glyph::{Font, GlyphId, PxScale, ScaleFont, point};
 use image::{GrayImage, Luma};
 
-use crate::char_index::{self, AaVariant, NORM_H};
+use crate::features::{self as features, AaVariant, NORM_H};
+
 
 /// Parameters controlling how a character is rendered.
 #[derive(Clone)]
@@ -52,8 +53,8 @@ fn cache_dir() -> PathBuf {
 
 fn dirs_cache_dir() -> PathBuf {
     std::env::var("HOME")
-        .map(|h| PathBuf::from(h).join(".cache").join("unscan"))
-        .unwrap_or_else(|_| PathBuf::from(".cache/unscan"))
+        .map(|h| PathBuf::from(h).join(".cache").join("unprint"))
+        .unwrap_or_else(|_| PathBuf::from(".cache/unprint"))
 }
 
 /// Build the cache file path for a given render configuration.
@@ -173,14 +174,14 @@ fn render_char_fresh<F: Font>(
     // Step 2: normalize_to_ink_bounds — crop to ink, 1px pad, Lanczos3 resize to params.height
     // If render_scale == 1, the image is already at target height, but we still
     // run normalize to get consistent ink cropping and padding.
-    let normalized = char_index::normalize_to_ink_bounds(&canvas, params.height)?;
+    let normalized = features::normalize_to_ink_bounds(&canvas, params.height)?;
 
     // Step 3: apply AA variant (AFTER normalize, BEFORE binarize)
     let aa_applied = params.aa.apply(&normalized);
 
     // Step 4: binarize if requested (AFTER AA)
     match params.binarize_threshold {
-        Some(t) => Some(char_index::binarize(&aa_applied, t)),
+        Some(t) => Some(features::binarize(&aa_applied, t)),
         None => Some(aa_applied),
     }
 }
@@ -233,3 +234,67 @@ pub fn render_glyph_at_ink_height<F: Font>(font: &F, gid: GlyphId, target_ink_h:
     Some(canvas)
 }
 
+
+/// Falls back to the font's default cmap lookup if no override exists for this character.
+pub fn resolve_glyph<F: ab_glyph::Font>(font: &F, ch: char, overrides: Option<&[(char, u16)]>) -> ab_glyph::GlyphId {
+    if let Some(ovs) = overrides {
+        if let Some(&(_, gid)) = ovs.iter().find(|(c, _)| *c == ch) {
+            return ab_glyph::GlyphId(gid);
+        }
+    }
+    font.glyph_id(ch)
+}
+
+// ---------------------------------------------------------------------------
+// CLI subcommand: render reference characters
+// ---------------------------------------------------------------------------
+
+/// Render reference characters for a font and exit.
+///
+/// `json_str` is a JSON object: `{"font": "<path>", "chars": "<string>", "output_dir": "<path>"}`.
+/// Each character with a glyph is rendered at the standard ink height and
+/// saved as `U+XXXX.png` in the output directory.
+pub fn render_ref_chars_and_exit(json_str: &str) -> ! {
+    use ab_glyph::{Font, FontVec};
+
+    #[derive(serde::Deserialize)]
+    struct Req {
+        font: String,
+        chars: String,
+        output_dir: String,
+    }
+
+    let req: Req = serde_json::from_str(json_str).unwrap_or_else(|e| {
+        eprintln!("Invalid --render-ref-chars JSON: {e}");
+        std::process::exit(1);
+    });
+
+    let font_data = std::fs::read(&req.font).unwrap_or_else(|e| {
+        eprintln!("Cannot read font {:?}: {e}", req.font);
+        std::process::exit(1);
+    });
+    let font = FontVec::try_from_vec(font_data).unwrap_or_else(|e| {
+        eprintln!("Cannot parse font {:?}: {e}", req.font);
+        std::process::exit(1);
+    });
+
+    let out = std::path::Path::new(&req.output_dir);
+    std::fs::create_dir_all(out).unwrap_or_else(|e| {
+        eprintln!("Cannot create output dir {:?}: {e}", req.output_dir);
+        std::process::exit(1);
+    });
+
+    let mut rendered = 0u32;
+    for c in req.chars.chars() {
+        if font.glyph_id(c).0 == 0 {
+            continue;
+        }
+        if let Some(img) = get_rendered_char_default(&font, &req.font, c, None) {
+            let fname = format!("U+{:04X}.png", c as u32);
+            let _ = img.save(out.join(&fname));
+            rendered += 1;
+        }
+    }
+    eprintln!("Rendered {rendered} glyphs");
+    std::process::exit(0);
+}

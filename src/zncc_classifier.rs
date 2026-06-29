@@ -12,9 +12,9 @@
 
 use std::collections::HashMap;
 use image::GrayImage;
-use crate::char_index::CharFeatures;
+use crate::features::CharFeatures;
 use crate::classifier::Classifier;
-use crate::ssim::zncc_global_pub;
+use crate::compare_rasters::zncc_global_pub;
 
 /// Temperature for ZNCC→probability conversion.
 /// Higher = flatter distribution; lower = more peaked.
@@ -101,9 +101,11 @@ impl Classifier for ZnccClassifier {
         self.n_fonts
     }
 
-    fn needs_raster(&self) -> bool { true }
+    fn font_name(&self, _font_id: usize) -> Option<&str> {
+        None // ZNCC doesn't track font names
+    }
 
-    fn add_font(&mut self, font_id: usize, ch: char, features: &CharFeatures) {
+    fn add_font(&mut self, font_id: usize, _font_name: &str, ch: char, features: &CharFeatures) {
         if let Some(ref img) = features.raster {
             self.refs.entry(ch).or_default().push((font_id, img.clone()));
             if font_id >= self.n_fonts {

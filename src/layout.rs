@@ -22,7 +22,7 @@ pub fn width_matched_em_px<F: Font>(font: &F, text: &str, target_width_px: f32, 
     let mut adv = 0.0f32;
     let mut prev: Option<ab_glyph::GlyphId> = None;
     for c in text.chars() {
-        let gid = crate::char_index::resolve_glyph(font, c, overrides);
+        let gid = crate::char_render::resolve_glyph(font, c, overrides);
         if let Some(p) = prev {
             adv += sf_ref.kern(p, gid);
         }
@@ -281,7 +281,7 @@ pub fn width_matched_em_px_shaped(font_data: &[u8], text: &str, target_width_px:
 
 /// Render a word into a grayscale canvas at a given em size.
 ///
-/// `resolve` maps each char to a glyph ID — pass `char_index::resolve_glyph`
+/// `resolve` maps each char to a glyph ID — pass `char_render::resolve_glyph`
 /// for override-aware matching, or `|f, c| f.glyph_id(c)` for plain lookup.
 ///
 /// If `canvas_h` is None, height is auto-sized from font ascent/descent.

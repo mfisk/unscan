@@ -1,4 +1,4 @@
-# Unscan Performance Audit
+# Unprint Performance Audit
 
 **Date:** 2025-07-13 (initial audit)  
 **Updated:** 2026-06-07  
@@ -11,8 +11,8 @@
 - Precomputed crop features for audit: `precompute_crop_features()` + `per_char_distances_precomputed()` avoid redundant feature extraction when computing distances against multiple fonts
 - Font data no longer stored in FontEntry/FontMatchResult (lazy load via FontCache)
 - Thread-local FreeType library in `verify.rs`
-- OnceLock Gaussian kernel in `ssim.rs`
-- Shared flood-fill, merged pixel scans, Zhang-Suen LUT in `char_index.rs`
+- OnceLock Gaussian kernel in `compare_rasters.rs`
+- Shared flood-fill, merged pixel scans, Zhang-Suen LUT in `features.rs`
 - Font-metric word splitting via `outline_glyph().px_bounds()` in `ocr.rs`
 - Vertical shift search ±12 px with center-outward order and early exit at SSIM ≥ 0.92
 

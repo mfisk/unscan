@@ -9,7 +9,7 @@
 Font files on disk have cryptic filenames that bear little resemblance to the
 font's canonical name: `arialbd.ttf`, `nimbussans-regular.otf`,
 `lmroman10-bold.otf`, `letr45w.ttf`. Without aliasing, these would appear in
-unscan's catalog as `Arialbd`, `Nimbussans Regular`, `Lmroman10 Bold`, and
+unprint's catalog as `Arialbd`, `Nimbussans Regular`, `Lmroman10 Bold`, and
 `Letr45w` — unrecognizable and useless for producing well-labeled output PDFs.
 
 The alias table maps lowercase filename stems to canonical family names with
@@ -67,7 +67,7 @@ nimbusroman-regular   → Times-Roman
 nimbusmonops-regular  → Courier
 ```
 
-This ensures unscan's output PDF references the standard names that all viewers
+This ensures unprint's output PDF references the standard names that all viewers
 understand, regardless of which physical font file was installed on the
 processing machine.
 
@@ -132,7 +132,7 @@ is stored in each `FontEntry` in the catalog.
 
 **Function:** `detect_ligature_glyphs()`
 
-Unscan needs to know which fonts have ligature substitutions so it can match
+Unprint needs to know which fonts have ligature substitutions so it can match
 ligature crops against the correct glyph in the character index.
 
 ### How It Works

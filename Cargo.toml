@@ -1,12 +1,12 @@
 [package]
-name = "unscan"
+name = "unprint"
 version = "0.2.0"
 edition = "2021"
 description = "Replace raster/scanned text with native vector text — zero information loss, maximum vectorization"
 license = "MIT"
 
 [[bin]]
-name = "unscan"
+name = "unprint"
 path = "src/main.rs"
 
 [[bin]]

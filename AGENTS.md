@@ -1,11 +1,11 @@
-# AGENTS.md — Unscan Project
+# AGENTS.md — Unprint Project
 
 ## Context Window Hygiene
 
 **Your context is finite. Protect it.**
 
-- **Use subagents for builds and tests.** Never run `cargo build`, `cargo test`, or full `unscan` runs in the main thread. Spawn a subagent, let it report back a summary.
-- **Never read diagnostic output in its entirety.** Test runs, cargo builds, and `unscan` stderr can produce thousands of lines. Reading all of it into an LLM context will blow your token budget. Always redirect to a file, then grep/tail for the specific lines you need.
+- **Use subagents for builds and tests.** Never run `cargo build`, `cargo test`, or full `unprint` runs in the main thread. Spawn a subagent, let it report back a summary.
+- **Never read diagnostic output in its entirety.** Test runs, cargo builds, and `unprint` stderr can produce thousands of lines. Reading all of it into an LLM context will blow your token budget. Always redirect to a file, then grep/tail for the specific lines you need.
 - **Reduce output verbosity.** Pipe through `tail -n`, grep for specific patterns, or redirect to files and read only what matters. Never dump raw cargo output or full test logs into main context.
 - **Build wrapper:** `cargo build --release 2>&1 | tail -3` at most. Only care about errors or "Finished".
 - **Test wrapper:** Capture full output to a file, then grep/parse for the summary line (accuracy %, pass/fail). Only surface misses if debugging them.
@@ -46,7 +46,7 @@ cargo test specimen_font_accuracy --release -- --nocapture --test-threads=1 2>&1
 cargo test specimen_font_accuracy --release -- --nocapture --test-threads=1 2>&1 | grep -E "accuracy|Misses|  " 
 
 # Crop dump for specific line (via --audit)
-./target/release/unscan test-docs/font-timeline-specimen-rasterized.pdf -o /dev/null --audit /tmp/audit-out
+./target/release/unprint test-docs/font-timeline-specimen-rasterized.pdf -o /dev/null --audit /tmp/audit-out
 ls /tmp/audit-out/<line_dir>/crops/
 ```
 

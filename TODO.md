@@ -1,4 +1,4 @@
-# Unscan TODO
+# Unprint TODO
 
 ## Active
 
@@ -9,7 +9,7 @@ The release build takes ~2–4 minutes, which kills iteration speed when tweakin
 - **`cranelift` backend** (`-Zcodegen-backend=cranelift`) — faster debug builds, no optimizations
 - **Profile-guided split**: keep hot paths in a small crate, cold code in a lib crate (incremental recompilation)
 - **`cargo build --profile dev-opt`** — custom profile with `opt-level=1` (faster than release, faster to compile than `opt-level=3`)
-- **Precompiled index**: avoid rebuilding char-index.bin during test iteration (already partially done — cached to disk)
+- **LDA weights cache**: avoid retraining `lda-weights.bin` during test iteration (already cached to disk)
 - **`cargo watch`** — auto-rebuild on save
 - Measure: where does time go? `cargo build --timings` to find the bottleneck (codegen? linking? macro expansion?)
 

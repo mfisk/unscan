@@ -59,7 +59,6 @@ pub struct WordPlacement {
     pub y_off: u32,
     pub width: u32,
     pub height: u32,
-    pub confidence: f32,
 }
 
 /// Verify a vectorised text region by:
@@ -104,7 +103,6 @@ pub fn verify_text_region(
             y_off: wr.y.saturating_sub(y),
             width: wr.width,
             height: wr.height,
-            confidence: wr.confidence,
         })
         .collect();
 
@@ -133,7 +131,7 @@ pub fn verify_text_region(
 
         // ZNCC scoring — no blur or contrast normalization needed,
         // ZNCC is inherently invariant to mean/contrast differences.
-        let (score, dy) = crate::ssim::zncc_windowed_best_vshift(&scan_crop, &render_for_score, 12, bail_below);
+        let (score, dy) = crate::compare_rasters::zncc_windowed_best_vshift(&scan_crop, &render_for_score, 12, bail_below);
 
         if score > best_score {
             best_score = score;
@@ -152,7 +150,7 @@ pub fn verify_text_region(
             };
 
             // Contrast-normalize scan crop for the visual diff only
-            let scan_for_diff = crate::char_index::contrast_normalize_char(
+            let scan_for_diff = crate::features::contrast_normalize_char(
                 best_scan_crop.as_ref().unwrap(),
             );
             best_diff = Some(compute_abs_diff(&scan_for_diff, &render_ink));
@@ -472,7 +470,7 @@ fn render_words_ab_glyph(
             let mut adv = 0.0f32;
             let mut prev: Option<ab_glyph::GlyphId> = None;
             for c in word.text.chars() {
-                let gid = crate::char_index::resolve_glyph(&font, c, overrides);
+                let gid = crate::char_render::resolve_glyph(&font, c, overrides);
                 if let Some(p) = prev {
                     adv += sf_line.kern(p, gid);
                 }
@@ -487,7 +485,7 @@ fn render_words_ab_glyph(
         let mut prev: Option<ab_glyph::GlyphId> = None;
 
         for c in word.text.chars() {
-            let gid = crate::char_index::resolve_glyph(&font, c, overrides);
+            let gid = crate::char_render::resolve_glyph(&font, c, overrides);
             if let Some(p) = prev {
                 cx += sf_line.kern(p, gid) * h_scale;
             }

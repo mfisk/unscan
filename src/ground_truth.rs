@@ -1,6 +1,6 @@
 //! Ground-truth extraction from a vector PDF for miss-only audit gating.
 //!
-//! When `--audit <path>` is given, unscan parses the vector
+//! When `--audit <path>` is given, unprint parses the vector
 //! PDF upfront and builds a per-page spatial index of text spans with their font
 //! names.  During per-line processing, each matched font is immediately compared
 //! against ground truth: hits skip expensive audit I/O (crop PNGs, per-char
@@ -637,7 +637,7 @@ fn extract_page_spans(
     }
 
     // Flip Y coordinates from PDF space (origin bottom-left) to display space
-    // (origin top-left) so they match the pixel coordinates unscan uses.
+    // (origin top-left) so they match the pixel coordinates unprint uses.
     for span in &mut spans {
         // PDF y is baseline from bottom; flip to top-down
         let pdf_y0 = span.bbox[1];

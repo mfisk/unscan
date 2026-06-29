@@ -1,8 +1,8 @@
-# Build Optimization Benchmark — unscan
+# Build Optimization Benchmark — unprint
 
 **Date:** 2026-06-13  
 **System:** AMD EPYC 9D25 (2 vCPUs), Rust 1.96.0 stable, x86_64-unknown-linux-gnu  
-**Workload:** Clean `cargo build --release --bin unscan` + full audit run on `font-timeline-specimen-scanned.pdf`
+**Workload:** Clean `cargo build --release --bin unprint` + full audit run on `font-timeline-specimen-scanned.pdf`
 
 ## Results
 
@@ -27,7 +27,7 @@ Debug builds (`cargo build` with no `--release`) compile in roughly the same tim
 
 ### What helps runtime (audit time)
 
-1. **`target-cpu=native`** is the single biggest runtime win (194 → 114s, −41%). This EPYC 9D25 supports AVX-512 and other modern SIMD extensions that the default `generic` target doesn't use. The image processing and feature vector math in unscan benefits enormously from wider SIMD.
+1. **`target-cpu=native`** is the single biggest runtime win (194 → 114s, −41%). This EPYC 9D25 supports AVX-512 and other modern SIMD extensions that the default `generic` target doesn't use. The image processing and feature vector math in unprint benefits enormously from wider SIMD.
 
 2. **`codegen-units = 1`** gives a solid −32% by enabling better inlining across the entire crate — the compiler sees the whole crate as one unit and can inline hot paths that would be opaque with 16 separate codegen units.
 

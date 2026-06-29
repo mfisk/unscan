@@ -545,7 +545,7 @@ Model size ~600KB as ONNX. Inference ~15µs per glyph image on CPU.
 
 ### Verdict
 
-**Best overall approach for unscan.** Combines:
+**Best overall approach for unprint.** Combines:
 - Non-linear feature transformation (captures interactions)
 - Open-set recognition (new fonts without retraining)
 - Natural font family grouping (triplet training with grouped labels)

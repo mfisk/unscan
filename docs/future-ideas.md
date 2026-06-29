@@ -10,6 +10,6 @@ frequency domain) and apply a matching blur to the rendered reference before
 SSIM comparison. This would let SSIM focus on letterform shape differences
 rather than penalizing "too sharp" renders.
 
-The `gaussian_blur_3x3` function in `ssim.rs` applies a fixed 3×3 kernel to both
+The `gaussian_blur_3x3` function in `compare_rasters.rs` applies a fixed 3×3 kernel to both
 scan and render crops. An adaptive kernel matched to the actual scan quality
 would be more accurate.

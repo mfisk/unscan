@@ -3,7 +3,7 @@ use std::path::{Path, PathBuf};
 
 #[derive(Parser, Debug)]
 #[command(
-    name = "unscan",
+    name = "unprint",
     about = "Replace scanned (raster) text with native (vector) text.\n\n\
              Zero information loss: only replaces raster when BOTH OCR and font match\n\
              confidence are high. All remaining raster is kept at original quality.\n\
@@ -55,23 +55,7 @@ pub struct Args {
     #[arg(long, value_name = "DIR")]
     pub audit: Option<PathBuf>,
 
-    // ── Character index flags ──────────────────────────────────────
-    /// Scan available fonts, update the cached character index if needed,
-    /// and exit.  Incrementally adds new fonts and removes stale ones
-    /// without rebuilding the entire index.
-    #[arg(long)]
-    pub index: bool,
-
-    /// Path to the character index cache file.
-    /// Default: ~/.cache/unscan/char-index.bin
-    #[arg(long)]
-    pub index_path: Option<PathBuf>,
-
-    /// Force a full rebuild of the character index, ignoring any cache.
-    #[arg(long)]
-    pub rebuild_index: bool,
-
-    /// Train LDA classifier weights and save to ~/.cache/unscan/lda-weights.bin.
+    // ── Training flags ──────────────────────────────────────────────/ Train LDA classifier weights and save to ~/.cache/unprint/lda-weights.bin.
     /// Scans all system fonts, renders characters, computes features, and trains
     /// the LDA projection.  Exits after training.
     #[arg(long)]
@@ -148,10 +132,10 @@ impl Args {
     /// for how reference characters are rendered — used by training, indexing,
     /// and inference.
     pub fn render_params(&self) -> crate::char_render::RenderParams {
-        use crate::char_index::AaVariant;
+        use crate::features::AaVariant;
         let aa = AaVariant::parse(&self.render_aa).unwrap_or(AaVariant::Native);
         crate::char_render::RenderParams {
-            height: crate::char_index::NORM_H,
+            height: crate::features::NORM_H,
             render_scale: self.render_scale,
             aa,
             binarize_threshold: self.render_binarize.filter(|&v| v > 0),
@@ -182,20 +166,6 @@ impl Args {
         self.audit.as_deref()
     }
 
-    /// Resolve the character index path.
-    /// Default: ~/.cache/unscan/char-index.bin
-    pub fn resolved_index_path(&self) -> PathBuf {
-        if let Some(ref p) = self.index_path {
-            p.clone()
-        } else {
-            let home = std::env::var("HOME").unwrap_or_else(|_| "/tmp".to_string());
-            PathBuf::from(home)
-                .join(".cache")
-                .join("unscan")
-                .join("char-index.bin")
-        }
-    }
-
     /// The ground-truth vector PDF path — from --test.
     pub fn gt_vector_pdf(&self) -> Option<&PathBuf> {
         self.test.as_ref()
@@ -207,13 +177,13 @@ impl Args {
         self.audit.is_some()
     }
 
-    /// Validate: if not --index, require input and output (unless --test).
+    /// Validate: require input and output (unless --test or non-scan mode).
     pub fn validate(&self) -> Result<(), String> {
-        if self.index || self.render_ref_chars.is_some() || !self.weight_explicit.is_empty() || self.train_lda {
+        if self.render_ref_chars.is_some() || !self.weight_explicit.is_empty() || self.train_lda {
             return Ok(());
         }
         if self.input.is_none() {
-            return Err("Input file required (or use --index)".to_string());
+            return Err("Input file required".to_string());
         }
         // --test mode doesn't require output
         if self.test.is_some() {

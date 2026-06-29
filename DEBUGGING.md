@@ -1,6 +1,6 @@
 # Debugging Font Matching
 
-How to diagnose and fix font identification errors in unscan.
+How to diagnose and fix font identification errors in unprint.
 
 ## Font Name Ambiguity and Canonical Lookup
 
@@ -44,7 +44,7 @@ font dictionary as a custom `/UnprintCanonical` key:
 
 1. **Font registration** (`register_all_fonts()` in gen-specimen.py):
    For each font file, call `make_weight_explicit(raw_ps, weight)` via
-   `unscan --weight-explicit`. This returns the canonical name. Build
+   `unprint --weight-explicit`. This returns the canonical name. Build
    `canonical_map: dict[str, str]` mapping raw PS name → canonical name.
    Include PDF base14 fonts (Times-Roman, Helvetica, Courier, etc.) — these
    are already unambiguous and map to themselves.
@@ -89,7 +89,7 @@ assumption, no global mapping table that could collide.
 #### Reproducing from scratch
 
 ```bash
-# 1. Build unscan with make_weight_explicit support
+# 1. Build unprint with make_weight_explicit support
 cargo build --release
 
 # 2. Generate specimen PDF (registers fonts, builds PDF, annotates)
@@ -109,7 +109,7 @@ pdf.close()
 "
 
 # 4. Run audit — GT reader will use /UnprintCanonical automatically
-./target/release/unscan font-timeline-specimen-rasterized.pdf \
+./target/release/unprint font-timeline-specimen-rasterized.pdf \
     --audit /tmp/audit --test font-timeline-specimen.pdf
 ```
 
@@ -166,7 +166,7 @@ can be lost:
       ▼
   ┌──────────────────────────────────┐
   │ 1. Character Extraction          │  VP + seam carving → per-char crops
-  │    segment_characters()          │  src/segment.rs, src/char_index.rs
+  │    segment_characters()          │  src/segment.rs
   └──────────────────────────────────┘
       │  (char, GrayImage) pairs
       ▼
@@ -174,7 +174,7 @@ can be lost:
   │ 2. CI Search                     │  Per-char 99-dim feature vectors →
   │    search_candidates()           │  brute-force nearest neighbor →
   │                                  │  weighted geometric mean → σ cutoff
-  │                                  │  src/char_index.rs
+  │                                  │  src/classifier.rs, src/font_match.rs
   └──────────────────────────────────┘
       │  CI #1 wins directly (no word-level SSIM reranking)
       ▼
@@ -246,7 +246,7 @@ The HTML report has collapsible CI candidate tables per line (showing score and
 gap from #1) and inline word crop vs render images with SSIM scores.
 
 ```bash
-unscan input.pdf -o /dev/null --diagnostic /tmp/diag
+unprint input.pdf -o /dev/null --diagnostic /tmp/diag
 open /tmp/diag/index.html
 ```
 
@@ -259,7 +259,7 @@ normalized to `NORM_H` pixels tall.
 Output: `DIR/p{page}_{text_slug}/word_{idx}_{text}/chars/NN_c.png`
 
 ```bash
-unscan input.pdf -o /dev/null --audit /tmp/audit-out
+unprint input.pdf -o /dev/null --audit /tmp/audit-out
 ls /tmp/audit-out/p2_Times_New_Roman/word_000_1931/chars/
 # 00_1.png  04_T.png  06_m.png ...
 ```
@@ -275,8 +275,8 @@ When a line has too many or too few crops, segmentation is the culprit. Compare
 crop count against expected character count (OCR text length minus spaces):
 
 ```bash
-unscan input.pdf -o /dev/null
-ls /tmp/unscan-crops/p4_line_ABCDEFGHIJKLMNOPQRSTUVWXYZ_abcdefghijklm/ | wc -l
+unprint input.pdf -o /dev/null
+ls /tmp/unprint-crops/p4_line_ABCDEFGHIJKLMNOPQRSTUVWXYZ_abcdefghijklm/ | wc -l
 # 99 crops for 52 expected chars = over-segmentation
 ```
 
@@ -327,7 +327,7 @@ selected it. Use this to see how a known-correct font scores even when CI
 would normally prune it.
 
 ```bash
-unscan input.pdf -o /dev/null --diagnostic /tmp/diag --include-font merriweather
+unprint input.pdf -o /dev/null --diagnostic /tmp/diag --include-font merriweather
 ```
 
 The included font appears in `data.json` CI candidates with score `-999.000`
@@ -406,15 +406,15 @@ independently (original vector PDF, designer confirmation, etc.).
 This is the first step. Always.
 
 ```bash
-rm -rf /tmp/unscan-crops
+rm -rf /tmp/unprint-crops
 RUST_LOG=info \
-  unscan input.pdf -o /dev/null --diagnostic /tmp/diag 2>&1 | tee /tmp/unscan-stderr.log
+  unprint input.pdf -o /dev/null --diagnostic /tmp/diag 2>&1 | tee /tmp/unprint-stderr.log
 ```
 
 For every failing line, open the crop PNGs and review them as a human:
 
 ```bash
-ls /tmp/unscan-crops/p{PAGE}_line_{TEXT}*/
+ls /tmp/unprint-crops/p{PAGE}_line_{TEXT}*/
 # Open the PNGs — look at them, don't just check sizes
 ```
 
@@ -549,7 +549,7 @@ or add temporary debug output in `search_candidates()` around the
 
 ### Step 4: Inspect SSIM Verification (Stage 4)
 
-**Note:** Word-level SSIM reranking (`word_match.rs`) has been removed. The CI
+**Note:** Word-level SSIM reranking has been removed. The CI
 #1 candidate wins directly. The only SSIM check remaining is the verification
 gate in Pass 2 (`verify_text_region()`, threshold 0.3).
 
@@ -654,10 +654,10 @@ PDF. It outputs performance stats as JSON to stdout and does not require
 
 ```bash
 # Fast accuracy scoring — no audit overhead
-./target/release/unscan INPUT.pdf --test VECTOR.pdf
+./target/release/unprint INPUT.pdf --test VECTOR.pdf
 
 # Full audit + ground-truth report
-./target/release/unscan INPUT.pdf \
+./target/release/unprint INPUT.pdf \
     -o /dev/null --audit /tmp/audit-out \
     --test VECTOR.pdf
 # Report at /tmp/audit-out/report.html
@@ -677,15 +677,16 @@ exactly how far each character was from the correct font.
 |------|-------|
 | CLI args | `src/cli.rs` |
 | Pipeline orchestration | `src/main.rs` |
-| SSIM fast path | `src/main.rs` (parallel font matching section) |
+| Font matching pipeline | `src/font_pipeline.rs` (match_lines, compute_font_size_pt) |
+| Page preparation | `src/page_cache.rs` (prepare_page: deskew → OCR → bg color → ink expand) |
+| SSIM fast path | `src/font_pipeline.rs` (parallel font matching section) |
 | Character segmentation | `src/segment.rs` (VP + seam carving DP) |
-| Feature computation | `src/char_index.rs` `compute_features()` |
-| CI search + scoring | `src/char_index.rs` `search_candidates()` |
+| Feature computation | `src/classifier.rs` `compute_features()` |
+| CI search + scoring | `src/font_match.rs` `identify_font()` |
 | Font-metric word splitting | `src/ocr.rs` `split_wide_whitespace_words()` |
-| Font-metric gap functions | `src/char_index.rs` `font_ink_width()`, `font_pair_ink_gap()` |
+| Font-metric gap functions | `src/char_render.rs` `font_ink_width()`, `font_pair_ink_gap()` |
 | SSIM verification | `src/verify.rs` `verify_text_region()` |
-| Pass 1.5 paragraph grouping | `src/main.rs` (paragraph-level font grouping section) |
-| Word-level SSIM reranking | `src/word_match.rs` (disabled — CI #1 wins directly) |
+| Pass 1.5 paragraph grouping | `src/font_pipeline.rs` (paragraph_font_grouping) |
 | Font scanning + OT variants | `src/font_scan.rs` |
 | Font cache (shared LRU) | `src/font_cache.rs` |
 | Ground truth | `test-docs/font-timeline-specimen.json` |
@@ -713,7 +714,7 @@ render/alignment.
 ### Step 1: Run with audit log
 
 ```bash
-./target/release/unscan test-docs/font-timeline-specimen-scanned.pdf \
+./target/release/unprint test-docs/font-timeline-specimen-scanned.pdf \
     -o /dev/null --audit /tmp/audit-out
 ```
 
@@ -740,7 +741,7 @@ for e in entries:
 ### Step 3: Use --audit for deep inspection
 
 ```bash
-./target/release/unscan INPUT.pdf -o /dev/null --audit /tmp/audit-out
+./target/release/unprint INPUT.pdf -o /dev/null --audit /tmp/audit-out
 ```
 
 Produces per-line directories, each containing per-word subdirectories:
