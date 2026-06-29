@@ -9,6 +9,7 @@ mod font_match;
 mod font_scan;
 mod geometry;
 pub mod features;
+pub mod glyph_map;
 pub mod char_render;
 pub mod train;
 pub mod layout;
@@ -158,11 +159,11 @@ fn build_audit_entry(
         reason: reason.to_string(),
         bbox: BBox { x: line.x, y: line.y, width: line.width, height: line.height },
         ci_candidates: lm.ci_top_for_audit.iter()
-            .map(|(k, s)| CiCandidate { font_key: k.clone(), score: *s })
+            .map(|(fk, s)| CiCandidate { font_key: fk.clone(), score: *s })
             .collect(),
         ci_char_votes: lm.ci_char_detail.iter().map(|d| char_vote(d, true)).collect(),
         ci_candidates_lig: lm.ci_top_for_audit_lig.iter()
-            .map(|(k, s)| CiCandidate { font_key: k.clone(), score: *s })
+            .map(|(fk, s)| CiCandidate { font_key: fk.clone(), score: *s })
             .collect(),
         ci_char_votes_lig: lm.ci_char_detail_lig.iter().map(|d| char_vote(d, false)).collect(),
         seg_winner: lm.seg_winner.clone(),
@@ -185,6 +186,7 @@ fn write_audit_report(
     ground_truth: Option<&ground_truth::GroundTruth>,
     dpi: u32,
     font_entries: &[font_scan::FontEntry],
+    glyph_map: &glyph_map::GlyphMap,
     args: &cli::Args,
     elapsed: std::time::Duration,
 ) {
@@ -203,6 +205,7 @@ fn write_audit_report(
         ground_truth,
         dpi,
         font_entries,
+        glyph_map,
         &meta,
     );
 }
@@ -234,6 +237,16 @@ fn run(args: &cli::Args, classifier: &mut dyn classifier::Classifier) -> Result<
     if font_registry.is_empty() {
         return Err(ScanTextError::NoFonts);
     }
+
+    // Load glyph map (glyph dedup groups) — required; run --train-lda first.
+    let gmap_path = glyph_map::GlyphMap::default_path();
+    let glyph_map = glyph_map::GlyphMap::load(&gmap_path)
+        .unwrap_or_else(|e| {
+            eprintln!("Error: could not load glyph-map.bin ({e})");
+            eprintln!("  expected at: {}", gmap_path.display());
+            eprintln!("  Run with --train-lda first to generate it.");
+            std::process::exit(1);
+        });
 
     // All font access goes through the shared cache below.
 
@@ -331,6 +344,7 @@ fn run(args: &cli::Args, classifier: &mut dyn classifier::Classifier) -> Result<
         let (line_matches, fp_hits) = font_pipeline::match_lines(
             &lines, &gray_page, page_img, page_num,
             &font_registry, &font_cache, classifier,
+            &glyph_map,
             ground_truth.as_ref(),
             dominant_font_candidate.as_ref(),
             args,
@@ -453,7 +467,7 @@ fn run(args: &cli::Args, classifier: &mut dyn classifier::Classifier) -> Result<
                     "font_score": fscore,
                     "ssim_score": ssim_score,
                     "ci_top_5": lm.ci_top_for_audit.iter().take(5)
-                        .map(|(k, s)| serde_json::json!({"font": k, "score": s}))
+                        .map(|(gid, s)| serde_json::json!({"glyph_id": gid, "score": s}))
                         .collect::<Vec<_>>(),
                     "decision": if keep_raster { "raster" } else { "vectorized" },
                 });
@@ -668,6 +682,7 @@ fn run(args: &cli::Args, classifier: &mut dyn classifier::Classifier) -> Result<
         ground_truth.as_ref(),
         args.dpi,
         font_registry.entries(),
+        &glyph_map,
     );
 
     if test_mode {
@@ -677,6 +692,7 @@ fn run(args: &cli::Args, classifier: &mut dyn classifier::Classifier) -> Result<
             ground_truth.as_ref(),
             args.dpi,
             font_registry.entries(),
+            &glyph_map,
         );
         // JSON output to stdout
         let test_json = serde_json::json!({
@@ -699,7 +715,7 @@ fn run(args: &cli::Args, classifier: &mut dyn classifier::Classifier) -> Result<
             }
             write_audit_report(
                 audit_root, &audit.text_entries, ground_truth.as_ref(),
-                args.dpi, font_registry.entries(), args, run_start.elapsed(),
+                args.dpi, font_registry.entries(), &glyph_map, args, run_start.elapsed(),
             );
         }
         return Ok(());
@@ -717,7 +733,7 @@ fn run(args: &cli::Args, classifier: &mut dyn classifier::Classifier) -> Result<
     if let Some(ref audit_root) = args.audit {
         write_audit_report(
             audit_root, &audit.text_entries, ground_truth.as_ref(),
-            args.dpi, font_registry.entries(), args, run_start.elapsed(),
+            args.dpi, font_registry.entries(), &glyph_map, args, run_start.elapsed(),
         );
     }
 

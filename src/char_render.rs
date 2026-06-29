@@ -9,15 +9,17 @@
 //! 3. If `binarize_threshold` is Some(t): `binarize(&img, t)` — AFTER normalize
 //! 4. Return image
 //!
-//! Rendered images are cached as individual PNGs under `~/.cache/unprint/chars/`.
+//! Rendered images are cached as PNGs under `~/.cache/unprint/chars/`,
+//! addressed by content hash (not font key) so identical renders are
+//! stored exactly once.
 
-use std::fmt::Write as FmtWrite;
 use std::path::PathBuf;
 
 use ab_glyph::{Font, GlyphId, PxScale, ScaleFont, point};
 use image::{GrayImage, Luma};
 
 use crate::features::{self as features, AaVariant, NORM_H};
+use crate::glyph_map;
 
 
 /// Parameters controlling how a character is rendered.
@@ -57,99 +59,86 @@ fn dirs_cache_dir() -> PathBuf {
         .unwrap_or_else(|_| PathBuf::from(".cache/unprint"))
 }
 
-/// Build the cache file path for a given render configuration.
-/// Structure: chars/h{H}_s{S}/{aa}_{binarize}/{font_dir}/U+XXXX[_g{gid}].png
-/// Font dir uses a sanitized (percent-encoded) font key for readability.
-/// Fewest-values directories first, fan out into many fonts, then characters.
-fn cache_path(
-    font_key: &str,
+/// Build the hash-addressed cache path for a rendered glyph image.
+/// Structure: chars/h{H}_s{S}/{aa}_{binarize}/U+XXXX/{hash}.png
+fn hash_cache_path(
     c: char,
-    glyph_id_override: Option<GlyphId>,
+    img_hash: u64,
     params: &RenderParams,
 ) -> PathBuf {
-    let font_dir = sanitize_font_key(font_key);
-
-    // Params dir: h24_s3
     let params_dir = format!("h{}_s{}", params.height, params.render_scale);
-
-    // AA + binarize dir: native_b128 or sharpen_bnone
     let binarize_tag = match params.binarize_threshold {
         Some(t) => format!("b{}", t),
         None => "bnone".to_string(),
     };
     let aa_dir = format!("{}_{}", params.aa.name(), binarize_tag);
+    let char_dir = format!("U+{:04X}", c as u32);
+    let fname = format!("{}.png", glyph_map::hash_hex(img_hash));
 
-    // Filename: U+0041.png or U+0041_g123.png
-    let mut fname = format!("U+{:04X}", c as u32);
-    if let Some(gid) = glyph_id_override {
-        write!(fname, "_g{}", gid.0).unwrap();
-    }
-    fname.push_str(".png");
-
-    cache_dir().join(params_dir).join(aa_dir).join(font_dir).join(fname)
+    cache_dir().join(params_dir).join(aa_dir).join(char_dir).join(fname)
 }
 
-/// SHA-256 of a string, returning the first `n` hex characters.
-/// Encode a font key for use as a directory name.
-/// Keeps ASCII alphanumerics, dash, dot, space literal; encodes everything else
-/// as _XX hex. Underscore is the escape prefix.
-fn sanitize_font_key(key: &str) -> String {
-    let mut out = String::with_capacity(key.len());
-    for b in key.bytes() {
-        match b {
-            b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'-' | b'.' | b' ' => {
-                out.push(b as char);
-            }
-            b'_' => out.push_str("_5F"),
-            _ => {
-                write!(out, "_{:02X}", b).unwrap();
-            }
-        }
+/// Load a cached glyph image by its content hash.
+/// Returns `None` if no cached image exists for this hash.
+pub fn load_cached_glyph(
+    c: char,
+    img_hash: u64,
+    params: &RenderParams,
+) -> Option<GrayImage> {
+    let path = hash_cache_path(c, img_hash, params);
+    if path.exists() {
+        image::open(&path).ok().map(|d| d.to_luma8())
+    } else {
+        None
     }
-    out
+}
+
+/// Return the filesystem path for a hash-addressed cached glyph image.
+pub fn glyph_cache_path(
+    c: char,
+    img_hash: u64,
+    params: &RenderParams,
+) -> PathBuf {
+    hash_cache_path(c, img_hash, params)
 }
 
 
-/// Render a character image through the canonical pipeline, with caching.
+/// Render a character image through the canonical pipeline, with
+/// hash-addressed caching.
 ///
 /// Returns `None` if the font doesn't contain the glyph.
+/// Returns `Some((hash, image))` — the content hash uniquely identifies
+/// the rendered image and is used as the glyph_id key.
 pub fn get_rendered_char<F: Font>(
     font: &F,
-    font_key: &str,
     c: char,
     glyph_id_override: Option<GlyphId>,
     params: &RenderParams,
-) -> Option<GrayImage> {
-    let path = cache_path(font_key, c, glyph_id_override, params);
-
-    // Cache hit: read from disk
-    if path.exists() {
-        if let Ok(dyn_img) = image::open(&path) {
-            return Some(dyn_img.to_luma8());
-        }
-        // Corrupted cache file — fall through to re-render
-    }
-
-    // Cache miss: render from scratch
+) -> Option<(u64, GrayImage)> {
+    // Always render (we need the image to compute the hash).
+    // The cache deduplicates storage — identical images share a file.
     let img = render_char_fresh(font, c, glyph_id_override, params)?;
+    let img_hash = glyph_map::hash_image(&img);
 
-    // Save to cache (best-effort, don't fail on I/O errors)
-    if let Some(parent) = path.parent() {
-        let _ = std::fs::create_dir_all(parent);
+    // Save to hash-addressed cache (best-effort, skip if already exists)
+    let path = hash_cache_path(c, img_hash, params);
+    if !path.exists() {
+        if let Some(parent) = path.parent() {
+            let _ = std::fs::create_dir_all(parent);
+        }
+        let _ = img.save(&path);
     }
-    let _ = img.save(&path);
 
-    Some(img)
+    Some((img_hash, img))
 }
 
 /// Convenience: render with default params (height=NORM_H, scale=1, native AA, no binarize).
 pub fn get_rendered_char_default<F: Font>(
     font: &F,
-    font_key: &str,
     c: char,
     glyph_id_override: Option<GlyphId>,
-) -> Option<GrayImage> {
-    get_rendered_char(font, font_key, c, glyph_id_override, &RenderParams::default())
+) -> Option<(u64, GrayImage)> {
+    get_rendered_char(font, c, glyph_id_override, &RenderParams::default())
 }
 
 /// The actual rendering pipeline — no caching.
@@ -172,8 +161,6 @@ fn render_char_fresh<F: Font>(
     let canvas = render_glyph_at_ink_height(font, gid, target_ink_h)?;
 
     // Step 2: normalize_to_ink_bounds — crop to ink, 1px pad, Lanczos3 resize to params.height
-    // If render_scale == 1, the image is already at target height, but we still
-    // run normalize to get consistent ink cropping and padding.
     let normalized = features::normalize_to_ink_bounds(&canvas, params.height)?;
 
     // Step 3: apply AA variant (AFTER normalize, BEFORE binarize)
@@ -289,7 +276,7 @@ pub fn render_ref_chars_and_exit(json_str: &str) -> ! {
         if font.glyph_id(c).0 == 0 {
             continue;
         }
-        if let Some(img) = get_rendered_char_default(&font, &req.font, c, None) {
+        if let Some((_hash, img)) = get_rendered_char_default(&font, c, None) {
             let fname = format!("U+{:04X}.png", c as u32);
             let _ = img.save(out.join(&fname));
             rendered += 1;

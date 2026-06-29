@@ -10,11 +10,11 @@ use image::{GrayImage, Luma};
 use ab_glyph::{Font, FontRef, PxScale, ScaleFont, point};
 use std::path::PathBuf;
 
-use unscan::char_index::{
+use unprint::char_index::{
     build_char_index, compute_features, compute_font_serif_score, compute_xh_cap_ratio,
     render_char_normalised, search_candidates, GlyphOverrides, Variations, CharFeatures, FEAT_LEN,
 };
-use unscan::classifier::FisherClassifier;
+use unprint::classifier::FisherClassifier;
 
 /// Render a single character in the given font at NORM_H=48 ink height,
 /// tight-cropped — same as what the index stores.
@@ -124,7 +124,7 @@ fn test_font_set() -> Vec<(String, PathBuf, GlyphOverrides, Variations)> {
 }
 
 /// Build the test index and render crops (shared between tests)
-fn setup() -> (unscan::char_index::CharIndex, Vec<(char, GrayImage)>, Vec<u8>) {
+fn setup() -> (unprint::char_index::CharIndex, Vec<(char, GrayImage)>, Vec<u8>) {
     let target_path = "/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf";
     let target_data = load_font(target_path);
     let font_set = test_font_set();
@@ -229,8 +229,8 @@ fn char_index_identifies_dejavu_sans_full_index() {
     let target_data = load_font(target_font);
 
     eprintln!("\n=== Loading full index from {:?} ===", index_path);
-    let index = unscan::char_index::load_index(&index_path, &FisherClassifier).expect("load index");
-    let font_count = unscan::char_index::count_fonts(&index);
+    let index = unprint::char_index::load_index(&index_path, &FisherClassifier).expect("load index");
+    let font_count = unprint::char_index::count_fonts(&index);
     eprintln!("  {} fonts in index", font_count);
 
     // Render "hamburgefontsiv" in DejaVu Sans
@@ -293,7 +293,7 @@ fn compare_dejavu_vs_noto_per_char() {
 
     let target_path = "/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf";
     let target_data = load_font(target_path);
-    let index = unscan::char_index::load_index(&index_path, &FisherClassifier).expect("load index");
+    let index = unprint::char_index::load_index(&index_path, &FisherClassifier).expect("load index");
 
     let test_word = "hamburgefontsiv";
     let mut seen = std::collections::HashSet::new();

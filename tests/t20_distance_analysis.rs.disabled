@@ -6,10 +6,10 @@
 use std::path::Path;
 use std::collections::HashMap;
 
-use unscan::char_index::{
+use unprint::char_index::{
     load_index, CharIndex, FEAT_LEN,
 };
-use unscan::classifier::FisherClassifier;
+use unprint::classifier::FisherClassifier;
 
 /// Extract a short display name from a font path or name
 fn short_name(full: &str) -> &str {

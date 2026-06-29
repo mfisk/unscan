@@ -43,24 +43,6 @@ pub fn aggregate_font_score(log_probs: &[(f32, f32)], n_total_chars: usize) -> f
 
 /// Compute the overall CI score for a single font using calibrated
 /// probabilities.  Returns `None` if the font has no data for any crop char.
-fn score_font(
-    classifier: &dyn crate::classifier::Classifier,
-    font_id: usize,
-    crop_data: &[(usize, char, CharFeatures)],
-) -> Option<f32> {
-    let log_probs: Vec<(f32, f32)> = crop_data.iter()
-        .filter_map(|&(_, ch, ref feat)| {
-            let p = classifier.probability(ch, feat, font_id)?;
-            // Clamp to avoid ln(0); 1e-30 is ~−69 in log space
-            Some((p.max(1e-30).ln(), char_weight(ch)))
-        })
-        .collect();
-    if log_probs.is_empty() {
-        return None;
-    }
-    let score = aggregate_font_score(&log_probs, crop_data.len());
-    if score.is_finite() { Some(score) } else { None }
-}
 
 /// Character discriminativeness weight for scoring.
 pub fn char_weight(c: char) -> f32 {
@@ -79,7 +61,7 @@ pub fn char_weight(c: char) -> f32 {
 // Matching — brute-force nearest-neighbor
 // ---------------------------------------------------------------------------
 
-/// Per-character CI detail, collected from the identify_font loop.
+/// Per-character CI detail, collected from the identify_glyph loop.
 #[derive(Debug, Clone)]
 pub struct CharMatchDetail {
     pub ch: char,
@@ -87,7 +69,7 @@ pub struct CharMatchDetail {
     pub best_prob: f32,
     pub passed_gate: bool,
     /// Top-3 fonts by probability (name, prob), highest first.
-    pub nearest: Vec<(String, f32)>,
+    pub nearest: Vec<(usize, f32)>,
     /// When the OCR correction gate fires, the original OCR character
     /// that was replaced.  `ch` then holds the corrected character,
     /// and `nearest`/`best_prob` reflect the corrected char's CI.
@@ -100,21 +82,24 @@ pub struct CharMatchDetail {
     pub best_alt_dist: Option<f32>,
 }
 
-/// Result of `identify_font`: ranked font scores + per-character CI detail.
+/// Result of `identify_glyph`: ranked font scores + per-character CI detail.
+/// scores are (font_key, aggregated_score) — globally consistent across characters.
+/// char_detail.nearest still uses per-char glyph_ids (valid within each character).
 #[derive(Debug)]
-pub struct FontIdResult {
+pub struct GlyphIdResult {
     pub scores: Vec<(String, f32)>,
     pub char_detail: Vec<CharMatchDetail>,
 }
 
-pub fn identify_font(
+pub fn identify_glyph(
     char_crops: &[(char, GrayImage)],
     _thoroughness: f32,
     _audit: bool,
     classifier: &dyn crate::classifier::Classifier,
-) -> FontIdResult {
+    glyph_map: &crate::glyph_map::GlyphMap,
+) -> GlyphIdResult {
     if char_crops.is_empty() {
-        return FontIdResult { scores: Vec::new(), char_detail: Vec::new() };
+        return GlyphIdResult { scores: Vec::new(), char_detail: Vec::new() };
     }
 
     // ── Pre-compute features ────────────────────────────────────────
@@ -128,37 +113,37 @@ pub fn identify_font(
         .collect();
 
     if crop_data.is_empty() {
-        return FontIdResult { scores: Vec::new(), char_detail: Vec::new() };
+        return GlyphIdResult { scores: Vec::new(), char_detail: Vec::new() };
     }
 
     let n_chars = crop_data.len();
 
-    // ── Stage 1: per-crop classification ────────────────────────────
-    // For each crop, the classifier picks the best font(s).
-    // Union all picks into the candidate set.
-    let mut candidate_set: HashSet<usize> = HashSet::new();
+    // ── Stage 1: per-crop classification → per-char glyph_ids ──────
+    // For each crop, classifier picks top glyph_ids (per-char dense indices).
+    // Expand each to font_keys via GlyphMap and union into candidate set.
+    let mut candidate_set: HashSet<String> = HashSet::new();
     let mut char_detail: Vec<CharMatchDetail> = Vec::with_capacity(n_chars);
 
     for &(crop_idx, ch, ref raw_feat) in &crop_data {
-        // Classifier picks top fonts — it owns the font vectors internally
         let picks = classifier.classify(ch, raw_feat, 3);
         if picks.is_empty() {
             continue;
         }
 
-        for &(font_id, _prob) in &picks {
-            candidate_set.insert(font_id);
+        // Expand per-char glyph_ids to font_keys
+        for &(glyph_id, _prob) in &picks {
+            for fk in glyph_map.fonts_for_glyph(ch, glyph_id) {
+                candidate_set.insert(fk.clone());
+            }
         }
 
         let best_prob = picks.iter()
             .map(|(_, p)| *p)
             .fold(0.0f32, f32::max);
 
-        let nearest: Vec<(String, f32)> = picks.iter()
+        let nearest: Vec<(usize, f32)> = picks.iter()
             .take(3)
-            .filter_map(|(id, p)| {
-                Some((classifier.font_name(*id)?.to_string(), *p))
-            })
+            .map(|&(id, p)| (id, p))
             .collect();
 
         char_detail.push(CharMatchDetail {
@@ -174,32 +159,36 @@ pub fn identify_font(
     }
 
     if candidate_set.is_empty() {
-        return FontIdResult { scores: Vec::new(), char_detail };
+        return GlyphIdResult { scores: Vec::new(), char_detail };
     }
 
-    // ── Stage 2: score each candidate across all crops ──────────────
-    let mut scores: Vec<(String, f32)> = candidate_set.iter()
-        .filter_map(|&font_id| {
-            let name = classifier.font_name(font_id)?.to_string();
-            let score = score_font(
-                classifier, font_id, &crop_data,
-            )?;
-            Some((name, score))
+    // ── Stage 2: score each candidate font_key across all crops ────
+    // For each font_key, look up its per-char glyph_id and get the
+    // classifier probability. This is globally consistent because
+    // font_keys are the same across characters.
+    let mut scores: Vec<(String, f32)> = candidate_set.into_iter()
+        .filter_map(|font_key| {
+            let log_probs: Vec<(f32, f32)> = crop_data.iter()
+                .filter_map(|&(_, ch, ref feat)| {
+                    let glyph_id = glyph_map.glyph_id_for_font(ch, &font_key)?;
+                    let p = classifier.probability(ch, feat, glyph_id)?;
+                    Some((p.max(1e-30).ln(), char_weight(ch)))
+                })
+                .collect();
+            if log_probs.is_empty() {
+                return None;
+            }
+            let score = aggregate_font_score(&log_probs, crop_data.len());
+            if score.is_finite() { Some((font_key, score)) } else { None }
         })
         .collect();
 
-    scores.retain(|(_, s)| s.is_finite());
-
     // Sort descending (higher = better = closer match).
-    // Tiebreaker: prefer base (untagged) font over OT variants.
     scores.sort_by(|a, b| {
         b.1.partial_cmp(&a.1)
             .unwrap_or(std::cmp::Ordering::Equal)
-            .then_with(|| a.0.contains('|').cmp(&b.0.contains('|')))
     });
 
-    // No candidate pruning — SSIM is the real arbiter.
-
-    FontIdResult { scores, char_detail }
+    GlyphIdResult { scores, char_detail }
 }
 
