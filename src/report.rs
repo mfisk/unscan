@@ -30,6 +30,22 @@ pub struct ReportMeta {
 
 // ── Glyph helpers ───────────────────────────────────────────────────────────
 
+/// Shorten a font_key to just the filename with file extension stripped.
+/// Variant tags ("|smcp") are preserved.
+fn short_key(key: &str) -> String {
+    let name = key.rsplit('/').next().unwrap_or(key);
+    // Handle "Font.otf|tag" → "Font|tag"
+    for ext in &[".otf", ".ttf", ".ttc"] {
+        if let Some(pos) = name.find(ext) {
+            let mut s = String::with_capacity(name.len() - 4);
+            s.push_str(&name[..pos]);
+            s.push_str(&name[pos + 4..]); // skip 4-char extension
+            return s;
+        }
+    }
+    name.to_string()
+}
+
 /// Resolve a glyph_id for a character to a display-friendly font key.
 /// Falls back to "glyph#{id}" when the map has no entry.
 fn glyph_display_key(glyph_map: &GlyphMap, ch: char, glyph_id: usize) -> String {
@@ -491,8 +507,8 @@ fn build_miss_block(
     dpi: u32,
 ) -> String {
     let entry = ce.entry;
-    let actual_font = ce.actual_font.as_deref().unwrap_or("?");
-    let matched = entry.font_matched.as_deref().unwrap_or("?");
+    let actual_font = ce.actual_font.as_deref().map(short_key).unwrap_or_else(|| "?".into());
+    let matched = entry.font_matched.as_deref().map(short_key).unwrap_or_else(|| "?".into());
 
     // Find correct font CI candidate
     let (gt_key, gt_score, gt_rank) =
@@ -544,7 +560,7 @@ fn build_miss_block(
 
     let ssim_compare_html = if let Some(ref dd) = diag_dir {
         build_ssim_block(
-            dd, actual_font, matched, entry.ssim_score,
+            dd, &actual_font, &matched, entry.ssim_score,
             gt_render_uri.as_deref(), gt_diff_uri.as_deref(),
             gt_ssim,
             gt_font_size_pt, unprint_font_size_pt,
@@ -589,8 +605,8 @@ fn build_miss_block(
             audit_root,
             correct_fe,
             chosen_fe,
-            actual_font,
-            matched,
+            &actual_font,
+            &matched,
             gt_rank,
             gt_score,
             font_data_cache,
@@ -614,6 +630,48 @@ fn build_miss_block(
         _ => String::new(),
     };
 
+    // Segmentation path comparison (ligature vs plain)
+    let seg_path_html = if let Some(ref winner) = entry.seg_winner {
+        if !entry.ci_candidates_lig.is_empty() {
+            let (lig_font, lig_score, plain_font, plain_score) = if winner == "ligature" {
+                // ci_candidates = ligature (winner), ci_candidates_lig = plain (loser)
+                let lf = entry.ci_candidates.first()
+                    .map(|c| short_key(&c.font_key)).unwrap_or_else(|| "?".into());
+                let ls = entry.ci_candidates.first().and_then(|c| c.score);
+                let pf = entry.ci_candidates_lig.first()
+                    .map(|c| short_key(&c.font_key)).unwrap_or_else(|| "?".into());
+                let ps = entry.ci_candidates_lig.first().and_then(|c| c.score);
+                (lf, ls, pf, ps)
+            } else {
+                // ci_candidates = plain (winner), ci_candidates_lig = ligature (loser)
+                let pf = entry.ci_candidates.first()
+                    .map(|c| short_key(&c.font_key)).unwrap_or_else(|| "?".into());
+                let ps = entry.ci_candidates.first().and_then(|c| c.score);
+                let lf = entry.ci_candidates_lig.first()
+                    .map(|c| short_key(&c.font_key)).unwrap_or_else(|| "?".into());
+                let ls = entry.ci_candidates_lig.first().and_then(|c| c.score);
+                (lf, ls, pf, ps)
+            };
+            let lig_marker = if winner == "ligature" { " ✓" } else { "" };
+            let plain_marker = if winner == "plain" { " ✓" } else { "" };
+            let ls = lig_score.map(|s| format!("{s:.4}")).unwrap_or_else(|| "—".into());
+            let ps = plain_score.map(|s| format!("{s:.4}")).unwrap_or_else(|| "—".into());
+            format!(
+                "<div class=\"seg-paths\">\
+                 <b>Seg paths:</b> \
+                 ligature → {} ({}){} · \
+                 plain → {} ({}){}\
+                 </div>",
+                lig_font, ls, lig_marker,
+                plain_font, ps, plain_marker,
+            )
+        } else {
+            String::new()
+        }
+    } else {
+        String::new()
+    };
+
     format!(
         "<div class=\"miss\">\
          <h3>p{}:L{} — \"{}\"{}{}</h3>\
@@ -621,9 +679,10 @@ fn build_miss_block(
          {}\
          {}\
          {}\
+         {}\
          </div>",
         entry.page, entry.line_index, text_preview, miss_kind_label, ssim_html,
-        scan_line_html, ssim_compare_html, tie_break_html, char_table_html,
+        seg_path_html, scan_line_html, ssim_compare_html, tie_break_html, char_table_html,
     )
 }
 
@@ -1295,7 +1354,7 @@ fn build_tie_break_block(
         header.push_str(&format!(
             "<th class=\"{}\">{}{}</th>",
             if tc.winner { "tie-winner" } else { "tie-loser" },
-            tc.family_name,
+            short_key(&tc.font_key),
             winner_marker,
         ));
     }

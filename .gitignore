@@ -51,3 +51,4 @@ test-docs/*-verify/
 training-data/
 audit.json
 hill-climb-test.sh
+audit-prev.json

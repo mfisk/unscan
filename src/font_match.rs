@@ -89,6 +89,10 @@ pub struct CharMatchDetail {
 pub struct GlyphIdResult {
     pub scores: Vec<(String, f32)>,
     pub char_detail: Vec<CharMatchDetail>,
+    /// Top score computed with uniform weights (all chars weight 1.0).
+    /// Used for path comparison (ligature vs plain) so char_weight
+    /// doesn't bias toward the ligature path.
+    pub unweighted_top: f32,
 }
 
 pub fn identify_glyph(
@@ -99,7 +103,7 @@ pub fn identify_glyph(
     glyph_map: &crate::glyph_map::GlyphMap,
 ) -> GlyphIdResult {
     if char_crops.is_empty() {
-        return GlyphIdResult { scores: Vec::new(), char_detail: Vec::new() };
+        return GlyphIdResult { scores: Vec::new(), char_detail: Vec::new(), unweighted_top: f32::MIN };
     }
 
     // ── Pre-compute features ────────────────────────────────────────
@@ -113,7 +117,7 @@ pub fn identify_glyph(
         .collect();
 
     if crop_data.is_empty() {
-        return GlyphIdResult { scores: Vec::new(), char_detail: Vec::new() };
+        return GlyphIdResult { scores: Vec::new(), char_detail: Vec::new(), unweighted_top: f32::MIN };
     }
 
     let n_chars = crop_data.len();
@@ -159,13 +163,14 @@ pub fn identify_glyph(
     }
 
     if candidate_set.is_empty() {
-        return GlyphIdResult { scores: Vec::new(), char_detail };
+        return GlyphIdResult { scores: Vec::new(), char_detail, unweighted_top: f32::MIN };
     }
 
     // ── Stage 2: score each candidate font_key across all crops ────
     // For each font_key, look up its per-char glyph_id and get the
     // classifier probability. This is globally consistent because
     // font_keys are the same across characters.
+    let mut best_unweighted = f32::MIN;
     let mut scores: Vec<(String, f32)> = candidate_set.into_iter()
         .filter_map(|font_key| {
             let log_probs: Vec<(f32, f32)> = crop_data.iter()
@@ -179,7 +184,13 @@ pub fn identify_glyph(
                 return None;
             }
             let score = aggregate_font_score(&log_probs, crop_data.len());
-            if score.is_finite() { Some((font_key, score)) } else { None }
+            if score.is_finite() {
+                // Unweighted mean for path comparison (ignore char_weight bias)
+                let uw = log_probs.iter().map(|(lp, _)| lp).sum::<f32>()
+                    / log_probs.len() as f32;
+                if uw > best_unweighted { best_unweighted = uw; }
+                Some((font_key, score))
+            } else { None }
         })
         .collect();
 
@@ -189,6 +200,6 @@ pub fn identify_glyph(
             .unwrap_or(std::cmp::Ordering::Equal)
     });
 
-    GlyphIdResult { scores, char_detail }
+    GlyphIdResult { scores, char_detail, unweighted_top: best_unweighted }
 }
 

@@ -231,10 +231,18 @@ pub fn match_lines(
                 font_match::identify_glyph(lig_crops, args.thoroughness, args.full_audit(), classifier, glyph_map)
             });
             prof_ci_us.fetch_add(ci_t0.elapsed().as_micros() as u64, Ordering::Relaxed);
-            // ── Pick the winner: higher top score wins ───────────
-            let plain_top = ci_result_plain.scores.first().map(|(_, s)| *s).unwrap_or(f32::MIN);
+            // ── Pick the winner: ligature vs plain segmentation ──
+            // We compare using unweighted (uniform) mean log-probs so
+            // char_weight doesn't bias the decision.  Ligature chars
+            // carry weight 2.0 for font ranking (they're highly
+            // discriminative), but that same bonus would unfairly tip
+            // the path comparison toward the ligature segmentation.
+            // Unweighted means treat every character equally, so the
+            // decision reflects which segmentation genuinely fits
+            // better, not which one has heavier-weighted chars.
+            let plain_top = ci_result_plain.unweighted_top;
             let lig_top = ci_result_lig.as_ref()
-                .and_then(|r| r.scores.first().map(|(_, s)| *s))
+                .map(|r| r.unweighted_top)
                 .unwrap_or(f32::MIN);
             let use_lig = ci_result_lig.is_some() && lig_top > plain_top;
 
@@ -317,7 +325,7 @@ pub fn match_lines(
                         tie_ssim_results.push((fe.font_key(), fe.family_name.clone(), ssim));
                         if best.as_ref().map_or(true, |(_, bs)| ssim > *bs) {
                             best = Some((font_match::FontMatchResult {
-                                font_name: fe.family_name.clone(),
+                                font_name: fe.font_key(),
                                 font_path: fe.path.clone(),
                                 font_key: fe.font_key(),
                                 variant_tag: fe.variant_tag.clone(),
@@ -347,7 +355,7 @@ pub fn match_lines(
                     let (ref font_key, score) = *tied[0];
                     let fm = font_registry.by_key(font_key)
                         .map(|fe| font_match::FontMatchResult {
-                            font_name: fe.family_name.clone(),
+                            font_name: fe.font_key(),
                             font_path: fe.path.clone(),
                             font_key: fe.font_key(),
                             variant_tag: fe.variant_tag.clone(),

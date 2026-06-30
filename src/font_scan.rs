@@ -131,9 +131,6 @@ impl FontRegistry {
         &self.entries
     }
 
-    pub fn into_entries(self) -> Vec<FontEntry> {
-        self.entries
-    }
 
     pub fn is_empty(&self) -> bool {
         self.entries.is_empty()

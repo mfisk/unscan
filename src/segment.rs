@@ -1081,6 +1081,7 @@ pub fn extract_line_chars(
     let mut char_counts_lig: HashMap<char, usize> = HashMap::new();
     let mut results: Vec<(char, GrayImage)> = Vec::new();
     let mut results_lig_all: Vec<(char, GrayImage)> = Vec::new();
+    let mut plain_for_lig_path: Vec<(char, GrayImage)> = Vec::new();
     let mut any_ligatures = false;
 
     for (word_idx, word) in sorted.iter().enumerate() {
@@ -1150,6 +1151,10 @@ pub fn extract_line_chars(
             word_diag_dir.as_ref().map(|d| d.join("seg_plain")).as_deref(),
 
         );
+        // Stash plain chars for non-ligature words before moving them
+        if !has_ligatures {
+            plain_for_lig_path.extend(results_plain.iter().cloned());
+        }
         results.extend(results_plain);
         char_counts = counts_plain;
 
@@ -1173,6 +1178,12 @@ pub fn extract_line_chars(
             results_lig_all.extend(results_lig);
             char_counts_lig = counts_lig;
         }
+    }
+
+    // Merge non-ligature words' plain chars into the ligature path
+    // so both paths score the full line.
+    if any_ligatures {
+        results_lig_all.extend(plain_for_lig_path);
     }
 
     LineCharCrops {

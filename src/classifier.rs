@@ -147,7 +147,7 @@ fn dense_project(out_dim: usize, mat: &[f32], x: &[f32]) -> Vec<f32> {
 /// For embedding classifiers, `σ²` is computed during training and stored
 /// per-character in the weight file (LDAC v2).  At runtime, `sigma_sq(ch)`
 /// returns the stored value.  If the weight file predates v2, `σ²` is
-/// computed on first access from the stored FontVecStore centroids as a
+/// computed on first access from the stored PerCharModel centroids as a
 /// fallback.
 #[allow(dead_code)]
 pub trait Classifier: Send + Sync {
@@ -203,7 +203,7 @@ fn sq_euclid(a: &[f32], b: &[f32]) -> f32 {
 /// with the embedded font centroids and the probability-calibration σ².
 ///
 /// Replaces the old split where weights lived in the Embedder and centroids
-/// lived in a separate FontVecStore.
+/// lived in a separate PerCharModel.
 pub struct CharModel {
     /// Classifier-specific weights as a flat f32 blob.
     /// Interpretation depends on the classifier type (magic byte in .bin header).
@@ -422,71 +422,6 @@ fn read_f32s(data: &[u8], pos: &mut usize, n: usize) -> Result<Vec<f32>, String>
 /// Reusable storage for classifiers that do brute-force distance search
 /// over embedded font vectors. Each embedding-based classifier composes
 /// this internally.
-/// Legacy font vector store — only retained for deserializing FVST blobs
-/// in GlobalTriplet v2 files. New classifiers use PerCharModel directly.
-pub(crate) struct FontVecStore {
-    /// Per-char font vectors: char → [(font_id, embedded_vec)]
-    pub(crate) vecs: HashMap<char, Vec<(usize, Vec<f32>)>>,
-    /// font_id → font name
-    pub(crate) font_names: Vec<String>,
-}
-
-impl FontVecStore {
-    /// Deserialize a font vector store from a reader (FVST format).
-    pub fn read_from(r: &mut dyn std::io::Read) -> Result<Self, String> {
-        let mut b4 = [0u8; 4];
-        r.read_exact(&mut b4).map_err(|e| format!("read FVST magic: {e}"))?;
-        if &b4 != b"FVST" {
-            return Err(format!("bad FontVecStore magic: {:?}", &b4[..]));
-        }
-        // Font names
-        r.read_exact(&mut b4).map_err(|e| format!("read n_fonts: {e}"))?;
-        let n_fonts = u32::from_le_bytes(b4) as usize;
-        let mut font_names = Vec::with_capacity(n_fonts);
-        for _ in 0..n_fonts {
-            r.read_exact(&mut b4).map_err(|e| format!("read name len: {e}"))?;
-            let len = u32::from_le_bytes(b4) as usize;
-            let mut buf = vec![0u8; len];
-            r.read_exact(&mut buf).map_err(|e| format!("read name: {e}"))?;
-            font_names.push(String::from_utf8(buf).map_err(|e| format!("bad font name: {e}"))?);
-        }
-        // Char vectors
-        r.read_exact(&mut b4).map_err(|e| format!("read n_chars: {e}"))?;
-        let n_chars = u32::from_le_bytes(b4) as usize;
-        let mut vecs: HashMap<char, Vec<(usize, Vec<f32>)>> = HashMap::with_capacity(n_chars);
-        for _ in 0..n_chars {
-            r.read_exact(&mut b4).map_err(|e| format!("read cp: {e}"))?;
-            let ch = char::from_u32(u32::from_le_bytes(b4))
-                .ok_or_else(|| "invalid codepoint".to_string())?;
-            r.read_exact(&mut b4).map_err(|e| format!("read n_entries: {e}"))?;
-            let n_entries = u32::from_le_bytes(b4) as usize;
-            let mut cv = Vec::with_capacity(n_entries);
-            for _ in 0..n_entries {
-                r.read_exact(&mut b4).map_err(|e| format!("read fid: {e}"))?;
-                let fid = u32::from_le_bytes(b4) as usize;
-                r.read_exact(&mut b4).map_err(|e| format!("read vlen: {e}"))?;
-                let vlen = u32::from_le_bytes(b4) as usize;
-                let mut v = vec![0.0f32; vlen];
-                for x in &mut v {
-                    r.read_exact(&mut b4).map_err(|e| format!("read val: {e}"))?;
-                    *x = f32::from_le_bytes(b4);
-                }
-                cv.push((fid, v));
-            }
-            vecs.insert(ch, cv);
-        }
-        // Sigma sq (read and discard — no longer used)
-        r.read_exact(&mut b4).map_err(|e| format!("read sigma count: {e}"))?;
-        let n_sigma = u32::from_le_bytes(b4) as usize;
-        for _ in 0..n_sigma {
-            r.read_exact(&mut b4).map_err(|_| "read sigma cp".to_string())?;
-            r.read_exact(&mut b4).map_err(|_| "read sigma val".to_string())?;
-        }
-        Ok(Self { vecs, font_names })
-    }
-}
-
-
 
 // ---------------------------------------------------------------------------
 // EmbeddingClassifier — shared Classifier impl for embed-then-store classifiers
@@ -937,126 +872,6 @@ impl Embedder for TripletClassifier {
 }
 
 // ---------------------------------------------------------------------------
-// Global triplet network (single model, all characters)
-// ---------------------------------------------------------------------------
-
-/// Single global triplet network classifier.
-///
-/// Unlike [`TripletClassifier`] which loads one MLP per character, this
-/// variant uses a single MLP for ALL characters.  The `embed()` method
-/// ignores the `ch` parameter — the same network processes every glyph.
-///
-/// Because the embedding space captures both font *and* character identity,
-/// nearest-neighbor search recovers both which character and which font
-/// match best.
-///
-/// Binary format (magic `b"TRPG"`, version 2):
-/// ```text
-/// magic:   b"TRPG" (4 bytes)
-/// version: u32 LE (2)
-/// W1: L1_IN×128 f32 LE, b1: 128 f32 LE
-/// W2: 128×64 f32 LE,  b2: 64 f32 LE
-/// W3: 64×32 f32 LE,   b3: 32 f32 LE
-/// FontVecStore (FVST section)
-/// ```
-pub struct GlobalTripletClassifier {
-    net: GlyphNet,
-}
-
-/// Header size for TRPG format: magic (4) + version (4) = 8 bytes.
-/// Then PARAMS_PER_CHAR × 4 bytes of weights.
-const GLOBAL_HEADER: usize = 8;
-
-impl GlobalTripletClassifier {
-    /// Load global triplet weights and font index.  No auto-train (training
-    /// is done through TripletClassifier's trainer).
-    pub fn load(
-        path: &std::path::Path,
-        _ctx: Option<&crate::train::TrainingContext>,
-    ) -> Result<EmbeddingClassifier, String> {
-        use std::io::{Cursor, Read};
-
-        let mut data = Vec::new();
-        std::fs::File::open(path)
-            .map_err(|e| format!("cannot open global-triplet weights {}: {e}", path.display()))?
-            .read_to_end(&mut data)
-            .map_err(|e| format!("read error on {}: {e}", path.display()))?;
-
-        let weights_end = GLOBAL_HEADER + PARAMS_PER_CHAR * 4;
-        if data.len() < weights_end {
-            return Err(format!(
-                "global-triplet weights: {} bytes, need at least {} ({} header + {} params × 4)",
-                data.len(),
-                weights_end,
-                GLOBAL_HEADER,
-                PARAMS_PER_CHAR,
-            ));
-        }
-
-        if &data[0..4] != b"TRPG" {
-            return Err(format!(
-                "bad magic in global-triplet weights (expected TRPG, got {:?})",
-                &data[0..4]
-            ));
-        }
-
-        let version = u32::from_le_bytes(data[4..8].try_into().unwrap());
-        if version != 2 {
-            return Err(format!("unsupported global-triplet weights version {version} (expected 2)"));
-        }
-
-        let mut r = BinaryReader::new(&data, GLOBAL_HEADER);
-
-        let net = GlyphNet {
-            fc1: InferenceLinear {
-                rows: L1_IN, cols: L1_OUT,
-                w: r.read_f32s(L1_IN * L1_OUT)?, b: r.read_f32s(L1_OUT)?,
-            },
-            fc2: InferenceLinear {
-                rows: L1_OUT, cols: L2_OUT,
-                w: r.read_f32s(L1_OUT * L2_OUT)?, b: r.read_f32s(L2_OUT)?,
-            },
-            fc3: InferenceLinear {
-                rows: L2_OUT, cols: L3_OUT,
-                w: r.read_f32s(L2_OUT * L3_OUT)?, b: r.read_f32s(L3_OUT)?,
-            },
-        };
-
-        let embedder = Self { net };
-
-        // Read legacy FVST font index and convert to PerCharModel
-        let model = if data.len() > weights_end {
-            let mut cursor = Cursor::new(&data[weights_end..]);
-            let store = FontVecStore::read_from(&mut cursor)?;
-            let mut pcm = PerCharModel::new(0);
-            for (ch, entries) in &store.vecs {
-                let centroids: Vec<(u32, Vec<f32>)> = entries.iter()
-                    .map(|(fid, v)| (*fid as u32, v.clone()))
-                    .collect();
-                let mut cm = CharModel {
-                    weights: Vec::new(), // global net, no per-char weights
-                    centroids,
-                    sigma_sq: 0.0,
-                };
-                cm.compute_sigma_sq();
-                pcm.chars.insert(*ch, cm);
-            }
-            pcm
-        } else {
-            PerCharModel::new(0)
-        };
-
-        Ok(EmbeddingClassifier { model, embedder: Box::new(embedder) })
-    }
-}
-
-impl Embedder for GlobalTripletClassifier {
-    fn embed(&self, _ch: char, features: &CharFeatures) -> Vec<f32> {
-        self.net.forward(&features.as_slice())
-    }
-    fn name(&self) -> &str { "global_triplet" }
-}
-
 // ---------------------------------------------------------------------------
 // Per-character Fisher (loads per-char weights from FISH file)
 // ---------------------------------------------------------------------------
@@ -1354,7 +1169,6 @@ impl Embedder for PerCharFisherClassifier {
 /// Per character (repeated n_chars times):
 ///   char_code: u32 LE
 ///   L_inv:     [f32; feat_len * feat_len] LE (row-major)
-/// FontVecStore (FVST section)
 /// ```
 pub struct MahalanobisClassifier {
     transforms: HashMap<char, Vec<f32>>, // L_inv per char, FEAT_LEN × FEAT_LEN row-major
@@ -1673,7 +1487,6 @@ impl Embedder for MahalanobisClassifier {
 ///   out_dim:   u32 LE (number of projection dimensions)
 ///   proj:      [f32; out_dim * FEAT_LEN] LE (row-major, each row = one projection direction)
 ///   sigma_sq:  f32 LE
-/// FontVecStore (FVST section)
 /// ```
 pub struct LdaClassifier {
     projections: HashMap<char, (usize, Vec<f32>)>, // (out_dim, proj matrix)
@@ -2113,7 +1926,6 @@ impl MlpCharNet {
 /// ```
 pub struct MlpClassifier {
     nets: HashMap<char, MlpCharNet>,
-    font_names: Vec<String>,
 }
 
 // MLP hidden layer sizes (must match trainer)
@@ -2181,18 +1993,7 @@ impl MlpClassifier {
             });
         }
 
-        Ok(Self { nets, font_names: Vec::new() })
-    }
-
-    /// Total number of unique font IDs across all character nets.
-    fn count_fonts(&self) -> usize {
-        let mut ids = std::collections::HashSet::new();
-        for net in self.nets.values() {
-            for &fid in &net.class_map {
-                ids.insert(fid);
-            }
-        }
-        ids.len()
+        Ok(Self { nets })
     }
 
     /// Train MLP weights from rendered training data and write an MLPC binary.
@@ -2634,12 +2435,6 @@ pub fn default_triplet_weights_path() -> std::path::PathBuf {
     std::path::PathBuf::from(home).join(".cache").join("unprint").join("triplet-weights.bin")
 }
 
-/// Default path for cached global-triplet weights.
-pub fn default_global_triplet_weights_path() -> std::path::PathBuf {
-    let home = std::env::var("HOME").unwrap_or_else(|_| ".".to_string());
-    std::path::PathBuf::from(home).join(".cache").join("unprint").join("global-triplet-weights.bin")
-}
-
 /// Default path for cached Mahalanobis weights.
 pub fn default_mahalanobis_weights_path() -> std::path::PathBuf {
     let home = std::env::var("HOME").unwrap_or_else(|_| ".".to_string());
@@ -2789,11 +2584,6 @@ pub fn build_classifier(
             |p| TripletClassifier::load(p, None).map(|c| { let ec: EmbeddingClassifier = c; ec }),
             auto_train, train_triplet,
         ),
-        "global-triplet" => load_or_train(
-            "Global-Triplet", weights_path, &default_global_triplet_weights_path(),
-            |p| GlobalTripletClassifier::load(p, None).map(|c| { let ec: EmbeddingClassifier = c; ec }),
-            auto_train, train_triplet,
-        ),
         "mahalanobis" => load_or_train(
             "Mahalanobis", weights_path, &default_mahalanobis_weights_path(),
             |p| MahalanobisClassifier::load(p, None).map(|c| { let ec: EmbeddingClassifier = c; ec }),
@@ -2836,7 +2626,7 @@ pub fn build_classifier(
             }
         }
         other => {
-            eprintln!("Error: unknown classifier '{other}'. Use 'lda', 'perchar-fisher', 'triplet', 'global-triplet', 'mahalanobis', 'mlp', 'fusion', or 'zncc'.");
+            eprintln!("Error: unknown classifier '{other}'. Use 'lda', 'perchar-fisher', 'triplet', 'mahalanobis', 'mlp', 'fusion', or 'zncc'.");
             std::process::exit(1);
         }
     }
