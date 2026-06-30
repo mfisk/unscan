@@ -1051,69 +1051,43 @@ fn render_correct_font_comparison(
         None => return (None, None, None),
     };
 
-    // Load font data
     let font_data = match font_data_cache.load(&fe.path) {
         Some(d) => d,
         None => return (None, None, None),
     };
 
-    // Build word placements relative to line bbox
-    let placements: Vec<crate::verify::WordPlacement> = entry
-        .word_bboxes
-        .iter()
-        .map(|wb| crate::verify::WordPlacement {
-            text: wb.text.clone(),
-            x_off: wb.x.saturating_sub(entry.bbox.x),
-            y_off: wb.y.saturating_sub(entry.bbox.y),
-            width: wb.width,
-            height: wb.height,
-        })
-        .collect();
-
-    if placements.is_empty() {
-        return (None, None, None);
-    }
-
-    let overrides: Option<Vec<(char, u16)>> = fe
-        .glyph_overrides
-        .as_ref()
-        .map(|v| v.iter().cloned().collect());
-
-    // Render the line in the correct font
-    let render_img = match crate::verify::render_line_for_comparison(
-        font_data,
-        &placements,
-        entry.bbox.width,
-        entry.bbox.height,
-        overrides.as_deref(),
-        &fe.variant_tag,
-        fe.variations.as_deref(),
-    ) {
+    // Load the scan crop saved during the chosen font's verification
+    let scan_path = dd.join("ssim_scan.png");
+    let scan_gray = match image::open(&scan_path).ok().map(|d| d.to_luma8()) {
         Some(img) => img,
         None => return (None, None, None),
     };
 
-    let render_uri = img_to_b64_uri(&render_img);
-
-    // Load ssim_scan.png, compute diff and ZNCC (same path as verify_text_region)
-    let scan_path = dd.join("ssim_scan.png");
-    let (diff_uri, correct_sim) = if scan_path.exists() {
-        if let Ok(scan_dyn) = image::open(&scan_path) {
-            let scan_gray = scan_dyn.to_luma8();
-            let diff_img = crate::verify::compute_abs_diff(&scan_gray, &render_img);
-            // Compute ZNCC: same pipeline as verify_text_region
-            let (zncc_val, _dy) = crate::compare_rasters::zncc_windowed_best_vshift(
-                &scan_gray, &render_img, 12, None,
-            );
-            (Some(img_to_b64_uri(&diff_img)), Some(zncc_val))
-        } else {
-            (None, None)
+    // Build TextRegions from word_bboxes for verify_text_region
+    let words: Vec<crate::ocr::TextRegion> = entry.word_bboxes.iter().map(|wb| {
+        crate::ocr::TextRegion {
+            text: wb.text.clone(),
+            x: wb.x, y: wb.y,
+            width: wb.width, height: wb.height,
+            font_size_pt: 0.0, confidence: wb.confidence,
+            level: 5, block_num: 0, par_num: 0, line_num: 0, word_num: 0,
         }
-    } else {
-        (None, None)
-    };
+    }).collect();
 
-    (Some(render_uri), diff_uri, correct_sim)
+    // Same pipeline as the chosen font — render, ZNCC, ink-crop for display
+    let vr = crate::verify::verify_text_region(
+        &scan_gray, font_data, &entry.text, &words,
+        entry.bbox.x, entry.bbox.y,
+        fe.glyph_overrides.as_ref().map(|v| v.as_slice()),
+        &fe.variant_tag, fe.variations.as_deref(),
+        None, None,
+    );
+
+    let render_uri = vr.render_ink.as_ref().map(|r| img_to_b64_uri(r));
+    let diff_uri = vr.diff.as_ref().map(|d| img_to_b64_uri(d));
+    let score = if vr.score > 0.0 { Some(vr.score) } else { None };
+
+    (render_uri, diff_uri, score)
 }
 
 /// Compute the font size (in PDF points) that unprint would infer for the

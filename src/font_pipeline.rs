@@ -99,7 +99,7 @@ pub fn match_lines(
 
         // ── Fast path: try dominant font via SSIM ────────────────
         if let (Some(fm), Some(ref fd)) = (dominant_font_candidate, &fast_path_font_data) {
-            let (score, _dy) = verify::verify_text_region(
+            let vr = verify::verify_text_region(
                 &norm_crop,
                 fd.as_slice(),
                 &line.text,
@@ -111,7 +111,7 @@ pub fn match_lines(
                 None,
                 Some(FAST_PATH_MIN_SSIM),
             );
-            if score >= FAST_PATH_MIN_SSIM {
+            if vr.score >= FAST_PATH_MIN_SSIM {
                 fast_path_hits.fetch_add(1, Ordering::Relaxed);
                 prof_fp_us.fetch_add(line_start.elapsed().as_micros() as u64, Ordering::Relaxed);
                 let text_color = color::detect_text_color(
@@ -126,7 +126,7 @@ pub fn match_lines(
                     },
                 );
                 let mut result = fm.clone();
-                result.best_dy = _dy;
+                result.best_dy = vr.dy;
                 return LineMatch {
                     font_result: Some(result),
                     text_color,
@@ -313,7 +313,7 @@ pub fn match_lines(
                             let _ = std::fs::create_dir_all(&p);
                             p
                         });
-                        let (sim, dy) = verify::verify_text_region(
+                        let vr = verify::verify_text_region(
                             &norm_crop, &fd, &line.text,
                             &line.words,
                             line.x, line.y,
@@ -321,10 +321,10 @@ pub fn match_lines(
                             fe.variations.as_deref(),
                             tie_audit_dir.as_deref(), None,
                         );
-                        log_parts.push(format!("{:.4}({})", sim, fe.family_name));
-                        tie_sim_results.push((fe.font_key(), fe.family_name.clone(), sim));
+                        log_parts.push(format!("{:.4}({})", vr.score, fe.family_name));
+                        tie_sim_results.push((fe.font_key(), fe.family_name.clone(), vr.score));
                         if best.as_ref().map_or(true, |(prev, bs)| {
-                            sim > *bs || (sim == *bs && !prev.variant_tag.is_empty() && fe.variant_tag.is_empty())
+                            vr.score > *bs || (vr.score == *bs && !prev.variant_tag.is_empty() && fe.variant_tag.is_empty())
                         }) {
                             best = Some((font_match::FontMatchResult {
                                 font_name: fe.font_key(),
@@ -334,8 +334,8 @@ pub fn match_lines(
                                 glyph_overrides: fe.glyph_overrides.clone(),
                                 variations: fe.variations.clone(),
                                 score: top_score,
-                                best_dy: dy,
-                            }, sim));
+                                best_dy: vr.dy,
+                            }, vr.score));
                         }
                         ti += 1;
                     }
