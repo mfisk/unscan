@@ -49,53 +49,6 @@ impl ZnccClassifier {
             glyph_hashes: std::collections::HashMap::new(),
         }
     }
-
-    /// Ensure glyph_hashes are populated for a character.
-    /// We need the image hash to load from the hash-addressed cache.
-    /// On first call per char, render one representative font per group
-    /// to get the hash.
-    fn ensure_hashes(&mut self, ch: char) {
-        if self.glyph_hashes.contains_key(&ch) {
-            return;
-        }
-        let groups = match self.glyph_map.groups.get(&ch) {
-            Some(g) => g,
-            None => return,
-        };
-        let mut hashes = Vec::with_capacity(groups.len());
-        for group in groups {
-            // Try to render via the first font in the group to get the hash
-            let mut found_hash = 0u64;
-            for font_key in group {
-                // Extract path from font_key (before any | variant tag)
-                let path = font_key.split('|').next().unwrap_or(font_key);
-                let font_data = match std::fs::read(path) {
-                    Ok(d) => d,
-                    Err(_) => continue,
-                };
-                let font = match ab_glyph::FontRef::try_from_slice(&font_data) {
-                    Ok(f) => f,
-                    Err(_) => continue,
-                };
-                // Extract glyph overrides from variant tag if present
-                let gid_override = if font_key.contains('|') {
-                    // For variant fonts, we'd need the glyph overrides
-                    // For now, use default glyph mapping
-                    None
-                } else {
-                    None
-                };
-                if let Some((hash, _img)) = crate::char_render::get_rendered_char(
-                    &font, ch, gid_override, &self.render_params,
-                ) {
-                    found_hash = hash;
-                    break;
-                }
-            }
-            hashes.push(found_hash);
-        }
-        self.glyph_hashes.insert(ch, hashes);
-    }
 }
 
 impl Classifier for ZnccClassifier {
