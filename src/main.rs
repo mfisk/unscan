@@ -33,7 +33,7 @@ use crate::error::ScanTextError;
 use rayon::prelude::*;
 
 /// Minimum SSIM score for SSIM verification to consider a font match acceptable.
-const MIN_VERIFY_SSIM: f32 = 0.8;
+const MIN_VERIFY_SIMILARITY: f32 = 0.8;
 
 /// Standalone char rendering: render characters using the index-time
 /// render_glyph_at_ink_height() pipeline and save as PNGs.
@@ -122,8 +122,8 @@ fn build_audit_entry(
     line: &ocr::TextLine,
     page_num: usize,
     line_num: usize,
-    ssim_score: Option<f32>,
-    ssim_pass: Option<bool>,
+    similarity_score: Option<f32>,
+    similarity_pass: Option<bool>,
     keep_raster: bool,
     reason: &str,
 ) -> AuditEntry {
@@ -153,8 +153,8 @@ fn build_audit_entry(
         ocr_confidence: line.confidence,
         font_matched: font_result.as_ref().map(|f| f.font_name.clone()),
         font_confidence: font_result.as_ref().map(|f| f.score),
-        ssim_score,
-        ssim_pass,
+        similarity_score,
+        similarity_pass,
         decision: if keep_raster { Decision::KeptRaster } else { Decision::Vectorized },
         reason: reason.to_string(),
         bbox: BBox { x: line.x, y: line.y, width: line.width, height: line.height },
@@ -378,9 +378,9 @@ fn run(args: &cli::Args, classifier: &mut dyn classifier::Classifier) -> Result<
             ocr::split_wide_whitespace_words(&mut lines, &gray_page, ink_thresh, &line_fonts);
         }
 
-        // ── Pass 2a: Parallel SSIM verification ─────────────────────
+        // ── Pass 2a: Parallel similarity (ZNCC) verification ────────
         let _verify_start = std::time::Instant::now();
-        let ssim_results: Vec<(Option<f32>, Option<bool>)> = lines.par_iter()
+        let similarity_results: Vec<(Option<f32>, Option<bool>)> = lines.par_iter()
             .enumerate()
             .map(|(li, line)| {
                 let lm = &line_matches[li];
@@ -419,7 +419,7 @@ fn run(args: &cli::Args, classifier: &mut dyn classifier::Classifier) -> Result<
                             lm.diag_seg_dir.as_deref(),
                             None,
                         );
-                        let pass = score >= MIN_VERIFY_SSIM;
+                        let pass = score >= MIN_VERIFY_SIMILARITY;
                         (Some(score), Some(pass))
                     } else {
                         (None, None)
@@ -429,7 +429,7 @@ fn run(args: &cli::Args, classifier: &mut dyn classifier::Classifier) -> Result<
                 }
             })
             .collect();
-        let _verify_count = ssim_results.iter().filter(|(s, _)| s.is_some()).count() as u32;
+        let _verify_count = similarity_results.iter().filter(|(s, _)| s.is_some()).count() as u32;
 
         // ── Pass 2b: Decision matrix + output ────────────────────────
         for (li, line) in lines.iter().enumerate() {
@@ -451,7 +451,7 @@ fn run(args: &cli::Args, classifier: &mut dyn classifier::Classifier) -> Result<
                 (false, "Vectorised".into())
             };
 
-            let (ssim_score, ssim_pass) = ssim_results[li];
+            let (similarity_score, similarity_pass) = similarity_results[li];
 
             // ── Logging ──────────────────────────────────────────────
             if keep_raster {
@@ -460,8 +460,8 @@ fn run(args: &cli::Args, classifier: &mut dyn classifier::Classifier) -> Result<
                 pg_vec += 1;
                 let _fname = font_result.as_ref().map(|f| f.font_name.as_str()).unwrap_or("?");
                 let _fscore = font_result.as_ref().map(|f| f.score).unwrap_or(0.0);
-                let _ssim_part = ssim_score
-                    .map(|s| format!(" ssim={s:.3}"))
+                let _sim_part = similarity_score
+                    .map(|s| format!(" sim={s:.3}"))
                     .unwrap_or_default();
             }
 
@@ -475,7 +475,7 @@ fn run(args: &cli::Args, classifier: &mut dyn classifier::Classifier) -> Result<
                     "text": &line.text,
                     "font_matched": fname,
                     "font_score": fscore,
-                    "ssim_score": ssim_score,
+                    "similarity_score": similarity_score,
                     "ci_top_5": lm.ci_top_for_audit.iter().take(5)
                         .map(|(gid, s)| serde_json::json!({"glyph_id": gid, "score": s}))
                         .collect::<Vec<_>>(),
@@ -489,7 +489,7 @@ fn run(args: &cli::Args, classifier: &mut dyn classifier::Classifier) -> Result<
 
             // ── Audit entry ──────────────────────────────────────────
             audit_text.push(build_audit_entry(
-                lm, line, page_num, line_num, ssim_score, ssim_pass, keep_raster, &reason,
+                lm, line, page_num, line_num, similarity_score, similarity_pass, keep_raster, &reason,
             ));
 
             placed_texts.push(pdf_out::PlacedText {
@@ -711,7 +711,7 @@ fn run(args: &cli::Args, classifier: &mut dyn classifier::Classifier) -> Result<
             "pct": (acc.pct * 10.0).round() / 10.0,
             "major_misses": acc.major_misses,
             "minor_misses": acc.minor_misses,
-            "ssim_failures": acc.ssim_failures,
+            "similarity_failures": acc.similarity_failures,
             "hits": acc.hits,
             "kept_raster": acc.kept_raster,
         });

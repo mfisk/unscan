@@ -1,5 +1,5 @@
 //! Audit log — single JSON sidecar with all pipeline decisions, CI detail,
-//! word-level SSIM scores, and image references (crops + renders).
+//! word-level similarity scores, and image references (crops + renders).
 
 use crate::error::ScanTextError;
 use serde::Serialize;
@@ -14,9 +14,9 @@ pub struct AuditEntry {
     pub ocr_confidence: f32,
     pub font_matched: Option<String>,
     pub font_confidence: Option<f32>,
-    pub ssim_score: Option<f32>,
+    pub similarity_score: Option<f32>,
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub ssim_pass: Option<bool>,
+    pub similarity_pass: Option<bool>,
     pub decision: Decision,
     pub reason: String,
     pub bbox: BBox,
@@ -39,11 +39,11 @@ pub struct AuditEntry {
     /// Raw Tesseract word bboxes before post-processing (clip/drop/expand).
     #[serde(skip_serializing_if = "Vec::is_empty")]
     pub word_bboxes_raw: Vec<WordBBox>,
-    /// CI tie-break candidates with per-candidate SSIM scores.
+    /// CI tie-break candidates with per-candidate similarity (ZNCC) scores.
     #[serde(skip_serializing_if = "Vec::is_empty")]
     pub tie_candidates: Vec<TieCandidate>,
     /// Ground-truth classification: "hit", "major_miss", "minor_miss",
-    /// "ssim_failure", "kept_raster", or "no_ground_truth".
+    /// "similarity_failure", "kept_raster", or "no_ground_truth".
     /// Populated when --audit is provided.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub miss_type: Option<String>,
@@ -71,12 +71,12 @@ pub struct CiCandidate {
     pub score: Option<f32>,
 }
 
-/// SSIM tie-break candidate detail.
+/// Similarity (ZNCC) tie-break candidate detail.
 #[derive(Debug, Serialize, Clone)]
 pub struct TieCandidate {
     pub font_key: String,
     pub family_name: String,
-    pub ssim_score: f32,
+    pub similarity_score: f32,
     /// Whether this candidate was the tie-break winner.
     pub winner: bool,
 }

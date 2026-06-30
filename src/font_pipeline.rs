@@ -293,10 +293,10 @@ pub fn match_lines(
                     .collect();
 
                 if tied.len() >= 2 {
-                    // Multiple fonts tied — SSIM decides
+                    // Multiple fonts tied — similarity (ZNCC) decides
                     let mut best: Option<(font_match::FontMatchResult, f32)> = None;
                     let mut log_parts: Vec<String> = Vec::new();
-                    let mut tie_ssim_results: Vec<(String, String, f32)> = Vec::new();
+                    let mut tie_sim_results: Vec<(String, String, f32)> = Vec::new();
                     let mut ti = 0usize;
                     for (font_key, _) in tied.iter().map(|&&(ref fk, s)| (fk, s)) {
                         let fe = match font_registry.by_key(font_key) {
@@ -307,13 +307,13 @@ pub fn match_lines(
                             Some(fd) => fd,
                             None => continue,
                         };
-                        // Save per-candidate SSIM images when audit dir exists
+                        // Save per-candidate comparison images when audit dir exists
                         let tie_audit_dir = diag_seg_dir.as_ref().map(|d| {
                             let p = d.join(format!("tie_{}", ti));
                             let _ = std::fs::create_dir_all(&p);
                             p
                         });
-                        let (ssim, dy) = verify::verify_text_region(
+                        let (sim, dy) = verify::verify_text_region(
                             &norm_crop, &fd, &line.text,
                             &line.words,
                             line.x, line.y,
@@ -321,10 +321,10 @@ pub fn match_lines(
                             fe.variations.as_deref(),
                             tie_audit_dir.as_deref(), None,
                         );
-                        log_parts.push(format!("{:.4}({})", ssim, fe.family_name));
-                        tie_ssim_results.push((fe.font_key(), fe.family_name.clone(), ssim));
+                        log_parts.push(format!("{:.4}({})", sim, fe.family_name));
+                        tie_sim_results.push((fe.font_key(), fe.family_name.clone(), sim));
                         if best.as_ref().map_or(true, |(prev, bs)| {
-                            ssim > *bs || (ssim == *bs && !prev.variant_tag.is_empty() && fe.variant_tag.is_empty())
+                            sim > *bs || (sim == *bs && !prev.variant_tag.is_empty() && fe.variant_tag.is_empty())
                         }) {
                             best = Some((font_match::FontMatchResult {
                                 font_name: fe.font_key(),
@@ -335,17 +335,17 @@ pub fn match_lines(
                                 variations: fe.variations.clone(),
                                 score: top_score,
                                 best_dy: dy,
-                            }, ssim));
+                            }, sim));
                         }
                         ti += 1;
                     }
                     // Build tie_candidates for audit
                     let winner_key = best.as_ref().map(|(fm, _)| fm.font_key.clone());
-                    for (fk, fname, ssim) in tie_ssim_results {
+                    for (fk, fname, sim) in tie_sim_results {
                         tie_candidates_audit.push(audit::TieCandidate {
                             font_key: fk.clone(),
                             family_name: fname,
-                            ssim_score: ssim,
+                            similarity_score: sim,
                             winner: Some(&fk) == winner_key.as_ref(),
                         });
                     }

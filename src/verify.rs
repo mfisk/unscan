@@ -63,9 +63,9 @@ pub struct WordPlacement {
 
 /// Verify a vectorised text region by:
 /// 1. Computing an aspect-ratio penalty (natural advance widths vs OCR bbox widths)
-/// 2. Rendering with per-word width scaling (so SSIM can compare glyph shapes)
-/// 3. Computing windowed SSIM on the width-scaled render
-/// 4. Returning `ssim * aspect_penalty`
+/// 2. Rendering with per-word width scaling (so ZNCC can compare glyph shapes)
+/// 3. Computing windowed ZNCC on the width-scaled render
+/// 4. Returning `zncc * aspect_penalty`
 pub fn verify_text_region(
     scan_crop: &GrayImage,
     font_data: &[u8],
@@ -154,7 +154,7 @@ pub fn verify_text_region(
         }
     }
 
-    // Save SSIM audit images.
+    // Save similarity audit images.
     if let Some(audit_path) = audit_dir {
         if let Some(ref sc) = best_scan_crop {
             let _ = sc.save(audit_path.join("ssim_scan.png"));
