@@ -407,7 +407,7 @@ fn run(args: &cli::Args, classifier: &mut dyn classifier::Classifier) -> Result<
                             let raw = image::imageops::crop_imm(&gray_page, cx, cy, cw, ch).to_image();
                             features::contrast_normalize_char(&raw)
                         };
-                        let (score, _dy) = verify::verify_text_region(
+                        let vr = verify::verify_text_region(
                             &norm_crop,
                             fd.as_slice(),
                             &line.text,
@@ -419,8 +419,8 @@ fn run(args: &cli::Args, classifier: &mut dyn classifier::Classifier) -> Result<
                             lm.diag_seg_dir.as_deref(),
                             None,
                         );
-                        let pass = score >= MIN_VERIFY_SIMILARITY;
-                        (Some(score), Some(pass))
+                        let pass = vr.score >= MIN_VERIFY_SIMILARITY;
+                        (Some(vr.score), Some(pass))
                     } else {
                         (None, None)
                     }

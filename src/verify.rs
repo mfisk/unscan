@@ -61,6 +61,18 @@ pub struct WordPlacement {
     pub height: u32,
 }
 
+/// Result of verifying a text region against a font render.
+pub struct VerifyResult {
+    /// ZNCC similarity score (0–1).
+    pub score: f32,
+    /// Vertical shift that produced the best score.
+    pub dy: i32,
+    /// Ink-cropped render image (for display).
+    pub render_ink: Option<GrayImage>,
+    /// Absolute-difference image: scan vs ink-cropped render (for display).
+    pub diff: Option<GrayImage>,
+}
+
 /// Verify a vectorised text region by:
 /// 1. Computing an aspect-ratio penalty (natural advance widths vs OCR bbox widths)
 /// 2. Rendering with per-word width scaling (so ZNCC can compare glyph shapes)
@@ -78,14 +90,12 @@ pub fn verify_text_region(
     variations: Option<&[([u8; 4], f32)]>,
     audit_dir: Option<&std::path::Path>,
     bail_below: Option<f32>,
-) -> (f32, i32) {
+) -> VerifyResult {
     let (w, h) = scan_crop.dimensions();
 
     if w < 3 || h < 3 {
-        return (0.0, 0);
+        return VerifyResult { score: 0.0, dy: 0, render_ink: None, diff: None };
     }
-
-    let full_scan = scan_crop;
 
     // Page-level Hough deskew already corrected the full page before we get
     // here, so no per-line rotation needed.
@@ -100,74 +110,44 @@ pub fn verify_text_region(
         })
         .collect();
 
-    // Try multiple render scales and pick the best SSIM.
-    let scales = vec![2, 4];
-
     // Both scan and render use the word-union bbox — the union of all
     // final (post-processed) word bboxes.  This matches what the report
     // draws as the "final" cyan-dashed boxes.
 
-    let mut best_score = 0.0f32;
-    let mut best_dy = 0i32;
-    let mut best_scan_crop: Option<GrayImage> = None;
-    let mut best_render_ink: Option<GrayImage> = None;
-    let mut best_diff: Option<GrayImage> = None;
+    let full_render = match render_via_freetype_scaled(
+        font_data, &placements, w, h, 1, overrides, variant_tag, variations,
+    ) {
+        Some(r) => r,
+        None => return VerifyResult { score: 0.0, dy: 0, render_ink: None, diff: None },
+    };
 
-    for &scale in &scales {
-        // Render into the expanded line bbox canvas
-        let full_render = match render_via_freetype_scaled(font_data, &placements, w, h, scale, overrides, variant_tag, variations) {
-            Some(r) => r,
-            None => continue,
-        };
+    // ZNCC scoring — no blur or contrast normalization needed,
+    // ZNCC is inherently invariant to mean/contrast differences.
+    let (score, dy) = crate::compare_rasters::zncc_windowed_best_vshift(
+        scan_crop, &full_render, 12, bail_below,
+    );
 
-        let scan_crop = full_scan.clone();
-        let render_for_score = full_render.clone();
+    // Ink-crop render for display
+    let ink_threshold = 240u8;
+    let (rw, rh) = full_render.dimensions();
+    let (r_top, r_bot) = crate::ocr::ink_vertical_extent(&full_render, 0, rw, 0, rh, ink_threshold);
+    let ink_h = r_bot.saturating_sub(r_top);
+    let render_ink = if ink_h >= 3 {
+        image::imageops::crop_imm(&full_render, 0, r_top, rw, ink_h).to_image()
+    } else {
+        full_render
+    };
 
-        // ZNCC scoring — no blur or contrast normalization needed,
-        // ZNCC is inherently invariant to mean/contrast differences.
-        let (score, dy) = crate::compare_rasters::zncc_windowed_best_vshift(&scan_crop, &render_for_score, 12, bail_below);
+    let diff = compute_abs_diff(scan_crop, &render_ink);
 
-        if score > best_score {
-            best_score = score;
-            best_dy = dy;
-            best_scan_crop = Some(scan_crop);
-
-            // Render for audit: ink-crop for clean display
-            let ink_threshold = 240u8;
-            let (rw, rh) = full_render.dimensions();
-            let (r_top, r_bot) = crate::ocr::ink_vertical_extent(&full_render, 0, rw, 0, rh, ink_threshold);
-            let ink_h = r_bot.saturating_sub(r_top);
-            let render_ink = if ink_h >= 3 {
-                image::imageops::crop_imm(&full_render, 0, r_top, rw, ink_h).to_image()
-            } else {
-                render_for_score
-            };
-
-            best_diff = Some(compute_abs_diff(best_scan_crop.as_ref().unwrap(), &render_ink));
-            best_render_ink = Some(render_ink);
-        }
-
-        // Early exit: if 2× already gives a strong match, skip the
-        // more expensive 4× render — the glyph shape is clearly right.
-        if best_score >= 0.75 {
-            break;
-        }
-    }
-
-    // Save similarity audit images.
+    // Save audit images if requested.
     if let Some(audit_path) = audit_dir {
-        if let Some(ref sc) = best_scan_crop {
-            let _ = sc.save(audit_path.join("ssim_scan.png"));
-        }
-        if let Some(ref ri) = best_render_ink {
-            let _ = ri.save(audit_path.join("ssim_render.png"));
-        }
-        if let Some(ref d) = best_diff {
-            let _ = d.save(audit_path.join("ssim_diff.png"));
-        }
+        let _ = scan_crop.save(audit_path.join("ssim_scan.png"));
+        let _ = render_ink.save(audit_path.join("ssim_render.png"));
+        let _ = diff.save(audit_path.join("ssim_diff.png"));
     }
 
-    (best_score, best_dy)
+    VerifyResult { score, dy, render_ink: Some(render_ink), diff: Some(diff) }
 }
 
 /// Compute absolute pixel difference between two grayscale images.
@@ -505,33 +485,6 @@ fn render_words_ab_glyph(
 // ---------------------------------------------------------------------------
 // Public: render a line for visual comparison in the miss report
 // ---------------------------------------------------------------------------
-
-/// Render a line of text for visual comparison.
-/// Returns the ink-cropped render image, or None if rendering fails.
-pub fn render_line_for_comparison(
-    font_data: &[u8],
-    words: &[WordPlacement],
-    canvas_w: u32,
-    canvas_h: u32,
-    overrides: Option<&[(char, u16)]>,
-    variant_tag: &str,
-    variations: Option<&[([u8; 4], f32)]>,
-) -> Option<GrayImage> {
-    let rendered = render_via_freetype_scaled(
-        font_data, words, canvas_w, canvas_h, 2, overrides, variant_tag, variations,
-    )?;
-
-    // Ink-crop vertically for clean display
-    let ink_threshold = 240u8;
-    let (rw, rh) = rendered.dimensions();
-    let (r_top, r_bot) = crate::ocr::ink_vertical_extent(&rendered, 0, rw, 0, rh, ink_threshold);
-    let ink_h = r_bot.saturating_sub(r_top);
-    if ink_h >= 3 {
-        Some(image::imageops::crop_imm(&rendered, 0, r_top, rw, ink_h).to_image())
-    } else {
-        Some(rendered)
-    }
-}
 
 // ---------------------------------------------------------------------------
 // Helpers
