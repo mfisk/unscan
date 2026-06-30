@@ -162,6 +162,19 @@ pub struct AuditLog {
     pub compression_ratio: f64,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub images_dir: Option<String>,
+    /// Rendering DPI used for OCR and rasterisation.
+    pub dpi: u32,
+    /// Classifier name (e.g. "lda-32").
+    pub classifier: String,
+    /// Render scale multiplier for ZNCC verification renders.
+    pub render_scale: u32,
+    /// Anti-aliasing mode for ZNCC verification renders.
+    pub render_aa: String,
+    /// Binarization threshold for ZNCC verification renders, if enabled.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub render_binarize: Option<u8>,
+    /// Total pipeline elapsed time in seconds.
+    pub elapsed_secs: f64,
     pub pages: Vec<PageSummary>,
     pub text_entries: Vec<AuditEntry>,
     pub geometry_entries: Vec<GeometryEntry>,

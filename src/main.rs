@@ -682,6 +682,12 @@ fn run(args: &cli::Args, classifier: &mut dyn classifier::Classifier) -> Result<
         output_size_bytes: output_size,
         compression_ratio: ratio,
         images_dir: audit_image_dir.as_ref().map(|aid| aid.rel_dir()),
+        dpi: args.dpi,
+        classifier: args.classifier.clone(),
+        render_scale: args.render_scale,
+        render_aa: args.render_aa.clone(),
+        render_binarize: args.render_binarize,
+        elapsed_secs: 0.0,  // updated before writing
         pages: page_summaries,
         text_entries: audit_text,
         geometry_entries: audit_geo,
@@ -720,6 +726,7 @@ fn run(args: &cli::Args, classifier: &mut dyn classifier::Classifier) -> Result<
         // If --audit is also set, write audit artifacts + HTML report
         if let Some(ref audit_root) = args.audit {
             let audit_path = args.audit_log_path();
+            audit.elapsed_secs = run_start.elapsed().as_secs_f64();
             if let Err(_e) = audit.write_to_file(&audit_path) {
             } else {
             }
@@ -734,6 +741,7 @@ fn run(args: &cli::Args, classifier: &mut dyn classifier::Classifier) -> Result<
     let audit_path = args.audit_log_path();
 
     if output.to_str() != Some("/dev/null") || args.audit.is_some() {
+        audit.elapsed_secs = run_start.elapsed().as_secs_f64();
         if let Err(_e) = audit.write_to_file(&audit_path) {
         } else {
         }
