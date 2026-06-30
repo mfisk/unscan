@@ -334,7 +334,7 @@ enum MissKind {
     Hit,
     MajorMiss,
     MinorMiss,
-    SsimFailure,
+    SimilarityFailure,
     KeptRaster,
     NoGroundTruth,
 }
@@ -345,7 +345,7 @@ impl MissKind {
             MissKind::Hit => "hit",
             MissKind::MajorMiss => "major_miss",
             MissKind::MinorMiss => "minor_miss",
-            MissKind::SsimFailure => "ssim_failure",
+            MissKind::SimilarityFailure => "similarity_failure",
             MissKind::KeptRaster => "kept_raster",
             MissKind::NoGroundTruth => "no_ground_truth",
         }
@@ -391,8 +391,8 @@ fn classify_entries<'a>(
                     });
 
                     if ps_match {
-                        if e.ssim_pass == Some(false) {
-                            MissKind::SsimFailure
+                        if e.similarity_pass == Some(false) {
+                            MissKind::SimilarityFailure
                         } else {
                             MissKind::Hit
                         }
@@ -542,11 +542,11 @@ fn build_miss_block(
     // Find diag_seg_dir for this line
     let diag_dir = find_diag_seg_dir(audit_root, entry.page, entry.line_index);
 
-    // Determine if font pick is correct (skip char table + GT render for SSIM-only failures)
-    let font_is_correct = ce.kind == MissKind::SsimFailure;
+    // Determine if font pick is correct (skip char table + GT render for similarity-only failures)
+    let font_is_correct = ce.kind == MissKind::SimilarityFailure;
 
-    // SSIM comparison block — render correct font for side-by-side if this is a font miss
-    let (gt_render_uri, gt_diff_uri, gt_ssim) = if !font_is_correct {
+    // Similarity comparison block — render correct font for side-by-side if this is a font miss
+    let (gt_render_uri, gt_diff_uri, gt_sim) = if !font_is_correct {
         render_correct_font_comparison(entry, correct_fe, font_data_cache, diag_dir.as_deref())
     } else {
         (None, None, None)
@@ -559,11 +559,11 @@ fn build_miss_block(
     });
     let unprint_font_size_pt = inferred_size.as_ref().map(|s| s.median_pt);
 
-    let ssim_compare_html = if let Some(ref dd) = diag_dir {
-        build_ssim_block(
-            dd, &actual_font, &matched, entry.ssim_score,
+    let sim_compare_html = if let Some(ref dd) = diag_dir {
+        build_similarity_block(
+            dd, &actual_font, &matched, entry.similarity_score,
             gt_render_uri.as_deref(), gt_diff_uri.as_deref(),
-            gt_ssim,
+            gt_sim,
             gt_font_size_pt, unprint_font_size_pt,
             inferred_size.as_ref().map(|s| s.per_word.as_slice()),
         )
@@ -585,8 +585,8 @@ fn build_miss_block(
         String::new()
     };
 
-    // SSIM info
-    let ssim_html = match (entry.ssim_score, entry.ssim_pass) {
+    // Similarity (ZNCC) info
+    let sim_html = match (entry.similarity_score, entry.similarity_pass) {
         (Some(score), Some(pass)) => {
             let cls = if pass { "ssim-pass" } else { "ssim-fail" };
             let label = if pass { "pass" } else { "FAIL" };
@@ -626,7 +626,7 @@ fn build_miss_block(
         MissKind::MinorMiss => {
             format!(" [minor: expected {}, got {}]", actual_font, matched)
         },
-        MissKind::SsimFailure => " [ZNCC failure]".to_string(),
+        MissKind::SimilarityFailure => " [ZNCC failure]".to_string(),
         MissKind::KeptRaster => " [kept raster]".to_string(),
         _ => String::new(),
     };
@@ -682,10 +682,10 @@ fn build_miss_block(
          {}\
          {}\
          </div>",
-        entry.page, entry.line_index, text_preview, miss_kind_label, ssim_html,
-        seg_path_html, scan_line_html, ssim_compare_html, tie_break_html, char_table_html,
+        entry.page, entry.line_index, text_preview, miss_kind_label, sim_html,
+        seg_path_html, scan_line_html, sim_compare_html, tie_break_html, char_table_html,
     );
-    (html, entry.ssim_score, gt_ssim)
+    (html, entry.similarity_score, gt_sim)
 }
 
 /// Build scan line image with word bbox and segmentation path overlays.
@@ -717,12 +717,12 @@ fn build_scan_line_with_overlays(diag_dir: &Path, entry: &AuditEntry) -> String 
         };
         (uri, ox, oy)
     } else {
-        // Fall back to ssim_scan.png
-        let ssim_path = diag_dir.join("ssim_scan.png");
-        if !ssim_path.exists() {
+        // Fall back to ssim_scan.png (legacy file name for similarity scan)
+        let scan_fallback_path = diag_dir.join("ssim_scan.png");
+        if !scan_fallback_path.exists() {
             return String::new();
         }
-        match file_to_b64_uri(&ssim_path) {
+        match file_to_b64_uri(&scan_fallback_path) {
             Some(u) => (u, entry.bbox.x, entry.bbox.y),
             None => return String::new(),
         }
@@ -733,8 +733,8 @@ fn build_scan_line_with_overlays(diag_dir: &Path, entry: &AuditEntry) -> String 
         image::image_dimensions(&scan_path)
             .unwrap_or((entry.bbox.width, entry.bbox.height))
     } else {
-        let ssim_path = diag_dir.join("ssim_scan.png");
-        image::image_dimensions(&ssim_path)
+        let scan_fallback_path = diag_dir.join("ssim_scan.png");
+        image::image_dimensions(&scan_fallback_path)
             .unwrap_or((entry.bbox.width, entry.bbox.height))
     };
 
@@ -1097,7 +1097,7 @@ fn render_correct_font_comparison(
 
     // Load ssim_scan.png, compute diff and ZNCC (same path as verify_text_region)
     let scan_path = dd.join("ssim_scan.png");
-    let (diff_uri, correct_ssim) = if scan_path.exists() {
+    let (diff_uri, correct_sim) = if scan_path.exists() {
         if let Ok(scan_dyn) = image::open(&scan_path) {
             let scan_gray = scan_dyn.to_luma8();
             let diff_img = crate::verify::compute_abs_diff(&scan_gray, &render_img);
@@ -1113,7 +1113,7 @@ fn render_correct_font_comparison(
         (None, None)
     };
 
-    (Some(render_uri), diff_uri, correct_ssim)
+    (Some(render_uri), diff_uri, correct_sim)
 }
 
 /// Compute the font size (in PDF points) that unprint would infer for the
@@ -1172,14 +1172,14 @@ fn compute_inferred_font_size(
 }
 
 
-fn build_ssim_block(
+fn build_similarity_block(
     diag_dir: &Path,
     correct_font: &str,
     chosen_font: &str,
-    ssim_score: Option<f32>,
+    sim_score: Option<f32>,
     correct_render_uri: Option<&str>,
     correct_diff_uri: Option<&str>,
-    correct_ssim: Option<f32>,
+    correct_sim: Option<f32>,
     gt_font_size_pt: Option<f32>,
     unprint_font_size_pt: Option<f32>,
     per_word_sizes: Option<&[WordSizeDetail]>,
@@ -1211,11 +1211,11 @@ fn build_ssim_block(
         None
     };
 
-    let ssim_str = ssim_score
+    let sim_str = sim_score
         .map(|s| format!("{s:.10}"))
         .unwrap_or_else(|| "—".into());
 
-    let correct_ssim_str = correct_ssim
+    let correct_sim_str = correct_sim
         .map(|s| format!("{s:.10}"))
         .unwrap_or_else(|| "—".into());
 
@@ -1319,8 +1319,8 @@ fn build_ssim_block(
          {render_row}\
          {diff_row_html}\
          <tr><td class=\"ssim-label\">ZNCC</td>\
-         <td class=\"correct\">{correct_ssim_str}</td>\
-         <td class=\"chosen\">{ssim_str}</td></tr>\
+         <td class=\"correct\">{correct_sim_str}</td>\
+         <td class=\"chosen\">{sim_str}</td></tr>\
          </table></div>"
     )
 }
@@ -1398,7 +1398,7 @@ fn build_tie_break_block(
     for tc in &entry.tie_candidates {
         let class = if tc.winner { "tie-winner" } else { "tie-loser" };
         rows.push_str(&format!(
-            "<td class=\"{}\">{:.6}</td>", class, tc.ssim_score
+            "<td class=\"{}\">{:.6}</td>", class, tc.similarity_score
         ));
     }
     rows.push_str("</tr>");
@@ -1686,7 +1686,7 @@ pub struct AccuracyResult {
     pub hits: usize,
     pub major_misses: usize,
     pub minor_misses: usize,
-    pub ssim_failures: usize,
+    pub similarity_failures: usize,
     pub kept_raster: usize,
     pub compared: usize,
     pub primary_hits: usize,
@@ -1707,7 +1707,7 @@ pub fn compute_accuracy(
     let mut hits = 0usize;
     let mut major_misses = 0usize;
     let mut minor_misses = 0usize;
-    let mut ssim_failures = 0usize;
+    let mut similarity_failures = 0usize;
     let mut kept_raster = 0usize;
 
     for ce in &classified {
@@ -1715,15 +1715,15 @@ pub fn compute_accuracy(
             MissKind::Hit => hits += 1,
             MissKind::MajorMiss => major_misses += 1,
             MissKind::MinorMiss => minor_misses += 1,
-            MissKind::SsimFailure => ssim_failures += 1,
+            MissKind::SimilarityFailure => similarity_failures += 1,
             MissKind::KeptRaster => kept_raster += 1,
             MissKind::NoGroundTruth => {}
         }
     }
 
-    let all_misses = major_misses + minor_misses + ssim_failures;
+    let all_misses = major_misses + minor_misses + similarity_failures;
     let compared = hits + all_misses;
-    let major_total = major_misses + ssim_failures;
+    let major_total = major_misses + similarity_failures;
     let primary_hits = compared - major_total;
     let pct = if compared > 0 {
         primary_hits as f64 / compared as f64 * 100.0
@@ -1735,7 +1735,7 @@ pub fn compute_accuracy(
         hits,
         major_misses,
         minor_misses,
-        ssim_failures,
+        similarity_failures,
         kept_raster,
         compared,
         primary_hits,
@@ -1758,7 +1758,7 @@ pub fn generate_report(
     let mut hits = 0usize;
     let mut major_misses: Vec<&ClassifiedEntry> = Vec::new();
     let mut minor_misses: Vec<&ClassifiedEntry> = Vec::new();
-    let mut ssim_failures: Vec<&ClassifiedEntry> = Vec::new();
+    let mut similarity_failures: Vec<&ClassifiedEntry> = Vec::new();
     let mut kept_raster: Vec<&ClassifiedEntry> = Vec::new();
     let mut total_chars = 0usize;
     let mut corrected_chars = 0usize;
@@ -1776,16 +1776,16 @@ pub fn generate_report(
             MissKind::Hit => hits += 1,
             MissKind::MajorMiss => major_misses.push(ce),
             MissKind::MinorMiss => minor_misses.push(ce),
-            MissKind::SsimFailure => ssim_failures.push(ce),
+            MissKind::SimilarityFailure => similarity_failures.push(ce),
             MissKind::KeptRaster => kept_raster.push(ce),
             MissKind::NoGroundTruth => {} // excluded from hit/miss denominator
         }
     }
 
-    let all_misses = major_misses.len() + minor_misses.len() + ssim_failures.len();
+    let all_misses = major_misses.len() + minor_misses.len() + similarity_failures.len();
     let compared = hits + all_misses;
     // Primary metric: only major misses count against the score.
-    let major_total = major_misses.len() + ssim_failures.len();
+    let major_total = major_misses.len() + similarity_failures.len();
     let primary_hits = compared - major_total;
     let pct = if compared > 0 {
         primary_hits as f64 / compared as f64 * 100.0
@@ -1830,13 +1830,13 @@ pub fn generate_report(
         }
     }
 
-    // Build SSIM failure blocks
-    let mut ssim_blocks = String::new();
-    for ce in &ssim_failures {
+    // Build similarity failure blocks
+    let mut sim_fail_blocks = String::new();
+    for ce in &similarity_failures {
         let (html, _chosen_zncc, _gt_zncc) = build_miss_block(
             ce, audit_root, font_catalog, glyph_map, &mut font_data_cache, dpi,
         );
-        ssim_blocks.push_str(&html);
+        sim_fail_blocks.push_str(&html);
     }
 
     // Build kept-raster blocks
@@ -1848,10 +1848,10 @@ pub fn generate_report(
         raster_blocks.push_str(&html);
     }
 
-    let ssim_section = if !ssim_blocks.is_empty() {
+    let sim_fail_section = if !sim_fail_blocks.is_empty() {
         format!(
             "<h2 style=\"margin-top:2em; color:#c55;\">\
-             ZNCC Failures (correct font, ZNCC rejected)</h2>{ssim_blocks}"
+             ZNCC Failures (correct font, ZNCC rejected)</h2>{sim_fail_blocks}"
         )
     } else {
         String::new()
@@ -1876,8 +1876,8 @@ pub fn generate_report(
         String::new()
     };
 
-    let ssim_miss_str = if !ssim_failures.is_empty() {
-        format!(" ({} SSIM)", ssim_failures.len())
+    let sim_fail_miss_str = if !similarity_failures.is_empty() {
+        format!(" ({} ZNCC fail)", similarity_failures.len())
     } else {
         String::new()
     };
@@ -1901,18 +1901,18 @@ pub fn generate_report(
     };
 
     // ZNCC percentiles across all lines that have a ZNCC score
-    let ssim_percentile_str = {
-        let mut ssim_vals: Vec<f32> = entries.iter()
-            .filter_map(|e| e.ssim_score)
+    let sim_percentile_str = {
+        let mut sim_vals: Vec<f32> = entries.iter()
+            .filter_map(|e| e.similarity_score)
             .collect();
-        ssim_vals.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
-        if ssim_vals.is_empty() {
+        sim_vals.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
+        if sim_vals.is_empty() {
             String::new()
         } else {
-            let n = ssim_vals.len();
-            let p50 = ssim_vals[n / 2];
+            let n = sim_vals.len();
+            let p50 = sim_vals[n / 2];
             let p90_idx = (n as f64 * 0.9).ceil() as usize;
-            let p90 = ssim_vals[p90_idx.min(n - 1)];
+            let p90 = sim_vals[p90_idx.min(n - 1)];
             format!(" | ZNCC p50={p50:.6} p90={p90:.6} (n={n})")
         }
     };
@@ -1972,7 +1972,7 @@ pub fn generate_report(
          {CSS}\n\
          <h2>unprint miss report</h2>\n\
          <div class=\"summary\">{primary_hits}/{compared} correct ({pct:.1}%) — \
-         {n_major} major + {n_minor} minor misses{ssim_miss_str}{raster_str}{visually_ok_str}{ocr_corr_str}{ssim_percentile_str}{gt_rank_str}</div>\n\
+         {n_major} major + {n_minor} minor misses{sim_fail_miss_str}{raster_str}{visually_ok_str}{ocr_corr_str}{sim_percentile_str}{gt_rank_str}</div>\n\
          <div class=\"summary\">{meta_str}</div>\n\
          <div class=\"score-legend\">\n\
          <b>Score key:</b>\n\
@@ -1989,7 +1989,7 @@ pub fn generate_report(
          {major_miss_blocks}\n\
          <h2 style=\"margin-top:2em; color:#e90;\">Minor Misses ({n_minor})</h2>\n\
          {minor_miss_blocks}\n\
-         {ssim_section}\n\
+         {sim_fail_section}\n\
          {raster_section}\n\
          {visually_ok_section}\n\
          </body>\n\
