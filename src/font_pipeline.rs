@@ -323,7 +323,9 @@ pub fn match_lines(
                         );
                         log_parts.push(format!("{:.4}({})", ssim, fe.family_name));
                         tie_ssim_results.push((fe.font_key(), fe.family_name.clone(), ssim));
-                        if best.as_ref().map_or(true, |(_, bs)| ssim > *bs) {
+                        if best.as_ref().map_or(true, |(prev, bs)| {
+                            ssim > *bs || (ssim == *bs && !prev.variant_tag.is_empty() && fe.variant_tag.is_empty())
+                        }) {
                             best = Some((font_match::FontMatchResult {
                                 font_name: fe.font_key(),
                                 font_path: fe.path.clone(),

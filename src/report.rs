@@ -498,6 +498,7 @@ fn find_correct_ci_candidate(
 
 // ── HTML block generation ───────────────────────────────────────────────────
 
+/// Returns (html_block, chosen_zncc, gt_zncc).
 fn build_miss_block(
     ce: &ClassifiedEntry,
     audit_root: &Path,
@@ -505,7 +506,7 @@ fn build_miss_block(
     glyph_map: &GlyphMap,
     font_data_cache: &mut FontDataCache,
     dpi: u32,
-) -> String {
+) -> (String, Option<f32>, Option<f32>) {
     let entry = ce.entry;
     let actual_font = ce.actual_font.as_deref().map(short_key).unwrap_or_else(|| "?".into());
     let matched = entry.font_matched.as_deref().map(short_key).unwrap_or_else(|| "?".into());
@@ -672,9 +673,9 @@ fn build_miss_block(
         String::new()
     };
 
-    format!(
+    let html = format!(
         "<div class=\"miss\">\
-         <h3>p{}:L{} — \"{}\"{}{}</h3>\
+         <h3>p{}:L{} — \"{}\"{}{}  </h3>\
          {}\
          {}\
          {}\
@@ -683,7 +684,8 @@ fn build_miss_block(
          </div>",
         entry.page, entry.line_index, text_preview, miss_kind_label, ssim_html,
         seg_path_html, scan_line_html, ssim_compare_html, tie_break_html, char_table_html,
-    )
+    );
+    (html, entry.ssim_score, gt_ssim)
 }
 
 /// Build scan line image with word bbox and segmentation path overlays.
@@ -1793,56 +1795,57 @@ pub fn generate_report(
 
     let mut font_data_cache = FontDataCache::new();
 
+    // Track misses where the chosen font's ZNCC >= GT font's ZNCC
+    // (visually indistinguishable or better — not really "wrong").
+    let mut visually_ok_blocks = String::new();
+    let mut n_visually_ok = 0usize;
+
     // Build major miss blocks
     let mut major_miss_blocks = String::new();
     for ce in &major_misses {
-        major_miss_blocks.push_str(&build_miss_block(
-            ce,
-            audit_root,
-            font_catalog,
-            glyph_map,
-            &mut font_data_cache,
-            dpi,
-        ));
+        let (html, chosen_zncc, gt_zncc) = build_miss_block(
+            ce, audit_root, font_catalog, glyph_map, &mut font_data_cache, dpi,
+        );
+        major_miss_blocks.push_str(&html);
+        if let (Some(cz), Some(gz)) = (chosen_zncc, gt_zncc) {
+            if cz >= gz {
+                visually_ok_blocks.push_str(&html);
+                n_visually_ok += 1;
+            }
+        }
     }
 
     // Build minor miss blocks
     let mut minor_miss_blocks = String::new();
     for ce in &minor_misses {
-        minor_miss_blocks.push_str(&build_miss_block(
-            ce,
-            audit_root,
-            font_catalog,
-            glyph_map,
-            &mut font_data_cache,
-            dpi,
-        ));
+        let (html, chosen_zncc, gt_zncc) = build_miss_block(
+            ce, audit_root, font_catalog, glyph_map, &mut font_data_cache, dpi,
+        );
+        minor_miss_blocks.push_str(&html);
+        if let (Some(cz), Some(gz)) = (chosen_zncc, gt_zncc) {
+            if cz >= gz {
+                visually_ok_blocks.push_str(&html);
+                n_visually_ok += 1;
+            }
+        }
     }
 
     // Build SSIM failure blocks
     let mut ssim_blocks = String::new();
     for ce in &ssim_failures {
-        ssim_blocks.push_str(&build_miss_block(
-            ce,
-            audit_root,
-            font_catalog,
-            glyph_map,
-            &mut font_data_cache,
-            dpi,
-        ));
+        let (html, _chosen_zncc, _gt_zncc) = build_miss_block(
+            ce, audit_root, font_catalog, glyph_map, &mut font_data_cache, dpi,
+        );
+        ssim_blocks.push_str(&html);
     }
 
     // Build kept-raster blocks
     let mut raster_blocks = String::new();
     for ce in &kept_raster {
-        raster_blocks.push_str(&build_miss_block(
-            ce,
-            audit_root,
-            font_catalog,
-            glyph_map,
-            &mut font_data_cache,
-            dpi,
-        ));
+        let (html, _chosen_zncc, _gt_zncc) = build_miss_block(
+            ce, audit_root, font_catalog, glyph_map, &mut font_data_cache, dpi,
+        );
+        raster_blocks.push_str(&html);
     }
 
     let ssim_section = if !ssim_blocks.is_empty() {
@@ -1864,6 +1867,15 @@ pub fn generate_report(
         String::new()
     };
 
+    let visually_ok_section = if n_visually_ok > 0 {
+        format!(
+            "<h2 style=\"margin-top:2em; color:#3a3;\">Visually OK Misses \
+             ({n_visually_ok} — chosen ZNCC ≥ GT ZNCC)</h2>{visually_ok_blocks}"
+        )
+    } else {
+        String::new()
+    };
+
     let ssim_miss_str = if !ssim_failures.is_empty() {
         format!(" ({} SSIM)", ssim_failures.len())
     } else {
@@ -1878,6 +1890,12 @@ pub fn generate_report(
 
     let ocr_corr_str = if total_chars > 0 {
         format!(" | OCR corrections: {corrected_chars}/{total_chars}")
+    } else {
+        String::new()
+    };
+
+    let visually_ok_str = if n_visually_ok > 0 {
+        format!(" | {n_visually_ok} visually OK")
     } else {
         String::new()
     };
@@ -1954,7 +1972,7 @@ pub fn generate_report(
          {CSS}\n\
          <h2>unprint miss report</h2>\n\
          <div class=\"summary\">{primary_hits}/{compared} correct ({pct:.1}%) — \
-         {n_major} major + {n_minor} minor misses{ssim_miss_str}{raster_str}{ocr_corr_str}{ssim_percentile_str}{gt_rank_str}</div>\n\
+         {n_major} major + {n_minor} minor misses{ssim_miss_str}{raster_str}{visually_ok_str}{ocr_corr_str}{ssim_percentile_str}{gt_rank_str}</div>\n\
          <div class=\"summary\">{meta_str}</div>\n\
          <div class=\"score-legend\">\n\
          <b>Score key:</b>\n\
@@ -1973,6 +1991,7 @@ pub fn generate_report(
          {minor_miss_blocks}\n\
          {ssim_section}\n\
          {raster_section}\n\
+         {visually_ok_section}\n\
          </body>\n\
          </html>",
         n_major = major_misses.len(),
