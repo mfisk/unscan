@@ -1050,22 +1050,33 @@ fn uniform_boundaries(width: u32, n: usize) -> Vec<u32> {
 
 const MIN_WORD_LEN: usize = 3;
 
-/// and `ligature` crops when ligature-eligible sequences exist.
-pub struct LineCharCrops {
-    pub plain: Vec<(char, GrayImage)>,
-    pub ligature: Option<Vec<(char, GrayImage)>>,
+/// Per-word segmentation data retained for lazy bigram cropping.
+pub struct WordSeg {
+    pub word_img: GrayImage,
+    pub chars: Vec<char>,
+    pub boundaries: Vec<u32>,
+    pub seam_paths: HashMap<u32, Vec<u32>>,
+    pub crop_h: u32,
 }
 
-pub fn extract_line_chars(
+pub struct LineCrops {
+    /// Per-word segmentation data for lazy unigram and bigram cropping (plain path).
+    pub word_segs: Vec<WordSeg>,
+    /// Per-word segmentation data for lazy cropping (ligature path).
+    /// Only present when the line has ligature-eligible words.
+    pub lig_word_segs: Option<Vec<WordSeg>>,
+}
+
+pub fn segment_line(
     page: &GrayImage,
     words: &[WordPlacement],
     word_height: u32,
     diag_seg_dir: Option<&std::path::Path>,
     render_params: &crate::char_render::RenderParams,
-) -> LineCharCrops {
+) -> LineCrops {
     let _ = render_params; // reserved for scan-side binarize
     if words.is_empty() || word_height == 0 {
-        return LineCharCrops { plain: Vec::new(), ligature: None };
+        return LineCrops { word_segs: Vec::new(), lig_word_segs: None };
     }
 
     // Crop whole words (reliable bboxes from Tesseract) and split them
@@ -1078,11 +1089,10 @@ pub fn extract_line_chars(
     sorted.sort_by(|a, b| b.text.chars().count().cmp(&a.text.chars().count()));
 
     let mut char_counts: HashMap<char, usize> = HashMap::new();
-    let mut char_counts_lig: HashMap<char, usize> = HashMap::new();
-    let mut results: Vec<(char, GrayImage)> = Vec::new();
-    let mut results_lig_all: Vec<(char, GrayImage)> = Vec::new();
-    let mut plain_for_lig_path: Vec<(char, GrayImage)> = Vec::new();
+    let mut word_segs: Vec<WordSeg> = Vec::new();
+    let mut lig_word_segs: Vec<WordSeg> = Vec::new();
     let mut any_ligatures = false;
+    let mut words_with_ligatures: HashSet<usize> = HashSet::new();
 
     for (word_idx, word) in sorted.iter().enumerate() {
         let chars_in_word: Vec<char> = word.text.chars().filter(|c| is_supported(*c)).collect();
@@ -1143,23 +1153,25 @@ pub fn extract_line_chars(
         } else {
             segment_characters(&word_img, all_chars.len())
         };
-        let mut results_plain: Vec<(char, GrayImage)> = Vec::new();
-        let mut counts_plain = char_counts.clone();
-        extract_chars_from_boundaries(
-            &word_img, &all_chars, &bounds_plain, &seams_plain, word_h,
-            &mut counts_plain, &mut results_plain,
-            word_diag_dir.as_ref().map(|d| d.join("seg_plain")).as_deref(),
 
-        );
-        // Stash plain chars for non-ligature words before moving them
-        if !has_ligatures {
-            plain_for_lig_path.extend(results_plain.iter().cloned());
+        // Update char counts (for the word-skip optimisation)
+        for &c in &all_chars {
+            if is_supported(c) {
+                *char_counts.entry(c).or_insert(0) += 1;
+            }
         }
-        results.extend(results_plain);
-        char_counts = counts_plain;
+
+        word_segs.push(WordSeg {
+            word_img: word_img.clone(),
+            chars: all_chars.clone(),
+            boundaries: bounds_plain.clone(),
+            seam_paths: seams_plain.clone(),
+            crop_h: word_h,
+        });
 
         if has_ligatures {
             any_ligatures = true;
+            words_with_ligatures.insert(word_segs.len() - 1);
             // ── Path B: ligature segmentation (reduced n_chars) ─────
             let (bounds_lig, seams_lig) = if let Some(ref wdir) = word_diag_dir {
                 let ldir = wdir.join("seg_lig");
@@ -1167,28 +1179,35 @@ pub fn extract_line_chars(
             } else {
                 segment_characters(&word_img, lig_chars.len())
             };
-            let mut results_lig: Vec<(char, GrayImage)> = Vec::new();
-            let mut counts_lig = char_counts_lig.clone();
-            extract_chars_from_boundaries(
-                &word_img, &lig_chars, &bounds_lig, &seams_lig, word_h,
-                &mut counts_lig, &mut results_lig,
-                word_diag_dir.as_ref().map(|d| d.join("seg_lig")).as_deref(),
 
-            );
-            results_lig_all.extend(results_lig);
-            char_counts_lig = counts_lig;
+            lig_word_segs.push(WordSeg {
+                word_img: word_img.clone(),
+                chars: lig_chars,
+                boundaries: bounds_lig,
+                seam_paths: seams_lig,
+                crop_h: word_h,
+            });
         }
     }
 
-    // Merge non-ligature words' plain chars into the ligature path
-    // so both paths score the full line.
+    // For the ligature path, non-ligature words use plain segmentation
     if any_ligatures {
-        results_lig_all.extend(plain_for_lig_path);
+        for (idx, seg) in word_segs.iter().enumerate() {
+            if !words_with_ligatures.contains(&idx) {
+                lig_word_segs.push(WordSeg {
+                    word_img: seg.word_img.clone(),
+                    chars: seg.chars.clone(),
+                    boundaries: seg.boundaries.clone(),
+                    seam_paths: seg.seam_paths.clone(),
+                    crop_h: seg.crop_h,
+                });
+            }
+        }
     }
 
-    LineCharCrops {
-        plain: results,
-        ligature: if any_ligatures { Some(results_lig_all) } else { None },
+    LineCrops {
+        word_segs,
+        lig_word_segs: if any_ligatures { Some(lig_word_segs) } else { None },
     }
 }
 
@@ -1226,111 +1245,86 @@ const LIGATURE_SEQUENCES: &[(&[char], char)] = &[
     (&['f', 'l'],      '\u{FB02}'),  // fl
 ];
 
-fn extract_chars_from_boundaries(
+
+
+// ---------------------------------------------------------------------------
+// Bigram crop extraction (sliding window pairs)
+// ---------------------------------------------------------------------------
+
+/// Extract sliding-window bigram crops from a word image.
+///
+/// For chars [c0, c1, c2, c3] with boundaries [b0, b1, b2, b3, b4],
+/// produces pairs: [(c0,c1, crop[b0..b2]), (c1,c2, crop[b1..b3]), (c2,c3, crop[b2..b4])].
+///
+/// Each pair crop spans from boundary[i] to boundary[i+2], ink-cropped
+/// and normalized to NORM_H.  This preserves relative heights, kerning,
+/// and spacing — the same signal the bigram training data captures.
+///
+/// `has_model` filters which pairs are worth cropping.  Pairs for which
+/// it returns false are skipped entirely (no crop, no resize).
+/// Crop a single character from a word image at position `i`.
+/// Returns `None` if the region is too narrow or contains no ink.
+/// Crop `n` adjacent characters starting at position `i` from a word image.
+/// Spans boundaries[i] to boundaries[i+n], with seam masking at the
+/// outer edges.  Returns `None` if the region is too narrow or has no ink.
+pub fn crop_ngram(
     word_img: &GrayImage,
-    chars: &[char],
+    i: usize,
+    n: usize,
     boundaries: &[u32],
     seam_paths: &HashMap<u32, Vec<u32>>,
     crop_h: u32,
-    char_counts: &mut HashMap<char, usize>,
-    results: &mut Vec<(char, GrayImage)>,
-    diag_dir: Option<&std::path::Path>,
-) {
-    let (ww, _wh) = word_img.dimensions();
+) -> Option<GrayImage> {
+    let (ww, _) = word_img.dimensions();
 
-    if let Some(ddir) = diag_dir {
-        let _ = std::fs::create_dir_all(ddir.join("chars"));
+    if i + n >= boundaries.len() {
+        return None;
     }
 
-    for (i, &c) in chars.iter().enumerate() {
-        if !is_supported(c) {
-            continue;
-        }
-        if char_counts.get(&c).copied().unwrap_or(0) >= 3 {
-            continue;
-        }
+    let b_left = boundaries[i];
+    let b_right = boundaries[i + n];
 
-        if i + 1 >= boundaries.len() {
-            break;
-        }
-        let b_left = boundaries[i];
-        let b_right = boundaries[i + 1];
+    let left_seam = seam_paths.get(&b_left);
+    let right_seam = seam_paths.get(&b_right);
 
-        // Look up seam paths for left and right boundaries.
-        let left_seam = seam_paths.get(&b_left);
-        let right_seam = seam_paths.get(&b_right);
+    let x0 = if let Some(sp) = left_seam {
+        sp.iter().copied().min().unwrap_or(b_left).min(b_left)
+    } else {
+        b_left
+    }.min(ww);
 
-        // Compute crop x-range: extend to the full seam extent so we
-        // capture all pixels that belong to this character.
-        let x0 = if let Some(sp) = left_seam {
-            sp.iter().copied().min().unwrap_or(b_left).min(b_left)
-        } else {
-            b_left
-        }.min(ww);
+    let x1 = if let Some(sp) = right_seam {
+        sp.iter().copied().max().unwrap_or(b_right).max(b_right).saturating_add(1)
+    } else {
+        b_right
+    }.min(ww);
 
-        let x1 = if let Some(sp) = right_seam {
-            sp.iter().copied().max().unwrap_or(b_right).max(b_right).saturating_add(1)
-        } else {
-            b_right
-        }.min(ww);
+    if x1 <= x0 || (x1 - x0) < 2 * (n as u32) {
+        return None;
+    }
 
-        if x1 <= x0 || (x1 - x0) < 2 {
-            continue;
-        }
+    let mut crop = image::imageops::crop_imm(word_img, x0, 0, x1 - x0, crop_h).to_image();
 
-        let mut char_crop = image::imageops::crop_imm(word_img, x0, 0, x1 - x0, crop_h).to_image();
-
-        // Mask out pixels on the wrong side of seam boundaries.
-        let crop_w = x1 - x0;
-        if left_seam.is_some() || right_seam.is_some() {
-            for y in 0..crop_h.min(char_crop.height()) {
-                // Left seam: blank pixels left of the seam path
-                if let Some(sp) = left_seam {
-                    if let Some(&seam_x) = sp.get(y as usize) {
-                        // seam_x is in word-image coords; convert to crop coords
-                        let limit = seam_x.saturating_sub(x0);
-                        for cx in 0..limit.min(crop_w) {
-                            char_crop.put_pixel(cx, y, image::Luma([255u8]));
-                        }
-                    }
-                }
-                // Right seam: blank pixels right of the seam path
-                if let Some(sp) = right_seam {
-                    if let Some(&seam_x) = sp.get(y as usize) {
-                        let start = seam_x.saturating_sub(x0);
-                        for cx in start..crop_w {
-                            char_crop.put_pixel(cx, y, image::Luma([255u8]));
-                        }
-                    }
+    let crop_w = x1 - x0;
+    for y in 0..crop_h.min(crop.height()) {
+        if let Some(sp) = left_seam {
+            if let Some(&seam_x) = sp.get(y as usize) {
+                let limit = seam_x.saturating_sub(x0);
+                for cx in 0..limit.min(crop_w) {
+                    crop.put_pixel(cx, y, image::Luma([255u8]));
                 }
             }
         }
-
-        // Word-level contrast normalization already applied above;
-        // no per-char re-normalization needed.
-
-        let scaled = match normalize_to_ink_bounds(&char_crop, NORM_H) {
-            Some(img) => img,
-            None => continue,
-        };
-
-        // Diag: save the exact image that CI searches against
-        if let Some(ddir) = diag_dir {
-            let label = crate::seg_diag::sanitize_char(c);
-            let fname = format!("{:02}_{}.png", i, label);
-            let _ = scaled.save(ddir.join("chars").join(fname));
+        if let Some(sp) = right_seam {
+            if let Some(&seam_x) = sp.get(y as usize) {
+                let start = seam_x.saturating_sub(x0);
+                for cx in start..crop_w {
+                    crop.put_pixel(cx, y, image::Luma([255u8]));
+                }
+            }
         }
-
-        results.push((c, scaled));
-        *char_counts.entry(c).or_insert(0) += 1;
     }
 
-    // NOTE: Ligature crops used to be appended here (merging adjacent
-    // char segments into a single ﬁ/ﬂ/ﬀ/ﬃ/ﬄ crop within the same
-    // results vec).  This predates the separate plain/ligature
-    // segmentation paths in extract_line_chars.  Now the ligature path
-    // uses collapse_ligature_chars to produce the correct n_chars and
-    // segments directly, so injecting ligature crops here would
-    // contaminate the plain path with ligature characters.
+    normalize_to_ink_bounds(&crop, NORM_H)
 }
 

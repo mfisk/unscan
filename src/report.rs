@@ -17,7 +17,7 @@ use crate::audit::{AuditEntry, Decision};
 use crate::char_render;
 use crate::ground_truth::{self, GroundTruth};
 use crate::font_scan::FontEntry;
-use crate::glyph_map::GlyphMap;
+use crate::glyph_map::NgramGlyphMap;
 
 /// Metadata about the run, displayed in the report header.
 pub struct ReportMeta {
@@ -48,8 +48,8 @@ fn short_key(key: &str) -> String {
 
 /// Resolve a glyph_id for a character to a display-friendly font key.
 /// Falls back to "glyph#{id}" when the map has no entry.
-fn glyph_display_key(glyph_map: &GlyphMap, ch: char, glyph_id: usize) -> String {
-    glyph_map.fonts_for_glyph(ch, glyph_id)
+fn glyph_display_key(glyph_map: &NgramGlyphMap, seq: &[char], glyph_id: usize) -> String {
+    glyph_map.fonts_for_glyph(seq, glyph_id)
         .first()
         .cloned()
         .unwrap_or_else(|| format!("glyph#{glyph_id}"))
@@ -100,15 +100,7 @@ fn dist_class(d2: f32) -> &'static str {
     }
 }
 
-fn prob_class(p: f32) -> &'static str {
-    if p < 0.01 {
-        "bad"
-    } else if p < 0.1 {
-        "warn"
-    } else {
-        "ok"
-    }
-}
+
 
 fn truncate(s: &str, max: usize) -> &str {
     if s.len() <= max {
@@ -142,94 +134,54 @@ fn find_font_by_key<'a>(font_catalog: &'a [FontEntry], font_key: &str) -> Option
     font_catalog.iter().find(|fe| fe.font_key() == font_key)
 }
 
-// ── Character selection (mirrors Python pick_interesting_chars) ──────────────
+// ── Character selection (mirrors Python pick_interesting_observations) ──────────────
 
-fn pick_interesting_chars(
-    chars: &[crate::audit::CharCiVote],
-    n_worst: usize,
-    n_normal: usize,
-) -> Vec<(usize, &crate::audit::CharCiVote)> {
-    let mut used: std::collections::HashSet<usize> = std::collections::HashSet::new();
-    let mut result: Vec<(usize, &crate::audit::CharCiVote)> = Vec::new();
+fn pick_interesting_observations(
+    chars: &[crate::audit::ObservationVote],
+    n_show: usize,
+    _n_normal: usize,
+) -> Vec<(usize, &crate::audit::ObservationVote)> {
+    // Rank by the log-probability difference between chosen and ground-truth fonts.
+    // Largest absolute difference first — these observations drive the font decision.
+    let mut scored: Vec<(usize, &crate::audit::ObservationVote, f32)> = chars.iter()
+        .enumerate()
+        .filter_map(|(i, c)| {
+            let cp = c.chosen_prob?;
+            let gp = c.gt_font_prob?;
+            // log contribution delta: positive means chosen scores better on this obs
+            let delta = cp.max(1e-30).ln() - gp.max(1e-30).ln();
+            Some((i, c, delta))
+        })
+        .collect();
+    // Sort by |delta| descending — biggest disagreements first
+    scored.sort_by(|a, b| b.2.abs().partial_cmp(&a.2.abs()).unwrap_or(std::cmp::Ordering::Equal));
 
-    // 1. OCR-corrected characters (always show)
+    let mut result: Vec<(usize, &crate::audit::ObservationVote)> = scored.iter()
+        .take(n_show)
+        .map(|&(i, c, _)| (i, c))
+        .collect();
+
+    // Always include OCR-corrected observations
+    let used: std::collections::HashSet<usize> = result.iter().map(|(i, _)| *i).collect();
     for (i, c) in chars.iter().enumerate() {
-        if c.ocr_corrected_from.is_some() {
-            used.insert(i);
+        if c.ocr_corrected_from.is_some() && !used.contains(&i) {
             result.push((i, c));
         }
     }
 
-    // 2. Worst characters for the chosen/matched font (lowest chosen_prob)
-    {
-        let mut by_chosen: Vec<(usize, &crate::audit::CharCiVote)> =
+    // If we didn't get enough from the delta sort (e.g. GT probs missing),
+    // fill with worst best_prob observations
+    if result.len() < n_show {
+        let used: std::collections::HashSet<usize> = result.iter().map(|(i, _)| *i).collect();
+        let mut by_prob: Vec<(usize, &crate::audit::ObservationVote)> =
             chars.iter().enumerate()
-                .filter(|(_, c)| c.chosen_prob.is_some())
+                .filter(|(i, _)| !used.contains(i))
                 .collect();
-        by_chosen.sort_by(|a, b| {
-            a.1.chosen_prob.unwrap()
-                .partial_cmp(&b.1.chosen_prob.unwrap())
-                .unwrap_or(std::cmp::Ordering::Equal)
-        });
-        for (i, c) in by_chosen.iter().take(n_worst) {
-            if used.insert(*i) {
-                result.push((*i, c));
-            }
-        }
-    }
-
-    // 3. Worst characters for the ground-truth font (lowest gt_font_prob)
-    {
-        let mut by_gt: Vec<(usize, &crate::audit::CharCiVote)> =
-            chars.iter().enumerate()
-                .filter(|(_, c)| c.gt_font_prob.is_some())
-                .collect();
-        by_gt.sort_by(|a, b| {
-            a.1.gt_font_prob.unwrap()
-                .partial_cmp(&b.1.gt_font_prob.unwrap())
-                .unwrap_or(std::cmp::Ordering::Equal)
-        });
-        for (i, c) in by_gt.iter().take(n_worst) {
-            if used.insert(*i) {
-                result.push((*i, c));
-            }
-        }
-    }
-
-    // 4. Worst by best_prob (lowest probability = worst match)
-    {
-        let mut by_prob: Vec<(usize, &crate::audit::CharCiVote)> =
-            chars.iter().enumerate().collect();
         by_prob.sort_by(|a, b| {
-            a.1.best_prob
-                .partial_cmp(&b.1.best_prob)
-                .unwrap_or(std::cmp::Ordering::Equal)
+            a.1.best_prob.partial_cmp(&b.1.best_prob).unwrap_or(std::cmp::Ordering::Equal)
         });
-        for (i, c) in by_prob.iter().take(n_worst) {
-            if used.insert(*i) {
-                result.push((*i, c));
-            }
-        }
-    }
-
-    // 5. A few normal characters for contrast (highest probability)
-    {
-        let mut by_prob: Vec<(usize, &crate::audit::CharCiVote)> =
-            chars.iter().enumerate().collect();
-        by_prob.sort_by(|a, b| {
-            b.1.best_prob
-                .partial_cmp(&a.1.best_prob)
-                .unwrap_or(std::cmp::Ordering::Equal)
-        });
-        let mut count = 0;
-        for (i, c) in by_prob.iter() {
-            if count >= n_normal {
-                break;
-            }
-            if c.best_prob > 0.5 && used.insert(*i) {
-                result.push((*i, c));
-                count += 1;
-            }
+        for (i, c) in by_prob.into_iter().take(n_show - result.len()) {
+            result.push((i, c));
         }
     }
 
@@ -257,25 +209,18 @@ fn find_diag_seg_dir(audit_root: &Path, page: usize, line_index: usize) -> Optio
 }
 
 /// Find the crop PNG for a specific crop index in a diag-seg line directory.
-fn find_crop_png(diag_dir: &Path, crop_index: usize) -> Option<PathBuf> {
+fn find_crop_png(diag_dir: &Path, crop_index: usize, seq: &[char]) -> Option<PathBuf> {
     let crop_dir = diag_dir.join("crops");
-    if !crop_dir.is_dir() {
-        return None;
-    }
-    let prefix = format!("crop_{crop_index:02}_");
-    for entry in std::fs::read_dir(&crop_dir).ok()? {
-        if let Ok(e) = entry {
-            let name = e.file_name();
-            if name.to_string_lossy().starts_with(&prefix) {
-                return Some(e.path());
-            }
-        }
-    }
-    None
+    let seq_label: String = seq.iter().map(|&c| {
+        if c.is_alphanumeric() { format!("{}", c) }
+        else { format!("U{:04X}", c as u32) }
+    }).collect();
+    let path = crop_dir.join(format!("crop_{crop_index:02}_{seq_label}.png"));
+    if path.is_file() { Some(path) } else { None }
 }
 
 /// Find the font ref glyph PNG for a character in the font_refs directory.
-fn find_font_ref_png(audit_root: &Path, font_entry: &FontEntry, ch: char) -> Option<PathBuf> {
+fn find_font_ref_ngram_png(audit_root: &Path, font_entry: &FontEntry, ch: char) -> Option<PathBuf> {
     let mut label = font_entry.family_name.replace(' ', "");
     if font_entry.is_bold {
         label.push_str("-Bold");
@@ -357,7 +302,7 @@ fn classify_entries<'a>(
     gt: Option<&GroundTruth>,
     dpi: u32,
     font_catalog: &[FontEntry],
-    _glyph_map: &GlyphMap,
+    _glyph_map: &NgramGlyphMap,
 ) -> Vec<ClassifiedEntry<'a>> {
     entries
         .iter()
@@ -384,8 +329,8 @@ fn classify_entries<'a>(
                     // (weight-explicit) names.  Variant entries carry
                     // "PSName|tag" which won't match base "PSName", so
                     // exact equality is sufficient.
-                    let ps_match = e.ci_candidates.first().and_then(|c| {
-                        find_font_by_key(font_catalog, &c.font_key)
+                    let ps_match = e.font_key_matched.as_ref().and_then(|fk| {
+                        find_font_by_key(font_catalog, fk)
                     }).map_or(false, |fe| {
                         fe.postscript_name == *actual
                     });
@@ -399,8 +344,8 @@ fn classify_entries<'a>(
                     } else {
                         // Font miss — classify as major or minor.
                         // Read identity from both the picked font and the GT font.
-                        let picked_path = e.ci_candidates.first()
-                            .and_then(|c| find_font_by_key(font_catalog, &c.font_key))
+                        let picked_path = e.font_key_matched.as_ref()
+                            .and_then(|fk| find_font_by_key(font_catalog, fk))
                             .map(|fe| fe.path.clone());
                         let gt_path = font_catalog.iter()
                             .find(|fe| fe.postscript_name == *actual)
@@ -456,7 +401,7 @@ pub fn enrich_audit_entries(
     gt: Option<&GroundTruth>,
     dpi: u32,
     font_catalog: &[FontEntry],
-    glyph_map: &GlyphMap,
+    glyph_map: &NgramGlyphMap,
 ) {
     // classify_entries produces a 1:1 parallel vec.
     let results: Vec<(String, Option<String>)> = {
@@ -479,14 +424,14 @@ fn find_correct_ci_candidate(
     entry: &AuditEntry,
     actual_font: &str,
     font_catalog: &[FontEntry],
-    _glyph_map: &GlyphMap,
+    _glyph_map: &NgramGlyphMap,
 ) -> (Option<String>, Option<f32>, Option<usize>) {
     let gt_ps = ground_truth::strip_subset_prefix_str(actual_font);
 
     // Match CI candidate's PostScript name against GT font.
     // After GT canonicalization, both names are canonical — exact equality.
     // Variant entries carry "PSName|tag" so they won't match base "PSName".
-    for (i, c) in entry.ci_candidates.iter().enumerate() {
+    for (i, c) in entry.font_candidates.iter().enumerate() {
         if let Some(fe) = find_font_by_key(font_catalog, &c.font_key) {
             if fe.postscript_name == gt_ps {
                 return (Some(c.font_key.clone()), c.score, Some(i + 1));
@@ -503,7 +448,7 @@ fn build_miss_block(
     ce: &ClassifiedEntry,
     audit_root: &Path,
     font_catalog: &[FontEntry],
-    glyph_map: &GlyphMap,
+    glyph_map: &NgramGlyphMap,
     font_data_cache: &mut FontDataCache,
     dpi: u32,
 ) -> (String, Option<f32>, Option<f32>) {
@@ -533,7 +478,7 @@ fn build_miss_block(
         .as_deref()
         .and_then(|m| {
             entry
-                .ci_candidates
+                .font_candidates
                 .first()
                 .and_then(|c| find_font_by_key(font_catalog, &c.font_key))
                 .or_else(|| find_font_in_catalog(font_catalog, m))
@@ -596,13 +541,13 @@ fn build_miss_block(
     };
 
     // Per-character comparison table
-    let char_table_html = if font_is_correct || entry.ci_char_votes.is_empty() {
+    let obs_table_html = if font_is_correct || entry.obs_votes.is_empty() {
         String::new()
     } else {
-        let chars_to_show = pick_interesting_chars(&entry.ci_char_votes, 4, 2);
-        build_char_table(
+        let obs_to_show = pick_interesting_observations(&entry.obs_votes, 6, 0);
+        build_observation_table(
             entry,
-            &chars_to_show,
+            &obs_to_show,
             audit_root,
             correct_fe,
             chosen_fe,
@@ -633,24 +578,24 @@ fn build_miss_block(
 
     // Segmentation path comparison (ligature vs plain)
     let seg_path_html = if let Some(ref winner) = entry.seg_winner {
-        if !entry.ci_candidates_lig.is_empty() {
+        if !entry.font_candidates_lig.is_empty() {
             let (lig_font, lig_score, plain_font, plain_score) = if winner == "ligature" {
-                // ci_candidates = ligature (winner), ci_candidates_lig = plain (loser)
-                let lf = entry.ci_candidates.first()
+                // font_candidates = ligature (winner), font_candidates_lig = plain (loser)
+                let lf = entry.font_candidates.first()
                     .map(|c| short_key(&c.font_key)).unwrap_or_else(|| "?".into());
-                let ls = entry.ci_candidates.first().and_then(|c| c.score);
-                let pf = entry.ci_candidates_lig.first()
+                let ls = entry.font_candidates.first().and_then(|c| c.score);
+                let pf = entry.font_candidates_lig.first()
                     .map(|c| short_key(&c.font_key)).unwrap_or_else(|| "?".into());
-                let ps = entry.ci_candidates_lig.first().and_then(|c| c.score);
+                let ps = entry.font_candidates_lig.first().and_then(|c| c.score);
                 (lf, ls, pf, ps)
             } else {
-                // ci_candidates = plain (winner), ci_candidates_lig = ligature (loser)
-                let pf = entry.ci_candidates.first()
+                // font_candidates = plain (winner), font_candidates_lig = ligature (loser)
+                let pf = entry.font_candidates.first()
                     .map(|c| short_key(&c.font_key)).unwrap_or_else(|| "?".into());
-                let ps = entry.ci_candidates.first().and_then(|c| c.score);
-                let lf = entry.ci_candidates_lig.first()
+                let ps = entry.font_candidates.first().and_then(|c| c.score);
+                let lf = entry.font_candidates_lig.first()
                     .map(|c| short_key(&c.font_key)).unwrap_or_else(|| "?".into());
-                let ls = entry.ci_candidates_lig.first().and_then(|c| c.score);
+                let ls = entry.font_candidates_lig.first().and_then(|c| c.score);
                 (lf, ls, pf, ps)
             };
             let lig_marker = if winner == "ligature" { " ✓" } else { "" };
@@ -683,13 +628,13 @@ fn build_miss_block(
          {}\
          </div>",
         entry.page, entry.line_index, text_preview, miss_kind_label, sim_html,
-        seg_path_html, scan_line_html, sim_compare_html, tie_break_html, char_table_html,
+        seg_path_html, scan_line_html, sim_compare_html, tie_break_html, obs_table_html,
     );
     (html, entry.similarity_score, gt_sim)
 }
 
 /// Build scan line image with word bbox and segmentation path overlays.
-/// Replicates the Python char-misses.py `render_scan_line_with_word_boxes()`:
+/// Replicates the Python report `render_scan_line_with_word_boxes()`:
 ///   - scan_line.png as the background (colour crop of the word-union region)
 ///   - Raw Tesseract word bboxes: dotted orange outlines
 ///   - Final post-processed word bboxes: dashed cyan outlines
@@ -1379,15 +1324,15 @@ fn build_tie_break_block(
 
     format!(
         "<div class=\"tie-break-block\">\
-         <div class=\"tie-break-title\">CI Tie-Break ({} candidates, ZNCC decides)</div>\
+         <div class=\"tie-break-title\">Font Tie-Break ({} candidates, ZNCC decides)</div>\
          <table class=\"ssim-compare-table\">{}</table></div>",
         entry.tie_candidates.len(), rows
     )
 }
 
-fn build_char_table(
+fn build_observation_table(
     entry: &AuditEntry,
-    chars_to_show: &[(usize, &crate::audit::CharCiVote)],
+    obs_to_show: &[(usize, &crate::audit::ObservationVote)],
     audit_root: &Path,
     correct_fe: Option<&FontEntry>,
     chosen_fe: Option<&FontEntry>,
@@ -1398,19 +1343,20 @@ fn build_char_table(
     font_data_cache: &mut FontDataCache,
     diag_dir: Option<&Path>,
     font_catalog: &[FontEntry],
-    glyph_map: &GlyphMap,
+    glyph_map: &NgramGlyphMap,
 ) -> String {
     let _ = font_catalog; // retained for future use
     let mut rows = String::new();
 
-    for &(_idx, cv) in chars_to_show {
-        let ch = cv.ch;
-        let original_ocr = cv.ocr_corrected_from.unwrap_or(ch);
+    for &(_idx, cv) in obs_to_show {
+        let seq: &[char] = &cv.seq;
+        let seq_label: String = seq.iter().collect();
+        let original_ocr = cv.ocr_corrected_from.unwrap_or(seq[0]);
         let best_p = cv.best_prob;
 
         // Crop image from disk
         let crop_uri = diag_dir.and_then(|dd| {
-            find_crop_png(dd, cv.crop_index)
+            find_crop_png(dd, cv.crop_index, &cv.seq)
                 .and_then(|p| file_to_b64_uri(&p))
         });
 
@@ -1424,17 +1370,21 @@ fn build_char_table(
                     font.set_variation(tag, *val);
                 }
             }
-            let gid_override = fe.glyph_overrides.as_ref()
-                .and_then(|ovs| ovs.iter().find(|(c, _)| *c == ch).map(|(_, g)| ab_glyph::GlyphId(*g)));
-            let (_hash, img) = char_render::get_rendered_char_default(&font, ch, gid_override)?;
+            let gid_overrides: Vec<Option<ab_glyph::GlyphId>> = seq.iter().map(|c| {
+                fe.glyph_overrides.as_ref()
+                    .and_then(|ovs| ovs.iter().find(|(gc, _)| *gc == *c).map(|(_, g)| ab_glyph::GlyphId(*g)))
+            }).collect();
+            let (_hash, img) = char_render::render_ngram_default(&font, seq, &gid_overrides)?;
             Some(img_to_b64_uri(&img))
         });
 
         // Chosen font reference glyph — try on-disk font_refs first, then render
         let chosen_ref_uri = chosen_fe.and_then(|fe| {
-            // Try on-disk first
-            if let Some(path) = find_font_ref_png(audit_root, fe, ch) {
-                return file_to_b64_uri(&path);
+            // Try on-disk first (only for single chars)
+            if seq.len() == 1 {
+                if let Some(path) = find_font_ref_ngram_png(audit_root, fe, seq[0]) {
+                    return file_to_b64_uri(&path);
+                }
             }
             // Render via shared pipeline
             let data = font_data_cache.load(&fe.path)?;
@@ -1445,33 +1395,44 @@ fn build_char_table(
                     font.set_variation(tag, *val);
                 }
             }
-            let gid_override = fe.glyph_overrides.as_ref()
-                .and_then(|ovs| ovs.iter().find(|(c, _)| *c == ch).map(|(_, g)| ab_glyph::GlyphId(*g)));
-            let (_hash, img) = char_render::get_rendered_char_default(&font, ch, gid_override)?;
+            let gid_overrides: Vec<Option<ab_glyph::GlyphId>> = seq.iter().map(|c| {
+                fe.glyph_overrides.as_ref()
+                    .and_then(|ovs| ovs.iter().find(|(gc, _)| *gc == *c).map(|(_, g)| ab_glyph::GlyphId(*g)))
+            }).collect();
+            let (_hash, img) = char_render::render_ngram_default(&font, seq, &gid_overrides)?;
             Some(img_to_b64_uri(&img))
         });
 
         // OCR cell
+        let ngram_tag = if seq.len() > 1 {
+            format!(" <span class='font-mini'>{}gram w={}</span>", seq.len(), cv.weight)
+        } else if cv.weight != 1.0 {
+            format!(" <span class='font-mini'>w={}</span>", cv.weight)
+        } else {
+            String::new()
+        };
         let ocr_label = if cv.ocr_corrected_from.is_some() {
             format!(
-                "<span class='ocr-fix'>'{original_ocr}' → '{ch}'</span>"
+                "<span class='ocr-fix'>'{original_ocr}' → '{seq_label}'</span>"
             )
+        } else if seq.len() > 1 {
+            format!("'{seq_label}'")
         } else {
             format!("'{original_ocr}'")
         };
 
-        let mut ocr_parts = vec![format!("OCR: <b>{ocr_label}</b>")];
+        let mut ocr_parts = vec![format!("OCR: <b>{ocr_label}</b>{ngram_tag}")];
 
-        // Best-scoring font for the OCR char (stage-1 diagnostic)
+        // Best-scoring font for this OCR observation (stage-1 diagnostic)
         if let Some(&(gid, _np)) = cv.nearest.first() {
-            let font_name = glyph_display_key(glyph_map, cv.ch, gid);
+            let font_name = glyph_display_key(glyph_map, seq, gid);
             let short = font_name.rsplit('/').next().unwrap_or(&font_name);
             ocr_parts.push(format!(
                 "<span class='font-mini'>{short}</span>"
             ));
         }
 
-        // Best alt char
+        // Best alternative character
         if let (Some(alt_ch), Some(alt_dist)) = (cv.best_alt_char, cv.best_alt_dist) {
             let dc = dist_class(alt_dist);
             ocr_parts.push(format!(
@@ -1481,34 +1442,47 @@ fn build_char_table(
 
         let ocr_cell = ocr_parts.join("<br>");
 
-        // Per-char probability labels
+        // Per-observation probability labels with color coding:
+        // Green background = this font scores better on this observation
+        // Red background = this font scores worse
+        let (chosen_win_class, correct_win_class) = match (cv.chosen_prob, cv.gt_font_prob) {
+            (Some(cp), Some(gp)) => {
+                let cl = cp.max(1e-30).ln();
+                let gl = gp.max(1e-30).ln();
+                if cl > gl {
+                    ("prob-win", "prob-lose")
+                } else if gl > cl {
+                    ("prob-lose", "prob-win")
+                } else {
+                    ("", "")
+                }
+            }
+            _ => ("", ""),
+        };
+
         let chosen_score_label = if let Some(p) = cv.chosen_prob {
-            let pc = prob_class(p);
             let rank_part = cv.chosen_rank
                 .map(|r| format!(" <span class='font-mini'>rank {r}</span>"))
                 .unwrap_or_default();
-            format!("<div class='sub'><span class='num {pc}'>{p:.6}</span>{rank_part}</div>")
+            format!("<div class='sub {chosen_win_class}'><span class='num'>{p:.6}</span>{rank_part}</div>")
         } else {
             String::new()
         };
 
         let correct_score_label = if let Some(p) = cv.gt_font_prob {
-            let pc = prob_class(p);
             let rank_part = cv.gt_font_rank
                 .map(|r| format!(" <span class='font-mini'>rank {r}</span>"))
                 .unwrap_or_default();
-            format!("<div class='sub'><span class='num {pc}'>{p:.6}</span>{rank_part}</div>")
+            format!("<div class='sub {correct_win_class}'><span class='num'>{p:.6}</span>{rank_part}</div>")
         } else {
             String::new()
         };
 
-        let _pc = prob_class(best_p);
-
         rows.push_str(&format!(
             "<tr>\
              <td class=\"img-td\">{}</td>\
-             <td class=\"img-td\">{}{}</td>\
-             <td class=\"img-td\">{}{}</td>\
+             <td class=\"img-td {correct_win_class}\">{}{}</td>\
+             <td class=\"img-td {chosen_win_class}\">{}{}</td>\
              <td class=\"ocr-col\">{}</td>\
              </tr>",
             img_td(crop_uri.as_deref()),
@@ -1522,18 +1496,18 @@ fn build_char_table(
 
     // Column headers
     let rank_str = match (gt_rank, gt_score) {
-        (Some(r), Some(s)) => format!("CI #{r}, score {s:.10}"),
-        _ => "not in CI".into(),
+        (Some(r), Some(s)) => format!("font #{r}, score {s:.10}"),
+        _ => "not scored".into(),
     };
 
     // The chosen font is always CI candidate #1
     let chosen_rank_info = entry
-        .ci_candidates
+        .font_candidates
         .first()
         .map(|c| {
             match c.score {
-                Some(s) => format!("CI #1, score {:.10}", s),
-                None => "CI #1".into(),
+                Some(s) => format!("font #1, score {:.10}", s),
+                None => "font #1".into(),
             }
         })
         .unwrap_or_default();
@@ -1601,9 +1575,8 @@ img.ci {
 .sub { font-size: 10px; color: #777; margin-top: 2px; }
 .ocr-fix { color: #c62828; }
 .num { font-family: monospace; font-size: 12px; text-align: right; white-space: nowrap; }
-.num.bad { color: #c62828; font-weight: bold; }
-.num.warn { color: #e65100; }
-.num.ok { color: #2e7d32; }
+.prob-win { background: #e8f5e9; border-left: 3px solid #4caf50; padding-left: 4px; }
+.prob-lose { background: #ffebee; border-left: 3px solid #ef5350; padding-left: 4px; }
 .per-word-sizes { font-family: monospace; font-size: 11px; line-height: 1.8; }
 .word-size-cell { display: inline-block; padding: 1px 5px; margin: 1px 3px; border-radius: 3px; background: #f5f5f5; border: 1px solid #ddd; }
 .word-size-cell.bad { background: #ffebee; border-color: #ef9a9a; }
@@ -1674,7 +1647,7 @@ pub fn compute_accuracy(
     gt: Option<&GroundTruth>,
     dpi: u32,
     font_catalog: &[FontEntry],
-    glyph_map: &GlyphMap,
+    glyph_map: &NgramGlyphMap,
 ) -> AccuracyResult {
     let classified = classify_entries(entries, gt, dpi, font_catalog, glyph_map);
 
@@ -1724,7 +1697,7 @@ pub fn generate_report(
     gt: Option<&GroundTruth>,
     dpi: u32,
     font_catalog: &[FontEntry],
-    glyph_map: &GlyphMap,
+    glyph_map: &NgramGlyphMap,
     meta: &ReportMeta,
 ) -> Result<(), String> {
     let classified = classify_entries(entries, gt, dpi, font_catalog, glyph_map);
@@ -1739,7 +1712,7 @@ pub fn generate_report(
 
     for ce in &classified {
         // Count OCR corrections
-        for cv in &ce.entry.ci_char_votes {
+        for cv in &ce.entry.obs_votes {
             total_chars += 1;
             if cv.ocr_corrected_from.is_some() {
                 corrected_chars += 1;
@@ -1766,6 +1739,17 @@ pub fn generate_report(
     } else {
         100.0
     };
+
+    // Sort each miss category by increasing ZNCC (worst visual matches first)
+    major_misses.sort_by(|a, b| {
+        a.entry.similarity_score.partial_cmp(&b.entry.similarity_score).unwrap_or(std::cmp::Ordering::Equal)
+    });
+    minor_misses.sort_by(|a, b| {
+        a.entry.similarity_score.partial_cmp(&b.entry.similarity_score).unwrap_or(std::cmp::Ordering::Equal)
+    });
+    similarity_failures.sort_by(|a, b| {
+        a.entry.similarity_score.partial_cmp(&b.entry.similarity_score).unwrap_or(std::cmp::Ordering::Equal)
+    });
 
     let mut font_data_cache = FontDataCache::new();
 
@@ -1894,7 +1878,7 @@ pub fn generate_report(
     // Per-character GT font rank statistics
     let gt_rank_str = {
         let mut all_ranks: Vec<usize> = classified.iter()
-            .flat_map(|ce| ce.entry.ci_char_votes.iter())
+            .flat_map(|ce| ce.entry.obs_votes.iter())
             .filter_map(|cv| cv.gt_font_rank)
             .collect();
         all_ranks.sort();
@@ -1908,7 +1892,7 @@ pub fn generate_report(
             let top1 = all_ranks.iter().filter(|&&r| r == 1).count();
             let top10 = all_ranks.iter().filter(|&&r| r <= 10).count();
             format!(
-                " | GT char rank: median={median} p90={p90} top1={top1}/{n} ({:.0}%) top10={top10}/{n} ({:.0}%)",
+                " | GT obs rank: median={median} p90={p90} top1={top1}/{n} ({:.0}%) top10={top10}/{n} ({:.0}%)",
                 top1 as f64 / n as f64 * 100.0,
                 top10 as f64 / n as f64 * 100.0,
             )
@@ -1950,10 +1934,10 @@ pub fn generate_report(
          <div class=\"summary\">{meta_str}</div>\n\
          <div class=\"score-legend\">\n\
          <b>Score key:</b>\n\
-         <b>CI score</b> (per-line) = mean(log(prob)) across characters, \
+         <b>font score</b> (per-line) = mean(log(prob)) across characters, \
          weighted by character discriminativeness; \
          <b>higher = better match</b>.\n\
-         <b>CI prob</b> (per-character) = calibrated posterior probability \
+         <b>font prob</b> (per-observation) = calibrated posterior probability \
          via Gaussian kernel over embedding distances; \
          <b>0–1, higher = better</b>.\n\
          <b>ZNCC</b> (per-line) = zero-mean normalized cross-correlation between scanned line \

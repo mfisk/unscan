@@ -702,9 +702,10 @@ pub fn split_wide_whitespace_words(
     gray: &GrayImage,
     ink_threshold: u8,
     line_fonts: &[Option<std::sync::Arc<Vec<u8>>>],
-) {
+) -> Vec<usize> {
     let (page_w, page_h) = gray.dimensions();
     let mut total_splits = 0u32;
+    let mut split_line_indices: Vec<usize> = Vec::new();
 
     for (line_idx, line) in lines.iter_mut().enumerate() {
         let mut new_words: Vec<TextRegion> = Vec::new();
@@ -892,6 +893,7 @@ pub fn split_wide_whitespace_words(
             }
 
             total_splits += wide_gap_indices.len() as u32;
+            split_line_indices.push(line_idx);
         }
 
         // Replace words and rebuild line text
@@ -901,6 +903,7 @@ pub fn split_wide_whitespace_words(
 
     if total_splits > 0 {
     }
+    split_line_indices
 }
 
 /// Scan a horizontal strip of the grayscale image for the topmost and

@@ -14,10 +14,10 @@
 // Returns glyph_ids (indices into GlyphMap groups for the given char),
 // not font_ids.
 
-use crate::features::CharFeatures;
+use crate::features::CropFeatures;
 use crate::classifier::Classifier;
 use crate::compare_rasters::zncc_global_pub;
-use crate::glyph_map::GlyphMap;
+use crate::glyph_map::NgramGlyphMap;
 use crate::char_render::RenderParams;
 
 /// Temperature for ZNCC→probability conversion.
@@ -25,19 +25,19 @@ const ZNCC_TEMPERATURE: f32 = 10.0;
 
 pub struct ZnccClassifier {
     /// Shared glyph equivalence map (glyph_id → font_keys per char).
-    glyph_map: GlyphMap,
+    glyph_map: NgramGlyphMap,
     /// Render parameters for loading cached glyphs.
     render_params: RenderParams,
     /// Per-char: glyph_id → image hash, for loading cached PNGs.
     /// Built on first access per char from GlyphMap + cache probing.
-    glyph_hashes: std::collections::HashMap<char, Vec<u64>>,
+    glyph_hashes: std::collections::HashMap<Vec<char>, Vec<u64>>,
 }
 
 impl ZnccClassifier {
     /// Build from a pre-built GlyphMap.  No training — reference rasters
     /// are loaded from the hash-addressed cache at classification time.
     pub fn from_glyph_map(
-        glyph_map: GlyphMap,
+        glyph_map: NgramGlyphMap,
         render_params: &RenderParams,
     ) -> Self {
         let total = glyph_map.groups.values().map(|g| g.len()).sum::<usize>();
@@ -52,13 +52,13 @@ impl ZnccClassifier {
 }
 
 impl Classifier for ZnccClassifier {
-    fn classify(&self, ch: char, query: &CharFeatures, k: usize) -> Vec<(usize, f32)> {
-        let mut probs = self.probabilities(ch, query);
+    fn classify(&self, seq: &[char], query: &CropFeatures, k: usize) -> Vec<(usize, f32)> {
+        let mut probs = self.probabilities(seq, query);
         probs.truncate(k);
         probs
     }
 
-    fn probabilities(&self, ch: char, query: &CharFeatures) -> Vec<(usize, f32)> {
+    fn probabilities(&self, seq: &[char], query: &CropFeatures) -> Vec<(usize, f32)> {
         let query_img = match query.raster.as_ref() {
             Some(img) => img,
             None => return Vec::new(),
@@ -66,11 +66,11 @@ impl Classifier for ZnccClassifier {
 
         // Need mutable self for ensure_hashes — but trait says &self.
         // Work around: load from cache directly using the glyph_map.
-        let groups = match self.glyph_map.groups.get(&ch) {
+        let groups = match self.glyph_map.groups.get(seq) {
             Some(g) => g,
             None => return Vec::new(),
         };
-        let hashes = self.glyph_hashes.get(&ch);
+        let hashes = self.glyph_hashes.get(seq);
 
         let mut scored: Vec<(usize, f32)> = Vec::new();
         for (glyph_id, group) in groups.iter().enumerate() {
@@ -78,7 +78,7 @@ impl Classifier for ZnccClassifier {
             let ref_img = if let Some(hs) = hashes {
                 if let Some(&h) = hs.get(glyph_id) {
                     if h != 0 {
-                        crate::char_render::load_cached_glyph(ch, h, &self.render_params)
+                        crate::char_render::load_cached_ngram(seq, h, &self.render_params)
                     } else {
                         None
                     }
@@ -98,8 +98,8 @@ impl Classifier for ZnccClassifier {
                         Ok(f) => f,
                         Err(_) => continue,
                     };
-                    if let Some((_hash, img)) = crate::char_render::get_rendered_char(
-                        &font, ch, None, &self.render_params,
+                    if let Some((_hash, img)) = crate::char_render::render_ngram(
+                        &font, seq, &[None], &self.render_params,
                     ) {
                         img_opt = Some(img);
                         break;
@@ -140,8 +140,8 @@ impl Classifier for ZnccClassifier {
         scored
     }
 
-    fn probability(&self, ch: char, query: &CharFeatures, glyph_id: usize) -> Option<f32> {
-        self.probabilities(ch, query).iter()
+    fn probability(&self, seq: &[char], query: &CropFeatures, glyph_id: usize) -> Option<f32> {
+        self.probabilities(seq, query).iter()
             .find(|(id, _)| *id == glyph_id)
             .map(|(_, p)| *p)
     }
@@ -150,11 +150,11 @@ impl Classifier for ZnccClassifier {
         "zncc"
     }
 
-    fn glyph_count(&self, ch: char) -> usize {
-        self.glyph_map.glyph_count(ch)
+    fn glyph_count(&self, seq: &[char]) -> usize {
+        self.glyph_map.glyph_count(seq)
     }
 
-    fn add_glyph(&mut self, _glyph_id: usize, _ch: char, _features: &CharFeatures) {
+    fn add_glyph(&mut self, _glyph_id: usize, _seq: &[char], _features: &CropFeatures) {
         // No-op: ZNCC works from glyph_map + cached renders.
     }
 }

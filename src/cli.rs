@@ -67,7 +67,7 @@ pub struct Args {
     pub compare: bool,
 
     /// Thoroughness factor for font matching. Default 1.0.
-    /// Higher values relax all CI thresholds (quorum, quality gate, search
+    /// Higher values relax all font-matching thresholds (quorum, quality gate, search
     /// radius) so more candidate fonts survive to evaluation.
     /// Useful for diagnosing why a known font isn't being matched.
     #[arg(long, default_value_t = 1.0)]
@@ -171,7 +171,7 @@ impl Args {
         self.test.as_ref()
     }
 
-    /// Whether full audit I/O (crops, per-char diagnostics, HTML) is enabled.
+    /// Whether full audit I/O (crops, per-observation diagnostics, HTML) is enabled.
     /// True when --audit is set.
     pub fn full_audit(&self) -> bool {
         self.audit.is_some()

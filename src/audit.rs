@@ -1,8 +1,9 @@
-//! Audit log — single JSON sidecar with all pipeline decisions, CI detail,
+//! Audit log — single JSON sidecar with all pipeline decisions, font-matching detail,
 //! word-level similarity scores, and image references (crops + renders).
 
 use crate::error::ScanTextError;
 use serde::Serialize;
+
 use std::path::{Path, PathBuf};
 
 /// Per-text-region audit record.
@@ -13,6 +14,9 @@ pub struct AuditEntry {
     pub text: String,
     pub ocr_confidence: f32,
     pub font_matched: Option<String>,
+    /// Font key of the actual matched font (after ZNCC tie-breaking).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub font_key_matched: Option<String>,
     pub font_confidence: Option<f32>,
     pub similarity_score: Option<f32>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -21,15 +25,15 @@ pub struct AuditEntry {
     pub reason: String,
     pub bbox: BBox,
     #[serde(skip_serializing_if = "Vec::is_empty")]
-    pub ci_candidates: Vec<CiCandidate>,
+    pub font_candidates: Vec<FontCandidate>,
     #[serde(skip_serializing_if = "Vec::is_empty")]
-    pub ci_char_votes: Vec<CharCiVote>,
-    /// Ligature-segmented CI candidates (when ligature sequences are present).
+    pub obs_votes: Vec<ObservationVote>,
+    /// Ligature-segmented font candidates (when ligature sequences are present).
     #[serde(skip_serializing_if = "Vec::is_empty")]
-    pub ci_candidates_lig: Vec<CiCandidate>,
-    /// Ligature-segmented per-char CI votes.
+    pub font_candidates_lig: Vec<FontCandidate>,
+    /// Ligature-segmented per-observation font-scoring votes.
     #[serde(skip_serializing_if = "Vec::is_empty")]
-    pub ci_char_votes_lig: Vec<CharCiVote>,
+    pub obs_votes_lig: Vec<ObservationVote>,
     /// Which segmentation path won: "plain" or "ligature".
     #[serde(skip_serializing_if = "Option::is_none")]
     pub seg_winner: Option<String>,
@@ -39,7 +43,7 @@ pub struct AuditEntry {
     /// Raw Tesseract word bboxes before post-processing (clip/drop/expand).
     #[serde(skip_serializing_if = "Vec::is_empty")]
     pub word_bboxes_raw: Vec<WordBBox>,
-    /// CI tie-break candidates with per-candidate similarity (ZNCC) scores.
+    /// font tie-break candidates with per-candidate similarity (ZNCC) scores.
     #[serde(skip_serializing_if = "Vec::is_empty")]
     pub tie_candidates: Vec<TieCandidate>,
     /// Ground-truth classification: "hit", "major_miss", "minor_miss",
@@ -64,9 +68,9 @@ pub struct WordBBox {
     pub confidence: f32,
 }
 
-/// CI candidate font score.
+/// font candidate font score.
 #[derive(Debug, Serialize, Clone)]
-pub struct CiCandidate {
+pub struct FontCandidate {
     pub font_key: String,
     pub score: Option<f32>,
 }
@@ -81,10 +85,13 @@ pub struct TieCandidate {
     pub winner: bool,
 }
 
-/// Per-character CI vote detail.
+/// Per-window font-scoring vote detail (1-gram or bigram).
 #[derive(Debug, Serialize, Clone)]
-pub struct CharCiVote {
-    pub ch: char,
+pub struct ObservationVote {
+    /// Full scored sequence (e.g. ['T','i'] for bigram, ['a'] for 1-gram).
+    pub seq: Vec<char>,
+    /// Weight used in scoring (0.5 for 1-gram fallback, 1.0 for bigram).
+    pub weight: f32,
     pub crop_index: usize,
     pub best_prob: f32,
     pub passed_gate: bool,

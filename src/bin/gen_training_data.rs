@@ -104,7 +104,7 @@ fn render_char_at_native_height<F: Font>(
         aa,
         binarize_threshold: None,
     };
-    let (_hash, full) = unprint::char_render::get_rendered_char(font, c, glyph_override, &params)?;
+    let (_hash, full) = unprint::char_render::render_ngram(font, &[c], &[glyph_override], &params)?;
 
     let (_w, h) = full.dimensions();
 

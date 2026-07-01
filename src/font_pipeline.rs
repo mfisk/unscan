@@ -10,6 +10,7 @@ use std::path::PathBuf;
 use std::sync::atomic::{AtomicU64, Ordering};
 
 use rayon::prelude::*;
+use image::GrayImage;
 
 use crate::audit;
 use crate::char_render;
@@ -22,7 +23,7 @@ use crate::font_match;
 use crate::font_scan;
 use crate::ground_truth;
 use crate::ocr::{TextLine, TextRegion};
-use crate::glyph_map::GlyphMap;
+use crate::glyph_map::NgramGlyphMap;
 use crate::segment;
 use crate::verify;
 
@@ -30,21 +31,21 @@ use crate::verify;
 pub struct LineMatch {
     pub font_result: Option<font_match::FontMatchResult>,
     pub text_color: (u8, u8, u8),
-    pub ci_top_for_audit: Vec<(String, Option<f32>)>,
-    pub ci_char_detail: Vec<font_match::CharMatchDetail>,
-    pub ci_top_for_audit_lig: Vec<(String, Option<f32>)>,
-    pub ci_char_detail_lig: Vec<font_match::CharMatchDetail>,
+    pub font_scores: Vec<(String, Option<f32>)>,
+    pub observations: Vec<font_match::ObservationDetail>,
+    pub font_scores_lig: Vec<(String, Option<f32>)>,
+    pub observations_lig: Vec<font_match::ObservationDetail>,
     pub seg_winner: Option<String>,
     pub diag_seg_dir: Option<PathBuf>,
-    /// Per-char rank (1-based) of the chosen font among all fonts, keyed by crop_index.
-    pub chosen_char_ranks: HashMap<usize, usize>,
-    /// Per-char rank (1-based) of the ground-truth font among all fonts, keyed by crop_index.
-    pub gt_font_char_ranks: HashMap<usize, usize>,
-    /// Per-char calibrated probability of the chosen font, keyed by crop_index.
-    pub chosen_char_probs: HashMap<usize, f32>,
-    /// Per-char calibrated probability of the ground-truth font, keyed by crop_index.
-    pub gt_font_char_probs: HashMap<usize, f32>,
-    /// CI tie-break candidates with per-candidate SSIM scores.
+    /// Per-observation rank (1-based) of the chosen font among all fonts, keyed by crop_index.
+    pub chosen_obs_ranks: HashMap<usize, usize>,
+    /// Per-observation rank (1-based) of the ground-truth font among all fonts, keyed by crop_index.
+    pub gt_font_obs_ranks: HashMap<usize, usize>,
+    /// Per-observation calibrated probability of the chosen font, keyed by crop_index.
+    pub chosen_obs_probs: HashMap<usize, f32>,
+    /// Per-observation calibrated probability of the ground-truth font, keyed by crop_index.
+    pub gt_font_obs_probs: HashMap<usize, f32>,
+    /// font tie-break candidates with per-candidate SSIM scores.
     pub tie_candidates: Vec<audit::TieCandidate>,
 }
 
@@ -54,8 +55,8 @@ const FAST_PATH_MIN_SSIM: f32 = 0.90;
 /// Pass 1: parallel font matching with SSIM fast path.
 ///
 /// For each line, tries the dominant font candidate via SSIM first; lines that
-/// pass skip segmentation and CI entirely. Misses fall through to the full
-/// pipeline: segmentation → CI search → font selection with tie-break.
+/// pass skip segmentation and font matching entirely. Misses fall through to the full
+/// pipeline: segmentation → font search → font selection with tie-break.
 ///
 /// Returns `(line_matches, fast_path_hit_count)`.
 pub fn match_lines(
@@ -66,10 +67,12 @@ pub fn match_lines(
     font_registry: &font_scan::FontRegistry,
     font_cache: &font_cache::FontCache,
     classifier: &dyn classifier::Classifier,
-    glyph_map: &GlyphMap,
+    glyph_map: &NgramGlyphMap,
     ground_truth: Option<&ground_truth::GroundTruth>,
     dominant_font_candidate: Option<&font_match::FontMatchResult>,
     args: &cli::Args,
+    // When set, only these line indices get diag/audit output on disk.
+    audit_line_filter: Option<&std::collections::HashSet<usize>>,
 ) -> (Vec<LineMatch>, u64) {
     let fast_path_font_data: Option<std::sync::Arc<Vec<u8>>> = dominant_font_candidate
         .and_then(|fm| font_cache.load(&fm.font_path).ok());
@@ -130,23 +133,23 @@ pub fn match_lines(
                 return LineMatch {
                     font_result: Some(result),
                     text_color,
-                    ci_top_for_audit: Vec::new(),
-                    ci_char_detail: Vec::new(),
-                    ci_top_for_audit_lig: Vec::new(),
-                    ci_char_detail_lig: Vec::new(),
+                    font_scores: Vec::new(),
+                    observations: Vec::new(),
+                    font_scores_lig: Vec::new(),
+                    observations_lig: Vec::new(),
                     seg_winner: None,
                     diag_seg_dir: None,
-                    chosen_char_ranks: HashMap::new(),
-                    gt_font_char_ranks: HashMap::new(),
-                    chosen_char_probs: HashMap::new(),
-                    gt_font_char_probs: HashMap::new(),
+                    chosen_obs_ranks: HashMap::new(),
+                    gt_font_obs_ranks: HashMap::new(),
+                    chosen_obs_probs: HashMap::new(),
+                    gt_font_obs_probs: HashMap::new(),
                     tie_candidates: Vec::new(),
                 };
             } else if li < 3 {
             }
         }
 
-        // ── Full pipeline: segmentation → CI search → font match ─
+        // ── Full pipeline: segmentation → font search → font match ─
         let _preview_end = {
             let mut end = line.text.len().min(30);
             while end > 0 && !line.text.is_char_boundary(end) { end -= 1; }
@@ -182,12 +185,14 @@ pub fn match_lines(
                 level: 5, block_num: 0, par_num: 0, line_num: 0, word_num: 0,
             },
         );
-        let mut ci_top_for_audit: Vec<(String, Option<f32>)>;
-        let ci_char_detail: Vec<font_match::CharMatchDetail>;
-        let ci_top_for_audit_lig: Vec<(String, Option<f32>)>;
-        let ci_char_detail_lig: Vec<font_match::CharMatchDetail>;
+        let font_scores: Vec<(String, Option<f32>)>;
+        let observations: Vec<font_match::ObservationDetail>;
+        let font_scores_lig: Vec<(String, Option<f32>)>;
+        let observations_lig: Vec<font_match::ObservationDetail>;
         let seg_winner: Option<String>;
-        let diag_seg_dir: Option<PathBuf> = args.diag_seg_dir().map(|d| {
+        let diag_seg_dir: Option<PathBuf> = args.diag_seg_dir()
+            .filter(|_| audit_line_filter.map_or(true, |f| f.contains(&li)))
+            .map(|d| {
             let line_slug: String = line.text.chars().take(30)
                 .map(|c| if c.is_alphanumeric() { c } else { '_' })
                 .collect();
@@ -195,7 +200,7 @@ pub fn match_lines(
             let _ = std::fs::create_dir_all(&p);
             p
         });
-        // Extract char crops (before font matching block so they're available after)
+        // Segment line (lazy crop data) (before font matching block so they're available after)
         let word_placements: Vec<crate::verify::WordPlacement> = line.words.iter()
             .map(|w| crate::verify::WordPlacement {
                 text: w.text.clone(),
@@ -207,72 +212,91 @@ pub fn match_lines(
             .collect();
         let word_height = line.words.iter().map(|w| w.height).max().unwrap_or(0);
         let seg_t0 = std::time::Instant::now();
-        let line_crops = segment::extract_line_chars(
+        let line_crops = segment::segment_line(
             gray_page, &word_placements, word_height,
             diag_seg_dir.as_deref(),
             &args.render_params(),
         );
         prof_seg_us.fetch_add(seg_t0.elapsed().as_micros() as u64, Ordering::Relaxed);
-        let char_crops = &line_crops.plain;
         if debug_mem {
         }
 
-        let (font_result, tie_candidates_audit) = {
+        let mut crop_store_plain: Vec<GrayImage> = Vec::new();
+        let mut crop_store_lig: Vec<GrayImage> = Vec::new();
+        let (font_result, tie_candidates_audit, gt_font_key) = {
 
             // Crop PNGs are saved after font matching, gated by ground-truth
             // miss detection when --audit is set (see below).
 
-            // ── Score plain path ─────────────────────────────────
-            let ci_t0 = std::time::Instant::now();
-            let ci_result_plain = font_match::identify_glyph(char_crops, args.thoroughness, args.full_audit(), classifier, glyph_map);
+            // ── Resolve ground-truth font key (if available) ─────
+            let gt_font_key: Option<String> = ground_truth.as_ref().and_then(|gt| {
+                let bbox_px = [line.x as f32, line.y as f32,
+                               (line.x + line.width) as f32,
+                               (line.y + line.height) as f32];
+                let gt_font_name = gt.lookup_font(page_num, &bbox_px, args.dpi)?;
+                let gt_ps = ground_truth::strip_subset_prefix_str(gt_font_name);
+                font_registry.iter()
+                    .find(|fe| fe.postscript_name == gt_ps)
+                    .map(|fe| fe.font_key())
+            });
+            let ensure_keys: Vec<&str> = gt_font_key.as_deref().into_iter().collect();
+
+            // ── Score: build sliding-window observations, run identify_fonts ──
+            let score_t0 = std::time::Instant::now();
+
+            let plain_windows = crate::ngram::build_scoring_windows(
+                &line_crops.word_segs, classifier, glyph_map,
+                &mut crop_store_plain,
+            );
+            let scoring_plain = font_match::identify_fonts(&plain_windows, classifier, glyph_map, args.thoroughness, args.full_audit(), &ensure_keys);
 
             // ── Score ligature path (if present) ─────────────────
-            let ci_result_lig = line_crops.ligature.as_ref().map(|lig_crops| {
-                font_match::identify_glyph(lig_crops, args.thoroughness, args.full_audit(), classifier, glyph_map)
-            });
-            prof_ci_us.fetch_add(ci_t0.elapsed().as_micros() as u64, Ordering::Relaxed);
+            let scoring_lig = if let Some(ref lig_segs) = line_crops.lig_word_segs {
+                let lig_windows = crate::ngram::build_scoring_windows(
+                    lig_segs, classifier, glyph_map,
+                    &mut crop_store_lig,
+                );
+                Some(font_match::identify_fonts(&lig_windows, classifier, glyph_map, args.thoroughness, args.full_audit(), &ensure_keys))
+            } else {
+                None
+            };
+            prof_ci_us.fetch_add(score_t0.elapsed().as_micros() as u64, Ordering::Relaxed);
             // ── Pick the winner: ligature vs plain segmentation ──
             // We compare using unweighted (uniform) mean log-probs so
-            // char_weight doesn't bias the decision.  Ligature chars
-            // carry weight 2.0 for font ranking (they're highly
-            // discriminative), but that same bonus would unfairly tip
-            // the path comparison toward the ligature segmentation.
-            // Unweighted means treat every character equally, so the
-            // decision reflects which segmentation genuinely fits
-            // better, not which one has heavier-weighted chars.
-            let plain_top = ci_result_plain.unweighted_top;
-            let lig_top = ci_result_lig.as_ref()
+            // weight doesn't bias the decision.
+            let plain_top = scoring_plain.unweighted_top;
+            let lig_top = scoring_lig.as_ref()
                 .map(|r| r.unweighted_top)
                 .unwrap_or(f32::MIN);
-            let use_lig = ci_result_lig.is_some() && lig_top > plain_top;
+            let use_lig = scoring_lig.is_some() && lig_top > plain_top;
 
-            let (ci_result, _winning_crops) = if use_lig {
-                (ci_result_lig.as_ref().unwrap(), line_crops.ligature.as_ref().unwrap().as_slice())
+            let scoring = if use_lig {
+                scoring_lig.as_ref().unwrap()
             } else {
-                (&ci_result_plain, char_crops.as_slice())
+                &scoring_plain
             };
 
             // Store both paths for audit
-            ci_top_for_audit = ci_result.scores.iter()
+            font_scores = scoring.scores.iter()
                 .map(|(fk, score)| (fk.clone(), Some(*score))).collect();
-            ci_char_detail = ci_result.char_detail.clone();
+            observations = scoring.observations.clone();
 
             // Store the alternate path for audit
-            let (ci_top_lig_audit, ci_char_lig_audit) = if let Some(ref lig_result) = ci_result_lig {
+            let (scores_lig_audit, obs_lig_audit) = if let Some(ref lig_result) = scoring_lig {
                 (lig_result.scores.iter().map(|(fk, s)| (fk.clone(), Some(*s))).collect::<Vec<_>>(),
-                 lig_result.char_detail.clone())
+                 lig_result.observations.clone())
             } else {
                 (Vec::new(), Vec::new())
             };
-            let (ci_top_plain_audit, ci_char_plain_audit) = (
-                ci_result_plain.scores.iter().map(|(fk, s)| (fk.clone(), Some(*s))).collect::<Vec<_>>(),
-                ci_result_plain.char_detail.clone(),
+            let (scores_plain_audit, obs_plain_audit) = (
+                scoring_plain.scores.iter().map(|(fk, s)| (fk.clone(), Some(*s))).collect::<Vec<_>>(),
+                scoring_plain.observations.clone(),
             );
 
             // Store both in the LineMatch for audit output
-            ci_top_for_audit_lig = if use_lig { ci_top_plain_audit } else { ci_top_lig_audit };
-            ci_char_detail_lig = if use_lig { ci_char_plain_audit } else { ci_char_lig_audit };
-            seg_winner = if ci_result_lig.is_some() {
+            font_scores_lig = if use_lig { scores_plain_audit } else { scores_lig_audit };
+            observations_lig = if use_lig { obs_plain_audit } else { obs_lig_audit };
+            seg_winner = if scoring_lig.is_some() {
                 Some(if use_lig { "ligature".to_string() } else { "plain".to_string() })
             } else {
                 None
@@ -283,12 +307,12 @@ pub fn match_lines(
 
             // Crop PNGs saved after font matching (see below).
 
-            // ── Font selection: CI #1, with SSIM tie-break ───────
+            // ── Font selection: font #1, with SSIM tie-break ───────
             let mut tie_candidates_audit: Vec<audit::TieCandidate> = Vec::new();
-            if let Some((ref _top_key, top_score)) = ci_result.scores.first() {
+            if let Some((ref _top_key, top_score)) = scoring.scores.first() {
                 let top_score = *top_score;
-                // Collect all candidates that share the top CI score
-                let tied: Vec<&(String, f32)> = ci_result.scores.iter()
+                // Collect all candidates that share the top font score
+                let tied: Vec<&(String, f32)> = scoring.scores.iter()
                     .take_while(|(_, s)| *s == top_score)
                     .collect();
 
@@ -351,9 +375,9 @@ pub fn match_lines(
                     }
                     if let Some((ref _winner, _)) = best {
                     }
-                    (best.map(|(fm, _)| fm), tie_candidates_audit)
+                    (best.map(|(fm, _)| fm), tie_candidates_audit, gt_font_key)
                 } else {
-                    // No tie — use CI #1 directly, font_key already resolved
+                    // No tie — use font #1 directly, font_key already resolved
                     let (ref font_key, score) = *tied[0];
                     let fm = font_registry.by_key(font_key)
                         .map(|fe| font_match::FontMatchResult {
@@ -366,10 +390,10 @@ pub fn match_lines(
                             score,
                             best_dy: 0,
                         });
-                    (fm, Vec::new())
+                    (fm, Vec::new(), gt_font_key)
                 }
             } else {
-                (None, Vec::new())
+                (None, Vec::new(), gt_font_key)
             }
         };
         let line_elapsed = line_start.elapsed();
@@ -402,87 +426,42 @@ pub fn match_lines(
             true // no ground truth → full audit for all lines
         };
 
-        // Compute per-char distances for the chosen font.
-        // Use corrected characters when the OCR correction gate fired.
-        // Use winning path's crops (plain or ligature).
-        let effective_crops: &[(char, image::GrayImage)] = if seg_winner.as_deref() == Some("ligature") {
-            line_crops.ligature.as_ref().map(|v| v.as_slice()).unwrap_or(char_crops)
+        // The winning crop store contains the actual crops used during scoring —
+        // both unigram and bigram crops, indexed by crop_index in observations.
+        let winning_crops: &[GrayImage] = if seg_winner.as_deref() == Some("ligature") {
+            &crop_store_lig
         } else {
-            char_crops
+            &crop_store_plain
         };
-        // Build a correction map: crop_index → corrected char, without cloning images
-        let char_corrections: HashMap<usize, char> = ci_char_detail.iter()
-            .filter_map(|d| d.ocr_corrected_from.as_ref().map(|_| (d.crop_index, d.ch)))
-            .collect();
-        let corrected_char_crops: Vec<(char, &image::GrayImage)> = effective_crops.iter()
-            .enumerate()
-            .map(|(i, (ch, img))| {
-                let effective_ch = char_corrections.get(&i).copied().unwrap_or(*ch);
-                (effective_ch, img)
-            })
-            .collect();
 
         let pcd_t0 = std::time::Instant::now();
-
-        // Per-char probabilities and audit detail: only for miss lines when full audit is active
-        let (chosen_char_ranks, chosen_char_probs, gt_font_char_ranks, gt_font_char_probs) = if is_miss && args.full_audit() {
-            // Compute raw features for each crop
-            let crop_feats: Vec<(usize, char, features::CharFeatures)> = corrected_char_crops
-                .iter()
-                .enumerate()
-                .filter_map(|(i, (c, img))| {
-                    features::compute_features(img, true).map(|f| (i, *c, f))
-                })
-                .collect();
-
+        // Per-observation probabilities and audit detail: only for miss lines when full audit is active
+        let (chosen_obs_ranks, chosen_obs_probs, gt_font_obs_ranks, gt_font_obs_probs) = if is_miss && args.full_audit() {
             // Resolve chosen and GT font keys
             let chosen_font_key: Option<String> = font_result.as_ref()
                 .filter(|fr| !fr.font_key.is_empty())
                 .map(|fr| fr.font_key.clone());
 
-            let gt_font_key: Option<String> = ground_truth.as_ref().and_then(|gt| {
-                let bbox_px = [line.x as f32, line.y as f32,
-                               (line.x + line.width) as f32,
-                               (line.y + line.height) as f32];
-                let gt_font_name = gt.lookup_font(page_num, &bbox_px, args.dpi)?;
-                let gt_ps = ground_truth::strip_subset_prefix_str(gt_font_name);
-                let gt_key = font_registry.iter()
-                    .find(|fe| fe.postscript_name == gt_ps)
-                    .map(|fe| fe.font_key())?;
-                // Inject GT font into ci_top_for_audit if its font_key is missing
-                if !ci_top_for_audit.iter().any(|(fk, _)| *fk == gt_key) {
-                    if let Some(&(_, _ch, _)) = crop_feats.first() {
-                        let gt_log_probs: Vec<(f32, f32)> = crop_feats.iter()
-                            .filter_map(|&(_, ch2, ref feat)| {
-                                let gid = glyph_map.glyph_id_for_font(ch2, &gt_key)?;
-                                let p = classifier.probability(ch2, feat, gid)?;
-                                Some((p.max(1e-30).ln(), font_match::char_weight(ch2)))
-                            })
-                            .collect();
-                        if !gt_log_probs.is_empty() {
-                            let score = font_match::aggregate_font_score(&gt_log_probs, crop_feats.len());
-                            if score.is_finite() {
-                                ci_top_for_audit.push((gt_key.clone(), Some(score)));
-                            }
-                        }
-                    }
-                }
-                Some(gt_key)
-            });
-
-            // One probabilities() call per character; extract
-            // rank and probability for chosen and GT glyph IDs (per-char via GlyphMap).
+            // Per-observation probabilities using the actual scoring crops and
+            // the correct classifier/glyph_map for each observation's seq length.
             let mut c_ranks = HashMap::new();
             let mut c_probs = HashMap::new();
             let mut g_ranks = HashMap::new();
             let mut g_probs = HashMap::new();
 
-            for &(crop_idx, ch, ref feat) in &crop_feats {
-                let probs = classifier.probabilities(ch, feat);
+            for d in &observations {
+                let crop = match winning_crops.get(d.crop_index) {
+                    Some(c) => c,
+                    None => continue,
+                };
+                let feat = match features::compute_features(crop, true) {
+                    Some(f) => f,
+                    None => continue,
+                };
+
+                let probs = classifier.probabilities(&d.seq, &feat);
                 if probs.is_empty() { continue; }
 
-                // Extract rank (1-based position in probability-sorted list)
-                // and probability for a glyph_id
                 let lookup = |gid: usize| -> Option<(usize, f32)> {
                     probs.iter().enumerate()
                         .find(|(_, (id, _))| *id == gid)
@@ -490,66 +469,19 @@ pub fn match_lines(
                 };
 
                 if let Some(ref fk) = chosen_font_key {
-                    if let Some(gid) = glyph_map.glyph_id_for_font(ch, fk) {
+                    if let Some(gid) = glyph_map.glyph_id_for_font(&d.seq, fk) {
                         if let Some((rank, prob)) = lookup(gid) {
-                            c_ranks.insert(crop_idx, rank);
-                            c_probs.insert(crop_idx, prob);
+                            c_ranks.insert(d.crop_index, rank);
+                            c_probs.insert(d.crop_index, prob);
                         }
                     }
                 }
                 if let Some(ref gtk) = gt_font_key {
-                    if let Some(gid) = glyph_map.glyph_id_for_font(ch, gtk) {
+                    if let Some(gid) = glyph_map.glyph_id_for_font(&d.seq, gtk) {
                         if let Some((rank, prob)) = lookup(gid) {
-                            g_ranks.insert(crop_idx, rank);
-                            g_probs.insert(crop_idx, prob);
+                            g_ranks.insert(d.crop_index, rank);
+                            g_probs.insert(d.crop_index, prob);
                         }
-                    }
-                }
-            }
-
-            // Save crop PNGs for miss lines
-            if let Some(ref ddir) = diag_seg_dir {
-                if !effective_crops.is_empty() {
-                    let crop_dir = ddir.join("crops");
-                    let _ = std::fs::create_dir_all(&crop_dir);
-                    for (i, (ch, img)) in effective_crops.iter().enumerate() {
-                        let path = crop_dir.join(format!("crop_{:02}_{}.png", i,
-                            if ch.is_alphanumeric() { format!("{}", ch) }
-                            else { format!("U{:04X}", *ch as u32) }));
-                        let _ = img.save(&path);
-                    }
-                }
-
-                // Save full-colour scan line crop for report overlay.
-                // "Surroundings" bbox: union of line bbox (= word-union)
-                // and raw word bboxes, plus 4px padding, so the report
-                // can show both original and expanded bbox sets.
-                {
-                    let pad = 4u32;
-                    let mut sx0 = line.x;
-                    let mut sy0 = line.y;
-                    let mut sx1 = line.x + line.width;
-                    let mut sy1 = line.y + line.height;
-                    for rw in &line.raw_words {
-                        sx0 = sx0.min(rw.x);
-                        sy0 = sy0.min(rw.y);
-                        sx1 = sx1.max(rw.x + rw.width);
-                        sy1 = sy1.max(rw.y + rw.height);
-                    }
-                    let surr_x = sx0.saturating_sub(pad).min(page_img.width().saturating_sub(1));
-                    let surr_y = sy0.saturating_sub(pad).min(page_img.height().saturating_sub(1));
-                    let surr_r = sx1.saturating_add(pad).min(page_img.width());
-                    let surr_b = sy1.saturating_add(pad).min(page_img.height());
-                    let surr_w = surr_r - surr_x;
-                    let surr_h = surr_b - surr_y;
-                    if surr_w >= 3 && surr_h >= 3 {
-                        let crop = image::imageops::crop_imm(page_img, surr_x, surr_y, surr_w, surr_h).to_image();
-                        let crop = features::contrast_normalize_rgba(&crop);
-                        let _ = crop.save(ddir.join("scan_line.png"));
-                        let _ = std::fs::write(
-                            ddir.join("scan_line_origin.json"),
-                            format!("{{\"x\":{},\"y\":{}}}", surr_x, surr_y),
-                        );
                     }
                 }
             }
@@ -589,12 +521,19 @@ pub fn match_lines(
                                 font.set_variation(tag, *val);
                             }
                         }
-                        for (ch, _crop) in corrected_char_crops.iter() {
-                            let fname = format!("U+{:04X}.png", *ch as u32);
+                        for d in &observations {
+                            // Filename: bigrams use "U+0041_U+0042.png", unigrams "U+0041.png"
+                            let fname: String = d.seq.iter()
+                                .map(|&c| format!("U+{:04X}", c as u32))
+                                .collect::<Vec<_>>()
+                                .join("_")
+                                + ".png";
                             let path = font_ref_dir.join(&fname);
                             if path.exists() { continue; }
-                            let gid_override = override_map.get(ch).map(|&gid| ab_glyph::GlyphId(gid));
-                            let ref_img = char_render::get_rendered_char_default(&font, *ch, gid_override);
+                            let gid_overrides: Vec<Option<ab_glyph::GlyphId>> = d.seq.iter()
+                                .map(|c| override_map.get(c).map(|&gid| ab_glyph::GlyphId(gid)))
+                                .collect();
+                            let ref_img = char_render::render_ngram_default(&font, &d.seq, &gid_overrides);
                             if let Some((_hash, img)) = ref_img {
                                 let _ = img.save(&path);
                             }
@@ -607,10 +546,60 @@ pub fn match_lines(
         } else {
             (HashMap::new(), HashMap::new(), HashMap::new(), HashMap::new())
         };
+
+        // Save crop PNGs and scan line image for ALL audited lines (not just
+        // misses), so similarity-failure lines have crops in the report too.
+        if let Some(ref ddir) = diag_seg_dir {
+            if !observations.is_empty() {
+                let crop_dir = ddir.join("crops");
+                let _ = std::fs::create_dir_all(&crop_dir);
+                for d in &observations {
+                    if let Some(img) = winning_crops.get(d.crop_index) {
+                        let seq_label: String = d.seq.iter().map(|&c| {
+                            if c.is_alphanumeric() { format!("{}", c) }
+                            else { format!("U{:04X}", c as u32) }
+                        }).collect();
+                        let path = crop_dir.join(format!("crop_{:02}_{}.png", d.crop_index, seq_label));
+                        let _ = img.save(&path);
+                    }
+                }
+            }
+
+            // Save full-colour scan line crop for report overlay.
+            {
+                let pad = 4u32;
+                let mut sx0 = line.x;
+                let mut sy0 = line.y;
+                let mut sx1 = line.x + line.width;
+                let mut sy1 = line.y + line.height;
+                for rw in &line.raw_words {
+                    sx0 = sx0.min(rw.x);
+                    sy0 = sy0.min(rw.y);
+                    sx1 = sx1.max(rw.x + rw.width);
+                    sy1 = sy1.max(rw.y + rw.height);
+                }
+                let surr_x = sx0.saturating_sub(pad).min(page_img.width().saturating_sub(1));
+                let surr_y = sy0.saturating_sub(pad).min(page_img.height().saturating_sub(1));
+                let surr_r = sx1.saturating_add(pad).min(page_img.width());
+                let surr_b = sy1.saturating_add(pad).min(page_img.height());
+                let surr_w = surr_r - surr_x;
+                let surr_h = surr_b - surr_y;
+                if surr_w >= 3 && surr_h >= 3 {
+                    let crop = image::imageops::crop_imm(page_img, surr_x, surr_y, surr_w, surr_h).to_image();
+                    let crop = features::contrast_normalize_rgba(&crop);
+                    let _ = crop.save(ddir.join("scan_line.png"));
+                    let _ = std::fs::write(
+                        ddir.join("scan_line_origin.json"),
+                        format!("{{\"x\":{},\"y\":{}}}", surr_x, surr_y),
+                    );
+                }
+            }
+        }
+
         prof_pcd_us.fetch_add(pcd_t0.elapsed().as_micros() as u64, Ordering::Relaxed);
 
         prof_full_us.fetch_add(line_start.elapsed().as_micros() as u64, Ordering::Relaxed);
-        LineMatch { font_result, text_color, ci_top_for_audit, ci_char_detail, ci_top_for_audit_lig, ci_char_detail_lig, seg_winner, diag_seg_dir, chosen_char_ranks, gt_font_char_ranks, chosen_char_probs, gt_font_char_probs, tie_candidates: tie_candidates_audit }
+        LineMatch { font_result, text_color, font_scores, observations, font_scores_lig, observations_lig, seg_winner, diag_seg_dir, chosen_obs_ranks, gt_font_obs_ranks, chosen_obs_probs, gt_font_obs_probs, tie_candidates: tie_candidates_audit }
     }).collect();
 
     let fp_hits = fast_path_hits.load(Ordering::Relaxed);

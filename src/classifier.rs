@@ -13,7 +13,7 @@
 //!   trained with triplet loss.  One network per indexed character.
 
 
-use crate::features::{CharFeatures, FEAT_LEN};
+use crate::features::{CropFeatures, FEAT_LEN};
 
 use std::collections::HashMap;
 
@@ -147,24 +147,24 @@ fn dense_project(out_dim: usize, mat: &[f32], x: &[f32]) -> Vec<f32> {
 /// For embedding classifiers, `σ²` is computed during training and stored
 /// per-character in the weight file (LDAC v2).  At runtime, `sigma_sq(ch)`
 /// returns the stored value.  If the weight file predates v2, `σ²` is
-/// computed on first access from the stored PerCharModel centroids as a
+/// computed on first access from the stored NgramModel centroids as a
 /// fallback.
 #[allow(dead_code)]
 pub trait Classifier: Send + Sync {
     /// Return the top `k` glyph matches for a character crop.
     /// Returns `(glyph_id, probability)` sorted descending (highest = best).
     /// glyph_id indexes into the GlyphMap for the given character.
-    fn classify(&self, ch: char, query: &CharFeatures, k: usize) -> Vec<(usize, f32)>;
+    fn classify(&self, seq: &[char], query: &CropFeatures, k: usize) -> Vec<(usize, f32)>;
 
     /// Return calibrated posterior probabilities for all glyphs, sorted
     /// descending by probability.  Probabilities sum to 1.
-    fn probabilities(&self, ch: char, query: &CharFeatures) -> Vec<(usize, f32)> {
-        self.classify(ch, query, self.glyph_count(ch))
+    fn probabilities(&self, seq: &[char], query: &CropFeatures) -> Vec<(usize, f32)> {
+        self.classify(seq, query, self.glyph_count(seq))
     }
 
     /// Posterior probability of a specific glyph given a query.
-    fn probability(&self, ch: char, query: &CharFeatures, glyph_id: usize) -> Option<f32> {
-        self.probabilities(ch, query).iter()
+    fn probability(&self, seq: &[char], query: &CropFeatures, glyph_id: usize) -> Option<f32> {
+        self.probabilities(seq, query).iter()
             .find(|(id, _)| *id == glyph_id)
             .map(|(_, p)| *p)
     }
@@ -172,12 +172,17 @@ pub trait Classifier: Send + Sync {
     /// Short name for logging and cache invalidation.
     fn name(&self) -> &str;
 
-    /// Number of distinct glyphs for a character.
-    fn glyph_count(&self, ch: char) -> usize;
+    /// Number of distinct glyphs for a sequence.
+    fn glyph_count(&self, seq: &[char]) -> usize;
+
+    /// Whether the classifier has a trained model for this sequence.
+    fn has_sequence(&self, seq: &[char]) -> bool {
+        self.glyph_count(seq) > 0
+    }
 
     /// Feed a glyph's feature vector for a character into the classifier.
     /// Called once per (glyph_id, char) pair during index build.
-    fn add_glyph(&mut self, _glyph_id: usize, _ch: char, _features: &CharFeatures) {}
+    fn add_glyph(&mut self, _glyph_id: usize, _seq: &[char], _features: &CropFeatures) {}
 }
 
 /// Convert `(font_id, sq_dist)` pairs to `(font_id, prob)` pairs using a
@@ -195,7 +200,7 @@ fn sq_euclid(a: &[f32], b: &[f32]) -> f32 {
 
 
 // ---------------------------------------------------------------------------
-// CharModel — per-character complete model state
+// ImageModel — per-character complete model state
 // ---------------------------------------------------------------------------
 
 /// Complete model state for a single character.  Co-locates the classifier-
@@ -203,8 +208,8 @@ fn sq_euclid(a: &[f32], b: &[f32]) -> f32 {
 /// with the embedded font centroids and the probability-calibration σ².
 ///
 /// Replaces the old split where weights lived in the Embedder and centroids
-/// lived in a separate PerCharModel.
-pub struct CharModel {
+/// lived in a separate NgramModel.
+pub struct ImageModel {
     /// Classifier-specific weights as a flat f32 blob.
     /// Interpretation depends on the classifier type (magic byte in .bin header).
     pub weights: Vec<f32>,
@@ -215,7 +220,7 @@ pub struct CharModel {
     pub sigma_sq: f32,
 }
 
-impl CharModel {
+impl ImageModel {
     /// Probability of each font given a query vector, sorted descending.
     pub fn probabilities(&self, query: &[f32]) -> Vec<(u32, f32)> {
         if self.centroids.is_empty() { return Vec::new(); }
@@ -271,16 +276,16 @@ impl CharModel {
 /// Per-character classifier with co-located weights, centroids, and σ².
 /// Font names are shared across all characters; centroids reference fonts
 /// by font_id (index into `font_names` / catalog).
-pub struct PerCharModel {
-    pub chars: HashMap<char, CharModel>,
+pub struct NgramModel {
+    pub entries: HashMap<Vec<char>, ImageModel>,
     /// Catalog hash at training time.  Used to reject stale .bin files
     /// when the font catalog changes.
     pub catalog_hash: u64,
 }
 
-impl PerCharModel {
+impl NgramModel {
     pub fn new(catalog_hash: u64) -> Self {
-        Self { chars: HashMap::new(), catalog_hash }
+        Self { entries: HashMap::new(), catalog_hash }
     }
 
     /// Serialize to the unified per-char .bin format.
@@ -313,10 +318,13 @@ impl PerCharModel {
         w.write_all(&version.to_le_bytes())?;
         w.write_all(&self.catalog_hash.to_le_bytes())?;
 
-        // Per-char models
-        w.write_all(&(self.chars.len() as u32).to_le_bytes())?;
-        for (&ch, model) in &self.chars {
-            w.write_all(&(ch as u32).to_le_bytes())?;
+        // Per-entry models (seq_len stored per entry for mixed ngram lengths)
+        w.write_all(&(self.entries.len() as u32).to_le_bytes())?;
+        for (seq, model) in &self.entries {
+            w.write_all(&(seq.len() as u32).to_le_bytes())?;
+            for &c in seq {
+                w.write_all(&(c as u32).to_le_bytes())?;
+            }
 
             // Weights
             w.write_all(&(model.weights.len() as u32).to_le_bytes())?;
@@ -364,13 +372,20 @@ impl PerCharModel {
 
         let mut pos = 16;
 
-        // Per-char models
-        let n_chars = read_u32(data, &mut pos)? as usize;
-        let mut chars = HashMap::with_capacity(n_chars);
-        for _ in 0..n_chars {
-            let cp = read_u32(data, &mut pos)?;
-            let ch = char::from_u32(cp)
-                .ok_or_else(|| format!("invalid codepoint U+{cp:04X}"))?;
+        // Per-entry models (seq_len stored per entry for mixed ngram lengths)
+        let n_entries = read_u32(data, &mut pos)? as usize;
+        let mut entries = HashMap::with_capacity(n_entries);
+        for _ in 0..n_entries {
+            let seq_len = read_u32(data, &mut pos)? as usize;
+            if seq_len == 0 || seq_len > 16 {
+                return Err(format!("invalid seq_len: {seq_len}"));
+            }
+            let mut seq = Vec::with_capacity(seq_len);
+            for _ in 0..seq_len {
+                let cp = read_u32(data, &mut pos)?;
+                seq.push(char::from_u32(cp)
+                    .ok_or_else(|| format!("invalid codepoint U+{cp:04X}"))?);
+            }
 
             // Weights
             let n_weights = read_u32(data, &mut pos)? as usize;
@@ -391,10 +406,10 @@ impl PerCharModel {
             let sigma_sq = f32::from_le_bytes(data[pos..pos + 4].try_into().unwrap());
             pos += 4;
 
-            chars.insert(ch, CharModel { weights, centroids, sigma_sq });
+            entries.insert(seq, ImageModel { weights, centroids, sigma_sq });
         }
 
-        Ok(Self { chars, catalog_hash })
+        Ok(Self { entries, catalog_hash })
     }
 }
 
@@ -430,39 +445,39 @@ fn read_f32s(data: &[u8], pos: &mut usize, n: usize) -> Result<Vec<f32>, String>
 /// Trait for the embedding step: converts raw features into a classifier-specific vector.
 #[allow(dead_code)]
 pub trait Embedder: Send + Sync {
-    fn embed(&self, ch: char, features: &CharFeatures) -> Vec<f32>;
+    fn embed(&self, seq: &[char], features: &CropFeatures) -> Vec<f32>;
     fn name(&self) -> &str;
 }
 
 /// Generic classifier that embeds features via an [`Embedder`] then searches
-/// pre-computed centroids stored in a [`PerCharModel`].
+/// pre-computed centroids stored in a [`NgramModel`].
 pub struct EmbeddingClassifier {
-    model: PerCharModel,
+    model: NgramModel,
     embedder: Box<dyn Embedder>,
 }
 
 impl Classifier for EmbeddingClassifier {
-    fn classify(&self, ch: char, query: &CharFeatures, k: usize) -> Vec<(usize, f32)> {
-        let q = self.embedder.embed(ch, query);
-        if let Some(cm) = self.model.chars.get(&ch) {
+    fn classify(&self, seq: &[char], query: &CropFeatures, k: usize) -> Vec<(usize, f32)> {
+        let q = self.embedder.embed(seq, query);
+        if let Some(cm) = self.model.entries.get(seq) {
             cm.classify(&q, k).into_iter().map(|(id, p)| (id as usize, p)).collect()
         } else {
             Vec::new()
         }
     }
 
-    fn probabilities(&self, ch: char, query: &CharFeatures) -> Vec<(usize, f32)> {
-        let q = self.embedder.embed(ch, query);
-        if let Some(cm) = self.model.chars.get(&ch) {
+    fn probabilities(&self, seq: &[char], query: &CropFeatures) -> Vec<(usize, f32)> {
+        let q = self.embedder.embed(seq, query);
+        if let Some(cm) = self.model.entries.get(seq) {
             cm.probabilities(&q).into_iter().map(|(id, p)| (id as usize, p)).collect()
         } else {
             Vec::new()
         }
     }
 
-    fn probability(&self, ch: char, query: &CharFeatures, glyph_id: usize) -> Option<f32> {
-        let q = self.embedder.embed(ch, query);
-        let cm = self.model.chars.get(&ch)?;
+    fn probability(&self, seq: &[char], query: &CropFeatures, glyph_id: usize) -> Option<f32> {
+        let q = self.embedder.embed(seq, query);
+        let cm = self.model.entries.get(seq)?;
         let probs = cm.probabilities(&q);
         probs.into_iter()
             .find(|(id, _)| *id as usize == glyph_id)
@@ -473,13 +488,13 @@ impl Classifier for EmbeddingClassifier {
         self.embedder.name()
     }
 
-    fn glyph_count(&self, ch: char) -> usize {
-        self.model.chars.get(&ch).map_or(0, |cm| cm.centroids.len())
+    fn glyph_count(&self, seq: &[char]) -> usize {
+        self.model.entries.get(seq).map_or(0, |cm| cm.centroids.len())
     }
 
-    fn add_glyph(&mut self, glyph_id: usize, ch: char, features: &CharFeatures) {
-        let embedded = self.embedder.embed(ch, features);
-        let cm = self.model.chars.entry(ch).or_insert_with(|| CharModel {
+    fn add_glyph(&mut self, glyph_id: usize, seq: &[char], features: &CropFeatures) {
+        let embedded = self.embedder.embed(seq, features);
+        let cm = self.model.entries.entry(seq.to_vec()).or_insert_with(|| ImageModel {
             weights: Vec::new(),
             centroids: Vec::new(),
             sigma_sq: 0.0,
@@ -544,7 +559,7 @@ impl GlyphNet {
 /// Stores projected font vectors internally and performs brute-force
 /// nearest-neighbor search in the embedding space.
 pub struct TripletClassifier {
-    nets: HashMap<char, GlyphNet>,
+    nets: HashMap<Vec<char>, GlyphNet>,
 }
 
 impl TripletClassifier {
@@ -582,14 +597,14 @@ impl TripletClassifier {
 
         let data = std::fs::read(path)
             .map_err(|e| format!("cannot read {}: {e}", path.display()))?;
-        let model = PerCharModel::read_bin(&data, b"TRIP", None)?;
+        let model = NgramModel::read_bin(&data, b"TRIP", None)?;
 
-        let mut nets = HashMap::with_capacity(model.chars.len());
-        for (&ch, cm) in &model.chars {
+        let mut nets = HashMap::with_capacity(model.entries.len());
+        for (seq, cm) in &model.entries {
             if cm.weights.len() != PARAMS_PER_CHAR {
                 return Err(format!(
-                    "Triplet char '{}': expected {} params, got {}",
-                    ch, PARAMS_PER_CHAR, cm.weights.len()
+                    "Triplet seq '{:?}': expected {} params, got {}",
+                    seq, PARAMS_PER_CHAR, cm.weights.len()
                 ));
             }
             let mut pos = 0usize;
@@ -605,15 +620,15 @@ impl TripletClassifier {
                 fc2: InferenceLinear { rows: L1_OUT, cols: L2_OUT, w: fc2_w, b: fc2_b },
                 fc3: InferenceLinear { rows: L2_OUT, cols: L3_OUT, w: fc3_w, b: fc3_b },
             };
-            nets.insert(ch, net);
+            nets.insert(seq.clone(), net);
         }
 
         let embedder = Self { nets };
         Ok(EmbeddingClassifier { model, embedder: Box::new(embedder) })
     }
 
-    fn embed(&self, ch: char, features: &CharFeatures) -> Vec<f32> {
-        if let Some(net) = self.nets.get(&ch) {
+    fn embed(&self, seq: &[char], features: &CropFeatures) -> Vec<f32> {
+        if let Some(net) = self.nets.get(seq) {
             net.forward(&features.as_slice())
         } else {
             let raw = features.as_slice();
@@ -781,8 +796,8 @@ impl TripletClassifier {
                 let mut char_top5 = 0usize;
                 for &i in &eval_indices {
                     let correct_font = samples[i].glyph_id;
-                    let ci_pos = centroid_fids.iter().position(|&f| f == correct_font).unwrap();
-                    let d_correct = dist_sq(&embeddings[i], &centroid_vecs[ci_pos]);
+                    let pos = centroid_fids.iter().position(|&f| f == correct_font).unwrap();
+                    let d_correct = dist_sq(&embeddings[i], &centroid_vecs[pos]);
 
                     let mut rank = 0usize;
                     for ci2 in 0..k {
@@ -821,7 +836,7 @@ impl TripletClassifier {
 
         // Write TRIP v3 binary (per-char model: weights + centroids + σ²)
         if let Some(parent) = output.parent() { let _ = std::fs::create_dir_all(parent); }
-        let mut model = PerCharModel::new(ctx.catalog_hash);
+        let mut model = NgramModel::new(ctx.catalog_hash);
         for (tc_idx, (c, net)) in trained_chars.iter().enumerate() {
             // Flatten net params into weights blob
             let mut weights = Vec::with_capacity(PARAMS_PER_CHAR);
@@ -848,9 +863,9 @@ impl TripletClassifier {
                 let centroid: Vec<f32> = sum.iter().map(|&v| v / cnt).collect();
                 centroids.push((fid, centroid));
             }
-            let mut cm = CharModel { weights, centroids, sigma_sq: 0.0 };
+            let mut cm = ImageModel { weights, centroids, sigma_sq: 0.0 };
             cm.compute_sigma_sq();
-            model.chars.insert(*c, cm);
+            model.entries.insert(vec![*c], cm);
         }
         let f = std::fs::File::create(output).expect("create output file");
         let mut w = BufWriter::new(f);
@@ -865,8 +880,8 @@ impl TripletClassifier {
 }
 
 impl Embedder for TripletClassifier {
-    fn embed(&self, ch: char, features: &CharFeatures) -> Vec<f32> {
-        TripletClassifier::embed(self, ch, features)
+    fn embed(&self, seq: &[char], features: &CropFeatures) -> Vec<f32> {
+        TripletClassifier::embed(self, seq, features)
     }
     fn name(&self) -> &str { "triplet" }
 }
@@ -893,7 +908,7 @@ impl Embedder for TripletClassifier {
 ///   weights:   [f32; FEAT_LEN] LE
 /// ```
 pub struct PerCharFisherClassifier {
-    weights: HashMap<char, [f32; FEAT_LEN]>,
+    weights: HashMap<Vec<char>, [f32; FEAT_LEN]>,
 }
 
 impl PerCharFisherClassifier {
@@ -935,11 +950,11 @@ impl PerCharFisherClassifier {
 
         let data = std::fs::read(path)
             .map_err(|e| format!("cannot read {}: {e}", path.display()))?;
-        let model = PerCharModel::read_bin(&data, b"FISH", None)?;
+        let model = NgramModel::read_bin(&data, b"FISH", None)?;
 
         // Extract normalized embedder weights from the model
-        let mut weights = HashMap::with_capacity(model.chars.len());
-        for (&ch, cm) in &model.chars {
+        let mut weights = HashMap::with_capacity(model.entries.len());
+        for (seq, cm) in &model.entries {
             let mut w = [0.0f32; FEAT_LEN];
             let n = cm.weights.len().min(FEAT_LEN);
             w[..n].copy_from_slice(&cm.weights[..n]);
@@ -953,16 +968,16 @@ impl PerCharFisherClassifier {
             let sum: f32 = w.iter().sum();
             if sum > 1e-12 { for v in &mut w { *v /= sum; } }
 
-            weights.insert(ch, w);
+            weights.insert(seq.clone(), w);
         }
 
         let embedder = Self { weights };
         Ok(EmbeddingClassifier { model, embedder: Box::new(embedder) })
     }
 
-    fn embed(&self, ch: char, features: &CharFeatures) -> Vec<f32> {
+    fn embed(&self, seq: &[char], features: &CropFeatures) -> Vec<f32> {
         let raw = features.as_slice();
-        if let Some(w) = self.weights.get(&ch) {
+        if let Some(w) = self.weights.get(seq) {
             let mut v = vec![0.0f32; FEAT_LEN];
             for i in 0..FEAT_LEN { v[i] = raw[i] * w[i]; }
             v
@@ -1112,7 +1127,7 @@ impl PerCharFisherClassifier {
         if let Some(parent) = output.parent() {
             let _ = std::fs::create_dir_all(parent);
         }
-        let mut model = PerCharModel::new(ctx.catalog_hash);
+        let mut model = NgramModel::new(ctx.catalog_hash);
         for (c, scores, class_means) in &fisher_chars {
             let nw = Self::normalize_scores(scores);
             let mut centroids: Vec<(u32, Vec<f32>)> = Vec::with_capacity(class_means.len());
@@ -1122,13 +1137,13 @@ impl PerCharFisherClassifier {
                     .collect();
                 centroids.push((fid, embedded));
             }
-            let mut cm = CharModel {
+            let mut cm = ImageModel {
                 weights: scores.to_vec(),
                 centroids,
                 sigma_sq: 0.0,
             };
             cm.compute_sigma_sq();
-            model.chars.insert(*c, cm);
+            model.entries.insert(vec![*c], cm);
         }
         let f = std::fs::File::create(output).expect("create output file");
         let mut w = BufWriter::new(f);
@@ -1142,8 +1157,8 @@ impl PerCharFisherClassifier {
 }
 
 impl Embedder for PerCharFisherClassifier {
-    fn embed(&self, ch: char, features: &CharFeatures) -> Vec<f32> {
-        PerCharFisherClassifier::embed(self, ch, features)
+    fn embed(&self, seq: &[char], features: &CropFeatures) -> Vec<f32> {
+        PerCharFisherClassifier::embed(self, seq, features)
     }
     fn name(&self) -> &str { "per_char_fisher" }
 }
@@ -1171,7 +1186,7 @@ impl Embedder for PerCharFisherClassifier {
 ///   L_inv:     [f32; feat_len * feat_len] LE (row-major)
 /// ```
 pub struct MahalanobisClassifier {
-    transforms: HashMap<char, Vec<f32>>, // L_inv per char, FEAT_LEN × FEAT_LEN row-major
+    transforms: HashMap<Vec<char>, Vec<f32>>, // L_inv per char, FEAT_LEN × FEAT_LEN row-major
 }
 
 impl MahalanobisClassifier {
@@ -1209,11 +1224,11 @@ impl MahalanobisClassifier {
 
         let data = std::fs::read(path)
             .map_err(|e| format!("cannot read {}: {e}", path.display()))?;
-        let model = PerCharModel::read_bin(&data, b"MAHA", None)?;
+        let model = NgramModel::read_bin(&data, b"MAHA", None)?;
 
-        let mut transforms = HashMap::with_capacity(model.chars.len());
-        for (&ch, cm) in &model.chars {
-            transforms.insert(ch, cm.weights.clone());
+        let mut transforms = HashMap::with_capacity(model.entries.len());
+        for (seq, cm) in &model.entries {
+            transforms.insert(seq.clone(), cm.weights.clone());
         }
 
         let embedder = Self { transforms };
@@ -1226,9 +1241,9 @@ impl MahalanobisClassifier {
         dense_project(FEAT_LEN, linv, x)
     }
 
-    fn embed(&self, ch: char, features: &CharFeatures) -> Vec<f32> {
+    fn embed(&self, seq: &[char], features: &CropFeatures) -> Vec<f32> {
         let raw = features.as_slice();
-        if let Some(linv) = self.transforms.get(&ch) {
+        if let Some(linv) = self.transforms.get(seq) {
             Self::apply_transform(linv, &raw)
         } else {
             raw.to_vec()
@@ -1428,7 +1443,7 @@ impl MahalanobisClassifier {
 
         // Write MAHA v3 binary (per-char model: weights + centroids + σ²)
         if let Some(parent) = output.parent() { let _ = std::fs::create_dir_all(parent); }
-        let mut model = PerCharModel::new(ctx.catalog_hash);
+        let mut model = NgramModel::new(ctx.catalog_hash);
         for (c, linv, class_means) in &maha_chars {
             let mut centroids: Vec<(u32, Vec<f32>)> = Vec::with_capacity(class_means.len());
             for (&fid, mean) in class_means {
@@ -1440,13 +1455,13 @@ impl MahalanobisClassifier {
                 }
                 centroids.push((fid, embedded));
             }
-            let mut cm = CharModel {
+            let mut cm = ImageModel {
                 weights: linv.to_vec(),
                 centroids,
                 sigma_sq: 0.0,
             };
             cm.compute_sigma_sq();
-            model.chars.insert(*c, cm);
+            model.entries.insert(vec![*c], cm);
         }
         let f = std::fs::File::create(output).expect("create output file");
         let mut w = BufWriter::new(f);
@@ -1461,8 +1476,8 @@ impl MahalanobisClassifier {
 }
 
 impl Embedder for MahalanobisClassifier {
-    fn embed(&self, ch: char, features: &CharFeatures) -> Vec<f32> {
-        MahalanobisClassifier::embed(self, ch, features)
+    fn embed(&self, seq: &[char], features: &CropFeatures) -> Vec<f32> {
+        MahalanobisClassifier::embed(self, seq, features)
     }
     fn name(&self) -> &str { "mahalanobis" }
 }
@@ -1489,7 +1504,7 @@ impl Embedder for MahalanobisClassifier {
 ///   sigma_sq:  f32 LE
 /// ```
 pub struct LdaClassifier {
-    projections: HashMap<char, (usize, Vec<f32>)>, // (out_dim, proj matrix)
+    projections: HashMap<Vec<char>, (usize, Vec<f32>)>, // (out_dim, proj matrix)
 }
 
 impl LdaClassifier {
@@ -1527,24 +1542,24 @@ impl LdaClassifier {
 
         let data = std::fs::read(path)
             .map_err(|e| format!("cannot read {}: {e}", path.display()))?;
-        let model = PerCharModel::read_bin(&data, b"LDAC", None)?;
+        let model = NgramModel::read_bin(&data, b"LDAC", None)?;
 
         // Extract LDA projections from the model
-        let mut projections = HashMap::with_capacity(model.chars.len());
+        let mut projections = HashMap::with_capacity(model.entries.len());
 
-        for (&ch, cm) in &model.chars {
+        for (seq, cm) in &model.entries {
             if cm.weights.is_empty() {
-                return Err(format!("LDA char '{}': empty weights", ch));
+                return Err(format!("LDA seq '{:?}': empty weights", seq));
             }
             let out_dim = cm.weights[0] as usize;
             let proj = cm.weights[1..].to_vec();
             if proj.len() != out_dim * FEAT_LEN {
                 return Err(format!(
-                    "LDA char '{}': proj len {} != {} × {} = {}",
-                    ch, proj.len(), out_dim, FEAT_LEN, out_dim * FEAT_LEN
+                    "LDA seq '{:?}': proj len {} != {} × {} = {}",
+                    seq, proj.len(), out_dim, FEAT_LEN, out_dim * FEAT_LEN
                 ));
             }
-            projections.insert(ch, (out_dim, proj));
+            projections.insert(seq.clone(), (out_dim, proj));
         }
 
         let embedder = Self { projections };
@@ -1555,9 +1570,9 @@ impl LdaClassifier {
         dense_project(out_dim, proj, x)
     }
 
-    fn embed(&self, ch: char, features: &CharFeatures) -> Vec<f32> {
+    fn embed(&self, seq: &[char], features: &CropFeatures) -> Vec<f32> {
         let raw = features.as_slice();
-        if let Some((out_dim, proj)) = self.projections.get(&ch) {
+        if let Some((out_dim, proj)) = self.projections.get(seq) {
             Self::project(*out_dim, proj, &raw)
         } else {
             raw.to_vec()
@@ -1828,7 +1843,7 @@ impl LdaClassifier {
 
         // Write LDAC v4 binary (per-char model: weights + centroids + σ²)
         if let Some(parent) = output.parent() { let _ = std::fs::create_dir_all(parent); }
-        let mut model = PerCharModel::new(ctx.catalog_hash);
+        let mut model = NgramModel::new(ctx.catalog_hash);
         for (c, actual_dim, proj, sigma, class_means) in &lda_chars {
             let mut centroids: Vec<(u32, Vec<f32>)> = Vec::with_capacity(class_means.len());
             for (&fid, mean) in class_means {
@@ -1845,7 +1860,7 @@ impl LdaClassifier {
             weights.push(*actual_dim as f32);
             weights.extend_from_slice(proj);
 
-            let mut cm = CharModel {
+            let mut cm = ImageModel {
                 weights,
                 centroids,
                 sigma_sq: *sigma,
@@ -1853,7 +1868,7 @@ impl LdaClassifier {
             if cm.sigma_sq <= 1e-30 {
                 cm.compute_sigma_sq();
             }
-            model.chars.insert(*c, cm);
+            model.entries.insert(vec![*c], cm);
         }
         let f = std::fs::File::create(output).expect("create output file");
         let mut w = BufWriter::new(f);
@@ -1868,8 +1883,8 @@ impl LdaClassifier {
 }
 
 impl Embedder for LdaClassifier {
-    fn embed(&self, ch: char, features: &CharFeatures) -> Vec<f32> {
-        LdaClassifier::embed(self, ch, features)
+    fn embed(&self, seq: &[char], features: &CropFeatures) -> Vec<f32> {
+        LdaClassifier::embed(self, seq, features)
     }
     fn name(&self) -> &str { "lda" }
 }
@@ -1925,7 +1940,7 @@ impl MlpCharNet {
 ///   W3: [f32; 128×k]   LE, b3: [f32; k]   LE
 /// ```
 pub struct MlpClassifier {
-    nets: HashMap<char, MlpCharNet>,
+    nets: HashMap<Vec<char>, MlpCharNet>,
 }
 
 // MLP hidden layer sizes (must match trainer)
@@ -1968,7 +1983,7 @@ impl MlpClassifier {
                 .ok_or_else(|| format!("invalid codepoint U+{cp:04X}"))?;
             let k = r.read_u32()? as usize;
             if k == 0 {
-                return Err(format!("char '{}': zero classes", ch));
+                return Err(format!("seq '{:?}': zero classes", ch));
             }
 
             // class_map: k × u32
@@ -1985,7 +2000,7 @@ impl MlpClassifier {
             let w3 = r.read_f32s(MLP_H2 * k)?;
             let b3 = r.read_f32s(k)?;
 
-            nets.insert(ch, MlpCharNet {
+            nets.insert(vec![ch], MlpCharNet {
                 fc1: InferenceLinear { rows: FEAT_LEN, cols: MLP_H1, w: w1, b: b1 },
                 fc2: InferenceLinear { rows: MLP_H1, cols: MLP_H2, w: w2, b: b2 },
                 fc3: InferenceLinear { rows: MLP_H2, cols: k, w: w3, b: b3 },
@@ -2263,8 +2278,8 @@ impl MlpClassifier {
 
 impl MlpClassifier {
     /// Compute softmax probabilities for a character query, returning (net, probs) if the char has a net.
-    fn softmax_probs(&self, ch: char, query: &CharFeatures) -> Option<(&MlpCharNet, Vec<f32>)> {
-        let net = self.nets.get(&ch)?;
+    fn softmax_probs(&self, seq: &[char], query: &CropFeatures) -> Option<(&MlpCharNet, Vec<f32>)> {
+        let net = self.nets.get(seq)?;
         let logits = net.forward(&query.as_slice());
         let max_logit = logits.iter().copied().fold(f32::NEG_INFINITY, f32::max);
         let mut probs: Vec<f32> = logits.iter().map(|&l| (l - max_logit).exp()).collect();
@@ -2275,8 +2290,8 @@ impl MlpClassifier {
 }
 
 impl Classifier for MlpClassifier {
-    fn classify(&self, ch: char, query: &CharFeatures, k: usize) -> Vec<(usize, f32)> {
-        if let Some((net, probs)) = self.softmax_probs(ch, query) {
+    fn classify(&self, seq: &[char], query: &CropFeatures, k: usize) -> Vec<(usize, f32)> {
+        if let Some((net, probs)) = self.softmax_probs(seq, query) {
             let mut scored: Vec<(usize, f32)> = net.class_map.iter().enumerate()
                 .map(|(ci, &fid)| (fid as usize, probs[ci]))
                 .collect();
@@ -2289,8 +2304,8 @@ impl Classifier for MlpClassifier {
     }
 
     /// MLP produces probabilities natively via softmax — no σ² needed.
-    fn probabilities(&self, ch: char, query: &CharFeatures) -> Vec<(usize, f32)> {
-        if let Some((net, probs)) = self.softmax_probs(ch, query) {
+    fn probabilities(&self, seq: &[char], query: &CropFeatures) -> Vec<(usize, f32)> {
+        if let Some((net, probs)) = self.softmax_probs(seq, query) {
             let mut scored: Vec<(usize, f32)> = net.class_map.iter().enumerate()
                 .map(|(ci, &fid)| (fid as usize, probs[ci]))
                 .collect();
@@ -2302,8 +2317,8 @@ impl Classifier for MlpClassifier {
         }
     }
 
-    fn probability(&self, ch: char, query: &CharFeatures, glyph_id: usize) -> Option<f32> {
-        let (net, probs) = self.softmax_probs(ch, query)?;
+    fn probability(&self, seq: &[char], query: &CropFeatures, glyph_id: usize) -> Option<f32> {
+        let (net, probs) = self.softmax_probs(seq, query)?;
         for (ci, &fid) in net.class_map.iter().enumerate() {
             if fid as usize == glyph_id {
                 return Some(probs[ci]);
@@ -2316,9 +2331,9 @@ impl Classifier for MlpClassifier {
         "mlp"
     }
 
-    fn glyph_count(&self, ch: char) -> usize {
+    fn glyph_count(&self, seq: &[char]) -> usize {
         // MLP class_map length for the char's network
-        self.nets.get(&ch).map_or(0, |net| net.class_map.len())
+        self.nets.get(seq).map_or(0, |net| net.class_map.len())
     }
 }
 
@@ -2346,8 +2361,8 @@ impl FusionClassifier {
 }
 
 impl Classifier for FusionClassifier {
-    fn classify(&self, ch: char, query: &CharFeatures, k: usize) -> Vec<(usize, f32)> {
-        let mut probs = self.probabilities(ch, query);
+    fn classify(&self, seq: &[char], query: &CropFeatures, k: usize) -> Vec<(usize, f32)> {
+        let mut probs = self.probabilities(seq, query);
         probs.truncate(k);
         probs
     }
@@ -2358,11 +2373,11 @@ impl Classifier for FusionClassifier {
     /// child i's probability and `w_i` is its normalized weight.  This is
     /// equivalent to `(∏ p_i^w_i) / Z`, the weighted geometric mean of
     /// individual posteriors, renormalized.
-    fn probabilities(&self, ch: char, query: &CharFeatures) -> Vec<(usize, f32)> {
+    fn probabilities(&self, seq: &[char], query: &CropFeatures) -> Vec<(usize, f32)> {
         // Collect child probability distributions
         let child_probs: Vec<(f32, HashMap<usize, f32>)> = self.children.iter()
             .map(|(weight, child)| {
-                let probs = child.probabilities(ch, query);
+                let probs = child.probabilities(seq, query);
                 let map: HashMap<usize, f32> = probs.into_iter().collect();
                 (*weight / self.weight_sum, map)
             })
@@ -2402,13 +2417,13 @@ impl Classifier for FusionClassifier {
         "fusion"
     }
 
-    fn glyph_count(&self, ch: char) -> usize {
-        self.children.iter().map(|(_, c)| c.glyph_count(ch)).max().unwrap_or(0)
+    fn glyph_count(&self, seq: &[char]) -> usize {
+        self.children.iter().map(|(_, c)| c.glyph_count(seq)).max().unwrap_or(0)
     }
 
-    fn add_glyph(&mut self, glyph_id: usize, ch: char, features: &CharFeatures) {
+    fn add_glyph(&mut self, glyph_id: usize, seq: &[char], features: &CropFeatures) {
         for (_, child) in &mut self.children {
-            child.add_glyph(glyph_id, ch, features);
+            child.add_glyph(glyph_id, seq, features);
         }
     }
 }
@@ -2612,8 +2627,8 @@ pub fn build_classifier(
         }
         "zncc" => {
             if let Some((_font_dir, render_params)) = auto_train {
-                let gmap_path = crate::glyph_map::GlyphMap::default_path();
-                let glyph_map = crate::glyph_map::GlyphMap::load(&gmap_path)
+                let gmap_path = crate::glyph_map::NgramGlyphMap::default_path();
+                let glyph_map = crate::glyph_map::NgramGlyphMap::load(&gmap_path)
                     .unwrap_or_else(|e| {
                         eprintln!("Cannot load glyph map from {}: {e}", gmap_path.display());
                         eprintln!("Run with --train-lda first to build the glyph map.");
