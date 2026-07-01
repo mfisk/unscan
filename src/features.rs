@@ -17,7 +17,7 @@ use image::{GrayImage, Luma};
 pub const NORM_H: u32 = 24;
 
 /// Number of bins in the column ink density profile.
-/// At NORM_H=24, typical char widths are 10–20 px, so 16 bins avoids
+/// At NORM_H=24, typical glyph widths are 10–20 px, so 16 bins avoids
 /// upsampling noise.  (Was 32 when NORM_H=48.)
 pub const PROFILE_BINS: usize = 16;
 
@@ -111,7 +111,7 @@ pub const SCALAR_V3: usize = 1 + 1 + 1 + 2 + 1 + 4 + 1;
 /// Feature vector length: col_profile + row_profile + original scalars + v2 + v3.
 pub const FEAT_LEN: usize = PROFILE_BINS + ROW_PROFILE_BINS + SCALAR_V1 + SCALAR_V2 + SCALAR_V3;
 
-/// Uniform Fisher weights (placeholder until per-char learned weights are loaded).
+/// Uniform Fisher weights (placeholder until per-sequence learned weights are loaded).
 pub const FISHER_WEIGHTS: [f32; FEAT_LEN] = [1.0 / FEAT_LEN as f32; FEAT_LEN];
 
 /// Canonical feature dimension names, one per FEAT_LEN slot, in as_slice() order.
@@ -207,13 +207,103 @@ pub fn is_supported(c: char) -> bool {
     supported_chars().contains(&c)
 }
 
+/// Common English bigrams (character pairs) for bigram classifiers.
+/// Includes frequent letter pairs, mixed-case pairs for sentence starts,
+/// and letter–punctuation pairs (period, comma) to capture relative size.
+pub fn supported_sequences(n: usize) -> &'static [Vec<char>] {
+    match n {
+        2 => supported_bigrams_internal(),
+        _ => &[],
+    }
+}
+
+fn supported_bigrams_internal() -> &'static [Vec<char>] {
+    static BIGRAMS: std::sync::LazyLock<Vec<Vec<char>>> = std::sync::LazyLock::new(|| {
+        let mut v = Vec::with_capacity(400);
+
+        // Top ~100 lowercase bigrams by English frequency
+        let lc = [
+            "th","he","in","er","an","re","on","at","en","nd",
+            "ti","es","or","te","of","ed","is","it","al","ar",
+            "st","to","nt","ng","se","ha","as","ou","io","le",
+            "ve","co","me","de","hi","ri","ro","ic","ne","ea",
+            "ra","ce","li","ch","ll","be","ma","si","om","ur",
+            "ca","el","ta","la","ns","ge","ly","pe","ec","vi",
+            "nc","no","tr","sh","di","ss","ag","ni","ct","pr",
+            "pl","ad","mi","fo","ow","un","su","us","mo","ol",
+            "wa","pa","do","gi","sa","rs","ex","im","po","we",
+            "ac","il","em","fi","ab","ir","id","ho","lo","op",
+        ];
+        for s in &lc {
+            let mut cs = s.chars();
+            let c1 = cs.next().unwrap();
+            let c2 = cs.next().unwrap();
+            v.push(vec![c1, c2]);
+        }
+
+        // Mixed-case pairs (uppercase + lowercase) for word starts
+        let mc = [
+            "Th","He","In","An","St","Ar","Ma","Re","Al","Se",
+            "Co","De","La","Pr","Ch","Le","Ca","Ha","Be","En",
+            "El","Ne","Mo","Di","Me","Mi","No","Do","Ba","Lo",
+            "To","Ro","Pa","Fo","Wi","Si","Li","Ho","Fi","Ea",
+            "Wh","Gr","Tr","Fr","Cr","Cl","Bl","Fl","Br","Dr",
+            "So","Po","Da","Te","We","Bo","Ri","Ra","Pe","Sh",
+        ];
+        for s in &mc {
+            let mut cs = s.chars();
+            let c1 = cs.next().unwrap();
+            let c2 = cs.next().unwrap();
+            v.push(vec![c1, c2]);
+        }
+
+        // Letter + punctuation pairs: every lowercase/uppercase letter
+        // adjacent to period or comma (captures relative size of punctuation)
+        for c in 'a'..='z' {
+            v.push(vec![c, '.']);
+            v.push(vec![c, ',']);
+        }
+        for c in 'A'..='Z' {
+            v.push(vec![c, '.']);
+            v.push(vec![c, ',']);
+        }
+
+        // Punctuation + uppercase letter (sentence boundaries: ". T")
+        // Less common (usually separated by space) but included for
+        // abbreviation patterns like "U.S." → "S."
+        // Already covered by uppercase + '.' above.
+
+        // Digit pairs for numbers
+        let digits = [
+            "01","10","12","19","20","23","30","45","50","67","89","99",
+        ];
+        for s in &digits {
+            let mut cs = s.chars();
+            let c1 = cs.next().unwrap();
+            let c2 = cs.next().unwrap();
+            v.push(vec![c1, c2]);
+        }
+
+        // Dedup (some bigrams may overlap between categories)
+        v.sort();
+        v.dedup();
+        v
+    });
+    &BIGRAMS
+}
+
+/// Check if a sequence is in the supported set.
+pub fn is_supported_sequence(seq: &[char]) -> bool {
+    supported_sequences(seq.len()).iter().any(|s| s.as_slice() == seq)
+}
+
 // ---------------------------------------------------------------------------
 // Feature vector
 // ---------------------------------------------------------------------------
 
 /// Compact feature vector for one character rendering.
 #[derive(Debug, Clone)]
-pub struct CharFeatures {
+pub struct CropFeatures {
     /// 16-bin column ink density profile (each 0.0–1.0).
     pub profile: [f32; PROFILE_BINS],
     /// Ink width / ink height.
@@ -275,7 +365,7 @@ pub struct CharFeatures {
     pub raster: Option<GrayImage>,
 }
 
-impl CharFeatures {
+impl CropFeatures {
     /// Raw feature vector for serialisation (no normalisation).
     pub fn as_slice(&self) -> [f32; FEAT_LEN] {
         let mut v = [0.0f32; FEAT_LEN];
@@ -396,7 +486,7 @@ fn detect_serif(img: &GrayImage) -> f32 {
 /// When `pre_normalized` is true the caller asserts the image has already
 /// been contrast-normalized (e.g. the word crop was normalized before
 /// segmentation) and the internal normalization pass is skipped.
-pub fn compute_features(img: &GrayImage, pre_normalized: bool) -> Option<CharFeatures> {
+pub fn compute_features(img: &GrayImage, pre_normalized: bool) -> Option<CropFeatures> {
     let img = if pre_normalized {
         std::borrow::Cow::Borrowed(img)
     } else {
@@ -525,7 +615,7 @@ pub fn compute_features(img: &GrayImage, pre_normalized: bool) -> Option<CharFea
 
     let quadrant_density = compute_quadrant_density(&ink_mask, ink_w_u, ink_h_u);
 
-    Some(CharFeatures {
+    Some(CropFeatures {
         profile,
         row_profile,
         aspect,
@@ -1327,13 +1417,13 @@ fn measure_mean_stroke_width(img: &GrayImage) -> f32 {
     (mean / h as f64) as f32
 }
 
-/// Aggregate per-char weighted log-probabilities into a single CI score.
-/// Used by both `identify_glyph` and GT-font injection — one formula,
+/// Aggregate per-observation weighted log-probabilities into a single font score.
+/// Used by both `identify_fonts` and GT-font injection — one formula,
 /// one implementation.  Higher = better (higher probability = better match).
 ///
-/// Input: `(ln(prob), char_weight)` pairs for each matched character.
-/// Missing glyphs (matched < n_total_chars) get probability 0 → ln(0) = −∞,
-/// guaranteeing a font that can't render a character can never win.
+/// Input: `(ln(prob), weight)` pairs for each matched observation (unigram or bigram).
+/// Missing glyphs (matched < n_windows) get probability 0 → ln(0) = −∞,
+/// guaranteeing a font that can't render an observation can never win.
 
 pub fn normalize_to_ink_bounds(img: &GrayImage, target_h: u32) -> Option<GrayImage> {
     let (w, h) = img.dimensions();

@@ -3,8 +3,8 @@
 //! When `--audit <path>` is given, unprint parses the vector
 //! PDF upfront and builds a per-page spatial index of text spans with their font
 //! names.  During per-line processing, each matched font is immediately compared
-//! against ground truth: hits skip expensive audit I/O (crop PNGs, per-char
-//! per-char distances, font ref glyphs); misses get full audit detail.
+//! against ground truth: hits skip expensive audit I/O (crop PNGs, per-observation
+//! distances, font ref glyphs); misses get full audit detail.
 
 use lopdf::Document;
 use std::collections::HashMap;

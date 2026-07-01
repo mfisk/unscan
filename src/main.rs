@@ -26,6 +26,7 @@ pub mod ground_truth;
 pub mod report;
 mod font_pipeline;
 mod zncc_classifier;
+mod ngram;
 
 use crate::audit::{AuditEntry, AuditLog, BBox, GeometryEntry, PageSummary};
 
@@ -127,23 +128,24 @@ fn build_audit_entry(
     keep_raster: bool,
     reason: &str,
 ) -> AuditEntry {
-    use audit::{BBox, CiCandidate, CharCiVote, Decision, WordBBox};
+    use audit::{BBox, FontCandidate, ObservationVote, Decision, WordBBox};
     let font_result = &lm.font_result;
-    let char_vote = |d: &font_match::CharMatchDetail, with_ranks: bool| {
-        CharCiVote {
-            ch: d.ch,
+    let obs_vote = |d: &font_match::ObservationDetail, with_ranks: bool| {
+        ObservationVote {
+            seq: d.seq.clone(),
+            weight: d.weight,
             crop_index: d.crop_index,
             best_prob: d.best_prob,
             passed_gate: d.passed_gate,
             nearest: d.nearest.clone(),
             crop_path: None,
-            chosen_rank: if with_ranks { lm.chosen_char_ranks.get(&d.crop_index).copied() } else { None },
+            chosen_rank: if with_ranks { lm.chosen_obs_ranks.get(&d.crop_index).copied() } else { None },
             ocr_corrected_from: d.ocr_corrected_from,
             best_alt_char: d.best_alt_char,
             best_alt_dist: d.best_alt_dist,
-            gt_font_rank: if with_ranks { lm.gt_font_char_ranks.get(&d.crop_index).copied() } else { None },
-            chosen_prob: if with_ranks { lm.chosen_char_probs.get(&d.crop_index).copied() } else { None },
-            gt_font_prob: if with_ranks { lm.gt_font_char_probs.get(&d.crop_index).copied() } else { None },
+            gt_font_rank: if with_ranks { lm.gt_font_obs_ranks.get(&d.crop_index).copied() } else { None },
+            chosen_prob: if with_ranks { lm.chosen_obs_probs.get(&d.crop_index).copied() } else { None },
+            gt_font_prob: if with_ranks { lm.gt_font_obs_probs.get(&d.crop_index).copied() } else { None },
         }
     };
     AuditEntry {
@@ -152,20 +154,21 @@ fn build_audit_entry(
         text: line.text.clone(),
         ocr_confidence: line.confidence,
         font_matched: font_result.as_ref().map(|f| f.font_name.clone()),
+        font_key_matched: font_result.as_ref().map(|f| f.font_key.clone()),
         font_confidence: font_result.as_ref().map(|f| f.score),
         similarity_score,
         similarity_pass,
         decision: if keep_raster { Decision::KeptRaster } else { Decision::Vectorized },
         reason: reason.to_string(),
         bbox: BBox { x: line.x, y: line.y, width: line.width, height: line.height },
-        ci_candidates: lm.ci_top_for_audit.iter()
-            .map(|(fk, s)| CiCandidate { font_key: fk.clone(), score: *s })
+        font_candidates: lm.font_scores.iter()
+            .map(|(fk, s)| FontCandidate { font_key: fk.clone(), score: *s })
             .collect(),
-        ci_char_votes: lm.ci_char_detail.iter().map(|d| char_vote(d, true)).collect(),
-        ci_candidates_lig: lm.ci_top_for_audit_lig.iter()
-            .map(|(fk, s)| CiCandidate { font_key: fk.clone(), score: *s })
+        obs_votes: lm.observations.iter().map(|d| obs_vote(d, true)).collect(),
+        font_candidates_lig: lm.font_scores_lig.iter()
+            .map(|(fk, s)| FontCandidate { font_key: fk.clone(), score: *s })
             .collect(),
-        ci_char_votes_lig: lm.ci_char_detail_lig.iter().map(|d| char_vote(d, false)).collect(),
+        obs_votes_lig: lm.observations_lig.iter().map(|d| obs_vote(d, false)).collect(),
         seg_winner: lm.seg_winner.clone(),
         word_bboxes: line.words.iter().map(|w| WordBBox {
             text: w.text.clone(), x: w.x, y: w.y, width: w.width, height: w.height, confidence: w.confidence,
@@ -186,7 +189,7 @@ fn write_audit_report(
     ground_truth: Option<&ground_truth::GroundTruth>,
     dpi: u32,
     font_entries: &[font_scan::FontEntry],
-    glyph_map: &glyph_map::GlyphMap,
+    glyph_map: &glyph_map::NgramGlyphMap,
     args: &cli::Args,
     elapsed: std::time::Duration,
 ) {
@@ -239,8 +242,8 @@ fn run(args: &cli::Args, classifier: &mut dyn classifier::Classifier) -> Result<
     }
 
     // Load glyph map (glyph dedup groups) — required; run --train-lda first.
-    let gmap_path = glyph_map::GlyphMap::default_path();
-    let glyph_map = glyph_map::GlyphMap::load(&gmap_path)
+    let gmap_path = glyph_map::NgramGlyphMap::default_path();
+    let glyph_map = glyph_map::NgramGlyphMap::load(&gmap_path)
         .unwrap_or_else(|e| {
             eprintln!("Error: could not load glyph-map.bin ({e})");
             eprintln!("  expected at: {}", gmap_path.display());
@@ -341,13 +344,14 @@ fn run(args: &cli::Args, classifier: &mut dyn classifier::Classifier) -> Result<
 
         // ── Pass 1: Match all lines ──────────────────────────────────
         let fontmatch_start = std::time::Instant::now();
-        let (line_matches, fp_hits) = font_pipeline::match_lines(
+        let (mut line_matches, fp_hits) = font_pipeline::match_lines(
             &lines, &gray_page, page_img, page_num,
             &font_registry, &font_cache, classifier,
             &glyph_map,
             ground_truth.as_ref(),
             dominant_font_candidate.as_ref(),
             args,
+            None,
         );
 
         // Update dominant font candidate for next page
@@ -355,11 +359,11 @@ fn run(args: &cli::Args, classifier: &mut dyn classifier::Classifier) -> Result<
             dominant_font_candidate = Some(new_dom);
         }
 
-        let ci_lines = lines.len() as u64 - fp_hits;
+        let scored_lines = lines.len() as u64 - fp_hits;
         let _fontmatch_elapsed = fontmatch_start.elapsed();
         if fp_hits > 0 {
         }
-        if ci_lines > 0 {
+        if scored_lines > 0 {
         }
 
         // ── Pass 1.5: Paragraph-level font grouping ─────────────────
@@ -367,6 +371,7 @@ fn run(args: &cli::Args, classifier: &mut dyn classifier::Classifier) -> Result<
 
         // ── Word split: split wide whitespace using matched fonts ──
         let _t_split = std::time::Instant::now();
+        let split_indices;
         {
             let line_fonts: Vec<Option<std::sync::Arc<Vec<u8>>>> = line_matches.iter()
                 .map(|lm| {
@@ -375,7 +380,29 @@ fn run(args: &cli::Args, classifier: &mut dyn classifier::Classifier) -> Result<
                     })
                 })
                 .collect();
-            ocr::split_wide_whitespace_words(&mut lines, &gray_page, ink_thresh, &line_fonts);
+            split_indices = ocr::split_wide_whitespace_words(&mut lines, &gray_page, ink_thresh, &line_fonts);
+        }
+
+        // ── Pass 1b: Re-score only lines whose words were split ─────
+        if !split_indices.is_empty() {
+            let split_set: std::collections::HashSet<usize> = split_indices.iter().copied().collect();
+            let (mut new_matches, _) = font_pipeline::match_lines(
+                &lines, &gray_page, page_img, page_num,
+                &font_registry, &font_cache, classifier,
+                &glyph_map,
+                ground_truth.as_ref(),
+                dominant_font_candidate.as_ref(),
+                args,
+                Some(&split_set),
+            );
+            for li in split_indices {
+                std::mem::swap(&mut line_matches[li], &mut new_matches[li]);
+                // After swap, new_matches[li] holds pass 1's stale LineMatch.
+                // Remove its diag dir so the report finds pass 2's dir.
+                if let Some(old_dir) = new_matches[li].diag_seg_dir.as_ref() {
+                    let _ = std::fs::remove_dir_all(old_dir);
+                }
+            }
         }
 
         // ── Pass 2a: Parallel similarity (ZNCC) verification ────────
@@ -476,7 +503,7 @@ fn run(args: &cli::Args, classifier: &mut dyn classifier::Classifier) -> Result<
                     "font_matched": fname,
                     "font_score": fscore,
                     "similarity_score": similarity_score,
-                    "ci_top_5": lm.ci_top_for_audit.iter().take(5)
+                    "font_scores_top_5": lm.font_scores.iter().take(5)
                         .map(|(gid, s)| serde_json::json!({"glyph_id": gid, "score": s}))
                         .collect::<Vec<_>>(),
                     "decision": if keep_raster { "raster" } else { "vectorized" },

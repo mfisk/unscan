@@ -27,7 +27,7 @@ pub struct TrainingContext<'a> {
     pub char_counts: &'a [usize],
     pub font_family: &'a [u32],
     pub font_id_map: &'a HashMap<String, u32>,
-    pub glyph_map: &'a crate::glyph_map::GlyphMap,
+    pub glyph_map: &'a crate::glyph_map::NgramGlyphMap,
     pub n_families: usize,
     pub multi_variant_families: usize,
     pub min_fonts: usize,
@@ -47,9 +47,9 @@ impl<'a> TrainingContext<'a> {
     /// Build a glyph_id → family_id mapping for a given character.
     /// Uses the first font in each glyph group to determine the family.
     pub fn glyph_family_for_char(&self, ch: char) -> Vec<u32> {
-        let n = self.glyph_map.glyph_count(ch);
+        let n = self.glyph_map.glyph_count(&[ch]);
         (0..n).map(|gid| {
-            let fonts = self.glyph_map.fonts_for_glyph(ch, gid);
+            let fonts = self.glyph_map.fonts_for_glyph(&[ch], gid);
             if let Some(fk) = fonts.first() {
                 if let Some(&fid) = self.font_id_map.get(fk.as_str()) {
                     return self.font_family[fid as usize];
@@ -723,7 +723,7 @@ pub fn run_train(mut args: TrainArgs) {
     // ── Pre-warm character render cache + build GlyphMap ──
     // Render every (font, char) at default params, capturing the content hash.
     // Identical renders share a hash → same glyph equivalence class.
-    let glyph_map = {
+    let mut glyph_map = {
         use std::sync::atomic::{AtomicUsize, Ordering};
         let prewarm_done = AtomicUsize::new(0);
         let prewarm_total = catalog.len();
@@ -731,8 +731,8 @@ pub fn run_train(mut args: TrainArgs) {
             prewarm_total, chars.len());
         let prewarm_t0 = std::time::Instant::now();
 
-        // Each font returns Vec<(char, hash, font_key)> for GlyphMap construction
-        let per_font_hashes: Vec<Vec<(char, u64, String)>> = catalog.par_iter().map(|fe| {
+        // Each font returns Vec<(Vec<char>, hash, font_key)> for GlyphMap construction
+        let per_font_hashes: Vec<Vec<(Vec<char>, u64, String)>> = catalog.par_iter().map(|fe| {
             let font_data = match std::fs::read(&fe.path) {
                 Ok(d) => d,
                 Err(_) => {
@@ -759,8 +759,8 @@ pub fn run_train(mut args: TrainArgs) {
             for &c in chars {
                 let gid_override = overrides
                     .and_then(|ovs| ovs.iter().find(|(ch, _)| *ch == c).map(|(_, g)| ab_glyph::GlyphId(*g)));
-                if let Some((hash, _img)) = crate::char_render::get_rendered_char_default(&font, c, gid_override) {
-                    hashes.push((c, hash, fk.clone()));
+                if let Some((hash, _img)) = crate::char_render::render_ngram_default(&font, &[c], &[gid_override]) {
+                    hashes.push((vec![c], hash, fk.clone()));
                 }
             }
             let done = prewarm_done.fetch_add(1, Ordering::Relaxed) + 1;
@@ -771,7 +771,7 @@ pub fn run_train(mut args: TrainArgs) {
         }).collect();
 
         // Merge into GlyphMap: (char, hash) → Vec<font_key>
-        let mut hash_groups: HashMap<char, HashMap<u64, Vec<String>>> = HashMap::new();
+        let mut hash_groups: HashMap<Vec<char>, HashMap<u64, Vec<String>>> = HashMap::new();
         for font_hashes in per_font_hashes {
             for (ch, hash, font_key) in font_hashes {
                 hash_groups.entry(ch).or_default()
@@ -781,20 +781,24 @@ pub fn run_train(mut args: TrainArgs) {
         }
 
         // Convert to GlyphMap groups (deterministic ordering by first font_key in each group)
-        let mut groups: HashMap<char, Vec<Vec<String>>> = HashMap::with_capacity(hash_groups.len());
+        let mut groups: HashMap<Vec<char>, Vec<Vec<String>>> = HashMap::with_capacity(hash_groups.len());
         let mut total_glyphs = 0usize;
         let mut total_deduped = 0usize;
         for (ch, by_hash) in &hash_groups {
             let mut char_groups: Vec<Vec<String>> = by_hash.values().cloned().collect();
-            // Sort groups by first font_key for determinism
+            // Sort fonts within each group first (Rayon order is non-deterministic)
+            for group in &mut char_groups {
+                group.sort();
+            }
+            // Then sort groups by first font_key for deterministic glyph_id assignment
             char_groups.sort_by(|a, b| a[0].cmp(&b[0]));
             total_glyphs += char_groups.len();
             total_deduped += char_groups.iter().filter(|g| g.len() > 1).map(|g| g.len() - 1).sum::<usize>();
-            groups.insert(*ch, char_groups);
+            groups.insert(ch.clone(), char_groups);
         }
 
-        let gmap = crate::glyph_map::GlyphMap { groups, catalog_hash };
-        let gmap_path = crate::glyph_map::GlyphMap::default_path();
+        let gmap = crate::glyph_map::NgramGlyphMap { groups, catalog_hash };
+        let gmap_path = crate::glyph_map::NgramGlyphMap::default_path();
         gmap.write_bin(&gmap_path).expect("write glyph-map.bin");
         eprintln!("  GlyphMap: {} unique glyphs across {} chars ({} duplicate renders eliminated)",
             total_glyphs, gmap.groups.len(), total_deduped);
@@ -913,7 +917,7 @@ pub fn run_train(mut args: TrainArgs) {
 
                     // Look up this font's glyph_id for this char.
                     // If the font didn't render this char (not in GlyphMap), skip.
-                    let glyph_id = match glyph_map.glyph_id_for_font(c, &fk) {
+                    let glyph_id = match glyph_map.glyph_id_for_font(&[c], &fk) {
                         Some(id) => id as u32,
                         None => continue,
                     };
@@ -921,7 +925,7 @@ pub fn run_train(mut args: TrainArgs) {
                     // Skip if we're not the representative font for this glyph group.
                     // All fonts in a group produce identical renders → identical features,
                     // so we only need one sample per glyph_id per combo.
-                    let rep_font = &glyph_map.fonts_for_glyph(c, glyph_id as usize)[0];
+                    let rep_font = &glyph_map.fonts_for_glyph(&[c], glyph_id as usize)[0];
                     if *rep_font != fk {
                         continue;
                     }
@@ -933,8 +937,8 @@ pub fn run_train(mut args: TrainArgs) {
                         let mut params = args.render_params.clone();
                         params.height = ht;
                         params.aa = all_aa[aa_idx_all];
-                        let img = match crate::char_render::get_rendered_char(
-                            &font, c, gid_override, &params,
+                        let img = match crate::char_render::render_ngram(
+                            &font, &[c], &[gid_override], &params,
                         ) {
                             Some((_hash, img)) => img,
                             None => continue,
@@ -1082,6 +1086,16 @@ pub fn run_train(mut args: TrainArgs) {
             render_params: &args.render_params,
         };
         classifier::LdaClassifier::train_with_params(&ctx, &args.output, args.lda_dims, args.lda_reg);
+
+        // ── Bigram training (extends the model written above) ─────────
+        eprintln!("\n=== Bigram classifier training ===");
+        crate::ngram::build_ngram_glyph_map(&catalog, &mut glyph_map);
+        crate::ngram::generate_ngram_training_data(&catalog, &glyph_map, &args.render_params);
+        crate::ngram::train_ngram_lda(
+            &glyph_map, &font_id_map, &font_family, &args.output,
+            args.lda_dims, args.lda_reg,
+        );
+
         return;
     }
 

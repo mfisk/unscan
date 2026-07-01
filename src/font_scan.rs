@@ -185,7 +185,7 @@ impl FontRegistry {
 }
 
 /// Glyph override map for OT variant entries (e.g. smcp, onum).
-/// Maps character → overridden glyph ID so the CI renders the correct variant glyph.
+/// Maps character → overridden glyph ID so the font matching renders the correct variant glyph.
 pub type GlyphOverrides = Option<Vec<(char, u16)>>;
 
 /// Variable-font axis coordinates to apply before rendering.
@@ -319,7 +319,7 @@ pub fn scan_fonts(dirs: &[PathBuf]) -> Vec<FontEntry> {
 
                 // ── Variable font weight instances ──────────────────────
                 // If the font has a wght axis, emit additional entries at
-                // each named-instance weight so the CI indexes bold/light/
+                // each named-instance weight so the font matcher indexes bold/light/
                 // etc. renderings from the same file.
                 let weight_instances = detect_weight_instances(path, fe.class);
                 for wi in &weight_instances {
@@ -1017,10 +1017,21 @@ pub struct FontIdentity {
 
 impl FontIdentity {
 
-    /// Two fonts are a "major" difference if family or italic differ.
-    /// Weight differences within the same family+italic are always minor.
+    /// Strip optical-size suffixes (Caption, SmText, Subhead, Display)
+    /// so "Source Serif 4 SmText" and "Source Serif 4" compare equal.
+    fn root_family(family: &str) -> &str {
+        for suffix in &[" Display", " Subhead", " SmText", " Caption"] {
+            if let Some(stripped) = family.strip_suffix(suffix) {
+                return stripped;
+            }
+        }
+        family
+    }
+
+    /// Two fonts are a "major" difference if root family or italic differ.
+    /// Weight and optical-size differences within the same family are minor.
     pub fn is_major_diff(&self, other: &FontIdentity) -> bool {
-        self.family != other.family
+        Self::root_family(&self.family) != Self::root_family(&other.family)
             || self.italic != other.italic
     }
 }

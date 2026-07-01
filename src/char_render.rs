@@ -1,17 +1,18 @@
-//! Single shared character rendering + caching module.
+//! Unified n-gram rendering + caching module.
 //!
-//! All callers that need a rendered font character image go through
-//! `get_rendered_char()` or its convenience wrapper `get_rendered_char_default()`.
+//! All callers that need rendered font glyph images go through
+//! `render_ngram()` or its convenience wrapper `render_ngram_default()`.
+//! Single characters are single-element sequences: `&['a']`.
 //!
 //! Pipeline (always this order):
-//! 1. Render glyph at `height * render_scale` ink height via ab_glyph
+//! 1. Render glyphs at shared em-size so tallest fills `height * render_scale`
 //! 2. `normalize_to_ink_bounds()` — find ink, crop with 1px pad, Lanczos3 resize to `height`
-//! 3. If `binarize_threshold` is Some(t): `binarize(&img, t)` — AFTER normalize
-//! 4. Return image
+//! 3. Apply AA variant
+//! 4. If `binarize_threshold` is Some(t): binarize
+//! 5. Hash → cache as PNG under `~/.cache/unprint/chars/`
 //!
-//! Rendered images are cached as PNGs under `~/.cache/unprint/chars/`,
-//! addressed by content hash (not font key) so identical renders are
-//! stored exactly once.
+//! Cache path: `chars/h{H}_s{S}/{aa}_{binarize}/{seq_dir}/{hash}.png`
+//! where `seq_dir` is `U+0061` for a single char or `U+0066_U+0069` for a bigram.
 
 use std::path::PathBuf;
 
@@ -27,8 +28,7 @@ use crate::glyph_map;
 pub struct RenderParams {
     /// Target normalized height in pixels (default: NORM_H = 24).
     pub height: u32,
-    /// Multiplier for hi-res render before downscale (default: 3, simulates ~300dpi).
-    /// A value of 1 means render directly at `height` (no downscale).
+    /// Multiplier for hi-res render before downscale (default: 1).
     pub render_scale: u32,
     /// Antialiasing variant applied after rendering (default: Native).
     pub aa: AaVariant,
@@ -59,10 +59,18 @@ fn dirs_cache_dir() -> PathBuf {
         .unwrap_or_else(|_| PathBuf::from(".cache/unprint"))
 }
 
-/// Build the hash-addressed cache path for a rendered glyph image.
-/// Structure: chars/h{H}_s{S}/{aa}_{binarize}/U+XXXX/{hash}.png
-fn hash_cache_path(
-    c: char,
+/// Build the sequence directory name: `U+0061` for len-1, `U+0066_U+0069` for len-2, etc.
+fn seq_dir_name(seq: &[char]) -> String {
+    seq.iter()
+        .map(|&c| format!("U+{:04X}", c as u32))
+        .collect::<Vec<_>>()
+        .join("_")
+}
+
+/// Build the hash-addressed cache path for a rendered ngram image.
+/// Structure: chars/h{H}_s{S}/{aa}_{binarize}/{seq_dir}/{hash}.png
+fn ngram_cache_path(
+    seq: &[char],
     img_hash: u64,
     params: &RenderParams,
 ) -> PathBuf {
@@ -72,20 +80,19 @@ fn hash_cache_path(
         None => "bnone".to_string(),
     };
     let aa_dir = format!("{}_{}", params.aa.name(), binarize_tag);
-    let char_dir = format!("U+{:04X}", c as u32);
     let fname = format!("{}.png", glyph_map::hash_hex(img_hash));
 
-    cache_dir().join(params_dir).join(aa_dir).join(char_dir).join(fname)
+    cache_dir().join(params_dir).join(aa_dir).join(seq_dir_name(seq)).join(fname)
 }
 
-/// Load a cached glyph image by its content hash.
+/// Load a cached ngram image by its content hash.
 /// Returns `None` if no cached image exists for this hash.
-pub fn load_cached_glyph(
-    c: char,
+pub fn load_cached_ngram(
+    seq: &[char],
     img_hash: u64,
     params: &RenderParams,
 ) -> Option<GrayImage> {
-    let path = hash_cache_path(c, img_hash, params);
+    let path = ngram_cache_path(seq, img_hash, params);
     if path.exists() {
         image::open(&path).ok().map(|d| d.to_luma8())
     } else {
@@ -93,35 +100,28 @@ pub fn load_cached_glyph(
     }
 }
 
-/// Return the filesystem path for a hash-addressed cached glyph image.
-pub fn glyph_cache_path(
-    c: char,
-    img_hash: u64,
-    params: &RenderParams,
-) -> PathBuf {
-    hash_cache_path(c, img_hash, params)
-}
-
-
-/// Render a character image through the canonical pipeline, with
-/// hash-addressed caching.
+/// Render an n-gram (one or more adjacent characters) through the canonical
+/// pipeline, with hash-addressed caching.
 ///
-/// Returns `None` if the font doesn't contain the glyph.
+/// All glyphs are rendered at the same em-size — the tallest glyph fills
+/// `params.height` and shorter glyphs appear proportionally smaller.
+/// Adjacent glyphs include kerning. For a single character, this degenerates
+/// to scaling that character's ink to fill the height.
+///
+/// Returns `None` if any glyph in the sequence is missing from the font.
 /// Returns `Some((hash, image))` — the content hash uniquely identifies
 /// the rendered image and is used as the glyph_id key.
-pub fn get_rendered_char<F: Font>(
+pub fn render_ngram<F: Font>(
     font: &F,
-    c: char,
-    glyph_id_override: Option<GlyphId>,
+    seq: &[char],
+    gid_overrides: &[Option<GlyphId>],
     params: &RenderParams,
 ) -> Option<(u64, GrayImage)> {
-    // Always render (we need the image to compute the hash).
-    // The cache deduplicates storage — identical images share a file.
-    let img = render_char_fresh(font, c, glyph_id_override, params)?;
+    let img = render_ngram_fresh(font, seq, gid_overrides, params)?;
     let img_hash = glyph_map::hash_image(&img);
 
     // Save to hash-addressed cache (best-effort, skip if already exists)
-    let path = hash_cache_path(c, img_hash, params);
+    let path = ngram_cache_path(seq, img_hash, params);
     if !path.exists() {
         if let Some(parent) = path.parent() {
             let _ = std::fs::create_dir_all(parent);
@@ -133,40 +133,119 @@ pub fn get_rendered_char<F: Font>(
 }
 
 /// Convenience: render with default params (height=NORM_H, scale=1, native AA, no binarize).
-pub fn get_rendered_char_default<F: Font>(
+pub fn render_ngram_default<F: Font>(
     font: &F,
-    c: char,
-    glyph_id_override: Option<GlyphId>,
+    seq: &[char],
+    gid_overrides: &[Option<GlyphId>],
 ) -> Option<(u64, GrayImage)> {
-    get_rendered_char(font, c, glyph_id_override, &RenderParams::default())
+    render_ngram(font, seq, gid_overrides, &RenderParams::default())
 }
 
 /// The actual rendering pipeline — no caching.
-fn render_char_fresh<F: Font>(
+fn render_ngram_fresh<F: Font>(
     font: &F,
-    c: char,
-    glyph_id_override: Option<GlyphId>,
+    seq: &[char],
+    gid_overrides: &[Option<GlyphId>],
     params: &RenderParams,
 ) -> Option<GrayImage> {
-    let gid = match glyph_id_override {
-        Some(g) => g,
-        None => font.glyph_id(c),
-    };
-    if gid.0 == 0 {
+    if seq.is_empty() {
         return None;
     }
 
-    // Step 1: Render at hi-res (height * render_scale ink height)
-    let target_ink_h = params.height * params.render_scale;
-    let canvas = render_glyph_at_ink_height(font, gid, target_ink_h)?;
+    // Resolve glyph IDs
+    let gids: Vec<GlyphId> = seq.iter().enumerate().map(|(i, &c)| {
+        gid_overrides.get(i).copied().flatten().unwrap_or_else(|| font.glyph_id(c))
+    }).collect();
 
-    // Step 2: normalize_to_ink_bounds — crop to ink, 1px pad, Lanczos3 resize to params.height
+    // All must have glyphs
+    if gids.iter().any(|g| g.0 == 0) {
+        return None;
+    }
+
+    // Measure ink heights at a reference em-size to find the tallest glyph
+    let ref_h = 200.0f32;
+    let ref_scale = PxScale::from(ref_h);
+    let sf_ref = font.as_scaled(ref_scale);
+
+    let measure_ink_h = |gid: GlyphId| -> Option<f32> {
+        let g = gid.with_scale_and_position(ref_scale, point(0.0, sf_ref.ascent()));
+        let outlined = font.outline_glyph(g)?;
+        let b = outlined.px_bounds();
+        Some(b.max.y - b.min.y)
+    };
+
+    let mut max_ink_h = 0.0f32;
+    for &gid in &gids {
+        let h = measure_ink_h(gid)?;
+        if h > max_ink_h {
+            max_ink_h = h;
+        }
+    }
+    if max_ink_h < 1.0 {
+        return None;
+    }
+
+    // Scale so the tallest glyph's ink height = target
+    let target_ink_h = params.height * params.render_scale;
+    let target_scale = ref_h * (target_ink_h as f32 / max_ink_h);
+    let scale = PxScale::from(target_scale);
+    let sf = font.as_scaled(scale);
+    let baseline_y = sf.ascent();
+
+    // Position glyphs with advances and kerning
+    let mut x_pos = Vec::with_capacity(gids.len());
+    x_pos.push(0.0f32);
+    for i in 1..gids.len() {
+        let prev_x = x_pos[i - 1];
+        x_pos.push(prev_x + sf.h_advance(gids[i - 1]) + sf.kern(gids[i - 1], gids[i]));
+    }
+
+    // Outline all glyphs and compute combined bounding box
+    let mut outlines = Vec::with_capacity(gids.len());
+    let mut min_x = f32::MAX;
+    let mut min_y = f32::MAX;
+    let mut max_x = f32::MIN;
+    let mut max_y = f32::MIN;
+
+    for (i, &gid) in gids.iter().enumerate() {
+        let g = gid.with_scale_and_position(scale, point(x_pos[i], baseline_y));
+        let outlined = font.outline_glyph(g)?;
+        let b = outlined.px_bounds();
+        min_x = min_x.min(b.min.x);
+        min_y = min_y.min(b.min.y);
+        max_x = max_x.max(b.max.x);
+        max_y = max_y.max(b.max.y);
+        outlines.push(outlined);
+    }
+
+    let img_w = (max_x - min_x).ceil() as u32 + 2;
+    let img_h = (max_y - min_y).ceil() as u32 + 2;
+    if img_w == 0 || img_h == 0 || img_w > 4000 || img_h > 2000 {
+        return None;
+    }
+
+    let mut canvas = GrayImage::from_pixel(img_w, img_h, Luma([255u8]));
+    let ox = min_x.floor() as i32;
+    let oy = min_y.floor() as i32;
+
+    for outlined in &outlines {
+        let ob = outlined.px_bounds();
+        outlined.draw(|gx, gy, cov| {
+            let px = gx as i32 + (ob.min.x.floor() as i32) - ox + 1;
+            let py = gy as i32 + (ob.min.y.floor() as i32) - oy + 1;
+            if px >= 0 && py >= 0 && (px as u32) < img_w && (py as u32) < img_h {
+                let val = (255.0 * (1.0 - cov)) as u8;
+                let cur = canvas.get_pixel(px as u32, py as u32).0[0];
+                canvas.put_pixel(px as u32, py as u32, Luma([cur.min(val)]));
+            }
+        });
+    }
+
+    // Normalize: ink-crop, 1px pad, resize to params.height
     let normalized = features::normalize_to_ink_bounds(&canvas, params.height)?;
 
-    // Step 3: apply AA variant (AFTER normalize, BEFORE binarize)
+    // Apply AA variant and optional binarization
     let aa_applied = params.aa.apply(&normalized);
-
-    // Step 4: binarize if requested (AFTER AA)
     match params.binarize_threshold {
         Some(t) => Some(features::binarize(&aa_applied, t)),
         None => Some(aa_applied),
@@ -176,7 +255,6 @@ fn render_char_fresh<F: Font>(
 /// Render a glyph at a specific ink height (in pixels).
 /// Returns the raw rendered canvas (grayscale, white background, black ink).
 pub fn render_glyph_at_ink_height<F: Font>(font: &F, gid: GlyphId, target_ink_h: u32) -> Option<GrayImage> {
-    // Measure ink height at a reference scale
     let ref_h = 200.0f32;
     let ref_scale = PxScale::from(ref_h);
     let sf_ref = font.as_scaled(ref_scale);
@@ -189,7 +267,6 @@ pub fn render_glyph_at_ink_height<F: Font>(font: &F, gid: GlyphId, target_ink_h:
         return None;
     }
 
-    // Scale to get target ink height
     let target_scale = ref_h * (target_ink_h as f32 / ink_h_ref);
     let scale = PxScale::from(target_scale);
     let sf = font.as_scaled(scale);
@@ -276,7 +353,7 @@ pub fn render_ref_chars_and_exit(json_str: &str) -> ! {
         if font.glyph_id(c).0 == 0 {
             continue;
         }
-        if let Some((_hash, img)) = get_rendered_char_default(&font, c, None) {
+        if let Some((_hash, img)) = render_ngram_default(&font, &[c], &[None]) {
             let fname = format!("U+{:04X}.png", c as u32);
             let _ = img.save(out.join(&fname));
             rendered += 1;
