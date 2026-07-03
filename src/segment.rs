@@ -74,26 +74,15 @@ fn ink_score(darkness: f32, row: usize, row_ink: &[f32]) -> f32 {
 #[inline]
 fn delta_ink_score(
     dark_cur: f32, dark_prev: f32,
-    row_cur: usize, _row_prev: usize,
-    row_ink: &[f32], max_ink: f32,
+    _row_cur: usize, _row_prev: usize,
+    _row_ink: &[f32], max_ink: f32,
 ) -> f32 {
     if dark_cur <= dark_prev { return 0.0; }
+    if !dark_cur.is_finite() || !dark_prev.is_finite() { return f32::INFINITY; }
     let p = seam_params();
+    // Linear edge penalty: k × (dc - dp).  Path-independent.
     let delta = dark_cur - dark_prev;
-    let base = if p.delta_power == 1.0 { delta } else { delta.powf(p.delta_power) };
-    let scale = if p.delta_scale_power == 1.0 {
-        dark_cur / max_ink
-    } else {
-        (dark_cur / max_ink).powf(p.delta_scale_power)
-    };
-    let row_factor = if p.delta_row_weight == 0.0 {
-        1.0
-    } else {
-        let ri = if p.delta_row_power == 1.0 { row_ink[row_cur] }
-                 else { row_ink[row_cur].powf(p.delta_row_power) };
-        1.0 + p.delta_row_weight * ri
-    };
-    p.delta_weight * base * scale * row_factor
+    p.delta_weight * delta
 }
 
 /// Fraction of the crop height that represents the smallest symbol
@@ -931,6 +920,8 @@ fn candidate_seams(
         let split_col = seg_start + c as u32;
         dp_candidates.push((split_col, combined));
     }
+
+    // Second pass: trace each DP candidate's path and adjust cost
 
     // Vertical-only candidates: score each column as a straight vertical
     // cut, discounting ink where the horizontal dark run through the
