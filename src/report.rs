@@ -817,14 +817,10 @@ fn build_scan_line_with_overlays(diag_dir: &Path, entry: &AuditEntry) -> String 
                             if let Some(col_px) = px.as_u64() {
                                 let px_x = wx + (col_px as f64 * sx_f) as u32;
                                 let px_y = wy + (row_idx as f64 * sy_f) as u32;
-                                let dot_pad = scale.max(1) / 3;
                                 overlays.push_str(&format!(
-                                    "<div style=\"position:absolute;left:{}px;top:{px_y}px;\
-                                     width:{}px;height:{}px;\
+                                    "<div style=\"position:absolute;left:{px_x}px;top:{px_y}px;\
+                                     width:1px;height:1px;\
                                      background:rgba(255,0,200,0.8);pointer-events:none;\"></div>",
-                                    px_x.saturating_sub(dot_pad),
-                                    dot_pad * 2 + 1,
-                                    scale.max(1),
                                 ));
                             }
                         }
@@ -1607,7 +1603,7 @@ img.ci {
 }
 .ssim-compare-img {
   max-width: 100%; image-rendering: pixelated;
-  border: 1px solid #ddd; display: block; margin: 2px 0;
+  display: block;
 }
 .tie-break-block {
   margin: 8px 0 10px 0; padding: 8px; background: #fff8f0;

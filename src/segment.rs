@@ -23,9 +23,9 @@ struct SeamParams {
     delta_scale_power: f32, // exponent on cur_dark/max_ink scaling
     delta_row_weight: f32,  // row_ink multiplier in delta (0.0 = ignore)
     delta_row_power: f32,   // exponent on row_ink in delta
-    vert_run_discount: f32,  // weight for short horizontal dark runs in vertical scoring
-    vert_run_threshold: u32, // run length cutoff for discount (<=threshold gets discount)
-    vert_row_ink_power: f32, // exponent on (row_ink/max_row_ink) discount in vertical scoring (0=off)
+    vert_run_discount: f32,  // per-pixel rate for run-length discount (weight = 1 - rate*(run-thresh+1))
+    vert_run_threshold: u32, // run length cutoff for discount (>=threshold gets discount)
+    vert_row_ink_power: f32, // divisor for row-ink discount: weight = 1 - ratio/divisor (0=off)
 }
 
 fn seam_params() -> &'static SeamParams {
@@ -46,10 +46,10 @@ fn seam_params() -> &'static SeamParams {
             delta_scale_power: env_f32("SEAM_DELTA_SCALE_POWER", 1.0),
             delta_row_weight: env_f32("SEAM_DELTA_ROW_WEIGHT", 0.0),
             delta_row_power: env_f32("SEAM_DELTA_ROW_POWER", 1.0),
-            vert_run_discount: env_f32("SEAM_VERT_RUN_DISCOUNT", 0.8),
+            vert_run_discount: env_f32("SEAM_VERT_RUN_DISCOUNT", 0.02),
             vert_run_threshold: std::env::var("SEAM_VERT_RUN_THRESHOLD").ok()
-                .and_then(|s| s.parse().ok()).unwrap_or(3u32),
-            vert_row_ink_power: env_f32("SEAM_VERT_ROW_INK_POWER", 0.0),
+                .and_then(|s| s.parse().ok()).unwrap_or(11u32),
+            vert_row_ink_power: env_f32("SEAM_VERT_ROW_INK_POWER", 8.0),
         };
         p
     })
@@ -315,6 +315,7 @@ fn segment_characters_inner(
     // for the audit summary JSON.
     let mut seam_seed_candidates: Vec<serde_json::Value> = Vec::new();
     let mut seam_greedy_log: Vec<serde_json::Value> = Vec::new();
+    let mut all_vp_step_data: HashMap<u32, Vec<serde_json::Value>> = HashMap::new();
     if splits.len() < need {
         use std::cmp::Ordering;
         use std::collections::BinaryHeap;
@@ -439,7 +440,7 @@ fn segment_characters_inner(
             let (ink_l, ink_r) = ink_extent(&col_has_ink_strict, seg_start, seg_end);
             if ink_r > ink_l + 2 {
                 let sid = next_seg_id; next_seg_id += 1;
-                let (cands, dp, vert_wins) = candidate_seams(&energy, ink_l, ink_r, h, None, None, max_ink, &row_ink);
+                let (cands, dp, vert_wins, vp_step_data) = candidate_seams(&energy, ink_l, ink_r, h, None, None, max_ink, &row_ink);
                 for (col, cost) in &cands {
                     let is_vert = vert_wins.contains(col);
                     heap.push(SeamEntry { cost: *cost, col: *col, seg_start: ink_l, seg_end: ink_r, seg_id: sid, is_vertical: is_vert });
@@ -448,6 +449,10 @@ fn segment_characters_inner(
                         "seg": [ink_l, ink_r], "sid": sid,
                         "is_vertical": is_vert,
                     }));
+                }
+                // Stash VP step data for accepted splits (written to summary later)
+                for (col, steps) in &vp_step_data {
+                    all_vp_step_data.insert(*col, steps.clone());
                 }
                 seg_bounds.insert(sid, SegBounds { left_path: None, right_path: None });
                 dp_cache.insert(sid, dp);
@@ -502,7 +507,7 @@ fn segment_characters_inner(
                         let parent_bounds = seg_bounds.get(&entry.seg_id);
                         let lp = parent_bounds.and_then(|b| b.left_path.clone());
                         let rp = parent_bounds.and_then(|b| b.right_path.clone());
-                        let (cands, dp, vert_wins) = candidate_seams(&energy, entry.seg_start, new_end, h, lp.as_deref(), rp.as_deref(), max_ink, &row_ink);
+                        let (cands, dp, vert_wins, _vp_steps) = candidate_seams(&energy, entry.seg_start, new_end, h, lp.as_deref(), rp.as_deref(), max_ink, &row_ink);
                         for (col, cost) in &cands {
                             heap.push(SeamEntry { cost: *cost, col: *col, seg_start: entry.seg_start, seg_end: new_end, seg_id: sid, is_vertical: vert_wins.contains(col) });
                         }
@@ -520,7 +525,7 @@ fn segment_characters_inner(
                         let parent_bounds = seg_bounds.get(&entry.seg_id);
                         let lp = parent_bounds.and_then(|b| b.left_path.clone());
                         let rp = parent_bounds.and_then(|b| b.right_path.clone());
-                        let (cands, dp, vert_wins) = candidate_seams(&energy, new_start, entry.seg_end, h, lp.as_deref(), rp.as_deref(), max_ink, &row_ink);
+                        let (cands, dp, vert_wins, _vp_steps) = candidate_seams(&energy, new_start, entry.seg_end, h, lp.as_deref(), rp.as_deref(), max_ink, &row_ink);
                         for (col, cost) in &cands {
                             heap.push(SeamEntry { cost: *cost, col: *col, seg_start: new_start, seg_end: entry.seg_end, seg_id: sid, is_vertical: vert_wins.contains(col) });
                         }
@@ -613,7 +618,7 @@ fn segment_characters_inner(
                     let sid = next_seg_id; next_seg_id += 1;
                     let lp = parent_lp.clone();
                     let rp: Option<Vec<u32>> = Some(path.clone());
-                    let (cands, dp, vert_wins) = candidate_seams(&energy, ink_l, ink_r, h, lp.as_deref(), rp.as_deref(), max_ink, &row_ink);
+                    let (cands, dp, vert_wins, _vp_steps) = candidate_seams(&energy, ink_l, ink_r, h, lp.as_deref(), rp.as_deref(), max_ink, &row_ink);
                     for (col, cost) in &cands {
                         heap.push(SeamEntry { cost: *cost, col: *col, seg_start: ink_l, seg_end: ink_r, seg_id: sid, is_vertical: vert_wins.contains(col) });
                     }
@@ -629,7 +634,7 @@ fn segment_characters_inner(
                     let sid = next_seg_id; next_seg_id += 1;
                     let lp: Option<Vec<u32>> = Some(path.clone());
                     let rp = parent_rp.clone();
-                    let (cands, dp, vert_wins) = candidate_seams(&energy, ink_l, ink_r, h, lp.as_deref(), rp.as_deref(), max_ink, &row_ink);
+                    let (cands, dp, vert_wins, _vp_steps) = candidate_seams(&energy, ink_l, ink_r, h, lp.as_deref(), rp.as_deref(), max_ink, &row_ink);
                     for (col, cost) in &cands {
                         heap.push(SeamEntry { cost: *cost, col: *col, seg_start: ink_l, seg_end: ink_r, seg_id: sid, is_vertical: vert_wins.contains(col) });
                     }
@@ -676,6 +681,37 @@ fn segment_characters_inner(
         let n_segs = bounds.len().saturating_sub(1);
 
         // Write summary JSON
+        // Include VP step data for accepted splits + top-N runner-up VP candidates
+        let mut vp_steps_json = serde_json::Map::new();
+        // Accepted VP splits
+        for &col in &vp_splits {
+            if let Some(steps) = all_vp_step_data.get(&col) {
+                vp_steps_json.insert(col.to_string(), serde_json::json!(steps));
+            }
+        }
+        // Top runner-up VP candidates not already included (cheapest first)
+        {
+            let mut vp_runners: Vec<(&u32, &Vec<serde_json::Value>)> = all_vp_step_data.iter()
+                .filter(|(col, _)| !vp_splits.contains(col))
+                .collect();
+            // Sort by cost from seam_seed_candidates
+            let vp_costs: HashMap<u32, f64> = seam_seed_candidates.iter()
+                .filter(|c| c["is_vertical"].as_bool() == Some(true))
+                .filter_map(|c| {
+                    let col = c["col"].as_u64()? as u32;
+                    let cost = c["cost"].as_f64()?;
+                    Some((col, cost))
+                })
+                .collect();
+            vp_runners.sort_by(|a, b| {
+                let ca = vp_costs.get(a.0).unwrap_or(&f64::INFINITY);
+                let cb = vp_costs.get(b.0).unwrap_or(&f64::INFINITY);
+                ca.partial_cmp(cb).unwrap_or(std::cmp::Ordering::Equal)
+            });
+            for (col, steps) in vp_runners.iter().take(10) {
+                vp_steps_json.insert(col.to_string(), serde_json::json!(steps));
+            }
+        }
         let summary = serde_json::json!({
             "word_text": wtext,
             "image_w": w,
@@ -689,6 +725,7 @@ fn segment_characters_inner(
             "mismatch": n_segs != n_chars,
             "seam_seed_candidates": seam_seed_candidates,
             "seam_greedy_log": seam_greedy_log,
+            "vp_steps": vp_steps_json,
         });
         let _ = std::fs::write(ddir.join("summary.json"), serde_json::to_string_pretty(&summary).unwrap_or_default());
     }
@@ -786,11 +823,11 @@ fn candidate_seams(
     right_path: Option<&[u32]>,  // pixels with col >= right_path[r] are masked
     max_ink: f32,                // p95 ink darkness — scales entry penalty
     row_ink: &[f32],             // per-row ink fractions for scoring
-) -> (Vec<(u32, f32)>, SeamDp, HashSet<u32>) {
+) -> (Vec<(u32, f32)>, SeamDp, HashSet<u32>, HashMap<u32, Vec<serde_json::Value>>) {
     let seg_w = (seg_end - seg_start) as usize;
     if seg_w < 3 || h < 1 {
         let dp = SeamDp { _cost_fwd: Vec::new(), _cost_rev: Vec::new(), pred_fwd: Vec::new(), pred_rev: Vec::new(), seg_start, _seg_end: seg_end, seg_w: 0, h, _max_ink: max_ink, _row_ink: row_ink.to_vec() };
-        return (Vec::new(), dp, HashSet::new());
+        return (Vec::new(), dp, HashSet::new(), HashMap::new());
     }
     let base = seg_start as usize;
     let mid_r = (h / 2) as usize;
@@ -810,11 +847,17 @@ fn candidate_seams(
     // Forward DP: cost_fwd[r * seg_w + c] = cheapest path from any top-row column
     // down to (r, c).  Cost = sum of ink darkness along the path, plus
     // an entry penalty each time the path moves into a darker pixel.
+    // Row-ink discount removed from DP: it's gated on run length (≥11px),
+    // which is column-dependent. VP uses it because it's a straight vertical
+    // line; DP paths wander, so the discount doesn't apply.
+    let p = seam_params();
     let n_cells = h as usize * seg_w;
     let mut cost_fwd = vec![0.0f32; n_cells];
     let mut pred_fwd = vec![0u32; n_cells];
     for c in 0..seg_w {
-        cost_fwd[c] = ink_score(masked_energy(0, c), 0, row_ink);
+        let dark0 = masked_energy(0, c);
+        cost_fwd[c] = ink_score(dark0, 0, row_ink)
+            + delta_ink_score(dark0, 0.0, 0, 0, row_ink, max_ink);
         pred_fwd[c] = c as u32; // self
     }
     for r in 1..h as usize {
@@ -826,7 +869,7 @@ fn candidate_seams(
             let cur_ink = ink_score(cur_dark, r, row_ink);
             let prev_dark = masked_energy(r - 1, c);
             let entry = delta_ink_score(cur_dark, prev_dark, r, r - 1, row_ink, max_ink);
-            cost_fwd[row_off + c] = cur_ink + cost_fwd[prev_off + c] + entry;
+            cost_fwd[row_off + c] = cur_ink + entry + cost_fwd[prev_off + c];
             pred_fwd[row_off + c] = (prev_off + c) as u32;
         }
         // Step 2-3: horizontal ±1 (chaining via cost_fwd)
@@ -862,7 +905,9 @@ fn candidate_seams(
     let mut pred_rev = vec![0u32; n_cells];
     let last_off = last_r * seg_w;
     for c in 0..seg_w {
-        cost_rev[last_off + c] = ink_score(masked_energy(last_r, c), last_r, row_ink);
+        let dark_last = masked_energy(last_r, c);
+        cost_rev[last_off + c] = ink_score(dark_last, last_r, row_ink)
+            + delta_ink_score(dark_last, 0.0, last_r, last_r, row_ink, max_ink);
         pred_rev[last_off + c] = (last_off + c) as u32; // self
     }
     for r in (0..last_r).rev() {
@@ -874,7 +919,7 @@ fn candidate_seams(
             let cur_ink = ink_score(cur_dark, r, row_ink);
             let child_dark = masked_energy(r + 1, c);
             let entry = delta_ink_score(child_dark, cur_dark, r + 1, r, row_ink, max_ink);
-            cost_rev[row_off + c] = cur_ink + cost_rev[next_off + c] + entry;
+            cost_rev[row_off + c] = cur_ink + entry + cost_rev[next_off + c];
             pred_rev[row_off + c] = (next_off + c) as u32;
         }
         // Step 2-3: horizontal ±1 (chaining via cost_rev)
@@ -913,12 +958,44 @@ fn candidate_seams(
         let me = masked_energy(mid_r, c);
         if me >= f32::INFINITY { continue; } // masked pixel, skip
         let combined = cost_fwd[mid_off + c] + cost_rev[mid_off + c] - ink_score(me, mid_r, row_ink);
+        // Width penalty: trace path to find horizontal extent, penalize wide seams.
+        let mut min_c = c;
+        let mut max_c = c;
+        // Trace forward (upward) path
+        {
+            let mut cur = mid_off + c;
+            loop {
+                let p = pred_fwd[cur] as usize;
+                if p == cur { break; }
+                let pc = p % seg_w;
+                if pc < min_c { min_c = pc; }
+                if pc > max_c { max_c = pc; }
+                cur = p;
+            }
+        }
+        // Trace reverse (downward) path
+        {
+            let mut cur = mid_off + c;
+            loop {
+                let p = pred_rev[cur] as usize;
+                if p == cur { break; }
+                let pc = p % seg_w;
+                if pc < min_c { min_c = pc; }
+                if pc > max_c { max_c = pc; }
+                cur = p;
+            }
+        }
+        let width = (max_c - min_c) as f32;
         let split_col = seg_start + c as u32;
-        dp_candidates.push((split_col, combined));
+        dp_candidates.push((split_col, combined * (1.0 + width)));
     }
 
     // Second pass: trace each DP candidate's path and adjust cost
 
+    // VP scoring disabled — DP with row-ink proration + width penalty handles all splits.
+    let vert_candidates: Vec<(u32, f32)> = Vec::new();
+    let vp_steps: HashMap<u32, Vec<serde_json::Value>> = HashMap::new();
+    /*
     // Vertical-only candidates: score each column as a straight vertical
     // cut, discounting ink where the horizontal dark run through the
     // candidate column is short (serif bridges).  Unlike the fixed
@@ -926,17 +1003,21 @@ fn candidate_seams(
     // (lowercase x-height, baseline, cap-height, etc.).
     let img_w = energy[0].len();
     let mut vert_candidates: Vec<(u32, f32)> = Vec::with_capacity(seg_w.saturating_sub(2));
+    let mut vp_steps: HashMap<u32, Vec<serde_json::Value>> = HashMap::new();
     let max_row_ink = row_ink.iter().copied().fold(0.0f32, f32::max).max(1e-9);
     for c in 1..seg_w - 1 {
         let abs_col = base + c;
         let mut cost = 0.0f32;
         let mut masked = false;
         let mut prev_dark = 0.0f32;
+        let mut steps: Vec<serde_json::Value> = Vec::new();
         for r in 0..h as usize {
             let e = masked_energy(r, c);
             if e >= f32::INFINITY { masked = true; break; }
             // Measure horizontal dark run length through this column.
-            // Short runs (1-3 px) are likely serif bridges → heavy discount.
+            // Long runs (≥ threshold) spanning many characters suggest a
+            // serif bridge / baseline band → discount proportional to how
+            // far past the threshold.
             let mut run_len = 1u32;
             // Extend left
             {
@@ -957,14 +1038,19 @@ fn candidate_seams(
             }
             let p = seam_params();
             let run_weight = if run_len >= p.vert_run_threshold {
-                p.vert_run_discount
+                (1.0 - p.vert_run_discount * (run_len - p.vert_run_threshold + 1) as f32)
+                    .max(0.1)
             } else {
                 1.0
             };
+            // Row-ink discount: rows with more total ink across the word
+            // are likely serif/baseline bands → discount.
+            // weight = 1 - (row_ink / max_row_ink) / vert_row_ink_power
+            // where vert_row_ink_power acts as divisor (0 = off).
             let row_weight = if p.vert_row_ink_power == 0.0 {
                 1.0
             } else {
-                (row_ink[r] / max_row_ink).powf(p.vert_row_ink_power)
+                1.0 - (row_ink[r] / max_row_ink) / p.vert_row_ink_power
             };
             let weight = run_weight * row_weight;
             // Same scoring as DP: ink_score + delta_ink_score
@@ -973,12 +1059,23 @@ fn candidate_seams(
                 delta_ink_score(e, prev_dark, r, r - 1, row_ink, max_ink)
             };
             cost += (ink + delta) * weight;
+            steps.push(serde_json::json!({
+                "row": r, "x": abs_col,
+                "ink": (ink * 10.0).round() / 10.0,
+                "delta": (delta * 10.0).round() / 10.0,
+                "run_len": run_len,
+                "run_wt": (run_weight * 1000.0).round() / 1000.0,
+                "row_wt": (row_weight * 1000.0).round() / 1000.0,
+            }));
             prev_dark = e;
         }
         if !masked {
-            vert_candidates.push((seg_start + c as u32, cost));
+            let col_abs = seg_start + c as u32;
+            vert_candidates.push((col_abs, cost));
+            vp_steps.insert(col_abs, steps);
         }
     }
+    */ // end VP commented out
 
     // Deduplicate: for each column keep only the cheapest candidate
     // (DP path or vertical cut, whichever wins).  Track which columns
@@ -1028,7 +1125,7 @@ fn candidate_seams(
     }
 
     let dp = SeamDp { _cost_fwd: cost_fwd, _cost_rev: cost_rev, pred_fwd, pred_rev, seg_start, _seg_end: seg_end, seg_w, h, _max_ink: max_ink, _row_ink: row_ink.to_vec() };
-    (candidates, dp, vertical_winners)
+    (candidates, dp, vertical_winners, vp_steps)
 }
 
 /// Uniform character boundaries.

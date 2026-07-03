@@ -218,22 +218,51 @@ remaining splits.
 
 **Energy function:** each pixel's base cost is its darkness
 (`255.0 - pixel_value`).  White pixels are zero cost; black pixels are 255.
-The DP adds an **entry penalty** when the path moves into a darker pixel:
-`ENTRY_PENALTY_WEIGHT (4.0) × max(0, darkness_increase)`.  This encodes
+The DP adds a **delta penalty** when the path moves into a darker pixel:
+`delta_weight (4.0) × max(0, dark_cur - dark_prev)`.  This encodes
 "stay in whitespace, don't wander into ink" — a path through a uniformly
-dark stroke interior pays base cost but no entry penalty, while a path
+dark stroke interior pays base cost but no delta penalty, while a path
 crossing from a white gap into a stroke edge pays heavily.
 
 **Dual DP (forward + reverse)** computes cost matrices from both top and
-bottom.  For each interior column at the midpoint row, the combined cost
-gives a candidate seam score.  Multiple candidates per segment are generated
-and placed on a global min-heap.
+bottom, meeting at the midpoint row.  Movement is vertical and horizontal
+only — no diagonals.  Horizontal steps incur a +100 penalty to discourage
+lateral drift.  For each interior column at the midpoint row, the combined
+cost `cost_fwd[mid][c] + cost_rev[mid][c] - ink_score(mid, c)` gives a
+candidate seam score.  First/last row boundary conditions treat out-of-bounds
+as zero ink (delta from 0).
 
 **Greedy loop:** pop cheapest candidate, validate ink on both sides
-(min_ink_for_symbol), accept the split, compute diagonal-masked candidates
-for the two child segments, repeat.
+(min_ink_for_symbol), accept the split, compute candidates for the two child
+segments, repeat.
 
-Seam paths are complex diagonal paths — one x value per row of the word
+#### VP Candidate Scoring
+
+VP candidates (from Pass 1 zero-ink runs) are scored as straight vertical
+cuts through the word image, with two discounts for serif/baseline ink:
+
+1. **Run-length discount:** At each row, measure the horizontal dark run
+   length through the candidate column.  Long runs (≥ `vert_run_threshold`,
+   default 11) suggest a serif bridge or baseline band spanning multiple
+   characters.  Discount scales with run length:
+   `weight = max(0.1, 1.0 - vert_run_discount × (run_len - threshold + 1))`
+   where `vert_run_discount` (default 0.02) is the per-pixel rate.
+
+2. **Row-ink discount:** Rows with heavy total ink across the whole word
+   are likely serif/baseline zones.  Weight:
+   `1.0 - (row_ink / max_row_ink) / vert_row_ink_power` where
+   `vert_row_ink_power` (default 4.0) acts as divisor (0 = off).
+
+Both discounts multiply: `weight = run_weight × row_weight`.  The per-row
+cost is `(ink_score + delta_ink_score) × weight`.
+
+**`tools/seam_viz.py`** visualizes seam and VP candidates side by side.
+VP candidates are shown as straight vertical columns; seam candidates show
+the full DP path.  This tool has a parallel scoring code path that must be
+kept in sync with the Rust implementation until per-step data is emitted in
+`summary.json` (see TODO below).
+
+Seam paths are complex paths — one x value per row of the word
 image — not straight vertical lines.
 
 ### normalize_to_ink_bounds

@@ -196,6 +196,19 @@ pub fn match_lines(
             let line_slug: String = line.text.chars().take(30)
                 .map(|c| if c.is_alphanumeric() { c } else { '_' })
                 .collect();
+            let prefix = format!("p{}_L{:03}_", page_num, line_num);
+            // Remove stale diag dirs from prior runs with different word splits
+            if let Ok(rd) = std::fs::read_dir(&d) {
+                for entry in rd.flatten() {
+                    let name = entry.file_name();
+                    let name_str = name.to_string_lossy();
+                    if name_str.starts_with(&prefix)
+                        && entry.file_type().map(|t| t.is_dir()).unwrap_or(false)
+                    {
+                        let _ = std::fs::remove_dir_all(entry.path());
+                    }
+                }
+            }
             let p = d.join(format!("p{}_L{:03}_{}", page_num, line_num, line_slug));
             let _ = std::fs::create_dir_all(&p);
             p
