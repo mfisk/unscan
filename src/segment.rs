@@ -817,11 +817,10 @@ fn candidate_seams(
         cost_fwd[c] = ink_score(masked_energy(0, c), 0, row_ink);
         pred_fwd[c] = c as u32; // self
     }
-    let mut vert_costs = vec![0.0f32; seg_w]; // scratch for single-step horizontal limit
     for r in 1..h as usize {
         let row_off = r * seg_w;
         let prev_off = (r - 1) * seg_w;
-        // Step 1: vertical-only from row above (same column)
+        // Step 1: vertical from row above (same column)
         for c in 0..seg_w {
             let cur_dark = masked_energy(r, c);
             let cur_ink = ink_score(cur_dark, r, row_ink);
@@ -829,17 +828,15 @@ fn candidate_seams(
             let entry = delta_ink_score(cur_dark, prev_dark, r, r - 1, row_ink, max_ink);
             cost_fwd[row_off + c] = cur_ink + cost_fwd[prev_off + c] + entry;
             pred_fwd[row_off + c] = (prev_off + c) as u32;
-            vert_costs[c] = cost_fwd[row_off + c];
         }
-        // Steps 2-3: single horizontal step only (read from vert_costs,
-        // not from the updated cost_fwd, so chains can't form).
+        // Step 2-3: horizontal ±1 (chaining via cost_fwd)
         // Left-to-right
         for c in 1..seg_w {
             let cur_dark = masked_energy(r, c);
             let cur_ink = ink_score(cur_dark, r, row_ink);
             let nbr_dark = masked_energy(r, c - 1);
             let entry = delta_ink_score(cur_dark, nbr_dark, r, r, row_ink, max_ink);
-            let via_left = vert_costs[c - 1] + cur_ink + entry;
+            let via_left = cost_fwd[row_off + c - 1] + cur_ink + entry;
             if via_left < cost_fwd[row_off + c] {
                 cost_fwd[row_off + c] = via_left;
                 pred_fwd[row_off + c] = (row_off + c - 1) as u32;
@@ -851,7 +848,7 @@ fn candidate_seams(
             let cur_ink = ink_score(cur_dark, r, row_ink);
             let nbr_dark = masked_energy(r, c + 1);
             let entry = delta_ink_score(cur_dark, nbr_dark, r, r, row_ink, max_ink);
-            let via_right = vert_costs[c + 1] + cur_ink + entry;
+            let via_right = cost_fwd[row_off + c + 1] + cur_ink + entry;
             if via_right < cost_fwd[row_off + c] {
                 cost_fwd[row_off + c] = via_right;
                 pred_fwd[row_off + c] = (row_off + c + 1) as u32;
@@ -871,7 +868,7 @@ fn candidate_seams(
     for r in (0..last_r).rev() {
         let row_off = r * seg_w;
         let next_off = (r + 1) * seg_w;
-        // Step 1: vertical-only from row below (same column)
+        // Step 1: vertical from row below (same column)
         for c in 0..seg_w {
             let cur_dark = masked_energy(r, c);
             let cur_ink = ink_score(cur_dark, r, row_ink);
@@ -879,28 +876,27 @@ fn candidate_seams(
             let entry = delta_ink_score(child_dark, cur_dark, r + 1, r, row_ink, max_ink);
             cost_rev[row_off + c] = cur_ink + cost_rev[next_off + c] + entry;
             pred_rev[row_off + c] = (next_off + c) as u32;
-            vert_costs[c] = cost_rev[row_off + c];
         }
-        // Steps 2-3: single horizontal step only (read from vert_costs).
-        // Left-to-right
+        // Step 2-3: horizontal ±1 (chaining via cost_rev)
+        // Left-to-right: path goes (r,c) → (r,c-1), charge when c-1 is darker
         for c in 1..seg_w {
             let cur_dark = masked_energy(r, c);
             let cur_ink = ink_score(cur_dark, r, row_ink);
             let nbr_dark = masked_energy(r, c - 1);
-            let entry = delta_ink_score(cur_dark, nbr_dark, r, r, row_ink, max_ink);
-            let via_left = vert_costs[c - 1] + cur_ink + entry;
+            let entry = delta_ink_score(nbr_dark, cur_dark, r, r, row_ink, max_ink);
+            let via_left = cost_rev[row_off + c - 1] + cur_ink + entry;
             if via_left < cost_rev[row_off + c] {
                 cost_rev[row_off + c] = via_left;
                 pred_rev[row_off + c] = (row_off + c - 1) as u32;
             }
         }
-        // Right-to-left
+        // Right-to-left: path goes (r,c) → (r,c+1), charge when c+1 is darker
         for c in (0..seg_w - 1).rev() {
             let cur_dark = masked_energy(r, c);
             let cur_ink = ink_score(cur_dark, r, row_ink);
             let nbr_dark = masked_energy(r, c + 1);
-            let entry = delta_ink_score(cur_dark, nbr_dark, r, r, row_ink, max_ink);
-            let via_right = vert_costs[c + 1] + cur_ink + entry;
+            let entry = delta_ink_score(nbr_dark, cur_dark, r, r, row_ink, max_ink);
+            let via_right = cost_rev[row_off + c + 1] + cur_ink + entry;
             if via_right < cost_rev[row_off + c] {
                 cost_rev[row_off + c] = via_right;
                 pred_rev[row_off + c] = (row_off + c + 1) as u32;

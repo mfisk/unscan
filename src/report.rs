@@ -683,7 +683,7 @@ fn build_scan_line_with_overlays(diag_dir: &Path, entry: &AuditEntry) -> String 
             .unwrap_or((entry.bbox.width, entry.bbox.height))
     };
 
-    let scale = 3u32; // 3× upscale to match Python
+    let scale = 1u32; // 1× native resolution
     let margin_top = 18 * scale;
     let margin_bot = 14 * scale;
     let canvas_w = img_w * scale;
@@ -874,11 +874,13 @@ fn build_scan_line_with_overlays(diag_dir: &Path, entry: &AuditEntry) -> String 
          <span style=\"color:#00c8dc\">- -</span> final box · \
          <span style=\"color:#2864dc\">│</span> v-whitespace · \
          <span style=\"color:#ff00c8\">╲</span> seam</div>\
-         <div style=\"position:relative;display:inline-block;width:{canvas_w}px;height:{canvas_h}px;overflow:visible;\">\
+         <div style=\"width:100%;aspect-ratio:{canvas_w}/{canvas_h};position:relative;overflow:hidden;\">\
+         <div style=\"position:absolute;inset:0;\">\
+         <div style=\"position:relative;width:{canvas_w}px;height:{canvas_h}px;transform-origin:top left;\" class=\"scan-line-inner\" data-w=\"{canvas_w}\">\
          <img src=\"{img_uri}\" style=\"position:absolute;left:0;top:{margin_top}px;\
          width:{cw}px;height:{ch}px;image-rendering:pixelated;\" class=\"scan-line-img\">\
          {overlays}\
-         </div>\
+         </div></div></div>\
          {seg_stats}\
          </div>",
         cw = img_w * scale,
@@ -1537,6 +1539,8 @@ fn build_observation_table(
 // ── CSS ──────────────────────────────────────────────────────────────────────
 
 const CSS: &str = r#"<style>
+@page { size: 841mm 1189mm landscape; margin: 10mm; }
+@media print { body { width: 100%; } }
 * { box-sizing: border-box; margin: 0; padding: 0; }
 .ssim-pass { font-size: 11px; padding: 1px 6px; border-radius: 3px; background: #d4edda; color: #155724; margin-left: 8px; }
 .ssim-fail { font-size: 11px; padding: 1px 6px; border-radius: 3px; background: #f8d7da; color: #721c24; margin-left: 8px; font-weight: bold; }
@@ -1624,7 +1628,21 @@ img.ci {
   image-rendering: pixelated;
   border: 1px solid #ddd; display: block; margin: 2px 0;
 }
-</style>"#;
+.scan-line-inner {
+  transform-origin: top left;
+}
+</style>
+<script>
+function scaleScanLines(){
+  document.querySelectorAll('.scan-line-inner').forEach(function(el){
+    var w=parseInt(el.getAttribute('data-w'));
+    var pw=el.parentElement.offsetWidth;
+    if(w>0&&pw>0) el.style.transform='scale('+pw/w+')';
+  });
+}
+window.addEventListener('load',scaleScanLines);
+window.addEventListener('resize',scaleScanLines);
+</script>"#;
 
 // ── Public API ──────────────────────────────────────────────────────────────
 
