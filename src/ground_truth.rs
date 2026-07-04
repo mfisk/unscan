@@ -471,7 +471,7 @@ fn extract_page_spans(
     // Build font resource name → (BaseFont name, PdfFontWidths) map for this page.
     let mut font_map: HashMap<Vec<u8>, String> = HashMap::new();
     let mut font_widths_map: HashMap<Vec<u8>, PdfFontWidths> = HashMap::new();
-    let mut tounicode_map: HashMap<Vec<u8>, HashMap<u16, String>> = HashMap::new();
+    let mut tounicode_map: HashMap<Vec<u8>, (HashMap<u16, String>, usize)> = HashMap::new();
     // Pre-populate from Resources/Font if available.
     if let Ok(page_dict) = doc.get_dictionary(page_id) {
         if let Ok(res_obj) = page_dict.get(b"Resources") {
@@ -691,8 +691,9 @@ fn as_f32(obj: &lopdf::Object) -> Option<f32> {
 }
 
 /// Extract a /ToUnicode CMap from a font dictionary.
-/// Returns a map from 2-byte glyph code to Unicode string.
-fn extract_tounicode_map(doc: &Document, font_dict: &lopdf::Dictionary) -> Option<HashMap<u16, String>> {
+/// Returns a map from glyph code to Unicode string, plus the code byte width
+/// (1 or 2) detected from the CMap source key lengths per the PDF spec.
+fn extract_tounicode_map(doc: &Document, font_dict: &lopdf::Dictionary) -> Option<(HashMap<u16, String>, usize)> {
     let tu_obj = font_dict.get(b"ToUnicode").ok()?;
     let tu_obj = doc.dereference(tu_obj).ok().map(|(_, o)| o).unwrap_or(tu_obj);
 
@@ -705,6 +706,9 @@ fn extract_tounicode_map(doc: &Document, font_dict: &lopdf::Dictionary) -> Optio
     let text = String::from_utf8_lossy(&content);
 
     let mut map: HashMap<u16, String> = HashMap::new();
+    // Detect code byte width from the hex key lengths in the CMap.
+    // <XX> = 1 byte, <XXXX> = 2 bytes.  Default to 2 if we can't tell.
+    let mut detected_code_bytes: Option<usize> = None;
 
     // Parse beginbfchar / endbfchar blocks
     for section in text.split("beginbfchar") {
@@ -712,29 +716,17 @@ fn extract_tounicode_map(doc: &Document, font_dict: &lopdf::Dictionary) -> Optio
             let block = &section[..end];
             for line in block.lines() {
                 let line = line.trim();
-                // Format: <XXXX> <YYYY> or <XXXX> <YYYYYYYY>
+                // Format: <XX> <YYYY> or <XXXX> <YYYY> or <XXXX> <YYYYYYYY>
                 let parts: Vec<&str> = line.split('<').filter(|s| s.contains('>')).collect();
                 if parts.len() >= 2 {
                     let src = parts[0].split('>').next().unwrap_or("");
                     let dst = parts[1].split('>').next().unwrap_or("");
+                    // Detect code width from source hex digit count
+                    if detected_code_bytes.is_none() && !src.is_empty() {
+                        detected_code_bytes = Some((src.len() + 1) / 2);
+                    }
                     if let Ok(code) = u16::from_str_radix(src, 16) {
-                        // dst can be multi-byte Unicode
-                        let mut s = String::new();
-                        let chars: Vec<char> = (0..dst.len() / 4).filter_map(|i| {
-                            u16::from_str_radix(&dst[i*4..(i+1)*4], 16).ok()
-                        }).filter_map(|cp| {
-                            char::from_u32(cp as u32)
-                        }).collect();
-                        if chars.is_empty() {
-                            // Try as a single 2-byte or 4-byte code
-                            if let Ok(cp) = u32::from_str_radix(dst, 16) {
-                                if let Some(c) = char::from_u32(cp) {
-                                    s.push(c);
-                                }
-                            }
-                        } else {
-                            for c in chars { s.push(c); }
-                        }
+                        let s = decode_tounicode_dst(dst);
                         if !s.is_empty() {
                             map.insert(code, s);
                         }
@@ -755,6 +747,9 @@ fn extract_tounicode_map(doc: &Document, font_dict: &lopdf::Dictionary) -> Optio
                     let start_s = parts[0].split('>').next().unwrap_or("");
                     let end_s = parts[1].split('>').next().unwrap_or("");
                     let base_s = parts[2].split('>').next().unwrap_or("");
+                    if detected_code_bytes.is_none() && !start_s.is_empty() {
+                        detected_code_bytes = Some((start_s.len() + 1) / 2);
+                    }
                     if let (Ok(start), Ok(end_code), Ok(base)) = (
                         u16::from_str_radix(start_s, 16),
                         u16::from_str_radix(end_s, 16),
@@ -772,7 +767,37 @@ fn extract_tounicode_map(doc: &Document, font_dict: &lopdf::Dictionary) -> Optio
         }
     }
 
-    if map.is_empty() { None } else { Some(map) }
+    if map.is_empty() {
+        None
+    } else {
+        let code_bytes = detected_code_bytes.unwrap_or(2).min(2).max(1);
+        Some((map, code_bytes))
+    }
+}
+
+/// Decode the destination hex string from a ToUnicode bfchar entry.
+/// Handles 2-byte (4 hex digit) and 4-byte (8 hex digit) Unicode values,
+/// as well as multi-char sequences.
+fn decode_tounicode_dst(dst: &str) -> String {
+    let mut s = String::new();
+    // Try as sequence of 16-bit code units (UTF-16)
+    let chars: Vec<char> = (0..dst.len() / 4)
+        .filter_map(|i| u16::from_str_radix(&dst[i * 4..(i + 1) * 4], 16).ok())
+        .filter_map(|cp| char::from_u32(cp as u32))
+        .collect();
+    if chars.is_empty() {
+        // Try as a single code point
+        if let Ok(cp) = u32::from_str_radix(dst, 16) {
+            if let Some(c) = char::from_u32(cp) {
+                s.push(c);
+            }
+        }
+    } else {
+        for c in chars {
+            s.push(c);
+        }
+    }
+    s
 }
 
 /// Count the number of text characters in the operands of a text-showing op.
@@ -795,9 +820,10 @@ fn text_length(operands: &[lopdf::Object]) -> usize {
 }
 
 /// Extract the text content from Tj/TJ operands as a String.
-/// If a ToUnicode CMap is available, use it to decode 2-byte glyph codes
-/// to Unicode. Otherwise fall back to raw bytes as Latin-1.
-fn text_content(operands: &[lopdf::Object], tounicode: Option<&HashMap<u16, String>>) -> String {
+/// If a ToUnicode CMap is available, use it to decode glyph codes
+/// to Unicode using the detected code byte width. Otherwise fall back
+/// to raw bytes as Latin-1.
+fn text_content(operands: &[lopdf::Object], tounicode: Option<&(HashMap<u16, String>, usize)>) -> String {
     let mut bytes_out = Vec::new();
     for op in operands {
         match op {
@@ -813,16 +839,20 @@ fn text_content(operands: &[lopdf::Object], tounicode: Option<&HashMap<u16, Stri
         }
     }
 
-    if let Some(tu) = tounicode {
-        // Decode 2-byte big-endian glyph codes via ToUnicode
+    if let Some((tu, code_bytes)) = tounicode {
+        let code_bytes = *code_bytes;
         let mut result = String::new();
         let mut i = 0;
-        while i + 1 < bytes_out.len() {
-            let code = ((bytes_out[i] as u16) << 8) | (bytes_out[i + 1] as u16);
+        while i + code_bytes <= bytes_out.len() {
+            let code: u16 = if code_bytes == 1 {
+                bytes_out[i] as u16
+            } else {
+                ((bytes_out[i] as u16) << 8) | (bytes_out[i + 1] as u16)
+            };
             if let Some(s) = tu.get(&code) {
                 result.push_str(s);
             }
-            i += 2;
+            i += code_bytes;
         }
         // If ToUnicode produced nothing, fall back
         if result.is_empty() {
