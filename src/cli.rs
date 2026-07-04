@@ -55,11 +55,7 @@ pub struct Args {
     #[arg(long, value_name = "DIR")]
     pub audit: Option<PathBuf>,
 
-    // ── Training flags ──────────────────────────────────────────────/ Train LDA classifier weights and save to ~/.cache/unprint/lda-weights.bin.
-    /// Scans all system fonts, renders characters, computes features, and trains
-    /// the LDA projection.  Exits after training.
-    #[arg(long)]
-    pub train_lda: bool,
+    // train_lda removed — training happens automatically.
 
     /// Generate side-by-side comparison images (scan crop vs rendered font)
     /// for every vectorized line. Output goes to <output_base>-compare/ directory.
@@ -179,7 +175,7 @@ impl Args {
 
     /// Validate: require input and output (unless --test or non-scan mode).
     pub fn validate(&self) -> Result<(), String> {
-        if self.render_ref_chars.is_some() || !self.weight_explicit.is_empty() || self.train_lda {
+        if self.render_ref_chars.is_some() || !self.weight_explicit.is_empty() {
             return Ok(());
         }
         if self.input.is_none() {

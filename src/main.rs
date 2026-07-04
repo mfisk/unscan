@@ -51,16 +51,7 @@ fn main() {
         char_render::render_ref_chars_and_exit(json_str);
     }
 
-    // ── train-lda: train LDA classifier and exit ────────────────────
-    if args.train_lda {
-        let train_args = train::TrainArgs {
-            font_dir: args.font_dir.clone(),
-            render_params: args.render_params(),
-            ..train::TrainArgs::default()
-        };
-        train::run_train(train_args);
-        std::process::exit(0);
-    }
+    // train-lda removed — training happens automatically when weights are stale.
 
     // ── weight-explicit: normalize PS names and exit ─────────────────
     if !args.weight_explicit.is_empty() {
