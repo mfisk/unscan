@@ -55,6 +55,8 @@ def build_dp(dark, seg_start, seg_end):
     base = seg_start
     def d(r, c): return dark[r, base + c]
 
+    DRIFT_MUL = 10.0
+
     n = h * sw
     cf = [0.0] * n; pf = [0] * n
     cr = [0.0] * n; pr = [0] * n
@@ -69,17 +71,22 @@ def build_dp(dark, seg_start, seg_end):
             dc, dp_ = d(r, c), d(r - 1, c)
             cf[ro + c] = dc + delta_ink(dc, dp_) + cf[po + c]
             pf[ro + c] = po + c
-        # Step 2-3: horizontal chaining (no per-step penalty)
+        # Step 2: diagonal from (r-1, c-1) → (r, c) — dest ink + delta + pass-through ink
         for c in range(1, sw):
-            dc, dn = d(r, c), d(r, c - 1)
-            v = cf[ro + c - 1] + dc + delta_ink(dc, dn)
+            dc = d(r, c)
+            dp_ = d(r - 1, c - 1)
+            pass_ink = d(r, c - 1)
+            v = cf[po + c - 1] + dc + delta_ink(dc, dp_) + pass_ink
             if v < cf[ro + c]:
-                cf[ro + c] = v; pf[ro + c] = ro + c - 1
-        for c in range(sw - 2, -1, -1):
-            dc, dn = d(r, c), d(r, c + 1)
-            v = cf[ro + c + 1] + dc + delta_ink(dc, dn)
+                cf[ro + c] = v; pf[ro + c] = po + c - 1
+        # Step 3: diagonal from (r-1, c+1) → (r, c) — dest ink + delta + pass-through ink
+        for c in range(sw - 1):
+            dc = d(r, c)
+            dp_ = d(r - 1, c + 1)
+            pass_ink = d(r, c + 1)
+            v = cf[po + c + 1] + dc + delta_ink(dc, dp_) + pass_ink
             if v < cf[ro + c]:
-                cf[ro + c] = v; pf[ro + c] = ro + c + 1
+                cf[ro + c] = v; pf[ro + c] = po + c + 1
 
     last = h - 1
     for c in range(sw):
@@ -92,17 +99,22 @@ def build_dp(dark, seg_start, seg_end):
             dc, ch_ = d(r, c), d(r + 1, c)
             cr[ro + c] = dc + delta_ink(ch_, dc) + cr[no + c]
             pr[ro + c] = no + c
-        # Step 2-3: horizontal chaining (no per-step penalty)
+        # Step 2: diagonal from (r+1, c-1) → (r, c) — dest ink + delta + pass-through ink
         for c in range(1, sw):
-            dc, dn = d(r, c), d(r, c - 1)
-            v = cr[ro + c - 1] + dc + delta_ink(dn, dc)
+            dc = d(r, c)
+            ch_ = d(r + 1, c - 1)
+            pass_ink = d(r, c - 1)
+            v = cr[no + c - 1] + dc + delta_ink(ch_, dc) + pass_ink
             if v < cr[ro + c]:
-                cr[ro + c] = v; pr[ro + c] = ro + c - 1
-        for c in range(sw - 2, -1, -1):
-            dc, dn = d(r, c), d(r, c + 1)
-            v = cr[ro + c + 1] + dc + delta_ink(dn, dc)
+                cr[ro + c] = v; pr[ro + c] = no + c - 1
+        # Step 3: diagonal from (r+1, c+1) → (r, c) — dest ink + delta + pass-through ink
+        for c in range(sw - 1):
+            dc = d(r, c)
+            ch_ = d(r + 1, c + 1)
+            pass_ink = d(r, c + 1)
+            v = cr[no + c + 1] + dc + delta_ink(ch_, dc) + pass_ink
             if v < cr[ro + c]:
-                cr[ro + c] = v; pr[ro + c] = ro + c + 1
+                cr[ro + c] = v; pr[ro + c] = no + c + 1
 
     return cf, pf, cr, pr, sw, base
 
@@ -132,19 +144,34 @@ def full_seam_path(dark, col, seg_start, seg_end):
 
     fwd_cells = [(r, c + base) for r, c in fwd]
     rev_cells = [(r, c + base) for r, c in rev_down[1:]]
-    cells = fwd_cells + rev_cells
+    raw_cells = fwd_cells + rev_cells
 
+    # Expand diagonals into vertical + horizontal steps for visual path
+    cells = [raw_cells[0]]
+    for i in range(1, len(raw_cells)):
+        pr_, pc_ = raw_cells[i - 1]
+        r, c = raw_cells[i]
+        if pc_ != c:
+            cells.append((r, pc_))
+        cells.append((r, c))
+
+    # Compute cost from raw_cells (not expanded), applying 2× on diagonals
     steps = []
     tot_ink = 0.0; tot_delta = 0.0; cum = 0.0
 
-    for i, (r, c) in enumerate(cells):
+    for i, (r, c) in enumerate(raw_cells):
         ink = float(dark[r, c])
         if i == 0:
             dlt = delta_ink(ink, 0)
         else:
-            pr_, pc_ = cells[i - 1]
+            pr_, pc_ = raw_cells[i - 1]
             dlt = delta_ink(ink, dark[pr_, pc_])
-        cum += ink + dlt
+        step_cost = ink + dlt
+        # Diagonal: add pass-through cell ink
+        if i > 0 and raw_cells[i - 1][1] != c:
+            pass_col = raw_cells[i - 1][1]
+            step_cost += float(dark[r, pass_col])
+        cum += step_cost
         tot_ink += ink; tot_delta += dlt
         steps.append(dict(r=r, c=c, dark=ink, ink=ink, delta=dlt, cum=cum))
 
@@ -157,13 +184,13 @@ def full_seam_path(dark, col, seg_start, seg_end):
         tot_delta += exit_dlt
         cum += exit_dlt
 
-    # Width penalty: multiplicative (1 + width)
-    all_cols = [c for _, c in cells]
+    # Additive width penalty: cost + 50 * width
+    all_cols = [c for _, c in raw_cells]
     width = max(all_cols) - min(all_cols)
 
     mi = mid * sw + cl
     raw_cost = cf[mi] + cr[mi] - dark[mid, col]
-    combined = raw_cost * (1.0 + width)
+    combined = raw_cost + 50.0 * width
     return steps, cf[mi], cr[mi], combined, tot_ink, tot_delta
 
 

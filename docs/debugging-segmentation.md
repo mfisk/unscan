@@ -16,7 +16,7 @@ The single flag for all diagnostic data.  Produces:
 1. `audit.json` — pipeline decisions (per-line font matches, CI votes,
    SSIM verification scores)
 2. Per-line diag-seg directories with per-word segmentation diagnostics
-   (word crops, VP/seam overlays, summary.json, character crops)
+   (word crops, seam overlays, summary.json, character crops)
 3. Per-line `crops/` directories (the exact character images CI scores)
 
 ```bash
@@ -38,9 +38,9 @@ There is **no separate `--diag-seg` flag** — `--audit` enables everything.
     word_000_Typography/                  # per-word directory
       seg_plain/                          # plain segmentation path
         word_crop.png                     # raw word image from Tesseract bbox
-        vp_overlay.png                    # VP pass: cyan low-ink runs, red split points
-        seam_overlay.png                  # VP (red) + seam (blue) splits overlaid
-        final_overlay.png                 # all passes: VP red, seam blue, charbox green
+        ws_overlay.png                    # whitespace pass: split points
+        seam_overlay.png                  # whitespace (red) + seam (blue) splits overlaid
+        final_overlay.png                 # all passes: whitespace red, seam blue, charbox green
         summary.json                      # machine-readable split data (see below)
         chars/                            # per-character crops
           00_T.png
@@ -142,8 +142,8 @@ Located at `<audit_dir>/p<N>_L<NNN>_<text>/word_<NNN>_<text>/seg_plain/summary.j
 ```
 
 The `seam_paths` field maps split column → full path (one x value per row
-of the word image).  VP splits are straight vertical lines and do not appear
-in `seam_paths`.
+of the word image).  Whitespace splits are straight vertical lines and do
+not appear in `seam_paths`.
 
 ---
 
@@ -202,19 +202,16 @@ pixel contributes 1, regardless of how dark.
 Key derived values:
 - `col_has_ink[x]`: true if `col_ink[x] > 0`
 
-### Pass 1: Zero-Ink VP (Vertical Projection)
+### Pass 1: Whitespace Splitting
 
-Find contiguous runs of zero-ink columns (interior only, not touching edges).
-Split at each run's midpoint.  Both sides must have at least
-`min_ink_for_symbol` total ink pixels or the split is rejected.  This
-threshold scales with the word crop height: `(0.07 × h)²`.
-
-If this yields ≥ N-1 splits, pick the N-1 widest runs and stop.
+Scan across the word's ink extent for contiguous runs of zero-ink columns.
+Split at each run's midpoint.  This handles the easy cases — obvious
+whitespace gaps between letters — so the DP only has to carve through ink.
 
 ### Pass 2: Greedy Seam Carving
 
-If Pass 1 didn't find enough splits, seam carving takes over for the
-remaining splits.
+For remaining splits, seam carving finds the cheapest vertical path through
+ink.
 
 **Energy function:** each pixel's base cost is its darkness
 (`255.0 - pixel_value`).  White pixels are zero cost; black pixels are 255.
@@ -226,44 +223,16 @@ crossing from a white gap into a stroke edge pays heavily.
 
 **Dual DP (forward + reverse)** computes cost matrices from both top and
 bottom, meeting at the midpoint row.  Movement is vertical and horizontal
-only — no diagonals.  Horizontal steps incur a +100 penalty to discourage
-lateral drift.  For each interior column at the midpoint row, the combined
-cost `cost_fwd[mid][c] + cost_rev[mid][c] - ink_score(mid, c)` gives a
-candidate seam score.  First/last row boundary conditions treat out-of-bounds
-as zero ink (delta from 0).
+(left-to-right + right-to-left chaining within each row).  For each interior
+column at the midpoint row, the combined cost
+`cost_fwd[mid][c] + cost_rev[mid][c] - ink_score(mid, c)` gives a candidate
+seam score.  A post-hoc **width penalty** (`50 × path_width`) discourages
+paths that wander far horizontally.  Runs of consecutive equal-cost
+candidates are collapsed to a single candidate at the midpoint.
 
 **Greedy loop:** pop cheapest candidate, validate ink on both sides
 (min_ink_for_symbol), accept the split, compute candidates for the two child
 segments, repeat.
-
-#### VP Candidate Scoring
-
-VP candidates (from Pass 1 zero-ink runs) are scored as straight vertical
-cuts through the word image, with two discounts for serif/baseline ink:
-
-1. **Run-length discount:** At each row, measure the horizontal dark run
-   length through the candidate column.  Long runs (≥ `vert_run_threshold`,
-   default 11) suggest a serif bridge or baseline band spanning multiple
-   characters.  Discount scales with run length:
-   `weight = max(0.1, 1.0 - vert_run_discount × (run_len - threshold + 1))`
-   where `vert_run_discount` (default 0.02) is the per-pixel rate.
-
-2. **Row-ink discount:** Rows with heavy total ink across the whole word
-   are likely serif/baseline zones.  Weight:
-   `1.0 - (row_ink / max_row_ink) / vert_row_ink_power` where
-   `vert_row_ink_power` (default 4.0) acts as divisor (0 = off).
-
-Both discounts multiply: `weight = run_weight × row_weight`.  The per-row
-cost is `(ink_score + delta_ink_score) × weight`.
-
-**`tools/seam_viz.py`** visualizes seam and VP candidates side by side.
-VP candidates are shown as straight vertical columns; seam candidates show
-the full DP path.  This tool has a parallel scoring code path that must be
-kept in sync with the Rust implementation until per-step data is emitted in
-`summary.json` (see TODO below).
-
-Seam paths are complex paths — one x value per row of the word
-image — not straight vertical lines.
 
 ### normalize_to_ink_bounds
 
@@ -368,17 +337,18 @@ can show what Tesseract saw vs what unprint used.
 
 ### 1. High-Contrast Fonts (Didone/Bodoni)
 
-**Symptom:** VP splits a character in half instead of splitting between
-characters.
+**Symptom:** Whitespace splitter puts a split inside a character instead of
+between characters.
 
 **Cause:** Fonts like Playfair Display have extreme stroke contrast — thick
 vertical stems with razor-thin hairline serifs.  The hairlines have very low
-`col_ink` values.  When VP searches for split candidates, these hairline
-regions look like inter-character gaps.
+`col_ink` values.  But since the whitespace splitter only splits at columns
+with truly zero ink, this only happens when a hairline is thin enough to
+have zero-ink columns — rare in practice.
 
-**Fix:** The valley-ranking algorithm ranks by minimum ink (deepest valley
-wins), not by run width.  Actual inter-character gaps have near-zero ink,
-beating intra-character hairlines.
+**Fix:** The whitespace splitter only fires on runs of truly zero-ink
+columns.  Non-zero ink columns, even very low ones, are left for the DP
+seam carver.
 
 ### 2. Segment/Character Count Mismatch
 
@@ -507,7 +477,7 @@ jq '[.text_entries[] | .font_matched] | group_by(.) |
 find /tmp/audit-out -name summary.json | xargs jq -r \
   'select(.mismatch) | "\(.word_text): \(.n_segments_produced) segs, expected \(.n_chars_expected)"'
 
-# Show VP vs seam split counts per word
+# Show whitespace vs seam split counts per word
 find /tmp/audit-out -name summary.json | xargs jq -r \
   '"\(.word_text): vp=\(.vp_splits | length) seam=\(.seam_splits | length) final=\(.final_boundaries | length - 1)/\(.n_chars_expected)"'
 
@@ -553,7 +523,7 @@ force it into CI candidate list.
 | Font-metric word splitting | `src/ocr.rs` | `split_wide_whitespace_words()` |
 | Character extraction | `src/segment.rs` | `extract_line_chars()` |
 | Segmentation algorithm | `src/segment.rs` | `segment_characters_inner()` |
-| Valley-finding (VP) | `src/segment.rs` | `best_low_ink_valley()` |
+| Whitespace splitting | `src/segment.rs` | Pass 1 in `segment_characters_inner()` |
 | Seam carving | `src/segment.rs` | Pass 2 in `segment_characters_inner()` |
 | normalize_to_ink_bounds | `src/features.rs` | `normalize_to_ink_bounds()` |
 | Boundary→crop extraction | `src/segment.rs` | `extract_chars_from_boundaries()` |

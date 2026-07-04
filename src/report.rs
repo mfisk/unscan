@@ -698,8 +698,8 @@ fn build_scan_line_with_overlays(diag_dir: &Path, entry: &AuditEntry) -> String 
         let bw = wb.width * scale;
         let bh = wb.height * scale;
         overlays.push_str(&format!(
-            "<div style=\"position:absolute;left:{bx}px;top:{by}px;width:{bw}px;height:{bh}px;\
-             border:1px dotted rgba(255,160,0,0.8);pointer-events:none;\"></div>"
+            "<rect x=\"{bx}\" y=\"{by}\" width=\"{bw}\" height=\"{bh}\" \
+             fill=\"none\" stroke=\"rgba(255,160,0,0.8)\" stroke-width=\"1\" stroke-dasharray=\"3,2\"/>"
         ));
     }
 
@@ -710,8 +710,8 @@ fn build_scan_line_with_overlays(diag_dir: &Path, entry: &AuditEntry) -> String 
         let bw = wb.width * scale;
         let bh = wb.height * scale;
         overlays.push_str(&format!(
-            "<div style=\"position:absolute;left:{bx}px;top:{by}px;width:{bw}px;height:{bh}px;\
-             border:1px dashed rgba(0,200,220,0.85);pointer-events:none;\"></div>"
+            "<rect x=\"{bx}\" y=\"{by}\" width=\"{bw}\" height=\"{bh}\" \
+             fill=\"none\" stroke=\"rgba(0,200,220,0.85)\" stroke-width=\"1\" stroke-dasharray=\"4,2\"/>"
         ));
 
         // Pixel-scale ruler at top of each final word box
@@ -722,18 +722,18 @@ fn build_scan_line_with_overlays(diag_dir: &Path, entry: &AuditEntry) -> String 
             if col % 10 == 0 {
                 // Major tick + label
                 overlays.push_str(&format!(
-                    "<div style=\"position:absolute;left:{sx}px;top:{}px;width:1px;height:6px;\
-                     background:rgba(140,140,140,0.7);pointer-events:none;\"></div>\
-                     <div style=\"position:absolute;left:{}px;top:{}px;\
-                     font-size:7px;color:rgba(120,120,120,0.8);pointer-events:none;\">{col}</div>",
-                    by.saturating_sub(6), sx.saturating_sub(8), by.saturating_sub(18)
+                    "<line x1=\"{sx}\" y1=\"{}\" x2=\"{sx}\" y2=\"{}\" \
+                     stroke=\"rgba(140,140,140,0.7)\" stroke-width=\"1\"/>\
+                     <text x=\"{sx}\" y=\"{}\" font-size=\"7\" fill=\"rgba(120,120,120,0.8)\" \
+                     text-anchor=\"start\" transform=\"rotate(-90,{sx},{})\">{col}</text>",
+                    by.saturating_sub(6), by, by.saturating_sub(9), by.saturating_sub(9)
                 ));
             } else {
                 // Minor tick
                 overlays.push_str(&format!(
-                    "<div style=\"position:absolute;left:{sx}px;top:{}px;width:1px;height:3px;\
-                     background:rgba(180,180,180,0.6);pointer-events:none;\"></div>",
-                    by.saturating_sub(3)
+                    "<line x1=\"{sx}\" y1=\"{}\" x2=\"{sx}\" y2=\"{}\" \
+                     stroke=\"rgba(180,180,180,0.6)\" stroke-width=\"1\"/>",
+                    by.saturating_sub(3), by
                 ));
             }
             col += 5;
@@ -793,17 +793,17 @@ fn build_scan_line_with_overlays(diag_dir: &Path, entry: &AuditEntry) -> String 
 
             let label_y = wy + wb_h + 2;
 
-            // VP splits — blue vertical lines
-            if let Some(vp_arr) = summary["vp_splits"].as_array() {
-                for vp in vp_arr {
-                    if let Some(col) = vp.as_u64() {
+            // Whitespace splits — blue vertical lines
+            if let Some(ws_arr) = summary["ws_splits"].as_array() {
+                for ws in ws_arr {
+                    if let Some(col) = ws.as_u64() {
                         let cx = wx + (col as f64 * sx_f) as u32;
                         overlays.push_str(&format!(
-                            "<div style=\"position:absolute;left:{cx}px;top:{wy}px;width:1px;height:{wb_h}px;\
-                             background:rgba(40,100,220,0.8);pointer-events:none;\"></div>\
-                             <div style=\"position:absolute;left:{}px;top:{label_y}px;\
-                             font-size:7px;color:rgba(40,100,220,0.9);pointer-events:none;\">{col}</div>",
-                            cx.saturating_sub(6)
+                            "<line x1=\"{cx}\" y1=\"{wy}\" x2=\"{cx}\" y2=\"{}\" \
+                             stroke=\"rgba(40,100,220,0.8)\" stroke-width=\"1\"/>\
+                             <text x=\"{}\" y=\"{label_y}\" font-size=\"7\" \
+                             fill=\"rgba(40,100,220,0.9)\">{col}</text>",
+                            wy + wb_h, cx.saturating_sub(6)
                         ));
                     }
                 }
@@ -818,9 +818,8 @@ fn build_scan_line_with_overlays(diag_dir: &Path, entry: &AuditEntry) -> String 
                                 let px_x = wx + (col_px as f64 * sx_f) as u32;
                                 let px_y = wy + (row_idx as f64 * sy_f) as u32;
                                 overlays.push_str(&format!(
-                                    "<div style=\"position:absolute;left:{px_x}px;top:{px_y}px;\
-                                     width:1px;height:1px;\
-                                     background:rgba(255,0,200,0.8);pointer-events:none;\"></div>",
+                                    "<rect x=\"{px_x}\" y=\"{px_y}\" width=\"1\" height=\"1\" \
+                                     fill=\"rgba(255,0,200,0.8)\"/>",
                                 ));
                             }
                         }
@@ -828,8 +827,8 @@ fn build_scan_line_with_overlays(diag_dir: &Path, entry: &AuditEntry) -> String 
                         let nominal_col = col_key.parse::<u64>().unwrap_or(0);
                         let cx = wx + (nominal_col as f64 * sx_f) as u32;
                         overlays.push_str(&format!(
-                            "<div style=\"position:absolute;left:{}px;top:{label_y}px;\
-                             font-size:7px;color:rgba(255,0,200,0.9);pointer-events:none;\">{col_key}</div>",
+                            "<text x=\"{}\" y=\"{label_y}\" font-size=\"7\" \
+                             fill=\"rgba(255,0,200,0.9)\">{col_key}</text>",
                             cx.saturating_sub(6)
                         ));
                     }
@@ -847,11 +846,11 @@ fn build_scan_line_with_overlays(diag_dir: &Path, entry: &AuditEntry) -> String 
                         if !seam_path_keys.contains(&col.to_string()) {
                             let cx = wx + (col as f64 * sx_f) as u32;
                             overlays.push_str(&format!(
-                                "<div style=\"position:absolute;left:{cx}px;top:{wy}px;width:1px;height:{wb_h}px;\
-                                 background:rgba(255,0,200,0.7);pointer-events:none;\"></div>\
-                                 <div style=\"position:absolute;left:{}px;top:{label_y}px;\
-                                 font-size:7px;color:rgba(255,0,200,0.9);pointer-events:none;\">{col}</div>",
-                                cx.saturating_sub(6)
+                                "<line x1=\"{cx}\" y1=\"{wy}\" x2=\"{cx}\" y2=\"{}\" \
+                                 stroke=\"rgba(255,0,200,0.7)\" stroke-width=\"1\"/>\
+                                 <text x=\"{}\" y=\"{label_y}\" font-size=\"7\" \
+                                 fill=\"rgba(255,0,200,0.9)\">{col}</text>",
+                                wy + wb_h, cx.saturating_sub(6)
                             ));
                         }
                     }
@@ -870,13 +869,11 @@ fn build_scan_line_with_overlays(diag_dir: &Path, entry: &AuditEntry) -> String 
          <span style=\"color:#00c8dc\">- -</span> final box · \
          <span style=\"color:#2864dc\">│</span> v-whitespace · \
          <span style=\"color:#ff00c8\">╲</span> seam</div>\
-         <div style=\"width:100%;aspect-ratio:{canvas_w}/{canvas_h};position:relative;overflow:hidden;\">\
-         <div style=\"position:absolute;inset:0;\">\
-         <div style=\"position:relative;width:{canvas_w}px;height:{canvas_h}px;transform-origin:top left;\" class=\"scan-line-inner\" data-w=\"{canvas_w}\">\
-         <img src=\"{img_uri}\" style=\"position:absolute;left:0;top:{margin_top}px;\
-         width:{cw}px;height:{ch}px;image-rendering:pixelated;\" class=\"scan-line-img\">\
+         <div style=\"width:100%;position:relative;\">\
+         <svg viewBox=\"0 0 {canvas_w} {canvas_h}\" style=\"width:100%;height:auto;display:block;\" xmlns=\"http://www.w3.org/2000/svg\">\
+         <image href=\"{img_uri}\" x=\"0\" y=\"{margin_top}\" width=\"{cw}\" height=\"{ch}\" style=\"image-rendering:pixelated;\"/>\
          {overlays}\
-         </div></div></div>\
+         </svg></div>\
          {seg_stats}\
          </div>",
         cw = img_w * scale,
@@ -938,7 +935,7 @@ fn build_seg_stats(diag_dir: &Path, entry: &AuditEntry) -> String {
             .map(|n| n.to_string())
             .unwrap_or_else(|| "?".to_string());
         let mismatch = summary["mismatch"].as_bool().unwrap_or(false);
-        let nvp = summary["vp_splits"]
+        let nvp = summary["ws_splits"]
             .as_array()
             .map(|a| a.len())
             .unwrap_or(0);
@@ -1252,18 +1249,6 @@ fn build_tie_break_block(
         return String::new();
     }
 
-    // Load scan image (shared across all candidates)
-    let scan_uri = {
-        // Try tie_0/ssim_scan.png first, then fall back to parent ssim_scan.png
-        let tie0_scan = diag_dir.join("tie_0").join("ssim_scan.png");
-        let parent_scan = diag_dir.join("ssim_scan.png");
-        let scan_path = if tie0_scan.exists() { tie0_scan } else { parent_scan };
-        match file_to_b64_uri(&scan_path) {
-            Some(u) => u,
-            None => return String::new(),
-        }
-    };
-
     let mut rows = String::new();
 
     // Header row with candidate names
@@ -1279,12 +1264,6 @@ fn build_tie_break_block(
     }
     header.push_str("</tr>");
     rows.push_str(&header);
-
-    // Scan row (same image for all)
-    rows.push_str(&format!(
-        "<tr><td class=\"ssim-label\">Scan</td><td colspan=\"{}\"><img src=\"{}\" class=\"ssim-compare-img\"></td></tr>",
-        entry.tie_candidates.len(), scan_uri
-    ));
 
     // Render row — one image per candidate
     rows.push_str("<tr><td class=\"ssim-label\">Render</td>");
@@ -1590,14 +1569,15 @@ img.ci {
   margin: 8px 0 10px 0; padding: 8px; background: #f5f8ff;
   border: 1px solid #ccd; border-radius: 4px;
 }
-.ssim-compare-table { border-collapse: collapse; width: 100%; }
+.ssim-compare-table { border-collapse: collapse; width: 100%; table-layout: fixed; }
 .ssim-compare-table th {
   text-align: center; font-size: 11px; font-weight: 600;
-  padding: 4px 6px; border-bottom: 2px solid #ccc;
+  padding: 4px 6px; border-bottom: 2px solid #ccc; overflow: hidden; word-break: break-all;
 }
 .ssim-compare-table td {
-  padding: 4px 6px; border-bottom: 1px solid #dde; vertical-align: middle;
+  padding: 4px 6px; border-bottom: 1px solid #dde; vertical-align: middle; overflow: hidden;
 }
+.ssim-compare-table img { max-width: 100%; height: auto; }
 .ssim-compare-table .ssim-label {
   font-size: 10px; font-weight: 600; color: #555; width: 50px; text-align: right;
 }
@@ -1608,6 +1588,7 @@ img.ci {
 .tie-break-block {
   margin: 8px 0 10px 0; padding: 8px; background: #fff8f0;
   border: 1px solid #dca; border-radius: 4px;
+  overflow-x: auto; max-width: 100%; box-sizing: border-box;
 }
 .tie-break-title {
   font-size: 11px; font-weight: 700; color: #c60; margin-bottom: 6px;
@@ -1615,30 +1596,13 @@ img.ci {
 .tie-winner { background: #e8ffe8; font-weight: 600; }
 .tie-loser { background: #fff0f0; }
 .scan-line-block {
-  margin: 6px 0 10px 0; padding: 8px; background: #f0f4f0;
-  border: 1px solid #c0c8c0; border-radius: 4px; overflow-x: auto;
-  box-sizing: border-box;
+  margin: 6px 0 10px 0; padding: 0; background: #f0f4f0;
+  border: 1px solid #c0c8c0; border-radius: 4px; overflow: hidden;
+  box-sizing: border-box; width: 100%;
 }
-.scan-line-label { font-size: 10px; font-weight: 600; color: #555; margin-bottom: 4px; }
-.scan-line-img {
-  image-rendering: pixelated;
-  border: 1px solid #ddd; display: block; margin: 2px 0;
-}
-.scan-line-inner {
-  transform-origin: top left;
-}
-</style>
-<script>
-function scaleScanLines(){
-  document.querySelectorAll('.scan-line-inner').forEach(function(el){
-    var w=parseInt(el.getAttribute('data-w'));
-    var pw=el.parentElement.offsetWidth;
-    if(w>0&&pw>0) el.style.transform='scale('+pw/w+')';
-  });
-}
-window.addEventListener('load',scaleScanLines);
-window.addEventListener('resize',scaleScanLines);
-</script>"#;
+.scan-line-label { font-size: 10px; font-weight: 600; color: #555; margin: 8px 8px 4px 8px; }
+.scan-line-block svg { display: block; width: 100%; height: auto; }
+</style>"#;
 
 // ── Public API ──────────────────────────────────────────────────────────────
 
@@ -1767,39 +1731,22 @@ pub fn generate_report(
 
     let mut font_data_cache = FontDataCache::new();
 
-    // Track misses where the chosen font's ZNCC >= GT font's ZNCC
-    // (visually indistinguishable or better — not really "wrong").
-    let mut visually_ok_blocks = String::new();
-    let mut n_visually_ok = 0usize;
-
     // Build major miss blocks
     let mut major_miss_blocks = String::new();
     for ce in &major_misses {
-        let (html, chosen_zncc, gt_zncc) = build_miss_block(
+        let (html, _chosen_zncc, _gt_zncc) = build_miss_block(
             ce, audit_root, font_catalog, glyph_map, &mut font_data_cache, dpi,
         );
         major_miss_blocks.push_str(&html);
-        if let (Some(cz), Some(gz)) = (chosen_zncc, gt_zncc) {
-            if cz >= gz {
-                visually_ok_blocks.push_str(&html);
-                n_visually_ok += 1;
-            }
-        }
     }
 
     // Build minor miss blocks
     let mut minor_miss_blocks = String::new();
     for ce in &minor_misses {
-        let (html, chosen_zncc, gt_zncc) = build_miss_block(
+        let (html, _chosen_zncc, _gt_zncc) = build_miss_block(
             ce, audit_root, font_catalog, glyph_map, &mut font_data_cache, dpi,
         );
         minor_miss_blocks.push_str(&html);
-        if let (Some(cz), Some(gz)) = (chosen_zncc, gt_zncc) {
-            if cz >= gz {
-                visually_ok_blocks.push_str(&html);
-                n_visually_ok += 1;
-            }
-        }
     }
 
     // Build similarity failure blocks
@@ -1839,15 +1786,6 @@ pub fn generate_report(
         String::new()
     };
 
-    let visually_ok_section = if n_visually_ok > 0 {
-        format!(
-            "<h2 style=\"margin-top:2em; color:#3a3;\">Visually OK Misses \
-             ({n_visually_ok} — chosen ZNCC ≥ GT ZNCC)</h2>{visually_ok_blocks}"
-        )
-    } else {
-        String::new()
-    };
-
     let sim_fail_miss_str = if !similarity_failures.is_empty() {
         format!(" ({} ZNCC fail)", similarity_failures.len())
     } else {
@@ -1862,12 +1800,6 @@ pub fn generate_report(
 
     let ocr_corr_str = if total_chars > 0 {
         format!(" | OCR corrections: {corrected_chars}/{total_chars}")
-    } else {
-        String::new()
-    };
-
-    let visually_ok_str = if n_visually_ok > 0 {
-        format!(" | {n_visually_ok} visually OK")
     } else {
         String::new()
     };
@@ -1944,7 +1876,7 @@ pub fn generate_report(
          {CSS}\n\
          <h2>unprint miss report</h2>\n\
          <div class=\"summary\">{primary_hits}/{compared} correct ({pct:.1}%) — \
-         {n_major} major + {n_minor} minor misses{sim_fail_miss_str}{raster_str}{visually_ok_str}{ocr_corr_str}{sim_percentile_str}{gt_rank_str}</div>\n\
+         {n_major} major + {n_minor} minor misses{sim_fail_miss_str}{raster_str}{ocr_corr_str}{sim_percentile_str}{gt_rank_str}</div>\n\
          <div class=\"summary\">{meta_str}</div>\n\
          <div class=\"score-legend\">\n\
          <b>Score key:</b>\n\
@@ -1963,7 +1895,6 @@ pub fn generate_report(
          {minor_miss_blocks}\n\
          {sim_fail_section}\n\
          {raster_section}\n\
-         {visually_ok_section}\n\
          </body>\n\
          </html>",
         n_major = major_misses.len(),
