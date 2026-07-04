@@ -191,67 +191,9 @@ def fc_find(family, style="Regular"):
     )
 
 
-def make_weight_explicit(path):
-    """Ensure the font's PS name always contains an explicit weight keyword.
-
-    Delegates to `unscan --weight-explicit` so the logic lives in one place
-    (Rust font_scan::make_weight_explicit).  The Rust catalog scanner applies
-    the same function at index time, so GT and catalog names always agree.
-
-    Returns (original_ps_name, display_ps_name, path).
-    """
-    from fontTools.ttLib import TTFont as FTFont
-    if not path:
-        return None, None, path
-
-    orig_ps = read_postscript_name(path)
-    if not orig_ps:
-        return None, None, path
-
-    try:
-        tt = FTFont(path)
-        weight = tt['OS/2'].usWeightClass
-        tt.close()
-    except Exception:
-        return orig_ps, orig_ps, path
-
-    unscan_bin = os.path.join(os.path.dirname(__file__), "..", "target", "release", "unscan")
-    if not os.path.exists(unscan_bin):
-        # Fallback: try PATH
-        unscan_bin = "unscan"
-
-    r = subprocess.run(
-        [unscan_bin, "--weight-explicit", f"{orig_ps}:{weight}"],
-        capture_output=True, text=True
-    )
-    if r.returncode == 0:
-        new_ps = r.stdout.strip()
-    else:
-        new_ps = orig_ps
-
-    if new_ps != orig_ps:
-        print(f"  WEIGHT EXPLICIT: {orig_ps} (w{weight}) → {new_ps}")
-    return orig_ps, new_ps, path
-
-
-def read_postscript_name(ttf_path):
-    """Read PostScript name (name ID 6) from a font file."""
-    from fontTools.ttLib import TTFont as FTFont
-    try:
-        tt = FTFont(ttf_path)
-        for rec in tt['name'].names:
-            if rec.nameID == 6:
-                try:
-                    ps = rec.toUnicode()
-                    if ps:
-                        tt.close()
-                        return ps
-                except Exception:
-                    pass
-        tt.close()
-    except Exception:
-        pass
-    return None
+# Shared font annotation utilities — canonical in tools/pdf_font_annotate.py
+sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", "tools"))
+from pdf_font_annotate import read_postscript_name, make_weight_explicit, annotate_canonical_names
 
 
 def register_font(ps_name, ttf_path):
@@ -1131,62 +1073,14 @@ def build_specimen(out_pdf, registered, alias_map):
     return out_pdf
 
 
-def annotate_canonical_names(pdf_path, canonical_map):
-    """Post-process a PDF: add /UnprintCanonical to every font dictionary.
-
-    For each font dictionary in the PDF, reads /BaseFont (stripping subset
-    prefix), looks it up in canonical_map, and writes /UnprintCanonical with
-    the canonical (weight-explicit) name.
-
-    Returns the number of fonts annotated and a list of any BaseFont names
-    that were NOT found in canonical_map (verification failures).
-    """
-    import pikepdf
-
-    pdf = pikepdf.open(pdf_path, allow_overwriting_input=True)
-    annotated = 0
-    missing = []
-
-    for page in pdf.pages:
-        resources = page.get("/Resources")
-        if resources is None:
-            continue
-        fonts = resources.get("/Font")
-        if fonts is None:
-            continue
-        for res_name in list(fonts.keys()):
-            font_dict = fonts[res_name]
-            if isinstance(font_dict, pikepdf.Object) and hasattr(font_dict, 'get'):
-                pass
-            else:
-                continue
-            base_font = font_dict.get("/BaseFont")
-            if base_font is None:
-                continue
-            bf_str = str(base_font).lstrip("/")
-            # Strip subset prefix (e.g. "AAAAAA+Lato-Italic" → "Lato-Italic")
-            if len(bf_str) > 7 and bf_str[6] == '+':
-                raw_ps = bf_str[7:]
-            else:
-                raw_ps = bf_str
-            canonical = canonical_map.get(raw_ps)
-            if canonical:
-                font_dict[pikepdf.Name("/UnprintCanonical")] = pikepdf.String(canonical)
-                annotated += 1
-            else:
-                if raw_ps not in missing:
-                    missing.append(raw_ps)
-
-    pdf.save(pdf_path)
-    pdf.close()
-    return annotated, missing
+# annotate_canonical_names is imported from tools/pdf_font_annotate.py above.
 
 
 # ---------------------------------------------------------------------------
 # Rasterization + fontmap — all logic lives in tools/rasterize.py.
 # gen-specimen.py only builds the vector PDF; rasterize.py does the rest.
 # ---------------------------------------------------------------------------
-sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "tools"))
+# tools/ already on sys.path from pdf_font_annotate import above.
 from importlib import import_module as _imp
 _rasterize_mod = _imp("rasterize")
 

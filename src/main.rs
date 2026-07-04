@@ -34,7 +34,7 @@ use crate::error::ScanTextError;
 use rayon::prelude::*;
 
 /// Minimum SSIM score for SSIM verification to consider a font match acceptable.
-const MIN_VERIFY_SIMILARITY: f32 = 0.8;
+const MIN_VERIFY_SIMILARITY: f32 = 0.9;
 
 /// Standalone char rendering: render characters using the index-time
 /// render_glyph_at_ink_height() pipeline and save as PNGs.
@@ -170,6 +170,9 @@ fn build_audit_entry(
         tie_candidates: lm.tie_candidates.clone(),
         miss_type: None,
         expected_font: None,
+        gt_text: None,
+        ocr_text: None,
+        ocr_correct: None,
     }
 }
 
@@ -738,6 +741,10 @@ fn run(args: &cli::Args, classifier: &mut dyn classifier::Classifier) -> Result<
             "similarity_failures": acc.similarity_failures,
             "hits": acc.hits,
             "kept_raster": acc.kept_raster,
+            "ocr_correct_total": acc.ocr_correct_total,
+            "ocr_correct_hits": acc.ocr_correct_hits,
+            "ocr_wrong_total": acc.ocr_wrong_total,
+            "ocr_wrong_hits": acc.ocr_wrong_hits,
         });
         println!("{}", serde_json::to_string_pretty(&test_json).unwrap());
 

@@ -414,6 +414,25 @@ pub fn enrich_audit_entries(
     for (e, (kind, expected)) in entries.iter_mut().zip(results) {
         e.miss_type = Some(kind);
         e.expected_font = expected;
+
+        // Populate GT text and OCR text comparison
+        if let Some(gt) = gt {
+            let bbox_px = [e.bbox.x as f32, e.bbox.y as f32,
+                           (e.bbox.x + e.bbox.width) as f32,
+                           (e.bbox.y + e.bbox.height) as f32];
+            e.gt_text = gt.lookup_text(e.page, &bbox_px, dpi).map(|s| s.to_string());
+        }
+        // OCR text: join word texts (from word_bboxes)
+        let ocr: String = e.word_bboxes.iter().map(|w| w.text.as_str()).collect::<Vec<_>>().join(" ");
+        if !ocr.is_empty() {
+            e.ocr_text = Some(ocr.clone());
+            if let Some(ref gt_t) = e.gt_text {
+                // Normalize for comparison: strip spaces, lowercase
+                let gt_norm: String = gt_t.chars().filter(|c| !c.is_whitespace()).collect::<String>().to_lowercase();
+                let ocr_norm: String = ocr.chars().filter(|c| !c.is_whitespace()).collect::<String>().to_lowercase();
+                e.ocr_correct = Some(gt_norm == ocr_norm);
+            }
+        }
     }
 }
 
@@ -442,6 +461,172 @@ fn find_correct_ci_candidate(
 }
 
 // ── HTML block generation ───────────────────────────────────────────────────
+
+/// Build a lightweight block for lines where the font matched but OCR got the text wrong.
+fn build_ocr_miss_block(
+    ce: &ClassifiedEntry,
+    audit_root: &Path,
+) -> String {
+    let entry = ce.entry;
+    let text_preview = truncate(&entry.text, 60);
+    let matched = entry.font_matched.as_deref().map(short_key).unwrap_or_else(|| "?".into());
+
+    let diag_dir = find_diag_seg_dir(audit_root, entry.page, entry.line_index);
+
+    // Scan line image
+    let scan_line_html = if let Some(ref dd) = diag_dir {
+        build_scan_line_with_overlays(dd, entry)
+    } else {
+        String::new()
+    };
+
+    // Similarity images (scan vs render vs diff)
+    let sim_images_html = if let Some(ref dd) = diag_dir {
+        let scan_path = dd.join("ssim_scan.png");
+        let render_path = dd.join("ssim_render.png");
+        let diff_path = dd.join("ssim_diff.png");
+        let scan_uri = file_to_b64_uri(&scan_path);
+        let render_uri = file_to_b64_uri(&render_path);
+        let diff_uri = file_to_b64_uri(&diff_path);
+        match (scan_uri, render_uri) {
+            (Some(s), Some(r)) => {
+                let diff_row = diff_uri.map(|d| format!(
+                    "<tr><td class=\"ssim-label\">Diff</td>\
+                     <td colspan=\"2\"><img src=\"{d}\" class=\"ssim-compare-img\"></td></tr>"
+                )).unwrap_or_default();
+                format!(
+                    "<table class=\"ssim-compare\" style=\"margin:0.5em 0;\">\
+                     <tr><td class=\"ssim-label\">Scan</td>\
+                     <td colspan=\"2\"><img src=\"{s}\" class=\"ssim-compare-img\"></td></tr>\
+                     <tr><td class=\"ssim-label\">Render</td>\
+                     <td colspan=\"2\"><img src=\"{r}\" class=\"ssim-compare-img\"></td></tr>\
+                     {diff_row}\
+                     </table>"
+                )
+            }
+            _ => String::new(),
+        }
+    } else {
+        String::new()
+    };
+
+    // Character-level diff between GT and OCR text
+    let diff_html = match (entry.gt_text.as_deref(), entry.ocr_text.as_deref()) {
+        (Some(gt), Some(ocr)) => {
+            let gt_chars: Vec<char> = gt.chars().filter(|c| !c.is_whitespace()).collect();
+            let ocr_chars: Vec<char> = ocr.chars().filter(|c| !c.is_whitespace()).collect();
+
+            // Simple LCS-based diff for highlighting
+            let (gt_marked, ocr_marked) = char_diff_markup(&gt_chars, &ocr_chars);
+
+            format!(
+                "<table class=\"ocr-diff\" style=\"margin:0.5em 0; border-collapse:collapse;\">\
+                 <tr><td style=\"padding:2px 8px; color:#888;\">GT</td>\
+                 <td style=\"padding:2px 8px; font-family:monospace;\">{}</td></tr>\
+                 <tr><td style=\"padding:2px 8px; color:#888;\">OCR</td>\
+                 <td style=\"padding:2px 8px; font-family:monospace;\">{}</td></tr>\
+                 </table>",
+                gt_marked, ocr_marked
+            )
+        }
+        _ => String::new(),
+    };
+
+    // ZNCC info
+    let sim_html = match (entry.similarity_score, entry.similarity_pass) {
+        (Some(score), Some(pass)) => {
+            let cls = if pass { "ssim-pass" } else { "ssim-fail" };
+            let label = if pass { "pass" } else { "FAIL" };
+            format!(" <span class=\"{cls}\">ZNCC {score:.4} ({label})</span>")
+        }
+        _ => String::new(),
+    };
+
+    format!(
+        "<div class=\"miss\" style=\"border-left: 3px solid #e90; padding-left: 1em; margin-bottom: 1em;\">\
+         <h3>p{}:L{} — \"{}\" [font: {}]{}</h3>\
+         {}\
+         {}\
+         {}\
+         </div>",
+        entry.page, entry.line_index, text_preview, matched, sim_html,
+        scan_line_html, sim_images_html, diff_html,
+    )
+}
+
+/// Produce character-level diff markup: matching chars are plain,
+/// mismatched/inserted/deleted chars are highlighted.
+fn char_diff_markup(gt: &[char], ocr: &[char]) -> (String, String) {
+    // LCS table
+    let m = gt.len();
+    let n = ocr.len();
+    let mut dp = vec![vec![0u16; n + 1]; m + 1];
+    for i in 1..=m {
+        for j in 1..=n {
+            dp[i][j] = if gt[i - 1] == ocr[j - 1] {
+                dp[i - 1][j - 1] + 1
+            } else {
+                dp[i - 1][j].max(dp[i][j - 1])
+            };
+        }
+    }
+
+    // Backtrack to produce aligned sequences
+    let mut gt_out = String::new();
+    let mut ocr_out = String::new();
+    let (mut i, mut j) = (m, n);
+    let mut gt_parts: Vec<(char, bool)> = Vec::new();
+    let mut ocr_parts: Vec<(char, bool)> = Vec::new();
+
+    while i > 0 || j > 0 {
+        if i > 0 && j > 0 && gt[i - 1] == ocr[j - 1] {
+            gt_parts.push((gt[i - 1], false));
+            ocr_parts.push((ocr[j - 1], false));
+            i -= 1;
+            j -= 1;
+        } else if j > 0 && (i == 0 || dp[i][j - 1] >= dp[i - 1][j]) {
+            // Insertion in OCR
+            ocr_parts.push((ocr[j - 1], true));
+            j -= 1;
+        } else {
+            // Deletion from GT
+            gt_parts.push((gt[i - 1], true));
+            i -= 1;
+        }
+    }
+
+    gt_parts.reverse();
+    ocr_parts.reverse();
+
+    for (ch, is_diff) in &gt_parts {
+        if *is_diff {
+            gt_out.push_str(&format!("<span style=\"background:#fdd; color:#900;\">{}</span>",
+                                     html_escape_char(*ch)));
+        } else {
+            gt_out.push_str(&html_escape_char(*ch));
+        }
+    }
+    for (ch, is_diff) in &ocr_parts {
+        if *is_diff {
+            ocr_out.push_str(&format!("<span style=\"background:#dfd; color:#090;\">{}</span>",
+                                      html_escape_char(*ch)));
+        } else {
+            ocr_out.push_str(&html_escape_char(*ch));
+        }
+    }
+
+    (gt_out, ocr_out)
+}
+
+fn html_escape_char(c: char) -> String {
+    match c {
+        '<' => "&lt;".to_string(),
+        '>' => "&gt;".to_string(),
+        '&' => "&amp;".to_string(),
+        '"' => "&quot;".to_string(),
+        _ => c.to_string(),
+    }
+}
 
 /// Returns (html_block, chosen_zncc, gt_zncc).
 fn build_miss_block(
@@ -1417,7 +1602,7 @@ fn build_observation_table(
             ));
         }
 
-        let ocr_cell = ocr_parts.join("<br>");
+        let ocr_cell = ocr_parts.join(" · ");
 
         // Per-observation probability labels with color coding:
         // Green background = this font scores better on this observation
@@ -1458,8 +1643,8 @@ fn build_observation_table(
         rows.push_str(&format!(
             "<tr>\
              <td class=\"img-td\">{}</td>\
-             <td class=\"img-td {correct_win_class}\">{}{}</td>\
-             <td class=\"img-td {chosen_win_class}\">{}{}</td>\
+             <td class=\"img-td {correct_win_class}\"><div class=\"img-stat\">{}{}</div></td>\
+             <td class=\"img-td {chosen_win_class}\"><div class=\"img-stat\">{}{}</div></td>\
              <td class=\"ocr-col\">{}</td>\
              </tr>",
             img_td(crop_uri.as_deref()),
@@ -1542,16 +1727,17 @@ th.correct { color: #2e7d32; }
 th.chosen { color: #c62828; }
 th .score { font-weight: 400; font-size: 10px; color: #666; }
 td {
-  padding: 6px; vertical-align: middle;
+  padding: 2px 4px; vertical-align: middle;
   border-bottom: 1px solid #eee;
 }
-.img-td { text-align: center; }
+.img-td { text-align: center; vertical-align: middle; }
+.img-stat { display: flex; align-items: center; gap: 4px; justify-content: center; }
 img.ci {
-  height: 48px; image-rendering: pixelated; display: block; margin: 0 auto;
+  height: 19px; image-rendering: pixelated; flex-shrink: 0;
   border: 1px solid #ddd;
   background: #f5f5f5;
 }
-.sub { font-size: 10px; color: #777; margin-top: 2px; }
+.sub { font-size: 10px; color: #777; white-space: nowrap; }
 .ocr-fix { color: #c62828; }
 .num { font-family: monospace; font-size: 12px; text-align: right; white-space: nowrap; }
 .prob-win { background: #e8f5e9; border-left: 3px solid #4caf50; padding-left: 4px; }
@@ -1616,6 +1802,10 @@ pub struct AccuracyResult {
     pub compared: usize,
     pub primary_hits: usize,
     pub pct: f64,
+    pub ocr_correct_total: usize,
+    pub ocr_correct_hits: usize,
+    pub ocr_wrong_total: usize,
+    pub ocr_wrong_hits: usize,
 }
 
 /// Compute accuracy without generating any HTML or audit I/O.
@@ -1656,6 +1846,22 @@ pub fn compute_accuracy(
         100.0
     };
 
+    let (ocr_correct_total, ocr_correct_hits, ocr_wrong_total, ocr_wrong_hits) = {
+        let mut c_total = 0usize;
+        let mut c_hits = 0usize;
+        let mut w_total = 0usize;
+        let mut w_hits = 0usize;
+        for ce in &classified {
+            let is_hit = matches!(ce.kind, MissKind::Hit | MissKind::MinorMiss);
+            match ce.entry.ocr_correct {
+                Some(true) => { c_total += 1; if is_hit { c_hits += 1; } },
+                Some(false) => { w_total += 1; if is_hit { w_hits += 1; } },
+                None => {},
+            }
+        }
+        (c_total, c_hits, w_total, w_hits)
+    };
+
     AccuracyResult {
         hits,
         major_misses,
@@ -1665,6 +1871,10 @@ pub fn compute_accuracy(
         compared,
         primary_hits,
         pct,
+        ocr_correct_total,
+        ocr_correct_hits,
+        ocr_wrong_total,
+        ocr_wrong_hits,
     }
 }
 
@@ -1707,6 +1917,12 @@ pub fn generate_report(
         }
     }
 
+    // Collect OCR-wrong hits/minor misses (font matched, but OCR text wrong)
+    let ocr_misses: Vec<&ClassifiedEntry> = classified.iter()
+        .filter(|ce| matches!(ce.kind, MissKind::Hit | MissKind::MinorMiss)
+                     && ce.entry.ocr_correct == Some(false))
+        .collect();
+
     let all_misses = major_misses.len() + minor_misses.len() + similarity_failures.len();
     let compared = hits + all_misses;
     // Primary metric: only major misses count against the score.
@@ -1716,6 +1932,24 @@ pub fn generate_report(
         primary_hits as f64 / compared as f64 * 100.0
     } else {
         100.0
+    };
+
+    // OCR accuracy split: break down font matching accuracy by OCR correctness
+    let (ocr_correct_total, ocr_correct_hits, ocr_wrong_total, ocr_wrong_hits, ocr_unknown_total) = {
+        let mut c_total = 0usize;
+        let mut c_hits = 0usize;
+        let mut w_total = 0usize;
+        let mut w_hits = 0usize;
+        let mut u_total = 0usize;
+        for ce in &classified {
+            let is_hit = matches!(ce.kind, MissKind::Hit | MissKind::MinorMiss);
+            match ce.entry.ocr_correct {
+                Some(true) => { c_total += 1; if is_hit { c_hits += 1; } },
+                Some(false) => { w_total += 1; if is_hit { w_hits += 1; } },
+                None => { u_total += 1; },
+            }
+        }
+        (c_total, c_hits, w_total, w_hits, u_total)
     };
 
     // Sort each miss category by increasing ZNCC (worst visual matches first)
@@ -1767,6 +2001,12 @@ pub fn generate_report(
         raster_blocks.push_str(&html);
     }
 
+    // Build OCR miss blocks (font matched, OCR text wrong)
+    let mut ocr_miss_blocks = String::new();
+    for ce in &ocr_misses {
+        ocr_miss_blocks.push_str(&build_ocr_miss_block(ce, audit_root));
+    }
+
     let sim_fail_section = if !sim_fail_blocks.is_empty() {
         format!(
             "<h2 style=\"margin-top:2em; color:#c55;\">\
@@ -1786,6 +2026,16 @@ pub fn generate_report(
         String::new()
     };
 
+    let ocr_miss_section = if !ocr_miss_blocks.is_empty() {
+        format!(
+            "<h2 style=\"margin-top:2em; color:#e90;\">\
+             OCR Text Mismatches ({} lines — font correct, text wrong)</h2>{ocr_miss_blocks}",
+            ocr_misses.len()
+        )
+    } else {
+        String::new()
+    };
+
     let sim_fail_miss_str = if !similarity_failures.is_empty() {
         format!(" ({} ZNCC fail)", similarity_failures.len())
     } else {
@@ -1800,6 +2050,21 @@ pub fn generate_report(
 
     let ocr_corr_str = if total_chars > 0 {
         format!(" | OCR corrections: {corrected_chars}/{total_chars}")
+    } else {
+        String::new()
+    };
+
+    // OCR accuracy split summary
+    let ocr_split_str = if ocr_correct_total + ocr_wrong_total > 0 {
+        let c_pct = if ocr_correct_total > 0 { ocr_correct_hits as f64 / ocr_correct_total as f64 * 100.0 } else { 0.0 };
+        let w_pct = if ocr_wrong_total > 0 { ocr_wrong_hits as f64 / ocr_wrong_total as f64 * 100.0 } else { 0.0 };
+        let mut s = format!(
+            "</div>\n<div class=\"summary\">OCR split: correct-text {ocr_correct_hits}/{ocr_correct_total} ({c_pct:.1}%) | wrong-text {ocr_wrong_hits}/{ocr_wrong_total} ({w_pct:.1}%)"
+        );
+        if ocr_unknown_total > 0 {
+            s.push_str(&format!(" | no-GT {ocr_unknown_total}"));
+        }
+        s
     } else {
         String::new()
     };
@@ -1877,6 +2142,7 @@ pub fn generate_report(
          <h2>unprint miss report</h2>\n\
          <div class=\"summary\">{primary_hits}/{compared} correct ({pct:.1}%) — \
          {n_major} major + {n_minor} minor misses{sim_fail_miss_str}{raster_str}{ocr_corr_str}{sim_percentile_str}{gt_rank_str}</div>\n\
+         {ocr_split_str}\n\
          <div class=\"summary\">{meta_str}</div>\n\
          <div class=\"score-legend\">\n\
          <b>Score key:</b>\n\
@@ -1895,6 +2161,7 @@ pub fn generate_report(
          {minor_miss_blocks}\n\
          {sim_fail_section}\n\
          {raster_section}\n\
+         {ocr_miss_section}\n\
          </body>\n\
          </html>",
         n_major = major_misses.len(),

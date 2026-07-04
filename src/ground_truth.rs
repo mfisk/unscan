@@ -18,6 +18,8 @@ pub struct VectorSpan {
     pub bbox: [f32; 4],
     /// Effective font size in PDF points (font_size × CTM y-scale).
     pub font_size_pt: f32,
+    /// Raw text content extracted from Tj/TJ operands.
+    pub text: String,
 }
 
 /// Ground truth for the entire document, keyed by 1-based page number.
@@ -469,6 +471,7 @@ fn extract_page_spans(
     // Build font resource name → (BaseFont name, PdfFontWidths) map for this page.
     let mut font_map: HashMap<Vec<u8>, String> = HashMap::new();
     let mut font_widths_map: HashMap<Vec<u8>, PdfFontWidths> = HashMap::new();
+    let mut tounicode_map: HashMap<Vec<u8>, HashMap<u16, String>> = HashMap::new();
     // Pre-populate from Resources/Font if available.
     if let Ok(page_dict) = doc.get_dictionary(page_id) {
         if let Ok(res_obj) = page_dict.get(b"Resources") {
@@ -486,6 +489,10 @@ fn extract_page_spans(
                                         if let Ok(fd) = font_obj.as_dict() {
                                             if let Some(fw) = extract_pdf_font_widths(doc, fd) {
                                                 font_widths_map.insert(name.clone(), fw);
+                                            }
+                                            // Extract /ToUnicode CMap
+                                            if let Some(tu) = extract_tounicode_map(doc, fd) {
+                                                tounicode_map.insert(name.clone(), tu);
                                             }
                                         }
                                     }
@@ -610,6 +617,7 @@ fn extract_page_spans(
                         font_name: current_font.clone(),
                         bbox: [x, y, x + w, y + h],
                         font_size_pt: h,
+                        text: text_content(&op.operands, tounicode_map.get(&current_font_resource)),
                     });
                 }
             }
@@ -628,6 +636,7 @@ fn extract_page_spans(
                         font_name: current_font.clone(),
                         bbox: [x, y, x + w, y + h],
                         font_size_pt: h,
+                        text: text_content(&op.operands, tounicode_map.get(&current_font_resource)),
                     });
                 }
             }
@@ -681,6 +690,91 @@ fn as_f32(obj: &lopdf::Object) -> Option<f32> {
     }
 }
 
+/// Extract a /ToUnicode CMap from a font dictionary.
+/// Returns a map from 2-byte glyph code to Unicode string.
+fn extract_tounicode_map(doc: &Document, font_dict: &lopdf::Dictionary) -> Option<HashMap<u16, String>> {
+    let tu_obj = font_dict.get(b"ToUnicode").ok()?;
+    let tu_obj = doc.dereference(tu_obj).ok().map(|(_, o)| o).unwrap_or(tu_obj);
+
+    // ToUnicode is a stream
+    let stream = match tu_obj {
+        lopdf::Object::Stream(ref s) => s,
+        _ => return None,
+    };
+    let content = stream.decompressed_content().ok().unwrap_or_else(|| stream.content.clone());
+    let text = String::from_utf8_lossy(&content);
+
+    let mut map: HashMap<u16, String> = HashMap::new();
+
+    // Parse beginbfchar / endbfchar blocks
+    for section in text.split("beginbfchar") {
+        if let Some(end) = section.find("endbfchar") {
+            let block = &section[..end];
+            for line in block.lines() {
+                let line = line.trim();
+                // Format: <XXXX> <YYYY> or <XXXX> <YYYYYYYY>
+                let parts: Vec<&str> = line.split('<').filter(|s| s.contains('>')).collect();
+                if parts.len() >= 2 {
+                    let src = parts[0].split('>').next().unwrap_or("");
+                    let dst = parts[1].split('>').next().unwrap_or("");
+                    if let Ok(code) = u16::from_str_radix(src, 16) {
+                        // dst can be multi-byte Unicode
+                        let mut s = String::new();
+                        let chars: Vec<char> = (0..dst.len() / 4).filter_map(|i| {
+                            u16::from_str_radix(&dst[i*4..(i+1)*4], 16).ok()
+                        }).filter_map(|cp| {
+                            char::from_u32(cp as u32)
+                        }).collect();
+                        if chars.is_empty() {
+                            // Try as a single 2-byte or 4-byte code
+                            if let Ok(cp) = u32::from_str_radix(dst, 16) {
+                                if let Some(c) = char::from_u32(cp) {
+                                    s.push(c);
+                                }
+                            }
+                        } else {
+                            for c in chars { s.push(c); }
+                        }
+                        if !s.is_empty() {
+                            map.insert(code, s);
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    // Parse beginbfrange / endbfrange blocks
+    for section in text.split("beginbfrange") {
+        if let Some(end) = section.find("endbfrange") {
+            let block = &section[..end];
+            for line in block.lines() {
+                let line = line.trim();
+                let parts: Vec<&str> = line.split('<').filter(|s| s.contains('>')).collect();
+                if parts.len() >= 3 {
+                    let start_s = parts[0].split('>').next().unwrap_or("");
+                    let end_s = parts[1].split('>').next().unwrap_or("");
+                    let base_s = parts[2].split('>').next().unwrap_or("");
+                    if let (Ok(start), Ok(end_code), Ok(base)) = (
+                        u16::from_str_radix(start_s, 16),
+                        u16::from_str_radix(end_s, 16),
+                        u32::from_str_radix(base_s, 16),
+                    ) {
+                        for code in start..=end_code {
+                            let cp = base + (code - start) as u32;
+                            if let Some(c) = char::from_u32(cp) {
+                                map.insert(code, c.to_string());
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    if map.is_empty() { None } else { Some(map) }
+}
+
 /// Count the number of text characters in the operands of a text-showing op.
 fn text_length(operands: &[lopdf::Object]) -> usize {
     let mut count = 0;
@@ -698,6 +792,47 @@ fn text_length(operands: &[lopdf::Object]) -> usize {
         }
     }
     count
+}
+
+/// Extract the text content from Tj/TJ operands as a String.
+/// If a ToUnicode CMap is available, use it to decode 2-byte glyph codes
+/// to Unicode. Otherwise fall back to raw bytes as Latin-1.
+fn text_content(operands: &[lopdf::Object], tounicode: Option<&HashMap<u16, String>>) -> String {
+    let mut bytes_out = Vec::new();
+    for op in operands {
+        match op {
+            lopdf::Object::String(bytes, _) => bytes_out.extend_from_slice(bytes),
+            lopdf::Object::Array(arr) => {
+                for item in arr {
+                    if let lopdf::Object::String(bytes, _) = item {
+                        bytes_out.extend_from_slice(bytes);
+                    }
+                }
+            }
+            _ => {}
+        }
+    }
+
+    if let Some(tu) = tounicode {
+        // Decode 2-byte big-endian glyph codes via ToUnicode
+        let mut result = String::new();
+        let mut i = 0;
+        while i + 1 < bytes_out.len() {
+            let code = ((bytes_out[i] as u16) << 8) | (bytes_out[i + 1] as u16);
+            if let Some(s) = tu.get(&code) {
+                result.push_str(s);
+            }
+            i += 2;
+        }
+        // If ToUnicode produced nothing, fall back
+        if result.is_empty() {
+            String::from_utf8_lossy(&bytes_out).into_owned()
+        } else {
+            result
+        }
+    } else {
+        String::from_utf8_lossy(&bytes_out).into_owned()
+    }
 }
 
 // ── Public API ──────────────────────────────────────────────────────────────
@@ -766,6 +901,17 @@ impl GroundTruth {
     /// given DPI).  Returns the font name of the best-overlapping span, or None
     /// if no span overlaps.
     pub fn lookup_font(&self, page: usize, bbox_px: &[f32; 4], dpi: u32) -> Option<&str> {
+        self.lookup_span(page, bbox_px, dpi).map(|s| s.font_name.as_str())
+    }
+
+    /// Look up the ground-truth text for a given audit bbox (in pixels at the
+    /// given DPI).  Returns the text of the best-overlapping span, or None.
+    pub fn lookup_text(&self, page: usize, bbox_px: &[f32; 4], dpi: u32) -> Option<&str> {
+        self.lookup_span(page, bbox_px, dpi).map(|s| s.text.as_str())
+    }
+
+    /// Find the best-overlapping VectorSpan for a given audit bbox.
+    fn lookup_span(&self, page: usize, bbox_px: &[f32; 4], dpi: u32) -> Option<&VectorSpan> {
         let scale = dpi as f32 / 72.0;
         // Convert pixel bbox to PDF points.
         let px0 = bbox_px[0] / scale;
@@ -775,7 +921,7 @@ impl GroundTruth {
 
         let spans = self.pages.get(&page)?;
 
-        let mut best_font: Option<&str> = None;
+        let mut best_span: Option<&VectorSpan> = None;
         let mut best_area: f32 = 0.0;
 
         for span in spans {
@@ -788,44 +934,18 @@ impl GroundTruth {
                 let area = (ox1 - ox0) * (oy1 - oy0);
                 if area > best_area {
                     best_area = area;
-                    best_font = Some(&span.font_name);
+                    best_span = Some(span);
                 }
             }
         }
 
-        best_font
+        best_span
     }
 
     /// Look up the ground-truth font name and effective font size (in PDF
     /// points) for a given audit bbox (in pixels at the given DPI).
     pub fn lookup_font_and_size(&self, page: usize, bbox_px: &[f32; 4], dpi: u32) -> Option<(&str, f32)> {
-        let scale = dpi as f32 / 72.0;
-        let px0 = bbox_px[0] / scale;
-        let py0 = bbox_px[1] / scale;
-        let px1 = bbox_px[2] / scale;
-        let py1 = bbox_px[3] / scale;
-
-        let spans = self.pages.get(&page)?;
-
-        let mut best: Option<(&str, f32)> = None;
-        let mut best_area: f32 = 0.0;
-
-        for span in spans {
-            let [sx0, sy0, sx1, sy1] = span.bbox;
-            let ox0 = sx0.max(px0);
-            let oy0 = sy0.max(py0);
-            let ox1 = sx1.min(px1);
-            let oy1 = sy1.min(py1);
-            if ox0 < ox1 && oy0 < oy1 {
-                let area = (ox1 - ox0) * (oy1 - oy0);
-                if area > best_area {
-                    best_area = area;
-                    best = Some((&span.font_name, span.font_size_pt));
-                }
-            }
-        }
-
-        best
+        self.lookup_span(page, bbox_px, dpi).map(|s| (s.font_name.as_str(), s.font_size_pt))
     }
 
     /// Check whether a matched font is correct for the given position.

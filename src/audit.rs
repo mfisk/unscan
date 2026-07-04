@@ -55,6 +55,15 @@ pub struct AuditEntry {
     /// Populated when --audit is provided.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub expected_font: Option<String>,
+    /// Ground-truth text from the vector PDF span.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub gt_text: Option<String>,
+    /// OCR-extracted text (joined word texts for this line).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub ocr_text: Option<String>,
+    /// Whether OCR text matches ground truth (None when GT unavailable).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub ocr_correct: Option<bool>,
 }
 
 /// Word-level bounding box with OCR text.
