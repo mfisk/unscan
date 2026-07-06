@@ -28,9 +28,6 @@ pub struct ZnccClassifier {
     glyph_map: NgramGlyphMap,
     /// Render parameters for loading cached glyphs.
     render_params: RenderParams,
-    /// Per-char: glyph_id → image hash, for loading cached PNGs.
-    /// Built on first access per char from GlyphMap + cache probing.
-    glyph_hashes: std::collections::HashMap<Vec<char>, Vec<u64>>,
 }
 
 impl ZnccClassifier {
@@ -46,7 +43,6 @@ impl ZnccClassifier {
         Self {
             glyph_map,
             render_params: render_params.clone(),
-            glyph_hashes: std::collections::HashMap::new(),
         }
     }
 }
@@ -64,48 +60,17 @@ impl Classifier for ZnccClassifier {
             None => return Vec::new(),
         };
 
-        // Need mutable self for ensure_hashes — but trait says &self.
-        // Work around: load from cache directly using the glyph_map.
         let groups = match self.glyph_map.groups.get(seq) {
             Some(g) => g,
             None => return Vec::new(),
         };
-        let hashes = self.glyph_hashes.get(seq);
 
         let mut scored: Vec<(usize, f32)> = Vec::new();
         for (glyph_id, group) in groups.iter().enumerate() {
-            // Try to get cached image via hash
-            let ref_img = if let Some(hs) = hashes {
-                if let Some(&h) = hs.get(glyph_id) {
-                    if h != 0 {
-                        crate::char_render::load_cached_ngram(seq, h, &self.render_params)
-                    } else {
-                        None
-                    }
-                } else {
-                    None
-                }
+            let ref_img = if group.hash != 0 {
+                crate::char_render::load_cached_ngram(seq, group.hash, &self.render_params)
             } else {
-                // Hashes not loaded yet — render from first font in group
-                let mut img_opt = None;
-                for font_key in group {
-                    let path = font_key.split('|').next().unwrap_or(font_key);
-                    let font_data = match std::fs::read(path) {
-                        Ok(d) => d,
-                        Err(_) => continue,
-                    };
-                    let font = match ab_glyph::FontRef::try_from_slice(&font_data) {
-                        Ok(f) => f,
-                        Err(_) => continue,
-                    };
-                    if let Some((_hash, img)) = crate::char_render::render_ngram(
-                        &font, seq, &[None], &self.render_params,
-                    ) {
-                        img_opt = Some(img);
-                        break;
-                    }
-                }
-                img_opt
+                None
             };
 
             let ref_img = match ref_img {
@@ -158,3 +123,4 @@ impl Classifier for ZnccClassifier {
         // No-op: ZNCC works from glyph_map + cached renders.
     }
 }
+

@@ -2626,7 +2626,7 @@ pub fn build_classifier(
             ]))
         }
         "zncc" => {
-            if let Some((_font_dir, render_params)) = auto_train {
+            if let Some((_font_dirs, render_params)) = auto_train {
                 let gmap_path = crate::glyph_map::NgramGlyphMap::default_path();
                 let glyph_map = crate::glyph_map::NgramGlyphMap::load(&gmap_path)
                     .unwrap_or_else(|e| {
@@ -2644,5 +2644,619 @@ pub fn build_classifier(
             eprintln!("Error: unknown classifier '{other}'. Use 'lda', 'perchar-fisher', 'triplet', 'mahalanobis', 'mlp', 'fusion', or 'zncc'.");
             std::process::exit(1);
         }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Per-font 1-gram LDA — classes = characters, one classifier per font
+// ---------------------------------------------------------------------------
+//
+// Trained per font: given this font, which character is this crop?
+// Used after font selection to find stray OCR errors.
+//
+// IMPORTANT: uses HOG features (128-dim) for character discrimination,
+// NOT the main CropFeatures (63-dim) which are designed for font
+// discrimination.  Different tasks need different features.
+//
+// Each font's classifier is cached to its own file under
+// ~/.cache/unprint/per-font-lda/<hash>.bin
+
+use std::sync::Mutex;
+
+/// In-memory cache of loaded per-font classifiers, keyed by font_key.
+static PER_FONT_CACHE: std::sync::LazyLock<Mutex<HashMap<String, std::sync::Arc<PerFontLda>>>> =
+    std::sync::LazyLock::new(|| Mutex::new(HashMap::new()));
+
+/// Per-font 1-gram LDA classifier using HOG features.
+///
+/// Self-contained: stores its own projection, centroids, and probability
+/// parameters.  Does NOT depend on `EmbeddingClassifier` or the `Embedder`
+/// trait (those are locked to CropFeatures for font identification).
+pub struct PerFontLda {
+    /// LDA projection matrix: [out_dim × HOG_FEAT_LEN] row-major
+    projection: Vec<f32>,
+    out_dim: usize,
+    /// Per-class centroids in projected space: (class_index, embedding)
+    centroids: Vec<Vec<f32>>,
+    /// RBF kernel bandwidth for probability computation
+    sigma_sq: f32,
+    /// class_index → character
+    char_map: Vec<char>,
+    font_key: String,
+    catalog_hash: u64,
+}
+
+impl PerFontLda {
+    /// Cache directory for per-font LDA classifiers.
+    fn cache_dir() -> std::path::PathBuf {
+        let home = std::env::var("HOME").unwrap_or_else(|_| ".".into());
+        std::path::Path::new(&home).join(".cache").join("unprint").join("per-font-lda")
+    }
+
+    /// Deterministic cache path for a font_key.
+    fn cache_path(font_key: &str) -> std::path::PathBuf {
+        use std::hash::{Hash, Hasher};
+        let mut hasher = std::collections::hash_map::DefaultHasher::new();
+        font_key.hash(&mut hasher);
+        let h = hasher.finish();
+        Self::cache_dir().join(format!("{:016x}.bin", h))
+    }
+
+    /// Load or train the per-font classifier for `font_key`.
+    /// Returns `None` if the font has fewer than 5 trainable characters.
+    pub fn load_or_train(
+        font_key: &str,
+        ctx: &crate::train::TrainingContext,
+    ) -> Option<std::sync::Arc<Self>> {
+        // Check in-memory cache first
+        {
+            let cache = PER_FONT_CACHE.lock().unwrap();
+            if let Some(arc) = cache.get(font_key) {
+                return Some(arc.clone());
+            }
+        }
+
+        // Try loading from disk
+        let path = Self::cache_path(font_key);
+        if path.exists() {
+            if let Some(clf) = Self::load(&path, font_key, ctx.catalog_hash) {
+                let arc = std::sync::Arc::new(clf);
+                PER_FONT_CACHE.lock().unwrap().insert(font_key.to_string(), arc.clone());
+                return Some(arc);
+            }
+            // Stale or corrupt — fall through to retrain
+        }
+
+        // Train
+        let clf = Self::train(font_key, ctx)?;
+        if let Err(e) = clf.save() {
+            eprintln!("Warning: could not cache per-font LDA for {font_key}: {e}");
+        }
+        let arc = std::sync::Arc::new(clf);
+        PER_FONT_CACHE.lock().unwrap().insert(font_key.to_string(), arc.clone());
+        Some(arc)
+    }
+
+    /// Predict which character best matches the HOG features.
+    /// Returns `(char, probability)` pairs sorted descending by probability.
+    pub fn predict(&self, hog: &[f32; crate::hog::HOG_FEAT_LEN], k: usize) -> Vec<(char, f32)> {
+        use crate::hog::HOG_FEAT_LEN;
+
+        // Project HOG features into LDA space
+        let mut emb = vec![0.0f32; self.out_dim];
+        for d in 0..self.out_dim {
+            let row_off = d * HOG_FEAT_LEN;
+            let mut sum = 0.0f32;
+            for j in 0..HOG_FEAT_LEN {
+                sum += self.projection[row_off + j] * hog[j];
+            }
+            emb[d] = sum;
+        }
+
+        // Compute squared distances to all centroids
+        let mut dists: Vec<(usize, f32)> = self.centroids.iter().enumerate()
+            .map(|(ci, cent)| {
+                let d: f32 = emb.iter().zip(cent.iter())
+                    .map(|(&a, &b)| { let d = a - b; d * d })
+                    .sum();
+                (ci, d)
+            })
+            .collect();
+
+        // Sort by distance ascending
+        dists.sort_by(|a, b| a.1.partial_cmp(&b.1).unwrap_or(std::cmp::Ordering::Equal));
+
+        // Convert to softmax probabilities via RBF kernel
+        let min_dist = dists.first().map(|d| d.1).unwrap_or(0.0);
+        let mut scores: Vec<(usize, f32)> = dists.iter()
+            .map(|&(ci, d)| (ci, (-(d - min_dist) / (2.0 * self.sigma_sq)).exp()))
+            .collect();
+        let total: f32 = scores.iter().map(|(_, s)| s).sum();
+        if total > 0.0 {
+            for s in &mut scores { s.1 /= total; }
+        }
+
+        scores.iter()
+            .take(k)
+            .filter_map(|&(ci, prob)| self.char_map.get(ci).map(|&ch| (ch, prob)))
+            .collect()
+    }
+
+    /// Predict top-1 character.
+    pub fn predict_top1(&self, hog: &[f32; crate::hog::HOG_FEAT_LEN]) -> Option<(char, f32)> {
+        self.predict(hog, 1).into_iter().next()
+    }
+
+    /// Expose sigma_sq for diagnostics.
+    pub fn sigma_sq(&self) -> f32 { self.sigma_sq }
+
+    /// Predict with raw squared distances for diagnostics.
+    /// Returns (char, probability, squared_distance) triples sorted by distance ascending.
+    pub fn predict_with_distances(&self, hog: &[f32; crate::hog::HOG_FEAT_LEN], k: usize) -> Vec<(char, f32, f32)> {
+        use crate::hog::HOG_FEAT_LEN;
+
+        let mut emb = vec![0.0f32; self.out_dim];
+        for d in 0..self.out_dim {
+            let row_off = d * HOG_FEAT_LEN;
+            let mut sum = 0.0f32;
+            for j in 0..HOG_FEAT_LEN {
+                sum += self.projection[row_off + j] * hog[j];
+            }
+            emb[d] = sum;
+        }
+
+        let mut dists: Vec<(usize, f32)> = self.centroids.iter().enumerate()
+            .map(|(ci, cent)| {
+                let d: f32 = emb.iter().zip(cent.iter())
+                    .map(|(&a, &b)| { let d = a - b; d * d })
+                    .sum();
+                (ci, d)
+            })
+            .collect();
+
+        dists.sort_by(|a, b| a.1.partial_cmp(&b.1).unwrap_or(std::cmp::Ordering::Equal));
+
+        let min_dist = dists.first().map(|d| d.1).unwrap_or(0.0);
+        let mut scores: Vec<(usize, f32, f32)> = dists.iter()
+            .map(|&(ci, d)| (ci, (-(d - min_dist) / (2.0 * self.sigma_sq)).exp(), d))
+            .collect();
+        let total: f32 = scores.iter().map(|(_, s, _)| s).sum();
+        if total > 0.0 {
+            for s in &mut scores { s.1 /= total; }
+        }
+
+        scores.iter()
+            .take(k)
+            .filter_map(|&(ci, prob, dist)| self.char_map.get(ci).map(|&ch| (ch, prob, dist)))
+            .collect()
+    }
+
+    /// Train a per-font LDA classifier from rendered glyphs.
+    ///
+    /// For each supported character, renders the glyph at multiple
+    /// degradation levels, computes HOG features, and trains LDA with
+    /// characters as classes.
+    fn train(font_key: &str, ctx: &crate::train::TrainingContext) -> Option<Self> {
+        use crate::hog::{HOG_FEAT_LEN, compute_hog};
+        use crate::features::NORM_H;
+
+        eprintln!("[pflda] Training per-font LDA for {font_key}");
+        // Find the font entry in the catalog
+        let font_entry = match ctx.catalog.iter().find(|fe| fe.font_key() == font_key) {
+            Some(fe) => fe,
+            None => {
+                eprintln!("[pflda] Font entry not found in catalog for {font_key}");
+                return None;
+            }
+        };
+
+        // Parse font data for rendering
+        // Font bytes are dropped from FontEntry after initial scan to save memory.
+        // Read from the file path instead.
+        let font_data = match std::fs::read(&font_entry.path) {
+            Ok(d) => d,
+            Err(e) => {
+                eprintln!("[pflda] Cannot read font file {:?}: {e}", font_entry.path);
+                return None;
+            }
+        };
+        let mut font = match ab_glyph::FontVec::try_from_vec(font_data) {
+            Ok(f) => f,
+            Err(e) => {
+                eprintln!("[pflda] FontVec parse failed for {font_key}: {e}");
+                return None;
+            }
+        };
+
+        // Apply variable-font axis coordinates (e.g. weight)
+        if let Some(ref vars) = font_entry.variations {
+            use ab_glyph::VariableFont;
+            for (tag, val) in vars {
+                font.set_variation(tag, *val);
+            }
+        }
+
+        // Degradation scale factors for training augmentation.
+        // These simulate different document resolutions so the within-class
+        // scatter captures real-world variation.
+        const DEGRADE_SCALES: &[f32] = &[1.0, 0.85, 0.70];
+
+        // Gather per-character HOG samples by rendering glyphs
+        let mut char_samples: Vec<(char, Vec<[f32; HOG_FEAT_LEN]>)> = Vec::new();
+        let mut total_samples = 0usize;
+
+        let overrides = font_entry.glyph_overrides.as_deref();
+
+        for &ch in ctx.chars.iter() {
+            // Check that the glyph map recognizes this font for this character
+            if ctx.glyph_map.glyph_id_for_font(&[ch], font_key).is_none() {
+                continue;
+            }
+
+            // Resolve glyph ID (handles OT feature overrides)
+            let gid = crate::char_render::resolve_glyph(&font, ch, overrides);
+            if gid.0 == 0 { continue; } // .notdef
+
+            // Render at NORM_H
+            let base_img = crate::char_render::render_glyph_at_ink_height(
+                &font, gid, NORM_H,
+            );
+            let base_img = match base_img {
+                Some(img) if img.width() >= 3 && img.height() >= 3 => img,
+                _ => continue,
+            };
+
+            let mut hog_feats: Vec<[f32; HOG_FEAT_LEN]> = Vec::new();
+
+            for &scale in DEGRADE_SCALES {
+                let img = if scale >= 0.999 {
+                    base_img.clone()
+                } else {
+                    match crate::features::degrade_and_renormalize(&base_img, scale) {
+                        Some(img) => img,
+                        None => continue,
+                    }
+                };
+
+                if let Some(h) = compute_hog(&img) {
+                    hog_feats.push(h);
+                }
+            }
+
+            if hog_feats.is_empty() { continue; }
+            total_samples += hog_feats.len();
+            char_samples.push((ch, hog_feats));
+        }
+
+        eprintln!("[pflda] {font_key}: {} chars, {} total HOG samples", char_samples.len(), total_samples);
+        if char_samples.len() < 5 {
+            eprintln!("[pflda] Only {} chars for {font_key}, skipping", char_samples.len());
+            return None; // not enough characters to be useful
+        }
+
+        let n_classes = char_samples.len();
+        let out_dim = (n_classes - 1).min(HOG_FEAT_LEN - 1).min(32);
+
+        // Build char_map: class_index → character
+        let char_map: Vec<char> = char_samples.iter().map(|(ch, _)| *ch).collect();
+
+        // Compute per-class means and global mean
+        let mut global_mean = vec![0.0f64; HOG_FEAT_LEN];
+        for (_, feats) in &char_samples {
+            for f in feats {
+                for j in 0..HOG_FEAT_LEN { global_mean[j] += f[j] as f64; }
+            }
+        }
+        for j in 0..HOG_FEAT_LEN { global_mean[j] /= total_samples as f64; }
+
+        let class_means: Vec<Vec<f64>> = char_samples.iter().map(|(_, feats)| {
+            let mut mean = vec![0.0f64; HOG_FEAT_LEN];
+            for f in feats {
+                for j in 0..HOG_FEAT_LEN { mean[j] += f[j] as f64; }
+            }
+            let cnt = feats.len() as f64;
+            for j in 0..HOG_FEAT_LEN { mean[j] /= cnt; }
+            mean
+        }).collect();
+
+        // Within-class scatter Sw
+        let mut sw = vec![0.0f64; HOG_FEAT_LEN * HOG_FEAT_LEN];
+        for (ci, (_, feats)) in char_samples.iter().enumerate() {
+            let cm = &class_means[ci];
+            for f in feats {
+                for a in 0..HOG_FEAT_LEN {
+                    let da = f[a] as f64 - cm[a];
+                    for b in a..HOG_FEAT_LEN {
+                        let db = f[b] as f64 - cm[b];
+                        sw[a * HOG_FEAT_LEN + b] += da * db;
+                    }
+                }
+            }
+        }
+        // Mirror lower triangle
+        for a in 0..HOG_FEAT_LEN { for b in 0..a { sw[a * HOG_FEAT_LEN + b] = sw[b * HOG_FEAT_LEN + a]; } }
+        for v in &mut sw { *v /= total_samples as f64; }
+
+        // Regularize
+        let trace: f64 = (0..HOG_FEAT_LEN).map(|j| sw[j * HOG_FEAT_LEN + j]).sum();
+        let eps = (trace / HOG_FEAT_LEN as f64) * 0.01 + 1e-6;
+        for j in 0..HOG_FEAT_LEN { sw[j * HOG_FEAT_LEN + j] += eps; }
+
+        // Cholesky: Sw = L L^T
+        let mut l = vec![0.0f64; HOG_FEAT_LEN * HOG_FEAT_LEN];
+        let mut chol_ok = true;
+        for i in 0..HOG_FEAT_LEN {
+            for j in 0..=i {
+                let mut sum = sw[i * HOG_FEAT_LEN + j];
+                for k in 0..j { sum -= l[i * HOG_FEAT_LEN + k] * l[j * HOG_FEAT_LEN + k]; }
+                if i == j {
+                    if sum <= 0.0 { chol_ok = false; break; }
+                    l[i * HOG_FEAT_LEN + j] = sum.sqrt();
+                } else {
+                    l[i * HOG_FEAT_LEN + j] = sum / l[j * HOG_FEAT_LEN + j];
+                }
+            }
+            if !chol_ok { break; }
+        }
+        if !chol_ok { eprintln!("[pflda] Cholesky failed for {font_key}"); return None; }
+
+        // L^{-1}
+        let mut linv = vec![0.0f64; HOG_FEAT_LEN * HOG_FEAT_LEN];
+        for j in 0..HOG_FEAT_LEN {
+            for i in 0..HOG_FEAT_LEN {
+                let mut sum = if i == j { 1.0 } else { 0.0 };
+                for k in 0..i { sum -= l[i * HOG_FEAT_LEN + k] * linv[k * HOG_FEAT_LEN + j]; }
+                linv[i * HOG_FEAT_LEN + j] = sum / l[i * HOG_FEAT_LEN + i];
+            }
+        }
+
+        // Whiten class means
+        let whitened_means: Vec<Vec<f64>> = class_means.iter().map(|cm| {
+            let mut centered = vec![0.0f64; HOG_FEAT_LEN];
+            for j in 0..HOG_FEAT_LEN { centered[j] = cm[j] - global_mean[j]; }
+            let mut wm = vec![0.0f64; HOG_FEAT_LEN];
+            for i in 0..HOG_FEAT_LEN {
+                for j in 0..HOG_FEAT_LEN {
+                    wm[i] += linv[i * HOG_FEAT_LEN + j] * centered[j];
+                }
+            }
+            wm
+        }).collect();
+
+        // PCA on whitened means to get top eigenvectors
+        let mut wm_mean = vec![0.0f64; HOG_FEAT_LEN];
+        for wm in &whitened_means { for j in 0..HOG_FEAT_LEN { wm_mean[j] += wm[j]; } }
+        for j in 0..HOG_FEAT_LEN { wm_mean[j] /= n_classes as f64; }
+
+        let mut cov = vec![0.0f64; HOG_FEAT_LEN * HOG_FEAT_LEN];
+        for wm in &whitened_means {
+            for a in 0..HOG_FEAT_LEN {
+                let da = wm[a] - wm_mean[a];
+                for b in a..HOG_FEAT_LEN {
+                    let db = wm[b] - wm_mean[b];
+                    cov[a * HOG_FEAT_LEN + b] += da * db;
+                }
+            }
+        }
+        for a in 0..HOG_FEAT_LEN { for b in 0..a { cov[a * HOG_FEAT_LEN + b] = cov[b * HOG_FEAT_LEN + a]; } }
+
+        let actual_dim = out_dim.min(HOG_FEAT_LEN);
+        let eigvecs = crate::train::jacobi_eigen_top_k(&cov, HOG_FEAT_LEN, actual_dim);
+
+        // Final projection: P = eigvecs^T * L^{-1}
+        let mut proj = vec![0.0f64; actual_dim * HOG_FEAT_LEN];
+        for d in 0..actual_dim {
+            for j in 0..HOG_FEAT_LEN {
+                let mut sum = 0.0f64;
+                for k in 0..HOG_FEAT_LEN {
+                    sum += eigvecs[d * HOG_FEAT_LEN + k] * linv[k * HOG_FEAT_LEN + j];
+                }
+                proj[d * HOG_FEAT_LEN + j] = sum;
+            }
+        }
+
+        // Scale calibration
+        let target_dist = 0.03f64;
+        let mut within_dists: Vec<f64> = Vec::new();
+        {
+            use rand::prelude::*;
+            use rand::rngs::SmallRng;
+            let mut rng = SmallRng::seed_from_u64(0x484f4743); // "HOGC"
+            for (_, feats) in &char_samples {
+                if feats.len() < 2 { continue; }
+                let npairs = 5.min(feats.len() * (feats.len() - 1) / 2);
+                for _ in 0..npairs {
+                    let a = rng.gen_range(0..feats.len());
+                    let b = loop { let x = rng.gen_range(0..feats.len()); if x != a { break x; } };
+                    let mut d = 0.0f64;
+                    for dim in 0..actual_dim {
+                        let mut ea = 0.0f64;
+                        let mut eb = 0.0f64;
+                        for j in 0..HOG_FEAT_LEN {
+                            ea += proj[dim * HOG_FEAT_LEN + j] * feats[a][j] as f64;
+                            eb += proj[dim * HOG_FEAT_LEN + j] * feats[b][j] as f64;
+                        }
+                        let diff = ea - eb;
+                        d += diff * diff;
+                    }
+                    within_dists.push(d);
+                }
+            }
+        }
+        let scale = if !within_dists.is_empty() {
+            within_dists.sort_by(|a, b| a.partial_cmp(b).unwrap());
+            let median = within_dists[within_dists.len() / 2];
+            if median > 1e-15 { (target_dist / median).sqrt() } else { 1.0 }
+        } else { 1.0 };
+        for v in &mut proj { *v *= scale; }
+
+        let proj_f32: Vec<f32> = proj.iter().map(|&v| v as f32).collect();
+
+        // Compute centroids in projected space
+        let centroids: Vec<Vec<f32>> = class_means.iter().map(|cm| {
+            let mut emb = vec![0.0f32; actual_dim];
+            for d in 0..actual_dim {
+                for j in 0..HOG_FEAT_LEN {
+                    emb[d] += proj_f32[d * HOG_FEAT_LEN + j] * cm[j] as f32;
+                }
+            }
+            emb
+        }).collect();
+
+        // Compute sigma_sq from within-class scatter: for each training
+        // sample, project it and measure d² to its class centroid.
+        // σ² = median of those distances — the typical noise around a centroid.
+        let sigma_sq: f32 = {
+            let mut within_dists: Vec<f32> = Vec::new();
+            for (ci, (_, feats)) in char_samples.iter().enumerate() {
+                let cent = &centroids[ci];
+                for f in feats {
+                    let mut emb = vec![0.0f32; actual_dim];
+                    for d in 0..actual_dim {
+                        for j in 0..HOG_FEAT_LEN {
+                            emb[d] += proj_f32[d * HOG_FEAT_LEN + j] * f[j] as f32;
+                        }
+                    }
+                    let d_sq: f32 = emb.iter().zip(cent.iter())
+                        .map(|(&a, &b)| { let dd = a - b; dd * dd })
+                        .sum();
+                    within_dists.push(d_sq);
+                }
+            }
+            if within_dists.is_empty() { 1.0 }
+            else {
+                within_dists.sort_by(|a, b| a.partial_cmp(b).unwrap());
+                within_dists[within_dists.len() / 2]
+            }
+        };
+
+        eprintln!("[pflda] Training complete for {font_key}: {} classes, out_dim={actual_dim}, sigma_sq={sigma_sq:.6}", n_classes);
+        Some(PerFontLda {
+            projection: proj_f32,
+            out_dim: actual_dim,
+            centroids,
+            sigma_sq,
+            char_map,
+            font_key: font_key.to_string(),
+            catalog_hash: ctx.catalog_hash,
+        })
+    }
+
+    /// Save to per-font cache file.
+    fn save(&self) -> Result<(), String> {
+        use std::io::{BufWriter, Write};
+        let dir = Self::cache_dir();
+        std::fs::create_dir_all(&dir)
+            .map_err(|e| format!("mkdir {}: {e}", dir.display()))?;
+        let path = Self::cache_path(&self.font_key);
+        let f = std::fs::File::create(&path)
+            .map_err(|e| format!("create {}: {e}", path.display()))?;
+        let mut w = BufWriter::new(f);
+
+        // Magic + version
+        w.write_all(b"PFHG").map_err(|e| e.to_string())?; // Per-Font HOG
+        w.write_all(&2u32.to_le_bytes()).map_err(|e| e.to_string())?; // version 2 (HOG)
+        w.write_all(&self.catalog_hash.to_le_bytes()).map_err(|e| e.to_string())?;
+
+        // Dimensions
+        w.write_all(&(self.out_dim as u32).to_le_bytes()).map_err(|e| e.to_string())?;
+        let n_classes = self.char_map.len() as u32;
+        w.write_all(&n_classes.to_le_bytes()).map_err(|e| e.to_string())?;
+
+        // char_map
+        for &ch in &self.char_map {
+            w.write_all(&(ch as u32).to_le_bytes()).map_err(|e| e.to_string())?;
+        }
+
+        // sigma_sq
+        w.write_all(&self.sigma_sq.to_le_bytes()).map_err(|e| e.to_string())?;
+
+        // projection: [out_dim × HOG_FEAT_LEN]
+        for &v in &self.projection {
+            w.write_all(&v.to_le_bytes()).map_err(|e| e.to_string())?;
+        }
+
+        // centroids: [n_classes × out_dim]
+        for cent in &self.centroids {
+            for &v in cent {
+                w.write_all(&v.to_le_bytes()).map_err(|e| e.to_string())?;
+            }
+        }
+
+        Ok(())
+    }
+
+    /// Load from a per-font cache file.  Returns None if stale or corrupt.
+    fn load(path: &std::path::Path, font_key: &str, catalog_hash: u64) -> Option<Self> {
+        use crate::hog::HOG_FEAT_LEN;
+        let data = std::fs::read(path).ok()?;
+        if data.len() < 24 { return None; } // magic(4) + ver(4) + hash(8) + dims(8)
+
+        let mut pos = 0usize;
+
+        // Magic
+        if &data[pos..pos+4] != b"PFHG" { return None; }
+        pos += 4;
+
+        // Version
+        let version = u32::from_le_bytes(data[pos..pos+4].try_into().ok()?);
+        if version != 2 { return None; }
+        pos += 4;
+
+        // Catalog hash
+        let file_hash = u64::from_le_bytes(data[pos..pos+8].try_into().ok()?);
+        if file_hash != catalog_hash { return None; }
+        pos += 8;
+
+        // Dimensions
+        let out_dim = u32::from_le_bytes(data[pos..pos+4].try_into().ok()?) as usize;
+        pos += 4;
+        let n_classes = u32::from_le_bytes(data[pos..pos+4].try_into().ok()?) as usize;
+        pos += 4;
+
+        // char_map
+        if data.len() < pos + n_classes * 4 { return None; }
+        let mut char_map = Vec::with_capacity(n_classes);
+        for _ in 0..n_classes {
+            let cp = u32::from_le_bytes(data[pos..pos+4].try_into().ok()?);
+            pos += 4;
+            char_map.push(char::from_u32(cp)?);
+        }
+
+        // sigma_sq
+        if data.len() < pos + 4 { return None; }
+        let sigma_sq = f32::from_le_bytes(data[pos..pos+4].try_into().ok()?);
+        pos += 4;
+
+        // projection
+        let proj_len = out_dim * HOG_FEAT_LEN;
+        if data.len() < pos + proj_len * 4 { return None; }
+        let mut projection = Vec::with_capacity(proj_len);
+        for _ in 0..proj_len {
+            projection.push(f32::from_le_bytes(data[pos..pos+4].try_into().ok()?));
+            pos += 4;
+        }
+
+        // centroids
+        if data.len() < pos + n_classes * out_dim * 4 { return None; }
+        let mut centroids = Vec::with_capacity(n_classes);
+        for _ in 0..n_classes {
+            let mut cent = Vec::with_capacity(out_dim);
+            for _ in 0..out_dim {
+                cent.push(f32::from_le_bytes(data[pos..pos+4].try_into().ok()?));
+                pos += 4;
+            }
+            centroids.push(cent);
+        }
+
+        Some(PerFontLda {
+            projection,
+            out_dim,
+            centroids,
+            sigma_sq,
+            char_map,
+            font_key: font_key.to_string(),
+            catalog_hash,
+        })
     }
 }

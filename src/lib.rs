@@ -23,3 +23,4 @@ pub mod glyph_map;
 pub mod char_render;
 pub mod train;
 pub mod ngram;
+pub mod hog;

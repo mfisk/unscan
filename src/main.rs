@@ -10,6 +10,7 @@ mod font_scan;
 mod geometry;
 pub mod features;
 pub mod glyph_map;
+pub mod hog;
 pub mod char_render;
 pub mod train;
 pub mod layout;
@@ -36,19 +37,11 @@ use rayon::prelude::*;
 /// Minimum SSIM score for SSIM verification to consider a font match acceptable.
 const MIN_VERIFY_SIMILARITY: f32 = 0.9;
 
-/// Standalone char rendering: render characters using the index-time
-/// render_glyph_at_ink_height() pipeline and save as PNGs.
-
 fn main() {
     let args = cli::parse();
     if let Err(msg) = args.validate() {
         eprintln!("Error: {msg}");
         std::process::exit(1);
-    }
-
-    // ── render-ref-chars: standalone char rendering, no PDF needed ───
-    if let Some(ref json_str) = args.render_ref_chars {
-        char_render::render_ref_chars_and_exit(json_str);
     }
 
     // train-lda removed — training happens automatically when weights are stale.
@@ -247,6 +240,11 @@ fn run(args: &cli::Args, classifier: &mut dyn classifier::Classifier) -> Result<
 
     // All font access goes through the shared cache below.
 
+    // ── 1c. Build runtime training data for per-font OCR correction ─
+    let rtd = train::RuntimeTrainingData::from_registry(
+        &font_registry, &glyph_map, &args.render_params(),
+    );
+
     // ── 1b''. Shared font cache for all post-index font access ──────
     let font_cache = font_cache::FontCache::new(font_cache::DEFAULT_CAPACITY);
 
@@ -346,6 +344,7 @@ fn run(args: &cli::Args, classifier: &mut dyn classifier::Classifier) -> Result<
             dominant_font_candidate.as_ref(),
             args,
             None,
+            rtd.as_ref(),
         );
 
         // Update dominant font candidate for next page
@@ -388,6 +387,7 @@ fn run(args: &cli::Args, classifier: &mut dyn classifier::Classifier) -> Result<
                 dominant_font_candidate.as_ref(),
                 args,
                 Some(&split_set),
+                rtd.as_ref(),
             );
             for li in split_indices {
                 std::mem::swap(&mut line_matches[li], &mut new_matches[li]);

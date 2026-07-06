@@ -82,12 +82,6 @@ pub struct Args {
     pub test: Option<PathBuf>,
 
     /// Render characters using the index-time render_glyph_at_ink_height() pipeline
-    /// and save as PNGs.  Takes a JSON object: {"font": "/path/to/font.ttf",
-    /// "chars": "abc", "output_dir": "/tmp/refs"}.  Each character is saved as
-    /// U+XXXX.png (e.g. U+0048.png for 'H').  Exits after rendering.
-    #[arg(long, value_name = "JSON")]
-    pub render_ref_chars: Option<String>,
-
     /// Font matching classifier: 'lda' (default, LDA-projected kNN),
     /// 'fisher' (Fisher-weighted kNN), 'triplet' (per-glyph learned embedding),
     /// 'global-triplet' (single learned embedding), 'mlp' (direct multi-class
@@ -175,7 +169,7 @@ impl Args {
 
     /// Validate: require input and output (unless --test or non-scan mode).
     pub fn validate(&self) -> Result<(), String> {
-        if self.render_ref_chars.is_some() || !self.weight_explicit.is_empty() {
+        if !self.weight_explicit.is_empty() {
             return Ok(());
         }
         if self.input.is_none() {

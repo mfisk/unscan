@@ -73,6 +73,8 @@ pub fn match_lines(
     args: &cli::Args,
     // When set, only these line indices get diag/audit output on disk.
     audit_line_filter: Option<&std::collections::HashSet<usize>>,
+    // Per-font LDA OCR correction data (None = skip correction)
+    training_data: Option<&crate::train::RuntimeTrainingData>,
 ) -> (Vec<LineMatch>, u64) {
     let fast_path_font_data: Option<std::sync::Arc<Vec<u8>>> = dominant_font_candidate
         .and_then(|fm| font_cache.load(&fm.font_path).ok());
@@ -186,7 +188,7 @@ pub fn match_lines(
             },
         );
         let font_scores: Vec<(String, Option<f32>)>;
-        let observations: Vec<font_match::ObservationDetail>;
+        let mut observations: Vec<font_match::ObservationDetail>;
         let font_scores_lig: Vec<(String, Option<f32>)>;
         let observations_lig: Vec<font_match::ObservationDetail>;
         let seg_winner: Option<String>;
@@ -447,6 +449,127 @@ pub fn match_lines(
             &crop_store_plain
         };
 
+        // ── Per-font LDA OCR correction (probability-gated) ─────────
+        // Two-pass: collect HOG predictions for all observations, then
+        // estimate inference σ² from median nearest-centroid d², then
+        // recompute softmax with that σ² and gate on p(top1).
+        //
+        // Training σ² reflects rendered-glyph noise (~0.01).  Inference
+        // noise (scan crops) is 50-100× larger, so we estimate σ² from
+        // the observations themselves.  Most observations are correctly
+        // OCR'd, so median d²(nearest) captures the real noise floor.
+        if let (Some(ref fr), Some(rtd)) = (&font_result, training_data) {
+            eprintln!("[pflda] OCR correction pass for font_key={}", fr.font_key);
+            let ctx = rtd.as_context(glyph_map);
+            if let Some(pf_lda) = classifier::PerFontLda::load_or_train(&fr.font_key, &ctx) {
+                eprintln!("[pflda] Loaded/trained OK, checking {} observations", observations.len());
+
+                // -- Pass 1: collect predictions (all classes) ----------
+                struct PfldaObs {
+                    obs_i: usize,
+                    crop_index: usize,
+                    ocr_char: char,
+                    dists: Vec<(char, f32)>, // (char, d²) sorted by d² asc
+                }
+                let mut pflda_obs: Vec<PfldaObs> = Vec::new();
+
+                for (i, obs) in observations.iter().enumerate() {
+                    if obs.seq.len() != 1 { continue; }
+                    let ocr_char = obs.seq[0];
+                    let crop = match winning_crops.get(obs.crop_index) {
+                        Some(c) => c,
+                        None => continue,
+                    };
+                    let hog = match crate::hog::compute_hog(crop) {
+                        Some(h) => h,
+                        None => continue,
+                    };
+                    let preds_d = pf_lda.predict_with_distances(&hog, 200);
+                    if preds_d.is_empty() { continue; }
+                    let dists: Vec<(char, f32)> = preds_d.iter()
+                        .map(|&(c, _, d)| (c, d))
+                        .collect();
+                    pflda_obs.push(PfldaObs {
+                        obs_i: i,
+                        crop_index: obs.crop_index,
+                        ocr_char,
+                        dists,
+                    });
+                }
+
+                // -- Inference σ² = median of nearest-centroid d² ------
+                let inference_sigma_sq: f32 = {
+                    let mut top1_d2: Vec<f32> = pflda_obs.iter()
+                        .map(|o| o.dists[0].1)
+                        .collect();
+                    if top1_d2.is_empty() {
+                        1.0
+                    } else {
+                        top1_d2.sort_by(|a, b| a.partial_cmp(b).unwrap());
+                        top1_d2[top1_d2.len() / 2]
+                    }
+                };
+                eprintln!("[pflda] inference σ²={:.6} (training σ²={:.6}, {} obs)",
+                    inference_sigma_sq, pf_lda.sigma_sq(), pflda_obs.len());
+
+                // -- Pass 2: softmax with inference σ², apply gate -----
+                for po in &pflda_obs {
+                    // Softmax with inference σ² (min-subtracted for stability)
+                    let min_d2 = po.dists[0].1;
+                    let weights: Vec<f32> = po.dists.iter()
+                        .map(|&(_, d)| (-(d - min_d2) / (2.0 * inference_sigma_sq)).exp())
+                        .collect();
+                    let total: f32 = weights.iter().sum();
+                    let probs: Vec<(char, f32, f32)> = po.dists.iter()
+                        .zip(weights.iter())
+                        .map(|(&(c, d), &w)| (c, if total > 0.0 { w / total } else { 0.0 }, d))
+                        .collect();
+                    if probs.is_empty() { continue; }
+
+                    let (top_char, top_p, top_d2) = probs[0];
+                    let d2_next = if probs.len() > 1 { probs[1].2 } else { 0.0 };
+
+                    let ocr_rank = probs.iter().position(|(ch, _, _)| *ch == po.ocr_char);
+                    let ocr_p = probs.iter().find(|(ch, _, _)| *ch == po.ocr_char)
+                        .map(|(_, p, _)| *p);
+
+                    eprintln!("[pflda] obs[{}] ocr='{}' | top1='{}' p={:.4} d²={:.4} | gap1-2={:.4} | σ²_inf={:.4} | ocr_rank={} ocr_p={} | top5: {}",
+                        po.crop_index,
+                        po.ocr_char,
+                        top_char,
+                        top_p,
+                        top_d2,
+                        d2_next - top_d2,
+                        inference_sigma_sq,
+                        ocr_rank.map(|r| format!("{}", r + 1)).unwrap_or("ABSENT".into()),
+                        ocr_p.map(|p| format!("{:.4}", p)).unwrap_or("?".into()),
+                        probs.iter().take(5).map(|(c, p, d)| format!("'{}'={:.4}(d²={:.3})", c, p, d)).collect::<Vec<_>>().join(" "),
+                    );
+
+                    // Record best alternative regardless of correction
+                    if top_char != po.ocr_char {
+                        observations[po.obs_i].best_alt_char = Some(top_char);
+                        observations[po.obs_i].best_alt_dist = Some(top_p);
+                    } else if probs.len() > 1 {
+                        observations[po.obs_i].best_alt_char = Some(probs[1].0);
+                        observations[po.obs_i].best_alt_dist = Some(probs[1].1);
+                    }
+
+                    // Probability-gated correction: only override OCR when
+                    // the classifier is confident the crop is a different char
+                    // AND the top1 is significantly more probable than the OCR
+                    // char (ratio gate).  Confusable pairs (,/' o/O I/l) have
+                    // ratio ≈ 1; true OCR errors have ratio >> 10.
+                    let ocr_p_val = ocr_p.unwrap_or(0.0);
+                    let ratio = if ocr_p_val > 1e-6 { top_p / ocr_p_val } else { f32::INFINITY };
+                    if top_p > 0.2 && ratio > 3.0 && top_char != po.ocr_char {
+                        observations[po.obs_i].ocr_corrected_from = Some(po.ocr_char);
+                        observations[po.obs_i].seq = vec![top_char];
+                    }
+                }
+            }
+        }
+
         let pcd_t0 = std::time::Instant::now();
         // Per-observation probabilities and audit detail: only for miss lines when full audit is active
         let (chosen_obs_ranks, chosen_obs_probs, gt_font_obs_ranks, gt_font_obs_probs) = if is_miss && args.full_audit() {
@@ -546,8 +669,8 @@ pub fn match_lines(
                             let gid_overrides: Vec<Option<ab_glyph::GlyphId>> = d.seq.iter()
                                 .map(|c| override_map.get(c).map(|&gid| ab_glyph::GlyphId(gid)))
                                 .collect();
-                            let ref_img = char_render::render_ngram_default(&font, &d.seq, &gid_overrides);
-                            if let Some((_hash, img)) = ref_img {
+                            let ref_img = char_render::render_ngram_fresh(&font, &d.seq, &gid_overrides, &char_render::RenderParams::default());
+                            if let Some(img) = ref_img {
                                 let _ = img.save(&path);
                             }
                         }

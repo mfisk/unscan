@@ -759,7 +759,16 @@ pub fn run_train(mut args: TrainArgs) {
             for &c in chars {
                 let gid_override = overrides
                     .and_then(|ovs| ovs.iter().find(|(ch, _)| *ch == c).map(|(_, g)| ab_glyph::GlyphId(*g)));
-                if let Some((hash, _img)) = crate::char_render::render_ngram_default(&font, &[c], &[gid_override]) {
+                let params = crate::char_render::RenderParams::default();
+                if let Some(img) = crate::char_render::render_ngram_fresh(&font, &[c], &[gid_override], &params) {
+                    let hash = crate::glyph_map::hash_image(&img);
+                    let path = crate::char_render::ngram_cache_path(&[c], hash, &params);
+                    if !path.exists() {
+                        if let Some(parent) = path.parent() {
+                            let _ = std::fs::create_dir_all(parent);
+                        }
+                        let _ = img.save(&path);
+                    }
                     hashes.push((vec![c], hash, fk.clone()));
                 }
             }
@@ -770,39 +779,22 @@ pub fn run_train(mut args: TrainArgs) {
             hashes
         }).collect();
 
-        // Merge into GlyphMap: (char, hash) → Vec<font_key>
-        let mut hash_groups: HashMap<Vec<char>, HashMap<u64, Vec<String>>> = HashMap::new();
+        // Register all results into the glyph_map
+        let mut gmap = crate::glyph_map::NgramGlyphMap::new(catalog_hash);
         for font_hashes in per_font_hashes {
-            for (ch, hash, font_key) in font_hashes {
-                hash_groups.entry(ch).or_default()
-                    .entry(hash).or_default()
-                    .push(font_key);
+            for (seq, hash, font_key) in font_hashes {
+                gmap.register(&seq, &font_key, hash);
             }
         }
 
-        // Convert to GlyphMap groups (deterministic ordering by first font_key in each group)
-        let mut groups: HashMap<Vec<char>, Vec<Vec<String>>> = HashMap::with_capacity(hash_groups.len());
-        let mut total_glyphs = 0usize;
-        let mut total_deduped = 0usize;
-        for (ch, by_hash) in &hash_groups {
-            let mut char_groups: Vec<Vec<String>> = by_hash.values().cloned().collect();
-            // Sort fonts within each group first (Rayon order is non-deterministic)
-            for group in &mut char_groups {
-                group.sort();
-            }
-            // Then sort groups by first font_key for deterministic glyph_id assignment
-            char_groups.sort_by(|a, b| a[0].cmp(&b[0]));
-            total_glyphs += char_groups.len();
-            total_deduped += char_groups.iter().filter(|g| g.len() > 1).map(|g| g.len() - 1).sum::<usize>();
-            groups.insert(ch.clone(), char_groups);
-        }
-
-        let gmap = crate::glyph_map::NgramGlyphMap { groups, catalog_hash };
-        let gmap_path = crate::glyph_map::NgramGlyphMap::default_path();
-        gmap.write_bin(&gmap_path).expect("write glyph-map.bin");
+        let total_glyphs: usize = gmap.groups.values().map(|g| g.len()).sum();
+        let total_deduped: usize = gmap.groups.values()
+            .flat_map(|gs| gs.iter())
+            .filter(|g| g.font_keys.len() > 1)
+            .map(|g| g.font_keys.len() - 1)
+            .sum();
         eprintln!("  GlyphMap: {} unique glyphs across {} chars ({} duplicate renders eliminated)",
             total_glyphs, gmap.groups.len(), total_deduped);
-        eprintln!("  Wrote {}", gmap_path.display());
         eprintln!("  Pre-warm + GlyphMap complete in {:.1}s", prewarm_t0.elapsed().as_secs_f64());
         gmap
     };
@@ -937,10 +929,10 @@ pub fn run_train(mut args: TrainArgs) {
                         let mut params = args.render_params.clone();
                         params.height = ht;
                         params.aa = all_aa[aa_idx_all];
-                        let img = match crate::char_render::render_ngram(
+                        let img = match crate::char_render::render_ngram_fresh(
                             &font, &[c], &[gid_override], &params,
                         ) {
-                            Some((_hash, img)) => img,
+                            Some(img) => img,
                             None => continue,
                         };
 
@@ -1405,5 +1397,147 @@ mod tests {
         eprintln!("First loss: {:.4}, Last loss: {:.4}", first_loss, last_loss);
         assert!(last_loss < first_loss, "Loss should decrease! first={:.4} last={:.4}", first_loss, last_loss);
         eprintln!("✓ Loss decrease test PASSED");
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Runtime training data — self-contained context for per-font LDA training
+// ---------------------------------------------------------------------------
+//
+// Owns the data that TrainingContext borrows, so it can live in the runtime
+// pipeline without tying callers to the training module's lifetimes.
+
+pub struct RuntimeTrainingData {
+    pub chars: &'static [char],
+    pub char_counts: Vec<usize>,
+    pub font_family: Vec<u32>,
+    pub font_id_map: HashMap<String, u32>,
+    pub n_families: usize,
+    pub multi_variant_families: usize,
+    pub feat_dir: std::path::PathBuf,
+    pub cached_combos: Vec<(u32, usize, Vec<usize>)>,
+    pub catalog: Vec<crate::font_scan::FontEntry>,
+    pub catalog_hash: u64,
+    pub render_params: crate::char_render::RenderParams,
+}
+
+impl RuntimeTrainingData {
+    /// Build from a font registry and existing feature cache.
+    /// Returns None if the feature cache doesn't exist.
+    pub fn from_registry(
+        font_registry: &crate::font_scan::FontRegistry,
+        glyph_map: &crate::glyph_map::NgramGlyphMap,
+        render_params: &crate::char_render::RenderParams,
+    ) -> Option<Self> {
+        let chars = crate::features::supported_chars();
+        let n_chars = chars.len();
+
+        // Get sorted catalog (same order as training)
+        let mut catalog: Vec<crate::font_scan::FontEntry> = font_registry.iter()
+            .cloned()
+            .collect();
+        catalog.sort_by(|a, b| a.font_key().cmp(&b.font_key()));
+
+        let catalog_hash = glyph_map.catalog_hash;
+
+        // Build font_id_map and family info
+        let font_id_map: HashMap<String, u32> = catalog.iter().enumerate()
+            .map(|(i, fe)| (fe.font_key(), i as u32))
+            .collect();
+
+        let mut family_name_to_id: HashMap<&str, u32> = HashMap::new();
+        let mut font_family: Vec<u32> = Vec::with_capacity(catalog.len());
+        let mut family_members: Vec<Vec<u32>> = Vec::new();
+        for (i, fe) in catalog.iter().enumerate() {
+            let fam_name = fe.family_name.as_str();
+            let fam_id = if let Some(&id) = family_name_to_id.get(fam_name) {
+                id
+            } else {
+                let id = family_members.len() as u32;
+                family_name_to_id.insert(fam_name, id);
+                family_members.push(Vec::new());
+                id
+            };
+            font_family.push(fam_id);
+            family_members[fam_id as usize].push(i as u32);
+        }
+        let n_families = family_members.len();
+        let multi_variant_families = family_members.iter().filter(|m| m.len() > 1).count();
+
+        // Find feature cache directory (same as run_train default)
+        let home = std::env::var("HOME").unwrap_or_else(|_| ".".into());
+        let feat_dir = std::path::Path::new(&home)
+            .join(".cache").join("unprint").join("training")
+            .to_path_buf();
+        if !feat_dir.exists() { return None; }
+
+        // Scan cached combos (same logic as run_train)
+        let all_aa = crate::features::AaVariant::all();
+        let active_heights = vec![crate::features::NORM_H];
+        let mut cached_combos: Vec<(u32, usize, Vec<usize>)> = Vec::new();
+
+        for &ht in &active_heights {
+            for (aa_idx, aa) in all_aa.iter().enumerate() {
+                let aa_name = aa.name();
+                let mpath = feat_dir.join(format!("manifest_h{}_{}.txt", ht, aa_name));
+                if let Ok(content) = std::fs::read_to_string(&mpath) {
+                    let mut lines = content.lines();
+                    if let Some(header) = lines.next() {
+                        let expected = format!("fonts={} chars={}", catalog.len(), n_chars);
+                        if header.trim() == expected {
+                            let counts: Vec<usize> = lines
+                                .filter_map(|l| l.trim().parse::<usize>().ok())
+                                .collect();
+                            if counts.len() == n_chars {
+                                cached_combos.push((ht, aa_idx, counts));
+                            }
+                        }
+                    }
+                }
+            }
+        }
+
+        if cached_combos.is_empty() { return None; }
+
+        // Build char_counts from cached_combos
+        let mut char_counts = vec![0usize; n_chars];
+        for (_, _, counts) in &cached_combos {
+            for (ci, &c) in counts.iter().enumerate() {
+                char_counts[ci] += c;
+            }
+        }
+
+        Some(RuntimeTrainingData {
+            chars,
+            char_counts,
+            font_family,
+            font_id_map,
+            n_families,
+            multi_variant_families,
+            feat_dir,
+            cached_combos,
+            catalog,
+            catalog_hash,
+            render_params: render_params.clone(),
+        })
+    }
+
+    /// Borrow as a TrainingContext for use with per-font classifier training.
+    pub fn as_context<'a>(&'a self, glyph_map: &'a crate::glyph_map::NgramGlyphMap) -> TrainingContext<'a> {
+        TrainingContext {
+            chars: self.chars,
+            char_counts: &self.char_counts,
+            font_family: &self.font_family,
+            font_id_map: &self.font_id_map,
+            glyph_map,
+            n_families: self.n_families,
+            multi_variant_families: self.multi_variant_families,
+            min_fonts: 2,
+            feat_dir: &self.feat_dir,
+            cached_combos: &self.cached_combos,
+            catalog: &self.catalog,
+            catalog_hash: self.catalog_hash,
+            render_params: &self.render_params,
+        }
     }
 }

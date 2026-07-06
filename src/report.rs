@@ -30,20 +30,11 @@ pub struct ReportMeta {
 
 // ── Glyph helpers ───────────────────────────────────────────────────────────
 
-/// Shorten a font_key to just the filename with file extension stripped.
-/// Variant tags ("|smcp") are preserved.
+/// Shorten a font_key for display.  Now that font_key is the canonical name
+/// from make_weight_explicit (not a file path), this is the identity function.
+/// Variant tags ("|smcp") are already part of the key and preserved.
 fn short_key(key: &str) -> String {
-    let name = key.rsplit('/').next().unwrap_or(key);
-    // Handle "Font.otf|tag" → "Font|tag"
-    for ext in &[".otf", ".ttf", ".ttc"] {
-        if let Some(pos) = name.find(ext) {
-            let mut s = String::with_capacity(name.len() - 4);
-            s.push_str(&name[..pos]);
-            s.push_str(&name[pos + 4..]); // skip 4-char extension
-            return s;
-        }
-    }
-    name.to_string()
+    key.to_string()
 }
 
 /// Resolve a glyph_id for a character to a display-friendly font key.
@@ -1536,7 +1527,7 @@ fn build_observation_table(
                 fe.glyph_overrides.as_ref()
                     .and_then(|ovs| ovs.iter().find(|(gc, _)| *gc == *c).map(|(_, g)| ab_glyph::GlyphId(*g)))
             }).collect();
-            let (_hash, img) = char_render::render_ngram_default(&font, seq, &gid_overrides)?;
+            let img = char_render::render_ngram_fresh(&font, seq, &gid_overrides, &char_render::RenderParams::default())?;
             Some(img_to_b64_uri(&img))
         });
 
@@ -1561,7 +1552,7 @@ fn build_observation_table(
                 fe.glyph_overrides.as_ref()
                     .and_then(|ovs| ovs.iter().find(|(gc, _)| *gc == *c).map(|(_, g)| ab_glyph::GlyphId(*g)))
             }).collect();
-            let (_hash, img) = char_render::render_ngram_default(&font, seq, &gid_overrides)?;
+            let img = char_render::render_ngram_fresh(&font, seq, &gid_overrides, &char_render::RenderParams::default())?;
             Some(img_to_b64_uri(&img))
         });
 

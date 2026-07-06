@@ -83,13 +83,14 @@ pub struct FontEntry {
 
 impl FontEntry {
     /// Unique key for this font entry in the font registry.
-    /// Encodes path + variant tag so each weight/style/OT-variant gets its own slot.
+    /// Uses the canonical PostScript name (from `make_weight_explicit`) so
+    /// duplicate font files with different paths but the same identity
+    /// collapse to a single key.  Variant entries append `|tag`.
     pub fn font_key(&self) -> String {
-        let p = self.path.display().to_string();
         if self.variant_tag.is_empty() {
-            p
+            self.postscript_name.clone()
         } else {
-            format!("{}|{}", p, self.variant_tag)
+            format!("{}|{}", self.postscript_name, self.variant_tag)
         }
     }
 }
@@ -388,6 +389,22 @@ pub fn scan_fonts(dirs: &[PathBuf]) -> Vec<FontEntry> {
         let removed = before - fonts.len();
         if removed > 0 {
             eprintln!("[scan] Dropped {} variable-font weight instances covered by static fonts", removed);
+        }
+    }
+
+    // ── Dedup by font_key ───────────────────────────────────────────────
+    // After make_weight_explicit, duplicate font files (e.g. specimen-fonts/
+    // ibm-plex-serif-400.ttf and ibm-plex/IBMPlexSerif-Regular.ttf) produce
+    // the same canonical postscript_name and therefore the same font_key.
+    // Keep the first entry encountered; drop duplicates.
+    {
+        use std::collections::HashSet;
+        let mut seen_keys: HashSet<String> = HashSet::new();
+        let before = fonts.len();
+        fonts.retain(|f| seen_keys.insert(f.font_key()));
+        let removed = before - fonts.len();
+        if removed > 0 {
+            eprintln!("[scan] Deduped {} entries by font_key ({} → {})", removed, before, fonts.len());
         }
     }
 
@@ -920,17 +937,51 @@ pub fn make_weight_explicit(ps_name: &str, weight: u16) -> String {
 
     let weight_str = weight.to_string();
 
+    // Strip any trailing weight-word suffix before appending the numeric
+    // weight.  This ensures two copies of the same font with different PS
+    // naming conventions (e.g. "IBMPlexSerif-Regular" vs "IBMPlexSerif")
+    // collapse to the same canonical name ("IBMPlexSerif-400").
+    // The OS/2 weight class is the authority; the word suffix is just a label.
+    let stem = strip_weight_suffix(ps_name);
+
     // Separate italic suffix — insert weight number before it.
-    if let Some(idx) = ps_name.to_lowercase().find("italic") {
-        let prefix = ps_name[..idx].trim_end_matches('-');
-        let italic_part = &ps_name[idx..];
+    if let Some(idx) = stem.to_lowercase().find("italic") {
+        let prefix = stem[..idx].trim_end_matches('-');
+        let italic_part = &stem[idx..];
         format!("{}-{}{}", prefix, weight_str, italic_part)
-    } else if ps_name.ends_with("It") {
-        let prefix = ps_name[..ps_name.len()-2].trim_end_matches('-');
+    } else if stem.ends_with("It") {
+        let prefix = stem[..stem.len()-2].trim_end_matches('-');
         format!("{}-{}It", prefix, weight_str)
     } else {
-        format!("{}-{}", ps_name, weight_str)
+        format!("{}-{}", stem, weight_str)
     }
+}
+
+/// Strip a trailing weight-word suffix (e.g. "-Regular", "-Bold") from a
+/// PostScript name, returning the family stem.  The suffix must appear after
+/// a hyphen; bare names without a hyphen are returned unchanged.
+fn strip_weight_suffix(ps_name: &str) -> &str {
+    const WEIGHT_SUFFIXES: &[&str] = &[
+        "-Regular",
+        "-Bold",
+        "-Light",
+        "-Medium",
+        "-Thin",
+        "-ExtraLight",
+        "-UltraLight",
+        "-SemiBold",
+        "-DemiBold",
+        "-ExtraBold",
+        "-UltraBold",
+        "-Heavy",
+        "-Black",
+    ];
+    for suffix in WEIGHT_SUFFIXES {
+        if ps_name.ends_with(suffix) {
+            return &ps_name[..ps_name.len() - suffix.len()];
+        }
+    }
+    ps_name
 }
 
 // ---------------------------------------------------------------------------

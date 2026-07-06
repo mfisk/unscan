@@ -22,10 +22,6 @@ use crate::glyph_map::NgramGlyphMap;
 // Paths
 // ---------------------------------------------------------------------------
 
-fn ngram_glyph_map_path() -> PathBuf {
-    NgramGlyphMap::default_path()
-}
-
 fn ngram_feat_dir(seq_len: usize) -> PathBuf {
     let home = std::env::var("HOME").unwrap_or_else(|_| ".".to_string());
     let dirname = if seq_len == 1 { "chars".to_string() } else { format!("ngram-{seq_len}") };
@@ -44,7 +40,6 @@ pub fn build_ngram_glyph_map(
     catalog: &[FontEntry],
     glyph_map: &mut NgramGlyphMap,
 ) -> () {
-    let _catalog_hash = glyph_map.catalog_hash;
     let bigrams = features::supported_sequences(2);
     eprintln!("\nBuilding bigram glyph map ({} fonts × {} bigrams)...",
         catalog.len(), bigrams.len());
@@ -52,7 +47,9 @@ pub fn build_ngram_glyph_map(
     let progress = AtomicUsize::new(0);
     let total = catalog.len();
 
-    // Each font returns Vec<((char,char), hash, font_key)>
+    // Each font returns Vec<(seq, hash, font_key)>
+    // Uses render_ngram_fresh directly for parallel rendering; results
+    // are registered into the glyph_map after collection.
     let per_font_hashes: Vec<Vec<(Vec<char>, u64, String)>> = catalog.par_iter().map(|fe| {
         let font_data = match std::fs::read(&fe.path) {
             Ok(d) => d,
@@ -78,9 +75,18 @@ pub fn build_ngram_glyph_map(
                 overrides.and_then(|ovs| ovs.iter().find(|(ch, _)| *ch == *c).map(|(_, g)| ab_glyph::GlyphId(*g)))
             }).collect();
 
-            if let Some((hash, _img)) = crate::char_render::render_ngram(
+            if let Some(img) = crate::char_render::render_ngram_fresh(
                 &font, seq, &gid_overrides, &params,
             ) {
+                let hash = crate::glyph_map::hash_image(&img);
+                // Write image cache
+                let path = crate::char_render::ngram_cache_path(seq, hash, &params);
+                if !path.exists() {
+                    if let Some(parent) = path.parent() {
+                        let _ = std::fs::create_dir_all(parent);
+                    }
+                    let _ = img.save(&path);
+                }
                 hashes.push((seq.clone(), hash, fk.clone()));
             }
         }
@@ -91,43 +97,21 @@ pub fn build_ngram_glyph_map(
         hashes
     }).collect();
 
-    // Merge into groups: (c1,c2,hash) → Vec<font_key>
-    let mut hash_groups: HashMap<Vec<char>, HashMap<u64, Vec<String>>> = HashMap::new();
+    // Register all results into the glyph_map
     for font_hashes in per_font_hashes {
         for (seq, hash, font_key) in font_hashes {
-            hash_groups.entry(seq).or_default()
-                .entry(hash).or_default()
-                .push(font_key);
+            glyph_map.register(&seq, &font_key, hash);
         }
     }
 
-    // Convert to NgramGlyphMap groups
-    let mut groups: HashMap<Vec<char>, Vec<Vec<String>>> = HashMap::with_capacity(hash_groups.len());
-    let mut total_glyphs = 0usize;
-    let mut total_deduped = 0usize;
-    let mut total_bigrams = 0usize;
-    for (pair, by_hash) in &hash_groups {
-        let mut pair_groups: Vec<Vec<String>> = by_hash.values().cloned().collect();
-        // Sort fonts within each group first (Rayon order is non-deterministic)
-        for group in &mut pair_groups {
-            group.sort();
-        }
-        // Then sort groups by first font_key for deterministic glyph_id assignment
-        pair_groups.sort_by(|a, b| a[0].cmp(&b[0]));
-        total_glyphs += pair_groups.len();
-        total_deduped += pair_groups.iter().filter(|g| g.len() > 1).map(|g| g.len() - 1).sum::<usize>();
-        total_bigrams += 1;
-        groups.insert(pair.clone(), pair_groups);
-    }
-
-    // Merge bigram entries into the existing glyph map
-    glyph_map.groups.extend(groups);
-    let gmap_path = ngram_glyph_map_path();
-    glyph_map.write_bin(&gmap_path).expect("write glyph-map.bin");
-    eprintln!("  Bigrams: {} unique glyphs across {} pairs ({} deduped)",
-        total_glyphs, total_bigrams, total_deduped);
-    eprintln!("  Combined glyph map: {} total entries", glyph_map.groups.len());
-    eprintln!("  Wrote {}", gmap_path.display());
+    let total_glyphs: usize = glyph_map.groups.values().map(|g| g.len()).sum();
+    let total_deduped: usize = glyph_map.groups.values()
+        .flat_map(|gs| gs.iter())
+        .filter(|g| g.font_keys.len() > 1)
+        .map(|g| g.font_keys.len() - 1)
+        .sum();
+    eprintln!("  Combined glyph map: {} unique glyphs across {} seqs ({} duplicate renders eliminated)",
+        total_glyphs, glyph_map.groups.len(), total_deduped);
     eprintln!("  Bigram glyph map complete in {:.1}s", t0.elapsed().as_secs_f64());
 }
 
@@ -231,10 +215,10 @@ pub fn generate_ngram_training_data(
                         params.height = ht;
                         params.aa = aa;
 
-                        let img = match crate::char_render::render_ngram(
+                        let img = match crate::char_render::render_ngram_fresh(
                             &font, &[c1, c2], &gid_overrides, &params,
                         ) {
-                            Some((_, img)) => img,
+                            Some(img) => img,
                             None => continue,
                         };
 
