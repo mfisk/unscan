@@ -452,6 +452,15 @@ pub fn load_char_combo_samples(
         let path = feat_dir.join(format!("char_{:04}_h{}_{}.bin", ci, ht, aa_name));
         let file = std::fs::File::open(&path).expect("open combo feature file");
         let mut reader = BufReader::with_capacity(256 * 1024, file);
+        // Read and validate header
+        reader.read_exact(&mut buf4).expect("read magic");
+        assert!(&buf4 == b"UTFD", "invalid training feature magic in {}", path.display());
+        reader.read_exact(&mut buf4).expect("read version");
+        let version = u32::from_le_bytes(buf4);
+        assert!(version == 1, "unsupported training feature version {version} in {}", path.display());
+        reader.read_exact(&mut buf4).expect("read feat_len");
+        let file_feat_len = u32::from_le_bytes(buf4) as usize;
+        assert!(file_feat_len == FEAT_LEN, "FEAT_LEN mismatch: file has {file_feat_len}, code has {FEAT_LEN} in {}", path.display());
         for _ in 0..n {
             reader.read_exact(&mut buf4).expect("read glyph_id");
             let glyph_id = u32::from_le_bytes(buf4);
@@ -964,6 +973,13 @@ pub fn run_train(mut args: TrainArgs) {
             for font_samples in chunk_results {
                 for (ci, combo_idx, sample) in font_samples {
                     let w = &mut combo_writers[ci][combo_idx];
+                    // Write header on first sample
+                    if combo_counts[combo_idx][ci] == 0 {
+                        use std::io::Write;
+                        w.write_all(b"UTFD").expect("write magic");        // Unprint Training Feature Data
+                        w.write_all(&1u32.to_le_bytes()).expect("write version");
+                        w.write_all(&(FEAT_LEN as u32).to_le_bytes()).expect("write feat_len");
+                    }
                     w.write_all(&sample.glyph_id.to_le_bytes()).expect("write glyph_id");
                     for &f in &sample.features {
                         w.write_all(&f.to_le_bytes()).expect("write feature");

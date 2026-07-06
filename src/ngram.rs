@@ -244,13 +244,19 @@ pub fn generate_ngram_training_data(
         // Write chunk results to per-bigram files
         for font_samples in chunk_results {
             for (bi, sample) in font_samples {
-                bigram_counts[bi].fetch_add(1, Ordering::Relaxed);
+                let was_zero = bigram_counts[bi].fetch_add(1, Ordering::Relaxed) == 0;
                 let seq = &bigrams[bi]; let (c1, c2) = (seq[0], seq[1]);
                 let path = feat_dir.join(format!("{:04X}_{:04X}.bin", c1 as u32, c2 as u32));
                 let mut f = std::fs::OpenOptions::new()
                     .create(true).append(true).open(&path)
                     .expect("open bigram feature file");
                 use std::io::Write;
+                // Write header on first sample for this bigram
+                if was_zero {
+                    f.write_all(b"UTFD").expect("write magic");
+                    f.write_all(&1u32.to_le_bytes()).expect("write version");
+                    f.write_all(&(FEAT_LEN as u32).to_le_bytes()).expect("write feat_len");
+                }
                 f.write_all(&sample.glyph_id.to_le_bytes()).expect("write glyph_id");
                 for &v in &sample.features {
                     f.write_all(&v.to_le_bytes()).expect("write feature");
@@ -273,17 +279,36 @@ fn load_bigram_samples(c1: char, c2: char) -> Vec<BigramSample> {
         Err(_) => return Vec::new(),
     };
 
+    let header_size = 12; // magic(4) + version(4) + feat_len(4)
+    if data.len() < header_size {
+        return Vec::new();
+    }
+    if &data[0..4] != b"UTFD" {
+        eprintln!("warning: invalid bigram feature magic in {:04X}_{:04X}.bin, skipping", c1 as u32, c2 as u32);
+        return Vec::new();
+    }
+    let version = u32::from_le_bytes(data[4..8].try_into().unwrap());
+    if version != 1 {
+        eprintln!("warning: unsupported bigram feature version {version} in {:04X}_{:04X}.bin, skipping", c1 as u32, c2 as u32);
+        return Vec::new();
+    }
+    let file_feat_len = u32::from_le_bytes(data[8..12].try_into().unwrap()) as usize;
+    if file_feat_len != FEAT_LEN {
+        eprintln!("warning: FEAT_LEN mismatch in {:04X}_{:04X}.bin (file={file_feat_len}, code={FEAT_LEN}), skipping", c1 as u32, c2 as u32);
+        return Vec::new();
+    }
+    let payload = &data[header_size..];
     let sample_size = 4 + FEAT_LEN * 4; // glyph_id(4) + features(FEAT_LEN*4)
-    let n = data.len() / sample_size;
+    let n = payload.len() / sample_size;
     let mut samples = Vec::with_capacity(n);
 
     for i in 0..n {
         let off = i * sample_size;
-        let glyph_id = u32::from_le_bytes(data[off..off + 4].try_into().unwrap());
+        let glyph_id = u32::from_le_bytes(payload[off..off + 4].try_into().unwrap());
         let mut features = [0.0f32; FEAT_LEN];
         for j in 0..FEAT_LEN {
             features[j] = f32::from_le_bytes(
-                data[off + 4 + j * 4..off + 4 + (j + 1) * 4].try_into().unwrap()
+                payload[off + 4 + j * 4..off + 4 + (j + 1) * 4].try_into().unwrap()
             );
         }
         samples.push(BigramSample { glyph_id, features });
