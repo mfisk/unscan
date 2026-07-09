@@ -13,7 +13,7 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 use image::GrayImage;
 use rayon::prelude::*;
 
-use crate::classifier::{NgramModel, ImageModel};
+use crate::classifier::{NgramModel, MmapNgramModel, ImageModel};
 use crate::features::{self, compute_features, FEAT_LEN};
 use crate::font_scan::FontEntry;
 use crate::glyph_map::NgramGlyphMap;
@@ -246,9 +246,10 @@ pub fn generate_ngram_training_data(
             for (bi, sample) in font_samples {
                 let was_zero = bigram_counts[bi].fetch_add(1, Ordering::Relaxed) == 0;
                 let seq = &bigrams[bi]; let (c1, c2) = (seq[0], seq[1]);
-                let path = feat_dir.join(format!("{:04X}_{:04X}.bin", c1 as u32, c2 as u32));
+                let final_path = feat_dir.join(format!("{:04X}_{:04X}.bin", c1 as u32, c2 as u32));
+                let tmp_path = crate::atomic_file::tmp_for(&final_path);
                 let mut f = std::fs::OpenOptions::new()
-                    .create(true).append(true).open(&path)
+                    .create(true).append(true).open(&tmp_path)
                     .expect("open bigram feature file");
                 use std::io::Write;
                 // Write header on first sample for this bigram
@@ -261,6 +262,18 @@ pub fn generate_ngram_training_data(
                 for &v in &sample.features {
                     f.write_all(&v.to_le_bytes()).expect("write feature");
                 }
+            }
+        }
+    }
+
+    // Atomically commit all bigram feature files
+    for (bi, count) in bigram_counts.iter().enumerate() {
+        if count.load(Ordering::Relaxed) > 0 {
+            let seq = &bigrams[bi]; let (c1, c2) = (seq[0], seq[1]);
+            let final_path = feat_dir.join(format!("{:04X}_{:04X}.bin", c1 as u32, c2 as u32));
+            let tmp_path = crate::atomic_file::tmp_for(&final_path);
+            if tmp_path.exists() {
+                std::fs::rename(&tmp_path, &final_path).expect("atomic rename bigram feature");
             }
         }
     }
@@ -483,15 +496,19 @@ pub fn train_ngram_lda(
         trained += 1;
     }
 
-    // Load existing model (unigram entries) and merge bigram entries in
-    let data = std::fs::read(model_path)
-        .unwrap_or_else(|e| panic!("cannot read {}: {e}", model_path.display()));
-    let mut model = NgramModel::read_bin(&data, b"LDAC", None)
-        .unwrap_or_else(|e| panic!("cannot parse {}: {e}", model_path.display()));
+    // Load existing indexed model (unigram entries) and merge bigram entries in
+    let mmap = MmapNgramModel::load_indexed(model_path, b"LDAC")
+        .unwrap_or_else(|e| panic!("cannot load {}: {e}", model_path.display()));
+    let mut model = mmap.to_owned_model();
     model.entries.extend(model_entries);
 
-    let mut f = std::fs::File::create(model_path).expect("create model file");
+    let tmp = crate::atomic_file::tmp_for(model_path);
+    let mut f = std::fs::File::create(&tmp).expect("create model file");
     model.write_bin(&mut f, b"LDAC", 5).expect("write combined ngram model");
+    use std::io::Write;
+    f.flush().expect("flush model");
+    drop(f);
+    std::fs::rename(&tmp, model_path).expect("atomic rename model");
 
     eprintln!("  Bigram LDA: trained {} bigrams, skipped {} ({:.1}s)",
         trained, skipped, t0.elapsed().as_secs_f64());
@@ -643,7 +660,7 @@ pub fn build_scoring_windows<'a>(
     classifier: &'a dyn crate::classifier::Classifier,
     _glyph_map: &'a crate::glyph_map::NgramGlyphMap,
     crop_store: &'a mut Vec<GrayImage>,
-) -> Vec<crate::font_match::ScoringWindow<'a>> {
+) -> (Vec<crate::font_match::ScoringWindow<'a>>, Vec<(usize, usize)>) {
     // Flatten characters across all words into (seg_idx, pos_in_word, character)
     let flat: Vec<(usize, usize, char)> = word_segs.iter().enumerate()
         .flat_map(|(seg_idx, seg)| {
@@ -655,7 +672,7 @@ pub fn build_scoring_windows<'a>(
 
     let n = flat.len();
     if n == 0 {
-        return Vec::new();
+        return (Vec::new(), Vec::new());
     }
 
     // Pass 1: crop into crop_store, record entries.
@@ -742,5 +759,10 @@ pub fn build_scoring_windows<'a>(
         }
     }
 
-    windows
+    // Position map: for each window, the (seg_idx, char_pos) of its first character
+    let position_map: Vec<(usize, usize)> = entries.iter()
+        .map(|&(fi, _, _)| (flat[fi].0, flat[fi].1))
+        .collect();
+
+    (windows, position_map)
 }

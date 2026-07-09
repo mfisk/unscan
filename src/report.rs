@@ -10,7 +10,7 @@ use std::path::{Path, PathBuf};
 
 use ab_glyph::FontRef;
 use base64::Engine;
-use image::GrayImage;
+use image::{GrayImage, RgbImage};
 
 use crate::audit::{AuditEntry, Decision};
 
@@ -63,6 +63,21 @@ fn img_to_b64_uri(img: &GrayImage) -> String {
     format!("data:image/png;base64,{b64}")
 }
 
+fn rgb_img_to_b64_uri(img: &RgbImage) -> String {
+    let mut buf = Vec::new();
+    let encoder = image::codecs::png::PngEncoder::new(&mut buf);
+    image::ImageEncoder::write_image(
+        encoder,
+        img.as_raw(),
+        img.width(),
+        img.height(),
+        image::ExtendedColorType::Rgb8,
+    )
+    .ok();
+    let b64 = base64::engine::general_purpose::STANDARD.encode(&buf);
+    format!("data:image/png;base64,{b64}")
+}
+
 fn file_to_b64_uri(path: &Path) -> Option<String> {
     let data = std::fs::read(path).ok()?;
     let b64 = base64::engine::general_purpose::STANDARD.encode(&data);
@@ -81,15 +96,7 @@ fn img_td(uri: Option<&str>) -> String {
     }
 }
 
-fn dist_class(d2: f32) -> &'static str {
-    if d2 > 0.05 {
-        "bad"
-    } else if d2 > 0.01 {
-        "warn"
-    } else {
-        "ok"
-    }
-}
+
 
 
 
@@ -366,9 +373,11 @@ fn classify_entries<'a>(
                     gt_font_size_pt,
                 }
             } else {
-                // No ground truth: only classify kept-raster vs hit
+                // No ground truth: classify kept-raster, similarity failure, or hit
                 let kind = if e.decision == Decision::KeptRaster {
                     MissKind::KeptRaster
+                } else if e.similarity_pass == Some(false) {
+                    MissKind::SimilarityFailure
                 } else {
                     MissKind::Hit
                 };
@@ -413,8 +422,13 @@ pub fn enrich_audit_entries(
                            (e.bbox.y + e.bbox.height) as f32];
             e.gt_text = gt.lookup_text(e.page, &bbox_px, dpi).map(|s| s.to_string());
         }
-        // OCR text: join word texts (from word_bboxes)
-        let ocr: String = e.word_bboxes.iter().map(|w| w.text.as_str()).collect::<Vec<_>>().join(" ");
+        // OCR text: join raw word texts (word_bboxes_raw = original tesseract output,
+        // before pflda corrections). word_bboxes has corrected text for rendering.
+        let ocr: String = if e.word_bboxes_raw.is_empty() {
+            e.word_bboxes.iter().map(|w| w.text.as_str()).collect::<Vec<_>>().join(" ")
+        } else {
+            e.word_bboxes_raw.iter().map(|w| w.text.as_str()).collect::<Vec<_>>().join(" ")
+        };
         if !ocr.is_empty() {
             e.ocr_text = Some(ocr.clone());
             if let Some(ref gt_t) = e.gt_text {
@@ -663,15 +677,9 @@ fn build_miss_block(
     // Find diag_seg_dir for this line
     let diag_dir = find_diag_seg_dir(audit_root, entry.page, entry.line_index);
 
-    // Determine if font pick is correct (skip char table + GT render for similarity-only failures)
-    let font_is_correct = ce.kind == MissKind::SimilarityFailure;
-
-    // Similarity comparison block — render correct font for side-by-side if this is a font miss
-    let (gt_render_uri, gt_diff_uri, gt_sim) = if !font_is_correct {
-        render_correct_font_comparison(entry, correct_fe, font_data_cache, diag_dir.as_deref())
-    } else {
-        (None, None, None)
-    };
+    // Similarity comparison block — always render for side-by-side comparison
+    let (gt_render_uri, gt_diff_uri, gt_sim) =
+        render_correct_font_comparison(entry, correct_fe, font_data_cache, diag_dir.as_deref());
     // Compute font sizes for comparison
     let gt_font_size_pt = ce.gt_font_size_pt;
     let inferred_size = chosen_fe.and_then(|fe| {
@@ -716,8 +724,8 @@ fn build_miss_block(
         _ => String::new(),
     };
 
-    // Per-character comparison table
-    let obs_table_html = if font_is_correct || entry.obs_votes.is_empty() {
+    // Per-character comparison table (skip for similarity-only failures — font is correct)
+    let obs_table_html = if ce.kind == MissKind::SimilarityFailure || entry.obs_votes.is_empty() {
         String::new()
     } else {
         let obs_to_show = pick_interesting_observations(&entry.obs_votes, 6, 0);
@@ -739,17 +747,22 @@ fn build_miss_block(
     };
 
     let text_preview = truncate(&entry.text, 60);
+    let ocr_fail_tag = if entry.ocr_correct == Some(false) {
+        " <span class=\"ocr-wrong-badge\">OCR WRONG</span>"
+    } else {
+        ""
+    };
     let miss_kind_label = match ce.kind {
         MissKind::MajorMiss => {
             // Show expected→got summary for font misses
-            format!(" [MAJOR: expected {}, got {}]", actual_font, matched)
+            format!(" [MAJOR: expected {}, got {}]{ocr_fail_tag}", actual_font, matched)
         },
         MissKind::MinorMiss => {
-            format!(" [minor: expected {}, got {}]", actual_font, matched)
+            format!(" [minor: expected {}, got {}]{ocr_fail_tag}", actual_font, matched)
         },
-        MissKind::SimilarityFailure => " [ZNCC failure]".to_string(),
-        MissKind::KeptRaster => " [kept raster]".to_string(),
-        _ => String::new(),
+        MissKind::SimilarityFailure => format!(" [ZNCC failure]{ocr_fail_tag}"),
+        MissKind::KeptRaster => format!(" [kept raster]{ocr_fail_tag}"),
+        _ => ocr_fail_tag.to_string(),
     };
 
     // Segmentation path comparison (ligature vs plain)
@@ -796,14 +809,16 @@ fn build_miss_block(
 
     let html = format!(
         "<div class=\"miss\">\
-         <h3>p{}:L{} — \"{}\"{}{}  </h3>\
+         <h3>p{}:L{}{}{}  </h3>\
+         <div class=\"line-text-preview\">\"{}\"</div>\
          {}\
          {}\
          {}\
          {}\
          {}\
          </div>",
-        entry.page, entry.line_index, text_preview, miss_kind_label, sim_html,
+        entry.page, entry.line_index, miss_kind_label, sim_html,
+        text_preview,
         seg_path_html, scan_line_html, sim_compare_html, tie_break_html, obs_table_html,
     );
     (html, entry.similarity_score, gt_sim)
@@ -1179,7 +1194,9 @@ fn render_correct_font_comparison(
         None => return (None, None, None),
     };
 
-    // Build TextRegions from word_bboxes for verify_text_region
+    // Build TextRegions from word_bboxes — these already contain pflda-corrected
+    // text (corrected_words written into audit in main.rs), so both the GT font
+    // render and the chosen font render use the identical corrected text.
     let words: Vec<crate::ocr::TextRegion> = entry.word_bboxes.iter().map(|wb| {
         crate::ocr::TextRegion {
             text: wb.text.clone(),
@@ -1200,7 +1217,7 @@ fn render_correct_font_comparison(
     );
 
     let render_uri = vr.render_ink.as_ref().map(|r| img_to_b64_uri(r));
-    let diff_uri = vr.diff.as_ref().map(|d| img_to_b64_uri(d));
+    let diff_uri = vr.diff.as_ref().map(|d| rgb_img_to_b64_uri(d));
     let score = if vr.score > 0.0 { Some(vr.score) } else { None };
 
     (render_uri, diff_uri, score)
@@ -1585,12 +1602,25 @@ fn build_observation_table(
             ));
         }
 
-        // Best alternative character
-        if let (Some(alt_ch), Some(alt_dist)) = (cv.best_alt_char, cv.best_alt_dist) {
-            let dc = dist_class(alt_dist);
-            ocr_parts.push(format!(
-                "Alt: <b>'{alt_ch}'</b> <span class='num {dc}'>{alt_dist:.6}</span>"
-            ));
+        // Per-font LDA character classification
+        if let (Some(top_ch), Some(top_p)) = (cv.pflda_top_char, cv.pflda_top_p) {
+            let ocr_p_str = cv.pflda_ocr_p
+                .map(|p| format!("{:.4}", p))
+                .unwrap_or_else(|| "?".into());
+            let original_ocr = cv.ocr_corrected_from.unwrap_or(seq[0]);
+            if cv.pflda_replaced {
+                ocr_parts.push(format!(
+                    "<span class='ocr-fix'>pflda: '{top_ch}' p={top_p:.4} vs OCR '{original_ocr}' p={ocr_p_str} → <b>REPLACED</b></span>"
+                ));
+            } else if top_ch != original_ocr {
+                ocr_parts.push(format!(
+                    "<span class='font-mini'>pflda: '{top_ch}' p={top_p:.4} vs OCR '{original_ocr}' p={ocr_p_str} → kept OCR</span>"
+                ));
+            } else {
+                ocr_parts.push(format!(
+                    "<span class='font-mini'>pflda: '{original_ocr}' p={top_p:.4} (confirmed)</span>"
+                ));
+            }
         }
 
         let ocr_cell = ocr_parts.join(" · ");
@@ -1778,6 +1808,8 @@ img.ci {
   box-sizing: border-box; width: 100%;
 }
 .scan-line-label { font-size: 10px; font-weight: 600; color: #555; margin: 8px 8px 4px 8px; }
+.ocr-wrong-badge { background: #f0a020; color: white; padding: 1px 6px; border-radius: 3px; font-size: 11px; font-weight: 700; }
+.line-text-preview { font-size: 12px; color: #666; margin: 2px 0 8px 0; font-style: italic; }
 .scan-line-block svg { display: block; width: 100%; height: auto; }
 </style>"#;
 
@@ -1886,18 +1918,7 @@ pub fn generate_report(
     let mut minor_misses: Vec<&ClassifiedEntry> = Vec::new();
     let mut similarity_failures: Vec<&ClassifiedEntry> = Vec::new();
     let mut kept_raster: Vec<&ClassifiedEntry> = Vec::new();
-    let mut total_chars = 0usize;
-    let mut corrected_chars = 0usize;
-
     for ce in &classified {
-        // Count OCR corrections
-        for cv in &ce.entry.obs_votes {
-            total_chars += 1;
-            if cv.ocr_corrected_from.is_some() {
-                corrected_chars += 1;
-            }
-        }
-
         match ce.kind {
             MissKind::Hit => hits += 1,
             MissKind::MajorMiss => major_misses.push(ce),
@@ -1926,22 +1947,7 @@ pub fn generate_report(
     };
 
     // OCR accuracy split: break down font matching accuracy by OCR correctness
-    let (ocr_correct_total, ocr_correct_hits, ocr_wrong_total, ocr_wrong_hits, ocr_unknown_total) = {
-        let mut c_total = 0usize;
-        let mut c_hits = 0usize;
-        let mut w_total = 0usize;
-        let mut w_hits = 0usize;
-        let mut u_total = 0usize;
-        for ce in &classified {
-            let is_hit = matches!(ce.kind, MissKind::Hit | MissKind::MinorMiss);
-            match ce.entry.ocr_correct {
-                Some(true) => { c_total += 1; if is_hit { c_hits += 1; } },
-                Some(false) => { w_total += 1; if is_hit { w_hits += 1; } },
-                None => { u_total += 1; },
-            }
-        }
-        (c_total, c_hits, w_total, w_hits, u_total)
-    };
+
 
     // Sort each miss category by increasing ZNCC (worst visual matches first)
     major_misses.sort_by(|a, b| {
@@ -2027,80 +2033,111 @@ pub fn generate_report(
         String::new()
     };
 
-    let sim_fail_miss_str = if !similarity_failures.is_empty() {
-        format!(" ({} ZNCC fail)", similarity_failures.len())
-    } else {
-        String::new()
-    };
-
-    let raster_str = if !kept_raster.is_empty() {
-        format!(" | {} kept raster", kept_raster.len())
-    } else {
-        String::new()
-    };
-
-    let ocr_corr_str = if total_chars > 0 {
-        format!(" | OCR corrections: {corrected_chars}/{total_chars}")
-    } else {
-        String::new()
-    };
-
-    // OCR accuracy split summary
-    let ocr_split_str = if ocr_correct_total + ocr_wrong_total > 0 {
-        let c_pct = if ocr_correct_total > 0 { ocr_correct_hits as f64 / ocr_correct_total as f64 * 100.0 } else { 0.0 };
-        let w_pct = if ocr_wrong_total > 0 { ocr_wrong_hits as f64 / ocr_wrong_total as f64 * 100.0 } else { 0.0 };
-        let mut s = format!(
-            "</div>\n<div class=\"summary\">OCR split: correct-text {ocr_correct_hits}/{ocr_correct_total} ({c_pct:.1}%) | wrong-text {ocr_wrong_hits}/{ocr_wrong_total} ({w_pct:.1}%)"
-        );
-        if ocr_unknown_total > 0 {
-            s.push_str(&format!(" | no-GT {ocr_unknown_total}"));
-        }
-        s
-    } else {
-        String::new()
-    };
-
-    // ZNCC percentiles across all lines that have a ZNCC score
-    let sim_percentile_str = {
+    // ── Summary line 1: Similarity ──────────────────────────────────
+    let sim_summary = {
         let mut sim_vals: Vec<f32> = entries.iter()
             .filter_map(|e| e.similarity_score)
             .collect();
         sim_vals.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
         if sim_vals.is_empty() {
-            String::new()
+            String::from("Similarity: no ZNCC data")
         } else {
             let n = sim_vals.len();
+            let above = sim_vals.iter().filter(|&&v| v >= crate::MIN_VERIFY_SIMILARITY).count();
+            let pct_above = above as f64 / n as f64 * 100.0;
             let p50 = sim_vals[n / 2];
             let p90_idx = (n as f64 * 0.9).ceil() as usize;
             let p90 = sim_vals[p90_idx.min(n - 1)];
-            format!(" | ZNCC p50={p50:.6} p90={p90:.6} (n={n})")
-        }
-    };
-
-    // Per-character GT font rank statistics
-    let gt_rank_str = {
-        let mut all_ranks: Vec<usize> = classified.iter()
-            .flat_map(|ce| ce.entry.obs_votes.iter())
-            .filter_map(|cv| cv.gt_font_rank)
-            .collect();
-        all_ranks.sort();
-        if all_ranks.is_empty() {
-            String::new()
-        } else {
-            let n = all_ranks.len();
-            let median = all_ranks[n / 2];
-            let p90_idx = (n as f64 * 0.9).ceil() as usize;
-            let p90 = all_ranks[p90_idx.min(n - 1)];
-            let top1 = all_ranks.iter().filter(|&&r| r == 1).count();
-            let top10 = all_ranks.iter().filter(|&&r| r <= 10).count();
             format!(
-                " | GT obs rank: median={median} p90={p90} top1={top1}/{n} ({:.0}%) top10={top10}/{n} ({:.0}%)",
-                top1 as f64 / n as f64 * 100.0,
-                top10 as f64 / n as f64 * 100.0,
+                "Similarity: <b>{above}/{n} ({pct_above:.0}%)</b> above {:.1} threshold · p50={p50:.4} · p90={p90:.4}",
+                crate::MIN_VERIFY_SIMILARITY,
             )
         }
     };
 
+    // ── Summary line 2: Font accuracy ────────────────────────────────
+    let font_summary = if compared > 0 {
+        let major_correct = compared - major_misses.len() - similarity_failures.len();
+        let major_pct = major_correct as f64 / compared as f64 * 100.0;
+        let minor_correct = hits; // hits = exact match
+        let minor_pct = minor_correct as f64 / compared as f64 * 100.0;
+        format!(
+            "Font accuracy: <b>{major_correct}/{compared} ({major_pct:.0}%)</b> major correct ·              <b>{minor_correct}/{compared} ({minor_pct:.0}%)</b> exact match"
+        )
+    } else {
+        String::from("Font accuracy: no GT data")
+    };
+
+    // ── Summary line 3: OCR ──────────────────────────────────────────
+    // Compare ocr_text (tesseract raw) against gt_text for tesseract accuracy.
+    // Compare word_bboxes text (pflda-corrected) against gt_text for post-pflda accuracy.
+    // Count pflda true/false by diffing ocr vs corrected positionally.
+    let (tess_correct, post_correct, ocr_total, pflda_true, pflda_false) = {
+        let mut tc = 0usize;
+        let mut pc = 0usize;
+        let mut total = 0usize;
+        let mut p_true = 0usize;
+        let mut p_false = 0usize;
+        for ce in &classified {
+            let gt_text = match ce.entry.gt_text.as_deref() {
+                Some(t) => t,
+                None => continue,
+            };
+            let ocr_text = match ce.entry.ocr_text.as_deref() {
+                Some(t) => t,
+                None => continue,
+            };
+            let gt_chars: Vec<char> = gt_text.chars().filter(|c| !c.is_whitespace()).collect();
+            let ocr_chars: Vec<char> = ocr_text.chars().filter(|c| !c.is_whitespace()).collect();
+
+            // Corrected text from word_bboxes (same source as chosen font verify)
+            let corrected_text: String = ce.entry.word_bboxes.iter()
+                .map(|wb| wb.text.as_str()).collect::<Vec<_>>().join(" ");
+            let corrected_chars: Vec<char> = corrected_text.chars()
+                .filter(|c| !c.is_whitespace()).collect();
+
+            // pflda true/false: diff ocr vs corrected positionally
+            let n_diff = ocr_chars.len().min(corrected_chars.len()).min(gt_chars.len());
+            for i in 0..n_diff {
+                if ocr_chars[i] != corrected_chars[i] {
+                    if gt_chars[i].to_lowercase().eq(corrected_chars[i].to_lowercase()) {
+                        p_true += 1;
+                    } else {
+                        p_false += 1;
+                    }
+                }
+            }
+
+            // Char-by-char accuracy comparison
+            let n = gt_chars.len().min(ocr_chars.len()).min(corrected_chars.len());
+            for i in 0..n {
+                total += 1;
+                if gt_chars[i].to_lowercase().eq(ocr_chars[i].to_lowercase()) { tc += 1; }
+                if gt_chars[i].to_lowercase().eq(corrected_chars[i].to_lowercase()) { pc += 1; }
+            }
+        }
+        (tc, pc, total, p_true, p_false)
+    };
+    let pflda_total = pflda_true + pflda_false;
+
+    let ocr_summary = {
+        let mut parts = Vec::new();
+        if ocr_total > 0 {
+            let post_pct = post_correct as f64 / ocr_total as f64 * 100.0;
+            let tess_pct = tess_correct as f64 / ocr_total as f64 * 100.0;
+            parts.push(format!(
+                "OCR: <b>{post_correct}/{ocr_total} ({post_pct:.1}%)</b> chars correct after pflda ·                  <b>{tess_correct}/{ocr_total} ({tess_pct:.1}%)</b> tesseract-only"
+            ));
+        }
+        if pflda_total > 0 {
+            parts.push(format!(
+                "pflda replacements: <b>{pflda_true}</b> correct, <b>{pflda_false}</b> wrong ({pflda_total} total)"
+            ));
+        }
+        parts.join(" · ")
+    };
+
+    // Per-character GT font rank statistics
     // Run metadata line
     let elapsed_secs = meta.elapsed.as_secs_f64();
     let elapsed_str = if elapsed_secs >= 60.0 {
@@ -2131,9 +2168,9 @@ pub fn generate_report(
          <body style=\"background: white; color: #222;\">\n\
          {CSS}\n\
          <h2>unprint miss report</h2>\n\
-         <div class=\"summary\">{primary_hits}/{compared} correct ({pct:.1}%) — \
-         {n_major} major + {n_minor} minor misses{sim_fail_miss_str}{raster_str}{ocr_corr_str}{sim_percentile_str}{gt_rank_str}</div>\n\
-         {ocr_split_str}\n\
+         <div class=\"summary\">{sim_summary}</div>\n\
+         <div class=\"summary\">{font_summary}</div>\n\
+         <div class=\"summary\">{ocr_summary}</div>\n\
          <div class=\"summary\">{meta_str}</div>\n\
          <div class=\"score-legend\">\n\
          <b>Score key:</b>\n\

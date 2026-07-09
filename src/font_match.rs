@@ -81,6 +81,14 @@ pub struct ObservationDetail {
     pub best_alt_char: Option<char>,
     /// Distance of the best alternative character.
     pub best_alt_dist: Option<f32>,
+    /// Per-font LDA top-1 predicted character.
+    pub pflda_top_char: Option<char>,
+    /// Per-font LDA probability of the top-1 prediction.
+    pub pflda_top_p: Option<f32>,
+    /// Per-font LDA probability of the OCR character.
+    pub pflda_ocr_p: Option<f32>,
+    /// Whether the pflda gate fired and replaced the OCR char.
+    pub pflda_replaced: bool,
 }
 
 /// Result of `identify_fonts`: ranked font scores + per-observation detail.
@@ -167,6 +175,10 @@ pub fn identify_fonts(
             ocr_corrected_from: None,
             best_alt_char: None,
             best_alt_dist: None,
+            pflda_top_char: None,
+            pflda_top_p: None,
+            pflda_ocr_p: None,
+            pflda_replaced: false,
         });
     }
 

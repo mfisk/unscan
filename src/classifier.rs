@@ -183,6 +183,10 @@ pub trait Classifier: Send + Sync {
     /// Feed a glyph's feature vector for a character into the classifier.
     /// Called once per (glyph_id, char) pair during index build.
     fn add_glyph(&mut self, _glyph_id: usize, _seq: &[char], _features: &CropFeatures) {}
+
+    /// Catalog hash baked into the model at training time, if available.
+    /// Used by load_or_train to detect stale weights when the font catalog changes.
+    fn catalog_hash(&self) -> Option<u64> { None }
 }
 
 /// Convert `(font_id, sq_dist)` pairs to `(font_id, prob)` pairs using a
@@ -283,134 +287,145 @@ pub struct NgramModel {
     pub catalog_hash: u64,
 }
 
+
+/// On-disk header for the indexed mmap binary format (32 bytes).
+#[repr(C)]
+#[derive(Clone, Copy, Debug)]
+struct IndexedHeader {
+    magic: [u8; 4],
+    version: u32,
+    catalog_hash: u64,
+    n_fonts: u32,
+    n_entries: u32,
+    index_off: u32,
+    data_off: u32,
+}
+
+/// Fixed fields of one index entry (28 bytes), written after the variable-
+/// length codepoint array.
+#[repr(C)]
+#[derive(Clone, Copy, Debug)]
+struct IndexedEntryFixed {
+    n_weights: u32,
+    weights_off: u32,
+    n_centroids: u32,
+    gids_off: u32,
+    vecs_off: u32,
+    vec_dim: u32,
+    sigma_sq_bits: u32,
+}
+
 impl NgramModel {
     pub fn new(catalog_hash: u64) -> Self {
         Self { entries: HashMap::new(), catalog_hash }
     }
 
-    /// Serialize to the unified per-char .bin format.
+    /// Serialize to the indexed mmap-friendly .bin format.
     ///
-    /// ```text
-    /// magic:         [u8; 4]       (caller-chosen, e.g. b"FISH")
-    /// version:       u32 le
-    /// catalog_hash:  u64 le
-    /// n_fonts:       u32 le
-    /// per font:      name_len: u32 le, name: [u8]
-    /// n_chars:       u32 le
-    /// per char:
-    ///   codepoint:   u32 le
-    ///   n_weights:   u32 le
-    ///   weights:     [f32; n_weights] le
-    ///   n_centroids: u32 le
-    ///   per centroid:
-    ///     font_id:   u32 le
-    ///     vec_len:   u32 le
-    ///     vec:       [f32; vec_len] le
-    ///   sigma_sq:    f32 le
-    /// ```
+    /// Version number has high bit set (0x8000_0000) to distinguish from
+    /// the legacy sequential format.  Data section is 4-byte aligned so
+    /// float arrays can be read as zero-copy slices from an mmap.
     pub fn write_bin(
         &self,
         w: &mut dyn std::io::Write,
         magic: &[u8; 4],
         version: u32,
     ) -> std::io::Result<()> {
-        w.write_all(magic)?;
-        w.write_all(&version.to_le_bytes())?;
-        w.write_all(&self.catalog_hash.to_le_bytes())?;
+        use std::io::Write;
+        let n_entries = self.entries.len();
 
-        // Per-entry models (seq_len stored per entry for mixed ngram lengths)
-        w.write_all(&(self.entries.len() as u32).to_le_bytes())?;
-        for (seq, model) in &self.entries {
-            w.write_all(&(seq.len() as u32).to_le_bytes())?;
-            for &c in seq {
-                w.write_all(&(c as u32).to_le_bytes())?;
-            }
-
-            // Weights
-            w.write_all(&(model.weights.len() as u32).to_le_bytes())?;
-            for &v in &model.weights { w.write_all(&v.to_le_bytes())?; }
-
-            // Centroids
-            w.write_all(&(model.centroids.len() as u32).to_le_bytes())?;
-            for (glyph_id, vec) in &model.centroids {
-                w.write_all(&glyph_id.to_le_bytes())?;
-                w.write_all(&(vec.len() as u32).to_le_bytes())?;
-                for &v in vec { w.write_all(&v.to_le_bytes())?; }
-            }
-
-            // σ²
-            w.write_all(&model.sigma_sq.to_le_bytes())?;
+        // Build data section: for each entry, pack weights, glyph_ids, centroid vecs
+        let mut data_buf: Vec<u8> = Vec::new();
+        struct EntryLayout {
+            seq: Vec<char>,
+            fixed: IndexedEntryFixed,
         }
+        let mut layouts: Vec<EntryLayout> = Vec::with_capacity(n_entries);
+
+        // Sort entries for deterministic output
+        let mut sorted_entries: Vec<_> = self.entries.iter().collect();
+        sorted_entries.sort_by_key(|(seq, _)| seq.clone());
+
+        for (seq, cm) in &sorted_entries {
+            let weights_off = data_buf.len();
+            for &wt in &cm.weights {
+                data_buf.extend_from_slice(&wt.to_le_bytes());
+            }
+            let gids_off = data_buf.len();
+            for &(gid, _) in &cm.centroids {
+                data_buf.extend_from_slice(&gid.to_le_bytes());
+            }
+            let vecs_off = data_buf.len();
+            let vec_dim = if cm.centroids.is_empty() { 0 }
+                          else { cm.centroids[0].1.len() };
+            for (_, v) in &cm.centroids {
+                debug_assert!(v.len() == vec_dim || cm.centroids.is_empty());
+                for &f in v {
+                    data_buf.extend_from_slice(&f.to_le_bytes());
+                }
+            }
+            layouts.push(EntryLayout {
+                seq: seq.to_vec(),
+                fixed: IndexedEntryFixed {
+                    n_weights: cm.weights.len() as u32,
+                    weights_off: weights_off as u32,
+                    n_centroids: cm.centroids.len() as u32,
+                    gids_off: gids_off as u32,
+                    vecs_off: vecs_off as u32,
+                    vec_dim: vec_dim as u32,
+                    sigma_sq_bits: cm.sigma_sq.to_bits(),
+                },
+            });
+        }
+
+        // Compute section offsets (no font names — empty font table)
+        let hdr_size = std::mem::size_of::<IndexedHeader>();
+        let entry_fixed_size = std::mem::size_of::<IndexedEntryFixed>();
+        let index_off = hdr_size; // no font section
+        let index_size: usize = layouts.iter()
+            .map(|l| 4 + l.seq.len() * 4 + entry_fixed_size)
+            .sum();
+        let data_off = (index_off + index_size + 3) & !3;
+
+        // Header
+        let hdr = IndexedHeader {
+            magic: *magic,
+            version: version | 0x8000_0000,
+            catalog_hash: self.catalog_hash,
+            n_fonts: 0,
+            n_entries: n_entries as u32,
+            index_off: index_off as u32,
+            data_off: data_off as u32,
+        };
+        w.write_all(unsafe {
+            std::slice::from_raw_parts(&hdr as *const _ as *const u8, hdr_size)
+        })?;
+
+        // Entry index
+        for layout in &layouts {
+            w.write_all(&(layout.seq.len() as u32).to_le_bytes())?;
+            for &ch in &layout.seq {
+                w.write_all(&(ch as u32).to_le_bytes())?;
+            }
+            w.write_all(unsafe {
+                std::slice::from_raw_parts(
+                    &layout.fixed as *const _ as *const u8, entry_fixed_size)
+            })?;
+        }
+
+        // Alignment padding before data section
+        let idx_end = index_off + index_size;
+        let data_pad = data_off - idx_end;
+        if data_pad > 0 {
+            w.write_all(&vec![0u8; data_pad])?;
+        }
+
+        // Data section
+        w.write_all(&data_buf)?;
         Ok(())
     }
 
-    /// Deserialize from the unified per-char .bin format.
-    /// Validates magic and catalog_hash.  Returns an error if magic doesn't
-    /// match `expected_magic` or if the catalog hash doesn't match
-    /// `expected_catalog_hash` (when Some).
-    pub fn read_bin(
-        data: &[u8],
-        expected_magic: &[u8; 4],
-        expected_catalog_hash: Option<u64>,
-    ) -> Result<Self, String> {
-        if data.len() < 16 {
-            return Err("file too small".into());
-        }
-        if &data[0..4] != expected_magic {
-            return Err(format!("bad magic (expected {:?}, got {:?})", expected_magic, &data[0..4]));
-        }
-        let _version = u32::from_le_bytes(data[4..8].try_into().unwrap());
-        let catalog_hash = u64::from_le_bytes(data[8..16].try_into().unwrap());
 
-        if let Some(expected) = expected_catalog_hash {
-            if catalog_hash != expected {
-                return Err(format!(
-                    "stale classifier: catalog_hash {catalog_hash:#x} != current {expected:#x}"
-                ));
-            }
-        }
-
-        let mut pos = 16;
-
-        // Per-entry models (seq_len stored per entry for mixed ngram lengths)
-        let n_entries = read_u32(data, &mut pos)? as usize;
-        let mut entries = HashMap::with_capacity(n_entries);
-        for _ in 0..n_entries {
-            let seq_len = read_u32(data, &mut pos)? as usize;
-            if seq_len == 0 || seq_len > 16 {
-                return Err(format!("invalid seq_len: {seq_len}"));
-            }
-            let mut seq = Vec::with_capacity(seq_len);
-            for _ in 0..seq_len {
-                let cp = read_u32(data, &mut pos)?;
-                seq.push(char::from_u32(cp)
-                    .ok_or_else(|| format!("invalid codepoint U+{cp:04X}"))?);
-            }
-
-            // Weights
-            let n_weights = read_u32(data, &mut pos)? as usize;
-            let weights = read_f32s(data, &mut pos, n_weights)?;
-
-            // Centroids
-            let n_centroids = read_u32(data, &mut pos)? as usize;
-            let mut centroids = Vec::with_capacity(n_centroids);
-            for _ in 0..n_centroids {
-                let glyph_id = read_u32(data, &mut pos)?;
-                let vec_len = read_u32(data, &mut pos)? as usize;
-                let vec = read_f32s(data, &mut pos, vec_len)?;
-                centroids.push((glyph_id, vec));
-            }
-
-            // σ²
-            if pos + 4 > data.len() { return Err("truncated sigma_sq".into()); }
-            let sigma_sq = f32::from_le_bytes(data[pos..pos + 4].try_into().unwrap());
-            pos += 4;
-
-            entries.insert(seq, ImageModel { weights, centroids, sigma_sq });
-        }
-
-        Ok(Self { entries, catalog_hash })
-    }
 }
 
 /// Read a u32 LE from `data` at `*pos`, advancing `*pos`.
@@ -451,34 +466,317 @@ pub trait Embedder: Send + Sync {
 
 /// Generic classifier that embeds features via an [`Embedder`] then searches
 /// pre-computed centroids stored in a [`NgramModel`].
+
+// ---------------------------------------------------------------------------
+// Memory-mapped model — zero-copy access to centroids via mmap
+// ---------------------------------------------------------------------------
+
+/// Index entry for one character in the mmap'd file.
+struct MmapEntryIndex {
+    weights_off: usize,   // byte offset to weights [f32; n_weights]
+    n_weights: usize,
+    glyph_ids_off: usize, // byte offset to [u32; n_centroids]
+    vecs_off: usize,      // byte offset to [f32; n_centroids * vec_dim]
+    n_centroids: usize,
+    vec_dim: usize,
+    sigma_sq: f32,
+}
+
+/// Zero-copy NgramModel backed by a memory-mapped indexed binary file.
+///
+/// File layout (all values little-endian, data section 4-byte aligned):
+/// ```text
+/// magic:          [u8; 4]
+/// version:        u32
+/// catalog_hash:   u64
+/// n_fonts:        u32
+/// n_entries:      u32
+/// index_off:      u32       — byte offset to entry index section
+/// data_off:       u32       — byte offset to data section
+///
+/// FONT NAMES (offset 32):
+///   per font: name_len: u32, name_bytes: [u8; name_len]
+///
+/// ENTRY INDEX (at index_off, 32 bytes per entry):
+///   seq_len:      u32
+///   codepoints:   [u32; seq_len]  — one u32 per character
+///   n_weights:    u32
+///   weights_off:  u32       — relative to data_off
+///   n_centroids:  u32
+///   gids_off:     u32       — relative to data_off
+///   vecs_off:     u32       — relative to data_off
+///   vec_dim:      u32       — unused padding / future multi-char
+///   sigma_sq_bits: u32      — f32 as u32 bits
+///   (entry size = 4 + seq_len*4 + 28 bytes)
+///
+/// DATA SECTION (at data_off, 4-byte aligned):
+///   [u32 glyph-id arrays and f32 weight/centroid arrays, contiguous]
+/// ```
+pub struct MmapNgramModel {
+    mmap: memmap2::Mmap,
+    _file: std::fs::File,
+    pub catalog_hash: u64,
+    entries: HashMap<Vec<char>, MmapEntryIndex>,
+    pub font_names: Vec<String>,
+}
+
+impl MmapNgramModel {
+    #[inline]
+    fn f32_slice(&self, off: usize, n: usize) -> &[f32] {
+        let end = off + n * 4;
+        debug_assert!(off % 4 == 0, "unaligned f32 read at offset {off}");
+        debug_assert!(end <= self.mmap.len(), "f32 slice out of bounds");
+        unsafe { std::slice::from_raw_parts(self.mmap.as_ptr().add(off) as *const f32, n) }
+    }
+
+    #[inline]
+    fn u32_slice(&self, off: usize, n: usize) -> &[u32] {
+        let end = off + n * 4;
+        debug_assert!(off % 4 == 0, "unaligned u32 read at offset {off}");
+        debug_assert!(end <= self.mmap.len(), "u32 slice out of bounds");
+        unsafe { std::slice::from_raw_parts(self.mmap.as_ptr().add(off) as *const u32, n) }
+    }
+
+    /// Probability of each font given a query vector, for the given char.
+    /// Returns None if the character is unknown.
+    pub fn probabilities(&self, seq: &[char], query: &[f32]) -> Option<Vec<(u32, f32)>> {
+        let e = self.entries.get(seq)?;
+        if e.n_centroids == 0 { return Some(Vec::new()); }
+        let gids = self.u32_slice(e.glyph_ids_off, e.n_centroids);
+        let mut dists: Vec<(u32, f32)> = Vec::with_capacity(e.n_centroids);
+        for i in 0..e.n_centroids {
+            let v = self.f32_slice(e.vecs_off + i * e.vec_dim * 4, e.vec_dim);
+            dists.push((gids[i], sq_euclid(query, v)));
+        }
+        let sigma = if e.sigma_sq > 1e-30 {
+            e.sigma_sq
+        } else {
+            let p = 1.0 / dists.len() as f32;
+            return Some(dists.into_iter().map(|(id, _)| (id, p)).collect());
+        };
+        let inv2s = 1.0 / (2.0 * sigma);
+        let min_d = dists.iter().map(|(_, d)| *d).fold(f32::INFINITY, f32::min);
+        let raw: Vec<f32> = dists.iter().map(|(_, d)| (-(d - min_d) * inv2s).exp()).collect();
+        let sum: f32 = raw.iter().sum();
+        let mut probs: Vec<(u32, f32)> = if sum < 1e-30 {
+            let p = 1.0 / dists.len() as f32;
+            dists.into_iter().map(|(id, _)| (id, p)).collect()
+        } else {
+            dists.iter().zip(raw.iter()).map(|((id, _), &r)| (*id, r / sum)).collect()
+        };
+        probs.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
+        Some(probs)
+    }
+
+    /// Top-k fonts by probability for a given char.
+    pub fn classify(&self, seq: &[char], query: &[f32], k: usize) -> Vec<(u32, f32)> {
+        match self.probabilities(seq, query) {
+            Some(mut probs) => { probs.truncate(k); probs }
+            None => Vec::new(),
+        }
+    }
+
+    /// Number of centroids (fonts) for a character.
+    pub fn glyph_count(&self, seq: &[char]) -> usize {
+        self.entries.get(seq).map_or(0, |e| e.n_centroids)
+    }
+
+    /// Glyph ID slice for a character (zero-copy from mmap).
+    fn glyph_ids(&self, seq: &[char]) -> &[u32] {
+        match self.entries.get(seq) {
+            Some(e) if e.n_centroids > 0 => self.u32_slice(e.glyph_ids_off, e.n_centroids),
+            _ => &[],
+        }
+    }
+
+    /// Centroid vector data for a character — flat f32 slice, n_centroids × vec_dim (zero-copy).
+    fn centroid_vecs(&self, seq: &[char]) -> &[f32] {
+        match self.entries.get(seq) {
+            Some(e) if e.n_centroids > 0 && e.vec_dim > 0 => {
+                self.f32_slice(e.vecs_off, e.n_centroids * e.vec_dim)
+            }
+            _ => &[],
+        }
+    }
+
+    /// All character sequences in the model.
+    pub fn entry_keys(&self) -> impl Iterator<Item = &Vec<char>> {
+        self.entries.keys()
+    }
+
+    /// Reconstruct an owned NgramModel from the mmap (for merge-and-rewrite).
+    pub fn to_owned_model(&self) -> NgramModel {
+        let mut entries = HashMap::with_capacity(self.entries.len());
+        for (seq, idx) in &self.entries {
+            let weights = self.weights(seq).map(|s| s.to_vec()).unwrap_or_default();
+            let mut centroids = Vec::with_capacity(idx.n_centroids);
+            let gids = self.glyph_ids(seq);
+            let vecs = self.centroid_vecs(seq);
+            for i in 0..idx.n_centroids {
+                let gid = gids[i];
+                let start = i * idx.vec_dim;
+                let end = start + idx.vec_dim;
+                centroids.push((gid, vecs[start..end].to_vec()));
+            }
+            entries.insert(seq.clone(), ImageModel { weights, centroids, sigma_sq: idx.sigma_sq });
+        }
+        NgramModel { entries, catalog_hash: self.catalog_hash }
+    }
+
+    /// Get the weights slice for a character (used by embedders at load time).
+    pub fn weights(&self, seq: &[char]) -> Option<&[f32]> {
+        let e = self.entries.get(seq)?;
+        Some(self.f32_slice(e.weights_off, e.n_weights))
+    }
+
+    /// Load an indexed mmap file.  Returns Err if format is wrong.
+    pub fn load_indexed(
+        path: &std::path::Path,
+        magic: &[u8; 4],
+    ) -> Result<Self, String> {
+        let file = std::fs::File::open(path)
+            .map_err(|e| format!("cannot open {}: {e}", path.display()))?;
+        let mmap = unsafe { memmap2::Mmap::map(&file) }
+            .map_err(|e| format!("cannot mmap {}: {e}", path.display()))?;
+        let data = &mmap[..];
+        let hdr_size = std::mem::size_of::<IndexedHeader>();
+        let entry_fixed_size = std::mem::size_of::<IndexedEntryFixed>();
+        if data.len() < hdr_size {
+            return Err("file too small for indexed header".into());
+        }
+        let hdr = unsafe { &*(data.as_ptr() as *const IndexedHeader) };
+        if &hdr.magic != magic {
+            return Err(format!("bad magic: expected {:?}, got {:?}", magic, hdr.magic));
+        }
+        if hdr.version & 0x8000_0000 == 0 {
+            return Err(format!("not an indexed file (version {})", hdr.version));
+        }
+        let n_fonts = hdr.n_fonts as usize;
+        let n_entries = hdr.n_entries as usize;
+        let index_off = hdr.index_off as usize;
+        let data_off = hdr.data_off as usize;
+
+        // Read font names
+        let mut pos = hdr_size;
+        let mut font_names = Vec::with_capacity(n_fonts);
+        for _ in 0..n_fonts {
+            if pos + 4 > data.len() { return Err("truncated font name".into()); }
+            let nlen = u32::from_le_bytes(data[pos..pos+4].try_into().unwrap()) as usize;
+            pos += 4;
+            if pos + nlen > data.len() { return Err("truncated font name data".into()); }
+            let name = String::from_utf8_lossy(&data[pos..pos+nlen]).into_owned();
+            pos += nlen;
+            font_names.push(name);
+        }
+
+        // Read entry index
+        let mut entries = HashMap::with_capacity(n_entries);
+        pos = index_off;
+        for _ in 0..n_entries {
+            if pos + 4 > data.len() { return Err("truncated entry index".into()); }
+            let seq_len = u32::from_le_bytes(data[pos..pos+4].try_into().unwrap()) as usize;
+            pos += 4;
+            let cp_bytes = seq_len * 4;
+            if pos + cp_bytes + entry_fixed_size > data.len() {
+                return Err("truncated entry index".into());
+            }
+            let mut seq = Vec::with_capacity(seq_len);
+            for _ in 0..seq_len {
+                let cp = u32::from_le_bytes(data[pos..pos+4].try_into().unwrap());
+                pos += 4;
+                seq.push(char::from_u32(cp).ok_or_else(|| format!("bad codepoint U+{cp:04X}"))?);
+            }
+            let ef = unsafe { &*(data.as_ptr().add(pos) as *const IndexedEntryFixed) };
+            pos += entry_fixed_size;
+
+            entries.insert(seq, MmapEntryIndex {
+                weights_off: data_off + ef.weights_off as usize,
+                n_weights: ef.n_weights as usize,
+                glyph_ids_off: data_off + ef.gids_off as usize,
+                vecs_off: data_off + ef.vecs_off as usize,
+                n_centroids: ef.n_centroids as usize,
+                vec_dim: ef.vec_dim as usize,
+                sigma_sq: f32::from_bits(ef.sigma_sq_bits),
+            });
+        }
+
+        Ok(MmapNgramModel { mmap, _file: file, catalog_hash: hdr.catalog_hash, entries, font_names })
+    }
+}
+
+
+
+/// Dispatches between owned NgramModel and zero-copy MmapNgramModel.
+pub enum CharModelStore {
+    Owned(NgramModel),
+    Mmap(MmapNgramModel),
+}
+
+impl CharModelStore {
+    pub fn probabilities(&self, seq: &[char], query: &[f32]) -> Vec<(u32, f32)> {
+        match self {
+            CharModelStore::Owned(m) => {
+                m.entries.get(seq).map_or_else(Vec::new, |cm| cm.probabilities(query))
+            }
+            CharModelStore::Mmap(m) => {
+                m.probabilities(seq, query).unwrap_or_default()
+            }
+        }
+    }
+
+    pub fn classify(&self, seq: &[char], query: &[f32], k: usize) -> Vec<(u32, f32)> {
+        match self {
+            CharModelStore::Owned(m) => {
+                m.entries.get(seq).map_or_else(Vec::new, |cm| cm.classify(query, k))
+            }
+            CharModelStore::Mmap(m) => {
+                m.classify(seq, query, k)
+            }
+        }
+    }
+
+    pub fn glyph_count(&self, seq: &[char]) -> usize {
+        match self {
+            CharModelStore::Owned(m) => m.entries.get(seq).map_or(0, |cm| cm.centroids.len()),
+            CharModelStore::Mmap(m) => m.glyph_count(seq),
+        }
+    }
+
+    /// Mutable access to the owned model for add_glyph.  Panics if mmap.
+    pub fn entries_mut(&mut self) -> &mut HashMap<Vec<char>, ImageModel> {
+        match self {
+            CharModelStore::Owned(m) => &mut m.entries,
+            CharModelStore::Mmap(_) => panic!("cannot mutate mmap model"),
+        }
+    }
+
+    pub fn catalog_hash(&self) -> u64 {
+        match self {
+            CharModelStore::Owned(m) => m.catalog_hash,
+            CharModelStore::Mmap(m) => m.catalog_hash,
+        }
+    }
+}
+
 pub struct EmbeddingClassifier {
-    model: NgramModel,
+    model: CharModelStore,
     embedder: Box<dyn Embedder>,
 }
 
 impl Classifier for EmbeddingClassifier {
     fn classify(&self, seq: &[char], query: &CropFeatures, k: usize) -> Vec<(usize, f32)> {
         let q = self.embedder.embed(seq, query);
-        if let Some(cm) = self.model.entries.get(seq) {
-            cm.classify(&q, k).into_iter().map(|(id, p)| (id as usize, p)).collect()
-        } else {
-            Vec::new()
-        }
+        self.model.classify(seq, &q, k).into_iter().map(|(id, p)| (id as usize, p)).collect()
     }
 
     fn probabilities(&self, seq: &[char], query: &CropFeatures) -> Vec<(usize, f32)> {
         let q = self.embedder.embed(seq, query);
-        if let Some(cm) = self.model.entries.get(seq) {
-            cm.probabilities(&q).into_iter().map(|(id, p)| (id as usize, p)).collect()
-        } else {
-            Vec::new()
-        }
+        self.model.probabilities(seq, &q).into_iter().map(|(id, p)| (id as usize, p)).collect()
     }
 
     fn probability(&self, seq: &[char], query: &CropFeatures, glyph_id: usize) -> Option<f32> {
         let q = self.embedder.embed(seq, query);
-        let cm = self.model.entries.get(seq)?;
-        let probs = cm.probabilities(&q);
+        let probs = self.model.probabilities(seq, &q);
         probs.into_iter()
             .find(|(id, _)| *id as usize == glyph_id)
             .map(|(_, p)| p)
@@ -489,17 +787,21 @@ impl Classifier for EmbeddingClassifier {
     }
 
     fn glyph_count(&self, seq: &[char]) -> usize {
-        self.model.entries.get(seq).map_or(0, |cm| cm.centroids.len())
+        self.model.glyph_count(seq)
     }
 
     fn add_glyph(&mut self, glyph_id: usize, seq: &[char], features: &CropFeatures) {
         let embedded = self.embedder.embed(seq, features);
-        let cm = self.model.entries.entry(seq.to_vec()).or_insert_with(|| ImageModel {
+        let cm = self.model.entries_mut().entry(seq.to_vec()).or_insert_with(|| ImageModel {
             weights: Vec::new(),
             centroids: Vec::new(),
             sigma_sq: 0.0,
         });
         cm.centroids.push((glyph_id as u32, embedded));
+    }
+
+    fn catalog_hash(&self) -> Option<u64> {
+        Some(self.model.catalog_hash())
     }
 }
 
@@ -576,9 +878,9 @@ impl TripletClassifier {
                 .map_err(|e| format!("cannot read {}: {e}", path.display()))?;
             if data.len() < 8 { true }
             else {
-                let version = u32::from_le_bytes(data[4..8].try_into().unwrap());
-                if version < 3 {
-                    eprintln!("Triplet weights {} are v{version}, retraining as v3...", path.display());
+                let version = u32::from_le_bytes(data[4..8].try_into().unwrap()) & 0x7FFF_FFFF;
+                if version != 3 {
+                    eprintln!("Triplet weights {} are v{version}, need v3 — retraining...", path.display());
                     true
                 } else if let Some(c) = ctx {
                     let file_hash = u64::from_le_bytes(data[8..16].try_into().unwrap());
@@ -595,25 +897,25 @@ impl TripletClassifier {
             Self::train(ctx, path);
         }
 
-        let data = std::fs::read(path)
-            .map_err(|e| format!("cannot read {}: {e}", path.display()))?;
-        let model = NgramModel::read_bin(&data, b"TRIP", None)?;
+        let mmap_model = MmapNgramModel::load_indexed(path, b"TRIP")?;
 
-        let mut nets = HashMap::with_capacity(model.entries.len());
-        for (seq, cm) in &model.entries {
-            if cm.weights.len() != PARAMS_PER_CHAR {
+        let mut nets = HashMap::new();
+        for seq in mmap_model.entry_keys().cloned().collect::<Vec<_>>() {
+            let w = mmap_model.weights(&seq)
+                .ok_or_else(|| format!("Triplet seq '{:?}': no weights", seq))?;
+            if w.len() != PARAMS_PER_CHAR {
                 return Err(format!(
                     "Triplet seq '{:?}': expected {} params, got {}",
-                    seq, PARAMS_PER_CHAR, cm.weights.len()
+                    seq, PARAMS_PER_CHAR, w.len()
                 ));
             }
             let mut pos = 0usize;
-            let fc1_w = cm.weights[pos..pos + L1_IN * L1_OUT].to_vec(); pos += L1_IN * L1_OUT;
-            let fc1_b = cm.weights[pos..pos + L1_OUT].to_vec(); pos += L1_OUT;
-            let fc2_w = cm.weights[pos..pos + L1_OUT * L2_OUT].to_vec(); pos += L1_OUT * L2_OUT;
-            let fc2_b = cm.weights[pos..pos + L2_OUT].to_vec(); pos += L2_OUT;
-            let fc3_w = cm.weights[pos..pos + L2_OUT * L3_OUT].to_vec(); pos += L2_OUT * L3_OUT;
-            let fc3_b = cm.weights[pos..pos + L3_OUT].to_vec();
+            let fc1_w = w[pos..pos + L1_IN * L1_OUT].to_vec(); pos += L1_IN * L1_OUT;
+            let fc1_b = w[pos..pos + L1_OUT].to_vec(); pos += L1_OUT;
+            let fc2_w = w[pos..pos + L1_OUT * L2_OUT].to_vec(); pos += L1_OUT * L2_OUT;
+            let fc2_b = w[pos..pos + L2_OUT].to_vec(); pos += L2_OUT;
+            let fc3_w = w[pos..pos + L2_OUT * L3_OUT].to_vec(); pos += L2_OUT * L3_OUT;
+            let fc3_b = w[pos..pos + L3_OUT].to_vec();
 
             let net = GlyphNet {
                 fc1: InferenceLinear { rows: L1_IN, cols: L1_OUT, w: fc1_w, b: fc1_b },
@@ -624,7 +926,7 @@ impl TripletClassifier {
         }
 
         let embedder = Self { nets };
-        Ok(EmbeddingClassifier { model, embedder: Box::new(embedder) })
+        Ok(EmbeddingClassifier { model: CharModelStore::Mmap(mmap_model), embedder: Box::new(embedder) })
     }
 
     fn embed(&self, seq: &[char], features: &CropFeatures) -> Vec<f32> {
@@ -658,12 +960,12 @@ impl TripletClassifier {
         use rand::rngs::SmallRng;
         use crate::train::{TrainableNet, dist_sq};
 
-        let chars = ctx.chars;
+        let sequences = ctx.sequences;
         eprintln!("\nTriplet training {} characters (epochs={}, lr={}, margin={})...",
-            chars.len(), epochs, lr, margin);
+            sequences.len(), epochs, lr, margin);
 
         let train_start = std::time::Instant::now();
-        let mut trained_chars: Vec<(char, TrainableNet)> = Vec::new();
+        let mut trained_seqs: Vec<(Vec<char>, TrainableNet)> = Vec::new();
         let mut skipped = 0usize;
         let mut total_rr_sum = 0.0f64;
         let mut total_top1 = 0usize;
@@ -671,18 +973,18 @@ impl TripletClassifier {
         let mut total_eval = 0usize;
 
         // Collect per-char samples for centroid computation after training
-        let mut per_char_samples: Vec<(char, Vec<crate::train::TrainingSample>)> = Vec::new();
+        let mut per_seq_samples: Vec<(Vec<char>, Vec<crate::train::TrainingSample>)> = Vec::new();
 
-        for (ci, &c) in chars.iter().enumerate() {
-            if ctx.char_counts[ci] == 0 { skipped += 1; continue; }
-            let samples = ctx.load_samples(ci);
+        for (si, seq) in sequences.iter().enumerate() {
+            if ctx.seq_counts[si] == 0 { skipped += 1; continue; }
+            let samples = ctx.load_samples(si);
 
             let mut font_set: Vec<u32> = samples.iter().map(|s| s.glyph_id).collect();
             font_set.sort_unstable();
             font_set.dedup();
             if font_set.len() < ctx.min_fonts.max(2) { skipped += 1; continue; }
 
-            let mut rng = SmallRng::seed_from_u64(c as u64);
+            let mut rng = SmallRng::seed_from_u64(si as u64);
             let mut net = TrainableNet::new(&mut rng);
 
             let mut font_samples: HashMap<u32, Vec<usize>> = HashMap::new();
@@ -747,17 +1049,17 @@ impl TripletClassifier {
 
                 if (epoch + 1) % 10 == 0 || epoch == 0 {
                     let avg_loss = if n_triplets > 0 { epoch_loss / n_triplets as f32 } else { 0.0 };
-                    if ci < 5 || ci == chars.len() - 1 {
-                        eprintln!("  char '{}' epoch {}/{}: loss={:.4} ({} active triplets)",
-                            c, epoch + 1, epochs, avg_loss, n_triplets);
+                    if si < 5 || si == sequences.len() - 1 {
+                        eprintln!("  seq {:?} epoch {}/{}: loss={:.4} ({} active triplets)",
+                            seq, epoch + 1, epochs, avg_loss, n_triplets);
                     }
                 }
             }
 
-            trained_chars.push((c, net));
+            trained_seqs.push((seq.clone(), net));
 
             // Retrieval quality: MRR via nearest-centroid
-            if let Some((_, ref trained_net)) = trained_chars.last() {
+            if let Some((_, ref trained_net)) = trained_seqs.last() {
                 let embeddings: Vec<Vec<f32>> = samples.iter()
                     .map(|s| trained_net.forward(&s.features).out)
                     .collect();
@@ -783,7 +1085,7 @@ impl TripletClassifier {
                 let eval_indices: Vec<usize> = if n <= max_eval {
                     (0..n).collect()
                 } else {
-                    let mut rng2 = SmallRng::seed_from_u64(c as u64 + 0x1234);
+                    let mut rng2 = SmallRng::seed_from_u64(si as u64 + 0x1234);
                     let mut idx: Vec<usize> = (0..n).collect();
                     idx.shuffle(&mut rng2);
                     idx.truncate(max_eval);
@@ -814,30 +1116,30 @@ impl TripletClassifier {
                 total_top5 += char_top5;
                 total_eval += n_eval;
 
-                if ci < 5 || ci == chars.len() - 1 || (ci + 1) % 20 == 0 {
-                    eprintln!("  char '{}' MRR={:.3} top1={:.1}% top5={:.1}% (n={})",
-                        c, mrr,
+                if si < 5 || si == sequences.len() - 1 || (si + 1) % 20 == 0 {
+                    eprintln!("  seq {:?} MRR={:.3} top1={:.1}% top5={:.1}% (n={})",
+                        seq, mrr,
                         char_top1 as f64 / n_eval as f64 * 100.0,
                         char_top5 as f64 / n_eval as f64 * 100.0,
                         n_eval);
                 }
             }
 
-            per_char_samples.push((c, samples));
+            per_seq_samples.push((seq.clone(), samples));
         }
 
         let train_elapsed = train_start.elapsed();
         let mrr = if total_eval > 0 { total_rr_sum / total_eval as f64 } else { 0.0 };
         let top1 = if total_eval > 0 { total_top1 as f64 / total_eval as f64 * 100.0 } else { 0.0 };
         let top5 = if total_eval > 0 { total_top5 as f64 / total_eval as f64 * 100.0 } else { 0.0 };
-        eprintln!("\nTriplet complete: {} chars, {} skipped, {:.1}s",
-            trained_chars.len(), skipped, train_elapsed.as_secs_f64());
+        eprintln!("\nTriplet complete: {} seqs, {} skipped, {:.1}s",
+            trained_seqs.len(), skipped, train_elapsed.as_secs_f64());
         eprintln!("  MRR={:.3} top1={:.1}% top5={:.1}% (n={})", mrr, top1, top5, total_eval);
 
         // Write TRIP v3 binary (per-char model: weights + centroids + σ²)
         if let Some(parent) = output.parent() { let _ = std::fs::create_dir_all(parent); }
         let mut model = NgramModel::new(ctx.catalog_hash);
-        for (tc_idx, (c, net)) in trained_chars.iter().enumerate() {
+        for (tc_idx, (seq, net)) in trained_seqs.iter().enumerate() {
             // Flatten net params into weights blob
             let mut weights = Vec::with_capacity(PARAMS_PER_CHAR);
             weights.extend_from_slice(&net.fc1.w);
@@ -848,7 +1150,7 @@ impl TripletClassifier {
             weights.extend_from_slice(&net.fc3.b);
 
             // Build centroids: embed each sample, average per font
-            let samples = &per_char_samples[tc_idx].1;
+            let samples = &per_seq_samples[tc_idx].1;
             let mut sums: HashMap<u32, Vec<f32>> = HashMap::new();
             let mut counts: HashMap<u32, usize> = HashMap::new();
             for s in samples {
@@ -865,12 +1167,15 @@ impl TripletClassifier {
             }
             let mut cm = ImageModel { weights, centroids, sigma_sq: 0.0 };
             cm.compute_sigma_sq();
-            model.entries.insert(vec![*c], cm);
+            model.entries.insert(seq.clone(), cm);
         }
-        let f = std::fs::File::create(output).expect("create output file");
+        let tmp = crate::atomic_file::tmp_for(output);
+        let f = std::fs::File::create(&tmp).expect("create output file");
         let mut w = BufWriter::new(f);
         model.write_bin(&mut w, b"TRIP", 3).expect("write TRIP v3");
         w.flush().unwrap();
+        drop(w);
+        std::fs::rename(&tmp, output).expect("atomic rename");
 
         let file_size = std::fs::metadata(output).map(|m| m.len()).unwrap_or(0);
         eprintln!("  Weights: {} ({:.1} MB, {} fonts indexed)",
@@ -929,9 +1234,9 @@ impl PerCharFisherClassifier {
                 .map_err(|e| format!("cannot read {}: {e}", path.display()))?;
             if data.len() < 8 { true }
             else {
-                let version = u32::from_le_bytes(data[4..8].try_into().unwrap());
-                if version < 3 {
-                    eprintln!("Fisher weights {} are v{version}, retraining as v3...", path.display());
+                let version = u32::from_le_bytes(data[4..8].try_into().unwrap()) & 0x7FFF_FFFF;
+                if version != 3 {
+                    eprintln!("Fisher weights {} are v{version}, need v3 — retraining...", path.display());
                     true
                 } else if let Some(c) = ctx {
                     let file_hash = u64::from_le_bytes(data[8..16].try_into().unwrap());
@@ -948,16 +1253,16 @@ impl PerCharFisherClassifier {
             Self::train(ctx, path);
         }
 
-        let data = std::fs::read(path)
-            .map_err(|e| format!("cannot read {}: {e}", path.display()))?;
-        let model = NgramModel::read_bin(&data, b"FISH", None)?;
+        let mmap_model = MmapNgramModel::load_indexed(path, b"FISH")?;
 
         // Extract normalized embedder weights from the model
-        let mut weights = HashMap::with_capacity(model.entries.len());
-        for (seq, cm) in &model.entries {
+        let mut weights = HashMap::new();
+        for seq in mmap_model.entry_keys().cloned().collect::<Vec<_>>() {
+            let wt = mmap_model.weights(&seq)
+                .ok_or_else(|| format!("Fisher seq '{:?}': no weights", seq))?;
             let mut w = [0.0f32; FEAT_LEN];
-            let n = cm.weights.len().min(FEAT_LEN);
-            w[..n].copy_from_slice(&cm.weights[..n]);
+            let n = wt.len().min(FEAT_LEN);
+            w[..n].copy_from_slice(&wt[..n]);
 
             let max_finite = w.iter().filter(|v| v.is_finite()).copied()
                 .fold(0.0f32, f32::max);
@@ -972,7 +1277,7 @@ impl PerCharFisherClassifier {
         }
 
         let embedder = Self { weights };
-        Ok(EmbeddingClassifier { model, embedder: Box::new(embedder) })
+        Ok(EmbeddingClassifier { model: CharModelStore::Mmap(mmap_model), embedder: Box::new(embedder) })
     }
 
     fn embed(&self, seq: &[char], features: &CropFeatures) -> Vec<f32> {
@@ -1007,16 +1312,16 @@ impl PerCharFisherClassifier {
     ) {
         use std::io::{BufWriter, Write};
 
-        let chars = ctx.chars;
-        eprintln!("\nFisher scoring {} characters...", chars.len());
+        let sequences = ctx.sequences;
+        eprintln!("\nFisher scoring {} characters...", sequences.len());
         let fisher_start = std::time::Instant::now();
-        let mut fisher_chars: Vec<(char, [f32; FEAT_LEN], HashMap<u32, Vec<f64>>)> = Vec::new();
+        let mut fisher_seqs: Vec<(Vec<char>, [f32; FEAT_LEN], HashMap<u32, Vec<f64>>)> = Vec::new();
         let mut skipped = 0usize;
         let mut total_stats = crate::train::RankStats::default();
 
-        for (ci, &c) in chars.iter().enumerate() {
-            if ctx.char_counts[ci] == 0 { skipped += 1; continue; }
-            let samples = ctx.load_samples(ci);
+        for (si, seq) in sequences.iter().enumerate() {
+            if ctx.seq_counts[si] == 0 { skipped += 1; continue; }
+            let samples = ctx.load_samples(si);
 
             let mut font_indices: HashMap<u32, Vec<usize>> = HashMap::new();
             for (i, s) in samples.iter().enumerate() {
@@ -1082,7 +1387,7 @@ impl PerCharFisherClassifier {
             }
 
             // Evaluate
-            let eval_indices = crate::train::subsample_eval(n, 2000, c);
+            let eval_indices = crate::train::subsample_eval(n, 2000, si as u64);
             let centroid_fids: Vec<u32> = class_means.keys().copied().collect();
             let centroid_feats: Vec<&Vec<f64>> = centroid_fids.iter()
                 .map(|fid| &class_means[fid])
@@ -1090,7 +1395,7 @@ impl PerCharFisherClassifier {
 
             let char_stats = crate::train::eval_mrr(
                 &samples, &eval_indices, &class_means, &centroid_fids,
-                &ctx.glyph_family_for_char(c),
+                &ctx.glyph_family_for_seq(seq),
                 &|i| {
                     centroid_fids.iter().enumerate().map(|(ci2, &fid)| {
                         let mut d = 0.0f64;
@@ -1103,20 +1408,20 @@ impl PerCharFisherClassifier {
                 },
             );
 
-            if ci < 5 || ci == chars.len() - 1 || (ci + 1) % 20 == 0 {
-                eprintln!("  char '{}' base={:.3} | strict={:.3} t1={:.1}% | family={:.3} t1={:.1}%",
-                    c, char_stats.base_mrr(), char_stats.strict_mrr(),
+            if si < 5 || si == sequences.len() - 1 || (si + 1) % 20 == 0 {
+                eprintln!("  seq {:?} base={:.3} | strict={:.3} t1={:.1}% | family={:.3} t1={:.1}%",
+                    seq, char_stats.base_mrr(), char_stats.strict_mrr(),
                     char_stats.strict_top1_pct(), char_stats.family_mrr(),
                     char_stats.family_top1_pct());
             }
 
             total_stats.accumulate(&char_stats);
-            fisher_chars.push((c, scores, class_means));
+            fisher_seqs.push((seq.clone(), scores, class_means));
         }
 
         let fisher_elapsed = fisher_start.elapsed();
-        eprintln!("\nFisher scoring complete: {} chars, {} skipped, {:.1}s",
-            fisher_chars.len(), skipped, fisher_elapsed.as_secs_f64());
+        eprintln!("\nFisher scoring complete: {} seqs, {} skipped, {:.1}s",
+            fisher_seqs.len(), skipped, fisher_elapsed.as_secs_f64());
         eprintln!("  Baseline:      MRR={:.3} top1={:.1}%", total_stats.base_mrr(), total_stats.base_top1_pct());
         eprintln!("  Fisher strict: MRR={:.3} top1={:.1}% top5={:.1}%",
             total_stats.strict_mrr(), total_stats.strict_top1_pct(), total_stats.strict_top5_pct());
@@ -1128,7 +1433,7 @@ impl PerCharFisherClassifier {
             let _ = std::fs::create_dir_all(parent);
         }
         let mut model = NgramModel::new(ctx.catalog_hash);
-        for (c, scores, class_means) in &fisher_chars {
+        for (seq, scores, class_means) in &fisher_seqs {
             let nw = Self::normalize_scores(scores);
             let mut centroids: Vec<(u32, Vec<f32>)> = Vec::with_capacity(class_means.len());
             for (&fid, mean) in class_means {
@@ -1143,12 +1448,15 @@ impl PerCharFisherClassifier {
                 sigma_sq: 0.0,
             };
             cm.compute_sigma_sq();
-            model.entries.insert(vec![*c], cm);
+            model.entries.insert(seq.clone(), cm);
         }
-        let f = std::fs::File::create(output).expect("create output file");
+        let tmp = crate::atomic_file::tmp_for(output);
+        let f = std::fs::File::create(&tmp).expect("create output file");
         let mut w = BufWriter::new(f);
         model.write_bin(&mut w, b"FISH", 3).expect("write FISH v3");
         w.flush().unwrap();
+        drop(w);
+        std::fs::rename(&tmp, output).expect("atomic rename");
 
         let file_size = std::fs::metadata(output).map(|m| m.len()).unwrap_or(0);
         eprintln!("  Weights: {} ({:.1} KB, {} fonts indexed)",
@@ -1203,9 +1511,9 @@ impl MahalanobisClassifier {
                 .map_err(|e| format!("cannot read {}: {e}", path.display()))?;
             if data.len() < 8 { true }
             else {
-                let version = u32::from_le_bytes(data[4..8].try_into().unwrap());
-                if version < 3 {
-                    eprintln!("Mahalanobis weights {} are v{version}, retraining as v3...", path.display());
+                let version = u32::from_le_bytes(data[4..8].try_into().unwrap()) & 0x7FFF_FFFF;
+                if version != 3 {
+                    eprintln!("Mahalanobis weights {} are v{version}, need v3 — retraining...", path.display());
                     true
                 } else if let Some(c) = ctx {
                     let file_hash = u64::from_le_bytes(data[8..16].try_into().unwrap());
@@ -1222,17 +1530,17 @@ impl MahalanobisClassifier {
             Self::train(ctx, path);
         }
 
-        let data = std::fs::read(path)
-            .map_err(|e| format!("cannot read {}: {e}", path.display()))?;
-        let model = NgramModel::read_bin(&data, b"MAHA", None)?;
+        let mmap_model = MmapNgramModel::load_indexed(path, b"MAHA")?;
 
-        let mut transforms = HashMap::with_capacity(model.entries.len());
-        for (seq, cm) in &model.entries {
-            transforms.insert(seq.clone(), cm.weights.clone());
+        let mut transforms = HashMap::new();
+        for seq in mmap_model.entry_keys().cloned().collect::<Vec<_>>() {
+            let w = mmap_model.weights(&seq)
+                .ok_or_else(|| format!("Mahalanobis seq '{:?}': no weights", seq))?;
+            transforms.insert(seq.clone(), w.to_vec());
         }
 
         let embedder = Self { transforms };
-        Ok(EmbeddingClassifier { model, embedder: Box::new(embedder) })
+        Ok(EmbeddingClassifier { model: CharModelStore::Mmap(mmap_model), embedder: Box::new(embedder) })
     }
 
     /// Apply L_inv transform: y = L_inv * x  (square FEAT_LEN×FEAT_LEN matrix multiply)
@@ -1259,16 +1567,16 @@ impl MahalanobisClassifier {
         use rand::prelude::*;
         use rand::rngs::SmallRng;
 
-        let chars = ctx.chars;
-        eprintln!("\nMahalanobis training {} characters...", chars.len());
+        let sequences = ctx.sequences;
+        eprintln!("\nMahalanobis training {} characters...", sequences.len());
         let maha_start = std::time::Instant::now();
-        let mut maha_chars: Vec<(char, Vec<f32>, HashMap<u32, Vec<f64>>)> = Vec::new();
+        let mut maha_seqs: Vec<(Vec<char>, Vec<f32>, HashMap<u32, Vec<f64>>)> = Vec::new();
         let mut skipped = 0usize;
         let mut total_stats = crate::train::RankStats::default();
 
-        for (ci, &c) in chars.iter().enumerate() {
-            if ctx.char_counts[ci] == 0 { skipped += 1; continue; }
-            let samples = ctx.load_samples(ci);
+        for (si, seq) in sequences.iter().enumerate() {
+            if ctx.seq_counts[si] == 0 { skipped += 1; continue; }
+            let samples = ctx.load_samples(si);
 
             let mut font_indices: HashMap<u32, Vec<usize>> = HashMap::new();
             for (i, s) in samples.iter().enumerate() {
@@ -1334,7 +1642,7 @@ impl MahalanobisClassifier {
                 if !chol_ok { break; }
             }
             if !chol_ok {
-                eprintln!("  char '{}' Cholesky failed, skipping", c);
+                eprintln!("  seq {:?} Cholesky failed, skipping", seq);
                 skipped += 1;
                 continue;
             }
@@ -1352,7 +1660,7 @@ impl MahalanobisClassifier {
             // Scale calibration
             let target_dist = 0.03f64;
             let mut within_dists: Vec<f64> = Vec::new();
-            let mut rng_cal = SmallRng::seed_from_u64(c as u64 + 9999);
+            let mut rng_cal = SmallRng::seed_from_u64(si as u64 + 9999);
             for (&_fid, indices) in &font_indices {
                 if indices.len() < 2 { continue; }
                 let npairs = 5.min(indices.len() * (indices.len() - 1) / 2);
@@ -1386,7 +1694,7 @@ impl MahalanobisClassifier {
             let linv_f32: Vec<f32> = linv.iter().map(|&v| v as f32).collect();
 
             // Evaluate MRR
-            let eval_indices = crate::train::subsample_eval(n, 2000, c);
+            let eval_indices = crate::train::subsample_eval(n, 2000, si as u64);
             let centroid_fids: Vec<u32> = class_means.keys().copied().collect();
             let centroid_embeds: Vec<Vec<f64>> = centroid_fids.iter().map(|fid| {
                 let cm = &class_means[fid];
@@ -1401,7 +1709,7 @@ impl MahalanobisClassifier {
 
             let char_stats = crate::train::eval_mrr(
                 &samples, &eval_indices, &class_means, &centroid_fids,
-                &ctx.glyph_family_for_char(c),
+                &ctx.glyph_family_for_seq(seq),
                 &|i| {
                     let mut emb = vec![0.0f64; FEAT_LEN];
                     for a in 0..FEAT_LEN {
@@ -1422,19 +1730,19 @@ impl MahalanobisClassifier {
                 },
             );
 
-            if ci < 5 || ci == chars.len() - 1 || (ci + 1) % 20 == 0 {
-                eprintln!("  char '{}' base={:.3} | strict={:.3} t1={:.1}% | family={:.3} t1={:.1}%",
-                    c, char_stats.base_mrr(), char_stats.strict_mrr(),
+            if si < 5 || si == sequences.len() - 1 || (si + 1) % 20 == 0 {
+                eprintln!("  seq {:?} base={:.3} | strict={:.3} t1={:.1}% | family={:.3} t1={:.1}%",
+                    seq, char_stats.base_mrr(), char_stats.strict_mrr(),
                     char_stats.strict_top1_pct(), char_stats.family_mrr(),
                     char_stats.family_top1_pct());
             }
             total_stats.accumulate(&char_stats);
-            maha_chars.push((c, linv_f32, class_means));
+            maha_seqs.push((seq.clone(), linv_f32, class_means));
         }
 
         let maha_elapsed = maha_start.elapsed();
-        eprintln!("\nMahalanobis complete: {} chars, {} skipped, {:.1}s",
-            maha_chars.len(), skipped, maha_elapsed.as_secs_f64());
+        eprintln!("\nMahalanobis complete: {} seqs, {} skipped, {:.1}s",
+            maha_seqs.len(), skipped, maha_elapsed.as_secs_f64());
         eprintln!("  Baseline:    MRR={:.3} top1={:.1}%", total_stats.base_mrr(), total_stats.base_top1_pct());
         eprintln!("  Maha strict: MRR={:.3} top1={:.1}% top5={:.1}%",
             total_stats.strict_mrr(), total_stats.strict_top1_pct(), total_stats.strict_top5_pct());
@@ -1444,7 +1752,7 @@ impl MahalanobisClassifier {
         // Write MAHA v3 binary (per-char model: weights + centroids + σ²)
         if let Some(parent) = output.parent() { let _ = std::fs::create_dir_all(parent); }
         let mut model = NgramModel::new(ctx.catalog_hash);
-        for (c, linv, class_means) in &maha_chars {
+        for (seq, linv, class_means) in &maha_seqs {
             let mut centroids: Vec<(u32, Vec<f32>)> = Vec::with_capacity(class_means.len());
             for (&fid, mean) in class_means {
                 let mut embedded = vec![0.0f32; FEAT_LEN];
@@ -1461,12 +1769,15 @@ impl MahalanobisClassifier {
                 sigma_sq: 0.0,
             };
             cm.compute_sigma_sq();
-            model.entries.insert(vec![*c], cm);
+            model.entries.insert(seq.clone(), cm);
         }
-        let f = std::fs::File::create(output).expect("create output file");
+        let tmp = crate::atomic_file::tmp_for(output);
+        let f = std::fs::File::create(&tmp).expect("create output file");
         let mut w = BufWriter::new(f);
         model.write_bin(&mut w, b"MAHA", 3).expect("write MAHA v3");
         w.flush().unwrap();
+        drop(w);
+        std::fs::rename(&tmp, output).expect("atomic rename");
 
         let file_size = std::fs::metadata(output).map(|m| m.len()).unwrap_or(0);
         eprintln!("  Weights: {} ({:.1} MB, {} fonts indexed)",
@@ -1517,16 +1828,19 @@ impl LdaClassifier {
         let need_train = if !path.exists() {
             true
         } else {
-            let data = std::fs::read(path)
-                .map_err(|e| format!("cannot read {}: {e}", path.display()))?;
-            if data.len() < 8 { true }
+            use std::io::Read;
+            let mut hdr = [0u8; 16];
+            let ok = std::fs::File::open(path)
+                .and_then(|mut f| f.read_exact(&mut hdr).map(|_| ()));
+            if ok.is_err() { true }
             else {
-                let version = u32::from_le_bytes(data[4..8].try_into().unwrap());
-                if version < 4 {
-                    eprintln!("LDA weights {} are v{version}, retraining as v4...", path.display());
+                let version = u32::from_le_bytes(hdr[4..8].try_into().unwrap());
+                let base_ver = version & 0x7FFF_FFFF;
+                if base_ver != 4 {
+                    eprintln!("LDA weights {} are v{base_ver}, need v4 — retraining...", path.display());
                     true
                 } else if let Some(c) = ctx {
-                    let file_hash = u64::from_le_bytes(data[8..16].try_into().unwrap());
+                    let file_hash = u64::from_le_bytes(hdr[8..16].try_into().unwrap());
                     if file_hash != c.catalog_hash {
                         eprintln!("LDA weights {} stale (catalog changed), retraining...", path.display());
                         true
@@ -1540,19 +1854,21 @@ impl LdaClassifier {
             Self::train(ctx, path);
         }
 
-        let data = std::fs::read(path)
-            .map_err(|e| format!("cannot read {}: {e}", path.display()))?;
-        let model = NgramModel::read_bin(&data, b"LDAC", None)?;
+        let mmap_model = MmapNgramModel::load_indexed(path, b"LDAC")?;
 
-        // Extract LDA projections from the model
-        let mut projections = HashMap::with_capacity(model.entries.len());
+        // Extract LDA projections from the mmap model
+        let mut projections = HashMap::new();
+        // Collect keys first to avoid borrow issues
+        let keys: Vec<Vec<char>> = mmap_model.entry_keys().cloned().collect();
 
-        for (seq, cm) in &model.entries {
-            if cm.weights.is_empty() {
+        for seq in &keys {
+            let w = mmap_model.weights(seq)
+                .ok_or_else(|| format!("LDA seq '{:?}': no weights", seq))?;
+            if w.is_empty() {
                 return Err(format!("LDA seq '{:?}': empty weights", seq));
             }
-            let out_dim = cm.weights[0] as usize;
-            let proj = cm.weights[1..].to_vec();
+            let out_dim = w[0] as usize;
+            let proj = w[1..].to_vec();
             if proj.len() != out_dim * FEAT_LEN {
                 return Err(format!(
                     "LDA seq '{:?}': proj len {} != {} × {} = {}",
@@ -1563,7 +1879,7 @@ impl LdaClassifier {
         }
 
         let embedder = Self { projections };
-        Ok(EmbeddingClassifier { model, embedder: Box::new(embedder) })
+        Ok(EmbeddingClassifier { model: CharModelStore::Mmap(mmap_model), embedder: Box::new(embedder) })
     }
 
     fn project(out_dim: usize, proj: &[f32], x: &[f32]) -> Vec<f32> {
@@ -1598,17 +1914,17 @@ impl LdaClassifier {
         use rand::prelude::*;
         use rand::rngs::SmallRng;
 
-        let chars = ctx.chars;
+        let sequences = ctx.sequences;
         let out_dim = lda_dims.min(FEAT_LEN - 1);
-        eprintln!("\nLDA training {} characters (target dim={})...", chars.len(), out_dim);
+        eprintln!("\nLDA training {} characters (target dim={})...", sequences.len(), out_dim);
         let lda_start = std::time::Instant::now();
-        let mut lda_chars: Vec<(char, usize, Vec<f32>, f32, HashMap<u32, Vec<f64>>)> = Vec::new();
+        let mut lda_chars: Vec<(Vec<char>, usize, Vec<f32>, f32, HashMap<u32, Vec<f64>>)> = Vec::new();
         let mut skipped = 0usize;
         let mut total_stats = crate::train::RankStats::default();
 
-        for (ci, &c) in chars.iter().enumerate() {
-            if ctx.char_counts[ci] == 0 { skipped += 1; continue; }
-            let samples = ctx.load_samples(ci);
+        for (si, seq) in sequences.iter().enumerate() {
+            if ctx.seq_counts[si] == 0 { skipped += 1; continue; }
+            let samples = ctx.load_samples(si);
 
             let mut font_indices: HashMap<u32, Vec<usize>> = HashMap::new();
             for (i, s) in samples.iter().enumerate() {
@@ -1736,7 +2052,7 @@ impl LdaClassifier {
             // Scale calibration
             let target_dist = 0.03f64;
             let mut within_dists: Vec<f64> = Vec::new();
-            let mut rng_cal = SmallRng::seed_from_u64(c as u64 + 9999);
+            let mut rng_cal = SmallRng::seed_from_u64(si as u64 + 9999);
             for (&_fid, indices) in &font_indices {
                 if indices.len() < 2 { continue; }
                 let npairs = 5.min(indices.len() * (indices.len() - 1) / 2);
@@ -1770,7 +2086,7 @@ impl LdaClassifier {
             let proj_f32: Vec<f32> = proj.iter().map(|&v| v as f32).collect();
 
             // Evaluate MRR
-            let eval_indices = crate::train::subsample_eval(n, 2000, c);
+            let eval_indices = crate::train::subsample_eval(n, 2000, si as u64);
             let centroid_embeds: Vec<Vec<f64>> = centroid_fids.iter().map(|fid| {
                 let cm = &class_means[fid];
                 let mut emb = vec![0.0f64; actual_dim];
@@ -1803,7 +2119,7 @@ impl LdaClassifier {
 
             let char_stats = crate::train::eval_mrr(
                 &samples, &eval_indices, &class_means, &centroid_fids,
-                &ctx.glyph_family_for_char(c),
+                &ctx.glyph_family_for_seq(seq),
                 &|i| {
                     let mut emb = vec![0.0f64; actual_dim];
                     for d in 0..actual_dim {
@@ -1822,18 +2138,18 @@ impl LdaClassifier {
                 },
             );
 
-            if ci < 5 || ci == chars.len() - 1 || (ci + 1) % 20 == 0 {
-                eprintln!("  char '{}' base={:.3} | strict={:.3} t1={:.1}% | family={:.3} t1={:.1}%",
-                    c, char_stats.base_mrr(), char_stats.strict_mrr(),
+            if si < 5 || si == sequences.len() - 1 || (si + 1) % 20 == 0 {
+                eprintln!("  seq {:?} base={:.3} | strict={:.3} t1={:.1}% | family={:.3} t1={:.1}%",
+                    seq, char_stats.base_mrr(), char_stats.strict_mrr(),
                     char_stats.strict_top1_pct(), char_stats.family_mrr(),
                     char_stats.family_top1_pct());
             }
             total_stats.accumulate(&char_stats);
-            lda_chars.push((c, actual_dim, proj_f32, sigma_sq, class_means));
+            lda_chars.push((seq.clone(), actual_dim, proj_f32, sigma_sq, class_means));
         }
 
         let lda_elapsed = lda_start.elapsed();
-        eprintln!("\nLDA complete: {} chars, {} skipped, {:.1}s",
+        eprintln!("\nLDA complete: {} seqs, {} skipped, {:.1}s",
             lda_chars.len(), skipped, lda_elapsed.as_secs_f64());
         eprintln!("  Baseline:   MRR={:.3} top1={:.1}%", total_stats.base_mrr(), total_stats.base_top1_pct());
         eprintln!("  LDA strict: MRR={:.3} top1={:.1}% top5={:.1}%",
@@ -1844,7 +2160,7 @@ impl LdaClassifier {
         // Write LDAC v4 binary (per-char model: weights + centroids + σ²)
         if let Some(parent) = output.parent() { let _ = std::fs::create_dir_all(parent); }
         let mut model = NgramModel::new(ctx.catalog_hash);
-        for (c, actual_dim, proj, sigma, class_means) in &lda_chars {
+        for (seq, actual_dim, proj, sigma, class_means) in &lda_chars {
             let mut centroids: Vec<(u32, Vec<f32>)> = Vec::with_capacity(class_means.len());
             for (&fid, mean) in class_means {
                 let mut embedded = vec![0.0f32; *actual_dim];
@@ -1868,12 +2184,15 @@ impl LdaClassifier {
             if cm.sigma_sq <= 1e-30 {
                 cm.compute_sigma_sq();
             }
-            model.entries.insert(vec![*c], cm);
+            model.entries.insert(seq.clone(), cm);
         }
-        let f = std::fs::File::create(output).expect("create output file");
+        let tmp = crate::atomic_file::tmp_for(output);
+        let f = std::fs::File::create(&tmp).expect("create output file");
         let mut w = BufWriter::new(f);
         model.write_bin(&mut w, b"LDAC", 4).expect("write LDAC v4");
         w.flush().unwrap();
+        drop(w);
+        std::fs::rename(&tmp, output).expect("atomic rename");
 
         let file_size = std::fs::metadata(output).map(|m| m.len()).unwrap_or(0);
         eprintln!("  Weights: {} ({:.1} MB, {} fonts indexed)",
@@ -1929,13 +2248,14 @@ impl MlpCharNet {
 /// Binary format (magic `b"MLPC"`):
 /// ```text
 /// magic:    b"MLPC" (4 bytes)
-/// version:  u32 LE (1)
-/// n_chars:  u32 LE
-/// Per character:
-///   char_code: u32 LE
+/// version:  u32 LE (2, only)
+/// n_seqs:   u32 LE
+/// Per sequence:
+///   seq_len:   u32 LE (number of codepoints in this sequence)
+///   codepoints: [u32; seq_len] LE
 ///   k:         u32 LE (number of classes)
 ///   class_map: [u32; k] LE (class_index → font_id)
-///   W1: [f32; 100×256] LE, b1: [f32; 256] LE
+///   W1: [f32; FEAT_LEN×256] LE, b1: [f32; 256] LE
 ///   W2: [f32; 256×128] LE, b2: [f32; 128] LE
 ///   W3: [f32; 128×k]   LE, b3: [f32; k]   LE
 /// ```
@@ -1969,21 +2289,25 @@ impl MlpClassifier {
             return Err(format!("bad magic (expected MLPC, got {:?})", &data[0..4]));
         }
         let version = u32::from_le_bytes(data[4..8].try_into().unwrap());
-        if version != 1 {
-            return Err(format!("unsupported MLP version {version}"));
+        if version != 2 {
+            return Err(format!("MLP weights are v{version}, need v2 — retraining required"));
         }
-        let n_chars = u32::from_le_bytes(data[8..12].try_into().unwrap()) as usize;
+        let n_seqs = u32::from_le_bytes(data[8..12].try_into().unwrap()) as usize;
 
-        let mut nets = HashMap::with_capacity(n_chars);
+        let mut nets = HashMap::with_capacity(n_seqs);
         let mut r = BinaryReader::new(data, 12);
 
-        for _ in 0..n_chars {
-            let cp = r.read_u32()?;
-            let ch = char::from_u32(cp)
-                .ok_or_else(|| format!("invalid codepoint U+{cp:04X}"))?;
+        for _ in 0..n_seqs {
+            let seq_len = r.read_u32()? as usize;
+            let mut seq = Vec::with_capacity(seq_len);
+            for _ in 0..seq_len {
+                let cp = r.read_u32()?;
+                seq.push(char::from_u32(cp)
+                    .ok_or_else(|| format!("invalid codepoint U+{cp:04X}"))?);
+            }
             let k = r.read_u32()? as usize;
             if k == 0 {
-                return Err(format!("seq '{:?}': zero classes", ch));
+                return Err(format!("seq {:?}: zero classes", seq));
             }
 
             // class_map: k × u32
@@ -2000,7 +2324,7 @@ impl MlpClassifier {
             let w3 = r.read_f32s(MLP_H2 * k)?;
             let b3 = r.read_f32s(k)?;
 
-            nets.insert(vec![ch], MlpCharNet {
+            nets.insert(seq, MlpCharNet {
                 fc1: InferenceLinear { rows: FEAT_LEN, cols: MLP_H1, w: w1, b: b1 },
                 fc2: InferenceLinear { rows: MLP_H1, cols: MLP_H2, w: w2, b: b2 },
                 fc3: InferenceLinear { rows: MLP_H2, cols: k, w: w3, b: b3 },
@@ -2026,9 +2350,9 @@ impl MlpClassifier {
         use rand::rngs::SmallRng;
         use crate::train::Linear;
 
-        let chars = ctx.chars;
+        let sequences = ctx.sequences;
         eprintln!("\nMLP training {} characters (epochs={}, noise={}, dropout={})...",
-            chars.len(), epochs, mlp_noise, mlp_dropout);
+            sequences.len(), epochs, mlp_noise, mlp_dropout);
         let mlp_start = std::time::Instant::now();
 
         const MLP_H1: usize = 256;
@@ -2124,13 +2448,13 @@ impl MlpClassifier {
             }
         }
 
-        let mut mlp_chars: Vec<(char, usize, Vec<u32>, MlpNet)> = Vec::new();
+        let mut mlp_seqs: Vec<(Vec<char>, usize, Vec<u32>, MlpNet)> = Vec::new();
         let mut skipped = 0usize;
         let mut total_stats = crate::train::RankStats::default();
 
-        for (ci, &c) in chars.iter().enumerate() {
-            if ctx.char_counts[ci] == 0 { skipped += 1; continue; }
-            let samples = ctx.load_samples(ci);
+        for (si, seq) in sequences.iter().enumerate() {
+            if ctx.seq_counts[si] == 0 { skipped += 1; continue; }
+            let samples = ctx.load_samples(si);
 
             let mut font_indices: HashMap<u32, Vec<usize>> = HashMap::new();
             for (i, s) in samples.iter().enumerate() {
@@ -2147,7 +2471,7 @@ impl MlpClassifier {
                 .enumerate().map(|(ci2, &fid)| (fid, ci2)).collect();
             let class_map: Vec<u32> = font_ids_sorted.clone();
 
-            let mut rng = SmallRng::seed_from_u64(c as u64);
+            let mut rng = SmallRng::seed_from_u64(si as u64);
             let mut net = MlpNet::new(k, &mut rng);
             let mut adam_t = 0usize;
             let mut sample_order: Vec<usize> = (0..n).collect();
@@ -2191,8 +2515,8 @@ impl MlpClassifier {
 
                 if (epoch + 1) % 10 == 0 || epoch == 0 {
                     let avg_loss = epoch_loss / n as f64;
-                    if ci < 5 || ci == chars.len() - 1 {
-                        eprintln!("  char '{}' epoch {}/{}: loss={:.4}", c, epoch + 1, epochs, avg_loss);
+                    if si < 5 || si == sequences.len() - 1 {
+                        eprintln!("  seq {:?} epoch {}/{}: loss={:.4}", seq, epoch + 1, epochs, avg_loss);
                     }
                 }
             }
@@ -2209,11 +2533,11 @@ impl MlpClassifier {
             }).collect();
 
             let centroid_fids: Vec<u32> = class_means.keys().copied().collect();
-            let eval_indices = crate::train::subsample_eval(n, 2000, c);
+            let eval_indices = crate::train::subsample_eval(n, 2000, si as u64);
 
             let char_stats = crate::train::eval_mrr(
                 &samples, &eval_indices, &class_means, &centroid_fids,
-                &ctx.glyph_family_for_char(c),
+                &ctx.glyph_family_for_seq(seq),
                 &|i| {
                     let logits = net.forward_eval(&samples[i].features);
                     let max_logit = logits.iter().copied().fold(f32::NEG_INFINITY, f32::max);
@@ -2231,19 +2555,19 @@ impl MlpClassifier {
                 },
             );
 
-            if ci < 5 || ci == chars.len() - 1 || (ci + 1) % 20 == 0 {
-                eprintln!("  char '{}' base={:.3} | strict={:.3} t1={:.1}% | family={:.3} t1={:.1}%",
-                    c, char_stats.base_mrr(), char_stats.strict_mrr(),
+            if si < 5 || si == sequences.len() - 1 || (si + 1) % 20 == 0 {
+                eprintln!("  seq {:?} base={:.3} | strict={:.3} t1={:.1}% | family={:.3} t1={:.1}%",
+                    seq, char_stats.base_mrr(), char_stats.strict_mrr(),
                     char_stats.strict_top1_pct(), char_stats.family_mrr(),
                     char_stats.family_top1_pct());
             }
             total_stats.accumulate(&char_stats);
-            mlp_chars.push((c, k, class_map, net));
+            mlp_seqs.push((seq.clone(), k, class_map, net));
         }
 
         let mlp_elapsed = mlp_start.elapsed();
-        eprintln!("\nMLP complete: {} chars, {} skipped, {:.1}s",
-            mlp_chars.len(), skipped, mlp_elapsed.as_secs_f64());
+        eprintln!("\nMLP complete: {} seqs, {} skipped, {:.1}s",
+            mlp_seqs.len(), skipped, mlp_elapsed.as_secs_f64());
         eprintln!("  Baseline:   MRR={:.3} top1={:.1}%", total_stats.base_mrr(), total_stats.base_top1_pct());
         eprintln!("  MLP strict: MRR={:.3} top1={:.1}% top5={:.1}%",
             total_stats.strict_mrr(), total_stats.strict_top1_pct(), total_stats.strict_top5_pct());
@@ -2252,13 +2576,16 @@ impl MlpClassifier {
 
         // Write MLPC binary
         if let Some(parent) = output.parent() { let _ = std::fs::create_dir_all(parent); }
-        let f = std::fs::File::create(output).expect("create output file");
+        let tmp = crate::atomic_file::tmp_for(output);
+        let f = std::fs::File::create(&tmp).expect("create output file");
         let mut w = BufWriter::new(f);
         w.write_all(b"MLPC").unwrap();
-        w.write_all(&1u32.to_le_bytes()).unwrap();
-        w.write_all(&(mlp_chars.len() as u32).to_le_bytes()).unwrap();
-        for (c, k, class_map, net) in &mlp_chars {
-            w.write_all(&(*c as u32).to_le_bytes()).unwrap();
+        w.write_all(&2u32.to_le_bytes()).unwrap();
+        w.write_all(&(mlp_seqs.len() as u32).to_le_bytes()).unwrap();
+        for (seq, k, class_map, net) in &mlp_seqs {
+            // Write sequence length + codepoints
+            w.write_all(&(seq.len() as u32).to_le_bytes()).unwrap();
+            for &ch in seq { w.write_all(&(ch as u32).to_le_bytes()).unwrap(); }
             w.write_all(&(*k as u32).to_le_bytes()).unwrap();
             for &fid in class_map { w.write_all(&fid.to_le_bytes()).unwrap(); }
             for &v in &net.fc1.w { w.write_all(&v.to_le_bytes()).unwrap(); }
@@ -2269,6 +2596,8 @@ impl MlpClassifier {
             for &v in &net.fc3.b { w.write_all(&v.to_le_bytes()).unwrap(); }
         }
         w.flush().unwrap();
+        drop(w);
+        std::fs::rename(&tmp, output).expect("atomic rename");
 
         let file_size = std::fs::metadata(output).map(|m| m.len()).unwrap_or(0);
         eprintln!("  Weights: {} ({:.1} MB)", output.display(), file_size as f64 / 1e6);
@@ -2473,6 +2802,76 @@ pub fn default_catalog_path() -> std::path::PathBuf {
 /// 1. If  is explicitly set, load from it (fail hard on error).
 /// 2. Otherwise try .
 /// 3. If missing, auto-train using  to produce .
+/// Read just the catalog_hash from catalog.bin (FONT header).
+/// Returns None if the file is missing, too small, or has wrong magic.
+fn read_catalog_hash() -> Option<u64> {
+    let path = default_catalog_path();
+    let data = std::fs::read(&path).ok()?;
+    if data.len() < 16 || &data[0..4] != b"FONT" { return None; }
+    Some(u64::from_le_bytes(data[8..16].try_into().unwrap()))
+}
+
+/// Check if any training feature manifest is older than font_scan.bin.
+/// If so, any classifier weights derived from those features are suspect
+/// (glyph IDs may correspond to a stale catalog ordering).
+fn training_features_stale() -> bool {
+    let scan_path = crate::font_scan::scan_cache_path();
+    let scan_mtime = match std::fs::metadata(&scan_path).and_then(|m| m.modified()) {
+        Ok(t) => t,
+        Err(_) => return false, // no font_scan cache → nothing to compare
+    };
+    let home = std::env::var("HOME").unwrap_or_else(|_| ".".to_string());
+    let feat_dir = std::path::PathBuf::from(&home)
+        .join(".cache").join("unprint").join("training");
+    let entries = match std::fs::read_dir(&feat_dir) {
+        Ok(e) => e,
+        Err(_) => return false, // no training dir → nothing stale
+    };
+    for entry in entries.flatten() {
+        let name = entry.file_name();
+        let name_str = name.to_string_lossy();
+        if !name_str.starts_with("manifest_") { continue; }
+        if let Ok(meta) = entry.metadata() {
+            if let Ok(mtime) = meta.modified() {
+                if mtime < scan_mtime {
+                    return true;
+                }
+            }
+        }
+    }
+    false
+}
+
+/// Check if the weights file is older than any training feature manifest.
+/// This catches the case where features were re-rendered (fixing a stale
+/// catalog) but the process died before retraining the weights.
+fn weights_older_than_features(weights_path: &std::path::Path) -> bool {
+    let weights_mtime = match std::fs::metadata(weights_path).and_then(|m| m.modified()) {
+        Ok(t) => t,
+        Err(_) => return false, // no weights file → nothing to compare
+    };
+    let home = std::env::var("HOME").unwrap_or_else(|_| ".".to_string());
+    let feat_dir = std::path::PathBuf::from(&home)
+        .join(".cache").join("unprint").join("training");
+    let entries = match std::fs::read_dir(&feat_dir) {
+        Ok(e) => e,
+        Err(_) => return false,
+    };
+    for entry in entries.flatten() {
+        let name = entry.file_name();
+        let name_str = name.to_string_lossy();
+        if !name_str.starts_with("manifest_") { continue; }
+        if let Ok(meta) = entry.metadata() {
+            if let Ok(mtime) = meta.modified() {
+                if weights_mtime < mtime {
+                    return true;
+                }
+            }
+        }
+    }
+    false
+}
+
 fn load_or_train<F, T>(
     name: &str,
     weights_path: Option<&std::path::Path>,
@@ -2493,10 +2892,36 @@ where
         }
     }
 
-    // Try default cache path.
+    // Try default cache path — also validate catalog_hash against catalog.bin.
     if default_path.exists() {
         match load_fn(default_path) {
-            Ok(c) => return Box::new(c),
+            Ok(c) => {
+                // Validate catalog_hash: if catalog.bin exists and the model
+                // has a different hash, the font catalog changed since training.
+                if let Some(expected) = read_catalog_hash() {
+                    if let Some(model_hash) = c.catalog_hash() {
+                        if model_hash != expected {
+                            eprintln!("{name} weights at {} stale (catalog_hash {model_hash:#x} != {expected:#x}), retraining...",
+                                default_path.display());
+                            // fall through to auto-train below
+                        } else if training_features_stale() {
+                            eprintln!("{name} weights at {} suspect (training features older than font_scan cache), retraining...",
+                                default_path.display());
+                            // fall through to auto-train below
+                        } else if weights_older_than_features(default_path) {
+                            eprintln!("{name} weights at {} stale (older than training features), retraining...",
+                                default_path.display());
+                            // fall through to auto-train below
+                        } else {
+                            return Box::new(c);
+                        }
+                    } else {
+                        return Box::new(c);
+                    }
+                } else {
+                    return Box::new(c);
+                }
+            }
             Err(e) => eprintln!("Warning: cached {name} weights at {} are corrupt ({e}), retraining...", default_path.display()),
         }
     }
@@ -2626,14 +3051,27 @@ pub fn build_classifier(
             ]))
         }
         "zncc" => {
-            if let Some((_font_dirs, render_params)) = auto_train {
+            if let Some((font_dirs, render_params)) = auto_train {
                 let gmap_path = crate::glyph_map::NgramGlyphMap::default_path();
-                let glyph_map = crate::glyph_map::NgramGlyphMap::load(&gmap_path)
-                    .unwrap_or_else(|e| {
-                        eprintln!("Cannot load glyph map from {}: {e}", gmap_path.display());
-                        eprintln!("Run with --train-lda first to build the glyph map.");
-                        std::process::exit(1);
-                    });
+                let glyph_map = match crate::glyph_map::NgramGlyphMap::load(&gmap_path) {
+                    Ok(g) => g,
+                    Err(e) => {
+                        eprintln!("Glyph map stale or missing ({e}), retraining...");
+                        let lda_path = default_lda_weights_path();
+                        crate::train::run_train(crate::train::TrainArgs {
+                            output: lda_path,
+                            font_dir: font_dirs.to_vec(),
+                            render_params: render_params.clone(),
+                            lda: true,
+                            ..crate::train::TrainArgs::default()
+                        });
+                        crate::glyph_map::NgramGlyphMap::load(&gmap_path)
+                            .unwrap_or_else(|e2| {
+                                eprintln!("Retraining did not produce a valid glyph map ({e2})");
+                                std::process::exit(1);
+                            })
+                    }
+                };
                 Box::new(crate::zncc_classifier::ZnccClassifier::from_glyph_map(glyph_map, render_params))
             } else {
                 eprintln!("ZNCC classifier requires font directories");
@@ -2887,9 +3325,13 @@ impl PerFontLda {
 
         let overrides = font_entry.glyph_overrides.as_deref();
 
-        for &ch in ctx.chars.iter() {
+        for seq in ctx.sequences.iter() {
+            // PerFontLda is per-character HOG — skip bigrams
+            if seq.len() != 1 { continue; }
+            let ch = seq[0];
+
             // Check that the glyph map recognizes this font for this character
-            if ctx.glyph_map.glyph_id_for_font(&[ch], font_key).is_none() {
+            if ctx.glyph_map.glyph_id_for_font(seq, font_key).is_none() {
                 continue;
             }
 

@@ -28,6 +28,7 @@ pub mod report;
 mod font_pipeline;
 mod zncc_classifier;
 mod ngram;
+mod atomic_file;
 
 use crate::audit::{AuditEntry, AuditLog, BBox, GeometryEntry, PageSummary};
 
@@ -38,6 +39,13 @@ use rayon::prelude::*;
 const MIN_VERIFY_SIMILARITY: f32 = 0.9;
 
 fn main() {
+    // ── pprof flamegraph (cargo build --features profile) ────────
+    #[cfg(feature = "profile")]
+    let pprof_guard = pprof::ProfilerGuardBuilder::default()
+        .frequency(997)
+        .blocklist(&["libc", "libgcc", "libpthread", "vdso"])
+        .build()
+        .expect("pprof guard");
     let args = cli::parse();
     if let Err(msg) = args.validate() {
         eprintln!("Error: {msg}");
@@ -74,6 +82,15 @@ fn main() {
     if let Err(e) = run(&args, &mut *clf) {
         eprintln!("Error: {e}");
         std::process::exit(1);
+    }
+
+    // ── Write flamegraph (cargo build --features profile) ────────
+    #[cfg(feature = "profile")]
+    if let Ok(report) = pprof_guard.report().build() {
+        let fg_path = std::path::Path::new("/tmp/lob-flamegraph.svg");
+        let file = std::fs::File::create(fg_path).expect("create flamegraph file");
+        report.flamegraph(file).expect("write flamegraph");
+        eprintln!("[profile] Wrote flamegraph to {}", fg_path.display());
     }
 }
 
@@ -127,6 +144,10 @@ fn build_audit_entry(
             ocr_corrected_from: d.ocr_corrected_from,
             best_alt_char: d.best_alt_char,
             best_alt_dist: d.best_alt_dist,
+            pflda_top_char: d.pflda_top_char,
+            pflda_top_p: d.pflda_top_p,
+            pflda_ocr_p: d.pflda_ocr_p,
+            pflda_replaced: d.pflda_replaced,
             gt_font_rank: if with_ranks { lm.gt_font_obs_ranks.get(&d.crop_index).copied() } else { None },
             chosen_prob: if with_ranks { lm.chosen_obs_probs.get(&d.crop_index).copied() } else { None },
             gt_font_prob: if with_ranks { lm.gt_font_obs_probs.get(&d.crop_index).copied() } else { None },
@@ -154,7 +175,7 @@ fn build_audit_entry(
             .collect(),
         obs_votes_lig: lm.observations_lig.iter().map(|d| obs_vote(d, false)).collect(),
         seg_winner: lm.seg_winner.clone(),
-        word_bboxes: line.words.iter().map(|w| WordBBox {
+        word_bboxes: lm.corrected_words.as_deref().unwrap_or(&line.words).iter().map(|w| WordBBox {
             text: w.text.clone(), x: w.x, y: w.y, width: w.width, height: w.height, confidence: w.confidence,
         }).collect(),
         word_bboxes_raw: line.raw_words.iter().map(|w| WordBBox {
@@ -228,15 +249,29 @@ fn run(args: &cli::Args, classifier: &mut dyn classifier::Classifier) -> Result<
         return Err(ScanTextError::NoFonts);
     }
 
-    // Load glyph map (glyph dedup groups) — required; run --train-lda first.
+    // Load glyph map (glyph dedup groups).  If missing or stale, retrain
+    // the LDA classifier (which rebuilds the glyph map as a side effect).
     let gmap_path = glyph_map::NgramGlyphMap::default_path();
-    let glyph_map = glyph_map::NgramGlyphMap::load(&gmap_path)
-        .unwrap_or_else(|e| {
-            eprintln!("Error: could not load glyph-map.bin ({e})");
-            eprintln!("  expected at: {}", gmap_path.display());
-            eprintln!("  Run with --train-lda first to generate it.");
-            std::process::exit(1);
-        });
+    let glyph_map = match glyph_map::NgramGlyphMap::load(&gmap_path) {
+        Ok(g) => g,
+        Err(e) => {
+            eprintln!("Glyph map at {} stale or missing ({e}), retraining...", gmap_path.display());
+            let font_dirs = font_scan::default_font_dirs(&args.font_dir);
+            let lda_path = classifier::default_lda_weights_path();
+            train::run_train(train::TrainArgs {
+                output: lda_path,
+                font_dir: font_dirs,
+                render_params: args.render_params(),
+                lda: true,
+                ..train::TrainArgs::default()
+            });
+            glyph_map::NgramGlyphMap::load(&gmap_path)
+                .unwrap_or_else(|e2| {
+                    eprintln!("Error: retraining did not produce a valid glyph map ({e2})");
+                    std::process::exit(1);
+                })
+        }
+    };
 
     // All font access goes through the shared cache below.
 
@@ -252,11 +287,7 @@ fn run(args: &cli::Args, classifier: &mut dyn classifier::Classifier) -> Result<
     let cache_dir = page_cache::cache_key(input, args.dpi)
         .and_then(|key| page_cache::cache_dir(&key));
 
-    let raster_start = std::time::Instant::now();
     let (pages, _raster_cached) = page_cache::get_pages(input, args.dpi)?;
-    let _raster_elapsed = raster_start.elapsed();
-    if std::env::var("UNPRINT_DEBUG_MEM").is_ok() {
-    }
 
     // ── 2b. Extract source image data for pass-through ───────────────
     let source_images = if input.extension().and_then(|e| e.to_str()) == Some("pdf") {
@@ -335,7 +366,6 @@ fn run(args: &cli::Args, classifier: &mut dyn classifier::Classifier) -> Result<
         let mut pg_raster = 0u32;
 
         // ── Pass 1: Match all lines ──────────────────────────────────
-        let fontmatch_start = std::time::Instant::now();
         let (mut line_matches, fp_hits) = font_pipeline::match_lines(
             &lines, &gray_page, page_img, page_num,
             &font_registry, &font_cache, classifier,
@@ -353,7 +383,6 @@ fn run(args: &cli::Args, classifier: &mut dyn classifier::Classifier) -> Result<
         }
 
         let scored_lines = lines.len() as u64 - fp_hits;
-        let _fontmatch_elapsed = fontmatch_start.elapsed();
         if fp_hits > 0 {
         }
         if scored_lines > 0 {
@@ -363,7 +392,6 @@ fn run(args: &cli::Args, classifier: &mut dyn classifier::Classifier) -> Result<
         font_pipeline::paragraph_font_grouping(&lines, &line_matches);
 
         // ── Word split: split wide whitespace using matched fonts ──
-        let _t_split = std::time::Instant::now();
         let split_indices;
         {
             let line_fonts: Vec<Option<std::sync::Arc<Vec<u8>>>> = line_matches.iter()
@@ -384,7 +412,7 @@ fn run(args: &cli::Args, classifier: &mut dyn classifier::Classifier) -> Result<
                 &font_registry, &font_cache, classifier,
                 &glyph_map,
                 ground_truth.as_ref(),
-                dominant_font_candidate.as_ref(),
+                None,  // No fast path — re-score fully with new word splits
                 args,
                 Some(&split_set),
                 rtd.as_ref(),
@@ -400,7 +428,6 @@ fn run(args: &cli::Args, classifier: &mut dyn classifier::Classifier) -> Result<
         }
 
         // ── Pass 2a: Parallel similarity (ZNCC) verification ────────
-        let _verify_start = std::time::Instant::now();
         let similarity_results: Vec<(Option<f32>, Option<bool>)> = lines.par_iter()
             .enumerate()
             .map(|(li, line)| {
@@ -428,11 +455,12 @@ fn run(args: &cli::Args, classifier: &mut dyn classifier::Classifier) -> Result<
                             let raw = image::imageops::crop_imm(&gray_page, cx, cy, cw, ch).to_image();
                             features::contrast_normalize_char(&raw)
                         };
+                        let verify_words = lm.corrected_words.as_deref().unwrap_or(&line.words);
                         let vr = verify::verify_text_region(
                             &norm_crop,
                             fd.as_slice(),
                             &line.text,
-                            &line.words,
+                            verify_words,
                             line.x, line.y,
                             fm.glyph_overrides.as_deref(),
                             &fm.variant_tag,
@@ -526,7 +554,7 @@ fn run(args: &cli::Args, classifier: &mut dyn classifier::Classifier) -> Result<
                 keep_raster,
                 color: text_color,
                 confidence: line.confidence,
-                words: line.words.iter().map(|w| pdf_out::WordBox {
+                words: lm.corrected_words.as_deref().unwrap_or(&line.words).iter().map(|w| pdf_out::WordBox {
                     text: w.text.clone(),
                     x: w.x as f32,
                     y: w.y as f32,
@@ -782,6 +810,8 @@ fn run(args: &cli::Args, classifier: &mut dyn classifier::Classifier) -> Result<
 
     // ── 6. Report ────────────────────────────────────────────────────
     let (_cache_hits, _cache_misses) = font_cache.stats();
+
+
 
     Ok(())
 }

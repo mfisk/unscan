@@ -47,6 +47,9 @@ pub struct LineMatch {
     pub gt_font_obs_probs: HashMap<usize, f32>,
     /// font tie-break candidates with per-candidate SSIM scores.
     pub tie_candidates: Vec<audit::TieCandidate>,
+    /// When pflda OCR correction fires, the corrected word regions
+    /// for use in ZNCC verification (replacing line.words).
+    pub corrected_words: Option<Vec<crate::ocr::TextRegion>>,
 }
 
 /// Minimum SSIM score for the fast-path dominant-font check.
@@ -81,15 +84,8 @@ pub fn match_lines(
     let fast_path_hits = AtomicU64::new(0);
 
     // Profiling accumulators (microseconds, atomic for par_iter)
-    let prof_seg_us = AtomicU64::new(0);
-    let prof_ci_us = AtomicU64::new(0);
-    let prof_pcd_us = AtomicU64::new(0);
-    let prof_fp_us = AtomicU64::new(0);
-    let prof_full_us = AtomicU64::new(0);
     let line_matches: Vec<LineMatch> = lines.par_iter().enumerate().map(|(li, line)| {
         let line_num = li + 1; // 1-indexed for output
-        let line_start = std::time::Instant::now();
-
         // Crop and contrast-normalize the word-union bbox once for all verify calls.
         let norm_crop = {
             let iw = gray_page.width();
@@ -118,7 +114,6 @@ pub fn match_lines(
             );
             if vr.score >= FAST_PATH_MIN_SSIM {
                 fast_path_hits.fetch_add(1, Ordering::Relaxed);
-                prof_fp_us.fetch_add(line_start.elapsed().as_micros() as u64, Ordering::Relaxed);
                 let text_color = color::detect_text_color(
                     page_img,
                     &TextRegion {
@@ -146,6 +141,7 @@ pub fn match_lines(
                     chosen_obs_probs: HashMap::new(),
                     gt_font_obs_probs: HashMap::new(),
                     tie_candidates: Vec::new(),
+                    corrected_words: None,
                 };
             } else if li < 3 {
             }
@@ -157,25 +153,7 @@ pub fn match_lines(
             while end > 0 && !line.text.is_char_boundary(end) { end -= 1; }
             end
         };
-        let debug_mem = std::env::var("UNPRINT_DEBUG_MEM").is_ok();
-        if debug_mem {
-        }
-        // Dump total mapped size from /proc/self/maps
-        if debug_mem && (li == 2 || li == 45) {
-            if let Ok(maps) = std::fs::read_to_string("/proc/self/maps") {
-                let mut _total: u64 = 0;
-                for l in maps.lines() {
-                    if let Some(range) = l.split_whitespace().next() {
-                        if let Some((start_s, end_s)) = range.split_once('-') {
-                            if let (Ok(s), Ok(e)) = (u64::from_str_radix(start_s, 16), u64::from_str_radix(end_s, 16)) {
-                                _total += e - s;
-                            }
-                        }
-                    }
-                }
-            }
-        }
-        let line_start = std::time::Instant::now();
+
         let text_color = color::detect_text_color(
             page_img,
             &TextRegion {
@@ -226,18 +204,15 @@ pub fn match_lines(
             })
             .collect();
         let word_height = line.words.iter().map(|w| w.height).max().unwrap_or(0);
-        let seg_t0 = std::time::Instant::now();
         let line_crops = segment::segment_line(
             gray_page, &word_placements, word_height,
             diag_seg_dir.as_deref(),
             &args.render_params(),
         );
-        prof_seg_us.fetch_add(seg_t0.elapsed().as_micros() as u64, Ordering::Relaxed);
-        if debug_mem {
-        }
 
         let mut crop_store_plain: Vec<GrayImage> = Vec::new();
         let mut crop_store_lig: Vec<GrayImage> = Vec::new();
+        let mut plain_pos_map: Vec<(usize, usize)> = Vec::new();
         let (font_result, tie_candidates_audit, gt_font_key) = {
 
             // Crop PNGs are saved after font matching, gated by ground-truth
@@ -257,17 +232,21 @@ pub fn match_lines(
             let ensure_keys: Vec<&str> = gt_font_key.as_deref().into_iter().collect();
 
             // ── Score: build sliding-window observations, run identify_fonts ──
-            let score_t0 = std::time::Instant::now();
 
-            let plain_windows = crate::ngram::build_scoring_windows(
-                &line_crops.word_segs, classifier, glyph_map,
-                &mut crop_store_plain,
-            );
+            let plain_windows;
+            {
+                let (w, pm) = crate::ngram::build_scoring_windows(
+                    &line_crops.word_segs, classifier, glyph_map,
+                    &mut crop_store_plain,
+                );
+                plain_windows = w;
+                plain_pos_map = pm;
+            }
             let scoring_plain = font_match::identify_fonts(&plain_windows, classifier, glyph_map, args.thoroughness, args.full_audit(), &ensure_keys);
 
             // ── Score ligature path (if present) ─────────────────
             let scoring_lig = if let Some(ref lig_segs) = line_crops.lig_word_segs {
-                let lig_windows = crate::ngram::build_scoring_windows(
+                let (lig_windows, _lig_pos_map) = crate::ngram::build_scoring_windows(
                     lig_segs, classifier, glyph_map,
                     &mut crop_store_lig,
                 );
@@ -275,7 +254,6 @@ pub fn match_lines(
             } else {
                 None
             };
-            prof_ci_us.fetch_add(score_t0.elapsed().as_micros() as u64, Ordering::Relaxed);
             // ── Pick the winner: ligature vs plain segmentation ──
             // We compare using unweighted (uniform) mean log-probs so
             // weight doesn't bias the decision.
@@ -317,8 +295,6 @@ pub fn match_lines(
                 None
             };
 
-            if debug_mem {
-            }
 
             // Crop PNGs saved after font matching (see below).
 
@@ -411,9 +387,6 @@ pub fn match_lines(
                 (None, Vec::new(), gt_font_key)
             }
         };
-        let line_elapsed = line_start.elapsed();
-        if line_elapsed.as_millis() > 500 {
-        }
         // ── Ground-truth gated audit detail ─────────────────────────
         // When --audit is set, check if this line is a miss before
         // doing expensive audit I/O.  Without --audit, all lines
@@ -450,57 +423,80 @@ pub fn match_lines(
         };
 
         // ── Per-font LDA OCR correction (probability-gated) ─────────
-        // Two-pass: collect HOG predictions for all observations, then
-        // estimate inference σ² from median nearest-centroid d², then
-        // recompute softmax with that σ² and gate on p(top1).
-        //
-        // Training σ² reflects rendered-glyph noise (~0.01).  Inference
-        // noise (scan crops) is 50-100× larger, so we estimate σ² from
-        // the observations themselves.  Most observations are correctly
-        // OCR'd, so median d²(nearest) captures the real noise floor.
+        // Iterate directly over OCR characters in the winning word_segs,
+        // crop each from segmentation data, classify with per-font LDA,
+        // and apply probability-gated corrections.  Positions are known
+        // because we walk the source text, so corrections propagate
+        // directly to line.words via source_word_idx.
+        let mut corrected_words: Option<Vec<crate::ocr::TextRegion>> = None;
         if let (Some(ref fr), Some(rtd)) = (&font_result, training_data) {
             eprintln!("[pflda] OCR correction pass for font_key={}", fr.font_key);
             let ctx = rtd.as_context(glyph_map);
             if let Some(pf_lda) = classifier::PerFontLda::load_or_train(&fr.font_key, &ctx) {
-                eprintln!("[pflda] Loaded/trained OK, checking {} observations", observations.len());
+                let winning_word_segs: &[segment::WordSeg] = if seg_winner.as_deref() == Some("ligature") {
+                    line_crops.lig_word_segs.as_deref().unwrap_or(&line_crops.word_segs)
+                } else {
+                    &line_crops.word_segs
+                };
+                eprintln!("[pflda] Loaded/trained OK, checking chars across {} word_segs", winning_word_segs.len());
 
-                // -- Pass 1: collect predictions (all classes) ----------
-                struct PfldaObs {
-                    obs_i: usize,
-                    crop_index: usize,
+                // -- Build reverse map: (seg_idx, char_pos) → obs index ---
+                // Used to update observation audit fields alongside corrected_words.
+                let winning_pos_map: &[(usize, usize)] = if seg_winner.as_deref() == Some("ligature") {
+                    &[] // ligature pos_map not tracked (rare path)
+                } else {
+                    &plain_pos_map
+                };
+                let mut char_to_obs: std::collections::HashMap<(usize, usize), usize> =
+                    std::collections::HashMap::new();
+                for (obs_i, obs) in observations.iter().enumerate() {
+                    if obs.seq.len() != 1 { continue; }
+                    if let Some(&(si, cp)) = winning_pos_map.get(obs.crop_index) {
+                        char_to_obs.insert((si, cp), obs_i);
+                    }
+                }
+
+                // -- Pass 1: iterate chars, crop, classify ----------------
+                struct PfldaChar {
+                    seg_idx: usize,
+                    char_pos: usize,
                     ocr_char: char,
                     dists: Vec<(char, f32)>, // (char, d²) sorted by d² asc
                 }
-                let mut pflda_obs: Vec<PfldaObs> = Vec::new();
+                let mut pflda_chars: Vec<PfldaChar> = Vec::new();
 
-                for (i, obs) in observations.iter().enumerate() {
-                    if obs.seq.len() != 1 { continue; }
-                    let ocr_char = obs.seq[0];
-                    let crop = match winning_crops.get(obs.crop_index) {
-                        Some(c) => c,
-                        None => continue,
-                    };
-                    let hog = match crate::hog::compute_hog(crop) {
-                        Some(h) => h,
-                        None => continue,
-                    };
-                    let preds_d = pf_lda.predict_with_distances(&hog, 200);
-                    if preds_d.is_empty() { continue; }
-                    let dists: Vec<(char, f32)> = preds_d.iter()
-                        .map(|&(c, _, d)| (c, d))
-                        .collect();
-                    pflda_obs.push(PfldaObs {
-                        obs_i: i,
-                        crop_index: obs.crop_index,
-                        ocr_char,
-                        dists,
-                    });
+                for (seg_idx, seg) in winning_word_segs.iter().enumerate() {
+                    for (char_pos, &ocr_char) in seg.chars.iter().enumerate() {
+                        if !crate::features::is_supported(ocr_char) { continue; }
+                        let crop = match crate::segment::crop_ngram(
+                            &seg.word_img, char_pos, 1,
+                            &seg.boundaries, &seg.seam_paths, seg.crop_h,
+                        ) {
+                            Some(c) => c,
+                            None => continue,
+                        };
+                        let hog = match crate::hog::compute_hog(&crop) {
+                            Some(h) => h,
+                            None => continue,
+                        };
+                        let preds_d = pf_lda.predict_with_distances(&hog, 200);
+                        if preds_d.is_empty() { continue; }
+                        let dists: Vec<(char, f32)> = preds_d.iter()
+                            .map(|&(c, _, d)| (c, d))
+                            .collect();
+                        pflda_chars.push(PfldaChar {
+                            seg_idx,
+                            char_pos,
+                            ocr_char,
+                            dists,
+                        });
+                    }
                 }
 
-                // -- Inference σ² = median of nearest-centroid d² ------
+                // -- Inference σ² = median of nearest-centroid d² ---------
                 let inference_sigma_sq: f32 = {
-                    let mut top1_d2: Vec<f32> = pflda_obs.iter()
-                        .map(|o| o.dists[0].1)
+                    let mut top1_d2: Vec<f32> = pflda_chars.iter()
+                        .map(|pc| pc.dists[0].1)
                         .collect();
                     if top1_d2.is_empty() {
                         1.0
@@ -509,18 +505,20 @@ pub fn match_lines(
                         top1_d2[top1_d2.len() / 2]
                     }
                 };
-                eprintln!("[pflda] inference σ²={:.6} (training σ²={:.6}, {} obs)",
-                    inference_sigma_sq, pf_lda.sigma_sq(), pflda_obs.len());
+                eprintln!("[pflda] inference σ²={:.6} (training σ²={:.6}, {} chars)",
+                    inference_sigma_sq, pf_lda.sigma_sq(), pflda_chars.len());
 
-                // -- Pass 2: softmax with inference σ², apply gate -----
-                for po in &pflda_obs {
-                    // Softmax with inference σ² (min-subtracted for stability)
-                    let min_d2 = po.dists[0].1;
-                    let weights: Vec<f32> = po.dists.iter()
+                // -- Pass 2: softmax with inference σ², apply gate --------
+                // corrections: (seg_idx, char_pos, from_char, to_char)
+                let mut corrections: Vec<(usize, usize, char, char)> = Vec::new();
+
+                for pc in &pflda_chars {
+                    let min_d2 = pc.dists[0].1;
+                    let weights: Vec<f32> = pc.dists.iter()
                         .map(|&(_, d)| (-(d - min_d2) / (2.0 * inference_sigma_sq)).exp())
                         .collect();
                     let total: f32 = weights.iter().sum();
-                    let probs: Vec<(char, f32, f32)> = po.dists.iter()
+                    let probs: Vec<(char, f32, f32)> = pc.dists.iter()
                         .zip(weights.iter())
                         .map(|(&(c, d), &w)| (c, if total > 0.0 { w / total } else { 0.0 }, d))
                         .collect();
@@ -529,13 +527,14 @@ pub fn match_lines(
                     let (top_char, top_p, top_d2) = probs[0];
                     let d2_next = if probs.len() > 1 { probs[1].2 } else { 0.0 };
 
-                    let ocr_rank = probs.iter().position(|(ch, _, _)| *ch == po.ocr_char);
-                    let ocr_p = probs.iter().find(|(ch, _, _)| *ch == po.ocr_char)
+                    let ocr_rank = probs.iter().position(|(ch, _, _)| *ch == pc.ocr_char);
+                    let ocr_p = probs.iter().find(|(ch, _, _)| *ch == pc.ocr_char)
                         .map(|(_, p, _)| *p);
 
-                    eprintln!("[pflda] obs[{}] ocr='{}' | top1='{}' p={:.4} d²={:.4} | gap1-2={:.4} | σ²_inf={:.4} | ocr_rank={} ocr_p={} | top5: {}",
-                        po.crop_index,
-                        po.ocr_char,
+                    eprintln!("[pflda] seg[{}][{}] ocr=\'{}\' | top1=\'{}\' p={:.4} d²={:.4} | gap1-2={:.4} | σ²_inf={:.4} | ocr_rank={} ocr_p={} | top5: {}",
+                        pc.seg_idx,
+                        pc.char_pos,
+                        pc.ocr_char,
                         top_char,
                         top_p,
                         top_d2,
@@ -543,34 +542,58 @@ pub fn match_lines(
                         inference_sigma_sq,
                         ocr_rank.map(|r| format!("{}", r + 1)).unwrap_or("ABSENT".into()),
                         ocr_p.map(|p| format!("{:.4}", p)).unwrap_or("?".into()),
-                        probs.iter().take(5).map(|(c, p, d)| format!("'{}'={:.4}(d²={:.3})", c, p, d)).collect::<Vec<_>>().join(" "),
+                        probs.iter().take(5).map(|(c, p, d)| format!("\'{}\' ={:.4}(d²={:.3})", c, p, d)).collect::<Vec<_>>().join(" "),
                     );
 
-                    // Record best alternative regardless of correction
-                    if top_char != po.ocr_char {
-                        observations[po.obs_i].best_alt_char = Some(top_char);
-                        observations[po.obs_i].best_alt_dist = Some(top_p);
-                    } else if probs.len() > 1 {
-                        observations[po.obs_i].best_alt_char = Some(probs[1].0);
-                        observations[po.obs_i].best_alt_dist = Some(probs[1].1);
+                    // Update observation audit fields if we have the mapping
+                    if let Some(&obs_i) = char_to_obs.get(&(pc.seg_idx, pc.char_pos)) {
+                        if top_char != pc.ocr_char {
+                            observations[obs_i].best_alt_char = Some(top_char);
+                            observations[obs_i].best_alt_dist = Some(top_p);
+                        } else if probs.len() > 1 {
+                            observations[obs_i].best_alt_char = Some(probs[1].0);
+                            observations[obs_i].best_alt_dist = Some(probs[1].1);
+                        }
+                        observations[obs_i].pflda_top_char = Some(top_char);
+                        observations[obs_i].pflda_top_p = Some(top_p);
+                        observations[obs_i].pflda_ocr_p = ocr_p;
                     }
 
-                    // Probability-gated correction: only override OCR when
-                    // the classifier is confident the crop is a different char
-                    // AND the top1 is significantly more probable than the OCR
-                    // char (ratio gate).  Confusable pairs (,/' o/O I/l) have
-                    // ratio ≈ 1; true OCR errors have ratio >> 10.
+                    // Probability-gated correction
                     let ocr_p_val = ocr_p.unwrap_or(0.0);
                     let ratio = if ocr_p_val > 1e-6 { top_p / ocr_p_val } else { f32::INFINITY };
-                    if top_p > 0.2 && ratio > 3.0 && top_char != po.ocr_char {
-                        observations[po.obs_i].ocr_corrected_from = Some(po.ocr_char);
-                        observations[po.obs_i].seq = vec![top_char];
+                    if top_p > 0.235 && ratio > 3.0 && top_char != pc.ocr_char {
+                        corrections.push((pc.seg_idx, pc.char_pos, pc.ocr_char, top_char));
+                        // Update observation
+                        if let Some(&obs_i) = char_to_obs.get(&(pc.seg_idx, pc.char_pos)) {
+                            observations[obs_i].ocr_corrected_from = Some(pc.ocr_char);
+                            observations[obs_i].seq = vec![top_char];
+                            observations[obs_i].pflda_replaced = true;
+                        }
+                        eprintln!("[pflda] CORRECTED \'{}\' → \'{}\' at seg[{}][{}] (word_idx={})",
+                            pc.ocr_char, top_char, pc.seg_idx, pc.char_pos,
+                            winning_word_segs[pc.seg_idx].source_word_idx);
                     }
+                }
+
+                // -- Build corrected_words from corrections ---------------
+                if !corrections.is_empty() {
+                    let mut words = line.words.clone();
+                    for &(seg_idx, char_pos, _from, to) in &corrections {
+                        let word_idx = winning_word_segs[seg_idx].source_word_idx;
+                        if word_idx < words.len() {
+                            let mut chars: Vec<char> = words[word_idx].text.chars().collect();
+                            if char_pos < chars.len() {
+                                chars[char_pos] = to;
+                                words[word_idx].text = chars.into_iter().collect();
+                            }
+                        }
+                    }
+                    corrected_words = Some(words);
                 }
             }
         }
 
-        let pcd_t0 = std::time::Instant::now();
         // Per-observation probabilities and audit detail: only for miss lines when full audit is active
         let (chosen_obs_ranks, chosen_obs_probs, gt_font_obs_ranks, gt_font_obs_probs) = if is_miss && args.full_audit() {
             // Resolve chosen and GT font keys
@@ -732,10 +755,8 @@ pub fn match_lines(
             }
         }
 
-        prof_pcd_us.fetch_add(pcd_t0.elapsed().as_micros() as u64, Ordering::Relaxed);
 
-        prof_full_us.fetch_add(line_start.elapsed().as_micros() as u64, Ordering::Relaxed);
-        LineMatch { font_result, text_color, font_scores, observations, font_scores_lig, observations_lig, seg_winner, diag_seg_dir, chosen_obs_ranks, gt_font_obs_ranks, chosen_obs_probs, gt_font_obs_probs, tie_candidates: tie_candidates_audit }
+        LineMatch { font_result, text_color, font_scores, observations, font_scores_lig, observations_lig, seg_winner, diag_seg_dir, chosen_obs_ranks, gt_font_obs_ranks, chosen_obs_probs, gt_font_obs_probs, tie_candidates: tie_candidates_audit, corrected_words }
     }).collect();
 
     let fp_hits = fast_path_hits.load(Ordering::Relaxed);

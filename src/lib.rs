@@ -24,3 +24,5 @@ pub mod char_render;
 pub mod train;
 pub mod ngram;
 pub mod hog;
+
+pub mod atomic_file;

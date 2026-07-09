@@ -448,12 +448,16 @@ pub fn ssim_compare(crop: &GrayImage, render: &GrayImage) -> SsimResult {
 // ZNCC — Zero-mean Normalised Cross-Correlation
 // ---------------------------------------------------------------------------
 
-/// Windowed ZNCC between two grayscale images with vertical shift search.
+/// Global ZNCC with vertical shift search and Cauchy-Schwarz early bail.
 ///
-/// Mirrors `ssim_windowed_best_vshift`: tries vertical offsets from
-/// 0 outward, keeps the best score, and exits early when a strong
-/// match is found.  ZNCC is inherently invariant to per-window mean
-/// and contrast differences, so no pre-normalisation is needed.
+/// For each candidate vertical shift, computes global (whole-image) ZNCC
+/// in two passes:
+///   Pass 1: compute per-image means and variances (no bail — cheap).
+///   Pass 2: accumulate cross-covariance with early bail using a
+///           Cauchy-Schwarz upper bound on the remaining contribution.
+///
+/// Tries vertical offsets from 0 outward, keeps the best score, and
+/// exits early when a strong match is found.
 pub fn zncc_windowed_best_vshift(
     a: &GrayImage,
     b: &GrayImage,
@@ -472,7 +476,7 @@ pub fn zncc_windowed_best_vshift(
     }
 
     for dy in shifts {
-        let score = zncc_windowed(a, b, dy, bail_below);
+        let score = zncc_global_bailable(a, b, dy, bail_below);
         if score > best {
             best = score;
             best_dy = dy;
@@ -485,6 +489,97 @@ pub fn zncc_windowed_best_vshift(
     let clamped = best.clamp(-1.0, 1.0);
     let normalized = (clamped + 1.0) / 2.0;
     (normalized, best_dy)
+}
+
+/// Global ZNCC with vertical shift and Cauchy-Schwarz early bail.
+///
+/// Pass 1: compute μ_a, μ_b, σ_a², σ_b² over ink pixels.
+/// Pass 2: accumulate Σ(a-μ_a)(b-μ_b) row by row; after each row,
+///         compute an upper bound on the final ZNCC. If the upper bound
+///         falls below `bail_below`, return early.
+fn zncc_global_bailable(
+    a: &GrayImage,
+    b: &GrayImage,
+    b_dy: i32,
+    bail_below: Option<f32>,
+) -> f32 {
+    let (w, h) = a.dimensions();
+    let bw = b.width() as i32;
+    let bh = b.height() as i32;
+
+    // Collect all pixel pairs (including background — global ZNCC needs
+    // the full image to avoid being dominated by edge noise).
+    let mut pixels: Vec<(f64, f64)> = Vec::with_capacity((w * h) as usize);
+
+    for y in 0..h {
+        let by = y as i32 + b_dy;
+        for x in 0..w {
+            let va = a.get_pixel(x, y).0[0] as f64;
+            let vb = if by >= 0 && by < bh && (x as i32) < bw {
+                b.get_pixel(x, by as u32).0[0] as f64
+            } else {
+                255.0
+            };
+            pixels.push((va, vb));
+        }
+    }
+
+    let n = pixels.len();
+    if n < 4 {
+        return 0.0;
+    }
+    let nf = n as f64;
+
+    // Pass 1: means, variances, and per-pixel squared deviations.
+    let mut sum_a = 0.0f64;
+    let mut sum_b = 0.0f64;
+    let mut sum_a2 = 0.0f64;
+    let mut sum_b2 = 0.0f64;
+    for &(va, vb) in &pixels {
+        sum_a += va;
+        sum_b += vb;
+        sum_a2 += va * va;
+        sum_b2 += vb * vb;
+    }
+    let mu_a = sum_a / nf;
+    let mu_b = sum_b / nf;
+    let total_var_a = sum_a2 - sum_a * sum_a / nf;  // = Σ(a - μ_a)²
+    let total_var_b = sum_b2 - sum_b * sum_b / nf;  // = Σ(b - μ_b)²
+    let denom = (total_var_a * total_var_b).sqrt();
+    if denom < 1e-10 {
+        return 1.0; // both constant → perfect match
+    }
+
+    // Pass 2: accumulate cross-covariance with Cauchy-Schwarz bail.
+    let mut partial_cov = 0.0f64;
+    let mut partial_var_a = 0.0f64;
+    let mut partial_var_b = 0.0f64;
+
+    // Check every ~200 pixels (cheap check, tight bound)
+    let check_interval = 200.min(n / 4).max(1);
+
+    for (i, &(va, vb)) in pixels.iter().enumerate() {
+        let da = va - mu_a;
+        let db = vb - mu_b;
+        partial_cov += da * db;
+        partial_var_a += da * da;
+        partial_var_b += db * db;
+
+        if let Some(bail_thresh) = bail_below {
+            if (i + 1) % check_interval == 0 && i + 1 < n {
+                // Cauchy-Schwarz upper bound on remaining covariance
+                let rem_var_a = (total_var_a - partial_var_a).max(0.0);
+                let rem_var_b = (total_var_b - partial_var_b).max(0.0);
+                let max_rem_cov = (rem_var_a * rem_var_b).sqrt();
+                let max_zncc = ((partial_cov + max_rem_cov) / denom) as f32;
+                if max_zncc < bail_thresh {
+                    return max_zncc.clamp(-1.0, 1.0);
+                }
+            }
+        }
+    }
+
+    (partial_cov / denom).clamp(-1.0, 1.0) as f32
 }
 
 /// Windowed ZNCC on grayscale images with a vertical shift applied to b.

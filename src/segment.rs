@@ -897,6 +897,8 @@ const MIN_WORD_LEN: usize = 3;
 
 /// Per-word segmentation data retained for lazy bigram cropping.
 pub struct WordSeg {
+    /// Index of the originating word in the input `words` slice (i.e. line.words).
+    pub source_word_idx: usize,
     pub word_img: GrayImage,
     pub chars: Vec<char>,
     pub boundaries: Vec<u32>,
@@ -927,11 +929,12 @@ pub fn segment_line(
     // Crop whole words (reliable bboxes from Tesseract) and split them
     // into individual characters using VP + seam carving.
 
-    let mut sorted: Vec<&WordPlacement> = words
+    let mut sorted: Vec<(usize, &WordPlacement)> = words
         .iter()
-        .filter(|w| w.text.chars().count() >= MIN_WORD_LEN && w.width > 0)
+        .enumerate()
+        .filter(|(_, w)| w.text.chars().count() >= MIN_WORD_LEN && w.width > 0)
         .collect();
-    sorted.sort_by(|a, b| b.text.chars().count().cmp(&a.text.chars().count()));
+    sorted.sort_by(|(_, a), (_, b)| b.text.chars().count().cmp(&a.text.chars().count()));
 
     let mut char_counts: HashMap<char, usize> = HashMap::new();
     let mut word_segs: Vec<WordSeg> = Vec::new();
@@ -939,7 +942,7 @@ pub fn segment_line(
     let mut any_ligatures = false;
     let mut words_with_ligatures: HashSet<usize> = HashSet::new();
 
-    for (word_idx, word) in sorted.iter().enumerate() {
+    for (word_idx, &(orig_idx, word)) in sorted.iter().enumerate() {
         let chars_in_word: Vec<char> = word.text.chars().filter(|c| is_supported(*c)).collect();
         if chars_in_word.is_empty() {
             continue;
@@ -1007,6 +1010,7 @@ pub fn segment_line(
         }
 
         word_segs.push(WordSeg {
+            source_word_idx: orig_idx,
             word_img: word_img.clone(),
             chars: all_chars.clone(),
             boundaries: bounds_plain.clone(),
@@ -1026,6 +1030,7 @@ pub fn segment_line(
             };
 
             lig_word_segs.push(WordSeg {
+                source_word_idx: orig_idx,
                 word_img: word_img.clone(),
                 chars: lig_chars,
                 boundaries: bounds_lig,
@@ -1040,6 +1045,7 @@ pub fn segment_line(
         for (idx, seg) in word_segs.iter().enumerate() {
             if !words_with_ligatures.contains(&idx) {
                 lig_word_segs.push(WordSeg {
+                    source_word_idx: seg.source_word_idx,
                     word_img: seg.word_img.clone(),
                     chars: seg.chars.clone(),
                     boundaries: seg.boundaries.clone(),

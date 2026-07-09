@@ -131,7 +131,8 @@ impl NgramGlyphMap {
         if let Some(parent) = path.parent() {
             std::fs::create_dir_all(parent)?;
         }
-        let f = std::fs::File::create(path)?;
+        let tmp = crate::atomic_file::tmp_for(path);
+        let f = std::fs::File::create(&tmp)?;
         let mut w = BufWriter::new(f);
 
         w.write_all(b"NGMP")?;
@@ -159,43 +160,34 @@ impl NgramGlyphMap {
             }
         }
         w.flush()?;
+        drop(w);
+        std::fs::rename(&tmp, path)?;
         self.dirty = false;
         Ok(())
     }
 
     pub fn load(path: &Path) -> Result<Self, String> {
-        let data = std::fs::read(path)
-            .map_err(|e| format!("read {}: {e}", path.display()))?;
+        let file = std::fs::File::open(path)
+            .map_err(|e| format!("open {}: {e}", path.display()))?;
+        let data = unsafe { memmap2::Mmap::map(&file) }
+            .map_err(|e| format!("mmap {}: {e}", path.display()))?;
         if data.len() < 20 { return Err("NGMP too small".into()); }
         if &data[0..4] != b"NGMP" {
             return Err(format!("bad magic: {:?} (expected NGMP)", &data[0..4]));
         }
         let version = u32::from_le_bytes(data[4..8].try_into().unwrap());
-        if version < 1 || version > 3 {
-            return Err(format!("unsupported NGMP version: {version} (expected 1, 2, or 3)"));
+        if version != 3 {
+            return Err(format!("NGMP version {version}, need v3 — rebuild required"));
         }
-        let has_hashes = version >= 3;
         let catalog_hash = u64::from_le_bytes(data[8..16].try_into().unwrap());
 
-        // v1: global seq_len at offset 16, n_entries at 20
-        // v2/v3: n_entries at offset 16, per-entry seq_len
-        let (global_seq_len, n_entries, mut pos) = if version == 1 {
-            let sl = u32::from_le_bytes(data[16..20].try_into().unwrap()) as usize;
-            if data.len() < 24 { return Err("NGMP v1 too small".into()); }
-            let ne = u32::from_le_bytes(data[20..24].try_into().unwrap()) as usize;
-            (Some(sl), ne, 24)
-        } else {
-            let ne = u32::from_le_bytes(data[16..20].try_into().unwrap()) as usize;
-            (None, ne, 20)
-        };
+        // v3: n_entries at offset 16, per-entry seq_len, with hashes
+        let n_entries = u32::from_le_bytes(data[16..20].try_into().unwrap()) as usize;
+        let mut pos = 20;
         let mut groups = HashMap::with_capacity(n_entries);
 
         for _ in 0..n_entries {
-            let seq_len = if let Some(sl) = global_seq_len {
-                sl
-            } else {
-                read_u32(&data, &mut pos)? as usize
-            };
+            let seq_len = read_u32(&data, &mut pos)? as usize;
             if seq_len == 0 || seq_len > 16 {
                 return Err(format!("invalid seq_len: {seq_len}"));
             }
@@ -209,7 +201,7 @@ impl NgramGlyphMap {
             let n_groups = read_u32(&data, &mut pos)? as usize;
             let mut entry_groups = Vec::with_capacity(n_groups);
             for _ in 0..n_groups {
-                let hash = if has_hashes { read_u64(&data, &mut pos)? } else { 0 };
+                let hash = read_u64(&data, &mut pos)?;
                 let n_fonts = read_u32(&data, &mut pos)? as usize;
                 let mut font_keys = Vec::with_capacity(n_fonts);
                 for _ in 0..n_fonts {

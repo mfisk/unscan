@@ -5,7 +5,7 @@
 //! for catching fonts whose proportions don't match the original.
 
 use ab_glyph::{Font, FontRef, PxScale, ScaleFont};
-use image::{GrayImage, Luma};
+use image::{GrayImage, Luma, RgbImage, Rgb};
 use crate::ocr::TextRegion;
 
 // ---------------------------------------------------------------------------
@@ -69,8 +69,8 @@ pub struct VerifyResult {
     pub dy: i32,
     /// Ink-cropped render image (for display).
     pub render_ink: Option<GrayImage>,
-    /// Absolute-difference image: scan vs ink-cropped render (for display).
-    pub diff: Option<GrayImage>,
+    /// Colored diff image: red = scan-only ink, blue = render-only ink, white = agreement.
+    pub diff: Option<RgbImage>,
 }
 
 /// Verify a vectorised text region by:
@@ -138,7 +138,7 @@ pub fn verify_text_region(
         full_render
     };
 
-    let diff = compute_abs_diff(scan_crop, &render_ink);
+    let diff = compute_colored_diff(scan_crop, &render_ink);
 
     // Save audit images if requested.
     if let Some(audit_path) = audit_dir {
@@ -150,21 +150,29 @@ pub fn verify_text_region(
     VerifyResult { score, dy, render_ink: Some(render_ink), diff: Some(diff) }
 }
 
-/// Compute absolute pixel difference between two grayscale images.
+/// Colored diff: red = scan-only ink, blue = render-only ink, white = agreement.
 /// Images are resized to match dimensions if needed (using the scan crop size).
-pub fn compute_abs_diff(a: &GrayImage, b: &GrayImage) -> GrayImage {
+pub fn compute_colored_diff(a: &GrayImage, b: &GrayImage) -> RgbImage {
     let (aw, ah) = a.dimensions();
     let b_resized = if b.dimensions() != (aw, ah) {
         image::imageops::resize(b, aw, ah, image::imageops::FilterType::Lanczos3)
     } else {
         b.clone()
     };
-    let mut diff = GrayImage::new(aw, ah);
+    let ink_thresh: u8 = 180;
+    let mut diff = RgbImage::new(aw, ah);
     for y in 0..ah {
         for x in 0..aw {
-            let pa = a.get_pixel(x, y).0[0] as i16;
-            let pb = b_resized.get_pixel(x, y).0[0] as i16;
-            diff.put_pixel(x, y, Luma([(pa - pb).unsigned_abs() as u8]));
+            let pa = a.get_pixel(x, y).0[0];
+            let pb = b_resized.get_pixel(x, y).0[0];
+            let a_ink = pa < ink_thresh;
+            let b_ink = pb < ink_thresh;
+            let color = match (a_ink, b_ink) {
+                (true, false) => Rgb([220, 30, 30]),   // scan-only: red
+                (false, true) => Rgb([30, 80, 220]),   // render-only: blue
+                _ => Rgb([255, 255, 255]),              // agreement: white
+            };
+            diff.put_pixel(x, y, color);
         }
     }
     diff

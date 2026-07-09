@@ -39,3 +39,14 @@ split-debuginfo = "unpacked"
 [profile.release]
 lto = "fat"
 codegen-units = 1
+
+[dependencies.memmap2]
+version = "0.9"
+
+[dependencies.pprof]
+version = "0.14"
+features = ["flamegraph"]
+optional = true
+
+[features]
+profile = ["pprof"]

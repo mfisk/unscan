@@ -23,8 +23,8 @@ use crate::font_scan;
 
 /// Everything a classifier's `train()` needs from the shared rendering pipeline.
 pub struct TrainingContext<'a> {
-    pub chars: &'a [char],
-    pub char_counts: &'a [usize],
+    pub sequences: &'a [Vec<char>],
+    pub seq_counts: &'a [usize],
     pub font_family: &'a [u32],
     pub font_id_map: &'a HashMap<String, u32>,
     pub glyph_map: &'a crate::glyph_map::NgramGlyphMap,
@@ -40,16 +40,16 @@ pub struct TrainingContext<'a> {
 
 impl<'a> TrainingContext<'a> {
     /// Load all training samples for character index `ci`.
-    pub fn load_samples(&self, ci: usize) -> Vec<TrainingSample> {
-        load_char_combo_samples(self.feat_dir, ci, self.cached_combos, crate::features::AaVariant::all())
+    pub fn load_samples(&self, si: usize) -> Vec<TrainingSample> {
+        load_seq_combo_samples(self.feat_dir, &self.sequences[si], si, self.cached_combos, crate::features::AaVariant::all())
     }
 
     /// Build a glyph_id → family_id mapping for a given character.
     /// Uses the first font in each glyph group to determine the family.
-    pub fn glyph_family_for_char(&self, ch: char) -> Vec<u32> {
-        let n = self.glyph_map.glyph_count(&[ch]);
+    pub fn glyph_family_for_seq(&self, seq: &[char]) -> Vec<u32> {
+        let n = self.glyph_map.glyph_count(seq);
         (0..n).map(|gid| {
-            let fonts = self.glyph_map.fonts_for_glyph(&[ch], gid);
+            let fonts = self.glyph_map.fonts_for_glyph(seq, gid);
             if let Some(fk) = fonts.first() {
                 if let Some(&fid) = self.font_id_map.get(fk.as_str()) {
                     return self.font_family[fid as usize];
@@ -436,20 +436,27 @@ pub fn jacobi_eigen_top_k(mat: &[f64], n: usize, k: usize) -> Vec<f64> {
 }
 
 /// Load per-character samples from multiple (height, aa) combo files.
-pub fn load_char_combo_samples(
+/// Codepoint-based key for a sequence. E.g. ['A'] → "0041", ['h','e'] → "0068_0065".
+pub fn seq_key(seq: &[char]) -> String {
+    seq.iter().map(|c| format!("{:04X}", *c as u32)).collect::<Vec<_>>().join("_")
+}
+
+pub fn load_seq_combo_samples(
     feat_dir: &std::path::Path,
-    ci: usize,
-    combos: &[(u32, usize, Vec<usize>)], // (ht, aa_idx, per-char counts)
+    seq: &[char],
+    si: usize,
+    combos: &[(u32, usize, Vec<usize>)], // (ht, aa_idx, per-seq counts)
     all_aa: &[AaVariant],
 ) -> Vec<TrainingSample> {
-    let total: usize = combos.iter().map(|(_, _, counts)| counts[ci]).sum();
+    let total: usize = combos.iter().map(|(_, _, counts)| counts[si]).sum();
     let mut samples = Vec::with_capacity(total);
     let mut buf4 = [0u8; 4];
+    let sk = seq_key(seq);
     for (ht, aa_idx, counts) in combos {
-        let n = counts[ci];
+        let n = counts[si];
         if n == 0 { continue; }
         let aa_name = all_aa[*aa_idx].name();
-        let path = feat_dir.join(format!("char_{:04}_h{}_{}.bin", ci, ht, aa_name));
+        let path = feat_dir.join(format!("{}_h{}_{}.bin", sk, ht, aa_name));
         let file = std::fs::File::open(&path).expect("open combo feature file");
         let mut reader = BufReader::with_capacity(256 * 1024, file);
         // Read and validate header
@@ -595,11 +602,11 @@ pub fn eval_mrr(
 
 /// Select up to `max_eval` evaluation indices, subsampling with a deterministic
 /// seed derived from the character.
-pub fn subsample_eval(n: usize, max_eval: usize, c: char) -> Vec<usize> {
+pub fn subsample_eval(n: usize, max_eval: usize, seed: u64) -> Vec<usize> {
     if n <= max_eval {
         (0..n).collect()
     } else {
-        let mut rng = SmallRng::seed_from_u64(c as u64);
+        let mut rng = SmallRng::seed_from_u64(seed);
         let mut idx: Vec<usize> = (0..n).collect();
         idx.shuffle(&mut rng);
         idx.truncate(max_eval);
@@ -660,8 +667,16 @@ pub fn run_train(mut args: TrainArgs) {
         eprintln!("  Limiting to {} fonts (--max-fonts)", args.max_fonts);
     }
 
-    let chars: &[char] = features::supported_chars();
-    eprintln!("  {} indexed characters", chars.len());
+    // Build unified sequence list: unigrams + bigrams, all using the same code path.
+    let sequences: Vec<Vec<char>> = {
+        let mut seqs: Vec<Vec<char>> = features::supported_chars().iter().map(|&c| vec![c]).collect();
+        seqs.extend(features::supported_sequences(2).iter().cloned());
+        seqs
+    };
+    eprintln!("  {} sequences ({} unigrams + {} bigrams)",
+        sequences.len(),
+        features::supported_chars().len(),
+        features::supported_sequences(2).len());
 
     // ── 2. Render & extract features ──────────────────────────────
     // Write per-char binary feature files to disk to avoid OOM.
@@ -707,10 +722,10 @@ pub fn run_train(mut args: TrainArgs) {
         n_families, multi_variant_families);
 
     let chunk_size = 200;
-    let n_chars = chars.len();
+    let n_seqs = sequences.len();
 
-    let char_to_idx: HashMap<char, usize> = chars.iter().enumerate()
-        .map(|(i, &c)| (c, i))
+    let seq_to_idx: HashMap<Vec<char>, usize> = sequences.iter().enumerate()
+        .map(|(i, seq)| (seq.clone(), i))
         .collect();
 
     // Training feature cache directory.
@@ -737,7 +752,7 @@ pub fn run_train(mut args: TrainArgs) {
         let prewarm_done = AtomicUsize::new(0);
         let prewarm_total = catalog.len();
         eprintln!("\nPre-warming character render cache + building GlyphMap ({} fonts × {} chars)...",
-            prewarm_total, chars.len());
+            prewarm_total, sequences.len());
         let prewarm_t0 = std::time::Instant::now();
 
         // Each font returns Vec<(Vec<char>, hash, font_key)> for GlyphMap construction
@@ -764,21 +779,22 @@ pub fn run_train(mut args: TrainArgs) {
             };
             let overrides = fe.glyph_overrides.as_deref();
             let fk = fe.font_key();
-            let mut hashes = Vec::with_capacity(chars.len());
-            for &c in chars {
-                let gid_override = overrides
-                    .and_then(|ovs| ovs.iter().find(|(ch, _)| *ch == c).map(|(_, g)| ab_glyph::GlyphId(*g)));
+            let mut hashes = Vec::with_capacity(sequences.len());
+            for seq in &sequences {
+                let gid_overrides: Vec<Option<ab_glyph::GlyphId>> = seq.iter().map(|c| {
+                    overrides.and_then(|ovs| ovs.iter().find(|(ch, _)| *ch == *c).map(|(_, g)| ab_glyph::GlyphId(*g)))
+                }).collect();
                 let params = crate::char_render::RenderParams::default();
-                if let Some(img) = crate::char_render::render_ngram_fresh(&font, &[c], &[gid_override], &params) {
+                if let Some(img) = crate::char_render::render_ngram_fresh(&font, seq, &gid_overrides, &params) {
                     let hash = crate::glyph_map::hash_image(&img);
-                    let path = crate::char_render::ngram_cache_path(&[c], hash, &params);
+                    let path = crate::char_render::ngram_cache_path(seq, hash, &params);
                     if !path.exists() {
                         if let Some(parent) = path.parent() {
                             let _ = std::fs::create_dir_all(parent);
                         }
                         let _ = img.save(&path);
                     }
-                    hashes.push((vec![c], hash, fk.clone()));
+                    hashes.push((seq.clone(), hash, fk.clone()));
                 }
             }
             let done = prewarm_done.fetch_add(1, Ordering::Relaxed) + 1;
@@ -802,7 +818,7 @@ pub fn run_train(mut args: TrainArgs) {
             .filter(|g| g.font_keys.len() > 1)
             .map(|g| g.font_keys.len() - 1)
             .sum();
-        eprintln!("  GlyphMap: {} unique glyphs across {} chars ({} duplicate renders eliminated)",
+        eprintln!("  GlyphMap: {} unique glyphs across {} sequences ({} duplicate renders eliminated)",
             total_glyphs, gmap.groups.len(), total_deduped);
         eprintln!("  Pre-warm + GlyphMap complete in {:.1}s", prewarm_t0.elapsed().as_secs_f64());
         gmap
@@ -813,9 +829,15 @@ pub fn run_train(mut args: TrainArgs) {
     let _all_heights: &[u32] = &args.heights;
     let all_aa: &[AaVariant] = AaVariant::all();
 
-    /// File path for a (char, height, aa) feature file.
-    fn combo_path(feat_dir: &std::path::Path, ci: usize, ht: u32, aa_name: &str) -> std::path::PathBuf {
-        feat_dir.join(format!("char_{:04}_h{}_{}.bin", ci, ht, aa_name))
+    /// Build a stable codepoint-based key for a character sequence.
+    /// E.g. ['A'] → "0041", ['h','e'] → "0068_0065".
+    fn seq_key(seq: &[char]) -> String {
+        seq.iter().map(|c| format!("{:04X}", *c as u32)).collect::<Vec<_>>().join("_")
+    }
+
+    /// File path for a (sequence, height, aa) feature file.
+    fn combo_path(feat_dir: &std::path::Path, seq: &[char], ht: u32, aa_name: &str) -> std::path::PathBuf {
+        feat_dir.join(format!("{}_h{}_{}.bin", seq_key(seq), ht, aa_name))
     }
 
     /// Manifest path for a (height, aa) combo.
@@ -823,24 +845,39 @@ pub fn run_train(mut args: TrainArgs) {
         feat_dir.join(format!("manifest_h{}_{}.txt", ht, aa_name))
     }
 
-    // A combo is cached if its manifest exists, matches the font count, and all char files exist.
+    // A combo is cached if its manifest exists, matches the font count, all
+    // char files exist, and the manifest is not older than the font scan cache
+    // (font key changes invalidate glyph IDs stored in the feature files).
+    let scan_cache_mtime = std::fs::metadata(crate::font_scan::scan_cache_path())
+        .and_then(|m| m.modified())
+        .ok();
     let combo_cached = |ht: u32, aa_idx: usize| -> Option<Vec<usize>> {
         let aa_name = all_aa[aa_idx].name();
         let mpath = manifest_combo_path(&feat_dir, ht, aa_name);
+        // Reject if manifest is older than font scan cache — glyph IDs may be stale
+        if let Some(scan_t) = scan_cache_mtime {
+            if let Ok(meta) = std::fs::metadata(&mpath) {
+                if let Ok(manifest_t) = meta.modified() {
+                    if manifest_t < scan_t {
+                        return None;
+                    }
+                }
+            }
+        }
         let content = std::fs::read_to_string(&mpath).ok()?;
         let mut lines = content.lines();
         let header = lines.next()?;
-        if header.trim() != format!("fonts={} chars={}", catalog.len(), n_chars) {
+        if header.trim() != format!("fonts={} seqs={}", catalog.len(), n_seqs) {
             return None;
         }
-        let mut counts = Vec::with_capacity(n_chars);
+        let mut counts = Vec::with_capacity(n_seqs);
         for line in lines {
             counts.push(line.trim().parse::<usize>().ok()?);
         }
-        if counts.len() != n_chars { return None; }
+        if counts.len() != n_seqs { return None; }
         // Verify all files exist
-        for ci in 0..n_chars {
-            if !combo_path(&feat_dir, ci, ht, aa_name).exists() { return None; }
+        for si in 0..n_seqs {
+            if !combo_path(&feat_dir, &sequences[si], ht, aa_name).exists() { return None; }
         }
         Some(counts)
     };
@@ -874,19 +911,26 @@ pub fn run_train(mut args: TrainArgs) {
         // Open writers: indexed by (ci, combo_index)
         // combo_index is position in needed_combos
         let n_combos = needed_combos.len();
-        let mut combo_writers: Vec<Vec<BufWriter<std::fs::File>>> = (0..n_chars).map(|ci| {
-            needed_combos.iter().map(|&(ht, aa_idx)| {
+        let mut combo_tmp_paths: Vec<Vec<(std::path::PathBuf, std::path::PathBuf)>> = Vec::new();
+        let mut combo_writers: Vec<Vec<BufWriter<std::fs::File>>> = (0..n_seqs).map(|si| {
+            let mut paths_row = Vec::new();
+            let writers: Vec<_> = needed_combos.iter().map(|&(ht, aa_idx)| {
                 let aa_name = all_aa[aa_idx].name();
-                let path = combo_path(&feat_dir, ci, ht, aa_name);
-                BufWriter::with_capacity(
+                let final_path = combo_path(&feat_dir, &sequences[si], ht, aa_name);
+                let tmp_path = crate::atomic_file::tmp_for(&final_path);
+                let w = BufWriter::with_capacity(
                     64 * 1024,
-                    std::fs::File::create(&path).expect("create combo feature file"),
-                )
-            }).collect()
+                    std::fs::File::create(&tmp_path).expect("create combo feature file"),
+                );
+                paths_row.push((tmp_path, final_path));
+                w
+            }).collect();
+            combo_tmp_paths.push(paths_row);
+            writers
         }).collect();
 
         // Per-combo per-char counts
-        let mut combo_counts: Vec<Vec<usize>> = vec![vec![0usize; n_chars]; n_combos];
+        let mut combo_counts: Vec<Vec<usize>> = vec![vec![0usize; n_seqs]; n_combos];
 
         for chunk_start in (0..catalog.len()).step_by(chunk_size) {
             let chunk_end = (chunk_start + chunk_size).min(catalog.len());
@@ -913,12 +957,10 @@ pub fn run_train(mut args: TrainArgs) {
                 let overrides = fe.glyph_overrides.as_deref();
                 let mut samples = Vec::new();
 
-                for &c in chars {
-                    let ci = char_to_idx[&c];
-
-                    // Look up this font's glyph_id for this char.
-                    // If the font didn't render this char (not in GlyphMap), skip.
-                    let glyph_id = match glyph_map.glyph_id_for_font(&[c], &fk) {
+                for (si, seq) in sequences.iter().enumerate() {
+                    // Look up this font's glyph_id for this sequence.
+                    // If the font didn't render it (not in GlyphMap), skip.
+                    let glyph_id = match glyph_map.glyph_id_for_font(seq, &fk) {
                         Some(id) => id as u32,
                         None => continue,
                     };
@@ -926,20 +968,21 @@ pub fn run_train(mut args: TrainArgs) {
                     // Skip if we're not the representative font for this glyph group.
                     // All fonts in a group produce identical renders → identical features,
                     // so we only need one sample per glyph_id per combo.
-                    let rep_font = &glyph_map.fonts_for_glyph(&[c], glyph_id as usize)[0];
+                    let rep_font = &glyph_map.fonts_for_glyph(seq, glyph_id as usize)[0];
                     if *rep_font != fk {
                         continue;
                     }
 
-                    let gid_override = overrides
-                        .and_then(|ovs| ovs.iter().find(|(ch, _)| *ch == c).map(|(_, g)| ab_glyph::GlyphId(*g)));
+                    let gid_overrides: Vec<Option<ab_glyph::GlyphId>> = seq.iter().map(|c| {
+                        overrides.and_then(|ovs| ovs.iter().find(|(ch, _)| *ch == *c).map(|(_, g)| ab_glyph::GlyphId(*g)))
+                    }).collect();
 
                     for &(ht, aa_idx_all) in &needed_combos {
                         let mut params = args.render_params.clone();
                         params.height = ht;
                         params.aa = all_aa[aa_idx_all];
                         let img = match crate::char_render::render_ngram_fresh(
-                            &font, &[c], &[gid_override], &params,
+                            &font, seq, &gid_overrides, &params,
                         ) {
                             Some(img) => img,
                             None => continue,
@@ -954,7 +997,7 @@ pub fn run_train(mut args: TrainArgs) {
                             .position(|&(h, a)| h == ht && a == aa_idx_all)
                             .unwrap();
 
-                        samples.push((ci, combo_idx, TrainingSample {
+                        samples.push((si, combo_idx, TrainingSample {
                             glyph_id,
                             features: feats.as_slice(),
                         }));
@@ -971,10 +1014,10 @@ pub fn run_train(mut args: TrainArgs) {
 
             // Write chunk results to per-combo per-char files
             for font_samples in chunk_results {
-                for (ci, combo_idx, sample) in font_samples {
-                    let w = &mut combo_writers[ci][combo_idx];
+                for (si, combo_idx, sample) in font_samples {
+                    let w = &mut combo_writers[si][combo_idx];
                     // Write header on first sample
-                    if combo_counts[combo_idx][ci] == 0 {
+                    if combo_counts[combo_idx][si] == 0 {
                         use std::io::Write;
                         w.write_all(b"UTFD").expect("write magic");        // Unprint Training Feature Data
                         w.write_all(&1u32.to_le_bytes()).expect("write version");
@@ -984,29 +1027,36 @@ pub fn run_train(mut args: TrainArgs) {
                     for &f in &sample.features {
                         w.write_all(&f.to_le_bytes()).expect("write feature");
                     }
-                    combo_counts[combo_idx][ci] += 1;
+                    combo_counts[combo_idx][si] += 1;
                 }
             }
         }
 
-        // Flush and close all writers
+        // Flush, close, and atomically rename all writers
         for char_ws in &mut combo_writers {
             for w in char_ws {
                 w.flush().expect("flush combo features");
             }
         }
         drop(combo_writers);
+        for paths_row in &combo_tmp_paths {
+            for (tmp, final_path) in paths_row {
+                std::fs::rename(tmp, final_path).expect("atomic rename combo feature");
+            }
+        }
 
         // Write per-combo manifests
         for (combo_idx, &(ht, aa_idx)) in needed_combos.iter().enumerate() {
             let aa_name = all_aa[aa_idx].name();
             let mpath = manifest_combo_path(&feat_dir, ht, aa_name);
-            let mut manifest = format!("fonts={} chars={}", catalog.len(), n_chars);
-            for ci in 0..n_chars {
+            let tmp_mpath = crate::atomic_file::tmp_for(&mpath);
+            let mut manifest = format!("fonts={} seqs={}", catalog.len(), n_seqs);
+            for ci in 0..n_seqs {
                 manifest.push('\n');
                 manifest.push_str(&combo_counts[combo_idx][ci].to_string());
             }
-            std::fs::write(&mpath, &manifest).expect("write combo manifest");
+            std::fs::write(&tmp_mpath, &manifest).expect("write combo manifest");
+            std::fs::rename(&tmp_mpath, &mpath).expect("atomic rename manifest");
         }
 
         let rendered_samples: usize = combo_counts.iter().flat_map(|c| c.iter()).sum();
@@ -1022,13 +1072,13 @@ pub fn run_train(mut args: TrainArgs) {
     }
 
     // ── Load aggregate char_counts from all active combos ────────
-    let mut char_counts = vec![0usize; n_chars];
+    let mut seq_counts = vec![0usize; n_seqs];
     for (_, _, ref counts) in &cached_combos {
-        for ci in 0..n_chars {
-            char_counts[ci] += counts[ci];
+        for si in 0..n_seqs {
+            seq_counts[si] += counts[si];
         }
     }
-    let total_samples: usize = char_counts.iter().sum();
+    let total_samples: usize = seq_counts.iter().sum();
     eprintln!("Total samples for evaluation: {} ({} combos)", total_samples, cached_combos.len());
 
 
@@ -1036,8 +1086,8 @@ pub fn run_train(mut args: TrainArgs) {
     if args.fisher {
         let _ = std::fs::remove_file(&args.output); // force retrain
         let ctx = TrainingContext {
-            chars: &chars,
-            char_counts: &char_counts,
+            sequences: &sequences,
+            seq_counts: &seq_counts,
             font_family: &font_family,
             font_id_map: &font_id_map,
             glyph_map: &glyph_map,
@@ -1058,8 +1108,8 @@ pub fn run_train(mut args: TrainArgs) {
     // ── 3b. Mahalanobis mode ─────────────────────────────────────
     if args.mahalanobis {
         let ctx = TrainingContext {
-            chars,
-            char_counts: &char_counts,
+            sequences: &sequences,
+            seq_counts: &seq_counts,
             font_family: &font_family,
             font_id_map: &font_id_map,
             glyph_map: &glyph_map,
@@ -1079,8 +1129,8 @@ pub fn run_train(mut args: TrainArgs) {
     // ── 3c. LDA mode ─────────────────────────────────────────────
     if args.lda {
         let ctx = TrainingContext {
-            chars,
-            char_counts: &char_counts,
+            sequences: &sequences,
+            seq_counts: &seq_counts,
             font_family: &font_family,
             font_id_map: &font_id_map,
             glyph_map: &glyph_map,
@@ -1095,23 +1145,14 @@ pub fn run_train(mut args: TrainArgs) {
         };
         classifier::LdaClassifier::train_with_params(&ctx, &args.output, args.lda_dims, args.lda_reg);
 
-        // ── Bigram training (extends the model written above) ─────────
-        eprintln!("\n=== Bigram classifier training ===");
-        crate::ngram::build_ngram_glyph_map(&catalog, &mut glyph_map);
-        crate::ngram::generate_ngram_training_data(&catalog, &glyph_map, &args.render_params);
-        crate::ngram::train_ngram_lda(
-            &glyph_map, &font_id_map, &font_family, &args.output,
-            args.lda_dims, args.lda_reg,
-        );
-
         return;
     }
 
     // ── 3d. MLP mode ─────────────────────────────────────────────
     if args.mlp {
         let ctx = TrainingContext {
-            chars,
-            char_counts: &char_counts,
+            sequences: &sequences,
+            seq_counts: &seq_counts,
             font_family: &font_family,
             font_id_map: &font_id_map,
             glyph_map: &glyph_map,
@@ -1134,8 +1175,8 @@ pub fn run_train(mut args: TrainArgs) {
 
     // ── 3. Train per-character triplet networks ─────────────────────
         let ctx = TrainingContext {
-            chars,
-            char_counts: &char_counts,
+            sequences: &sequences,
+            seq_counts: &seq_counts,
             font_family: &font_family,
             font_id_map: &font_id_map,
             glyph_map: &glyph_map,
@@ -1424,8 +1465,8 @@ mod tests {
 // pipeline without tying callers to the training module's lifetimes.
 
 pub struct RuntimeTrainingData {
-    pub chars: &'static [char],
-    pub char_counts: Vec<usize>,
+    pub sequences: Vec<Vec<char>>,
+    pub seq_counts: Vec<usize>,
     pub font_family: Vec<u32>,
     pub font_id_map: HashMap<String, u32>,
     pub n_families: usize,
@@ -1445,8 +1486,12 @@ impl RuntimeTrainingData {
         glyph_map: &crate::glyph_map::NgramGlyphMap,
         render_params: &crate::char_render::RenderParams,
     ) -> Option<Self> {
-        let chars = crate::features::supported_chars();
-        let n_chars = chars.len();
+        let sequences: Vec<Vec<char>> = {
+            let mut seqs: Vec<Vec<char>> = crate::features::supported_chars().iter().map(|&c| vec![c]).collect();
+            seqs.extend(crate::features::supported_sequences(2).iter().cloned());
+            seqs
+        };
+        let n_seqs = sequences.len();
 
         // Get sorted catalog (same order as training)
         let mut catalog: Vec<crate::font_scan::FontEntry> = font_registry.iter()
@@ -1499,12 +1544,12 @@ impl RuntimeTrainingData {
                 if let Ok(content) = std::fs::read_to_string(&mpath) {
                     let mut lines = content.lines();
                     if let Some(header) = lines.next() {
-                        let expected = format!("fonts={} chars={}", catalog.len(), n_chars);
+                        let expected = format!("fonts={} seqs={}", catalog.len(), n_seqs);
                         if header.trim() == expected {
                             let counts: Vec<usize> = lines
                                 .filter_map(|l| l.trim().parse::<usize>().ok())
                                 .collect();
-                            if counts.len() == n_chars {
+                            if counts.len() == n_seqs {
                                 cached_combos.push((ht, aa_idx, counts));
                             }
                         }
@@ -1516,16 +1561,16 @@ impl RuntimeTrainingData {
         if cached_combos.is_empty() { return None; }
 
         // Build char_counts from cached_combos
-        let mut char_counts = vec![0usize; n_chars];
+        let mut seq_counts = vec![0usize; n_seqs];
         for (_, _, counts) in &cached_combos {
-            for (ci, &c) in counts.iter().enumerate() {
-                char_counts[ci] += c;
+            for (si, &cnt) in counts.iter().enumerate() {
+                seq_counts[si] += cnt;
             }
         }
 
         Some(RuntimeTrainingData {
-            chars,
-            char_counts,
+            sequences,
+            seq_counts,
             font_family,
             font_id_map,
             n_families,
@@ -1541,8 +1586,8 @@ impl RuntimeTrainingData {
     /// Borrow as a TrainingContext for use with per-font classifier training.
     pub fn as_context<'a>(&'a self, glyph_map: &'a crate::glyph_map::NgramGlyphMap) -> TrainingContext<'a> {
         TrainingContext {
-            chars: self.chars,
-            char_counts: &self.char_counts,
+            sequences: &self.sequences,
+            seq_counts: &self.seq_counts,
             font_family: &self.font_family,
             font_id_map: &self.font_id_map,
             glyph_map,

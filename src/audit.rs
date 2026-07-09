@@ -120,6 +120,17 @@ pub struct ObservationVote {
     /// Distance of the best alternative character.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub best_alt_dist: Option<f32>,
+    /// Per-font LDA top-1 predicted character.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub pflda_top_char: Option<char>,
+    /// Per-font LDA probability of top-1 prediction.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub pflda_top_p: Option<f32>,
+    /// Per-font LDA probability of the OCR character.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub pflda_ocr_p: Option<f32>,
+    /// Whether pflda correction gate fired and replaced the OCR char.
+    pub pflda_replaced: bool,
     /// 1-based rank of the ground-truth font among all fonts for this
     /// character, sorted by probability (1 = highest).  `None` when GT font
     /// is unknown or not in the index for this character.

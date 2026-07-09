@@ -166,7 +166,8 @@ impl FontRegistry {
         if let Some(parent) = path.parent() {
             std::fs::create_dir_all(parent)?;
         }
-        let f = std::fs::File::create(path)?;
+        let tmp = crate::atomic_file::tmp_for(path);
+        let f = std::fs::File::create(&tmp)?;
         let mut w = BufWriter::new(f);
 
         w.write_all(b"FONT")?;
@@ -181,6 +182,8 @@ impl FontRegistry {
             w.write_all(key.as_bytes())?;
         }
         w.flush()?;
+        drop(w);
+        std::fs::rename(&tmp, path)?;
         Ok(())
     }
 }
@@ -239,12 +242,51 @@ pub fn default_font_dirs(extra: &[PathBuf]) -> Vec<PathBuf> {
     dirs
 }
 
-/// Walk the given directories for .ttf / .otf files and return a catalogue.
-pub fn scan_fonts(dirs: &[PathBuf]) -> Vec<FontEntry> {
-    let aliases = build_alias_table();
-    let mut fonts = Vec::new();
-    let mut seen_paths: std::collections::HashSet<PathBuf> = std::collections::HashSet::new();
 
+// ---------------------------------------------------------------------------
+// Font scan cache (FSCN)
+// ---------------------------------------------------------------------------
+//
+// Caches the output of scan_fonts() so subsequent runs skip the expensive
+// per-font-file parsing (OT feature detection, ligature probing, weight
+// instance enumeration).  Invalidation is by a content fingerprint: the
+// sorted list of canonical paths for every .ttf/.otf
+// in the scanned directories, hashed together.
+//
+// Format:
+//   magic:       b"FSCN"          (4 bytes)
+//   version:     u32 le           (currently 1)
+//   fingerprint: u64 le           (directory content hash)
+//   n_entries:   u32 le
+//   per entry:
+//     path_len:           u32 le + [u8; path_len]
+//     family_name_len:    u32 le + [u8; family_name_len]
+//     postscript_name_len:u32 le + [u8; postscript_name_len]
+//     raw_ps_name_len:    u32 le + [u8; raw_ps_name_len]
+//     is_bold:            u8
+//     is_italic:          u8
+//     class:              u8  (0=Serif, 1=Sans, 2=Mono, 3=Unknown)
+//     oldstyle_figures:   u8
+//     variant_tag_len:    u32 le + [u8; variant_tag_len]
+//     n_overrides:        u32 le  (0xFFFFFFFF = None)
+//       per override:     u32 le (char) + u16 le (glyph_id)
+//     n_variations:       u32 le  (0xFFFFFFFF = None)
+//       per variation:    [u8; 4] (axis tag) + f32 le
+//     typographic_family_len: u32 le + [u8; typographic_family_len]
+
+const FSCN_MAGIC: &[u8; 4] = b"FSCN";
+const FSCN_VERSION: u32 = 2;
+
+pub(crate) fn scan_cache_path() -> PathBuf {
+    let home = std::env::var("HOME").unwrap_or_else(|_| ".".to_string());
+    PathBuf::from(home).join(".cache").join("unprint").join("font_scan.bin")
+}
+
+/// Walk font directories and return deduplicated, sorted canonical paths
+/// for all .ttf/.otf files.
+fn collect_font_paths(dirs: &[PathBuf]) -> Vec<PathBuf> {
+    let mut seen: std::collections::HashSet<PathBuf> = std::collections::HashSet::new();
+    let mut paths: Vec<PathBuf> = Vec::new();
     for dir in dirs {
         if !dir.exists() {
             continue;
@@ -255,20 +297,324 @@ pub fn scan_fonts(dirs: &[PathBuf]) -> Vec<FontEntry> {
             .filter_map(|e| e.ok())
         {
             let path = entry.path();
-            let ext = path
-                .extension()
+            let ext = path.extension()
                 .and_then(|e| e.to_str())
                 .unwrap_or("")
                 .to_lowercase();
             if ext != "ttf" && ext != "otf" {
                 continue;
             }
-            // Canonicalize to avoid duplicates from overlapping dir walks
             let canon = path.canonicalize().unwrap_or_else(|_| path.to_path_buf());
-            if !seen_paths.insert(canon) {
-                continue;
+            if seen.insert(canon.clone()) {
+                paths.push(canon);
             }
-            if let Some(fe) = load_font_entry(path, &aliases) {
+        }
+    }
+    paths.sort();
+    paths
+}
+
+fn write_str(w: &mut impl std::io::Write, s: &str) -> std::io::Result<()> {
+    w.write_all(&(s.len() as u32).to_le_bytes())?;
+    w.write_all(s.as_bytes())?;
+    Ok(())
+}
+
+fn read_str(r: &mut &[u8]) -> Option<String> {
+    if r.len() < 4 { return None; }
+    let len = u32::from_le_bytes([r[0], r[1], r[2], r[3]]) as usize;
+    *r = &r[4..];
+    if r.len() < len { return None; }
+    let s = std::str::from_utf8(&r[..len]).ok()?.to_string();
+    *r = &r[len..];
+    Some(s)
+}
+
+fn read_u32(r: &mut &[u8]) -> Option<u32> {
+    if r.len() < 4 { return None; }
+    let v = u32::from_le_bytes([r[0], r[1], r[2], r[3]]);
+    *r = &r[4..];
+    Some(v)
+}
+
+fn read_u16(r: &mut &[u8]) -> Option<u16> {
+    if r.len() < 2 { return None; }
+    let v = u16::from_le_bytes([r[0], r[1]]);
+    *r = &r[2..];
+    Some(v)
+}
+
+fn read_u8(r: &mut &[u8]) -> Option<u8> {
+    if r.is_empty() { return None; }
+    let v = r[0];
+    *r = &r[1..];
+    Some(v)
+}
+
+fn read_f32(r: &mut &[u8]) -> Option<f32> {
+    if r.len() < 4 { return None; }
+    let v = f32::from_le_bytes([r[0], r[1], r[2], r[3]]);
+    *r = &r[4..];
+    Some(v)
+}
+
+fn class_to_u8(c: FontClass) -> u8 {
+    match c {
+        FontClass::Serif => 0,
+        FontClass::Sans => 1,
+        FontClass::Mono => 2,
+        FontClass::Unknown => 3,
+    }
+}
+
+fn u8_to_class(v: u8) -> FontClass {
+    match v {
+        0 => FontClass::Serif,
+        1 => FontClass::Sans,
+        2 => FontClass::Mono,
+        _ => FontClass::Unknown,
+    }
+}
+
+fn write_scan_cache(path: &Path, entries: &[FontEntry]) -> std::io::Result<()> {
+    use std::io::{BufWriter, Write};
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent)?;
+    }
+    let tmp = crate::atomic_file::tmp_for(path);
+    let f = std::fs::File::create(&tmp)?;
+    let mut w = BufWriter::new(f);
+
+    w.write_all(FSCN_MAGIC)?;
+    w.write_all(&FSCN_VERSION.to_le_bytes())?;
+    w.write_all(&(entries.len() as u32).to_le_bytes())?;
+
+    for e in entries {
+        // path (as UTF-8 lossy)
+        write_str(&mut w, &e.path.to_string_lossy())?;
+        write_str(&mut w, &e.family_name)?;
+        write_str(&mut w, &e.postscript_name)?;
+        write_str(&mut w, &e.raw_postscript_name)?;
+        w.write_all(&[e.is_bold as u8])?;
+        w.write_all(&[e.is_italic as u8])?;
+        w.write_all(&[class_to_u8(e.class)])?;
+        w.write_all(&[e.oldstyle_figures as u8])?;
+        write_str(&mut w, &e.variant_tag)?;
+
+        // glyph_overrides
+        match &e.glyph_overrides {
+            None => w.write_all(&0xFFFF_FFFFu32.to_le_bytes())?,
+            Some(ov) => {
+                w.write_all(&(ov.len() as u32).to_le_bytes())?;
+                for &(ch, gid) in ov {
+                    w.write_all(&(ch as u32).to_le_bytes())?;
+                    w.write_all(&gid.to_le_bytes())?;
+                }
+            }
+        }
+
+        // variations
+        match &e.variations {
+            None => w.write_all(&0xFFFF_FFFFu32.to_le_bytes())?,
+            Some(vars) => {
+                w.write_all(&(vars.len() as u32).to_le_bytes())?;
+                for &(tag, val) in vars {
+                    w.write_all(&tag)?;
+                    w.write_all(&val.to_le_bytes())?;
+                }
+            }
+        }
+
+        write_str(&mut w, &e.typographic_family)?;
+    }
+
+    w.flush()?;
+    drop(w);
+    std::fs::rename(&tmp, path)?;
+    Ok(())
+}
+
+fn read_scan_cache(path: &Path) -> Option<Vec<FontEntry>> {
+    let data = std::fs::read(path).ok()?;
+    let mut r: &[u8] = &data;
+
+    // Header: magic(4) + version(4) + count(4)
+    if r.len() < 12 { return None; }
+    if &r[..4] != FSCN_MAGIC { return None; }
+    r = &r[4..];
+    let version = read_u32(&mut r)?;
+    if version != FSCN_VERSION {
+        eprintln!("[scan] Font scan cache is v{version}, need v{FSCN_VERSION} — rescanning...");
+        return None;
+    }
+    let n = read_u32(&mut r)? as usize;
+
+    let mut entries = Vec::with_capacity(n);
+    for _ in 0..n {
+        let path_str = read_str(&mut r)?;
+        let family_name = read_str(&mut r)?;
+        let postscript_name = read_str(&mut r)?;
+        let raw_postscript_name = read_str(&mut r)?;
+        let is_bold = read_u8(&mut r)? != 0;
+        let is_italic = read_u8(&mut r)? != 0;
+        let class = u8_to_class(read_u8(&mut r)?);
+        let oldstyle_figures = read_u8(&mut r)? != 0;
+        let variant_tag = read_str(&mut r)?;
+
+        // glyph_overrides
+        let n_ov = read_u32(&mut r)?;
+        let glyph_overrides = if n_ov == 0xFFFF_FFFF {
+            None
+        } else {
+            let mut ov = Vec::with_capacity(n_ov as usize);
+            for _ in 0..n_ov {
+                let ch = char::from_u32(read_u32(&mut r)?)?;
+                let gid = read_u16(&mut r)?;
+                ov.push((ch, gid));
+            }
+            Some(ov)
+        };
+
+        // variations
+        let n_var = read_u32(&mut r)?;
+        let variations = if n_var == 0xFFFF_FFFF {
+            None
+        } else {
+            let mut vars = Vec::with_capacity(n_var as usize);
+            for _ in 0..n_var {
+                if r.len() < 4 { return None; }
+                let tag: [u8; 4] = [r[0], r[1], r[2], r[3]];
+                r = &r[4..];
+                let val = read_f32(&mut r)?;
+                vars.push((tag, val));
+            }
+            Some(vars)
+        };
+
+        let typographic_family = read_str(&mut r)?;
+
+        entries.push(FontEntry {
+            path: PathBuf::from(path_str),
+            family_name,
+            postscript_name,
+            raw_postscript_name,
+            is_bold,
+            is_italic,
+            class,
+            data: Vec::new(),
+            oldstyle_figures,
+            variant_tag,
+            glyph_overrides,
+            variations,
+            typographic_family,
+        });
+    }
+
+    Some(entries)
+}
+
+/// Dedup font entries: drop variable-font weight instances covered by static
+/// fonts, then dedup by font_key.
+fn dedup_fonts(mut fonts: Vec<FontEntry>) -> Vec<FontEntry> {
+    // Prefer static fonts over variable-font weight instances
+    {
+        use std::collections::HashSet;
+        let static_keys: HashSet<(String, u16, bool)> = fonts.iter()
+            .filter(|f| f.variations.is_none() && !f.variant_tag.starts_with("wght"))
+            .filter_map(|f| {
+                if f.typographic_family.is_empty() { return None; }
+                let ps = &f.postscript_name;
+                let base = ps.strip_suffix("Italic")
+                    .or_else(|| ps.strip_suffix("It"))
+                    .unwrap_or(ps);
+                let w = base.rsplit('-').next()
+                    .and_then(|s| s.parse::<u16>().ok())
+                    .filter(|&w| (100..=900).contains(&w))?;
+                Some((f.typographic_family.clone(), w, f.is_italic))
+            })
+            .collect();
+
+        let before = fonts.len();
+        fonts.retain(|f| {
+            if !f.variant_tag.starts_with("wght") {
+                return true;
+            }
+            let weight = f.variant_tag.strip_prefix("wght")
+                .and_then(|s| s.parse::<u16>().ok())
+                .unwrap_or(0);
+            !static_keys.contains(&(f.typographic_family.clone(), weight, f.is_italic))
+        });
+        let removed = before - fonts.len();
+        if removed > 0 {
+            eprintln!("[scan] Dropped {} variable-font weight instances covered by static fonts", removed);
+        }
+    }
+
+    // Dedup by font_key
+    {
+        use std::collections::HashSet;
+        let mut seen_keys: HashSet<String> = HashSet::new();
+        let before = fonts.len();
+        fonts.retain(|f| seen_keys.insert(f.font_key()));
+        let removed = before - fonts.len();
+        if removed > 0 {
+            eprintln!("[scan] Deduped {} entries by font_key ({} → {})", removed, before, fonts.len());
+        }
+    }
+
+    fonts
+}
+
+/// Walk the given directories for .ttf / .otf files and return a catalogue.
+pub fn scan_fonts(dirs: &[PathBuf]) -> Vec<FontEntry> {
+    let current_paths = collect_font_paths(dirs);
+    let cache_path = scan_cache_path();
+
+    // Load cached entries indexed by source font file path
+    let cached_by_path: std::collections::HashMap<PathBuf, Vec<FontEntry>> = {
+        let mut map: std::collections::HashMap<PathBuf, Vec<FontEntry>> = std::collections::HashMap::new();
+        if let Some(entries) = read_scan_cache(&cache_path) {
+            for e in entries {
+                map.entry(e.path.clone()).or_default().push(e);
+            }
+        }
+        map
+    };
+
+    let current_set: std::collections::HashSet<&PathBuf> = current_paths.iter().collect();
+    let cached_set: std::collections::HashSet<&PathBuf> = cached_by_path.keys().collect();
+
+    let added: Vec<&PathBuf> = current_set.difference(&cached_set).copied().collect();
+    let removed: Vec<&PathBuf> = cached_set.difference(&current_set).copied().collect();
+    let cache_changed = !added.is_empty() || !removed.is_empty();
+
+    if !cache_changed {
+        let mut fonts: Vec<FontEntry> = current_paths.iter()
+            .flat_map(|p| cached_by_path.get(p).cloned().unwrap_or_default())
+            .collect();
+        // Filter out tombstone entries (empty family_name = rejected font file)
+        fonts.retain(|f| !f.family_name.is_empty());
+        eprintln!("[scan] Loaded {} font entries from cache", fonts.len());
+        return dedup_fonts(fonts);
+    }
+
+    if !removed.is_empty() {
+        eprintln!("[scan] {} font files removed", removed.len());
+    }
+    if !added.is_empty() {
+        eprintln!("[scan] {} new font files to scan", added.len());
+    }
+
+    // Start with cached entries for paths that still exist
+    let mut fonts: Vec<FontEntry> = current_paths.iter()
+        .filter(|p| cached_by_path.contains_key(*p))
+        .flat_map(|p| cached_by_path.get(p).cloned().unwrap_or_default())
+        .collect();
+
+    // Parse only the new font files
+    let aliases = build_alias_table();
+    for path in &added {
+        if let Some(fe) = load_font_entry(path, &aliases) {
                 let _fig_label = if fe.oldstyle_figures { "OLDSTYLE" } else { "lining" };
 
                 // Detect ligature glyphs (liga + dlig)
@@ -349,66 +695,44 @@ pub fn scan_fonts(dirs: &[PathBuf]) -> Vec<FontEntry> {
                 }
 
                 fonts.push(fe);
+        }
+    }
+
+    // Add tombstone entries for font files that produced no entries
+    // (e.g. corrupt or unparseable) so they aren't re-scanned next time.
+    {
+        let covered: std::collections::HashSet<PathBuf> = fonts.iter().map(|f| f.path.clone()).collect();
+        for path in &added {
+            if !covered.contains(path.as_path()) {
+                fonts.push(FontEntry {
+                    path: path.to_path_buf(),
+                    family_name: String::new(),
+                    postscript_name: String::new(),
+                    raw_postscript_name: String::new(),
+                    is_bold: false,
+                    is_italic: false,
+                    class: FontClass::Serif,
+                    data: Vec::new(),
+                    oldstyle_figures: false,
+                    variant_tag: String::new(),
+                    glyph_overrides: None,
+                    variations: None,
+                    typographic_family: String::new(),
+                });
             }
         }
     }
 
-    // ── Dedup: prefer static fonts over variable-font weight instances ──
-    // When a static font file exists at the same typographic family + weight
-    // + italic as a variable-font weight instance, drop the variable instance.
-    // The static file is the canonical rendering at that weight.
-    {
-        use std::collections::HashSet;
-        let static_keys: HashSet<(String, u16, bool)> = fonts.iter()
-            .filter(|f| f.variations.is_none() && !f.variant_tag.starts_with("wght"))
-            .filter_map(|f| {
-                if f.typographic_family.is_empty() { return None; }
-                // Extract weight from postscript_name (output of make_weight_explicit).
-                // Format: "Name-{weight}" or "Name-{weight}It" / "Name-{weight}Italic"
-                let ps = &f.postscript_name;
-                let base = ps.strip_suffix("Italic")
-                    .or_else(|| ps.strip_suffix("It"))
-                    .unwrap_or(ps);
-                let w = base.rsplit('-').next()
-                    .and_then(|s| s.parse::<u16>().ok())
-                    .filter(|&w| (100..=900).contains(&w))?;
-                Some((f.typographic_family.clone(), w, f.is_italic))
-            })
-            .collect();
-
-        let before = fonts.len();
-        fonts.retain(|f| {
-            if !f.variant_tag.starts_with("wght") {
-                return true; // keep everything that isn't a weight instance
-            }
-            let weight = f.variant_tag.strip_prefix("wght")
-                .and_then(|s| s.parse::<u16>().ok())
-                .unwrap_or(0);
-            !static_keys.contains(&(f.typographic_family.clone(), weight, f.is_italic))
-        });
-        let removed = before - fonts.len();
-        if removed > 0 {
-            eprintln!("[scan] Dropped {} variable-font weight instances covered by static fonts", removed);
-        }
+    // Write cache pre-dedup so every source path is represented
+    if let Err(e) = write_scan_cache(&cache_path, &fonts) {
+        eprintln!("[scan] Warning: failed to write font scan cache: {}", e);
+    } else {
+        eprintln!("[scan] Wrote {} font entries to cache", fonts.len());
     }
 
-    // ── Dedup by font_key ───────────────────────────────────────────────
-    // After make_weight_explicit, duplicate font files (e.g. specimen-fonts/
-    // ibm-plex-serif-400.ttf and ibm-plex/IBMPlexSerif-Regular.ttf) produce
-    // the same canonical postscript_name and therefore the same font_key.
-    // Keep the first entry encountered; drop duplicates.
-    {
-        use std::collections::HashSet;
-        let mut seen_keys: HashSet<String> = HashSet::new();
-        let before = fonts.len();
-        fonts.retain(|f| seen_keys.insert(f.font_key()));
-        let removed = before - fonts.len();
-        if removed > 0 {
-            eprintln!("[scan] Deduped {} entries by font_key ({} → {})", removed, before, fonts.len());
-        }
-    }
-
-    fonts
+    // Filter out tombstone entries before dedup
+    fonts.retain(|f| !f.family_name.is_empty());
+    dedup_fonts(fonts)
 }
 
 // ---------------------------------------------------------------------------
