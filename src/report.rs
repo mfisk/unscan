@@ -752,15 +752,20 @@ fn build_miss_block(
     } else {
         ""
     };
+    let fast_path_tag = if entry.fast_path {
+        " <span class=\"fast-path-badge\">fast-path</span>"
+    } else {
+        ""
+    };
     let miss_kind_label = match ce.kind {
         MissKind::MajorMiss => {
             // Show expected→got summary for font misses
-            format!(" [MAJOR: expected {}, got {}]{ocr_fail_tag}", actual_font, matched)
+            format!(" [MAJOR: expected {}, got {}]{fast_path_tag}{ocr_fail_tag}", actual_font, matched)
         },
         MissKind::MinorMiss => {
-            format!(" [minor: expected {}, got {}]{ocr_fail_tag}", actual_font, matched)
+            format!(" [minor: expected {}, got {}]{fast_path_tag}{ocr_fail_tag}", actual_font, matched)
         },
-        MissKind::SimilarityFailure => format!(" [ZNCC failure]{ocr_fail_tag}"),
+        MissKind::SimilarityFailure => format!(" [ZNCC failure]{fast_path_tag}{ocr_fail_tag}"),
         MissKind::KeptRaster => format!(" [kept raster]{ocr_fail_tag}"),
         _ => ocr_fail_tag.to_string(),
     };
@@ -942,7 +947,7 @@ fn build_scan_line_with_overlays(diag_dir: &Path, entry: &AuditEntry) -> String 
             .collect();
         word_dirs.sort_by_key(|d| d.file_name().to_string_lossy().to_string());
 
-        for wd in &word_dirs {
+        for (word_idx, wd) in word_dirs.iter().enumerate() {
             let wpath = wd.path();
             let data_path = {
                 let sp = wpath.join("seg_plain");
@@ -960,16 +965,14 @@ fn build_scan_line_with_overlays(diag_dir: &Path, entry: &AuditEntry) -> String 
                 None => continue,
             };
 
-            let word_text = summary["word_text"].as_str().unwrap_or("");
             let seg_img_w = summary["image_w"].as_u64().unwrap_or(0) as u32;
             let seg_img_h = summary["image_h"].as_u64().unwrap_or(0) as u32;
             if seg_img_w == 0 || seg_img_h == 0 {
                 continue;
             }
 
-            // Find matching word bbox
-            let matching_wb = entry.word_bboxes.iter().find(|wb| wb.text == word_text);
-            let matching_wb = match matching_wb {
+            // Match word bbox by position (not text) — pflda may alter word_bboxes text
+            let matching_wb = match entry.word_bboxes.get(word_idx) {
                 Some(wb) => wb,
                 None => continue,
             };
@@ -1098,7 +1101,7 @@ fn build_seg_stats(diag_dir: &Path, entry: &AuditEntry) -> String {
         Err(_) => return String::new(),
     };
 
-    for wd in &word_dirs {
+    for (word_idx, wd) in word_dirs.iter().enumerate() {
         let wpath = wd.path();
         // Prefer seg_plain subdirectory, fall back to flat layout
         let data_path = {
@@ -1809,6 +1812,7 @@ img.ci {
 }
 .scan-line-label { font-size: 10px; font-weight: 600; color: #555; margin: 8px 8px 4px 8px; }
 .ocr-wrong-badge { background: #f0a020; color: white; padding: 1px 6px; border-radius: 3px; font-size: 11px; font-weight: 700; }
+.fast-path-badge { background: #8b5cf6; color: white; padding: 1px 6px; border-radius: 3px; font-size: 11px; font-weight: 700; }
 .line-text-preview { font-size: 12px; color: #666; margin: 2px 0 8px 0; font-style: italic; }
 .scan-line-block svg { display: block; width: 100%; height: auto; }
 </style>"#;
