@@ -83,11 +83,15 @@ def main():
         args = args[:idx] + args[idx + 2:]
 
     if len(args) < 2:
-        print("Usage: gen-line-test.py <page> <line> [<line2> ...]")
+        print("Usage: gen-line-test.py <page> <line> [<line2> ...] or <p:l> [<p:l> ...]")
         sys.exit(1)
 
-    page = int(args[0])
-    line_indices = [int(a) for a in args[1:]]
+    # Support both "page line1 line2" and "page:line page:line" formats
+    if ':' in args[0]:
+        page_lines = [(int(a.split(':')[0]), int(a.split(':')[1])) for a in args]
+    else:
+        page = int(args[0])
+        page_lines = [(page, int(a)) for a in args[1:]]
 
     with open(audit_ref) as f:
         audit = json.load(f)
@@ -95,7 +99,7 @@ def main():
     # Collect entries and fonts for each line
     canonical_map = {}
     story = []
-    for li in line_indices:
+    for (page, li) in page_lines:
         entries = [e for e in audit['text_entries']
                    if e.get('page') == page and e.get('line_index') == li]
         if not entries:
@@ -104,7 +108,7 @@ def main():
 
         entry = entries[0]
         expected_font = entry.get('expected_font', '')
-        text = entry.get('text', entry.get('ocr_text', ''))
+        text = entry.get('text', entry.get('ocr_text', '')) + '.'
         print(f"p{page}:L{li}: text='{text}', expected={expected_font}")
 
         ttf_path, canonical_name = resolve_font(expected_font)

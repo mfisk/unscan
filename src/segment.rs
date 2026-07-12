@@ -150,6 +150,9 @@ fn segment_characters_inner(
     let min_side = MIN_SYMBOL_FRAC * h as f32;
     let min_ink_for_symbol = (min_side * min_side) as u32;
 
+    // Average character width — used to penalize splitting narrow segments.
+    let avg_char_width = w as f32 / n_chars as f32;
+
     // Two-pass segmentation cascade:
     //   Pass 1 — Whitespace: split at midpoint of zero-ink column runs
     //   Pass 2 — Seam carving: cheapest vertical path for remaining splits
@@ -223,16 +226,30 @@ fn segment_characters_inner(
 
     }
 
+    // Segment-size penalty: discourages splits that create a segment
+    // narrower than the expected character width.
+    // (10 * avg_char_width / min_child_width)^2, applied additively to seam cost.
+    // Penalizes based on the smallest segment CREATED by the split,
+    // so splitting near the edge costs more than splitting in the middle.
+    let segment_penalty = |seg_start: u32, seg_end: u32, col: u32| -> f32 {
+        let left = (col - seg_start) as f32;
+        let right = (seg_end - col) as f32;
+        let min_child = left.min(right);
+        if min_child <= 0.0 { return f32::MAX; }
+        let p = 10.0 * avg_char_width / min_child;
+        p * p
+    };
+
     // --- Pass 2: greedy seam carving ---
     //
     // For remaining splits, find the cheapest vertical seam in each segment.
     // Greedy: pop cheapest, split, recompute children, repeat.
     let mut seam_paths: HashMap<u32, Vec<[u32; 2]>> = HashMap::new();
-    let mut seam_costs: HashMap<u32, f32> = HashMap::new();
+    let mut seam_costs: HashMap<u32, SeamCost> = HashMap::new();
     // Paths for top candidates (including unused) — traced at generation time
     // so we have them before DPs are consumed. Keyed by (col, cost_bits) to
     // avoid overwriting when same col appears in different segments.
-    let mut candidate_paths: Vec<(u32, f32, Vec<[u32; 2]>)> = Vec::new();  // (col, cost, path)
+    let mut candidate_paths: Vec<(u32, SeamCost, Vec<[u32; 2]>)> = Vec::new();  // (col, SeamCost, path)
     // Seam instrumentation: capture seed candidates and greedy-loop events
     // for the audit summary JSON.
     if splits.len() < need {
@@ -360,7 +377,7 @@ fn segment_characters_inner(
                 let sid = next_seg_id; next_seg_id += 1;
                 let (cands, dp) = candidate_seams(&energy, ink_l, ink_r, h, None, None, max_ink, &row_ink);
                 for (col, cost) in &cands {
-                    heap.push(SeamEntry { cost: *cost, col: *col, seg_start: ink_l, seg_end: ink_r, seg_id: sid });
+                    heap.push(SeamEntry { cost: *cost + segment_penalty(ink_l, ink_r, *col), col: *col, seg_start: ink_l, seg_end: ink_r, seg_id: sid });
                 }
                 // Trace paths for all candidates while DP is available
                 {
@@ -368,7 +385,18 @@ fn segment_characters_inner(
                     sorted_cands.sort_by(|a, b| a.1.partial_cmp(&b.1).unwrap_or(std::cmp::Ordering::Equal));
                     for &(col, cost) in sorted_cands.iter() {
                         let path = dp.trace_path_through(&energy, col, &row_ink);
-                        candidate_paths.push((col, cost, path));
+                        let p_min = path.iter().map(|p| p[1]).min().unwrap_or(col);
+                        let p_max = path.iter().map(|p| p[1]).max().unwrap_or(col);
+                        let pw = (p_max - p_min) as f32;
+                        let sp = segment_penalty(ink_l, ink_r, (p_min + p_max) / 2);
+                        let hm = path.windows(2).filter(|w| w[0][0] == w[1][0]).count() as f32;
+                        candidate_paths.push((col, SeamCost {
+                            dp_cost: cost - pw - hm,
+                            seam_width_penalty: pw,
+                            segment_size_penalty: sp,
+                            horizontal_cost: hm,
+                            total: cost + sp,
+                        }, path));
                     }
                 }
                 seg_bounds.insert(sid, SegBounds { left_path: None, right_path: None });
@@ -413,7 +441,7 @@ fn segment_characters_inner(
                         let rp = parent_bounds.and_then(|b| b.right_path.clone());
                         let (cands, dp) = candidate_seams(&energy, entry.seg_start, new_end, h, lp.as_deref(), rp.as_deref(), max_ink, &row_ink);
                         for (col, cost) in &cands {
-                            heap.push(SeamEntry { cost: *cost, col: *col, seg_start: entry.seg_start, seg_end: new_end, seg_id: sid });
+                            heap.push(SeamEntry { cost: *cost + segment_penalty(entry.seg_start, new_end, *col), col: *col, seg_start: entry.seg_start, seg_end: new_end, seg_id: sid });
                         }
                         seg_bounds.insert(sid, SegBounds { left_path: lp, right_path: rp });
                         dp_cache.insert(sid, dp);
@@ -431,7 +459,7 @@ fn segment_characters_inner(
                         let rp = parent_bounds.and_then(|b| b.right_path.clone());
                         let (cands, dp) = candidate_seams(&energy, new_start, entry.seg_end, h, lp.as_deref(), rp.as_deref(), max_ink, &row_ink);
                         for (col, cost) in &cands {
-                            heap.push(SeamEntry { cost: *cost, col: *col, seg_start: new_start, seg_end: entry.seg_end, seg_id: sid });
+                            heap.push(SeamEntry { cost: *cost + segment_penalty(new_start, entry.seg_end, *col), col: *col, seg_start: new_start, seg_end: entry.seg_end, seg_id: sid });
                         }
                         seg_bounds.insert(sid, SegBounds { left_path: lp, right_path: rp });
                         dp_cache.insert(sid, dp);
@@ -499,7 +527,21 @@ fn segment_characters_inner(
 
             splits.push(final_col);
             seam_paths.insert(final_col, path.clone());
-            seam_costs.insert(final_col, entry.cost);
+            let path_cols_iter = seam_paths[&final_col].iter().map(|p| p[1]);
+            let path_min_col = path_cols_iter.clone().min().unwrap_or(final_col);
+            let path_max_col = path_cols_iter.max().unwrap_or(final_col);
+            let swp = (path_max_col - path_min_col) as f32;
+            let seg_pen = segment_penalty(entry.seg_start, entry.seg_end, (path_min_col + path_max_col) / 2);
+            let h_moves = seam_paths[&final_col].windows(2)
+                .filter(|w| w[0][0] == w[1][0])
+                .count() as f32;
+            seam_costs.insert(final_col, SeamCost {
+                dp_cost: entry.cost - seg_pen - swp - h_moves,
+                seam_width_penalty: swp,
+                segment_size_penalty: seg_pen,
+                horizontal_cost: h_moves,
+                total: entry.cost,
+            });
 
             // Capture parent's diagonal bounds before removing.
             let parent_lp = seg_bounds.get(&entry.seg_id).and_then(|b| b.left_path.clone());
@@ -524,7 +566,7 @@ fn segment_characters_inner(
                     let rp: Option<Vec<[u32; 2]>> = Some(path.clone());
                     let (cands, dp) = candidate_seams(&energy, ink_l, ink_r, h, lp.as_deref(), rp.as_deref(), max_ink, &row_ink);
                     for (col, cost) in &cands {
-                        heap.push(SeamEntry { cost: *cost, col: *col, seg_start: ink_l, seg_end: ink_r, seg_id: sid });
+                        heap.push(SeamEntry { cost: *cost + segment_penalty(ink_l, ink_r, *col), col: *col, seg_start: ink_l, seg_end: ink_r, seg_id: sid });
                     }
                     // Trace paths for all child candidates
                     {
@@ -532,7 +574,18 @@ fn segment_characters_inner(
                         sorted_cands.sort_by(|a, b| a.1.partial_cmp(&b.1).unwrap_or(std::cmp::Ordering::Equal));
                         for &(col, cost) in sorted_cands.iter() {
                             let path = dp.trace_path_through(&energy, col, &row_ink);
-                            candidate_paths.push((col, cost, path));
+                            let p_min = path.iter().map(|p| p[1]).min().unwrap_or(col);
+                            let p_max = path.iter().map(|p| p[1]).max().unwrap_or(col);
+                            let pw = (p_max - p_min) as f32;
+                            let sp = segment_penalty(ink_l, ink_r, (p_min + p_max) / 2);
+                            let hm = path.windows(2).filter(|w| w[0][0] == w[1][0]).count() as f32;
+                            candidate_paths.push((col, SeamCost {
+                                dp_cost: cost - pw - hm,
+                                seam_width_penalty: pw,
+                                segment_size_penalty: sp,
+                                horizontal_cost: hm,
+                                total: cost + sp,
+                            }, path));
                         }
                     }
                     seg_bounds.insert(sid, SegBounds { left_path: lp, right_path: rp });
@@ -549,7 +602,7 @@ fn segment_characters_inner(
                     let rp = parent_rp.clone();
                     let (cands, dp) = candidate_seams(&energy, ink_l, ink_r, h, lp.as_deref(), rp.as_deref(), max_ink, &row_ink);
                     for (col, cost) in &cands {
-                        heap.push(SeamEntry { cost: *cost, col: *col, seg_start: ink_l, seg_end: ink_r, seg_id: sid });
+                        heap.push(SeamEntry { cost: *cost + segment_penalty(ink_l, ink_r, *col), col: *col, seg_start: ink_l, seg_end: ink_r, seg_id: sid });
                     }
                     // Trace paths for all child candidates
                     {
@@ -557,7 +610,18 @@ fn segment_characters_inner(
                         sorted_cands.sort_by(|a, b| a.1.partial_cmp(&b.1).unwrap_or(std::cmp::Ordering::Equal));
                         for &(col, cost) in sorted_cands.iter() {
                             let path = dp.trace_path_through(&energy, col, &row_ink);
-                            candidate_paths.push((col, cost, path));
+                            let p_min = path.iter().map(|p| p[1]).min().unwrap_or(col);
+                            let p_max = path.iter().map(|p| p[1]).max().unwrap_or(col);
+                            let pw = (p_max - p_min) as f32;
+                            let sp = segment_penalty(ink_l, ink_r, (p_min + p_max) / 2);
+                            let hm = path.windows(2).filter(|w| w[0][0] == w[1][0]).count() as f32;
+                            candidate_paths.push((col, SeamCost {
+                                dp_cost: cost - pw - hm,
+                                seam_width_penalty: pw,
+                                segment_size_penalty: sp,
+                                horizontal_cost: hm,
+                                total: cost + sp,
+                            }, path));
                         }
                     }
                     seg_bounds.insert(sid, SegBounds { left_path: lp, right_path: rp });
@@ -576,15 +640,15 @@ fn segment_characters_inner(
                 Some(n) => n.parse().ok(),
                 None => Some(10),
             };
-            candidate_paths.sort_by(|a, b| a.1.partial_cmp(&b.1).unwrap_or(std::cmp::Ordering::Equal));
+            candidate_paths.sort_by(|a, b| a.1.total.partial_cmp(&b.1.total).unwrap_or(std::cmp::Ordering::Equal));
             let mut added = 0usize;
-            for (col, cost, path) in &candidate_paths {
+            for (col, sc, path) in &candidate_paths {
                 if let Some(limit) = extra_limit {
                     if added >= limit { break; }
                 }
                 if seam_paths.contains_key(col) { continue; }
                 seam_paths.insert(*col, path.clone());
-                seam_costs.insert(*col, *cost);
+                seam_costs.insert(*col, sc.clone());
                 added += 1;
             }
         }
@@ -819,7 +883,7 @@ fn candidate_seams(
             let pass_ink = ink_score(pass_dark, r - 1, row_ink);
             let pass_entry = delta_ink_score(pass_dark, prev_dark, r - 1, r - 1, row_ink, max_ink);
             let cur_entry = delta_ink_score(cur_dark, pass_dark, r, r - 1, row_ink, max_ink);
-            let via_diag = cost_fwd[prev_off + c - 1] + pass_ink + pass_entry + cur_ink + cur_entry;
+            let via_diag = cost_fwd[prev_off + c - 1] + pass_ink + pass_entry + cur_ink + cur_entry + 1.0;
             if via_diag < cost_fwd[row_off + c] {
                 cost_fwd[row_off + c] = via_diag;
                 pred_fwd[row_off + c] = (prev_off + c - 1) as u32;
@@ -835,7 +899,7 @@ fn candidate_seams(
             let pass_ink = ink_score(pass_dark, r - 1, row_ink);
             let pass_entry = delta_ink_score(pass_dark, prev_dark, r - 1, r - 1, row_ink, max_ink);
             let cur_entry = delta_ink_score(cur_dark, pass_dark, r, r - 1, row_ink, max_ink);
-            let via_diag = cost_fwd[prev_off + c + 1] + pass_ink + pass_entry + cur_ink + cur_entry;
+            let via_diag = cost_fwd[prev_off + c + 1] + pass_ink + pass_entry + cur_ink + cur_entry + 1.0;
             if via_diag < cost_fwd[row_off + c] {
                 cost_fwd[row_off + c] = via_diag;
                 pred_fwd[row_off + c] = (prev_off + c + 1) as u32;
@@ -876,7 +940,7 @@ fn candidate_seams(
             let pass_ink = ink_score(pass_dark, r, row_ink);
             let pass_entry = delta_ink_score(pass_dark, cur_dark, r, r, row_ink, max_ink);
             let child_entry = delta_ink_score(child_dark, pass_dark, r + 1, r, row_ink, max_ink);
-            let via_diag = cost_rev[next_off + c - 1] + cur_ink + pass_ink + pass_entry + child_entry;
+            let via_diag = cost_rev[next_off + c - 1] + cur_ink + pass_ink + pass_entry + child_entry + 1.0;
             if via_diag < cost_rev[row_off + c] {
                 cost_rev[row_off + c] = via_diag;
                 pred_rev[row_off + c] = (next_off + c - 1) as u32;
@@ -892,7 +956,7 @@ fn candidate_seams(
             let pass_ink = ink_score(pass_dark, r, row_ink);
             let pass_entry = delta_ink_score(pass_dark, cur_dark, r, r, row_ink, max_ink);
             let child_entry = delta_ink_score(child_dark, pass_dark, r + 1, r, row_ink, max_ink);
-            let via_diag = cost_rev[next_off + c + 1] + cur_ink + pass_ink + pass_entry + child_entry;
+            let via_diag = cost_rev[next_off + c + 1] + cur_ink + pass_ink + pass_entry + child_entry + 1.0;
             if via_diag < cost_rev[row_off + c] {
                 cost_rev[row_off + c] = via_diag;
                 pred_rev[row_off + c] = (next_off + c + 1) as u32;
@@ -943,25 +1007,38 @@ fn candidate_seams(
 
     // Second pass: trace each DP candidate's path and adjust cost
 
-    // Sort DP candidates by column for collapse pass.
+    // Sort DP candidates by column for local-minima pass.
     dp_candidates.sort_by(|a, b| a.0.cmp(&b.0));
 
-    // Collapse runs of consecutive columns with equal cost into a
-    // single candidate at the run's midpoint.  This picks the center
-    // of a zero-cost band, maximizing distance from ink on both sides.
-    let mut candidates: Vec<(u32, f32)> = Vec::with_capacity(dp_candidates.len());
-    let mut i = 0;
-    while i < dp_candidates.len() {
-        let cost = dp_candidates[i].1;
-        let run_start = i;
-        while i < dp_candidates.len()
-            && dp_candidates[i].1 == cost
-            && (i == run_start || dp_candidates[i].0 == dp_candidates[i - 1].0 + 1)
-        {
-            i += 1;
+    // Find local minima in DP cost (before segment penalty).
+    // A local minimum is a column (or run of equal-cost consecutive columns)
+    // whose cost is strictly less than both neighbors.  Among equal-cost runs
+    // that form a local minimum, pick the middle column (maximizes distance
+    // from ink on both sides).  Boundary columns are treated as having
+    // infinite cost, so an edge candidate is a local minimum if the first
+    // interior neighbor is higher.
+    let mut candidates: Vec<(u32, f32)> = Vec::new();
+    let n = dp_candidates.len();
+    if n > 0 {
+        let mut i = 0;
+        while i < n {
+            let cost = dp_candidates[i].1;
+            let run_start = i;
+            // Extend through consecutive columns with equal cost.
+            while i < n
+                && dp_candidates[i].1 == cost
+                && (i == run_start || dp_candidates[i].0 == dp_candidates[i - 1].0 + 1)
+            {
+                i += 1;
+            }
+            // Check local-minimum condition: both neighbors must be strictly higher.
+            let left_higher = run_start == 0 || dp_candidates[run_start - 1].1 > cost;
+            let right_higher = i >= n || dp_candidates[i].1 > cost;
+            if left_higher && right_higher {
+                let mid_idx = (run_start + i - 1) / 2;
+                candidates.push(dp_candidates[mid_idx]);
+            }
         }
-        let mid_idx = (run_start + i - 1) / 2;
-        candidates.push(dp_candidates[mid_idx]);
     }
 
     let dp = SeamDp { _cost_fwd: cost_fwd, _cost_rev: cost_rev, pred_fwd, pred_rev, seg_start, _seg_end: seg_end, seg_w, h, _max_ink: max_ink, _row_ink: row_ink.to_vec() };
@@ -980,6 +1057,16 @@ fn uniform_boundaries(width: u32, n: usize) -> Vec<u32> {
 
 const MIN_WORD_LEN: usize = 3;
 
+/// Cost breakdown for a single seam, stored in audit data.
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct SeamCost {
+    pub dp_cost: f32,
+    pub seam_width_penalty: f32,
+    pub segment_size_penalty: f32,
+    pub horizontal_cost: f32,
+    pub total: f32,
+}
+
 /// Segmentation summary for a single word — returned from segmentation
 /// for audit integration. Does not include large debug arrays
 pub struct SegSummary {
@@ -990,7 +1077,7 @@ pub struct SegSummary {
     pub mismatch: bool,
     pub ws_splits: Vec<u32>,
     pub seam_splits: Vec<u32>,
-    pub seam_costs: HashMap<u32, f32>,
+    pub seam_costs: HashMap<u32, SeamCost>,
 }
 
 /// Per-word segmentation data retained for lazy bigram cropping.
@@ -1001,7 +1088,7 @@ pub struct WordSeg {
     pub chars: Vec<char>,
     pub boundaries: Vec<u32>,
     pub seam_paths: HashMap<u32, Vec<[u32; 2]>>,
-    pub seam_costs: HashMap<u32, f32>,
+    pub seam_costs: HashMap<u32, SeamCost>,
     pub crop_h: u32,
     // Segmentation summary fields (for audit integration)
     pub word_text: String,

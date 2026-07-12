@@ -1196,6 +1196,10 @@ const LIGATURE_PROBES: &[(&str, char)] = &[
     ("fl",  '\u{FB02}'),
     ("ffi", '\u{FB03}'),
     ("ffl", '\u{FB04}'),
+    // Double quotes as ligatures of two single quotes
+    ("''",            '"'),          // U+0027 U+0027 → U+0022 (straight)
+    ("\u{2018}\u{2018}", '\u{201C}'),  // left single → left double
+    ("\u{2019}\u{2019}", '\u{201D}'),  // right single → right double
 ];
 
 /// Returns true if `c` is a Unicode ligature codepoint (ff, fi, fl, ffi, ffl).

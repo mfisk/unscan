@@ -52,3 +52,5 @@ training-data/
 audit.json
 hill-climb-test.sh
 audit-prev.json
+*.bak*
+workspace/

@@ -724,8 +724,10 @@ fn build_miss_block(
         _ => String::new(),
     };
 
-    // Per-character comparison table (skip for similarity-only failures — font is correct)
-    let obs_table_html = if ce.kind == MissKind::SimilarityFailure || entry.obs_votes.is_empty() {
+    // Per-character comparison table (skip for similarity-only failures unless OCR was overridden)
+    let has_ocr_override = entry.word_bboxes.iter().zip(entry.word_bboxes_raw.iter())
+        .any(|(wb, wr)| wb.text != wr.text);
+    let obs_table_html = if (ce.kind == MissKind::SimilarityFailure && !has_ocr_override) || entry.obs_votes.is_empty() {
         String::new()
     } else {
         let obs_to_show = pick_interesting_observations(&entry.obs_votes, 6, 0);
@@ -1430,7 +1432,6 @@ fn build_observation_table(
     font_catalog: &[FontEntry],
     glyph_map: &NgramGlyphMap,
 ) -> String {
-    let _ = font_catalog; // retained for future use
     let mut rows = String::new();
 
     for &(_idx, cv) in obs_to_show {
@@ -1545,11 +1546,9 @@ fn build_observation_table(
         // Red background = this font scores worse
         let (chosen_win_class, correct_win_class) = match (cv.chosen_prob, cv.gt_font_prob) {
             (Some(cp), Some(gp)) => {
-                let cl = cp.max(1e-30).ln();
-                let gl = gp.max(1e-30).ln();
-                if cl > gl {
+                if cp > gp {
                     ("prob-win", "prob-lose")
-                } else if gl > cl {
+                } else if gp > cp {
                     ("prob-lose", "prob-win")
                 } else {
                     ("", "")
@@ -1558,20 +1557,20 @@ fn build_observation_table(
             _ => ("", ""),
         };
 
-        let chosen_score_label = if let Some(p) = cv.chosen_prob {
+        let chosen_score_label = if let Some(xu) = cv.chosen_prob {
             let rank_part = cv.chosen_rank
                 .map(|r| format!(" <span class='font-mini'>rank {r}</span>"))
                 .unwrap_or_default();
-            format!("<div class='sub {chosen_win_class}'><span class='num'>{p:.6}</span>{rank_part}</div>")
+            format!("<div class='sub {chosen_win_class}'><span class='num'>{xu:.1}×u</span>{rank_part}</div>")
         } else {
             String::new()
         };
 
-        let correct_score_label = if let Some(p) = cv.gt_font_prob {
+        let correct_score_label = if let Some(xu) = cv.gt_font_prob {
             let rank_part = cv.gt_font_rank
                 .map(|r| format!(" <span class='font-mini'>rank {r}</span>"))
                 .unwrap_or_default();
-            format!("<div class='sub {correct_win_class}'><span class='num'>{p:.6}</span>{rank_part}</div>")
+            format!("<div class='sub {correct_win_class}'><span class='num'>{xu:.1}×u</span>{rank_part}</div>")
         } else {
             String::new()
         };
@@ -1776,8 +1775,8 @@ pub fn compute_accuracy(
     }
 
     let all_misses = major_misses + minor_misses + similarity_failures;
-    let compared = hits + all_misses;
-    let major_total = major_misses + similarity_failures;
+    let compared = hits + all_misses + kept_raster;
+    let major_total = major_misses + similarity_failures + kept_raster;
     let primary_hits = compared - major_total;
     let pct = if compared > 0 {
         primary_hits as f64 / compared as f64 * 100.0
@@ -1852,9 +1851,9 @@ pub fn generate_report(
         .collect();
 
     let all_misses = major_misses.len() + minor_misses.len() + similarity_failures.len();
-    let compared = hits + all_misses;
+    let compared = hits + all_misses + kept_raster.len();
     // Primary metric: only major misses count against the score.
-    let major_total = major_misses.len() + similarity_failures.len();
+    let major_total = major_misses.len() + similarity_failures.len() + kept_raster.len();
     let primary_hits = compared - major_total;
     let pct = if compared > 0 {
         primary_hits as f64 / compared as f64 * 100.0
@@ -2093,9 +2092,8 @@ pub fn generate_report(
          <b>font score</b> (per-line) = mean(log(prob)) across characters, \
          weighted by character discriminativeness; \
          <b>higher = better match</b>.\n\
-         <b>font prob</b> (per-observation) = calibrated posterior probability \
-         via Gaussian kernel over embedding distances; \
-         <b>0–1, higher = better</b>.\n\
+         <b>font prob</b> (per-observation) = probability as a multiple of uniform (1/N fonts); \
+         <b>×u, higher = better</b>. Values below the threshold (default 6×u) are noise.\n\
          <b>ZNCC</b> (per-line) = zero-mean normalized cross-correlation between scanned line \
          and re-render; <b>-1–1, higher = more similar</b>.\n\
          </div>\n\

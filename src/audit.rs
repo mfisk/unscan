@@ -21,7 +21,7 @@ pub struct WordSegSummary {
     pub ws_splits: Vec<u32>,
     pub seam_splits: Vec<u32>,
     pub seam_paths: HashMap<u32, Vec<[u32; 2]>>,
-    pub seam_costs: HashMap<u32, f32>,
+    pub seam_costs: HashMap<u32, crate::segment::SeamCost>,
 }
 
 /// Per-text-region audit record.

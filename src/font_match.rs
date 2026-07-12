@@ -92,6 +92,10 @@ pub struct ObservationDetail {
 }
 
 /// Result of `identify_fonts`: ranked font scores + per-observation detail.
+/// Minimum probability for an ngram observation to be included in font scoring.
+/// Observations with p < this threshold are excluded as noise.
+const MIN_NGRAM_PROB: f32 = 0.001;
+
 /// scores are (font_key, aggregated_score) — globally consistent across observations.
 /// observations[].nearest still uses per-observation glyph_ids (valid within each seq's classifier).
 #[derive(Debug)]
@@ -111,6 +115,7 @@ pub fn identify_fonts(
     _thoroughness: f32,
     _audit: bool,
     ensure_font_keys: &[&str],
+    min_ngram_prob: f32,
 ) -> FontIdResult {
     if windows.is_empty() {
         return FontIdResult { scores: Vec::new(), observations: Vec::new(), unweighted_top: f32::MIN };
@@ -191,21 +196,40 @@ pub fn identify_fonts(
         return FontIdResult { scores: Vec::new(), observations, unweighted_top: f32::MIN };
     }
 
-    // ── Stage 2: score each candidate font_key across all windows ──
+    // ── Stage 2a: filter ngrams — keep only windows where at least one
+    // candidate font scores above (min_ngram_prob × uniform). This ensures
+    // all fonts are scored on the same set of ngrams. ──
+    let candidate_vec: Vec<String> = candidate_set.into_iter().collect();
+    let scoring_window_indices: Vec<usize> = (0..crop_data.len())
+        .filter(|&i| {
+            let wd = &crop_data[i];
+            let n_glyphs = classifier.glyph_count(&wd.seq).max(1) as f32;
+            let threshold = min_ngram_prob / n_glyphs;
+            candidate_vec.iter().any(|font_key| {
+                glyph_map.glyph_id_for_font(&wd.seq, font_key)
+                    .and_then(|gid| classifier.probability(&wd.seq, &wd.feat, gid))
+                    .map_or(false, |p| p >= threshold)
+            })
+        })
+        .collect();
+
+    // ── Stage 2b: score each candidate font on the surviving ngrams ──
+    let n_scoring = scoring_window_indices.len();
     let mut best_unweighted = f32::MIN;
-    let mut scores: Vec<(String, f32)> = candidate_set.into_iter()
+    let mut scores: Vec<(String, f32)> = candidate_vec.into_iter()
         .filter_map(|font_key| {
-            let log_probs: Vec<(f32, f32)> = crop_data.iter()
-                .filter_map(|wd| {
+            let log_probs: Vec<(f32, f32)> = scoring_window_indices.iter()
+                .filter_map(|&i| {
+                    let wd = &crop_data[i];
                     let glyph_id = glyph_map.glyph_id_for_font(&wd.seq, &font_key)?;
                     let p = classifier.probability(&wd.seq, &wd.feat, glyph_id)?;
-                    Some((p.max(1e-30).ln(), wd.weight))
+                    Some((p.ln(), wd.weight))
                 })
                 .collect();
             if log_probs.is_empty() {
                 return None;
             }
-            let score = aggregate_font_score(&log_probs, crop_data.len());
+            let score = aggregate_font_score(&log_probs, n_scoring);
             if score.is_finite() {
                 // Unweighted mean for path comparison (ignore weight bias)
                 let uw = log_probs.iter().map(|(lp, _)| lp).sum::<f32>()

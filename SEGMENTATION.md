@@ -79,12 +79,23 @@ combined(c) = cost_fwd[mid_r][c] + cost_rev[mid_r][c] - darkness(mid_r, c)
 Subtracting the mid-row darkness avoids double-counting. Multiple candidate
 seams are generated per segment — all go onto the min-heap.
 
-### Midpoint Tie-Breaking
+### Local-Minima Selection
 
-Consecutive columns with equal combined cost are collapsed into a single
-candidate at the run's midpoint. For example, if columns 108–114 all have
-zero cost, only column 111 becomes a candidate. This centers splits in
-zero-cost bands, maximizing distance from ink on both sides.
+Only local minima in DP cost enter the candidate set.  A local minimum is
+a column (or run of consecutive equal-cost columns) whose DP cost is
+strictly less than both neighbors.  This filters out plateau and shoulder
+candidates that are not at a true cost valley, preventing the segment
+penalty from pulling splits away from clean whitespace channels.
+
+Among equal-cost runs that form a local minimum, the middle column is
+selected, centering the split and maximizing distance from ink on both
+sides.  For example, if columns 108–114 all have zero cost and both
+neighbors are higher, only column 111 becomes a candidate.
+
+Segment penalty is then added to each local-minimum candidate when it
+enters the greedy heap.  Among multiple local minima in the same segment,
+the heap picks the one with the best overall score (DP cost + segment
+penalty).
 
 ### Straight-Path Preference
 
@@ -121,7 +132,9 @@ Each child inherits up to two boundaries via `SegBounds`:
 ### Greedy Loop
 
 1. Compute candidate seams for each VP segment that needs more splits.
-   All candidates go onto a min-heap keyed by combined cost.
+   Only local minima in DP cost become candidates (see Local-Minima
+   Selection above).  Segment penalty is added to each, and all go onto
+   a min-heap keyed by total cost (DP + segment penalty).
 2. Pop the cheapest candidate. Validate:
    - **Ink on both sides**: the proposed left and right sub-segments must
      each have at least `min_ink_for_symbol` total ink (height-scaled;

@@ -115,6 +115,15 @@ pub struct Args {
     /// Default: no binarization (keep native greyscale with AA).
     #[arg(long)]
     pub render_binarize: Option<u8>,
+
+    /// Minimum ngram probability as a multiplier on uniform (1/glyph_count).
+    /// An ngram is included in scoring only if at least one candidate font
+    /// scores above (threshold × uniform) for that ngram; otherwise the
+    /// ngram is discarded. All fonts are then scored on the same surviving
+    /// set of ngrams. Default 6.0 means a glyph must be 6× more likely
+    /// than random to count.
+    #[arg(long, default_value_t = 6.0)]
+    pub min_ngram_prob: f32,
 }
 
 impl Args {

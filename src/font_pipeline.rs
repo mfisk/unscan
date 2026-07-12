@@ -251,7 +251,7 @@ pub fn match_lines(
                 plain_windows = w;
                 plain_pos_map = pm;
             }
-            let scoring_plain = font_match::identify_fonts(&plain_windows, classifier, glyph_map, args.thoroughness, args.full_audit(), &ensure_keys);
+            let scoring_plain = font_match::identify_fonts(&plain_windows, classifier, glyph_map, args.thoroughness, args.full_audit(), &ensure_keys, args.min_ngram_prob);
 
             // ── Score ligature path (if present) ─────────────────
             let scoring_lig = if let Some(ref lig_segs) = line_crops.lig_word_segs {
@@ -259,7 +259,7 @@ pub fn match_lines(
                     lig_segs, classifier, glyph_map,
                     &mut crop_store_lig,
                 );
-                Some(font_match::identify_fonts(&lig_windows, classifier, glyph_map, args.thoroughness, args.full_audit(), &ensure_keys))
+                Some(font_match::identify_fonts(&lig_windows, classifier, glyph_map, args.thoroughness, args.full_audit(), &ensure_keys, args.min_ngram_prob))
             } else {
                 None
             };
@@ -604,7 +604,8 @@ pub fn match_lines(
         }
 
         // Per-observation probabilities and audit detail: only for miss lines when full audit is active
-        let (chosen_obs_ranks, chosen_obs_probs, gt_font_obs_ranks, gt_font_obs_probs) = if is_miss && args.full_audit() {
+        let has_ocr_correction = corrected_words.is_some();
+        let (chosen_obs_ranks, chosen_obs_probs, gt_font_obs_ranks, gt_font_obs_probs) = if (is_miss || has_ocr_correction) && args.full_audit() {
             // Resolve chosen and GT font keys
             let chosen_font_key: Option<String> = font_result.as_ref()
                 .filter(|fr| !fr.font_key.is_empty())

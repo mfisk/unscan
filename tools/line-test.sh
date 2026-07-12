@@ -20,6 +20,13 @@ AUDIT_DIR="test-docs/line-test-audit"
 # Generate test PDFs from scratch
 python3 test-docs/gen-line-test.py "$@"
 
+# Copy to the filenames unprint expects
+cp test-docs/line-test-gt.pdf test-docs/line-test-seams-gt.pdf
+cp test-docs/line-test.pdf test-docs/line-test-seams.pdf
+
+# Clear page cache for these PDFs
+rm -rf /tmp/unprint-page-cache/line-test-seams*
+
 # Build debug binary if needed
 export PATH="$HOME/.cargo/bin:$PATH"
 if [ ! -f target/debug/unprint ] || [ "$(find src -newer target/debug/unprint -name '*.rs' | head -1)" ]; then

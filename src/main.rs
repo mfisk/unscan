@@ -128,15 +128,17 @@ fn build_audit_entry(
     similarity_pass: Option<bool>,
     keep_raster: bool,
     reason: &str,
+    classifier: &dyn classifier::Classifier,
 ) -> AuditEntry {
     use audit::{BBox, FontCandidate, ObservationVote, Decision, WordBBox};
     let font_result = &lm.font_result;
     let obs_vote = |d: &font_match::ObservationDetail, with_ranks: bool| {
+        let n_glyphs = classifier.glyph_count(&d.seq).max(1) as f32;
         ObservationVote {
             seq: d.seq.clone(),
             weight: d.weight,
             crop_index: d.crop_index,
-            best_prob: d.best_prob,
+            best_prob: d.best_prob * n_glyphs,
             passed_gate: d.passed_gate,
             nearest: d.nearest.clone(),
             crop_path: None,
@@ -149,8 +151,8 @@ fn build_audit_entry(
             pflda_ocr_p: d.pflda_ocr_p,
             pflda_replaced: d.pflda_replaced,
             gt_font_rank: if with_ranks { lm.gt_font_obs_ranks.get(&d.crop_index).copied() } else { None },
-            chosen_prob: if with_ranks { lm.chosen_obs_probs.get(&d.crop_index).copied() } else { None },
-            gt_font_prob: if with_ranks { lm.gt_font_obs_probs.get(&d.crop_index).copied() } else { None },
+            chosen_prob: if with_ranks { lm.chosen_obs_probs.get(&d.crop_index).copied().map(|p| p * n_glyphs) } else { None },
+            gt_font_prob: if with_ranks { lm.gt_font_obs_probs.get(&d.crop_index).copied().map(|p| p * n_glyphs) } else { None },
         }
     };
     AuditEntry {
@@ -545,7 +547,7 @@ fn run(args: &cli::Args, classifier: &mut dyn classifier::Classifier) -> Result<
 
             // ── Audit entry ──────────────────────────────────────────
             audit_text.push(build_audit_entry(
-                lm, line, page_num, line_num, similarity_score, similarity_pass, keep_raster, &reason,
+                lm, line, page_num, line_num, similarity_score, similarity_pass, keep_raster, &reason, classifier,
             ));
 
             placed_texts.push(pdf_out::PlacedText {

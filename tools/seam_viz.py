@@ -144,7 +144,7 @@ def load_fonts():
 
 
 def render_panel(dark, orig, col, steps, combined, tot_ink, tot_delta,
-                 cell_font, label_font):
+                 cell_font, label_font, swp=0.0, ssp=0.0, hc=0.0):
     h = dark.shape[0]
     mid = h // 2
 
@@ -156,7 +156,7 @@ def render_panel(dark, orig, col, steps, combined, tot_ink, tot_delta,
     step_map = {(s['r'], s['c']): s for s in steps}
 
     header_h = LABEL_FONT_SIZE + 8
-    totals_h = LABEL_FONT_SIZE * 4 + 20
+    totals_h = LABEL_FONT_SIZE * 5 + 24
     panel_w = cw * SCALE
     panel_h = header_h + h * SCALE + totals_h
 
@@ -164,7 +164,7 @@ def render_panel(dark, orig, col, steps, combined, tot_ink, tot_delta,
     draw = ImageDraw.Draw(img)
 
     path_width = max(path_cols) - min(path_cols)
-    header = f"Col {col}: cost={combined:.0f}  ink={tot_ink:.0f}  w={path_width}  wp={WIDTH_PENALTY*path_width}"
+    header = f"Col {col}: total={combined:.0f}"
     draw.text((4, 2), header, fill=COL_LABEL, font=label_font)
     y_off = header_h
 
@@ -223,7 +223,10 @@ def render_panel(dark, orig, col, steps, combined, tot_ink, tot_delta,
     ty = y_off + h * SCALE + 8
     draw.text((4, ty), f"col={col}  cells={len(steps)}", fill=COL_LABEL, font=label_font)
     ty += LABEL_FONT_SIZE + 4
-    draw.text((4, ty), f"ink={tot_ink:.0f}  \u0394={tot_delta:.0f}  w={path_width} (pen={WIDTH_PENALTY*path_width})  total={combined:.0f}",
+    draw.text((4, ty), f"ink={tot_ink:.0f}  \u0394={tot_delta:.0f}  seam_w={swp:.0f}  seg_sz={ssp:.0f}  horiz={hc:.0f}",
+              fill=COL_LABEL, font=label_font)
+    ty += LABEL_FONT_SIZE + 4
+    draw.text((4, ty), f"total={combined:.0f}",
               fill=COL_LABEL, font=label_font)
 
     return img, combined
@@ -234,13 +237,16 @@ def render(dark, orig, col_a, col_b, out_path,
            cost_a=0.0, cost_b=0.0,
            ink_a=0.0, ink_b=0.0,
            delta_a=0.0, delta_b=0.0,
-           vp_a=False, vp_b=False):
+           vp_a=False, vp_b=False,
+           swp_a=0.0, swp_b=0.0,
+           ssp_a=0.0, ssp_b=0.0,
+           hc_a=0.0, hc_b=0.0):
     cell_font, label_font, title_font = load_fonts()
 
     panel_a, _ = render_panel(dark, orig, col_a, steps_a, cost_a, ink_a, delta_a,
-                              cell_font, label_font)
+                              cell_font, label_font, swp=swp_a, ssp=ssp_a, hc=hc_a)
     panel_b, _ = render_panel(dark, orig, col_b, steps_b, cost_b, ink_b, delta_b,
-                              cell_font, label_font)
+                              cell_font, label_font, swp=swp_b, ssp=ssp_b, hc=hc_b)
 
     title_h = TITLE_FONT_SIZE + 12
     legend_h = CELL_FONT_SIZE + 8
@@ -406,7 +412,18 @@ if __name__ == '__main__':
     results = {}
     for col in [a.col_a, a.col_b]:
         is_vp = col in ws_splits
-        audit_cost = seam_costs.get(col)
+        raw_cost = seam_costs.get(col)
+        # Handle both old (float) and new (struct) formats
+        if isinstance(raw_cost, dict):
+            audit_cost = raw_cost.get('total')
+            swp = raw_cost.get('seam_width_penalty', 0.0)
+            ssp = raw_cost.get('segment_size_penalty', 0.0)
+            hc = raw_cost.get('horizontal_cost', 0.0)
+        else:
+            audit_cost = raw_cost
+            swp = 0.0
+            ssp = 0.0
+            hc = 0.0
 
         if is_vp:
             steps, tot_ink, tot_delta = steps_from_vertical(dark, col)
@@ -419,7 +436,8 @@ if __name__ == '__main__':
             print(f"ERROR: col {col} has no audit data (not a VP split and no recorded seam path)", file=sys.stderr)
             sys.exit(1)
 
-        results[col] = dict(steps=steps, cost=cost, ink=tot_ink, delta=tot_delta, is_vp=is_vp)
+        results[col] = dict(steps=steps, cost=cost, ink=tot_ink, delta=tot_delta, is_vp=is_vp,
+                            seam_width_penalty=swp, segment_size_penalty=ssp, horizontal_cost=hc)
 
     out = a.output or f'/tmp/seam_{a.col_a}_vs_{a.col_b}.png'
     ra, rb = results[a.col_a], results[a.col_b]
@@ -428,4 +446,7 @@ if __name__ == '__main__':
            cost_a=ra['cost'], cost_b=rb['cost'],
            ink_a=ra['ink'], ink_b=rb['ink'],
            delta_a=ra['delta'], delta_b=rb['delta'],
-           vp_a=ra['is_vp'], vp_b=rb['is_vp'])
+           vp_a=ra['is_vp'], vp_b=rb['is_vp'],
+           swp_a=ra['seam_width_penalty'], swp_b=rb['seam_width_penalty'],
+           ssp_a=ra['segment_size_penalty'], ssp_b=rb['segment_size_penalty'],
+           hc_a=ra['horizontal_cost'], hc_b=rb['horizontal_cost'])
