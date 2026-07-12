@@ -936,119 +936,73 @@ fn build_scan_line_with_overlays(diag_dir: &Path, entry: &AuditEntry) -> String 
         }
     }
 
-    // Segmentation paths from diag-seg summary.json
-    if let Ok(rd) = std::fs::read_dir(diag_dir) {
-        let mut word_dirs: Vec<_> = rd
-            .filter_map(|e| e.ok())
-            .filter(|e| {
-                e.file_name().to_string_lossy().starts_with("word_")
-                    && e.path().is_dir()
-            })
-            .collect();
-        word_dirs.sort_by_key(|d| d.file_name().to_string_lossy().to_string());
+    // Segmentation paths from audit entry word_segmentation
+    for ws in &entry.word_segmentation {
+        if ws.image_w == 0 || ws.image_h == 0 {
+            continue;
+        }
+        let matching_wb = match entry.word_bboxes.get(ws.source_word_idx) {
+            Some(wb) => wb,
+            None => continue,
+        };
 
-        for (word_idx, wd) in word_dirs.iter().enumerate() {
-            let wpath = wd.path();
-            let data_path = {
-                let sp = wpath.join("seg_plain");
-                if sp.is_dir() { sp } else { wpath.clone() }
-            };
-            let summary_path = data_path.join("summary.json");
-            if !summary_path.exists() {
-                continue;
+        let wx = (matching_wb.x.saturating_sub(crop_x)) * scale;
+        let wy = (matching_wb.y.saturating_sub(crop_y)) * scale + margin_top;
+        let wb_h = matching_wb.height * scale;
+
+        let sx_f = matching_wb.width as f64 / ws.image_w as f64 * scale as f64;
+        let sy_f = matching_wb.height as f64 / ws.image_h as f64 * scale as f64;
+
+        let label_y = wy + wb_h + 2;
+
+        // Whitespace splits — blue vertical lines
+        for &col in &ws.ws_splits {
+            let cx = wx + (col as f64 * sx_f) as u32;
+            overlays.push_str(&format!(
+                "<line x1=\"{cx}\" y1=\"{wy}\" x2=\"{cx}\" y2=\"{}\" \
+                 stroke=\"rgba(40,100,220,0.8)\" stroke-width=\"1\"/>\
+                 <text x=\"{}\" y=\"{label_y}\" font-size=\"7\" \
+                 fill=\"rgba(40,100,220,0.9)\">{col}</text>",
+                wy + wb_h, cx.saturating_sub(6)
+            ));
+        }
+
+        // Seam paths — magenta diagonal paths (one x per row)
+        // seam_paths now includes candidate (unused) paths too; only draw accepted ones.
+        let seam_split_set: std::collections::HashSet<u32> = ws.seam_splits.iter().copied().collect();
+        for (col_key, path) in &ws.seam_paths {
+            if !seam_split_set.contains(col_key) { continue; }
+            for entry in path.iter() {
+                let col_px = entry[1];
+                let row_idx = entry[0];
+                let px_x = wx + (col_px as f64 * sx_f) as u32;
+                let px_y = wy + (row_idx as f64 * sy_f) as u32;
+                overlays.push_str(&format!(
+                    "<rect x=\"{px_x}\" y=\"{px_y}\" width=\"1\" height=\"1\" \
+                     fill=\"rgba(255,0,200,0.8)\"/>",
+                ));
             }
-            let summary: serde_json::Value = match std::fs::read_to_string(&summary_path)
-                .ok()
-                .and_then(|s| serde_json::from_str(&s).ok())
-            {
-                Some(v) => v,
-                None => continue,
-            };
+            // Column label
+            let cx = wx + (*col_key as f64 * sx_f) as u32;
+            overlays.push_str(&format!(
+                "<text x=\"{}\" y=\"{label_y}\" font-size=\"7\" \
+                 fill=\"rgba(255,0,200,0.9)\">{col_key}</text>",
+                cx.saturating_sub(6)
+            ));
+        }
 
-            let seg_img_w = summary["image_w"].as_u64().unwrap_or(0) as u32;
-            let seg_img_h = summary["image_h"].as_u64().unwrap_or(0) as u32;
-            if seg_img_w == 0 || seg_img_h == 0 {
-                continue;
-            }
-
-            // Match word bbox by position (not text) — pflda may alter word_bboxes text
-            let matching_wb = match entry.word_bboxes.get(word_idx) {
-                Some(wb) => wb,
-                None => continue,
-            };
-
-            let wx = (matching_wb.x.saturating_sub(crop_x)) * scale;
-            let wy = (matching_wb.y.saturating_sub(crop_y)) * scale + margin_top;
-            let wb_h = matching_wb.height * scale;
-
-            // Scale factors: seg boundaries are in word image pixels
-            let sx_f = matching_wb.width as f64 / seg_img_w as f64 * scale as f64;
-            let sy_f = matching_wb.height as f64 / seg_img_h as f64 * scale as f64;
-
-            let label_y = wy + wb_h + 2;
-
-            // Whitespace splits — blue vertical lines
-            if let Some(ws_arr) = summary["ws_splits"].as_array() {
-                for ws in ws_arr {
-                    if let Some(col) = ws.as_u64() {
-                        let cx = wx + (col as f64 * sx_f) as u32;
-                        overlays.push_str(&format!(
-                            "<line x1=\"{cx}\" y1=\"{wy}\" x2=\"{cx}\" y2=\"{}\" \
-                             stroke=\"rgba(40,100,220,0.8)\" stroke-width=\"1\"/>\
-                             <text x=\"{}\" y=\"{label_y}\" font-size=\"7\" \
-                             fill=\"rgba(40,100,220,0.9)\">{col}</text>",
-                            wy + wb_h, cx.saturating_sub(6)
-                        ));
-                    }
-                }
-            }
-
-            // Seam paths — magenta diagonal paths (one x per row)
-            if let Some(seam_obj) = summary["seam_paths"].as_object() {
-                for (col_key, path_arr) in seam_obj {
-                    if let Some(path) = path_arr.as_array() {
-                        for (row_idx, px) in path.iter().enumerate() {
-                            if let Some(col_px) = px.as_u64() {
-                                let px_x = wx + (col_px as f64 * sx_f) as u32;
-                                let px_y = wy + (row_idx as f64 * sy_f) as u32;
-                                overlays.push_str(&format!(
-                                    "<rect x=\"{px_x}\" y=\"{px_y}\" width=\"1\" height=\"1\" \
-                                     fill=\"rgba(255,0,200,0.8)\"/>",
-                                ));
-                            }
-                        }
-                        // Column label
-                        let nominal_col = col_key.parse::<u64>().unwrap_or(0);
-                        let cx = wx + (nominal_col as f64 * sx_f) as u32;
-                        overlays.push_str(&format!(
-                            "<text x=\"{}\" y=\"{label_y}\" font-size=\"7\" \
-                             fill=\"rgba(255,0,200,0.9)\">{col_key}</text>",
-                            cx.saturating_sub(6)
-                        ));
-                    }
-                }
-            }
-
-            // Seam splits without paths — magenta vertical lines
-            let seam_path_keys: std::collections::HashSet<String> = summary["seam_paths"]
-                .as_object()
-                .map(|m| m.keys().cloned().collect())
-                .unwrap_or_default();
-            if let Some(seam_arr) = summary["seam_splits"].as_array() {
-                for seam in seam_arr {
-                    if let Some(col) = seam.as_u64() {
-                        if !seam_path_keys.contains(&col.to_string()) {
-                            let cx = wx + (col as f64 * sx_f) as u32;
-                            overlays.push_str(&format!(
-                                "<line x1=\"{cx}\" y1=\"{wy}\" x2=\"{cx}\" y2=\"{}\" \
-                                 stroke=\"rgba(255,0,200,0.7)\" stroke-width=\"1\"/>\
-                                 <text x=\"{}\" y=\"{label_y}\" font-size=\"7\" \
-                                 fill=\"rgba(255,0,200,0.9)\">{col}</text>",
-                                wy + wb_h, cx.saturating_sub(6)
-                            ));
-                        }
-                    }
-                }
+        // Seam splits without paths — magenta vertical lines
+        let seam_path_keys: std::collections::HashSet<u32> = ws.seam_paths.keys().copied().collect();
+        for &col in &ws.seam_splits {
+            if !seam_path_keys.contains(&col) {
+                let cx = wx + (col as f64 * sx_f) as u32;
+                overlays.push_str(&format!(
+                    "<line x1=\"{cx}\" y1=\"{wy}\" x2=\"{cx}\" y2=\"{}\" \
+                     stroke=\"rgba(255,0,200,0.7)\" stroke-width=\"1\"/>\
+                     <text x=\"{}\" y=\"{label_y}\" font-size=\"7\" \
+                     fill=\"rgba(255,0,200,0.9)\">{col}</text>",
+                    wy + wb_h, cx.saturating_sub(6)
+                ));
             }
         }
     }
@@ -1075,7 +1029,11 @@ fn build_scan_line_with_overlays(diag_dir: &Path, entry: &AuditEntry) -> String 
     )
 }
 
-fn build_seg_stats(diag_dir: &Path, entry: &AuditEntry) -> String {
+fn build_seg_stats(_diag_dir: &Path, entry: &AuditEntry) -> String {
+    if entry.word_segmentation.is_empty() {
+        return String::new();
+    }
+
     // Build word text → x position map for left-to-right ordering
     let word_x_map: HashMap<&str, u32> = entry
         .word_bboxes
@@ -1085,65 +1043,19 @@ fn build_seg_stats(diag_dir: &Path, entry: &AuditEntry) -> String {
 
     let mut seg_parts: Vec<(u32, String)> = Vec::new();
 
-    // Read word directories
-    let word_dirs = match std::fs::read_dir(diag_dir) {
-        Ok(rd) => {
-            let mut dirs: Vec<_> = rd
-                .filter_map(|e| e.ok())
-                .filter(|e| {
-                    e.file_name().to_string_lossy().starts_with("word_")
-                        && e.path().is_dir()
-                })
-                .collect();
-            dirs.sort_by_key(|d| d.file_name().to_string_lossy().to_string());
-            dirs
-        }
-        Err(_) => return String::new(),
-    };
+    for ws in &entry.word_segmentation {
+        let wtext = &ws.word_text;
+        let n_exp = ws.n_chars_expected.to_string();
+        let n_got = ws.n_segments_produced.to_string();
 
-    for (word_idx, wd) in word_dirs.iter().enumerate() {
-        let wpath = wd.path();
-        // Prefer seg_plain subdirectory, fall back to flat layout
-        let data_path = {
-            let sp = wpath.join("seg_plain");
-            if sp.is_dir() { sp } else { wpath.clone() }
-        };
-        let summary_path = data_path.join("summary.json");
-        if !summary_path.exists() {
-            continue;
-        }
-        let summary: serde_json::Value = match std::fs::read_to_string(&summary_path)
-            .ok()
-            .and_then(|s| serde_json::from_str(&s).ok())
-        {
-            Some(v) => v,
-            None => continue,
-        };
-        let wtext = summary["word_text"].as_str().unwrap_or("?");
-        let n_exp = summary["n_chars_expected"]
-            .as_u64()
-            .map(|n| n.to_string())
-            .unwrap_or_else(|| "?".to_string());
-        let n_got = summary["n_segments_produced"]
-            .as_u64()
-            .map(|n| n.to_string())
-            .unwrap_or_else(|| "?".to_string());
-        let mismatch = summary["mismatch"].as_bool().unwrap_or(false);
-        let nvp = summary["ws_splits"]
-            .as_array()
-            .map(|a| a.len())
-            .unwrap_or(0);
-        let nseam = summary["seam_splits"]
-            .as_array()
-            .map(|a| a.len())
-            .unwrap_or(0);
-
-        let word_x = word_x_map.get(wtext).copied().unwrap_or(999999u32);
+        let word_x = word_x_map.get(wtext.as_str()).copied().unwrap_or(999999u32);
         let mut info = format!("&quot;{wtext}&quot; {n_got}/{n_exp}");
-        if mismatch {
+        if ws.mismatch {
             info.push_str(" \u{26a0}");
         }
         let mut tags = Vec::new();
+        let nvp = ws.ws_splits.len();
+        let nseam = ws.seam_splits.len();
         if nvp > 0 {
             tags.push(format!("{nvp} vert"));
         }

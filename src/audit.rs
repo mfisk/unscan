@@ -1,10 +1,28 @@
 //! Audit log — single JSON sidecar with all pipeline decisions, font-matching detail,
 //! word-level similarity scores, and image references (crops + renders).
+use std::collections::HashMap;
 
 use crate::error::ScanTextError;
 use serde::Serialize;
 
 use std::path::{Path, PathBuf};
+
+/// Per-word segmentation summary, embedded in the audit entry so the report
+/// doesn't need to crawl summary.json files from disk.
+#[derive(Debug, Serialize, Clone)]
+pub struct WordSegSummary {
+    pub word_text: String,
+    pub source_word_idx: usize,
+    pub image_w: u32,
+    pub image_h: u32,
+    pub n_chars_expected: u32,
+    pub n_segments_produced: u32,
+    pub mismatch: bool,
+    pub ws_splits: Vec<u32>,
+    pub seam_splits: Vec<u32>,
+    pub seam_paths: HashMap<u32, Vec<[u32; 2]>>,
+    pub seam_costs: HashMap<u32, f32>,
+}
 
 /// Per-text-region audit record.
 #[derive(Debug, Serialize)]
@@ -64,6 +82,13 @@ pub struct AuditEntry {
     /// Whether OCR text matches ground truth (None when GT unavailable).
     #[serde(skip_serializing_if = "Option::is_none")]
     pub ocr_correct: Option<bool>,
+    /// Whether this line was matched via the dominant-font fast path
+    /// (skipping full classification).
+    #[serde(skip_serializing_if = "std::ops::Not::not")]
+    pub fast_path: bool,
+    /// Per-word segmentation summaries for this line.
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub word_segmentation: Vec<WordSegSummary>,
 }
 
 /// Word-level bounding box with OCR text.

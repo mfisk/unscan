@@ -1,8 +1,12 @@
 #!/usr/bin/env python3
 """Seam pixel visualizer: side-by-side zoomed panels with per-pixel cost inside each cell.
 
+Reads all data from audit output (summary.json + word_crop.png). No recomputation.
+The seam path comes from seam_paths in summary.json; per-pixel ink/delta are
+read from the image along the recorded path.
+
 Each path pixel is outlined in a color indicating cost type, with ink value
-and delta penalty written inside the cell.  No circles, no connecting lines.
+and delta penalty written inside the cell.
 
 Color coding:
   blue   = ink only (delta=0)
@@ -15,20 +19,22 @@ Yellow horizontal line = mid row (forward/reverse DP meeting point).
 Totals at bottom of each panel.
 
 Usage:
-  python3 tools/seam_viz.py <word_crop.png> <col_a> <col_b> \
-    [--seg-start S --seg-end E] [--summary summary.json] [-o output.png]
+  python3 tools/seam_viz.py <audit.json> <word> <col_a> <col_b> [-o output.png]
+  python3 tools/seam_viz.py <audit.json> <word> <col_a> <col_b> --line 5
+  python3 tools/seam_viz.py dummy WORD <col_a> <col_b> --seg-dir <seg_plain_dir>  # legacy
 """
 
 from PIL import Image, ImageDraw, ImageFont
 import numpy as np
-import argparse, json, sys
+import argparse, json, sys, os
 
-DELTA_WEIGHT = 4.0
+DELTA_WEIGHT = 1.0
 SCALE = 32
 PAD_COLS = 6
-GAP = 40
+WIDTH_PENALTY = 1
+PANEL_GAP = 40
 FONT_PATH = "/usr/share/fonts/truetype/dejavu/DejaVuSansMono.ttf"
-CELL_FONT_SIZE = 9       # text inside each pixel cell
+CELL_FONT_SIZE = 9
 LABEL_FONT_SIZE = 14
 TITLE_FONT_SIZE = 16
 
@@ -49,242 +55,104 @@ def delta_ink(dc, dp):
     return DELTA_WEIGHT * (dc - dp)
 
 
-def build_dp(dark, seg_start, seg_end):
-    h, w_full = dark.shape
-    sw = seg_end - seg_start
-    base = seg_start
-    def d(r, c): return dark[r, base + c]
-
-    DRIFT_MUL = 10.0
-
-    n = h * sw
-    cf = [0.0] * n; pf = [0] * n
-    cr = [0.0] * n; pr = [0] * n
-
-    for c in range(sw):
-        cf[c] = d(0, c) + delta_ink(d(0, c), 0); pf[c] = c
-
-    for r in range(1, h):
-        ro, po = r * sw, (r - 1) * sw
-        # Step 1: vertical from row above
-        for c in range(sw):
-            dc, dp_ = d(r, c), d(r - 1, c)
-            cf[ro + c] = dc + delta_ink(dc, dp_) + cf[po + c]
-            pf[ro + c] = po + c
-        # Step 2: diagonal from (r-1, c-1) → (r, c) — dest ink + delta + pass-through ink
-        for c in range(1, sw):
-            dc = d(r, c)
-            dp_ = d(r - 1, c - 1)
-            pass_ink = d(r, c - 1)
-            v = cf[po + c - 1] + dc + delta_ink(dc, dp_) + pass_ink
-            if v < cf[ro + c]:
-                cf[ro + c] = v; pf[ro + c] = po + c - 1
-        # Step 3: diagonal from (r-1, c+1) → (r, c) — dest ink + delta + pass-through ink
-        for c in range(sw - 1):
-            dc = d(r, c)
-            dp_ = d(r - 1, c + 1)
-            pass_ink = d(r, c + 1)
-            v = cf[po + c + 1] + dc + delta_ink(dc, dp_) + pass_ink
-            if v < cf[ro + c]:
-                cf[ro + c] = v; pf[ro + c] = po + c + 1
-
-    last = h - 1
-    for c in range(sw):
-        i = last * sw + c; cr[i] = d(last, c) + delta_ink(d(last, c), 0); pr[i] = i
-
-    for r in range(last - 1, -1, -1):
-        ro, no = r * sw, (r + 1) * sw
-        # Step 1: vertical from row below
-        for c in range(sw):
-            dc, ch_ = d(r, c), d(r + 1, c)
-            cr[ro + c] = dc + delta_ink(ch_, dc) + cr[no + c]
-            pr[ro + c] = no + c
-        # Step 2: diagonal from (r+1, c-1) → (r, c) — dest ink + delta + pass-through ink
-        for c in range(1, sw):
-            dc = d(r, c)
-            ch_ = d(r + 1, c - 1)
-            pass_ink = d(r, c - 1)
-            v = cr[no + c - 1] + dc + delta_ink(ch_, dc) + pass_ink
-            if v < cr[ro + c]:
-                cr[ro + c] = v; pr[ro + c] = no + c - 1
-        # Step 3: diagonal from (r+1, c+1) → (r, c) — dest ink + delta + pass-through ink
-        for c in range(sw - 1):
-            dc = d(r, c)
-            ch_ = d(r + 1, c + 1)
-            pass_ink = d(r, c + 1)
-            v = cr[no + c + 1] + dc + delta_ink(ch_, dc) + pass_ink
-            if v < cr[ro + c]:
-                cr[ro + c] = v; pr[ro + c] = no + c + 1
-
-    return cf, pf, cr, pr, sw, base
-
-
-def trace(pred, start, sw):
-    path = []; idx = start; seen = set()
-    while idx not in seen:
-        seen.add(idx)
-        path.append((idx // sw, idx % sw))
-        p = pred[idx]
-        if p == idx: break
-        idx = p
-    path.reverse()
-    return path
-
-
-def full_seam_path(dark, col, seg_start, seg_end):
-    h = dark.shape[0]
-    cf, pf, cr, pr, sw, base = build_dp(dark, seg_start, seg_end)
-    mid = h // 2
-    cl = col - base
-    mi = mid * sw + cl
-
-    fwd = trace(pf, mi, sw)                     # [row0, ..., mid]
-    rev = trace(pr, mi, sw)                      # [last_row, ..., mid]
-    rev_down = rev[::-1]                         # [mid, ..., last_row]
-
-    fwd_cells = [(r, c + base) for r, c in fwd]
-    rev_cells = [(r, c + base) for r, c in rev_down[1:]]
-    raw_cells = fwd_cells + rev_cells
-
-    # Expand diagonals into vertical + horizontal steps for visual path
-    cells = [raw_cells[0]]
-    for i in range(1, len(raw_cells)):
-        pr_, pc_ = raw_cells[i - 1]
-        r, c = raw_cells[i]
-        if pc_ != c:
-            cells.append((r, pc_))
-        cells.append((r, c))
-
-    # Compute cost from raw_cells (not expanded), applying 2× on diagonals
+def steps_from_recorded_path(dark, path_data):
+    """Walk a recorded seam path over the image.
+    Path is a list of [row, col] pairs from the audit data — including
+    pass-through pixels.  Show exactly what the audit contains.
+    Returns (steps, tot_ink, tot_delta)."""
     steps = []
-    tot_ink = 0.0; tot_delta = 0.0; cum = 0.0
+    tot_ink = 0.0
+    tot_delta = 0.0
+    cum = 0.0
+    prev_dark = 0.0  # boundary above
 
-    for i, (r, c) in enumerate(raw_cells):
-        ink = float(dark[r, c])
-        if i == 0:
-            dlt = delta_ink(ink, 0)
+    for entry in path_data:
+        r, c = int(entry[0]), int(entry[1])
+        d = float(dark[r, c])
+        dlt = delta_ink(d, prev_dark)
+        cum += d + dlt
+        tot_ink += d
+        tot_delta += dlt
+        steps.append(dict(r=r, c=c, dark=d, ink=d, delta=dlt, cum=cum))
+        prev_dark = d
+
+    return steps, tot_ink, tot_delta
+
+
+def steps_from_vertical(dark, col):
+    """Walk a straight vertical column — VP candidate. Includes run-length
+    and row-ink discounts."""
+    VERT_RUN_THRESHOLD = 11
+    VERT_RUN_DISCOUNT = 0.02
+    VERT_ROW_INK_DIVISOR = 8.0
+    h, w_full = dark.shape
+    row_ink = dark.sum(axis=1)
+    max_row_ink = max(row_ink.max(), 1e-9)
+    steps = []
+    tot_ink = 0.0
+    tot_delta = 0.0
+    cum = 0.0
+    prev_dark = 0.0
+    for r in range(h):
+        d = float(dark[r, col])
+        run_len = 1
+        cx = col - 1
+        while cx >= 0 and dark[r, cx] > 0:
+            run_len += 1; cx -= 1
+        cx = col + 1
+        while cx < w_full and dark[r, cx] > 0:
+            run_len += 1; cx += 1
+        if run_len >= VERT_RUN_THRESHOLD:
+            run_wt = max(0.1, 1.0 - VERT_RUN_DISCOUNT * (run_len - VERT_RUN_THRESHOLD + 1))
         else:
-            pr_, pc_ = raw_cells[i - 1]
-            dlt = delta_ink(ink, dark[pr_, pc_])
-        step_cost = ink + dlt
-        # Diagonal: add pass-through cell ink
-        if i > 0 and raw_cells[i - 1][1] != c:
-            pass_col = raw_cells[i - 1][1]
-            step_cost += float(dark[r, pass_col])
-        cum += step_cost
-        tot_ink += ink; tot_delta += dlt
-        steps.append(dict(r=r, c=c, dark=ink, ink=ink, delta=dlt, cum=cum))
-
-    # Last cell: exit to below (no ink out of bounds)
-    last_ink = steps[-1]['dark']
-    exit_dlt = delta_ink(last_ink, 0)
-    if exit_dlt > 0:
-        steps[-1]['delta'] += exit_dlt
-        steps[-1]['cum'] += exit_dlt
-        tot_delta += exit_dlt
-        cum += exit_dlt
-
-    # Additive width penalty: cost + 50 * width
-    all_cols = [c for _, c in raw_cells]
-    width = max(all_cols) - min(all_cols)
-
-    mi = mid * sw + cl
-    raw_cost = cf[mi] + cr[mi] - dark[mid, col]
-    combined = raw_cost + 50.0 * width
-    return steps, cf[mi], cr[mi], combined, tot_ink, tot_delta
+            run_wt = 1.0
+        row_wt = 1.0 - (row_ink[r] / max_row_ink) / VERT_ROW_INK_DIVISOR
+        wt = run_wt * row_wt
+        ink = d
+        dlt = delta_ink(d, prev_dark)
+        weighted = (ink + dlt) * wt
+        cum += weighted
+        tot_ink += ink * wt
+        tot_delta += dlt * wt
+        steps.append(dict(r=r, c=col, dark=d, ink=ink, delta=dlt,
+                          run_len=run_len, run_weight=run_wt,
+                          row_weight=row_wt, weight=wt, cum=cum))
+        prev_dark = d
+    return steps, tot_ink, tot_delta
 
 
 def step_color(s):
     if s['dark'] == 0:
         return COL_FREE
     if s['delta'] > 0:
-        return COL_DELTA
+        return (255, 100, 100) if s['delta'] > 50 else COL_DELTA
     return COL_INK
 
 
 def text_color_for_bg(orig_val):
-    """Pick text color that's readable against the greyscale background."""
-    return (255, 255, 255) if orig_val < 140 else (0, 0, 0)
+    return (255, 255, 255) if orig_val < 128 else (0, 0, 0)
 
 
 def load_fonts():
     try:
         cell_font = ImageFont.truetype(FONT_PATH, CELL_FONT_SIZE)
-    except (OSError, IOError):
-        cell_font = ImageFont.load_default()
-    try:
         label_font = ImageFont.truetype(FONT_PATH, LABEL_FONT_SIZE)
-    except (OSError, IOError):
-        label_font = cell_font
-    try:
         title_font = ImageFont.truetype(FONT_PATH, TITLE_FONT_SIZE)
-    except (OSError, IOError):
-        title_font = label_font
+    except IOError:
+        cell_font = label_font = title_font = ImageFont.load_default()
     return cell_font, label_font, title_font
 
 
-def render_panel(dark, orig, col, seg_start, seg_end, cell_font, label_font,
-                 is_vertical=False, audit_cost=None):
+def render_panel(dark, orig, col, steps, combined, tot_ink, tot_delta,
+                 cell_font, label_font):
     h = dark.shape[0]
     mid = h // 2
-
-    if is_vertical:
-        # VP candidate: straight vertical line, per-row darkness + delta,
-        # with run-length and row-ink discounts for serif/baseline bands.
-        VERT_RUN_THRESHOLD = 11
-        VERT_RUN_DISCOUNT = 0.02  # per-pixel rate
-        VERT_ROW_INK_DIVISOR = 8.0
-        w_full = dark.shape[1]
-        row_ink = dark.sum(axis=1)
-        max_row_ink = max(row_ink.max(), 1e-9)
-        steps = []
-        tot_ink = 0.0
-        tot_delta = 0.0
-        cum = 0.0
-        prev_dark = 0.0  # boundary: no ink above
-        for r in range(h):
-            d = float(dark[r, col])
-            # Measure horizontal dark run through this column
-            run_len = 1
-            cx = col - 1
-            while cx >= 0 and dark[r, cx] > 0:
-                run_len += 1
-                cx -= 1
-            cx = col + 1
-            while cx < w_full and dark[r, cx] > 0:
-                run_len += 1
-                cx += 1
-            # Run-length discount: long runs get scaled discount
-            if run_len >= VERT_RUN_THRESHOLD:
-                run_wt = max(0.1, 1.0 - VERT_RUN_DISCOUNT * (run_len - VERT_RUN_THRESHOLD + 1))
-            else:
-                run_wt = 1.0
-            # Row-ink discount: high-ink rows discounted
-            row_wt = 1.0 - (row_ink[r] / max_row_ink) / VERT_ROW_INK_DIVISOR
-            wt = run_wt * row_wt
-            ink = d
-            dlt = delta_ink(d, prev_dark)
-            weighted = (ink + dlt) * wt
-            cum += weighted
-            tot_ink += ink * wt
-            tot_delta += dlt * wt
-            steps.append(dict(r=r, c=col, dark=d, ink=ink, delta=dlt,
-                              run_len=run_len, run_weight=run_wt,
-                              row_weight=row_wt, weight=wt, cum=cum))
-            prev_dark = d
-        combined = audit_cost if audit_cost is not None else cum
-        cf = combined
-        cr = 0.0
-    else:
-        steps, cf, cr, combined, tot_ink, tot_delta = full_seam_path(
-            dark, col, seg_start, seg_end)
 
     path_cols = [s['c'] for s in steps]
     c_min = max(0, min(path_cols) - PAD_COLS)
     c_max = min(orig.shape[1], max(path_cols) + PAD_COLS + 1)
     cw = c_max - c_min
 
-    # Build lookup: (r,c) -> step
     step_map = {(s['r'], s['c']): s for s in steps}
 
     header_h = LABEL_FONT_SIZE + 8
@@ -295,12 +163,11 @@ def render_panel(dark, orig, col, seg_start, seg_end, cell_font, label_font,
     img = Image.new('RGB', (panel_w, panel_h), COL_BG)
     draw = ImageDraw.Draw(img)
 
-    # Header
-    header = f"Col {col}: cost={combined:.0f}  ink={tot_ink:.0f}"
+    path_width = max(path_cols) - min(path_cols)
+    header = f"Col {col}: cost={combined:.0f}  ink={tot_ink:.0f}  w={path_width}  wp={WIDTH_PENALTY*path_width}"
     draw.text((4, 2), header, fill=COL_LABEL, font=label_font)
     y_off = header_h
 
-    # Draw all pixels as greyscale background
     for r in range(h):
         for c in range(c_min, c_max):
             v = int(orig[r, c])
@@ -310,11 +177,9 @@ def render_panel(dark, orig, col, seg_start, seg_end, cell_font, label_font,
             draw.rectangle([x0, y0, x0 + SCALE - 1, y0 + SCALE - 1],
                            fill=(v, v, v))
 
-    # Mid row line
     my = y_off + mid * SCALE + SCALE // 2
     draw.line([(0, my), (cw * SCALE, my)], fill=COL_MID, width=1)
 
-    # Draw path pixels: colored outline + cost text inside cell
     for s in steps:
         lc = s['c'] - c_min
         x0 = lc * SCALE
@@ -322,11 +187,9 @@ def render_panel(dark, orig, col, seg_start, seg_end, cell_font, label_font,
         color = step_color(s)
         bg_val = int(orig[s['r'], s['c']])
 
-        # Colored outline, 2px
         draw.rectangle([x0, y0, x0 + SCALE - 1, y0 + SCALE - 1],
                        outline=color, width=2)
 
-        # Text inside the cell
         tc_ = text_color_for_bg(bg_val)
 
         has_wt = 'weight' in s and s['weight'] < 0.999
@@ -335,20 +198,18 @@ def render_panel(dark, orig, col, seg_start, seg_end, cell_font, label_font,
         tx = x0 + (SCALE - line1_w) / 2
 
         if has_wt:
-            # VP cell with discount: show ink, delta, and weight
             lines = [ink_str]
             if s['delta'] > 0:
                 lines.append(f"+{s['delta']:.0f}")
-            lines.append(f"×{s['weight']:.2f}")
+            lines.append(f"\u00d7{s['weight']:.2f}")
             n = len(lines)
             ty = y0 + (SCALE - n * (CELL_FONT_SIZE + 1)) / 2
             for i, line in enumerate(lines):
                 lw = cell_font.getlength(line)
                 lx = x0 + (SCALE - lw) / 2
-                c_ = (255, 200, 80) if line.startswith('×') else color
+                c_ = (255, 200, 80) if line.startswith('\u00d7') else color
                 draw.text((lx, ty + i * (CELL_FONT_SIZE + 1)), line, fill=c_, font=cell_font)
         elif s['delta'] > 0:
-            # Two lines: ink on top, delta below
             ty = y0 + (SCALE - 2 * CELL_FONT_SIZE - 2) / 2
             draw.text((tx, ty), ink_str, fill=color, font=cell_font)
             dlt_str = f"+{s['delta']:.0f}"
@@ -356,42 +217,36 @@ def render_panel(dark, orig, col, seg_start, seg_end, cell_font, label_font,
             dx = x0 + (SCALE - dlt_w) / 2
             draw.text((dx, ty + CELL_FONT_SIZE + 2), dlt_str, fill=color, font=cell_font)
         elif s['dark'] > 0:
-            # One line: ink centered
             ty = y0 + (SCALE - CELL_FONT_SIZE) / 2
             draw.text((tx, ty), ink_str, fill=color, font=cell_font)
-        # else: free cell, outline only
 
-    # Totals at bottom
     ty = y_off + h * SCALE + 8
     draw.text((4, ty), f"col={col}  cells={len(steps)}", fill=COL_LABEL, font=label_font)
     ty += LABEL_FONT_SIZE + 4
-    draw.text((4, ty), f"ink={tot_ink:.0f}  Δ={tot_delta:.0f}  total={combined:.0f}",
+    draw.text((4, ty), f"ink={tot_ink:.0f}  \u0394={tot_delta:.0f}  w={path_width} (pen={WIDTH_PENALTY*path_width})  total={combined:.0f}",
               fill=COL_LABEL, font=label_font)
-    ty += LABEL_FONT_SIZE + 4
-    draw.text((4, ty), f"fwd={cf:.0f}  rev={cr:.0f}", fill=COL_TEXT, font=cell_font)
 
     return img, combined
 
 
-def render(dark, orig, col_a, col_b, seg_start, seg_end, out_path,
-           vp_a=False, vp_b=False, cost_a_audit=None, cost_b_audit=None,
-           seg_a=None, seg_b=None):
+def render(dark, orig, col_a, col_b, out_path,
+           steps_a=None, steps_b=None,
+           cost_a=0.0, cost_b=0.0,
+           ink_a=0.0, ink_b=0.0,
+           delta_a=0.0, delta_b=0.0,
+           vp_a=False, vp_b=False):
     cell_font, label_font, title_font = load_fonts()
-    ss_a, se_a = seg_a if seg_a else (seg_start, seg_end)
-    ss_b, se_b = seg_b if seg_b else (seg_start, seg_end)
 
-    panel_a, cost_a = render_panel(dark, orig, col_a, ss_a, se_a,
-                                    cell_font, label_font,
-                                    is_vertical=vp_a, audit_cost=cost_a_audit)
-    panel_b, cost_b = render_panel(dark, orig, col_b, ss_b, se_b,
-                                    cell_font, label_font,
-                                    is_vertical=vp_b, audit_cost=cost_b_audit)
+    panel_a, _ = render_panel(dark, orig, col_a, steps_a, cost_a, ink_a, delta_a,
+                              cell_font, label_font)
+    panel_b, _ = render_panel(dark, orig, col_b, steps_b, cost_b, ink_b, delta_b,
+                              cell_font, label_font)
 
     title_h = TITLE_FONT_SIZE + 12
     legend_h = CELL_FONT_SIZE + 8
     header_h = title_h + legend_h
 
-    total_w = panel_a.width + GAP + panel_b.width
+    total_w = panel_a.width + PANEL_GAP + panel_b.width
     total_h = header_h + max(panel_a.height, panel_b.height)
     combined = Image.new('RGB', (total_w, total_h), COL_BG)
     draw = ImageDraw.Draw(combined)
@@ -399,95 +254,178 @@ def render(dark, orig, col_a, col_b, seg_start, seg_end, out_path,
     winner = col_a if cost_a < cost_b else col_b
     tag_a = "VP" if vp_a else "seam"
     tag_b = "VP" if vp_b else "seam"
-    title = f"Col {col_a} [{tag_a}] ({cost_a:.0f}) vs col {col_b} [{tag_b}] ({cost_b:.0f})  —  winner: {winner}"
+    title = f"Col {col_a} [{tag_a}] ({cost_a:.0f}) vs col {col_b} [{tag_b}] ({cost_b:.0f})  \u2014  winner: {winner}"
     draw.text((8, 4), title, fill=COL_LABEL, font=title_font)
 
     ly = title_h
     lx = 8
-    for label, color in [("■ ink only", COL_INK), ("■ ink+Δ", COL_DELTA),
-                          ("■ free", COL_FREE),
-                          ("│ target", (0, 200, 0)), ("─ mid", COL_MID)]:
+    for label, color in [("\u25a0 ink only", COL_INK), ("\u25a0 ink+\u0394", COL_DELTA),
+                          ("\u25a0 free", COL_FREE),
+                          ("\u2502 target", (0, 200, 0)), ("\u2500 mid", COL_MID)]:
         draw.text((lx, ly), label, fill=color, font=cell_font)
         lx += int(cell_font.getlength(label)) + 16
 
     combined.paste(panel_a, (0, header_h))
-    combined.paste(panel_b, (panel_a.width + GAP, header_h))
+    combined.paste(panel_b, (panel_a.width + PANEL_GAP, header_h))
 
     combined.save(out_path)
     print(f"Written to {out_path}")
 
 
+def sanitize_text(text, max_len=30):
+    """Match the slug logic in Rust: alphanumeric pass-through, else underscore."""
+    return ''.join(c if c.isalnum() else '_' for c in text[:max_len])
+
+
+def find_word_crop(audit_dir, page, line_index, word_text, source_word_idx):
+    """Locate word_crop.png on disk from audit dir structure."""
+    # Line dirs: p{page}_L{line:03}_{slug}
+    line_prefix = f"p{page}_L{line_index:03}_"
+    for entry in sorted(os.listdir(audit_dir)):
+        if entry.startswith(line_prefix) and os.path.isdir(os.path.join(audit_dir, entry)):
+            line_dir = os.path.join(audit_dir, entry)
+            # Word dirs: word_{idx:03}_{slug}
+            word_prefix = f"word_{source_word_idx:03}_"
+            for wentry in sorted(os.listdir(line_dir)):
+                if wentry.startswith(word_prefix) and os.path.isdir(os.path.join(line_dir, wentry)):
+                    seg_plain = os.path.join(line_dir, wentry, 'seg_plain')
+                    if os.path.isdir(seg_plain):
+                        crop = os.path.join(seg_plain, 'word_crop.png')
+                        if os.path.exists(crop):
+                            return crop, seg_plain
+                    # Flat layout fallback
+                    crop = os.path.join(line_dir, wentry, 'word_crop.png')
+                    if os.path.exists(crop):
+                        return crop, os.path.join(line_dir, wentry)
+    return None, None
+
+
+def find_seg_summary(seg_plain_dir):
+    """Load summary.json from seg_plain dir for candidate_seam_paths and seam_seed_candidates."""
+    if seg_plain_dir is None:
+        return {}
+    summary_path = os.path.join(seg_plain_dir, 'summary.json')
+    if os.path.exists(summary_path):
+        with open(summary_path) as f:
+            return json.load(f)
+    return {}
+
+
 if __name__ == '__main__':
-    p = argparse.ArgumentParser(description="Seam path comparison visualizer")
-    p.add_argument('image', help='word_crop.png path')
-    p.add_argument('col_a', type=int, help='First seam column')
-    p.add_argument('col_b', type=int, help='Second seam column')
-    p.add_argument('--seg-start', type=int, default=None)
-    p.add_argument('--seg-end', type=int, default=None)
-    p.add_argument('--summary', default=None,
-                   help='Path to summary.json for cost validation')
+    p = argparse.ArgumentParser(description="Seam path comparison visualizer (reads audit.json)")
+    p.add_argument('audit_json', help='Path to audit.json')
+    p.add_argument('word', help='Word text to visualize (matched against word_segmentation)')
+    p.add_argument('col_a', type=int, help='First column')
+    p.add_argument('col_b', type=int, help='Second column')
+    p.add_argument('--line', type=int, default=None,
+                   help='Line index (0-based) to disambiguate if word appears on multiple lines')
     p.add_argument('-o', '--output', default=None,
                    help='Output path (default: /tmp/seam_<a>_vs_<b>.png)')
+    # Legacy mode: accept seg_plain dir directly
+    p.add_argument('--seg-dir', default=None,
+                   help='Legacy: seg_plain directory (bypasses audit.json lookup)')
     a = p.parse_args()
 
-    img = Image.open(a.image)
+    if a.seg_dir:
+        # Legacy mode: read from seg_plain dir directly
+        summary_path = os.path.join(a.seg_dir, 'summary.json')
+        crop_path = os.path.join(a.seg_dir, 'word_crop.png')
+        if not os.path.exists(summary_path):
+            print(f"ERROR: {summary_path} not found", file=sys.stderr)
+            sys.exit(1)
+        if not os.path.exists(crop_path):
+            print(f"ERROR: {crop_path} not found", file=sys.stderr)
+            sys.exit(1)
+        with open(summary_path) as f:
+            summary = json.load(f)
+
+        seam_paths = {int(k): v for k, v in summary.get('seam_paths', {}).items()}
+        seam_costs = {int(k): v for k, v in summary.get('seam_costs', {}).items()}
+        ws_splits = set(summary.get('ws_splits', []))
+        # Legacy fallback: derive costs from seam_seed_candidates if seam_costs absent
+        if not seam_costs:
+            for c in summary.get('seam_seed_candidates', []):
+                seam_costs[c['col']] = c['cost']
+    else:
+        # Primary mode: read from audit.json
+        if not os.path.exists(a.audit_json):
+            print(f"ERROR: {a.audit_json} not found", file=sys.stderr)
+            sys.exit(1)
+
+        with open(a.audit_json) as f:
+            audit = json.load(f)
+
+        audit_dir = os.path.dirname(os.path.abspath(a.audit_json))
+
+        # Find the matching word_segmentation entry
+        match = None
+        match_entry = None
+        for entry in audit['text_entries']:
+            if a.line is not None and entry['line_index'] != a.line:
+                continue
+            for ws in entry.get('word_segmentation', []):
+                if ws['word_text'] == a.word:
+                    match = ws
+                    match_entry = entry
+                    break
+            if match:
+                break
+
+        if match is None:
+            print(f"ERROR: word '{a.word}' not found in audit.json word_segmentation", file=sys.stderr)
+            # List available words
+            words = set()
+            for entry in audit['text_entries']:
+                for ws in entry.get('word_segmentation', []):
+                    words.add(f"L{entry['line_index']:03}:{ws['word_text']}")
+            if words:
+                print(f"Available: {', '.join(sorted(words))}", file=sys.stderr)
+            sys.exit(1)
+
+        # Seam data from audit.json
+        seam_paths = {int(k): v for k, v in match['seam_paths'].items()}
+        seam_costs = {int(k): v for k, v in match.get('seam_costs', {}).items()}
+        ws_splits = set(match['ws_splits'])
+
+        # Find word_crop.png on disk (still needed for pixel data)
+        crop_path, seg_plain_dir = find_word_crop(
+            audit_dir, match_entry['page'], match_entry['line_index'],
+            match['word_text'], match['source_word_idx'])
+
+        if crop_path is None:
+            print(f"ERROR: word_crop.png not found for word '{a.word}' "
+                  f"(page {match_entry['page']}, line {match_entry['line_index']})", file=sys.stderr)
+            sys.exit(1)
+
+    img = Image.open(crop_path)
     arr = np.array(img)
     if arr.ndim == 3:
         arr = arr[:, :, 0]
     dark = 255.0 - arr.astype(float)
-    w = arr.shape[1]
-    ss = a.seg_start if a.seg_start is not None else max(0, min(a.col_a, a.col_b) - 30)
-    se = a.seg_end if a.seg_end is not None else min(w, max(a.col_a, a.col_b) + 30)
 
-    if a.summary:
-        with open(a.summary) as f:
-            summary = json.load(f)
-        candidates = {c['col']: c for c in summary.get('seam_seed_candidates', [])}
-        ok = True
-        vp_flags = {}
-        audit_costs = {}
-        for col in [a.col_a, a.col_b]:
-            if col not in candidates:
-                print(f"WARN: col {col} not in seam_seed_candidates, skipping validation")
-                vp_flags[col] = False
-                continue
-            cand = candidates[col]
-            vp_flags[col] = cand.get('is_vertical', False)
-            audit_costs[col] = cand.get('cost')
-            if vp_flags[col]:
-                print(f"VP col {col}: audit_cost={cand['cost']:.1f}")
-                continue
-            c_ss, c_se = cand['seg']
-            steps, cf_, cr_, comb, ti, td = full_seam_path(dark, col, c_ss, c_se)
-            audit_cost = cand['cost']
-            if abs(comb - audit_cost) > 1.0:
-                print(f"MISMATCH col {col}: python={comb:.1f} audit={audit_cost:.1f} "
-                      f"(diff={comb - audit_cost:.1f})", file=sys.stderr)
-                ok = False
-            else:
-                print(f"OK col {col}: python={comb:.1f} audit={audit_cost:.1f}")
-        if not ok:
-            print("VALIDATION WARNING: cost mismatch (scoring params changed since audit)", file=sys.stderr)
-    else:
-        vp_flags = {a.col_a: False, a.col_b: False}
-        audit_costs = {}
+    results = {}
+    for col in [a.col_a, a.col_b]:
+        is_vp = col in ws_splits
+        audit_cost = seam_costs.get(col)
+
+        if is_vp:
+            steps, tot_ink, tot_delta = steps_from_vertical(dark, col)
+            cost = audit_cost if audit_cost is not None else steps[-1]['cum']
+        elif col in seam_paths:
+            path_cols = seam_paths[col]
+            steps, tot_ink, tot_delta = steps_from_recorded_path(dark, path_cols)
+            cost = audit_cost if audit_cost is not None else steps[-1]['cum']
+        else:
+            print(f"ERROR: col {col} has no audit data (not a VP split and no recorded seam path)", file=sys.stderr)
+            sys.exit(1)
+
+        results[col] = dict(steps=steps, cost=cost, ink=tot_ink, delta=tot_delta, is_vp=is_vp)
 
     out = a.output or f'/tmp/seam_{a.col_a}_vs_{a.col_b}.png'
-    seg_a_bounds = None
-    seg_b_bounds = None
-    if a.summary:
-        for col, attr in [(a.col_a, 'seg_a_bounds'), (a.col_b, 'seg_b_bounds')]:
-            if col in candidates:
-                cand = candidates[col]
-                bounds = tuple(cand['seg'])
-                if col == a.col_a:
-                    seg_a_bounds = bounds
-                else:
-                    seg_b_bounds = bounds
-    render(dark, arr, a.col_a, a.col_b, ss, se, out,
-           vp_a=vp_flags.get(a.col_a, False),
-           vp_b=vp_flags.get(a.col_b, False),
-           cost_a_audit=audit_costs.get(a.col_a),
-           cost_b_audit=audit_costs.get(a.col_b),
-           seg_a=seg_a_bounds,
-           seg_b=seg_b_bounds)
+    ra, rb = results[a.col_a], results[a.col_b]
+    render(dark, arr, a.col_a, a.col_b, out,
+           steps_a=ra['steps'], steps_b=rb['steps'],
+           cost_a=ra['cost'], cost_b=rb['cost'],
+           ink_a=ra['ink'], ink_b=rb['ink'],
+           delta_a=ra['delta'], delta_b=rb['delta'],
+           vp_a=ra['is_vp'], vp_b=rb['is_vp'])

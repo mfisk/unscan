@@ -47,7 +47,7 @@ through the interior of a uniformly dark stroke pays the base darkness cost
 but no entry penalty (the darkness isn't increasing). A path crossing from
 a white gap into a stroke edge pays a heavy penalty.
 
-`ENTRY_PENALTY_WEIGHT = 4.0`.
+`ENTRY_PENALTY_WEIGHT = 3.0`.
 
 ### Dual DP: Forward + Reverse
 
@@ -158,5 +158,5 @@ infinite cost or fail ink validation), fall back to
 | Constant | Value | Purpose |
 |----------|-------|---------|
 | `VP_THRESHOLD` | 200 | Grayscale values ≥ 200 are treated as white (no ink) |
-| `ENTRY_PENALTY_WEIGHT` | 4.0 | Multiplier for dark-entry penalty in seam DP |
+| `ENTRY_PENALTY_WEIGHT` | 3.0 | Multiplier for dark-entry penalty in seam DP |
 | `MIN_SYMBOL_FRAC` | 0.07 | Fraction of crop height for the smallest symbol (a period).  Minimum ink threshold = `(0.07 × h)² × 255`, scaling with DPI and font size. |

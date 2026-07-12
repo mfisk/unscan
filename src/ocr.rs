@@ -207,6 +207,7 @@ pub fn assemble_lines(words: &[TextRegion]) -> Vec<TextLine> {
 /// Must run immediately after `assemble_lines()`, before any other
 /// post-processing.
 pub fn merge_overlapping_lines(lines: &mut Vec<TextLine>) {
+    return; // DISABLED — split_merged_lines handles the multi-line case
     if lines.len() < 2 {
         return;
     }
@@ -377,6 +378,144 @@ pub fn clip_word_overlaps(lines: &mut [TextLine]) {
 /// Heuristic: if a word's height is ≥ 1.8× the median word height in the line
 /// AND its confidence is below 70, drop it.  After dropping, recompute the
 /// line's text and bbox from the surviving words.
+
+/// Split lines that contain words from multiple physical text lines.
+///
+/// Uses a confidence-weighted vertical projection profile: for each y-pixel
+/// in the line's bounding box, accumulate `confidence / 100` for every word
+/// box that covers it.  Contiguous interior runs where the profile drops
+/// below 0.5 (less than one word at 50% confidence — the point where
+/// Tesseract itself considers recognition a coin-flip) are valleys.
+///
+/// Words whose vertical midpoint falls in a valley and whose confidence is
+/// below 60% are dropped (likely image artefacts or decorations that span
+/// the gap between real text lines).  The remaining words are partitioned
+/// into bands separated by the valleys, each band becoming its own TextLine.
+pub fn split_merged_lines(lines: &mut Vec<TextLine>) {
+    let mut i = 0;
+    while i < lines.len() {
+        if lines[i].words.len() < 3 {
+            i += 1;
+            continue;
+        }
+
+        let y_min = match lines[i].words.iter().map(|w| w.y).min() {
+            Some(v) => v,
+            None => { i += 1; continue; }
+        };
+        let y_max = match lines[i].words.iter().map(|w| w.y + w.height).max() {
+            Some(v) => v,
+            None => { i += 1; continue; }
+        };
+        if y_max <= y_min {
+            i += 1;
+            continue;
+        }
+
+        let h = (y_max - y_min) as usize;
+
+        // Confidence-weighted vertical projection profile.
+        let mut profile = vec![0.0f32; h];
+        for w in &lines[i].words {
+            let top = w.y.saturating_sub(y_min) as usize;
+            let bot = (w.y + w.height).saturating_sub(y_min) as usize;
+            let weight = w.confidence / 100.0;
+            for y_px in top..bot.min(h) {
+                profile[y_px] += weight;
+            }
+        }
+
+        // Valleys: contiguous runs where weighted coverage < 0.5.
+        let threshold = 0.5f32;
+        let mut valleys: Vec<(usize, usize)> = Vec::new();
+        let mut in_valley = false;
+        let mut vs = 0usize;
+        for (y_px, &val) in profile.iter().enumerate() {
+            if val < threshold {
+                if !in_valley {
+                    vs = y_px;
+                    in_valley = true;
+                }
+            } else if in_valley {
+                valleys.push((vs, y_px));
+                in_valley = false;
+            }
+        }
+        // Trailing valley (below all words) is ignored.
+
+        // Must be interior and at least 2px wide.
+        valleys.retain(|&(s, e)| e - s >= 2 && s > 0 && e < h);
+
+        if valleys.is_empty() {
+            i += 1;
+            continue;
+        }
+
+        // Partition words into bands separated by valleys.
+        let n_bands = valleys.len() + 1;
+        let mut bands: Vec<Vec<TextRegion>> = vec![Vec::new(); n_bands];
+
+        for w in &lines[i].words {
+            let mid_y = (w.y + w.height / 2).saturating_sub(y_min) as usize;
+
+            let in_valley_region = valleys.iter()
+                .any(|&(s, e)| mid_y >= s && mid_y < e);
+
+            if in_valley_region && w.confidence < 60.0 {
+                continue; // drop low-confidence bridge word
+            }
+
+            let mut band = 0;
+            for (vi, &(_, ve)) in valleys.iter().enumerate() {
+                if mid_y >= ve {
+                    band = vi + 1;
+                }
+            }
+            bands[band].push(w.clone());
+        }
+
+        // Need at least 2 non-empty bands.
+        let non_empty: Vec<Vec<TextRegion>> = bands.into_iter()
+            .filter(|b| !b.is_empty())
+            .collect();
+
+        if non_empty.len() < 2 {
+            i += 1;
+            continue;
+        }
+
+        lines.remove(i);
+        let n_new = non_empty.len();
+        for (j, band_words) in non_empty.into_iter().enumerate() {
+            let text = band_words.iter()
+                .map(|w| w.text.as_str())
+                .collect::<Vec<_>>()
+                .join(" ");
+            let bx = band_words.iter().map(|w| w.x).min().unwrap_or(0);
+            let by = band_words.iter().map(|w| w.y).min().unwrap_or(0);
+            let bx_max = band_words.iter().map(|w| w.x + w.width).max().unwrap_or(0);
+            let by_max = band_words.iter().map(|w| w.y + w.height).max().unwrap_or(0);
+            let avg_conf = band_words.iter().map(|w| w.confidence).sum::<f32>()
+                / band_words.len() as f32;
+            let fsize = band_words.first()
+                .map(|w| w.font_size_pt).unwrap_or(12.0);
+
+            lines.insert(i + j, TextLine {
+                text,
+                x: bx,
+                y: by,
+                width: bx_max.saturating_sub(bx),
+                height: by_max.saturating_sub(by),
+                font_size_pt: fsize,
+                confidence: avg_conf,
+                words: band_words,
+                raw_words: Vec::new(),
+            });
+        }
+        i += n_new;
+    }
+}
+
 pub fn drop_outlier_words(lines: &mut Vec<TextLine>) {
     let mut dropped_total = 0u32;
     lines.retain_mut(|line| {
@@ -734,7 +873,7 @@ pub fn split_wide_whitespace_words(
 
             // Crop the word image and run CI segmentation to get per-char boundaries
             let word_img = image::imageops::crop_imm(gray, wx, wy, ww, wh).to_image();
-            let (boundaries, _seams) = crate::segment::segment_characters(&word_img, n_chars);
+            let (boundaries, _seams, _seg_summary) = crate::segment::segment_characters(&word_img, n_chars);
 
             // boundaries: [0, b1, b2, ..., ww] — n_chars+1 entries
             // Character i occupies columns [boundaries[i] .. boundaries[i+1])
@@ -1210,6 +1349,7 @@ pub fn postprocess_words(word_regions: &[TextRegion]) -> Vec<TextLine> {
     let mut lines = assemble_lines(word_regions);
     snapshot_raw_bboxes(&mut lines);
     merge_overlapping_lines(&mut lines);
+    split_merged_lines(&mut lines);
     clip_word_overlaps(&mut lines);
     drop_outlier_words(&mut lines);
     lines

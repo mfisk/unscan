@@ -50,10 +50,16 @@ pub struct LineMatch {
     /// When pflda OCR correction fires, the corrected word regions
     /// for use in ZNCC verification (replacing line.words).
     pub corrected_words: Option<Vec<crate::ocr::TextRegion>>,
+    /// Whether this line was matched via the dominant-font fast path.
+    pub fast_path: bool,
+    /// ZNCC verify score from the fast-path check (so pass 2a can skip re-verification).
+    pub fast_path_score: Option<f32>,
+    /// Per-word segmentation summaries for audit integration.
+    pub word_seg_summaries: Vec<crate::audit::WordSegSummary>,
 }
 
 /// Minimum SSIM score for the fast-path dominant-font check.
-const FAST_PATH_MIN_SSIM: f32 = 0.90;
+const FAST_PATH_MIN_SSIM: f32 = 0.95;
 
 /// Pass 1: parallel font matching with SSIM fast path.
 ///
@@ -142,6 +148,9 @@ pub fn match_lines(
                     gt_font_obs_probs: HashMap::new(),
                     tie_candidates: Vec::new(),
                     corrected_words: None,
+                    fast_path: true,
+                    fast_path_score: Some(vr.score),
+                    word_seg_summaries: Vec::new(),
                 };
             } else if li < 3 {
             }
@@ -756,7 +765,29 @@ pub fn match_lines(
         }
 
 
-        LineMatch { font_result, text_color, font_scores, observations, font_scores_lig, observations_lig, seg_winner, diag_seg_dir, chosen_obs_ranks, gt_font_obs_ranks, chosen_obs_probs, gt_font_obs_probs, tie_candidates: tie_candidates_audit, corrected_words }
+        // Build per-word segmentation summaries for audit integration
+        let word_seg_summaries: Vec<crate::audit::WordSegSummary> = {
+            let winning_segs: &[segment::WordSeg] = if seg_winner.as_deref() == Some("ligature") {
+                line_crops.lig_word_segs.as_deref().unwrap_or(&line_crops.word_segs)
+            } else {
+                &line_crops.word_segs
+            };
+            winning_segs.iter().map(|ws| crate::audit::WordSegSummary {
+                word_text: ws.word_text.clone(),
+                source_word_idx: ws.source_word_idx,
+                image_w: ws.image_w,
+                image_h: ws.image_h,
+                n_chars_expected: ws.n_chars_expected,
+                n_segments_produced: ws.n_segments_produced,
+                mismatch: ws.mismatch,
+                ws_splits: ws.ws_splits.clone(),
+                seam_splits: ws.seam_splits.clone(),
+                seam_paths: ws.seam_paths.clone(),
+                seam_costs: ws.seam_costs.clone(),
+            }).collect()
+        };
+
+        LineMatch { font_result, text_color, font_scores, observations, font_scores_lig, observations_lig, seg_winner, diag_seg_dir, chosen_obs_ranks, gt_font_obs_ranks, chosen_obs_probs, gt_font_obs_probs, tie_candidates: tie_candidates_audit, corrected_words, fast_path: false, fast_path_score: None, word_seg_summaries }
     }).collect();
 
     let fp_hits = fast_path_hits.load(Ordering::Relaxed);

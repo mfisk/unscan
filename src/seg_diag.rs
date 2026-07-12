@@ -6,7 +6,6 @@
 //!   word_NNN_TEXT_seam.png    — VP (red) + seam splits (blue) overlaid
 //!   word_NNN_TEXT_final.png   — all splits (VP red, seam blue) overlaid
 //!   word_NNN_TEXT_chars/      — per-character crop PNGs (00_A.png, 01_B.png, ...)
-//!   summary.json              — structured dump of everything
 
 use image::{GrayImage, Rgb, RgbImage};
 use std::path::Path;
@@ -73,7 +72,7 @@ pub fn save_split_overlay_with_paths(
     vp: &[u32],
     _seam: &[u32],
     _extra: &[u32],
-    seam_paths: &std::collections::HashMap<u32, Vec<u32>>,
+    seam_paths: &std::collections::HashMap<u32, Vec<[u32; 2]>>,
     path: &Path,
 ) {
     let (w, h) = img.dimensions();
@@ -86,12 +85,14 @@ pub fn save_split_overlay_with_paths(
     }
     // Seam splits: blue diagonal paths
     for (_col, sp) in seam_paths {
-        for (y, &x) in sp.iter().enumerate() {
-            if x < w && (y as u32) < h {
-                rgb.put_pixel(x, y as u32, Rgb([0, 100, 255]));
+        for entry in sp.iter() {
+            let y = entry[0];
+            let x = entry[1];
+            if x < w && y < h {
+                rgb.put_pixel(x, y, Rgb([0, 100, 255]));
                 // Thicken: draw ±1 pixel horizontally for visibility
-                if x > 0 { rgb.put_pixel(x - 1, y as u32, Rgb([0, 100, 255])); }
-                if x + 1 < w { rgb.put_pixel(x + 1, y as u32, Rgb([0, 100, 255])); }
+                if x > 0 { rgb.put_pixel(x - 1, y, Rgb([0, 100, 255])); }
+                if x + 1 < w { rgb.put_pixel(x + 1, y, Rgb([0, 100, 255])); }
             }
         }
     }

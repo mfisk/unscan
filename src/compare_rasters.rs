@@ -476,7 +476,9 @@ pub fn zncc_windowed_best_vshift(
     }
 
     for dy in shifts {
-        let score = zncc_global_bailable(a, b, dy, bail_below);
+        // bail_below is in normalized [0,1] space; convert to raw [-1,1] for zncc_global_bailable
+        let raw_bail = bail_below.map(|t| t * 2.0 - 1.0);
+        let score = zncc_global_bailable(a, b, dy, raw_bail);
         if score > best {
             best = score;
             best_dy = dy;

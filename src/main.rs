@@ -187,6 +187,8 @@ fn build_audit_entry(
         gt_text: None,
         ocr_text: None,
         ocr_correct: None,
+        fast_path: lm.fast_path,
+        word_segmentation: lm.word_seg_summaries.clone(),
     }
 }
 
@@ -433,6 +435,11 @@ fn run(args: &cli::Args, classifier: &mut dyn classifier::Classifier) -> Result<
             .map(|(li, line)| {
                 let lm = &line_matches[li];
                 let font_result = &lm.font_result;
+
+                // Fast-path lines already verified — use stored score
+                if let Some(fps) = lm.fast_path_score {
+                    return (Some(fps), Some(fps >= MIN_VERIFY_SIMILARITY));
+                }
 
                 let ocr_ok = line.confidence >= args.min_ocr_confidence as f32
                     && !line.text.trim().is_empty();

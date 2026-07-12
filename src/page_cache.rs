@@ -130,8 +130,16 @@ pub fn get_pages(
     // Cache miss — rasterize fresh.
     let pages = rasterize(input, dpi)?;
 
-    // Write back to cache.
+    // Write back to cache, clearing stale OCR so prepare_page re-runs Tesseract.
     if let Some(ref dir) = cdir {
+        if dir.exists() {
+            for entry in std::fs::read_dir(dir).into_iter().flatten().flatten() {
+                let name = entry.file_name();
+                if name.to_string_lossy().ends_with("-ocr.json") {
+                    let _ = std::fs::remove_file(entry.path());
+                }
+            }
+        }
         for (i, img) in pages.iter().enumerate() {
             save_cached_image(dir, i, img);
         }
