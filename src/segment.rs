@@ -23,6 +23,7 @@ struct SeamParams {
     delta_scale_power: f32, // exponent on cur_dark/max_ink scaling
     delta_row_weight: f32,  // row_ink multiplier in delta (0.0 = ignore)
     delta_row_power: f32,   // exponent on row_ink in delta
+    horizontal_cost: f32,   // cost per diagonal move
 }
 
 fn seam_params() -> &'static SeamParams {
@@ -43,6 +44,7 @@ fn seam_params() -> &'static SeamParams {
             delta_scale_power: env_f32("SEAM_DELTA_SCALE_POWER", 1.0),
             delta_row_weight: env_f32("SEAM_DELTA_ROW_WEIGHT", 0.0),
             delta_row_power: env_f32("SEAM_DELTA_ROW_POWER", 1.0),
+            horizontal_cost: env_f32("SEAM_HORIZONTAL_COST", 0.01),
         };
         p
     })
@@ -231,7 +233,8 @@ fn segment_characters_inner(
     // (10 * avg_char_width / min_child_width)^2, applied additively to seam cost.
     // Penalizes based on the smallest segment CREATED by the split,
     // so splitting near the edge costs more than splitting in the middle.
-    let segment_penalty = |seg_start: u32, seg_end: u32, col: u32| -> f32 {
+    let segment_penalty = |seg_start: u32, seg_end: u32, col: u32, cost: f32| -> f32 {
+        if cost < 1.0 { return 0.0; }
         let left = (col - seg_start) as f32;
         let right = (seg_end - col) as f32;
         let min_child = left.min(right);
@@ -334,6 +337,35 @@ fn segment_characters_inner(
             }).sum()
         };
 
+        // Factor: trace all candidate seam paths and record their costs.
+        let trace_candidate_costs = |cands: &[(u32, f32)], dp: &SeamDp,
+            seg_start: u32, seg_end: u32, energy: &[Vec<f32>], row_ink: &[f32],
+            seg_pen: &dyn Fn(u32, u32, u32, f32) -> f32,
+            ink_disc: &dyn Fn(&[[u32; 2]]) -> f32,
+            h_cost: f32,
+            paths: &mut Vec<(u32, SeamCost, Vec<[u32; 2]>)>|
+        {
+            let mut sorted: Vec<(u32, f32)> = cands.to_vec();
+            sorted.sort_by(|a, b| a.1.partial_cmp(&b.1).unwrap_or(std::cmp::Ordering::Equal));
+            for &(col, cost) in sorted.iter() {
+                let path = dp.trace_path_through(energy, col, row_ink);
+                let p_min = path.iter().map(|p| p[1]).min().unwrap_or(col);
+                let p_max = path.iter().map(|p| p[1]).max().unwrap_or(col);
+                let pw = (p_max - p_min) as f32;
+                let sp = seg_pen(seg_start, seg_end, (p_min + p_max) / 2, cost);
+                let hm = path.windows(2).filter(|w| w[0][0] == w[1][0]).count() as f32;
+                let id = ink_disc(&path);
+                paths.push((col, SeamCost {
+                    dp_cost: cost - pw - hm * h_cost,
+                    seam_width_penalty: pw,
+                    segment_size_penalty: sp,
+                    horizontal_cost: hm * h_cost,
+                    ink_discount: id,
+                    total: cost + sp,
+                }, path));
+            }
+        };
+
         // Word-level max ink (p95 of raw darkness): used by delta_ink_score
         // to scale the entry penalty proportionally.
         let mut ink_values: Vec<f32> = Vec::new();
@@ -413,30 +445,10 @@ fn segment_characters_inner(
                 let sid = next_seg_id; next_seg_id += 1;
                 let (cands, dp) = candidate_seams(&energy, ink_l, ink_r, h, None, None, max_ink, &row_ink);
                 for (col, cost) in &cands {
-                    heap.push(SeamEntry { cost: *cost + segment_penalty(ink_l, ink_r, *col), col: *col, seg_start: ink_l, seg_end: ink_r, seg_id: sid });
+                    heap.push(SeamEntry { cost: *cost + segment_penalty(ink_l, ink_r, *col, *cost), col: *col, seg_start: ink_l, seg_end: ink_r, seg_id: sid });
                 }
-                // Trace paths for all candidates while DP is available
-                {
-                    let mut sorted_cands: Vec<(u32, f32)> = cands.clone();
-                    sorted_cands.sort_by(|a, b| a.1.partial_cmp(&b.1).unwrap_or(std::cmp::Ordering::Equal));
-                    for &(col, cost) in sorted_cands.iter() {
-                        let path = dp.trace_path_through(&energy, col, &row_ink);
-                        let p_min = path.iter().map(|p| p[1]).min().unwrap_or(col);
-                        let p_max = path.iter().map(|p| p[1]).max().unwrap_or(col);
-                        let pw = (p_max - p_min) as f32;
-                        let sp = segment_penalty(ink_l, ink_r, (p_min + p_max) / 2);
-                        let hm = path.windows(2).filter(|w| w[0][0] == w[1][0]).count() as f32;
-                        let id = ink_discount_for_path(&path);
-                        candidate_paths.push((col, SeamCost {
-                            dp_cost: cost - pw - hm,
-                            seam_width_penalty: pw,
-                            segment_size_penalty: sp,
-                            horizontal_cost: hm,
-                            ink_discount: id,
-                            total: cost + sp,
-                        }, path));
-                    }
-                }
+                trace_candidate_costs(&cands, &dp, ink_l, ink_r, &energy, &row_ink,
+                    &segment_penalty, &ink_discount_for_path, seam_params().horizontal_cost, &mut candidate_paths);
                 seg_bounds.insert(sid, SegBounds { left_path: None, right_path: None });
                 dp_cache.insert(sid, dp);
             }
@@ -479,7 +491,7 @@ fn segment_characters_inner(
                         let rp = parent_bounds.and_then(|b| b.right_path.clone());
                         let (cands, dp) = candidate_seams(&energy, entry.seg_start, new_end, h, lp.as_deref(), rp.as_deref(), max_ink, &row_ink);
                         for (col, cost) in &cands {
-                            heap.push(SeamEntry { cost: *cost + segment_penalty(entry.seg_start, new_end, *col), col: *col, seg_start: entry.seg_start, seg_end: new_end, seg_id: sid });
+                            heap.push(SeamEntry { cost: *cost + segment_penalty(entry.seg_start, new_end, *col, *cost), col: *col, seg_start: entry.seg_start, seg_end: new_end, seg_id: sid });
                         }
                         seg_bounds.insert(sid, SegBounds { left_path: lp, right_path: rp });
                         dp_cache.insert(sid, dp);
@@ -497,7 +509,7 @@ fn segment_characters_inner(
                         let rp = parent_bounds.and_then(|b| b.right_path.clone());
                         let (cands, dp) = candidate_seams(&energy, new_start, entry.seg_end, h, lp.as_deref(), rp.as_deref(), max_ink, &row_ink);
                         for (col, cost) in &cands {
-                            heap.push(SeamEntry { cost: *cost + segment_penalty(new_start, entry.seg_end, *col), col: *col, seg_start: new_start, seg_end: entry.seg_end, seg_id: sid });
+                            heap.push(SeamEntry { cost: *cost + segment_penalty(new_start, entry.seg_end, *col, *cost), col: *col, seg_start: new_start, seg_end: entry.seg_end, seg_id: sid });
                         }
                         seg_bounds.insert(sid, SegBounds { left_path: lp, right_path: rp });
                         dp_cache.insert(sid, dp);
@@ -569,16 +581,16 @@ fn segment_characters_inner(
             let path_min_col = path_cols_iter.clone().min().unwrap_or(final_col);
             let path_max_col = path_cols_iter.max().unwrap_or(final_col);
             let swp = (path_max_col - path_min_col) as f32;
-            let seg_pen = segment_penalty(entry.seg_start, entry.seg_end, (path_min_col + path_max_col) / 2);
+            let seg_pen = segment_penalty(entry.seg_start, entry.seg_end, (path_min_col + path_max_col) / 2, entry.cost);
             let h_moves = seam_paths[&final_col].windows(2)
                 .filter(|w| w[0][0] == w[1][0])
                 .count() as f32;
             let id = ink_discount_for_path(&seam_paths[&final_col]);
             seam_costs.insert(final_col, SeamCost {
-                dp_cost: entry.cost - seg_pen - swp - h_moves,
+                dp_cost: entry.cost - seg_pen - swp - h_moves * seam_params().horizontal_cost,
                 seam_width_penalty: swp,
                 segment_size_penalty: seg_pen,
-                horizontal_cost: h_moves,
+                horizontal_cost: h_moves * seam_params().horizontal_cost,
                 ink_discount: id,
                 total: entry.cost,
             });
@@ -606,30 +618,10 @@ fn segment_characters_inner(
                     let rp: Option<Vec<[u32; 2]>> = Some(path.clone());
                     let (cands, dp) = candidate_seams(&energy, ink_l, ink_r, h, lp.as_deref(), rp.as_deref(), max_ink, &row_ink);
                     for (col, cost) in &cands {
-                        heap.push(SeamEntry { cost: *cost + segment_penalty(ink_l, ink_r, *col), col: *col, seg_start: ink_l, seg_end: ink_r, seg_id: sid });
+                        heap.push(SeamEntry { cost: *cost + segment_penalty(ink_l, ink_r, *col, *cost), col: *col, seg_start: ink_l, seg_end: ink_r, seg_id: sid });
                     }
-                    // Trace paths for all child candidates
-                    {
-                        let mut sorted_cands: Vec<(u32, f32)> = cands.clone();
-                        sorted_cands.sort_by(|a, b| a.1.partial_cmp(&b.1).unwrap_or(std::cmp::Ordering::Equal));
-                        for &(col, cost) in sorted_cands.iter() {
-                            let path = dp.trace_path_through(&energy, col, &row_ink);
-                            let p_min = path.iter().map(|p| p[1]).min().unwrap_or(col);
-                            let p_max = path.iter().map(|p| p[1]).max().unwrap_or(col);
-                            let pw = (p_max - p_min) as f32;
-                            let sp = segment_penalty(ink_l, ink_r, (p_min + p_max) / 2);
-                            let hm = path.windows(2).filter(|w| w[0][0] == w[1][0]).count() as f32;
-                            let id = ink_discount_for_path(&path);
-                            candidate_paths.push((col, SeamCost {
-                                dp_cost: cost - pw - hm,
-                                seam_width_penalty: pw,
-                                segment_size_penalty: sp,
-                                horizontal_cost: hm,
-                                ink_discount: id,
-                                total: cost + sp,
-                            }, path));
-                        }
-                    }
+                    trace_candidate_costs(&cands, &dp, ink_l, ink_r, &energy, &row_ink,
+                        &segment_penalty, &ink_discount_for_path, seam_params().horizontal_cost, &mut candidate_paths);
                     seg_bounds.insert(sid, SegBounds { left_path: lp, right_path: rp });
                     dp_cache.insert(sid, dp);
                 }
@@ -644,30 +636,10 @@ fn segment_characters_inner(
                     let rp = parent_rp.clone();
                     let (cands, dp) = candidate_seams(&energy, ink_l, ink_r, h, lp.as_deref(), rp.as_deref(), max_ink, &row_ink);
                     for (col, cost) in &cands {
-                        heap.push(SeamEntry { cost: *cost + segment_penalty(ink_l, ink_r, *col), col: *col, seg_start: ink_l, seg_end: ink_r, seg_id: sid });
+                        heap.push(SeamEntry { cost: *cost + segment_penalty(ink_l, ink_r, *col, *cost), col: *col, seg_start: ink_l, seg_end: ink_r, seg_id: sid });
                     }
-                    // Trace paths for all child candidates
-                    {
-                        let mut sorted_cands: Vec<(u32, f32)> = cands.clone();
-                        sorted_cands.sort_by(|a, b| a.1.partial_cmp(&b.1).unwrap_or(std::cmp::Ordering::Equal));
-                        for &(col, cost) in sorted_cands.iter() {
-                            let path = dp.trace_path_through(&energy, col, &row_ink);
-                            let p_min = path.iter().map(|p| p[1]).min().unwrap_or(col);
-                            let p_max = path.iter().map(|p| p[1]).max().unwrap_or(col);
-                            let pw = (p_max - p_min) as f32;
-                            let sp = segment_penalty(ink_l, ink_r, (p_min + p_max) / 2);
-                            let hm = path.windows(2).filter(|w| w[0][0] == w[1][0]).count() as f32;
-                            let id = ink_discount_for_path(&path);
-                            candidate_paths.push((col, SeamCost {
-                                dp_cost: cost - pw - hm,
-                                seam_width_penalty: pw,
-                                segment_size_penalty: sp,
-                                horizontal_cost: hm,
-                                ink_discount: id,
-                                total: cost + sp,
-                            }, path));
-                        }
-                    }
+                    trace_candidate_costs(&cands, &dp, ink_l, ink_r, &energy, &row_ink,
+                        &segment_penalty, &ink_discount_for_path, seam_params().horizontal_cost, &mut candidate_paths);
                     seg_bounds.insert(sid, SegBounds { left_path: lp, right_path: rp });
                     dp_cache.insert(sid, dp);
                 }
@@ -928,7 +900,7 @@ fn candidate_seams(
             let pass_ink = ink_score(pass_dark, r - 1, row_ink);
             let pass_entry = delta_ink_score(pass_dark, prev_dark, r - 1, r - 1, row_ink, max_ink);
             let cur_entry = delta_ink_score(cur_dark, pass_dark, r, r - 1, row_ink, max_ink);
-            let via_diag = cost_fwd[prev_off + c - 1] + pass_ink + pass_entry + cur_ink + cur_entry + 1.0;
+            let via_diag = cost_fwd[prev_off + c - 1] + pass_ink + pass_entry + cur_ink + cur_entry + 0.01;
             if via_diag < cost_fwd[row_off + c] {
                 cost_fwd[row_off + c] = via_diag;
                 pred_fwd[row_off + c] = (prev_off + c - 1) as u32;
@@ -944,7 +916,7 @@ fn candidate_seams(
             let pass_ink = ink_score(pass_dark, r - 1, row_ink);
             let pass_entry = delta_ink_score(pass_dark, prev_dark, r - 1, r - 1, row_ink, max_ink);
             let cur_entry = delta_ink_score(cur_dark, pass_dark, r, r - 1, row_ink, max_ink);
-            let via_diag = cost_fwd[prev_off + c + 1] + pass_ink + pass_entry + cur_ink + cur_entry + 1.0;
+            let via_diag = cost_fwd[prev_off + c + 1] + pass_ink + pass_entry + cur_ink + cur_entry + 0.01;
             if via_diag < cost_fwd[row_off + c] {
                 cost_fwd[row_off + c] = via_diag;
                 pred_fwd[row_off + c] = (prev_off + c + 1) as u32;
@@ -985,7 +957,7 @@ fn candidate_seams(
             let pass_ink = ink_score(pass_dark, r, row_ink);
             let pass_entry = delta_ink_score(pass_dark, cur_dark, r, r, row_ink, max_ink);
             let child_entry = delta_ink_score(child_dark, pass_dark, r + 1, r, row_ink, max_ink);
-            let via_diag = cost_rev[next_off + c - 1] + cur_ink + pass_ink + pass_entry + child_entry + 1.0;
+            let via_diag = cost_rev[next_off + c - 1] + cur_ink + pass_ink + pass_entry + child_entry + 0.01;
             if via_diag < cost_rev[row_off + c] {
                 cost_rev[row_off + c] = via_diag;
                 pred_rev[row_off + c] = (next_off + c - 1) as u32;
@@ -1001,7 +973,7 @@ fn candidate_seams(
             let pass_ink = ink_score(pass_dark, r, row_ink);
             let pass_entry = delta_ink_score(pass_dark, cur_dark, r, r, row_ink, max_ink);
             let child_entry = delta_ink_score(child_dark, pass_dark, r + 1, r, row_ink, max_ink);
-            let via_diag = cost_rev[next_off + c + 1] + cur_ink + pass_ink + pass_entry + child_entry + 1.0;
+            let via_diag = cost_rev[next_off + c + 1] + cur_ink + pass_ink + pass_entry + child_entry + 0.01;
             if via_diag < cost_rev[row_off + c] {
                 cost_rev[row_off + c] = via_diag;
                 pred_rev[row_off + c] = (next_off + c + 1) as u32;
@@ -1047,7 +1019,7 @@ fn candidate_seams(
         }
         let width = (max_c - min_c) as f32;
         let split_col = seg_start + c as u32;
-        dp_candidates.push((split_col, combined + 1.0 * width));
+        dp_candidates.push((split_col, combined + 0.0 * width));
     }
 
     // Second pass: trace each DP candidate's path and adjust cost

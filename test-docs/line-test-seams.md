@@ -14,3 +14,7 @@ Columns are relative to the word crop.
 ## L3: ABCDEFGHIJKLMNOPQRSTUVWXYZ. (p3:L45, Georgia-400)
 
 26, 268, 291, 504, 531, 557, 592, 619, 642
+
+## L4: abcdefghijklmnopqrstuvwxyz. (p4:L46, OpenSans-400)
+
+TBD

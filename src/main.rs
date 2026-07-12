@@ -397,7 +397,7 @@ fn run(args: &cli::Args, classifier: &mut dyn classifier::Classifier) -> Result<
         font_pipeline::paragraph_font_grouping(&lines, &line_matches);
 
         // ── Word split: split wide whitespace using matched fonts ──
-        let split_indices;
+        let split_indices: Vec<usize>;
         {
             let line_fonts: Vec<Option<std::sync::Arc<Vec<u8>>>> = line_matches.iter()
                 .map(|lm| {
@@ -407,6 +407,7 @@ fn run(args: &cli::Args, classifier: &mut dyn classifier::Classifier) -> Result<
                 })
                 .collect();
             split_indices = ocr::split_wide_whitespace_words(&mut lines, &gray_page, ink_thresh, &line_fonts);
+            // split_indices = vec![];
         }
 
         // ── Pass 1b: Re-score only lines whose words were split ─────

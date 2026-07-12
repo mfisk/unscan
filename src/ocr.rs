@@ -392,6 +392,91 @@ pub fn clip_word_overlaps(lines: &mut [TextLine]) {
 /// the gap between real text lines).  The remaining words are partitioned
 /// into bands separated by the valleys, each band becoming its own TextLine.
 pub fn split_merged_lines(lines: &mut Vec<TextLine>) {
+    // ── First pass: split lines with extreme height-ratio words ──────
+    // Words at drastically different scales belong to different lines
+    // regardless of confidence. Pure geometric check — if words in the
+    // same Tesseract line have heights differing by 2×+, they're from
+    // different text regions.
+    let mut i = 0;
+    while i < lines.len() {
+        if lines[i].words.len() < 2 {
+            i += 1;
+            continue;
+        }
+
+        let mut heights: Vec<(usize, u32)> = lines[i].words.iter()
+            .enumerate()
+            .map(|(idx, w)| (idx, w.height))
+            .collect();
+        heights.sort_by_key(|&(_, h)| h);
+
+        // Find the largest relative gap between consecutive sorted heights.
+        let mut best_ratio = 1.0f64;
+        let mut best_split = 0usize;
+        for k in 0..heights.len() - 1 {
+            let lo = heights[k].1.max(1) as f64;
+            let hi = heights[k + 1].1.max(1) as f64;
+            let ratio = hi / lo;
+            if ratio > best_ratio {
+                best_ratio = ratio;
+                best_split = k;
+            }
+        }
+
+        if best_ratio < 2.0 {
+            i += 1;
+            continue;
+        }
+
+        let small_indices: std::collections::HashSet<usize> = heights[..=best_split]
+            .iter().map(|&(idx, _)| idx).collect();
+
+        let mut small_words: Vec<TextRegion> = Vec::new();
+        let mut large_words: Vec<TextRegion> = Vec::new();
+        for (idx, w) in lines[i].words.iter().enumerate() {
+            if small_indices.contains(&idx) {
+                small_words.push(w.clone());
+            } else {
+                large_words.push(w.clone());
+            }
+        }
+
+        if small_words.is_empty() || large_words.is_empty() {
+            i += 1;
+            continue;
+        }
+
+        lines.remove(i);
+        for (j, group) in [small_words, large_words].into_iter().enumerate() {
+            let text = group.iter()
+                .map(|w| w.text.as_str())
+                .collect::<Vec<_>>()
+                .join(" ");
+            let bx = group.iter().map(|w| w.x).min().unwrap_or(0);
+            let by = group.iter().map(|w| w.y).min().unwrap_or(0);
+            let bx_max = group.iter().map(|w| w.x + w.width).max().unwrap_or(0);
+            let by_max = group.iter().map(|w| w.y + w.height).max().unwrap_or(0);
+            let avg_conf = group.iter().map(|w| w.confidence).sum::<f32>()
+                / group.len() as f32;
+            let fsize = group.first()
+                .map(|w| w.font_size_pt).unwrap_or(12.0);
+
+            lines.insert(i + j, TextLine {
+                text,
+                x: bx,
+                y: by,
+                width: bx_max.saturating_sub(bx),
+                height: by_max.saturating_sub(by),
+                font_size_pt: fsize,
+                confidence: avg_conf,
+                words: group,
+                raw_words: Vec::new(),
+            });
+        }
+        i += 2;
+    }
+
+    // ── Second pass: valley-based vertical split ─────────────────────
     let mut i = 0;
     while i < lines.len() {
         if lines[i].words.len() < 3 {
@@ -514,6 +599,7 @@ pub fn split_merged_lines(lines: &mut Vec<TextLine>) {
         }
         i += n_new;
     }
+
 }
 
 pub fn drop_outlier_words(lines: &mut Vec<TextLine>) {

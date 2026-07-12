@@ -108,7 +108,7 @@ def main():
 
         entry = entries[0]
         expected_font = entry.get('expected_font', '')
-        text = entry.get('text', entry.get('ocr_text', '')) + '.'
+        text = entry.get('gt_text', entry.get('text', entry.get('ocr_text', ''))) + '.'
         print(f"p{page}:L{li}: text='{text}', expected={expected_font}")
 
         ttf_path, canonical_name = resolve_font(expected_font)

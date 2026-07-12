@@ -424,9 +424,10 @@ pub fn enrich_audit_entries(
         if !ocr.is_empty() {
             e.ocr_text = Some(ocr.clone());
             if let Some(ref gt_t) = e.gt_text {
-                // Normalize for comparison: strip spaces, lowercase
-                let gt_norm: String = gt_t.chars().filter(|c| !c.is_whitespace()).collect::<String>().to_lowercase();
-                let ocr_norm: String = ocr.chars().filter(|c| !c.is_whitespace()).collect::<String>().to_lowercase();
+                // Normalize for comparison: collapse whitespace runs to single space, trim, lowercase.
+                // Preserves word boundaries so word-split errors count as OCR misses.
+                let gt_norm: String = gt_t.split_whitespace().collect::<Vec<_>>().join(" ").to_lowercase();
+                let ocr_norm: String = ocr.split_whitespace().collect::<Vec<_>>().join(" ").to_lowercase();
                 e.ocr_correct = Some(gt_norm == ocr_norm);
             }
         }
