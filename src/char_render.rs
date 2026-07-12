@@ -367,3 +367,44 @@ pub fn render_ref_chars(json_str: &str) {
     eprintln!("Rendered {rendered} glyphs");
     std::process::exit(0);
 }
+
+/// Compute per-glyph vertical ink position ratios for a font.
+///
+/// Returns a map of char → (top_frac, bottom_frac) where fractions express
+/// the glyph's ink bounding box relative to the font's full vertical extent
+/// (ascent to descent).  0.0 = ascender line, 1.0 = descender line.
+///
+/// Uses `outline_glyph` + `px_bounds` — no rasterisation, just outline math.
+pub fn glyph_metric_ratios<F: ab_glyph::Font>(
+    font: &F,
+    chars: &[char],
+    overrides: Option<&[(char, u16)]>,
+) -> std::collections::HashMap<char, (f32, f32)> {
+    use ab_glyph::{Font, PxScale, point};
+
+    let scale = PxScale::from(100.0); // arbitrary reference scale; ratios are scale-invariant
+    let sf = font.as_scaled(scale);
+    let ascent = sf.ascent();
+    let descent = sf.descent(); // negative value
+    let full_height = ascent - descent;
+    if full_height < 1.0 { return std::collections::HashMap::new(); }
+
+    let mut result = std::collections::HashMap::new();
+    for &ch in chars {
+        let gid = resolve_glyph(font, ch, overrides);
+        if gid.0 == 0 { continue; }
+
+        let glyph = gid.with_scale_and_position(scale, point(0.0, ascent));
+        let outlined = match font.outline_glyph(glyph) {
+            Some(o) => o,
+            None => continue,
+        };
+        let b = outlined.px_bounds();
+        // b.min.y = top of ink, b.max.y = bottom of ink
+        // Both in pixel coords where y=0 is top and baseline is at y=ascent
+        let top_frac = b.min.y / full_height;
+        let bottom_frac = b.max.y / full_height;
+        result.insert(ch, (top_frac, bottom_frac));
+    }
+    result
+}

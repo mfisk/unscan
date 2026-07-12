@@ -134,11 +134,11 @@ fn find_font_by_key<'a>(font_catalog: &'a [FontEntry], font_key: &str) -> Option
 
 // ── Character selection (mirrors Python pick_interesting_observations) ──────────────
 
-fn pick_interesting_observations(
-    chars: &[crate::audit::ObservationVote],
+fn pick_interesting_observations<'a>(
+    chars: &'a [crate::audit::ObservationVote],
     n_show: usize,
     _n_normal: usize,
-) -> Vec<(usize, &crate::audit::ObservationVote)> {
+) -> Vec<(usize, &'a crate::audit::ObservationVote)> {
     // Rank by the log-probability difference between chosen and ground-truth fonts.
     // Largest absolute difference first — these observations drive the font decision.
     let mut scored: Vec<(usize, &crate::audit::ObservationVote, f32)> = chars.iter()
@@ -158,14 +158,6 @@ fn pick_interesting_observations(
         .take(n_show)
         .map(|&(i, c, _)| (i, c))
         .collect();
-
-    // Always include OCR-corrected observations
-    let used: std::collections::HashSet<usize> = result.iter().map(|(i, _)| *i).collect();
-    for (i, c) in chars.iter().enumerate() {
-        if c.ocr_corrected_from.is_some() && !used.contains(&i) {
-            result.push((i, c));
-        }
-    }
 
     // If we didn't get enough from the delta sort (e.g. GT probs missing),
     // fill with worst best_prob observations
@@ -724,10 +716,8 @@ fn build_miss_block(
         _ => String::new(),
     };
 
-    // Per-character comparison table (skip for similarity-only failures unless OCR was overridden)
-    let has_ocr_override = entry.word_bboxes.iter().zip(entry.word_bboxes_raw.iter())
-        .any(|(wb, wr)| wb.text != wr.text);
-    let obs_table_html = if (ce.kind == MissKind::SimilarityFailure && !has_ocr_override) || entry.obs_votes.is_empty() {
+    // Per-character comparison table (skip for similarity-only failures)
+    let obs_table_html = if ce.kind == MissKind::SimilarityFailure || entry.obs_votes.is_empty() {
         String::new()
     } else {
         let obs_to_show = pick_interesting_observations(&entry.obs_votes, 6, 0);
@@ -814,6 +804,32 @@ fn build_miss_block(
         String::new()
     };
 
+    // OCR override table — separate from font-matching obs table.
+    // OCR corrections table — from audit ocr_corrections data.
+    let ocr_override_html = {
+        if entry.ocr_corrections.is_empty() {
+            String::new()
+        } else {
+            let mut rows = String::new();
+            for oc in &entry.ocr_corrections {
+                let ocr_p_str = oc.ocr_p.map(|p| format!("{:.4}", p)).unwrap_or("—".into());
+                let ratio_str = if oc.ratio.is_infinite() { "∞".into() } else { format!("{:.1}", oc.ratio) };
+                rows.push_str(&format!(
+                    "<tr><td>{}</td><td class=\"mono\">{}</td><td class=\"mono\">{}</td>                     <td>{:.4}</td><td>{}</td><td>{}</td></tr>",
+                    oc.char_pos, oc.ocr_char, oc.replacement,
+                    oc.replacement_p, ocr_p_str, ratio_str,
+                ));
+            }
+            format!(
+                "<details open><summary>OCR corrections (PFLDA)</summary>\
+                 <table class=\"obs-table\"><thead><tr>\
+                 <th>Pos</th><th>OCR</th><th>Replaced</th><th>PFLDA p</th><th>OCR p</th>                 <th>Ratio</th>\
+                 </tr></thead><tbody>{}</tbody></table></details>",
+                rows
+            )
+        }
+    };
+
     let html = format!(
         "<div class=\"miss\">\
          <h3>p{}:L{}{}{}  </h3>\
@@ -823,10 +839,12 @@ fn build_miss_block(
          {}\
          {}\
          {}\
+         {}\
          </div>",
         entry.page, entry.line_index, miss_kind_label, sim_html,
         text_preview,
         seg_path_html, scan_line_html, sim_compare_html, tie_break_html, obs_table_html,
+        ocr_override_html,
     );
     (html, entry.similarity_score, gt_sim)
 }
@@ -1437,7 +1455,6 @@ fn build_observation_table(
     for &(_idx, cv) in obs_to_show {
         let seq: &[char] = &cv.seq;
         let seq_label: String = seq.iter().collect();
-        let original_ocr = cv.ocr_corrected_from.unwrap_or(seq[0]);
         let best_p = cv.best_prob;
 
         // Crop image from disk
@@ -1497,15 +1514,7 @@ fn build_observation_table(
         } else {
             String::new()
         };
-        let ocr_label = if cv.ocr_corrected_from.is_some() {
-            format!(
-                "<span class='ocr-fix'>'{original_ocr}' → '{seq_label}'</span>"
-            )
-        } else if seq.len() > 1 {
-            format!("'{seq_label}'")
-        } else {
-            format!("'{original_ocr}'")
-        };
+        let ocr_label = format!("'{seq_label}'");
 
         let mut ocr_parts = vec![format!("OCR: <b>{ocr_label}</b>{ngram_tag}")];
 
@@ -1518,26 +1527,7 @@ fn build_observation_table(
             ));
         }
 
-        // Per-font LDA character classification
-        if let (Some(top_ch), Some(top_p)) = (cv.pflda_top_char, cv.pflda_top_p) {
-            let ocr_p_str = cv.pflda_ocr_p
-                .map(|p| format!("{:.4}", p))
-                .unwrap_or_else(|| "?".into());
-            let original_ocr = cv.ocr_corrected_from.unwrap_or(seq[0]);
-            if cv.pflda_replaced {
-                ocr_parts.push(format!(
-                    "<span class='ocr-fix'>pflda: '{top_ch}' p={top_p:.4} vs OCR '{original_ocr}' p={ocr_p_str} → <b>REPLACED</b></span>"
-                ));
-            } else if top_ch != original_ocr {
-                ocr_parts.push(format!(
-                    "<span class='font-mini'>pflda: '{top_ch}' p={top_p:.4} vs OCR '{original_ocr}' p={ocr_p_str} → kept OCR</span>"
-                ));
-            } else {
-                ocr_parts.push(format!(
-                    "<span class='font-mini'>pflda: '{original_ocr}' p={top_p:.4} (confirmed)</span>"
-                ));
-            }
-        }
+
 
         let ocr_cell = ocr_parts.join(" · ");
 

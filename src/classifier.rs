@@ -3111,9 +3111,11 @@ static PER_FONT_CACHE: std::sync::LazyLock<Mutex<HashMap<String, std::sync::Arc<
 /// parameters.  Does NOT depend on `EmbeddingClassifier` or the `Embedder`
 /// trait (those are locked to CropFeatures for font identification).
 pub struct PerFontLda {
-    /// LDA projection matrix: [out_dim × HOG_FEAT_LEN] row-major
+    /// LDA projection matrix: [out_dim × feat_dim] row-major
     projection: Vec<f32>,
     out_dim: usize,
+    /// Input feature dimension (HOG_FEAT_LEN or HOG_FEAT_LEN + metric features)
+    feat_dim: usize,
     /// Per-class centroids in projected space: (class_index, embedding)
     centroids: Vec<Vec<f32>>,
     /// RBF kernel bandwidth for probability computation
@@ -3177,16 +3179,16 @@ impl PerFontLda {
 
     /// Predict which character best matches the HOG features.
     /// Returns `(char, probability)` pairs sorted descending by probability.
-    pub fn predict(&self, hog: &[f32; crate::hog::HOG_FEAT_LEN], k: usize) -> Vec<(char, f32)> {
-        use crate::hog::HOG_FEAT_LEN;
+    pub fn predict(&self, feats: &[f32], k: usize) -> Vec<(char, f32)> {
+        let feat_dim = self.feat_dim;
 
-        // Project HOG features into LDA space
+        // Project features into LDA space
         let mut emb = vec![0.0f32; self.out_dim];
         for d in 0..self.out_dim {
-            let row_off = d * HOG_FEAT_LEN;
+            let row_off = d * feat_dim;
             let mut sum = 0.0f32;
-            for j in 0..HOG_FEAT_LEN {
-                sum += self.projection[row_off + j] * hog[j];
+            for j in 0..feat_dim {
+                sum += self.projection[row_off + j] * feats[j];
             }
             emb[d] = sum;
         }
@@ -3221,7 +3223,7 @@ impl PerFontLda {
     }
 
     /// Predict top-1 character.
-    pub fn predict_top1(&self, hog: &[f32; crate::hog::HOG_FEAT_LEN]) -> Option<(char, f32)> {
+    pub fn predict_top1(&self, hog: &[f32]) -> Option<(char, f32)> {
         self.predict(hog, 1).into_iter().next()
     }
 
@@ -3230,15 +3232,15 @@ impl PerFontLda {
 
     /// Predict with raw squared distances for diagnostics.
     /// Returns (char, probability, squared_distance) triples sorted by distance ascending.
-    pub fn predict_with_distances(&self, hog: &[f32; crate::hog::HOG_FEAT_LEN], k: usize) -> Vec<(char, f32, f32)> {
-        use crate::hog::HOG_FEAT_LEN;
+    pub fn predict_with_distances(&self, feats: &[f32], k: usize) -> Vec<(char, f32, f32)> {
+        let feat_dim = self.feat_dim;
 
         let mut emb = vec![0.0f32; self.out_dim];
         for d in 0..self.out_dim {
-            let row_off = d * HOG_FEAT_LEN;
+            let row_off = d * feat_dim;
             let mut sum = 0.0f32;
-            for j in 0..HOG_FEAT_LEN {
-                sum += self.projection[row_off + j] * hog[j];
+            for j in 0..feat_dim {
+                sum += self.projection[row_off + j] * feats[j];
             }
             emb[d] = sum;
         }
@@ -3319,11 +3321,21 @@ impl PerFontLda {
         // scatter captures real-world variation.
         const DEGRADE_SCALES: &[f32] = &[1.0, 0.85, 0.70];
 
-        // Gather per-character HOG samples by rendering glyphs
-        let mut char_samples: Vec<(char, Vec<[f32; HOG_FEAT_LEN]>)> = Vec::new();
-        let mut total_samples = 0usize;
-
         let overrides = font_entry.glyph_overrides.as_deref();
+
+        // Compute glyph metric ratios for all supported characters
+        let all_chars: Vec<char> = ctx.sequences.iter()
+            .filter(|s| s.len() == 1)
+            .map(|s| s[0])
+            .collect();
+        let glyph_metrics = crate::char_render::glyph_metric_ratios(
+            &font, &all_chars, overrides,
+        );
+        let feat_dim = HOG_FEAT_LEN + 2; // HOG + top_frac + bottom_frac
+
+        // Gather per-character feature samples (HOG + glyph metrics)
+        let mut char_samples: Vec<(char, Vec<Vec<f32>>)> = Vec::new();
+        let mut total_samples = 0usize;
 
         for seq in ctx.sequences.iter() {
             // PerFontLda is per-character HOG — skip bigrams
@@ -3348,7 +3360,12 @@ impl PerFontLda {
                 _ => continue,
             };
 
-            let mut hog_feats: Vec<[f32; HOG_FEAT_LEN]> = Vec::new();
+            // Get glyph metric features for this character
+            let (metric_top, metric_bot) = glyph_metrics.get(&ch)
+                .copied()
+                .unwrap_or((0.0, 0.0));
+
+            let mut feats: Vec<Vec<f32>> = Vec::new();
 
             for &scale in DEGRADE_SCALES {
                 let img = if scale >= 0.999 {
@@ -3361,13 +3378,17 @@ impl PerFontLda {
                 };
 
                 if let Some(h) = compute_hog(&img) {
-                    hog_feats.push(h);
+                    let mut fv = Vec::with_capacity(feat_dim);
+                    fv.extend_from_slice(&h);
+                    fv.push(metric_top);
+                    fv.push(metric_bot);
+                    feats.push(fv);
                 }
             }
 
-            if hog_feats.is_empty() { continue; }
-            total_samples += hog_feats.len();
-            char_samples.push((ch, hog_feats));
+            if feats.is_empty() { continue; }
+            total_samples += feats.len();
+            char_samples.push((ch, feats));
         }
 
         eprintln!("[pflda] {font_key}: {} chars, {} total HOG samples", char_samples.len(), total_samples);
@@ -3377,65 +3398,65 @@ impl PerFontLda {
         }
 
         let n_classes = char_samples.len();
-        let out_dim = (n_classes - 1).min(HOG_FEAT_LEN - 1).min(32);
+        let out_dim = (n_classes - 1).min(feat_dim - 1).min(32);
 
         // Build char_map: class_index → character
         let char_map: Vec<char> = char_samples.iter().map(|(ch, _)| *ch).collect();
 
         // Compute per-class means and global mean
-        let mut global_mean = vec![0.0f64; HOG_FEAT_LEN];
+        let mut global_mean = vec![0.0f64; feat_dim];
         for (_, feats) in &char_samples {
             for f in feats {
-                for j in 0..HOG_FEAT_LEN { global_mean[j] += f[j] as f64; }
+                for j in 0..feat_dim { global_mean[j] += f[j] as f64; }
             }
         }
-        for j in 0..HOG_FEAT_LEN { global_mean[j] /= total_samples as f64; }
+        for j in 0..feat_dim { global_mean[j] /= total_samples as f64; }
 
         let class_means: Vec<Vec<f64>> = char_samples.iter().map(|(_, feats)| {
-            let mut mean = vec![0.0f64; HOG_FEAT_LEN];
+            let mut mean = vec![0.0f64; feat_dim];
             for f in feats {
-                for j in 0..HOG_FEAT_LEN { mean[j] += f[j] as f64; }
+                for j in 0..feat_dim { mean[j] += f[j] as f64; }
             }
             let cnt = feats.len() as f64;
-            for j in 0..HOG_FEAT_LEN { mean[j] /= cnt; }
+            for j in 0..feat_dim { mean[j] /= cnt; }
             mean
         }).collect();
 
         // Within-class scatter Sw
-        let mut sw = vec![0.0f64; HOG_FEAT_LEN * HOG_FEAT_LEN];
+        let mut sw = vec![0.0f64; feat_dim * feat_dim];
         for (ci, (_, feats)) in char_samples.iter().enumerate() {
             let cm = &class_means[ci];
             for f in feats {
-                for a in 0..HOG_FEAT_LEN {
+                for a in 0..feat_dim {
                     let da = f[a] as f64 - cm[a];
-                    for b in a..HOG_FEAT_LEN {
+                    for b in a..feat_dim {
                         let db = f[b] as f64 - cm[b];
-                        sw[a * HOG_FEAT_LEN + b] += da * db;
+                        sw[a * feat_dim + b] += da * db;
                     }
                 }
             }
         }
         // Mirror lower triangle
-        for a in 0..HOG_FEAT_LEN { for b in 0..a { sw[a * HOG_FEAT_LEN + b] = sw[b * HOG_FEAT_LEN + a]; } }
+        for a in 0..feat_dim { for b in 0..a { sw[a * feat_dim + b] = sw[b * feat_dim + a]; } }
         for v in &mut sw { *v /= total_samples as f64; }
 
         // Regularize
-        let trace: f64 = (0..HOG_FEAT_LEN).map(|j| sw[j * HOG_FEAT_LEN + j]).sum();
-        let eps = (trace / HOG_FEAT_LEN as f64) * 0.01 + 1e-6;
-        for j in 0..HOG_FEAT_LEN { sw[j * HOG_FEAT_LEN + j] += eps; }
+        let trace: f64 = (0..feat_dim).map(|j| sw[j * feat_dim + j]).sum();
+        let eps = (trace / feat_dim as f64) * 0.01 + 1e-6;
+        for j in 0..feat_dim { sw[j * feat_dim + j] += eps; }
 
         // Cholesky: Sw = L L^T
-        let mut l = vec![0.0f64; HOG_FEAT_LEN * HOG_FEAT_LEN];
+        let mut l = vec![0.0f64; feat_dim * feat_dim];
         let mut chol_ok = true;
-        for i in 0..HOG_FEAT_LEN {
+        for i in 0..feat_dim {
             for j in 0..=i {
-                let mut sum = sw[i * HOG_FEAT_LEN + j];
-                for k in 0..j { sum -= l[i * HOG_FEAT_LEN + k] * l[j * HOG_FEAT_LEN + k]; }
+                let mut sum = sw[i * feat_dim + j];
+                for k in 0..j { sum -= l[i * feat_dim + k] * l[j * feat_dim + k]; }
                 if i == j {
                     if sum <= 0.0 { chol_ok = false; break; }
-                    l[i * HOG_FEAT_LEN + j] = sum.sqrt();
+                    l[i * feat_dim + j] = sum.sqrt();
                 } else {
-                    l[i * HOG_FEAT_LEN + j] = sum / l[j * HOG_FEAT_LEN + j];
+                    l[i * feat_dim + j] = sum / l[j * feat_dim + j];
                 }
             }
             if !chol_ok { break; }
@@ -3443,57 +3464,57 @@ impl PerFontLda {
         if !chol_ok { eprintln!("[pflda] Cholesky failed for {font_key}"); return None; }
 
         // L^{-1}
-        let mut linv = vec![0.0f64; HOG_FEAT_LEN * HOG_FEAT_LEN];
-        for j in 0..HOG_FEAT_LEN {
-            for i in 0..HOG_FEAT_LEN {
+        let mut linv = vec![0.0f64; feat_dim * feat_dim];
+        for j in 0..feat_dim {
+            for i in 0..feat_dim {
                 let mut sum = if i == j { 1.0 } else { 0.0 };
-                for k in 0..i { sum -= l[i * HOG_FEAT_LEN + k] * linv[k * HOG_FEAT_LEN + j]; }
-                linv[i * HOG_FEAT_LEN + j] = sum / l[i * HOG_FEAT_LEN + i];
+                for k in 0..i { sum -= l[i * feat_dim + k] * linv[k * feat_dim + j]; }
+                linv[i * feat_dim + j] = sum / l[i * feat_dim + i];
             }
         }
 
         // Whiten class means
         let whitened_means: Vec<Vec<f64>> = class_means.iter().map(|cm| {
-            let mut centered = vec![0.0f64; HOG_FEAT_LEN];
-            for j in 0..HOG_FEAT_LEN { centered[j] = cm[j] - global_mean[j]; }
-            let mut wm = vec![0.0f64; HOG_FEAT_LEN];
-            for i in 0..HOG_FEAT_LEN {
-                for j in 0..HOG_FEAT_LEN {
-                    wm[i] += linv[i * HOG_FEAT_LEN + j] * centered[j];
+            let mut centered = vec![0.0f64; feat_dim];
+            for j in 0..feat_dim { centered[j] = cm[j] - global_mean[j]; }
+            let mut wm = vec![0.0f64; feat_dim];
+            for i in 0..feat_dim {
+                for j in 0..feat_dim {
+                    wm[i] += linv[i * feat_dim + j] * centered[j];
                 }
             }
             wm
         }).collect();
 
         // PCA on whitened means to get top eigenvectors
-        let mut wm_mean = vec![0.0f64; HOG_FEAT_LEN];
-        for wm in &whitened_means { for j in 0..HOG_FEAT_LEN { wm_mean[j] += wm[j]; } }
-        for j in 0..HOG_FEAT_LEN { wm_mean[j] /= n_classes as f64; }
+        let mut wm_mean = vec![0.0f64; feat_dim];
+        for wm in &whitened_means { for j in 0..feat_dim { wm_mean[j] += wm[j]; } }
+        for j in 0..feat_dim { wm_mean[j] /= n_classes as f64; }
 
-        let mut cov = vec![0.0f64; HOG_FEAT_LEN * HOG_FEAT_LEN];
+        let mut cov = vec![0.0f64; feat_dim * feat_dim];
         for wm in &whitened_means {
-            for a in 0..HOG_FEAT_LEN {
+            for a in 0..feat_dim {
                 let da = wm[a] - wm_mean[a];
-                for b in a..HOG_FEAT_LEN {
+                for b in a..feat_dim {
                     let db = wm[b] - wm_mean[b];
-                    cov[a * HOG_FEAT_LEN + b] += da * db;
+                    cov[a * feat_dim + b] += da * db;
                 }
             }
         }
-        for a in 0..HOG_FEAT_LEN { for b in 0..a { cov[a * HOG_FEAT_LEN + b] = cov[b * HOG_FEAT_LEN + a]; } }
+        for a in 0..feat_dim { for b in 0..a { cov[a * feat_dim + b] = cov[b * feat_dim + a]; } }
 
-        let actual_dim = out_dim.min(HOG_FEAT_LEN);
-        let eigvecs = crate::train::jacobi_eigen_top_k(&cov, HOG_FEAT_LEN, actual_dim);
+        let actual_dim = out_dim.min(feat_dim);
+        let eigvecs = crate::train::jacobi_eigen_top_k(&cov, feat_dim, actual_dim);
 
         // Final projection: P = eigvecs^T * L^{-1}
-        let mut proj = vec![0.0f64; actual_dim * HOG_FEAT_LEN];
+        let mut proj = vec![0.0f64; actual_dim * feat_dim];
         for d in 0..actual_dim {
-            for j in 0..HOG_FEAT_LEN {
+            for j in 0..feat_dim {
                 let mut sum = 0.0f64;
-                for k in 0..HOG_FEAT_LEN {
-                    sum += eigvecs[d * HOG_FEAT_LEN + k] * linv[k * HOG_FEAT_LEN + j];
+                for k in 0..feat_dim {
+                    sum += eigvecs[d * feat_dim + k] * linv[k * feat_dim + j];
                 }
-                proj[d * HOG_FEAT_LEN + j] = sum;
+                proj[d * feat_dim + j] = sum;
             }
         }
 
@@ -3514,9 +3535,9 @@ impl PerFontLda {
                     for dim in 0..actual_dim {
                         let mut ea = 0.0f64;
                         let mut eb = 0.0f64;
-                        for j in 0..HOG_FEAT_LEN {
-                            ea += proj[dim * HOG_FEAT_LEN + j] * feats[a][j] as f64;
-                            eb += proj[dim * HOG_FEAT_LEN + j] * feats[b][j] as f64;
+                        for j in 0..feat_dim {
+                            ea += proj[dim * feat_dim + j] * feats[a][j] as f64;
+                            eb += proj[dim * feat_dim + j] * feats[b][j] as f64;
                         }
                         let diff = ea - eb;
                         d += diff * diff;
@@ -3538,8 +3559,8 @@ impl PerFontLda {
         let centroids: Vec<Vec<f32>> = class_means.iter().map(|cm| {
             let mut emb = vec![0.0f32; actual_dim];
             for d in 0..actual_dim {
-                for j in 0..HOG_FEAT_LEN {
-                    emb[d] += proj_f32[d * HOG_FEAT_LEN + j] * cm[j] as f32;
+                for j in 0..feat_dim {
+                    emb[d] += proj_f32[d * feat_dim + j] * cm[j] as f32;
                 }
             }
             emb
@@ -3555,8 +3576,8 @@ impl PerFontLda {
                 for f in feats {
                     let mut emb = vec![0.0f32; actual_dim];
                     for d in 0..actual_dim {
-                        for j in 0..HOG_FEAT_LEN {
-                            emb[d] += proj_f32[d * HOG_FEAT_LEN + j] * f[j] as f32;
+                        for j in 0..feat_dim {
+                            emb[d] += proj_f32[d * feat_dim + j] * f[j] as f32;
                         }
                     }
                     let d_sq: f32 = emb.iter().zip(cent.iter())
@@ -3576,6 +3597,7 @@ impl PerFontLda {
         Some(PerFontLda {
             projection: proj_f32,
             out_dim: actual_dim,
+            feat_dim,
             centroids,
             sigma_sq,
             char_map,
@@ -3597,10 +3619,11 @@ impl PerFontLda {
 
         // Magic + version
         w.write_all(b"PFHG").map_err(|e| e.to_string())?; // Per-Font HOG
-        w.write_all(&2u32.to_le_bytes()).map_err(|e| e.to_string())?; // version 2 (HOG)
+        w.write_all(&3u32.to_le_bytes()).map_err(|e| e.to_string())?; // version 3 (HOG + glyph metrics)
         w.write_all(&self.catalog_hash.to_le_bytes()).map_err(|e| e.to_string())?;
 
         // Dimensions
+        w.write_all(&(self.feat_dim as u32).to_le_bytes()).map_err(|e| e.to_string())?;
         w.write_all(&(self.out_dim as u32).to_le_bytes()).map_err(|e| e.to_string())?;
         let n_classes = self.char_map.len() as u32;
         w.write_all(&n_classes.to_le_bytes()).map_err(|e| e.to_string())?;
@@ -3613,7 +3636,7 @@ impl PerFontLda {
         // sigma_sq
         w.write_all(&self.sigma_sq.to_le_bytes()).map_err(|e| e.to_string())?;
 
-        // projection: [out_dim × HOG_FEAT_LEN]
+        // projection: [out_dim × feat_dim]
         for &v in &self.projection {
             w.write_all(&v.to_le_bytes()).map_err(|e| e.to_string())?;
         }
@@ -3630,9 +3653,8 @@ impl PerFontLda {
 
     /// Load from a per-font cache file.  Returns None if stale or corrupt.
     fn load(path: &std::path::Path, font_key: &str, catalog_hash: u64) -> Option<Self> {
-        use crate::hog::HOG_FEAT_LEN;
         let data = std::fs::read(path).ok()?;
-        if data.len() < 24 { return None; } // magic(4) + ver(4) + hash(8) + dims(8)
+        if data.len() < 28 { return None; } // magic(4) + ver(4) + hash(8) + feat_dim(4) + dims(8)
 
         let mut pos = 0usize;
 
@@ -3642,7 +3664,7 @@ impl PerFontLda {
 
         // Version
         let version = u32::from_le_bytes(data[pos..pos+4].try_into().ok()?);
-        if version != 2 { return None; }
+        if version != 3 { return None; }
         pos += 4;
 
         // Catalog hash
@@ -3651,6 +3673,8 @@ impl PerFontLda {
         pos += 8;
 
         // Dimensions
+        let feat_dim = u32::from_le_bytes(data[pos..pos+4].try_into().ok()?) as usize;
+        pos += 4;
         let out_dim = u32::from_le_bytes(data[pos..pos+4].try_into().ok()?) as usize;
         pos += 4;
         let n_classes = u32::from_le_bytes(data[pos..pos+4].try_into().ok()?) as usize;
@@ -3671,7 +3695,7 @@ impl PerFontLda {
         pos += 4;
 
         // projection
-        let proj_len = out_dim * HOG_FEAT_LEN;
+        let proj_len = out_dim * feat_dim;
         if data.len() < pos + proj_len * 4 { return None; }
         let mut projection = Vec::with_capacity(proj_len);
         for _ in 0..proj_len {
@@ -3694,6 +3718,7 @@ impl PerFontLda {
         Some(PerFontLda {
             projection,
             out_dim,
+            feat_dim,
             centroids,
             sigma_sq,
             char_map,

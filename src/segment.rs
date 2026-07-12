@@ -293,10 +293,46 @@ fn segment_characters_inner(
             })
             .collect();
 
-        // The energy map is just darkness — used for the base per-pixel
-        // cost in the DP.  The entry penalty is applied during the DP
-        // transition, not stored in the energy map.
-        let energy = &darkness;
+        // Energy map: darkness with horizontal-context discount.
+        // If a pixel is lighter than the average of its two left neighbors
+        // AND the average of its two right neighbors, it sits at a narrow
+        // gap between heavier ink — discount its ink cost by half.
+        // Precomputing this here keeps the DP loop untouched.
+        let energy: Vec<Vec<f32>> = darkness.iter().map(|row| {
+            let w = row.len();
+            (0..w).map(|c| {
+                let d = row[c];
+                if d > 0.0 {
+                    let left_avg = if c >= 2 {
+                        (row[c - 1] + row[c - 2]) * 0.5
+                    } else if c >= 1 {
+                        row[c - 1]
+                    } else {
+                        d
+                    };
+                    let right_avg = if c + 2 < w {
+                        (row[c + 1] + row[c + 2]) * 0.5
+                    } else if c + 1 < w {
+                        row[c + 1]
+                    } else {
+                        d
+                    };
+                    if left_avg > d && right_avg > d { d * 0.5 } else { d }
+                } else {
+                    d
+                }
+            }).collect()
+        }).collect();
+
+        // Ink discount along a path: sum of (raw darkness - discounted energy)
+        // for each pixel on the path.
+        let ink_discount_for_path = |path: &[[u32; 2]]| -> f32 {
+            path.iter().map(|p| {
+                let r = p[0] as usize;
+                let c = p[1] as usize;
+                darkness[r][c] - energy[r][c]
+            }).sum()
+        };
 
         // Word-level max ink (p95 of raw darkness): used by delta_ink_score
         // to scale the entry penalty proportionally.
@@ -390,11 +426,13 @@ fn segment_characters_inner(
                         let pw = (p_max - p_min) as f32;
                         let sp = segment_penalty(ink_l, ink_r, (p_min + p_max) / 2);
                         let hm = path.windows(2).filter(|w| w[0][0] == w[1][0]).count() as f32;
+                        let id = ink_discount_for_path(&path);
                         candidate_paths.push((col, SeamCost {
                             dp_cost: cost - pw - hm,
                             seam_width_penalty: pw,
                             segment_size_penalty: sp,
                             horizontal_cost: hm,
+                            ink_discount: id,
                             total: cost + sp,
                         }, path));
                     }
@@ -535,11 +573,13 @@ fn segment_characters_inner(
             let h_moves = seam_paths[&final_col].windows(2)
                 .filter(|w| w[0][0] == w[1][0])
                 .count() as f32;
+            let id = ink_discount_for_path(&seam_paths[&final_col]);
             seam_costs.insert(final_col, SeamCost {
                 dp_cost: entry.cost - seg_pen - swp - h_moves,
                 seam_width_penalty: swp,
                 segment_size_penalty: seg_pen,
                 horizontal_cost: h_moves,
+                ink_discount: id,
                 total: entry.cost,
             });
 
@@ -579,11 +619,13 @@ fn segment_characters_inner(
                             let pw = (p_max - p_min) as f32;
                             let sp = segment_penalty(ink_l, ink_r, (p_min + p_max) / 2);
                             let hm = path.windows(2).filter(|w| w[0][0] == w[1][0]).count() as f32;
+                            let id = ink_discount_for_path(&path);
                             candidate_paths.push((col, SeamCost {
                                 dp_cost: cost - pw - hm,
                                 seam_width_penalty: pw,
                                 segment_size_penalty: sp,
                                 horizontal_cost: hm,
+                                ink_discount: id,
                                 total: cost + sp,
                             }, path));
                         }
@@ -615,11 +657,13 @@ fn segment_characters_inner(
                             let pw = (p_max - p_min) as f32;
                             let sp = segment_penalty(ink_l, ink_r, (p_min + p_max) / 2);
                             let hm = path.windows(2).filter(|w| w[0][0] == w[1][0]).count() as f32;
+                            let id = ink_discount_for_path(&path);
                             candidate_paths.push((col, SeamCost {
                                 dp_cost: cost - pw - hm,
                                 seam_width_penalty: pw,
                                 segment_size_penalty: sp,
                                 horizontal_cost: hm,
+                                ink_discount: id,
                                 total: cost + sp,
                             }, path));
                         }
@@ -834,6 +878,7 @@ fn candidate_seams(
     });
 
     // Masked energy: pixels outside diagonal boundaries are impassable.
+    // Energy already includes the horizontal-context ink discount.
     let masked_energy = |r: usize, c: usize| -> f32 {
         let abs_col = base + c;
         if let Some(ref lb) = left_bound {
@@ -1064,6 +1109,7 @@ pub struct SeamCost {
     pub seam_width_penalty: f32,
     pub segment_size_penalty: f32,
     pub horizontal_cost: f32,
+    pub ink_discount: f32,
     pub total: f32,
 }
 

@@ -89,6 +89,29 @@ pub struct AuditEntry {
     /// Per-word segmentation summaries for this line.
     #[serde(skip_serializing_if = "Vec::is_empty")]
     pub word_segmentation: Vec<WordSegSummary>,
+    /// PFLDA OCR corrections with decision data.
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub ocr_corrections: Vec<OcrCorrection>,
+}
+
+/// A single PFLDA OCR correction with its decision data.
+#[derive(Debug, Serialize, Clone)]
+pub struct OcrCorrection {
+    /// Index into the character sequence (word-relative position).
+    pub char_pos: usize,
+    /// Segment (word) index within the line.
+    pub seg_idx: usize,
+    /// Original OCR character.
+    pub ocr_char: char,
+    /// PFLDA replacement character.
+    pub replacement: char,
+    /// PFLDA probability of the replacement character.
+    pub replacement_p: f32,
+    /// PFLDA probability of the original OCR character (None if OCR char not in font).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub ocr_p: Option<f32>,
+    /// Ratio of replacement_p / ocr_p.
+    pub ratio: f32,
 }
 
 /// Word-level bounding box with OCR text.

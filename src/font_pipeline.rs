@@ -56,6 +56,8 @@ pub struct LineMatch {
     pub fast_path_score: Option<f32>,
     /// Per-word segmentation summaries for audit integration.
     pub word_seg_summaries: Vec<crate::audit::WordSegSummary>,
+    /// PFLDA OCR corrections with decision data.
+    pub ocr_corrections: Vec<crate::audit::OcrCorrection>,
 }
 
 /// Minimum SSIM score for the fast-path dominant-font check.
@@ -151,6 +153,7 @@ pub fn match_lines(
                     fast_path: true,
                     fast_path_score: Some(vr.score),
                     word_seg_summaries: Vec::new(),
+                    ocr_corrections: Vec::new(),
                 };
             } else if li < 3 {
             }
@@ -438,6 +441,7 @@ pub fn match_lines(
         // because we walk the source text, so corrections propagate
         // directly to line.words via source_word_idx.
         let mut corrected_words: Option<Vec<crate::ocr::TextRegion>> = None;
+        let mut ocr_correction_audit: Vec<crate::audit::OcrCorrection> = Vec::new();
         if let (Some(ref fr), Some(rtd)) = (&font_result, training_data) {
             eprintln!("[pflda] OCR correction pass for font_key={}", fr.font_key);
             let ctx = rtd.as_context(glyph_map);
@@ -448,6 +452,39 @@ pub fn match_lines(
                     &line_crops.word_segs
                 };
                 eprintln!("[pflda] Loaded/trained OK, checking chars across {} word_segs", winning_word_segs.len());
+
+                // -- Load font and compute glyph metric ratios ----------
+                // Used to validate OCR corrections: reject replacements
+                // whose vertical geometry is incompatible with the crop.
+                let glyph_metrics: std::collections::HashMap<char, (f32, f32)> = {
+                    let font_entry = ctx.catalog.iter().find(|fe| fe.font_key() == fr.font_key);
+                    if let Some(fe) = font_entry {
+                        if let Ok(font_data) = std::fs::read(&fe.path) {
+                            if let Ok(mut font) = ab_glyph::FontVec::try_from_vec(font_data) {
+                                if let Some(ref vars) = fe.variations {
+                                    use ab_glyph::VariableFont;
+                                    for (tag, val) in vars {
+                                        font.set_variation(tag, *val);
+                                    }
+                                }
+                                // Gather all chars that appear in any segment
+                                let all_chars: Vec<char> = winning_word_segs.iter()
+                                    .flat_map(|seg| seg.chars.iter().copied())
+                                    .collect::<std::collections::HashSet<_>>()
+                                    .into_iter()
+                                    .collect();
+                                crate::char_render::glyph_metric_ratios(
+                                    &font,
+                                    &all_chars,
+                                    fe.glyph_overrides.as_deref(),
+                                )
+                            } else { std::collections::HashMap::new() }
+                        } else { std::collections::HashMap::new() }
+                    } else { std::collections::HashMap::new() }
+                };
+                if !glyph_metrics.is_empty() {
+                    eprintln!("[pflda] Loaded glyph metrics for {} chars", glyph_metrics.len());
+                }
 
                 // -- Build reverse map: (seg_idx, char_pos) → obs index ---
                 // Used to update observation audit fields alongside corrected_words.
@@ -488,7 +525,15 @@ pub fn match_lines(
                             Some(h) => h,
                             None => continue,
                         };
-                        let preds_d = pf_lda.predict_with_distances(&hog, 200);
+                        // Build feature vector: HOG + glyph metric ratios
+                        let (metric_top, metric_bot) = glyph_metrics.get(&ocr_char)
+                            .copied()
+                            .unwrap_or((0.0, 0.0));
+                        let mut feats = Vec::with_capacity(hog.len() + 2);
+                        feats.extend_from_slice(&hog);
+                        feats.push(metric_top);
+                        feats.push(metric_bot);
+                        let preds_d = pf_lda.predict_with_distances(&feats, 200);
                         if preds_d.is_empty() { continue; }
                         let dists: Vec<(char, f32)> = preds_d.iter()
                             .map(|&(c, _, d)| (c, d))
@@ -571,8 +616,18 @@ pub fn match_lines(
                     // Probability-gated correction
                     let ocr_p_val = ocr_p.unwrap_or(0.0);
                     let ratio = if ocr_p_val > 1e-6 { top_p / ocr_p_val } else { f32::INFINITY };
+
                     if top_p > 0.235 && ratio > 3.0 && top_char != pc.ocr_char {
                         corrections.push((pc.seg_idx, pc.char_pos, pc.ocr_char, top_char));
+                        ocr_correction_audit.push(crate::audit::OcrCorrection {
+                            char_pos: pc.char_pos,
+                            seg_idx: pc.seg_idx,
+                            ocr_char: pc.ocr_char,
+                            replacement: top_char,
+                            replacement_p: top_p,
+                            ocr_p,
+                            ratio,
+                        });
                         // Update observation
                         if let Some(&obs_i) = char_to_obs.get(&(pc.seg_idx, pc.char_pos)) {
                             observations[obs_i].ocr_corrected_from = Some(pc.ocr_char);
@@ -788,7 +843,7 @@ pub fn match_lines(
             }).collect()
         };
 
-        LineMatch { font_result, text_color, font_scores, observations, font_scores_lig, observations_lig, seg_winner, diag_seg_dir, chosen_obs_ranks, gt_font_obs_ranks, chosen_obs_probs, gt_font_obs_probs, tie_candidates: tie_candidates_audit, corrected_words, fast_path: false, fast_path_score: None, word_seg_summaries }
+        LineMatch { font_result, text_color, font_scores, observations, font_scores_lig, observations_lig, seg_winner, diag_seg_dir, chosen_obs_ranks, gt_font_obs_ranks, chosen_obs_probs, gt_font_obs_probs, tie_candidates: tie_candidates_audit, corrected_words, fast_path: false, fast_path_score: None, word_seg_summaries, ocr_corrections: ocr_correction_audit }
     }).collect();
 
     let fp_hits = fast_path_hits.load(Ordering::Relaxed);

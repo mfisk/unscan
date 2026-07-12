@@ -191,6 +191,7 @@ fn build_audit_entry(
         ocr_correct: None,
         fast_path: lm.fast_path,
         word_segmentation: lm.word_seg_summaries.clone(),
+        ocr_corrections: lm.ocr_corrections.clone(),
     }
 }
 
