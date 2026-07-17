@@ -196,10 +196,13 @@ fn segment_characters_inner(
     let initial_ink = ink_extent(&col_has_ink_strict, 0, w);
 
     // --- Pass 1: whitespace splitter ---
-    // Find runs of consecutive zero-ink columns within the ink extent
-    // and split at the midpoint of each run.
+    // Find runs of consecutive zero-ink columns within the ink extent.
+    // Collect candidates, then greedily accept only those whose segment
+    // penalty is acceptable — prevents over-splitting when glyphs like
+    // " have multiple clean vertical gaps but only need one split.
     {
         let (ink_l, ink_r) = ink_extent(&col_has_ink_strict, 0, w);
+        let mut vp_candidates: Vec<u32> = Vec::new();
         let mut run_start: Option<u32> = None;
         for c in ink_l..ink_r {
             if !col_has_ink_strict[c as usize] {
@@ -209,8 +212,38 @@ fn segment_characters_inner(
             } else {
                 if let Some(rs) = run_start {
                     let mid = (rs + c) / 2;
-                    splits.push(mid);
+                    vp_candidates.push(mid);
                     run_start = None;
+                }
+            }
+        }
+
+        // Fast path: if we don't have more VP candidates than needed,
+        // accept them all — no selection required.
+        if vp_candidates.len() <= need - splits.len() {
+            splits.extend(&vp_candidates);
+        } else {
+            // Greedy selection: always pick the most balanced VP split
+            // (smallest segment penalty), stop when we have enough.
+            while splits.len() < need && !vp_candidates.is_empty() {
+                let mut best_idx: Option<usize> = None;
+                let mut best_min_child: f32 = -1.0;
+                for (i, &col) in vp_candidates.iter().enumerate() {
+                    let seg_start = splits.iter().filter(|&&s| s < col).copied()
+                        .max().unwrap_or(0);
+                    let seg_end = splits.iter().filter(|&&s| s > col).copied()
+                        .min().unwrap_or(w);
+                    let left = (col - seg_start) as f32;
+                    let right = (seg_end - col) as f32;
+                    let min_child = left.min(right);
+                    if min_child > best_min_child {
+                        best_min_child = min_child;
+                        best_idx = Some(i);
+                    }
+                }
+                match best_idx {
+                    Some(i) => { splits.push(vp_candidates.remove(i)); }
+                    None => break,
                 }
             }
         }
@@ -1072,7 +1105,6 @@ fn uniform_boundaries(width: u32, n: usize) -> Vec<u32> {
 }
 
 
-const MIN_WORD_LEN: usize = 3;
 
 /// Cost breakdown for a single seam, stored in audit data.
 #[derive(Debug, Clone, serde::Serialize)]
@@ -1145,7 +1177,7 @@ pub fn segment_line(
     let mut sorted: Vec<(usize, &WordPlacement)> = words
         .iter()
         .enumerate()
-        .filter(|(_, w)| w.text.chars().count() >= MIN_WORD_LEN && w.width > 0)
+        .filter(|(_, w)| w.width > 0)
         .collect();
     sorted.sort_by(|(_, a), (_, b)| b.text.chars().count().cmp(&a.text.chars().count()));
 

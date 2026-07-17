@@ -142,4 +142,59 @@ No change to the UCIX binary format. The BF index is rebuilt from the same
 4. **Profile and optimize:** If 75µs/query is too slow, add inverted-index
    prefilter to reduce scan from 3,700 to ~500 candidates per character
 5. **Resolved — brute-force is now the production search method.
-   
+
+
+## Classifier Confidence Blending (OOD Dampening)
+
+`GlyphClassifier::probabilities()` in `src/classifier.rs` uses a Gaussian
+kernel over squared Euclidean distances in LDA space to produce softmax
+probabilities for each glyph.  A confidence blending step dampens scores
+for out-of-distribution (OOD) query vectors.
+
+### How it works
+
+1. **Standard softmax**: for each centroid, compute
+   `exp(-(d - d_min) / (2σ²))`, normalize to sum to 1.
+
+2. **Confidence**: `exp(-d_min / (2σ²))` — the raw Gaussian density at the
+   nearest centroid.  When the query sits on a centroid, confidence ≈ 1.0.
+   When it's far from all centroids, confidence → 0.
+
+3. **Blend**: final probability =
+   `confidence × softmax_p + (1 - confidence) × uniform_p`.
+
+The effect: an in-distribution query (small `d_min`) gets pure softmax
+probabilities — the top glyph might be 28× uniform.  An OOD query (large
+`d_min`) converges toward 1× uniform regardless of which glyph "wins" the
+softmax, because the win is meaningless when the query is far from
+everything.
+
+### σ² computation
+
+`compute_sigma_sq()` sets σ² to the **median pairwise squared distance**
+between all centroids for a given character class.  This is computed once
+per character at model load time.  Using the median makes the bandwidth
+robust to outlier centroids without requiring per-font tuning.
+
+### Motivation
+
+Without confidence blending, a wrong crop (e.g., an `r` misclassified as
+`-` due to a segmentation failure) can produce extreme ×uniform values
+(28×, 36×) because the softmax still concentrates on whichever centroid
+happens to be geometrically closest, even though the query is nowhere near
+the true distribution of any glyph.  These inflated scores dominate the
+font score sum (`weighted_mean(ln(p))` in `aggregate_font_score()`) and
+can flip the font selection to the wrong font.
+
+Confidence blending limits the damage: an OOD crop that lands far from all
+centroids gets a confidence near 0, so its probability converges to uniform
+and its contribution to font scoring is neutralized.
+
+### Limitations
+
+The blending has no effect when the wrong crop happens to land *near* a
+real centroid in LDA space.  For example, an `r` crop may land near the
+em-dash centroid because LDA can't distinguish them — `d_min` is small,
+confidence ≈ 1.0, and the full softmax score passes through.  This case
+requires a scoring-level cap (not yet implemented) rather than
+classifier-level dampening.

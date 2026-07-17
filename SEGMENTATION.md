@@ -244,3 +244,96 @@ infinite cost or fail ink validation), fall back to
 | `delta_weight` | 1.0 | Weight on entry penalty relative to base ink cost |
 | Horizontal cost | +1.0 | Per diagonal move in the DP |
 | Width penalty | 1.0× | Multiplier on seam path width in candidate cost |
+
+## Classifier Probability & Confidence
+
+After segmentation produces character crops, each crop is classified against
+per-character font models.  Two values control the output probability:
+the **classifier score** (a softmax over font centroids) and the
+**confidence score** (an out-of-distribution detector).
+
+### Classifier Score (Softmax)
+
+For a given character (e.g. `'A'`), the model stores one centroid per font
+in LDA embedding space.  Given a query feature vector:
+
+1. Embed the query into the same space (LDA projection).
+2. Compute d²_i = squared Euclidean distance from query to each font
+   centroid i.
+3. Compute σ²_pairwise = median of all pairwise d² among centroids.
+   This is the **kernel bandwidth** — it scales the softmax so that
+   characters with widely-spread centroids don't produce artificially
+   peaked distributions.
+4. Softmax with Gaussian kernel (max-subtracted for numerical stability):
+
+```
+softmax_i = exp(-(d²_i - d²_min) / (2·σ²_pairwise))
+          / Σ_j exp(-(d²_j - d²_min) / (2·σ²_pairwise))
+```
+
+This is a standard nearest-centroid classifier with a Gaussian kernel
+whose bandwidth adapts per character.
+
+### Confidence Score (OOD Detection)
+
+A second variance, σ²_within, captures the **within-class scatter**:
+the median d² from training samples to their own class centroid.  This
+measures how far a typical in-distribution sample sits from its centroid.
+
+The confidence score for a query is:
+
+```
+confidence = exp(-d²_min / (2·σ²_within))
+```
+
+where d²_min is the distance to the closest centroid.
+
+- **In-distribution** (d²_min ≈ σ²_within): confidence ≈ 0.6 — the
+  query is about as far as a typical training sample.  Softmax ranking
+  is mostly preserved.
+- **On a centroid** (d²_min ≈ 0): confidence ≈ 1.0 — full trust in the
+  softmax distribution.
+- **Out-of-distribution** (d²_min >> σ²_within): confidence → 0 — the
+  query is far from everything the model has seen.
+
+### Blending
+
+The final probability blends softmax with uniform using confidence:
+
+```
+p_i = confidence · softmax_i + (1 - confidence) · (1/N)
+```
+
+where N is the number of fonts for that character.
+
+**Effect:** An OOD observation (bad crop, unseen glyph, ligature fragment)
+converges to uniform — it contributes no font preference.  An in-distribution
+observation preserves its softmax ranking.  This prevents a single
+overconfident misclassification from dominating the font score.
+
+### Why Two Sigmas
+
+σ²_pairwise and σ²_within serve different purposes and differ by orders
+of magnitude (typically 400–12,000×):
+
+| Sigma | Computed from | Typical scale | Purpose |
+|-------|--------------|---------------|---------|
+| σ²_pairwise | Median pairwise d² among centroids | ~7–127 | Softmax bandwidth: controls how peaked the probability distribution is |
+| σ²_within | Median d² from training samples to own centroid | ~0.01 | Confidence: detects when the query is far from all known classes |
+
+Using pairwise sigma for both would make the confidence check useless
+(everything looks in-distribution relative to inter-centroid distances).
+Using within-class sigma for both would make the softmax too peaked
+(all probability on the nearest centroid).
+
+### How Sigmas Are Computed (LDA Training)
+
+**σ²_pairwise:** `pairwise_sigma_sq()` — enumerate all (N choose 2) pairs
+of centroids, compute d² for each, take the median.
+
+**σ²_within:** For each training sample, project it into LDA space and
+compute d² to its own class centroid.  Collect all such distances across
+all training samples for that character, take the median.
+
+Both are stored per character in the weight file (IndexedEntryFixed, 32
+bytes per entry).

@@ -4,6 +4,7 @@ use std::collections::HashMap;
 
 use crate::error::ScanTextError;
 use serde::Serialize;
+use crate::classifier::ObsStats;
 
 use std::path::{Path, PathBuf};
 
@@ -190,6 +191,9 @@ pub struct ObservationVote {
     /// Calibrated posterior probability of the ground-truth font for this character.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub gt_font_prob: Option<f32>,
+    /// Raw classifier distance stats (populated when UNPRINT_OBS_STATS=1).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub obs_stats: Option<ObsStats>,
 }
 
 #[derive(Debug, Serialize, Clone)]

@@ -122,7 +122,7 @@ pub struct Args {
     /// ngram is discarded. All fonts are then scored on the same surviving
     /// set of ngrams. Default 6.0 means a glyph must be 6× more likely
     /// than random to count.
-    #[arg(long, default_value_t = 6.0)]
+    #[arg(long, default_value_t = 0.0)]
     pub min_ngram_prob: f32,
 }
 

@@ -18,6 +18,69 @@ use crate::features::{CropFeatures, FEAT_LEN};
 use std::collections::HashMap;
 
 // ---------------------------------------------------------------------------
+// OOD observation diagnostics (gated by UNPRINT_OBS_STATS=1)
+// ---------------------------------------------------------------------------
+
+/// Raw distance metrics from a single probabilities() call.
+/// Populated only when UNPRINT_OBS_STATS=1.
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct ObsStats {
+    pub min_d: f32,
+    pub d_second: f32,
+    pub sigma_sq: f32,
+    pub med_nn: f32,
+    pub n_centroids: usize,
+    /// Pre-blend softmax winner probability.
+    pub softmax_max: f32,
+    /// Shannon entropy of the raw softmax distribution (nats).
+    pub softmax_entropy: f32,
+}
+
+/// Whether to collect OOD observation stats (checked once at startup).
+static OBS_STATS_ENABLED: std::sync::LazyLock<bool> = std::sync::LazyLock::new(|| {
+    std::env::var("UNPRINT_OBS_STATS").map_or(false, |v| v == "1")
+});
+
+thread_local! {
+    /// Sidecar from the last probabilities() call, if stats collection is enabled.
+    static LAST_OBS_STATS: std::cell::RefCell<Option<ObsStats>> = const { std::cell::RefCell::new(None) };
+}
+
+/// Retrieve and clear the last observation stats (call after probabilities()/classify()).
+pub fn take_obs_stats() -> Option<ObsStats> {
+    if !*OBS_STATS_ENABLED { return None; }
+    LAST_OBS_STATS.with(|cell| cell.borrow_mut().take())
+}
+
+
+
+fn stash_obs_stats(min_d: f32, dists: &[(u32, f32)], sigma_sq: f32, med_nn: f32, softmax_probs: &[(u32, f32)]) {
+    if !*OBS_STATS_ENABLED { return; }
+    let n = dists.len();
+    let mut d_second = f32::INFINITY;
+    for &(_, d) in dists {
+        if d > min_d && d < d_second {
+            d_second = d;
+        }
+    }
+    let softmax_max = softmax_probs.iter().map(|(_, p)| *p).fold(0.0f32, f32::max);
+    let softmax_entropy = -softmax_probs.iter()
+        .map(|(_, p)| if *p > 1e-30 { p * p.ln() } else { 0.0 })
+        .sum::<f32>();
+    LAST_OBS_STATS.with(|cell| {
+        *cell.borrow_mut() = Some(ObsStats {
+            min_d,
+            d_second,
+            sigma_sq,
+            med_nn,
+            n_centroids: n,
+            softmax_max,
+            softmax_entropy,
+        });
+    });
+}
+
+// ---------------------------------------------------------------------------
 // Binary weight-file reader
 // ---------------------------------------------------------------------------
 
@@ -213,6 +276,24 @@ fn sq_euclid(a: &[f32], b: &[f32]) -> f32 {
 ///
 /// Replaces the old split where weights lived in the Embedder and centroids
 /// lived in a separate NgramModel.
+/// Median pairwise squared distance among a set of centroids.
+pub fn pairwise_sigma_sq(centroids: &[(u32, Vec<f32>)]) -> f32 {
+    let n = centroids.len();
+    if n < 2 { return 0.0; }
+    let mut dists: Vec<f32> = Vec::with_capacity(n * (n - 1) / 2);
+    for i in 0..n {
+        for j in (i + 1)..n {
+            dists.push(sq_euclid(&centroids[i].1, &centroids[j].1));
+        }
+    }
+    dists.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
+    dists[dists.len() / 2]
+}
+
+
+// ---------------------------------------------------------------------------
+
+
 pub struct ImageModel {
     /// Classifier-specific weights as a flat f32 blob.
     /// Interpretation depends on the classifier type (magic byte in .bin header).
@@ -222,6 +303,9 @@ pub struct ImageModel {
     /// Gaussian bandwidth for probability calibration (median pairwise
     /// squared distance among centroids).  0.0 means not yet computed.
     pub sigma_sq: f32,
+    /// OOD gating threshold: median nearest-foreign-centroid d².
+    /// Used for Cauchy OOD confidence blending.  0.0 means not yet computed.
+    pub med_nn: f32,
 }
 
 impl ImageModel {
@@ -238,18 +322,18 @@ impl ImageModel {
             return dists.into_iter().map(|(id, _)| (id, p)).collect();
         };
         let inv2s = 1.0 / (2.0 * sigma);
-        let mut probs: Vec<(u32, f32)> = {
-            // Standard Gaussian kernel with softmax max-subtraction for numerical stability
-            let min_d = dists.iter().map(|(_, d)| *d).fold(f32::INFINITY, f32::min);
-            let raw: Vec<f32> = dists.iter().map(|(_, d)| (-(d - min_d) * inv2s).exp()).collect();
-            let sum: f32 = raw.iter().sum();
-            if sum < 1e-30 {
-                let p = 1.0 / dists.len() as f32;
-                dists.into_iter().map(|(id, _)| (id, p)).collect()
-            } else {
-                dists.iter().zip(raw.iter()).map(|((id, _), &r)| (*id, r / sum)).collect()
-            }
+        let min_d = dists.iter().map(|(_, d)| *d).fold(f32::INFINITY, f32::min);
+        let raw: Vec<f32> = dists.iter().map(|(_, d)| (-(d - min_d) * inv2s).exp()).collect();
+        let sum: f32 = raw.iter().sum();
+        let softmax: Vec<(u32, f32)> = if sum < 1e-30 {
+            let p = 1.0 / dists.len() as f32;
+            dists.iter().map(|(id, _)| (*id, p)).collect::<Vec<_>>()
+        } else {
+            dists.iter().zip(raw.iter()).map(|((id, _), &r)| (*id, r / sum)).collect()
         };
+        // Stash pre-blend stats for OOD diagnostics
+        stash_obs_stats(min_d, &dists, sigma, self.med_nn, &softmax);
+        let mut probs = softmax;
         probs.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
         probs
     }
@@ -274,6 +358,25 @@ impl ImageModel {
         dists.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
         let median = dists[dists.len() / 2];
         if median > 1e-30 { self.sigma_sq = median; }
+    }
+
+    /// Compute median nearest-neighbor squared distance among centroids.
+    pub fn compute_med_nn(&mut self) {
+        let n = self.centroids.len();
+        if n < 2 { return; }
+        let mut nn_dists: Vec<f32> = Vec::with_capacity(n);
+        for i in 0..n {
+            let mut best = f32::INFINITY;
+            for j in 0..n {
+                if i == j { continue; }
+                let d = sq_euclid(&self.centroids[i].1, &self.centroids[j].1);
+                if d < best { best = d; }
+            }
+            nn_dists.push(best);
+        }
+        nn_dists.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
+        let median = nn_dists[nn_dists.len() / 2];
+        if median > 1e-30 { self.med_nn = median; }
     }
 }
 
@@ -313,6 +416,7 @@ struct IndexedEntryFixed {
     vecs_off: u32,
     vec_dim: u32,
     sigma_sq_bits: u32,
+    med_nn_bits: u32,
 }
 
 impl NgramModel {
@@ -374,6 +478,7 @@ impl NgramModel {
                     vecs_off: vecs_off as u32,
                     vec_dim: vec_dim as u32,
                     sigma_sq_bits: cm.sigma_sq.to_bits(),
+                    med_nn_bits: cm.med_nn.to_bits(),
                 },
             });
         }
@@ -480,6 +585,7 @@ struct MmapEntryIndex {
     n_centroids: usize,
     vec_dim: usize,
     sigma_sq: f32,
+    med_nn: f32,
 }
 
 /// Zero-copy NgramModel backed by a memory-mapped indexed binary file.
@@ -558,12 +664,16 @@ impl MmapNgramModel {
         let min_d = dists.iter().map(|(_, d)| *d).fold(f32::INFINITY, f32::min);
         let raw: Vec<f32> = dists.iter().map(|(_, d)| (-(d - min_d) * inv2s).exp()).collect();
         let sum: f32 = raw.iter().sum();
-        let mut probs: Vec<(u32, f32)> = if sum < 1e-30 {
+        let softmax: Vec<(u32, f32)> = if sum < 1e-30 {
             let p = 1.0 / dists.len() as f32;
-            dists.into_iter().map(|(id, _)| (id, p)).collect()
+            dists.iter().map(|(id, _)| (*id, p)).collect::<Vec<_>>()
         } else {
-            dists.iter().zip(raw.iter()).map(|((id, _), &r)| (*id, r / sum)).collect()
+            dists.iter().zip(raw.iter())
+                .map(|((id, _), &r)| (*id, r / sum)).collect()
         };
+        // Stash pre-blend stats for OOD diagnostics
+        stash_obs_stats(min_d, &dists, sigma, e.med_nn, &softmax);
+        let mut probs = softmax;
         probs.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
         Some(probs)
     }
@@ -618,7 +728,7 @@ impl MmapNgramModel {
                 let end = start + idx.vec_dim;
                 centroids.push((gid, vecs[start..end].to_vec()));
             }
-            entries.insert(seq.clone(), ImageModel { weights, centroids, sigma_sq: idx.sigma_sq });
+            entries.insert(seq.clone(), ImageModel { weights, centroids, sigma_sq: idx.sigma_sq, med_nn: idx.med_nn });
         }
         NgramModel { entries, catalog_hash: self.catalog_hash }
     }
@@ -697,6 +807,7 @@ impl MmapNgramModel {
                 n_centroids: ef.n_centroids as usize,
                 vec_dim: ef.vec_dim as usize,
                 sigma_sq: f32::from_bits(ef.sigma_sq_bits),
+                med_nn: f32::from_bits(ef.med_nn_bits),
             });
         }
 
@@ -796,6 +907,7 @@ impl Classifier for EmbeddingClassifier {
             weights: Vec::new(),
             centroids: Vec::new(),
             sigma_sq: 0.0,
+            med_nn: 0.0,
         });
         cm.centroids.push((glyph_id as u32, embedded));
     }
@@ -1165,8 +1277,9 @@ impl TripletClassifier {
                 let centroid: Vec<f32> = sum.iter().map(|&v| v / cnt).collect();
                 centroids.push((fid, centroid));
             }
-            let mut cm = ImageModel { weights, centroids, sigma_sq: 0.0 };
+            let mut cm = ImageModel { weights, centroids, sigma_sq: 0.0, med_nn: 0.0 };
             cm.compute_sigma_sq();
+                cm.compute_med_nn();
             model.entries.insert(seq.clone(), cm);
         }
         let tmp = crate::atomic_file::tmp_for(output);
@@ -1446,8 +1559,10 @@ impl PerCharFisherClassifier {
                 weights: scores.to_vec(),
                 centroids,
                 sigma_sq: 0.0,
+                med_nn: 0.0,
             };
             cm.compute_sigma_sq();
+                cm.compute_med_nn();
             model.entries.insert(seq.clone(), cm);
         }
         let tmp = crate::atomic_file::tmp_for(output);
@@ -1767,8 +1882,10 @@ impl MahalanobisClassifier {
                 weights: linv.to_vec(),
                 centroids,
                 sigma_sq: 0.0,
+                med_nn: 0.0,
             };
             cm.compute_sigma_sq();
+                cm.compute_med_nn();
             model.entries.insert(seq.clone(), cm);
         }
         let tmp = crate::atomic_file::tmp_for(output);
@@ -1819,7 +1936,7 @@ pub struct LdaClassifier {
 }
 
 impl LdaClassifier {
-    /// Load an LDA classifier from an LDAC v4 binary, or train one if the file
+    /// Load an LDA classifier from an LDAC v6 binary, or train one if the file
     /// doesn't exist or is stale.  Returns a ready-to-use `EmbeddingClassifier`.
     pub fn load(
         path: &std::path::Path,
@@ -1836,8 +1953,8 @@ impl LdaClassifier {
             else {
                 let version = u32::from_le_bytes(hdr[4..8].try_into().unwrap());
                 let base_ver = version & 0x7FFF_FFFF;
-                if base_ver != 4 {
-                    eprintln!("LDA weights {} are v{base_ver}, need v4 — retraining...", path.display());
+                if base_ver != 8 {
+                    eprintln!("LDA weights {} are v{base_ver}, need v8 — retraining...", path.display());
                     true
                 } else if let Some(c) = ctx {
                     let file_hash = u64::from_le_bytes(hdr[8..16].try_into().unwrap());
@@ -1895,7 +2012,7 @@ impl LdaClassifier {
         }
     }
 
-    /// Train LDA weights and write an LDAC v3 binary (weights + font index).
+    /// Train LDA weights and write an LDAC v6 binary (weights + font index).
     pub fn train(
         ctx: &crate::train::TrainingContext,
         output: &std::path::Path,
@@ -1918,7 +2035,7 @@ impl LdaClassifier {
         let out_dim = lda_dims.min(FEAT_LEN - 1);
         eprintln!("\nLDA training {} characters (target dim={})...", sequences.len(), out_dim);
         let lda_start = std::time::Instant::now();
-        let mut lda_chars: Vec<(Vec<char>, usize, Vec<f32>, f32, HashMap<u32, Vec<f64>>)> = Vec::new();
+        let mut lda_chars: Vec<(Vec<char>, usize, Vec<f32>, f32, HashMap<u32, Vec<f64>>, f32)> = Vec::new();
         let mut skipped = 0usize;
         let mut total_stats = crate::train::RankStats::default();
 
@@ -2049,7 +2166,10 @@ impl LdaClassifier {
                 }
             }
 
-            // Scale calibration
+
+            // Scale calibration — rescale projection so median within-class d²
+            // equals target_dist (0.03).  Keeps f32 distances in a numerically
+            // useful range for the softmax kernel.  Store scale² in med_nn so
             let target_dist = 0.03f64;
             let mut within_dists: Vec<f64> = Vec::new();
             let mut rng_cal = SmallRng::seed_from_u64(si as u64 + 9999);
@@ -2145,7 +2265,37 @@ impl LdaClassifier {
                     char_stats.family_top1_pct());
             }
             total_stats.accumulate(&char_stats);
-            lda_chars.push((seq.clone(), actual_dim, proj_f32, sigma_sq, class_means));
+            // Compute d95: nearest foreign centroid distance.
+            // For each centroid, find the distance to its closest
+            // *different-character* centroid.  Use the median of these
+            // nearest-foreign distances as the OOD scale for this char.
+            // Geometric interpretation: confidence ~ 0.5 when min_d equals
+            // the inter-class gap, so observations inside the gap get high
+            // confidence and those outside get suppressed.
+            let d95: f32 = {
+                let nc = centroid_embeds.len();
+                if nc < 2 { 0.0 }
+                else {
+                    let mut nearest_foreign: Vec<f64> = Vec::with_capacity(nc);
+                    for i in 0..nc {
+                        let mut best = f64::MAX;
+                        for j in 0..nc {
+                            if i == j { continue; }
+                            let mut d = 0.0f64;
+                            for k in 0..actual_dim {
+                                let diff = centroid_embeds[i][k] - centroid_embeds[j][k];
+                                d += diff * diff;
+                            }
+                            if d < best { best = d; }
+                        }
+                        nearest_foreign.push(best);
+                    }
+                    nearest_foreign.sort_by(|a, b| a.partial_cmp(b).unwrap());
+                    nearest_foreign[nearest_foreign.len() / 2] as f32
+                }
+            };
+
+            lda_chars.push((seq.clone(), actual_dim, proj_f32, sigma_sq, class_means, d95));
         }
 
         let lda_elapsed = lda_start.elapsed();
@@ -2157,10 +2307,10 @@ impl LdaClassifier {
         eprintln!("  LDA family: MRR={:.3} top1={:.1}% top5={:.1}%",
             total_stats.family_mrr(), total_stats.family_top1_pct(), total_stats.family_top5_pct());
 
-        // Write LDAC v4 binary (per-char model: weights + centroids + σ²)
+        // Write LDAC v7 binary (per-char model: weights + centroids + σ²)
         if let Some(parent) = output.parent() { let _ = std::fs::create_dir_all(parent); }
         let mut model = NgramModel::new(ctx.catalog_hash);
-        for (seq, actual_dim, proj, sigma, class_means) in &lda_chars {
+        for (seq, actual_dim, proj, sigma, class_means, d95) in &lda_chars {
             let mut centroids: Vec<(u32, Vec<f32>)> = Vec::with_capacity(class_means.len());
             for (&fid, mean) in class_means {
                 let mut embedded = vec![0.0f32; *actual_dim];
@@ -2180,6 +2330,7 @@ impl LdaClassifier {
                 weights,
                 centroids,
                 sigma_sq: *sigma,
+                med_nn: *d95,
             };
             if cm.sigma_sq <= 1e-30 {
                 cm.compute_sigma_sq();
@@ -2189,7 +2340,7 @@ impl LdaClassifier {
         let tmp = crate::atomic_file::tmp_for(output);
         let f = std::fs::File::create(&tmp).expect("create output file");
         let mut w = BufWriter::new(f);
-        model.write_bin(&mut w, b"LDAC", 4).expect("write LDAC v4");
+        model.write_bin(&mut w, b"LDAC", 8).expect("write LDAC v8");
         w.flush().unwrap();
         drop(w);
         std::fs::rename(&tmp, output).expect("atomic rename");

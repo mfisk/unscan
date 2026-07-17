@@ -428,6 +428,14 @@ pub fn split_merged_lines(lines: &mut Vec<TextLine>) {
             continue;
         }
 
+        // Don't split out words under 10px tall — they're punctuation
+        // strokes (em-dashes, dots), not text from a separate line.
+        let tallest_small = heights[best_split].1;
+        if tallest_small < 10 {
+            i += 1;
+            continue;
+        }
+
         let small_indices: std::collections::HashSet<usize> = heights[..=best_split]
             .iter().map(|&(idx, _)| idx).collect();
 

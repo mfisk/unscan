@@ -30,6 +30,7 @@ mod zncc_classifier;
 mod ngram;
 mod atomic_file;
 
+use crate::font_pipeline::ObsRankProbs;
 use crate::audit::{AuditEntry, AuditLog, BBox, GeometryEntry, PageSummary};
 
 use crate::error::ScanTextError;
@@ -132,7 +133,7 @@ fn build_audit_entry(
 ) -> AuditEntry {
     use audit::{BBox, FontCandidate, ObservationVote, Decision, WordBBox};
     let font_result = &lm.font_result;
-    let obs_vote = |d: &font_match::ObservationDetail, with_ranks: bool| {
+    let obs_vote = |d: &font_match::ObservationDetail, rp: &ObsRankProbs| {
         let n_glyphs = classifier.glyph_count(&d.seq).max(1) as f32;
         ObservationVote {
             seq: d.seq.clone(),
@@ -142,7 +143,7 @@ fn build_audit_entry(
             passed_gate: d.passed_gate,
             nearest: d.nearest.clone(),
             crop_path: None,
-            chosen_rank: if with_ranks { lm.chosen_obs_ranks.get(&d.crop_index).copied() } else { None },
+            chosen_rank: rp.chosen_ranks.get(&d.crop_index).copied(),
             ocr_corrected_from: d.ocr_corrected_from,
             best_alt_char: d.best_alt_char,
             best_alt_dist: d.best_alt_dist,
@@ -150,15 +151,22 @@ fn build_audit_entry(
             pflda_top_p: d.pflda_top_p,
             pflda_ocr_p: d.pflda_ocr_p,
             pflda_replaced: d.pflda_replaced,
-            gt_font_rank: if with_ranks { lm.gt_font_obs_ranks.get(&d.crop_index).copied() } else { None },
-            chosen_prob: if with_ranks { lm.chosen_obs_probs.get(&d.crop_index).copied().map(|p| p * n_glyphs) } else { None },
-            gt_font_prob: if with_ranks { lm.gt_font_obs_probs.get(&d.crop_index).copied().map(|p| p * n_glyphs) } else { None },
+            gt_font_rank: rp.gt_ranks.get(&d.crop_index).copied(),
+            chosen_prob: rp.chosen_probs.get(&d.crop_index).copied().map(|p| p * n_glyphs),
+            gt_font_prob: rp.gt_probs.get(&d.crop_index).copied().map(|p| p * n_glyphs),
+            obs_stats: d.obs_stats.clone(),
         }
+    };
+    // Use corrected text if OCR corrections were applied
+    let display_text = if let Some(ref cw) = lm.corrected_words {
+        cw.iter().map(|w| w.text.as_str()).collect::<Vec<_>>().join(" ")
+    } else {
+        line.text.clone()
     };
     AuditEntry {
         page: page_num,
         line_index: line_num,
-        text: line.text.clone(),
+        text: display_text,
         ocr_confidence: line.confidence,
         font_matched: font_result.as_ref().map(|f| f.font_name.clone()),
         font_key_matched: font_result.as_ref().map(|f| f.font_key.clone()),
@@ -171,11 +179,11 @@ fn build_audit_entry(
         font_candidates: lm.font_scores.iter()
             .map(|(fk, s)| FontCandidate { font_key: fk.clone(), score: *s })
             .collect(),
-        obs_votes: lm.observations.iter().map(|d| obs_vote(d, true)).collect(),
+        obs_votes: lm.observations.iter().map(|d| obs_vote(d, &lm.obs_rank_probs)).collect(),
         font_candidates_lig: lm.font_scores_lig.iter()
             .map(|(fk, s)| FontCandidate { font_key: fk.clone(), score: *s })
             .collect(),
-        obs_votes_lig: lm.observations_lig.iter().map(|d| obs_vote(d, false)).collect(),
+        obs_votes_lig: lm.observations_lig.iter().map(|d| obs_vote(d, &lm.alt_obs_rank_probs)).collect(),
         seg_winner: lm.seg_winner.clone(),
         word_bboxes: lm.corrected_words.as_deref().unwrap_or(&line.words).iter().map(|w| WordBBox {
             text: w.text.clone(), x: w.x, y: w.y, width: w.width, height: w.height, confidence: w.confidence,
@@ -479,6 +487,32 @@ fn run(args: &cli::Args, classifier: &mut dyn classifier::Classifier) -> Result<
                             lm.diag_seg_dir.as_deref(),
                             None,
                         );
+                        // Verify alt segmentation path's top font for ZNCC comparison
+                        if lm.seg_winner.is_some() && !lm.font_scores_lig.is_empty() {
+                            if let Some((ref alt_key, _)) = lm.font_scores_lig.first() {
+                                if let Some(alt_fe) = font_registry.by_key(alt_key) {
+                                    if let Ok(alt_fd) = font_cache.load(&alt_fe.path) {
+                                        let alt_audit_dir = lm.diag_seg_dir.as_ref().map(|d| {
+                                            let p = d.join("ssim_alt");
+                                            let _ = std::fs::create_dir_all(&p);
+                                            p
+                                        });
+                                        let _alt_vr = verify::verify_text_region(
+                                            &norm_crop,
+                                            alt_fd.as_slice(),
+                                            &line.text,
+                                            verify_words,
+                                            line.x, line.y,
+                                            alt_fe.glyph_overrides.as_deref(),
+                                            &alt_fe.variant_tag,
+                                            alt_fe.variations.as_deref(),
+                                            alt_audit_dir.as_deref(),
+                                            None,
+                                        );
+                                    }
+                                }
+                            }
+                        }
                         let pass = vr.score >= MIN_VERIFY_SIMILARITY;
                         (Some(vr.score), Some(pass))
                     } else {
@@ -529,10 +563,15 @@ fn run(args: &cli::Args, classifier: &mut dyn classifier::Classifier) -> Result<
             if let Some(ref ddir) = lm.diag_seg_dir {
                 let fname = font_result.as_ref().map(|f| f.font_name.as_str()).unwrap_or("?");
                 let fscore = font_result.as_ref().map(|f| f.score).unwrap_or(0.0);
+                let diag_text = if let Some(ref cw) = lm.corrected_words {
+                    cw.iter().map(|w| w.text.as_str()).collect::<Vec<_>>().join(" ")
+                } else {
+                    line.text.clone()
+                };
                 let line_summary = serde_json::json!({
                     "page": page_num,
                     "line_index": line_num,
-                    "text": &line.text,
+                    "text": diag_text,
                     "font_matched": fname,
                     "font_score": fscore,
                     "similarity_score": similarity_score,
@@ -552,8 +591,13 @@ fn run(args: &cli::Args, classifier: &mut dyn classifier::Classifier) -> Result<
                 lm, line, page_num, line_num, similarity_score, similarity_pass, keep_raster, &reason, classifier,
             ));
 
+            let render_text = if let Some(ref cw) = lm.corrected_words {
+                cw.iter().map(|w| w.text.as_str()).collect::<Vec<_>>().join(" ")
+            } else {
+                line.text.clone()
+            };
             placed_texts.push(pdf_out::PlacedText {
-                text: line.text.clone(),
+                text: render_text,
                 x: line.x as f32,
                 y: line.y as f32,
                 width: line.width as f32,
@@ -771,10 +815,17 @@ fn run(args: &cli::Args, classifier: &mut dyn classifier::Classifier) -> Result<
             &glyph_map,
         );
         // JSON output to stdout
+        let zncc_avg: f64 = {
+            let vals: Vec<f64> = audit.text_entries.iter()
+                .filter_map(|e| e.similarity_score.map(|s| s as f64))
+                .collect();
+            if vals.is_empty() { 0.0 } else { vals.iter().sum::<f64>() / vals.len() as f64 }
+        };
         let test_json = serde_json::json!({
             "primary_hits": acc.primary_hits,
             "compared": acc.compared,
             "pct": (acc.pct * 10.0).round() / 10.0,
+            "zncc_avg": (zncc_avg * 10000.0).round() / 10000.0,
             "major_misses": acc.major_misses,
             "minor_misses": acc.minor_misses,
             "similarity_failures": acc.similarity_failures,

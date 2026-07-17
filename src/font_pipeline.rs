@@ -6,7 +6,7 @@
 //! - [`paragraph_font_grouping`]: Pass 1.5 — paragraph-level font grouping
 
 use std::collections::HashMap;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 
 use rayon::prelude::*;
@@ -27,6 +27,15 @@ use crate::glyph_map::NgramGlyphMap;
 use crate::segment;
 use crate::verify;
 
+/// Per-observation rank and probability data for a font path (winner or alt).
+#[derive(Default)]
+pub struct ObsRankProbs {
+    pub chosen_ranks: HashMap<usize, usize>,
+    pub chosen_probs: HashMap<usize, f32>,
+    pub gt_ranks: HashMap<usize, usize>,
+    pub gt_probs: HashMap<usize, f32>,
+}
+
 /// Per-line font matching result produced by [`match_lines`].
 pub struct LineMatch {
     pub font_result: Option<font_match::FontMatchResult>,
@@ -37,14 +46,10 @@ pub struct LineMatch {
     pub observations_lig: Vec<font_match::ObservationDetail>,
     pub seg_winner: Option<String>,
     pub diag_seg_dir: Option<PathBuf>,
-    /// Per-observation rank (1-based) of the chosen font among all fonts, keyed by crop_index.
-    pub chosen_obs_ranks: HashMap<usize, usize>,
-    /// Per-observation rank (1-based) of the ground-truth font among all fonts, keyed by crop_index.
-    pub gt_font_obs_ranks: HashMap<usize, usize>,
-    /// Per-observation calibrated probability of the chosen font, keyed by crop_index.
-    pub chosen_obs_probs: HashMap<usize, f32>,
-    /// Per-observation calibrated probability of the ground-truth font, keyed by crop_index.
-    pub gt_font_obs_probs: HashMap<usize, f32>,
+    /// Per-observation ranks/probs for the winner path.
+    pub obs_rank_probs: ObsRankProbs,
+    /// Per-observation ranks/probs for the alt (losing) path.
+    pub alt_obs_rank_probs: ObsRankProbs,
     /// font tie-break candidates with per-candidate SSIM scores.
     pub tie_candidates: Vec<audit::TieCandidate>,
     /// When pflda OCR correction fires, the corrected word regions
@@ -70,6 +75,76 @@ const FAST_PATH_MIN_SSIM: f32 = 0.95;
 /// pipeline: segmentation → font search → font selection with tie-break.
 ///
 /// Returns `(line_matches, fast_path_hit_count)`.
+/// Compute per-observation ranks and calibrated probabilities for a set of
+/// observations against their crops, comparing a chosen font and a GT font.
+fn compute_obs_rank_probs(
+    observations: &[font_match::ObservationDetail],
+    crops: &[GrayImage],
+    chosen_font_key: Option<&str>,
+    gt_font_key: Option<&str>,
+    classifier: &dyn classifier::Classifier,
+    glyph_map: &NgramGlyphMap,
+) -> ObsRankProbs {
+    let mut result = ObsRankProbs::default();
+    for d in observations {
+        let crop = match crops.get(d.crop_index) {
+            Some(c) => c,
+            None => continue,
+        };
+        let feat = match features::compute_features(crop, true) {
+            Some(f) => f,
+            None => continue,
+        };
+        let probs = classifier.probabilities(&d.seq, &feat);
+        if probs.is_empty() { continue; }
+
+        let lookup = |gid: usize| -> Option<(usize, f32)> {
+            probs.iter().enumerate()
+                .find(|(_, (id, _))| *id == gid)
+                .map(|(pos, (_, p))| (pos + 1, *p))
+        };
+
+        if let Some(fk) = chosen_font_key {
+            if let Some(gid) = glyph_map.glyph_id_for_font(&d.seq, fk) {
+                if let Some((rank, prob)) = lookup(gid) {
+                    result.chosen_ranks.insert(d.crop_index, rank);
+                    result.chosen_probs.insert(d.crop_index, prob);
+                }
+            }
+        }
+        if let Some(gtk) = gt_font_key {
+            if let Some(gid) = glyph_map.glyph_id_for_font(&d.seq, gtk) {
+                if let Some((rank, prob)) = lookup(gid) {
+                    result.gt_ranks.insert(d.crop_index, rank);
+                    result.gt_probs.insert(d.crop_index, prob);
+                }
+            }
+        }
+    }
+    result
+}
+
+/// Save observation crops to a subdirectory under diag_dir.
+fn save_obs_crops(
+    diag_dir: &Path,
+    subdir: &str,
+    observations: &[font_match::ObservationDetail],
+    crops: &[GrayImage],
+) {
+    let crop_dir = diag_dir.join(subdir);
+    let _ = std::fs::create_dir_all(&crop_dir);
+    for d in observations {
+        if let Some(img) = crops.get(d.crop_index) {
+            let seq_label: String = d.seq.iter().map(|&c| {
+                if c.is_alphanumeric() { format!("{}", c) }
+                else { format!("U{:04X}", c as u32) }
+            }).collect();
+            let path = crop_dir.join(format!("crop_{:02}_{}.png", d.crop_index, seq_label));
+            let _ = img.save(&path);
+        }
+    }
+}
+
 pub fn match_lines(
     lines: &[TextLine],
     gray_page: &image::GrayImage,
@@ -144,10 +219,8 @@ pub fn match_lines(
                     observations_lig: Vec::new(),
                     seg_winner: None,
                     diag_seg_dir: None,
-                    chosen_obs_ranks: HashMap::new(),
-                    gt_font_obs_ranks: HashMap::new(),
-                    chosen_obs_probs: HashMap::new(),
-                    gt_font_obs_probs: HashMap::new(),
+                    obs_rank_probs: ObsRankProbs::default(),
+                    alt_obs_rank_probs: ObsRankProbs::default(),
                     tie_candidates: Vec::new(),
                     corrected_words: None,
                     fast_path: true,
@@ -660,55 +733,15 @@ pub fn match_lines(
 
         // Per-observation probabilities and audit detail: only for miss lines when full audit is active
         let has_ocr_correction = corrected_words.is_some();
-        let (chosen_obs_ranks, chosen_obs_probs, gt_font_obs_ranks, gt_font_obs_probs) = if (is_miss || has_ocr_correction) && args.full_audit() {
-            // Resolve chosen and GT font keys
+        let obs_rank_probs = if (is_miss || has_ocr_correction) && args.full_audit() {
             let chosen_font_key: Option<String> = font_result.as_ref()
                 .filter(|fr| !fr.font_key.is_empty())
                 .map(|fr| fr.font_key.clone());
-
-            // Per-observation probabilities using the actual scoring crops and
-            // the correct classifier/glyph_map for each observation's seq length.
-            let mut c_ranks = HashMap::new();
-            let mut c_probs = HashMap::new();
-            let mut g_ranks = HashMap::new();
-            let mut g_probs = HashMap::new();
-
-            for d in &observations {
-                let crop = match winning_crops.get(d.crop_index) {
-                    Some(c) => c,
-                    None => continue,
-                };
-                let feat = match features::compute_features(crop, true) {
-                    Some(f) => f,
-                    None => continue,
-                };
-
-                let probs = classifier.probabilities(&d.seq, &feat);
-                if probs.is_empty() { continue; }
-
-                let lookup = |gid: usize| -> Option<(usize, f32)> {
-                    probs.iter().enumerate()
-                        .find(|(_, (id, _))| *id == gid)
-                        .map(|(pos, (_, p))| (pos + 1, *p))
-                };
-
-                if let Some(ref fk) = chosen_font_key {
-                    if let Some(gid) = glyph_map.glyph_id_for_font(&d.seq, fk) {
-                        if let Some((rank, prob)) = lookup(gid) {
-                            c_ranks.insert(d.crop_index, rank);
-                            c_probs.insert(d.crop_index, prob);
-                        }
-                    }
-                }
-                if let Some(ref gtk) = gt_font_key {
-                    if let Some(gid) = glyph_map.glyph_id_for_font(&d.seq, gtk) {
-                        if let Some((rank, prob)) = lookup(gid) {
-                            g_ranks.insert(d.crop_index, rank);
-                            g_probs.insert(d.crop_index, prob);
-                        }
-                    }
-                }
-            }
+            let rp = compute_obs_rank_probs(
+                &observations, winning_crops,
+                chosen_font_key.as_deref(), gt_font_key.as_deref(),
+                classifier, glyph_map,
+            );
 
             // Render font ref glyphs for miss lines
             if let (Some(ref audit_root), Some(ref fr)) = (&args.audit, &font_result) {
@@ -766,27 +799,41 @@ pub fn match_lines(
                 }
             }
 
-            (c_ranks, c_probs, g_ranks, g_probs)
+            rp
         } else {
-            (HashMap::new(), HashMap::new(), HashMap::new(), HashMap::new())
+            ObsRankProbs::default()
+        };
+
+        // Alt path per-observation ranks/probs (using losing path's crops)
+        let alt_obs_rank_probs = if !observations_lig.is_empty() && (is_miss || has_ocr_correction) && args.full_audit() {
+            let losing_crops: &[GrayImage] = if seg_winner.as_deref() == Some("ligature") {
+                &crop_store_plain
+            } else {
+                &crop_store_lig
+            };
+            let alt_font_key: Option<String> = font_scores_lig.first().map(|(k, _)| k.clone());
+            compute_obs_rank_probs(
+                &observations_lig, losing_crops,
+                alt_font_key.as_deref(), gt_font_key.as_deref(),
+                classifier, glyph_map,
+            )
+        } else {
+            ObsRankProbs::default()
         };
 
         // Save crop PNGs and scan line image for ALL audited lines (not just
         // misses), so similarity-failure lines have crops in the report too.
         if let Some(ref ddir) = diag_seg_dir {
             if !observations.is_empty() {
-                let crop_dir = ddir.join("crops");
-                let _ = std::fs::create_dir_all(&crop_dir);
-                for d in &observations {
-                    if let Some(img) = winning_crops.get(d.crop_index) {
-                        let seq_label: String = d.seq.iter().map(|&c| {
-                            if c.is_alphanumeric() { format!("{}", c) }
-                            else { format!("U{:04X}", c as u32) }
-                        }).collect();
-                        let path = crop_dir.join(format!("crop_{:02}_{}.png", d.crop_index, seq_label));
-                        let _ = img.save(&path);
-                    }
-                }
+                save_obs_crops(ddir, "crops", &observations, winning_crops);
+            }
+            if !observations_lig.is_empty() && seg_winner.is_some() {
+                let losing_crops: &[GrayImage] = if seg_winner.as_deref() == Some("ligature") {
+                    &crop_store_plain
+                } else {
+                    &crop_store_lig
+                };
+                save_obs_crops(ddir, "crops_alt", &observations_lig, losing_crops);
             }
 
             // Save full-colour scan line crop for report overlay.
@@ -843,7 +890,7 @@ pub fn match_lines(
             }).collect()
         };
 
-        LineMatch { font_result, text_color, font_scores, observations, font_scores_lig, observations_lig, seg_winner, diag_seg_dir, chosen_obs_ranks, gt_font_obs_ranks, chosen_obs_probs, gt_font_obs_probs, tie_candidates: tie_candidates_audit, corrected_words, fast_path: false, fast_path_score: None, word_seg_summaries, ocr_corrections: ocr_correction_audit }
+        LineMatch { font_result, text_color, font_scores, observations, font_scores_lig, observations_lig, seg_winner, diag_seg_dir, obs_rank_probs, alt_obs_rank_probs, tie_candidates: tie_candidates_audit, corrected_words, fast_path: false, fast_path_score: None, word_seg_summaries, ocr_corrections: ocr_correction_audit }
     }).collect();
 
     let fp_hits = fast_path_hits.load(Ordering::Relaxed);

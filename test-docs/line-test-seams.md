@@ -18,3 +18,15 @@ Columns are relative to the word crop.
 ## L4: abcdefghijklmnopqrstuvwxyz. (p4:L46, OpenSans-400)
 
 TBD
+
+## L5: dogs. (p1:L71, LibreBodoni-400Italic)
+
+TBD
+
+## L6: abcdefghijklmnopqg rstuvwxyz (p5:L79, IBMPlexSans-400)
+
+TBD
+
+## L7: Mayr-Duffner & (p1:L10, SourceSerif4-400It)
+
+TBD

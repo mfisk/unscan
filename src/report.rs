@@ -199,8 +199,8 @@ fn find_diag_seg_dir(audit_root: &Path, page: usize, line_index: usize) -> Optio
 }
 
 /// Find the crop PNG for a specific crop index in a diag-seg line directory.
-fn find_crop_png(diag_dir: &Path, crop_index: usize, seq: &[char]) -> Option<PathBuf> {
-    let crop_dir = diag_dir.join("crops");
+fn find_crop_png_in(diag_dir: &Path, subdir: &str, crop_index: usize, seq: &[char]) -> Option<PathBuf> {
+    let crop_dir = diag_dir.join(subdir);
     let seq_label: String = seq.iter().map(|&c| {
         if c.is_alphanumeric() { format!("{}", c) }
         else { format!("U{:04X}", c as u32) }
@@ -208,6 +208,8 @@ fn find_crop_png(diag_dir: &Path, crop_index: usize, seq: &[char]) -> Option<Pat
     let path = crop_dir.join(format!("crop_{crop_index:02}_{seq_label}.png"));
     if path.is_file() { Some(path) } else { None }
 }
+
+
 
 /// Find the font ref glyph PNG for a character in the font_refs directory.
 fn find_font_ref_ngram_png(audit_root: &Path, font_entry: &FontEntry, ch: char) -> Option<PathBuf> {
@@ -414,21 +416,23 @@ pub fn enrich_audit_entries(
                            (e.bbox.y + e.bbox.height) as f32];
             e.gt_text = gt.lookup_text(e.page, &bbox_px, dpi).map(|s| s.to_string());
         }
-        // OCR text: join raw word texts (word_bboxes_raw = original tesseract output,
-        // before pflda corrections). word_bboxes has corrected text for rendering.
-        let ocr: String = if e.word_bboxes_raw.is_empty() {
+        // OCR text: word_bboxes_raw = original tesseract output (before pflda corrections),
+        // word_bboxes = corrected text (used for rendering and comparison).
+        let ocr_raw: String = if e.word_bboxes_raw.is_empty() {
             e.word_bboxes.iter().map(|w| w.text.as_str()).collect::<Vec<_>>().join(" ")
         } else {
             e.word_bboxes_raw.iter().map(|w| w.text.as_str()).collect::<Vec<_>>().join(" ")
         };
-        if !ocr.is_empty() {
-            e.ocr_text = Some(ocr.clone());
+        let ocr_corrected: String = e.word_bboxes.iter()
+            .map(|w| w.text.as_str()).collect::<Vec<_>>().join(" ");
+        if !ocr_raw.is_empty() {
+            e.ocr_text = Some(ocr_raw);
             if let Some(ref gt_t) = e.gt_text {
-                // Normalize for comparison: collapse whitespace runs to single space, trim, lowercase.
-                // Preserves word boundaries so word-split errors count as OCR misses.
+                // Compare corrected text against GT (not raw OCR).
+                // Normalize: collapse whitespace, trim, lowercase.
                 let gt_norm: String = gt_t.split_whitespace().collect::<Vec<_>>().join(" ").to_lowercase();
-                let ocr_norm: String = ocr.split_whitespace().collect::<Vec<_>>().join(" ").to_lowercase();
-                e.ocr_correct = Some(gt_norm == ocr_norm);
+                let corrected_norm: String = ocr_corrected.split_whitespace().collect::<Vec<_>>().join(" ").to_lowercase();
+                e.ocr_correct = Some(gt_norm == corrected_norm);
             }
         }
     }
@@ -700,6 +704,13 @@ fn build_miss_block(
         String::new()
     };
 
+    // Ligature vs plain segmentation visual comparison
+    let lig_compare_html = if let Some(ref dd) = diag_dir {
+        build_lig_comparison_block(dd, entry)
+    } else {
+        String::new()
+    };
+
     // Scan line image with word bbox + segmentation overlays
     let scan_line_html = if let Some(ref dd) = diag_dir {
         build_scan_line_with_overlays(dd, entry)
@@ -736,7 +747,57 @@ fn build_miss_block(
             diag_dir.as_deref(),
             font_catalog,
             glyph_map,
+            "crops",
         )
+    };
+
+    // Per-character comparison table for the alternate (lig) segmentation path
+    let obs_table_lig_html = if entry.obs_votes_lig.is_empty() || entry.seg_winner.is_none() {
+        String::new()
+    } else {
+        let winner = entry.seg_winner.as_deref().unwrap_or("?");
+        let alt_label = if winner == "ligature" { "plain" } else { "ligature" };
+        let alt_font_key = entry.font_candidates_lig.first()
+            .map(|c| c.font_key.as_str()).unwrap_or("?");
+        let alt_font = short_key(alt_font_key);
+        let alt_chosen_fe = font_catalog.iter().find(|fe| fe.font_key() == alt_font_key);
+        // GT rank/score in the alt path's candidate list (not winner's)
+        let alt_gt = if let Some(ref af) = ce.actual_font {
+            let gt_ps = ground_truth::strip_subset_prefix_str(af);
+            entry.font_candidates_lig.iter().enumerate()
+                .find(|(_, c)| {
+                    find_font_by_key(font_catalog, &c.font_key)
+                        .map_or(false, |fe| fe.postscript_name == gt_ps)
+                })
+                .map(|(i, c)| (Some(i + 1), c.score))
+                .unwrap_or((None, None))
+        } else {
+            (None, None)
+        };
+        let obs_to_show = pick_interesting_observations(&entry.obs_votes_lig, 6, 0);
+        let table = build_observation_table(
+            entry,
+            &obs_to_show,
+            audit_root,
+            correct_fe,
+            alt_chosen_fe,
+            &actual_font,
+            &alt_font,
+            alt_gt.0,
+            alt_gt.1,
+            font_data_cache,
+            diag_dir.as_deref(),
+            font_catalog,
+            glyph_map,
+            "crops_alt",
+        );
+        if table.is_empty() {
+            String::new()
+        } else {
+            format!(
+                "<div class=\"seg-alt-obs\"><b>Alternate path ({alt_label}) \u{2192} {alt_font}</b>{table}</div>",
+            )
+        }
     };
 
     let text_preview = truncate(&entry.text, 60);
@@ -841,13 +902,128 @@ fn build_miss_block(
          {}\
          {}\
          {}\
+         {}\
+         {}\
          </div>",
         entry.page, entry.line_index, miss_kind_label, sim_html,
         text_preview,
-        seg_path_html, scan_line_html, sim_compare_html, tie_break_html, obs_table_html,
-        ocr_override_html,
+        seg_path_html, lig_compare_html, scan_line_html, sim_compare_html, tie_break_html, obs_table_html,
+        obs_table_lig_html, ocr_override_html,
     );
     (html, entry.similarity_score, gt_sim)
+}
+
+/// Build ligature vs plain segmentation visual comparison.
+/// Finds word_*/seg_plain/word_crop.png and word_*/seg_lig/word_crop.png
+/// in the diag directory and renders them side by side when both exist.
+/// Also shows ZNCC render/diff images for both paths when available.
+fn build_lig_comparison_block(diag_dir: &Path, entry: &AuditEntry) -> String {
+    if entry.seg_winner.is_none() || entry.font_candidates_lig.is_empty() {
+        return String::new();
+    }
+    let winner = entry.seg_winner.as_deref().unwrap_or("?");
+    let (winner_label, loser_label) = if winner == "plain" {
+        ("Plain ✓", "Ligature")
+    } else {
+        ("Plain", "Ligature ✓")
+    };
+
+    let mut word_dirs: Vec<_> = match std::fs::read_dir(diag_dir) {
+        Ok(rd) => rd
+            .filter_map(|e| e.ok())
+            .filter(|e| {
+                e.file_name().to_string_lossy().starts_with("word_")
+                    && e.path().is_dir()
+            })
+            .collect(),
+        Err(_) => return String::new(),
+    };
+    word_dirs.sort_by_key(|d| d.file_name().to_string_lossy().to_string());
+
+    let mut rows = String::new();
+    for wd in &word_dirs {
+        let wpath = wd.path();
+        let plain_img = wpath.join("seg_plain").join("word_crop.png");
+        let lig_img = wpath.join("seg_lig").join("word_crop.png");
+        if !plain_img.exists() || !lig_img.exists() {
+            continue;
+        }
+        let plain_uri = match file_to_b64_uri(&plain_img) {
+            Some(u) => u,
+            None => continue,
+        };
+        let lig_uri = match file_to_b64_uri(&lig_img) {
+            Some(u) => u,
+            None => continue,
+        };
+        let dirname = wd.file_name().to_string_lossy().to_string();
+        let word_label = dirname.splitn(3, '_').nth(2).unwrap_or(&dirname);
+
+        rows.push_str(&format!(
+            "<tr>\
+             <td style=\"vertical-align:middle;font-size:11px;font-weight:600;padding:4px 6px;\">\
+             {word_label}</td>\
+             <td style=\"padding:2px;\"><img src=\"{plain_uri}\" \
+             style=\"max-width:100%;image-rendering:pixelated;\"/></td>\
+             <td style=\"padding:2px;\"><img src=\"{lig_uri}\" \
+             style=\"max-width:100%;image-rendering:pixelated;\"/></td></tr>",
+        ));
+    }
+
+    // ZNCC comparison: winner path renders from diag_dir, alt path from ssim_alt/
+    let mut zncc_rows = String::new();
+    let winner_render = diag_dir.join("ssim_render.png");
+    let winner_diff = diag_dir.join("ssim_diff.png");
+    let alt_render = diag_dir.join("ssim_alt").join("ssim_render.png");
+    let alt_diff = diag_dir.join("ssim_alt").join("ssim_diff.png");
+
+    if winner_render.exists() && alt_render.exists() {
+        if let (Some(wr_uri), Some(ar_uri)) = (file_to_b64_uri(&winner_render), file_to_b64_uri(&alt_render)) {
+            let (left_uri, right_uri) = if winner == "plain" { (wr_uri, ar_uri) } else { (ar_uri, wr_uri) };
+            zncc_rows.push_str(&format!(
+                "<tr>\
+                 <td style=\"vertical-align:middle;font-size:11px;font-weight:600;padding:4px 6px;\">\
+                 ZNCC render</td>\
+                 <td style=\"padding:2px;\"><img src=\"{left_uri}\" \
+                 style=\"max-width:100%;image-rendering:pixelated;\"/></td>\
+                 <td style=\"padding:2px;\"><img src=\"{right_uri}\" \
+                 style=\"max-width:100%;image-rendering:pixelated;\"/></td></tr>",
+            ));
+        }
+    }
+    if winner_diff.exists() && alt_diff.exists() {
+        if let (Some(wd_uri), Some(ad_uri)) = (file_to_b64_uri(&winner_diff), file_to_b64_uri(&alt_diff)) {
+            let (left_uri, right_uri) = if winner == "plain" { (wd_uri, ad_uri) } else { (ad_uri, wd_uri) };
+            zncc_rows.push_str(&format!(
+                "<tr>\
+                 <td style=\"vertical-align:middle;font-size:11px;font-weight:600;padding:4px 6px;\">\
+                 ZNCC diff</td>\
+                 <td style=\"padding:2px;\"><img src=\"{left_uri}\" \
+                 style=\"max-width:100%;image-rendering:pixelated;\"/></td>\
+                 <td style=\"padding:2px;\"><img src=\"{right_uri}\" \
+                 style=\"max-width:100%;image-rendering:pixelated;\"/></td></tr>",
+            ));
+        }
+    }
+
+    let all_rows = format!("{rows}{zncc_rows}");
+    if all_rows.is_empty() {
+        return String::new();
+    }
+
+    format!(
+        "<div class=\"seg-compare\">\
+         <b>Segmentation comparison</b> (winner: {winner})\
+         <table style=\"border-collapse:collapse;margin-top:4px;\">\
+         <tr><th></th>\
+         <th style=\"font-size:11px;padding:2px 6px;\">{winner_label}</th>\
+         <th style=\"font-size:11px;padding:2px 6px;\">{loser_label}</th></tr>\
+         {all_rows}\
+         </table></div>",
+        winner_label = winner_label,
+        loser_label = loser_label,
+        all_rows = all_rows,
+    )
 }
 
 /// Build scan line image with word bbox and segmentation path overlays.
@@ -1450,6 +1626,7 @@ fn build_observation_table(
     diag_dir: Option<&Path>,
     font_catalog: &[FontEntry],
     glyph_map: &NgramGlyphMap,
+    crop_dir_name: &str,
 ) -> String {
     let mut rows = String::new();
 
@@ -1460,7 +1637,7 @@ fn build_observation_table(
 
         // Crop image from disk
         let crop_uri = diag_dir.and_then(|dd| {
-            find_crop_png(dd, cv.crop_index, &cv.seq)
+            find_crop_png_in(dd, crop_dir_name, cv.crop_index, &cv.seq)
                 .and_then(|p| file_to_b64_uri(&p))
         });
 
@@ -1588,9 +1765,13 @@ fn build_observation_table(
         _ => "not scored".into(),
     };
 
-    // The chosen font is always CI candidate #1
-    let chosen_rank_info = entry
-        .font_candidates
+    // The chosen font is CI candidate #1 from the appropriate path
+    let path_candidates = if crop_dir_name == "crops_alt" {
+        &entry.font_candidates_lig
+    } else {
+        &entry.font_candidates
+    };
+    let chosen_rank_info = path_candidates
         .first()
         .map(|c| {
             match c.score {
@@ -1837,7 +2018,7 @@ pub fn generate_report(
 
     // Collect OCR-wrong hits/minor misses (font matched, but OCR text wrong)
     let ocr_misses: Vec<&ClassifiedEntry> = classified.iter()
-        .filter(|ce| matches!(ce.kind, MissKind::Hit | MissKind::MinorMiss)
+        .filter(|ce| matches!(ce.kind, MissKind::Hit)
                      && ce.entry.ocr_correct == Some(false))
         .collect();
 
@@ -1951,11 +2132,12 @@ pub fn generate_report(
             let n = sim_vals.len();
             let above = sim_vals.iter().filter(|&&v| v >= crate::MIN_VERIFY_SIMILARITY).count();
             let pct_above = above as f64 / n as f64 * 100.0;
+            let avg: f64 = sim_vals.iter().map(|&v| v as f64).sum::<f64>() / n as f64;
             let p50 = sim_vals[n / 2];
             let p90_idx = (n as f64 * 0.9).ceil() as usize;
             let p90 = sim_vals[p90_idx.min(n - 1)];
             format!(
-                "Similarity: <b>{above}/{n} ({pct_above:.0}%)</b> above {:.1} threshold · p50={p50:.4} · p90={p90:.4}",
+                "Similarity: <b>avg={avg:.4}</b> · <b>{above}/{n} ({pct_above:.0}%)</b> above {:.1} threshold · p50={p50:.4} · p90={p90:.4}",
                 crate::MIN_VERIFY_SIMILARITY,
             )
         }

@@ -4,6 +4,7 @@ use std::collections::HashSet;
 use std::path::PathBuf;
 use image::GrayImage;
 use crate::features::{CropFeatures, compute_features};
+use crate::classifier::{self, ObsStats};
 
 // ---------------------------------------------------------------------------
 // Types
@@ -89,6 +90,8 @@ pub struct ObservationDetail {
     pub pflda_ocr_p: Option<f32>,
     /// Whether the pflda gate fired and replaced the OCR char.
     pub pflda_replaced: bool,
+    /// Raw classifier distance stats (populated when UNPRINT_OBS_STATS=1).
+    pub obs_stats: Option<ObsStats>,
 }
 
 /// Result of `identify_fonts`: ranked font scores + per-observation detail.
@@ -184,6 +187,7 @@ pub fn identify_fonts(
             pflda_top_p: None,
             pflda_ocr_p: None,
             pflda_replaced: false,
+            obs_stats: classifier::take_obs_stats(),
         });
     }
 

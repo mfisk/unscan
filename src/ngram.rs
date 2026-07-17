@@ -489,8 +489,32 @@ pub fn train_ngram_lda(
             }
         }
 
-        let mut cm = ImageModel { weights, centroids, sigma_sq: 0.0 };
-        cm.compute_sigma_sq();
+        // sigma_sq: pairwise (softmax bandwidth)
+        let sigma_sq = crate::classifier::pairwise_sigma_sq(&centroids);
+
+        // med_nn: median nearest-neighbor distance among centroids (OOD confidence)
+        let med_nn: f32 = {
+            if centroids.len() < 2 { 0.0 }
+            else {
+                let mut nn_dists: Vec<f32> = Vec::with_capacity(centroids.len());
+                for i in 0..centroids.len() {
+                    let mut min_d = f32::INFINITY;
+                    for j in 0..centroids.len() {
+                        if i == j { continue; }
+                        let d_sq: f32 = centroids[i].1.iter()
+                            .zip(centroids[j].1.iter())
+                            .map(|(&a, &b)| { let dd = a - b; dd * dd })
+                            .sum();
+                        if d_sq < min_d { min_d = d_sq; }
+                    }
+                    nn_dists.push(min_d);
+                }
+                nn_dists.sort_by(|a, b| a.partial_cmp(b).unwrap());
+                nn_dists[nn_dists.len() / 2]
+            }
+        };
+
+        let cm = ImageModel { weights, centroids, sigma_sq, med_nn };
 
         model_entries.insert(vec![c1, c2], cm);
         trained += 1;
