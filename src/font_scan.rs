@@ -1291,6 +1291,7 @@ pub fn make_weight_explicit(ps_name: &str, weight: u16) -> String {
 fn strip_weight_suffix(ps_name: &str) -> &str {
     const WEIGHT_SUFFIXES: &[&str] = &[
         "-Regular",
+        "-Roman",
         "-Bold",
         "-Light",
         "-Medium",

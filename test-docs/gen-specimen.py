@@ -1,114 +1,29 @@
 #!/usr/bin/env python3
-"""
-Generate "A Timeline of Typography" — a multi-page vector PDF specimen.
+"""gen-specimen.py — Generate font-timeline-specimen.pdf using WeasyPrint.
 
-Output:
-  font-timeline-specimen.pdf       — native vector PDF with embedded fonts + SVG logos
-  font-timeline-specimen-scanned.pdf — rasterized with scan artifacts (skew, noise, blur)
+Outputs:
+  font-timeline-specimen.pdf        — vector PDF with embedded fonts
   font-timeline-specimen-scanned.pdf — rasterized with scan artifacts
 
-Fonts are registered under their actual PostScript names (name ID 6) so that
-the PDF BaseFont values exactly match what font catalog indexers read from the
-same font files. This eliminates the need for heuristic string matching during
-font identification audit.
-
-All text is real PDF text (not raster). SVG logos are placed as vector drawings.
-The "scanned" version rasterizes entire pages then re-assembles as a raster PDF.
+Uses WeasyPrint (Pango/HarfBuzz backend) for proper OpenType kerning.
+Each section is rendered in the font it describes.  The PDF is then annotated
+with /UnprintCanonical entries mapping raw PostScript names to weight-explicit
+canonical names, and a rasterized "scanned" version is generated.
 """
 
-import json
-import os
-import random
-import subprocess
-import sys
+import os, sys, subprocess
 from pathlib import Path
-
-from reportlab.lib.pagesizes import letter
-from reportlab.lib.units import inch, mm
-from reportlab.pdfbase import pdfmetrics
-from reportlab.pdfbase.ttfonts import TTFont
-from reportlab.platypus import (
-    SimpleDocTemplate, Paragraph, Spacer, Image as RLImage,
-    FrameBreak, BaseDocTemplate, Frame, PageTemplate, KeepTogether,
-    Flowable, Table, TableStyle, ImageAndFlowables,
-)
-from reportlab.lib.styles import ParagraphStyle
-from reportlab.lib.enums import TA_LEFT, TA_JUSTIFY
-from PIL import Image as PILImage
 
 SCRIPT_DIR = Path(__file__).resolve().parent
 OUT_DIR = SCRIPT_DIR
-LOGO_DIR = SCRIPT_DIR / "logos"
 
-PAGE_W, PAGE_H = letter  # 612 × 792 points (8.5 × 11 in)
 
-# ---------------------------------------------------------------------------
-# Variable font instantiation cache
-# ---------------------------------------------------------------------------
-_INSTANCE_CACHE = {}  # (path, weight) -> instantiated_path
-
-def _instantiate_variable(path, target_weight, style):
-    """Instantiate a variable font at a fixed weight, returning a static .ttf path.
-
-    Uses fontTools.varLib.instancer to pin the wght axis.  Result is cached in
-    a temp directory so we only instantiate once per (path, weight) pair.
-    """
-    key = (path, target_weight)
-    if key in _INSTANCE_CACHE:
-        return _INSTANCE_CACHE[key]
-
-    import os, tempfile
-    from fontTools.ttLib import TTFont as FTFont
-    from fontTools.varLib.instancer import instantiateVariableFont
-
-    tt = FTFont(path)
-    inst = instantiateVariableFont(tt, {"wght": target_weight})
-    # Drop GPOS — its repack can hang for 10+ minutes on multi-axis fonts.
-    # We don't need kerning for specimen rendering.
-    if "GPOS" in inst:
-        del inst["GPOS"]
-
-    # Update the PostScript name (nameID 6) to reflect the pinned weight.
-    # Without this, ReportLab embeds the original variable-font PS name
-    # (e.g. "Merriweather-Light") even though glyphs are at weight 700.
-    WEIGHT_SUFFIX = {
-        300: "Light", 400: "Regular", 500: "Medium",
-        600: "SemiBold", 700: "Bold", 800: "ExtraBold", 900: "Black",
-    }
-    suffix = WEIGHT_SUFFIX.get(target_weight, f"w{target_weight}")
-    # Derive family from the original PS name: strip everything after the
-    # first hyphen (weight/style suffix).
-    orig_ps = None
-    for rec in inst["name"].names:
-        if rec.nameID == 6:
-            try:
-                orig_ps = rec.toUnicode()
-                break
-            except Exception:
-                pass
-    if orig_ps:
-        family_stem = orig_ps.split("-")[0]
-        is_italic = "italic" in style.lower()
-        new_ps = f"{family_stem}-{'BoldItalic' if is_italic and target_weight == 700 else suffix}"
-        for rec in inst["name"].names:
-            if rec.nameID == 6:
-                rec.string = new_ps
-    basename = os.path.splitext(os.path.basename(path))[0]
-    # Sanitize brackets from variable font filenames
-    basename = basename.replace("[", "_").replace("]", "")
-    out_dir = os.path.join(tempfile.gettempdir(), "unscan-instances")
-    os.makedirs(out_dir, exist_ok=True)
-    style_tag = style.replace(" ", "")
-    out_path = os.path.join(out_dir, f"{basename}-{style_tag}-w{target_weight}.ttf")
-    inst.save(out_path)
-    tt.close()
-    _INSTANCE_CACHE[key] = out_path
-    return out_path
 
 
 # ---------------------------------------------------------------------------
-# Font registration — fonts are resolved via fontconfig
+# Font resolution via fontconfig
 # ---------------------------------------------------------------------------
+
 def fc_find(family, style="Regular"):
     """Find a font file via fontconfig for the given family and style.
 
@@ -130,7 +45,6 @@ def fc_find(family, style="Regular"):
     target_weight = STYLE_WEIGHTS.get(style, 400)
     NORMAL_WIDTH = 5  # usWidthClass: 5 = normal
 
-    # Gather candidates from fontconfig
     candidates = []
     for query in [f"{family}:style={style}", family]:
         r = subprocess.run(
@@ -144,9 +58,8 @@ def fc_find(family, style="Regular"):
     if not candidates:
         raise RuntimeError(f"fc_find: no .ttf candidates for '{family}' style='{style}'")
 
-    # Classify candidates
-    exact_static = []   # static font, exact weight, normal width
-    variable = []       # variable font, normal width, wght axis covers target
+    exact_static = []
+    variable = []
 
     for path in candidates:
         try:
@@ -173,17 +86,16 @@ def fc_find(family, style="Regular"):
         elif is_var and wght_range and wght_range[0] <= target_weight <= wght_range[1]:
             variable.append(path)
 
-    # 1. Prefer static font with exact weight
     if exact_static:
-        # Prefer non-specimen-fonts paths (system packages have canonical PS names)
         for p in exact_static:
             if "/specimen-fonts/" not in p:
                 return p
         return exact_static[0]
 
-    # 2. Instantiate variable font at the target weight
     if variable:
-        return _instantiate_variable(variable[0], target_weight, style)
+        # WeasyPrint/Pango handles variable fonts natively — no instantiation needed.
+        # The @font-face CSS specifies the target weight; Pango shapes at that weight.
+        return variable[0]
 
     raise RuntimeError(
         f"fc_find: no font for '{family}' style='{style}' (weight={target_weight}). "
@@ -191,96 +103,67 @@ def fc_find(family, style="Regular"):
     )
 
 
-# Shared font annotation utilities — canonical in tools/pdf_font_annotate.py
+# Shared font annotation utilities
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", "tools"))
-from pdf_font_annotate import read_postscript_name, make_weight_explicit, annotate_canonical_names
+from pdf_font_annotate import make_weight_explicit, annotate_canonical_names
 
 
-def register_font(ps_name, ttf_path):
-    """Register a TTF with reportlab under its PostScript name. Returns True on success."""
-    if ttf_path and os.path.exists(ttf_path) and ps_name:
-        try:
-            pdfmetrics.registerFont(TTFont(ps_name, ttf_path))
-            return True
-        except Exception as e:
-            print(f"  WARN: can't register {ps_name} from {ttf_path}: {e}")
-    return False
+# ---------------------------------------------------------------------------
+# Font families to include in the specimen
+# ---------------------------------------------------------------------------
 
-# Font spec: (rl_base_name, regular_path, bold_path, italic_path)
-# We'll register {base}, {base}-Bold, {base}-Italic
+FAMILIES = {
+    # Google Fonts
+    "EBGaramond": "EB Garamond",
+    "LibreCaslonText": "Libre Caslon Text",
+    "LibreBaskerville": "Libre Baskerville",
+    "LibreBodoni": "Libre Bodoni",
+    "ZillaSlab": "Zilla Slab",
+    "Jost": "Jost",
+    "PlayfairDisplay": "Playfair Display",
+    "Roboto": "Roboto",
+    "OpenSans": "Open Sans",
+    "Lato": "Lato",
+    "Merriweather": "Merriweather",
+    "SourceSans3": "Source Sans 3",
+    "SourceSerif4": "Source Serif 4",
+    "NotoSerif": "Noto Serif",
+    "PTSerif": "PT Serif",
+    "IBMPlexSans": "IBM Plex Sans",
+    "IBMPlexSerif": "IBM Plex Serif",
+    "IBMPlexMono": "IBM Plex Mono",
+    "Inter": "Inter",
+    "SpecialElite": "Special Elite",
+    # System / MS Core Fonts
+    "TimesNewRoman": "Times New Roman",
+    "CourierNew": "Courier New",
+    "NimbusSans": "Arial",
+    "Arial": "Arial",
+    "Georgia": "Georgia",
+    "Verdana": "Verdana",
+    "ComicSansMS": "Comic Sans MS",
+    "TrebuchetMS": "Trebuchet MS",
+    "Caladea": "Caladea",
+    "PrestigeElite": "Prestige Elite",
+}
 
-def register_all_fonts():
-    """Register all specimen fonts with reportlab using their actual PostScript names.
 
-    ReportLab uses the registration name as the PDF BaseFont value.
-    By registering under the real PostScript name (name ID 6), the GT PDF
-    will contain exact PS names that match the font catalog — no heuristic
-    string matching needed at audit time.
+def resolve_all_fonts():
+    """Resolve all font families via fontconfig.
 
-    Returns (registered, alias_map) where alias_map maps
-    friendly base names to actual PS names for use in section styles.
+    Returns (font_paths, all_font_files):
+      font_paths[base] = {'regular': path, 'bold': path, 'italic': path}
+      all_font_files: deduplicated list of all resolved TTF paths
     """
-    from reportlab.lib.fonts import addMapping
-
-    # All fonts are resolved via fontconfig by family name.
-    # This is the normal way fonts are installed on Linux — no hard-coded paths.
-    FAMILIES = {
-        # Google Fonts
-        "EBGaramond": "EB Garamond",
-        "LibreCaslonText": "Libre Caslon Text",
-        "LibreBaskerville": "Libre Baskerville",
-        "LibreBodoni": "Libre Bodoni",
-        "ZillaSlab": "Zilla Slab",
-        "Jost": "Jost",
-        "PlayfairDisplay": "Playfair Display",
-        "Roboto": "Roboto",
-        "OpenSans": "Open Sans",
-        "Lato": "Lato",
-        "Merriweather": "Merriweather",
-        "SourceSans3": "Source Sans 3",
-        "SourceSerif4": "Source Serif 4",
-        "NotoSerif": "Noto Serif",
-        "PTSerif": "PT Serif",
-        "IBMPlexSans": "IBM Plex Sans",
-        "IBMPlexSerif": "IBM Plex Serif",
-        "IBMPlexMono": "IBM Plex Mono",
-        "Inter": "Inter",
-        "SpecialElite": "Special Elite",
-        # System / MS Core Fonts
-        "TimesNewRoman": "Times New Roman",
-        "CourierNew": "Courier New",
-        "NimbusSans": "Arial",
-        "Arial": "Arial",
-        "Georgia": "Georgia",
-        "Verdana": "Verdana",
-        "ComicSansMS": "Comic Sans MS",
-        "TrebuchetMS": "Trebuchet MS",
-        "Caladea": "Caladea",
-        "PrestigeElite": "Prestige Elite",
-    }
-
-    registered = {}
-    alias_map = {}  # base_name -> ps_name (for regular), base_name-Bold -> ps_bold, etc.
-    canonical_map = {}  # raw PS name (nameID 6) → canonical (weight-explicit) PS name
-
-    # ReportLab base14 fonts: these may appear as default Tf state even when
-    # all visible text uses our registered fonts.  Add them to canonical_map
-    # so every font dict in the PDF gets annotated.
-    for base14 in [
-        "Times-Roman", "Times-Bold", "Times-Italic", "Times-BoldItalic",
-        "Helvetica", "Helvetica-Bold", "Helvetica-Oblique", "Helvetica-BoldOblique",
-        "Courier", "Courier-Bold", "Courier-Oblique", "Courier-BoldOblique",
-        "Symbol", "ZapfDingbats",
-    ]:
-        canonical_map[base14] = base14  # base14 names are already unambiguous
+    font_paths = {}
+    all_font_files = []
+    seen = set()
 
     for base, family in FAMILIES.items():
+        paths = {}
         reg = fc_find(family, "Regular")
+        paths['regular'] = reg
 
-        # Bold and Italic may not exist for every family.  When missing,
-        # apply CSS font-weight matching: try heavier weights first (800, 900),
-        # then lighter (600, 500).  Only fall back to Regular if nothing works.
-        # See CSS Fonts Module Level 4 §4.7.2 — weight matching for bold.
         try:
             bold = fc_find(family, "Bold")
         except RuntimeError:
@@ -295,59 +178,205 @@ def register_all_fonts():
             if bold is None:
                 print(f"  NOTE: {family} has no Bold or nearby weight — using Regular")
                 bold = reg
+        paths['bold'] = bold
+
         try:
             italic = fc_find(family, "Italic")
         except RuntimeError:
             print(f"  NOTE: {family} has no Italic — using Regular")
             italic = reg
+        paths['italic'] = italic
 
-        # Always make weight explicit in PostScript names.
-        # E.g. "Lato-Italic" (w400) → "Lato-400Italic"
-        # The Rust font catalog does the same transformation so both sides agree.
-        orig_reg, ps_reg, reg = make_weight_explicit(reg)
-        orig_bold, ps_bold, bold = make_weight_explicit(bold)
-        orig_italic, ps_italic, italic = make_weight_explicit(italic)
+        font_paths[base] = paths
+        for p in [reg, bold, italic]:
+            if p not in seen:
+                seen.add(p)
+                all_font_files.append(p)
 
-        # Track raw → canonical mapping for PDF annotation.
-        if orig_reg and ps_reg:
-            canonical_map[orig_reg] = ps_reg
-        if orig_bold and ps_bold:
-            canonical_map[orig_bold] = ps_bold
-        if orig_italic and ps_italic:
-            canonical_map[orig_italic] = ps_italic
-
-        ok = register_font(ps_reg, reg)
-        if ok:
-            registered[base] = True
-            alias_map[base] = ps_reg
-        ok_b = register_font(ps_bold, bold)
-        ok_i = register_font(ps_italic, italic)
-        if not ok_b and ps_reg:
-            register_font(ps_reg + "-Bold-fallback", reg)
-            alias_map[f"{base}-Bold"] = ps_reg + "-Bold-fallback"
-        else:
-            alias_map[f"{base}-Bold"] = ps_bold
-        if not ok_i and ps_reg:
-            register_font(ps_reg + "-Italic-fallback", reg)
-            alias_map[f"{base}-Italic"] = ps_reg + "-Italic-fallback"
-        else:
-            alias_map[f"{base}-Italic"] = ps_italic
-
-        # ReportLab font family mapping for <b> and <i> tags in Paragraphs
-        if ps_reg:
-            addMapping(ps_reg, 0, 0, ps_reg)
-            addMapping(ps_reg, 1, 0, alias_map.get(f"{base}-Bold", ps_reg))
-            addMapping(ps_reg, 0, 1, alias_map.get(f"{base}-Italic", ps_reg))
-            addMapping(ps_reg, 1, 1, alias_map.get(f"{base}-Bold", ps_reg))
-
-    return registered, alias_map, canonical_map
+    return font_paths, all_font_files
 
 
+def build_canonical_map(pdf_path, all_font_files):
+    """Build canonical_map by extracting PS names from embedded font data in the PDF.
+
+    WeasyPrint/Pango uses its own naming for PDF BaseFont entries that differs
+    from the fonts' PostScript names.  Rather than trying to predict those names,
+    we read the embedded font data (TrueType streams) from the PDF, extract the
+    real PostScript name (nameID 6) from each, and map through make_weight_explicit.
+
+    For variable fonts, Pango subsets the font at the requested weight but keeps
+    the same PS name (nameID 6).  We read the OS/2 usWeightClass from the embedded
+    subset — which reflects the actual rendered weight — and use that to construct
+    the correct canonical name via `unprint --weight-explicit`.
+
+    Returns canonical_map: raw BaseFont (subset-stripped) → canonical PS name.
+    """
+    import pikepdf, io, subprocess, os
+    from fontTools.ttLib import TTFont as FTFont
+
+    # Pre-compute canonical names from all font files for PS name → canonical lookup
+    ps_to_canonical = {}
+    # Also store original OS/2 weight per PS name for mismatch detection
+    ps_to_orig_weight = {}
+    for path in all_font_files:
+        orig_ps, canonical_ps, _ = make_weight_explicit(path)
+        if orig_ps and canonical_ps:
+            ps_to_canonical[orig_ps] = canonical_ps
+            try:
+                tt = FTFont(path)
+                ps_to_orig_weight[orig_ps] = tt['OS/2'].usWeightClass
+                tt.close()
+            except Exception:
+                pass
+
+    # Locate unprint binary for --weight-explicit calls
+    script_dir = os.path.dirname(os.path.abspath(__file__))
+    repo_root = os.path.dirname(script_dir)
+    unprint_bin = None
+    for bin_path in [
+        os.path.join(repo_root, "target", "release", "unprint"),
+        os.path.join(repo_root, "target", "release", "unscan"),
+        os.path.join(repo_root, "target", "debug", "unprint"),
+        os.path.join(repo_root, "target", "debug", "unscan"),
+    ]:
+        if os.path.exists(bin_path):
+            unprint_bin = bin_path
+            break
+    if unprint_bin is None:
+        unprint_bin = "unprint"
+
+    canonical_map = {}
+    pdf = pikepdf.open(pdf_path)
+
+    for page in pdf.pages:
+        resources = page.get("/Resources")
+        if resources is None:
+            continue
+        fonts = resources.get("/Font")
+        if fonts is None:
+            continue
+
+        for res_name in list(fonts.keys()):
+            font_dict = fonts[res_name]
+            base_font = font_dict.get("/BaseFont")
+            if base_font is None:
+                continue
+
+            bf_str = str(base_font).lstrip("/")
+            # Strip subset prefix (e.g. "ABCDEF+FontName" → "FontName")
+            if len(bf_str) > 7 and bf_str[6] == '+':
+                raw_bf = bf_str[7:]
+            else:
+                raw_bf = bf_str
+
+            if raw_bf in canonical_map:
+                continue
+
+            # Extract the embedded font stream and read its real PS name + weight
+            embedded_ps, embedded_weight = _extract_embedded_ps_and_weight(font_dict)
+            if not embedded_ps:
+                continue
+
+            # Check if the embedded weight differs from the original font file's
+            # default weight (variable font weight mismatch).
+            orig_weight = ps_to_orig_weight.get(embedded_ps)
+            if embedded_weight is not None and orig_weight is not None and embedded_weight != orig_weight:
+                # Variable font: the PS name is weight-agnostic.  Use the
+                # embedded OS/2 weight to get the correct canonical name.
+                r = subprocess.run(
+                    [unprint_bin, "--weight-explicit", f"{embedded_ps}:{embedded_weight}"],
+                    capture_output=True, text=True
+                )
+                if r.returncode == 0 and r.stdout.strip():
+                    canonical_map[raw_bf] = r.stdout.strip()
+                else:
+                    canonical_map[raw_bf] = embedded_ps
+            elif embedded_ps in ps_to_canonical:
+                canonical_map[raw_bf] = ps_to_canonical[embedded_ps]
+            else:
+                # PS name not in our pre-computed map (e.g. fonts WeasyPrint
+                # pulled via fontconfig that aren't in all_font_files).
+                # Run the same make_weight_explicit normalization the font DB
+                # scanner uses, so the canonical name matches the DB key.
+                if embedded_weight is not None:
+                    r = subprocess.run(
+                        [unprint_bin, "--weight-explicit", f"{embedded_ps}:{embedded_weight}"],
+                        capture_output=True, text=True
+                    )
+                    if r.returncode == 0 and r.stdout.strip():
+                        canonical_map[raw_bf] = r.stdout.strip()
+                    else:
+                        canonical_map[raw_bf] = embedded_ps
+                else:
+                    canonical_map[raw_bf] = embedded_ps
+
+    pdf.close()
+    return canonical_map
 
 
-# ---------------------------------------------------------------------------
-# Section data
-# ---------------------------------------------------------------------------
+def _extract_embedded_ps_and_weight(font_dict):
+    """Extract PS name and OS/2 weight from a PDF font dict's embedded font data.
+
+    Returns (ps_name, os2_weight) or (None, None).
+    Variable fonts embedded by WeasyPrint/Pango keep the same PS name (nameID 6)
+    regardless of the rendered weight, but the OS/2 usWeightClass reflects the
+    actual instantiated weight.
+    """
+    # Direct font (non-CID)
+    font_desc = font_dict.get("/FontDescriptor")
+    if font_desc is not None:
+        ps, w = _read_ps_and_weight_from_descriptor(font_desc)
+        if ps:
+            return ps, w
+
+    # CIDFont: check DescendantFonts
+    descendants = font_dict.get("/DescendantFonts")
+    if descendants is not None:
+        for desc in descendants:
+            font_desc = desc.get("/FontDescriptor")
+            if font_desc is not None:
+                ps, w = _read_ps_and_weight_from_descriptor(font_desc)
+                if ps:
+                    return ps, w
+
+    return None, None
+
+
+def _read_ps_and_weight_from_descriptor(font_desc):
+    """Read PS name and OS/2 weight from a font descriptor's embedded font stream."""
+    import io
+    from fontTools.ttLib import TTFont as FTFont
+
+    for key in ("/FontFile2", "/FontFile3", "/FontFile"):
+        stream = font_desc.get(key)
+        if stream is None:
+            continue
+        try:
+            data = bytes(stream.read_bytes())
+            tt = FTFont(io.BytesIO(data))
+            ps_name = ""
+            for rec in tt["name"].names:
+                if rec.nameID == 6:
+                    try:
+                        ps_name = rec.toUnicode()
+                        break
+                    except Exception:
+                        pass
+            os2_weight = None
+            try:
+                os2_weight = tt["OS/2"].usWeightClass
+            except Exception:
+                pass
+            tt.close()
+            if ps_name:
+                return ps_name, os2_weight
+        except Exception:
+            continue
+    return None, None
+
+
+
+
 SECTIONS = [
     {
         "era": "c. 1530 — The Garamond",
@@ -788,312 +817,247 @@ SECTIONS = [
 
 
 # ---------------------------------------------------------------------------
-# SVG logo flowable
+# HTML + CSS generation
 # ---------------------------------------------------------------------------
-class SVGLogo(Flowable):
-    """Place an SVG as a vector drawing in the PDF."""
-    def __init__(self, svg_path, max_width, max_height=50):
-        Flowable.__init__(self)
-        self.svg_path = svg_path
-        self.max_width = max_width
-        self.max_height = max_height
-        self._drawing = None
-        self._load()
 
-    def _load(self):
-        try:
-            from svglib.svglib import svg2rlg
-            drawing = svg2rlg(self.svg_path)
-            if drawing is None:
-                return
-            # Scale to fit: scale up small SVGs to max_height, scale down large ones
-            sx = self.max_width / drawing.width
-            sy = self.max_height / drawing.height
-            scale = min(sx, sy)
-            drawing.width *= scale
-            drawing.height *= scale
-            drawing.scale(scale, scale)
-            self._drawing = drawing
-            self.width = drawing.width
-            self.height = drawing.height
-        except Exception as e:
-            print(f"  WARN: SVG load failed for {self.svg_path}: {e}")
-
-    def wrap(self, availWidth, availHeight):
-        if self._drawing:
-            return self._drawing.width, self._drawing.height
-        return 0, 0
-
-    def draw(self):
-        if self._drawing:
-            self._drawing.drawOn(self.canv, 0, 0)
+def _font_face_css(font_paths):
+    """Generate @font-face CSS rules from resolved font paths."""
+    rules = []
+    for base, paths in font_paths.items():
+        for variant, path in paths.items():
+            weight = '700' if variant == 'bold' else '400'
+            style = 'italic' if variant == 'italic' else 'normal'
+            rules.append(
+                f"@font-face {{\n"
+                f"  font-family: '{base}';\n"
+                f"  src: url('file://{path}') format('truetype');\n"
+                f"  font-weight: {weight};\n"
+                f"  font-style: {style};\n"
+                f"}}"
+            )
+    return "\n".join(rules)
 
 
-class StackedFlowables(Flowable):
-    """Stack multiple flowables vertically into a single flowable.
-    Used to combine headshot + logo into one image block for ImageAndFlowables."""
-    def __init__(self, flowables, gap=3):
-        Flowable.__init__(self)
-        self._flowables = [f for f in flowables if f is not None]
-        self._gap = gap
-        self.drawWidth = 0
-        self.drawHeight = 0
-
-    def _restrictSize(self, aW, aH):
-        """Mimic Image._restrictSize so ImageAndFlowables can use us."""
-        if self.drawWidth > aW + 1e-6 or self.drawHeight > aH + 1e-6:
-            self._oldDrawSize = self.drawWidth, self.drawHeight
-            factor = min(float(aW) / max(self.drawWidth, 1e-6),
-                         float(aH) / max(self.drawHeight, 1e-6))
-            self.drawWidth *= factor
-            self.drawHeight *= factor
-        return self.drawWidth, self.drawHeight
-
-    def _unRestrictSize(self):
-        dwh = getattr(self, '_oldDrawSize', None)
-        if dwh:
-            self.drawWidth, self.drawHeight = dwh
-
-    def wrap(self, availWidth, availHeight):
-        self.drawWidth = 0
-        self.drawHeight = 0
-        for i, f in enumerate(self._flowables):
-            w, h = f.wrap(availWidth, availHeight)
-            self.drawWidth = max(self.drawWidth, w)
-            self.drawHeight += h
-            if i > 0:
-                self.drawHeight += self._gap
-        self.width = self.drawWidth
-        self.height = self.drawHeight
-        return self.drawWidth, self.drawHeight
-
-    def draw(self):
-        y = self.drawHeight
-        for i, f in enumerate(self._flowables):
-            w, h = f.wrap(self.drawWidth, self.drawHeight)
-            y -= h
-            f.drawOn(self.canv, 0, y)
-            if i < len(self._flowables) - 1:
-                y -= self._gap
-
-
-# ---------------------------------------------------------------------------
-# Build the specimen PDF
-# ---------------------------------------------------------------------------
-def build_specimen(out_pdf, registered, alias_map):
-    """Build a proper vector PDF with embedded fonts and SVG logos."""
-
-    def ps(name):
-        """Resolve a friendly font name to its registered PostScript name."""
-        return alias_map.get(name, name)
-
-    # Two-column layout
-    margin_side = 0.6 * inch
-    margin_top = 0.5 * inch
-    margin_bottom = 0.5 * inch
-    gutter = 0.3 * inch
-    col_w = (PAGE_W - 2 * margin_side - gutter) / 2
-
-    frame_left = Frame(
-        margin_side, margin_bottom,
-        col_w, PAGE_H - margin_top - margin_bottom,
-        id='left', leftPadding=0, rightPadding=0, topPadding=0, bottomPadding=0
-    )
-    frame_right = Frame(
-        margin_side + col_w + gutter, margin_bottom,
-        col_w, PAGE_H - margin_top - margin_bottom,
-        id='right', leftPadding=0, rightPadding=0, topPadding=0, bottomPadding=0
+def _img_tag(rel_path, css_class, max_w_pt=40, max_h_pt=55):
+    """Generate an <img> tag for a logo or headshot, if the file exists."""
+    full_path = SCRIPT_DIR / rel_path
+    if not full_path.exists():
+        return ""
+    return (
+        f'<img src="{rel_path}" class="{css_class}" '
+        f'style="max-width: {max_w_pt}pt; max-height: {max_h_pt}pt;">'
     )
 
-    doc = BaseDocTemplate(
-        str(out_pdf),
-        pagesize=letter,
-        leftMargin=margin_side,
-        rightMargin=margin_side,
-        topMargin=margin_top,
-        bottomMargin=margin_bottom,
-    )
-    doc.addPageTemplates([
-        PageTemplate(id='TwoCol', frames=[frame_left, frame_right]),
-    ])
 
-    story = []
+def _escape(text):
+    """Escape HTML special characters."""
+    return text.replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;").replace('"', "&quot;")
 
-    # --- Title block ---
-    title_style = ParagraphStyle(
-        'Title', fontName=ps('PlayfairDisplay'), fontSize=22, leading=26,
-        spaceAfter=4
-    )
-    subtitle_style = ParagraphStyle(
-        'Subtitle', fontName=ps('SourceSerif4-Italic'),
-        fontSize=10, leading=13, spaceAfter=2, textColor='#444444'
-    )
-    intro_style = ParagraphStyle(
-        'Intro', fontName=ps('SourceSerif4'), fontSize=9, leading=12, spaceAfter=10
-    )
 
-    story.append(Paragraph("A Timeline of Typography", title_style))
-    story.append(Paragraph(
-        "<i>Five Centuries of Letterforms — A Font Specimen for OCR Audit</i>",
-        subtitle_style
-    ))
-    story.append(Paragraph(
-        "Each section is rendered in a known font. Every blurb is set in the font it describes. "
-        "SVG logos mark companies that made or popularized each typeface.",
-        intro_style
-    ))
-    story.append(Spacer(1, 8))
+def generate_html(font_paths):
+    """Generate the full HTML document for the specimen."""
 
-    # --- Sections ---
-    # Image column width for headshot/logo sidebar
-    IMG_COL_W = 52  # points — fits ~40pt image + padding
+    font_face_css = _font_face_css(font_paths)
 
+    # SourceSerif4 for source lines — resolve its italic path
+    ss4_it = font_paths.get("SourceSerif4", {}).get("italic", "")
+    # PlayfairDisplay for title
+    pd_reg = font_paths.get("PlayfairDisplay", {}).get("regular", "")
+
+    sections_html = []
     for section in SECTIONS:
         rl = section["rl_font"]
-        if rl not in registered:
+        if rl not in font_paths:
             raise RuntimeError(
-                f"Font '{rl}' (family '{section['font_family']}') not registered — "
+                f"Font '{rl}' (family '{section['font_family']}') not resolved — "
                 f"run scripts/install-all-fonts.sh to install missing fonts"
             )
-        text_items = []  # left column: all text flowables
-        img_items = []   # right column: headshot + logo stacked
 
-        # --- Build right-column image stack ---
+        align = "justify" if section.get("alignment") == "justify" else "left"
 
-        # Headshot/portrait (aspect-ratio-preserving)
+        # Build image sidebar
+        imgs = []
         headshot_rel = section.get("headshot")
         if headshot_rel:
-            hs_path = SCRIPT_DIR / headshot_rel
-            if hs_path.exists():
-                try:
-                    pil_img = PILImage.open(hs_path)
-                    iw, ih = pil_img.size
-                    target_w = 40  # points
-                    max_h = 55     # points — cap very tall portraits
-                    aspect = ih / iw
-                    target_h = min(target_w * aspect, max_h)
-                    # If capped by max_h, shrink width to preserve ratio
-                    if target_w * aspect > max_h:
-                        target_w = max_h / aspect
-                    img_items.append(RLImage(str(hs_path), width=target_w, height=target_h))
-                    img_items.append(Spacer(1, 3))
-                except Exception as e:
-                    print(f"  WARN: headshot load failed for {hs_path}: {e}")
+            tag = _img_tag(headshot_rel, "headshot")
+            if tag:
+                imgs.append(tag)
+        logo_rel = section.get("logo_svg")
+        if logo_rel:
+            tag = _img_tag(logo_rel, "logo", max_w_pt=42, max_h_pt=30)
+            if tag:
+                imgs.append(tag)
 
-        # SVG logo
-        svg_rel = section.get("logo_svg")
-        if svg_rel:
-            svg_path = SCRIPT_DIR / svg_rel
-            if svg_path.exists():
-                logo = SVGLogo(str(svg_path), max_width=42, max_height=30)
-                if logo._drawing:
-                    img_items.append(logo)
-                    img_items.append(Spacer(1, 3))
+        img_html = ""
+        if imgs:
+            img_html = '<div class="sidebar">' + "".join(imgs) + "</div>"
 
-        has_images = len(img_items) > 0
+        blurb = _escape(section["blurb"])
 
-        # --- Build left-column text flowables ---
+        sections_html.append(f"""
+<div class="section">
+  {img_html}
+  <h2 style="font-family: '{rl}'; font-weight: bold;">{_escape(section["era"])}</h2>
+  <p class="source">Font: {_escape(section["source"])}</p>
+  <p class="blurb" style="font-family: '{rl}'; text-align: {align};">{blurb}</p>
+  <p class="sample" style="font-family: '{rl}'; font-weight: bold; text-align: {align};">Bold: The quick brown fox jumps over 1,234,567,890 lazy dogs.</p>
+  <p class="sample" style="font-family: '{rl}'; font-style: italic; text-align: {align};">Italic: The quick brown fox jumps over 1,234,567,890 lazy dogs.</p>
+  <p class="alpha" style="font-family: '{rl}';">ABCDEFGHIJKLMNOPQRSTUVWXYZ  abcdefghijklmnopqrstuvwxyz</p>
+  <p class="alpha" style="font-family: '{rl}';">Lining figures: 0 1 2 3 4 5 6 7 8 9</p>
+</div>""")
 
-        # Heading in the section's own font, bold
-        hdr_style = ParagraphStyle(
-            f'Hdr-{rl}', fontName=ps(f'{rl}-Bold'), fontSize=14, leading=17,
-            spaceBefore=6, spaceAfter=2
-        )
-        text_items.append(Paragraph(section["era"], hdr_style))
+    all_sections = "\n".join(sections_html)
 
-        # Source line
-        src_style = ParagraphStyle(
-            f'Src-{rl}', fontName=ps('SourceSerif4-Italic'),
-            fontSize=7, leading=9, textColor='#777777', spaceAfter=3
-        )
-        text_items.append(Paragraph(f"Font: {section['source']}", src_style))
+    return f"""<!DOCTYPE html>
+<html>
+<head>
+<meta charset="utf-8">
+<style>
+{font_face_css}
 
-        # Body blurb in the section's font
-        text_align = TA_JUSTIFY if section.get("alignment") == "justify" else TA_LEFT
-        body_style = ParagraphStyle(
-            f'Body-{rl}', fontName=ps(rl), fontSize=10, leading=13, spaceAfter=2,
-            alignment=text_align
-        )
-        text_items.append(Paragraph(section["blurb"], body_style))
+@page {{
+  size: 8.5in 11in;
+  margin: 0.5in 0.6in;
+}}
 
-        # Bold sample
-        bold_style = ParagraphStyle(
-            f'Bold-{rl}', fontName=ps(f'{rl}-Bold'), fontSize=10, leading=13, spaceAfter=1,
-            alignment=text_align
-        )
-        text_items.append(Paragraph(
-            "Bold: The quick brown fox jumps over 1,234,567,890 lazy dogs.",
-            bold_style
-        ))
+body {{
+  columns: 2;
+  column-gap: 0.3in;
+  font-size: 10pt;
+  line-height: 1.3;
+  orphans: 3;
+  widows: 3;
+}}
 
-        # Italic sample
-        italic_style = ParagraphStyle(
-            f'Italic-{rl}', fontName=ps(f'{rl}-Italic'), fontSize=10, leading=13, spaceAfter=1,
-            alignment=text_align
-        )
-        text_items.append(Paragraph(
-            "Italic: The quick brown fox jumps over 1,234,567,890 lazy dogs.",
-            italic_style
-        ))
+.title-block {{
+  column-span: all;
+  margin-bottom: 8pt;
+}}
 
-        # Alphabet + digits
-        alpha_style = ParagraphStyle(
-            f'Alpha-{rl}', fontName=ps(rl), fontSize=9, leading=11, spaceAfter=1
-        )
-        text_items.append(Paragraph(
-            "ABCDEFGHIJKLMNOPQRSTUVWXYZ  abcdefghijklmnopqrstuvwxyz",
-            alpha_style
-        ))
-        text_items.append(Paragraph("Lining figures: 0 1 2 3 4 5 6 7 8 9", alpha_style))
+.title-block h1 {{
+  font-family: 'PlayfairDisplay';
+  font-size: 22pt;
+  line-height: 1.18;
+  margin: 0 0 4pt 0;
+}}
 
-        # --- Compose layout: ImageAndFlowables (text wraps around images) ---
-        if has_images:
-            # Stack headshot + logo into one composite image flowable
-            # Filter out Spacer items from img_items — only keep actual images
-            real_images = [f for f in img_items if not isinstance(f, Spacer)]
-            if len(real_images) >= 1:
-                side_img = StackedFlowables(real_images, gap=3)
+.title-block .subtitle {{
+  font-family: 'SourceSerif4';
+  font-style: italic;
+  font-size: 10pt;
+  line-height: 1.3;
+  color: #444444;
+  margin: 0 0 2pt 0;
+}}
 
-            iaf = ImageAndFlowables(
-                side_img, text_items,
-                imageLeftPadding=4, imageRightPadding=0,
-                imageTopPadding=0, imageBottomPadding=3,
-                imageSide='right',
-            )
-            section_items = [iaf, Spacer(1, 8)]
-        else:
-            # No images — full-width text
-            text_items.append(Spacer(1, 8))
-            section_items = text_items
+.title-block .intro {{
+  font-family: 'SourceSerif4';
+  font-size: 9pt;
+  line-height: 1.33;
+  margin: 0 0 10pt 0;
+}}
 
-        # Try to keep section together
-        story.append(KeepTogether(section_items))
+.section {{
+  break-inside: avoid;
+  margin-bottom: 8pt;
+}}
 
-    doc.build(story)
+.section h2 {{
+  font-size: 14pt;
+  line-height: 1.21;
+  margin: 6pt 0 2pt 0;
+}}
+
+.section .source {{
+  font-family: 'SourceSerif4';
+  font-style: italic;
+  font-size: 7pt;
+  line-height: 1.29;
+  color: #777777;
+  margin: 0 0 3pt 0;
+}}
+
+.section .blurb {{
+  font-size: 10pt;
+  line-height: 1.3;
+  margin: 0 0 2pt 0;
+}}
+
+.section .sample {{
+  font-size: 10pt;
+  line-height: 1.3;
+  margin: 0 0 1pt 0;
+}}
+
+.section .alpha {{
+  font-size: 9pt;
+  line-height: 1.22;
+  margin: 0 0 1pt 0;
+}}
+
+.sidebar {{
+  float: right;
+  margin: 0 0 3pt 4pt;
+  text-align: center;
+}}
+
+.sidebar .headshot {{
+  display: block;
+  margin-bottom: 3pt;
+}}
+
+.sidebar .logo {{
+  display: block;
+}}
+</style>
+</head>
+<body>
+
+<div class="title-block">
+  <h1>A Timeline of Typography</h1>
+  <p class="subtitle"><i>Five Centuries of Letterforms — A Font Specimen for OCR Audit</i></p>
+  <p class="intro">Each section is rendered in a known font. Every blurb is set in the font
+  it describes. SVG logos mark companies that made or popularized each typeface.</p>
+</div>
+
+{all_sections}
+
+</body>
+</html>"""
+
+
+# ---------------------------------------------------------------------------
+# PDF rendering + post-processing
+# ---------------------------------------------------------------------------
+
+def build_specimen(out_pdf, font_paths):
+    """Render the specimen HTML to PDF with WeasyPrint."""
+    import weasyprint
+    html = generate_html(font_paths)
+    doc = weasyprint.HTML(string=html, base_url=str(SCRIPT_DIR))
+    doc.write_pdf(str(out_pdf))
     return out_pdf
 
 
-# annotate_canonical_names is imported from tools/pdf_font_annotate.py above.
-
-
-# ---------------------------------------------------------------------------
-# Rasterization + fontmap — all logic lives in tools/rasterize.py.
-# gen-specimen.py only builds the vector PDF; rasterize.py does the rest.
-# ---------------------------------------------------------------------------
-# tools/ already on sys.path from pdf_font_annotate import above.
+# Rasterization — all logic lives in tools/rasterize.py.
 from importlib import import_module as _imp
 _rasterize_mod = _imp("rasterize")
 
 
 def main():
-    print("Registering fonts...")
-    registered, alias_map, canonical_map = register_all_fonts()
-    print(f"  {len(registered)} font families registered")
-    print(f"  {len(canonical_map)} raw→canonical mappings")
+    print("Resolving fonts...")
+    font_paths, all_font_files = resolve_all_fonts()
+    print(f"  {len(font_paths)} font families resolved")
+    print(f"  {len(all_font_files)} unique font files")
 
     out_pdf = OUT_DIR / "font-timeline-specimen.pdf"
     print(f"Building vector specimen: {out_pdf}")
-    build_specimen(out_pdf, registered, alias_map)
+    build_specimen(out_pdf, font_paths)
+
+    # Build canonical map from actual PDF BaseFont names
+    print("Building canonical map from PDF font names...")
+    canonical_map = build_canonical_map(str(out_pdf), all_font_files)
+    print(f"  {len(canonical_map)} mappings built")
 
     # Annotate font dictionaries with /UnprintCanonical
     print("Annotating PDF with canonical font names...")
@@ -1105,10 +1069,10 @@ def main():
             print(f"    {m}")
 
     # Rasterize
-    scanned_pdf = OUT_DIR / "font-timeline-specimen-scanned.pdf"
-    print("Creating scanned version...")
-    _rasterize_mod.rasterize(out_pdf, scanned_pdf)
-    print(f"  → {scanned_pdf}")
+    rasterized_pdf = OUT_DIR / "font-timeline-specimen-rasterized.pdf"
+    print("Creating rasterized version...")
+    _rasterize_mod.rasterize(out_pdf, rasterized_pdf)
+    print(f"  → {rasterized_pdf}")
 
     print("Done!")
 
