@@ -12,11 +12,11 @@ use common::run_unscan;
 use std::path::PathBuf;
 use std::process::Command;
 
-/// Expected seam splits for each test line (verified correct Jul 12 2026).
+/// Expected seam splits for each test line (updated Jul 16 2026 for HarfBuzz kerning).
 const EXPECTED: &[(&str, &[u32])] = &[
-    ("ABCDEFGHIJKLMNOPQRSTUVWXYZ.", &[25, 188, 232, 274, 331, 522, 548, 574, 612, 632, 650]),
-    ("abcdefghijklmnopqrstuvwxyz.", &[19, 114, 165, 194, 399, 418, 438, 455]),
-    ("ABCDEFGHIJKLMNOPQRSTUVWXYZ.", &[25, 267, 291, 506, 537, 562, 588, 613, 635]),
+    ("ABCDEFGHIJKLMNOPQRSTUVWXYZ.", &[25, 187, 216, 230, 276, 332, 471, 518, 545, 570, 604, 633, 656]),
+    ("abcdefghijklmnopqrstuvwxyz.", &[17, 112, 166, 199, 208, 395, 413, 440, 460]),
+    ("ABCDEFGHIJKLMNOPQRSTUVWXYZ.", &[26, 268, 292, 504, 531, 557, 592, 618, 642]),
 ];
 
 #[test]

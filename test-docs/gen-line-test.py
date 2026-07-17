@@ -18,11 +18,11 @@ import os
 import sys
 from pathlib import Path
 
+import uharfbuzz as hb
 from reportlab.lib.pagesizes import letter
 from reportlab.pdfbase import pdfmetrics
 from reportlab.pdfbase.ttfonts import TTFont
-from reportlab.platypus import SimpleDocTemplate, Paragraph
-from reportlab.lib.styles import ParagraphStyle
+from reportlab.pdfgen import canvas as rl_canvas
 
 
 def _draw_edge_rules(canvas, doc):
@@ -73,6 +73,33 @@ def resolve_font(expected_font):
     return ttf_path, canonical_name
 
 
+def shape_text(ttf_path, text, font_size):
+    """Shape text with HarfBuzz, returning per-character x positions in points.
+    Kerning is applied; ligatures are disabled to match specimen rendering."""
+    blob = hb.Blob.from_file_path(ttf_path)
+    face = hb.Face(blob)
+    font = hb.Font(face)
+    upem = face.upem
+    font.scale = (upem, upem)
+
+    buf = hb.Buffer()
+    buf.add_str(text)
+    buf.guess_segment_properties()
+    hb.shape(font, buf, {"kern": True, "liga": False, "clig": False})
+
+    scale = font_size / upem
+    positions = buf.glyph_positions
+    infos = buf.glyph_infos
+
+    result = []  # (cluster_index, x_pt)
+    x = 0.0
+    for info, pos in zip(infos, positions):
+        result.append((info.cluster, x * scale))
+        x += pos.x_advance
+
+    return result, x * scale
+
+
 def main():
     # Parse args: page line1 [line2 ...] [--audit-ref PATH]
     args = sys.argv[1:]
@@ -98,7 +125,7 @@ def main():
 
     # Collect entries and fonts for each line
     canonical_map = {}
-    story = []
+    lines = []  # (text, canonical_name, ttf_path)
     for (page, li) in page_lines:
         entries = [e for e in audit['text_entries']
                    if e.get('page') == page and e.get('line_index') == li]
@@ -109,6 +136,8 @@ def main():
         entry = entries[0]
         expected_font = entry.get('expected_font', '')
         text = entry.get('gt_text', entry.get('text', entry.get('ocr_text', '')))
+        if not text.endswith('.'):
+            text += '.'
         print(f"p{page}:L{li}: text='{text}', expected={expected_font}")
 
         ttf_path, canonical_name = resolve_font(expected_font)
@@ -125,17 +154,35 @@ def main():
         canonical_map[ps_name] = canonical_name
         canonical_map[canonical_name] = canonical_name
 
-        style_obj = ParagraphStyle(
-            f'Line-{li}', fontName=canonical_name,
-            fontSize=9, leading=10.8)
-        story.append(Paragraph(text, style_obj))
+        lines.append((text, canonical_name, str(ttf_path)))
 
-    # Build vector PDF
+    # Build vector PDF with HarfBuzz-kerned text
     gt_pdf = str(SCRIPT_DIR / "line-test-gt.pdf")
-    doc = SimpleDocTemplate(gt_pdf, pagesize=letter,
-                            leftMargin=72, rightMargin=72,
-                            topMargin=72, bottomMargin=72)
-    doc.build(story, onFirstPage=_draw_edge_rules, onLaterPages=_draw_edge_rules)
+    w, h = letter
+    font_size = 9
+    leading = 10.8
+    left_margin = 72
+
+    c = rl_canvas.Canvas(gt_pdf, pagesize=letter)
+
+    # Edge rules (same as before — gives detect_skew horizontal signal)
+    c.setStrokeColor((0.3, 0.3, 0.3))
+    c.setLineWidth(1.0)
+    c.line(18, h - 18, w - 18, h - 18)
+    c.line(18, 18, w - 18, 18)
+
+    # Draw each line with HarfBuzz kerning
+    y = h - 72 - font_size  # first baseline: top margin + descend one line
+    for text, canonical_name, ttf_path in lines:
+        c.setFont(canonical_name, font_size)
+        char_positions, total_w = shape_text(ttf_path, text, font_size)
+
+        for cluster_idx, x_pt in char_positions:
+            c.drawString(left_margin + x_pt, y, text[cluster_idx])
+
+        y -= leading
+
+    c.save()
     print(f"wrote: {gt_pdf}")
 
     # Annotate /UnprintCanonical
