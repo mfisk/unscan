@@ -464,8 +464,6 @@ fn segment_characters_inner(
         let mut next_seg_id: u32 = 0;
 
         // Build initial segments from VP splits and seed the heap.
-        // Use ink_extent to trim whitespace so seam carving searches
-        // inside the ink region, not in adjacent whitespace.
         let mut initial_segs: Vec<(u32, u32)> = Vec::new();
         {
             let mut prev = 0u32;
@@ -480,14 +478,13 @@ fn segment_characters_inner(
             }
         }
         for &(seg_start, seg_end) in &initial_segs {
-            let (ink_l, ink_r) = ink_extent(&col_has_ink_strict, seg_start, seg_end);
-            if ink_r > ink_l + 2 {
+            if seg_end > seg_start + 2 {
                 let sid = next_seg_id; next_seg_id += 1;
-                let (cands, dp) = candidate_seams(&energy, ink_l, ink_r, h, None, None, max_ink, &row_ink);
+                let (cands, dp) = candidate_seams(&energy, seg_start, seg_end, h, None, None, max_ink, &row_ink);
                 for (col, cost) in &cands {
-                    heap.push(SeamEntry { cost: *cost + segment_penalty(ink_l, ink_r, *col, *cost), col: *col, seg_start: ink_l, seg_end: ink_r, seg_id: sid });
+                    heap.push(SeamEntry { cost: *cost + segment_penalty(seg_start, seg_end, *col, *cost), col: *col, seg_start, seg_end, seg_id: sid });
                 }
-                trace_candidate_costs(&cands, &dp, ink_l, ink_r, &energy, &row_ink,
+                trace_candidate_costs(&cands, &dp, seg_start, seg_end, &energy, &row_ink,
                     &segment_penalty, &ink_discount_for_path, seam_params().horizontal_cost, &mut candidate_paths);
                 seg_bounds.insert(sid, SegBounds { left_path: None, right_path: None });
                 dp_cache.insert(sid, dp);
@@ -645,22 +642,25 @@ fn segment_characters_inner(
             dp_cache.remove(&old_sid);
             seg_bounds.remove(&old_sid);
 
-            // Recompute child ink extents.
-            let child_left_ink = ink_extent(&col_has_ink_strict, entry.seg_start, final_col);
-            let child_right_ink = ink_extent(&col_has_ink_strict, final_col + 1, entry.seg_end);
+            // Recompute child segments.  Use raw boundaries for segment
+            // identity and penalty; only narrow the DP search range when a
+            // child side has no ink at all.
+            let child_left_start = entry.seg_start;
+            let child_left_end = final_col;
+            let child_right_start = final_col + 1;
+            let child_right_end = entry.seg_end;
 
             // Left child: inherits parent's left boundary, seam path as right boundary.
             {
-                let (ink_l, ink_r) = child_left_ink;
-                if ink_r > ink_l + 2 {
+                if child_left_end > child_left_start + 2 {
                     let sid = next_seg_id; next_seg_id += 1;
                     let lp = parent_lp.clone();
                     let rp: Option<Vec<[u32; 2]>> = Some(path.clone());
-                    let (cands, dp) = candidate_seams(&energy, ink_l, ink_r, h, lp.as_deref(), rp.as_deref(), max_ink, &row_ink);
+                    let (cands, dp) = candidate_seams(&energy, child_left_start, child_left_end, h, lp.as_deref(), rp.as_deref(), max_ink, &row_ink);
                     for (col, cost) in &cands {
-                        heap.push(SeamEntry { cost: *cost + segment_penalty(ink_l, ink_r, *col, *cost), col: *col, seg_start: ink_l, seg_end: ink_r, seg_id: sid });
+                        heap.push(SeamEntry { cost: *cost + segment_penalty(child_left_start, child_left_end, *col, *cost), col: *col, seg_start: child_left_start, seg_end: child_left_end, seg_id: sid });
                     }
-                    trace_candidate_costs(&cands, &dp, ink_l, ink_r, &energy, &row_ink,
+                    trace_candidate_costs(&cands, &dp, child_left_start, child_left_end, &energy, &row_ink,
                         &segment_penalty, &ink_discount_for_path, seam_params().horizontal_cost, &mut candidate_paths);
                     seg_bounds.insert(sid, SegBounds { left_path: lp, right_path: rp });
                     dp_cache.insert(sid, dp);
@@ -669,16 +669,15 @@ fn segment_characters_inner(
 
             // Right child: seam path as left boundary, inherits parent's right boundary.
             {
-                let (ink_l, ink_r) = child_right_ink;
-                if ink_r > ink_l + 2 {
+                if child_right_end > child_right_start + 2 {
                     let sid = next_seg_id; next_seg_id += 1;
                     let lp: Option<Vec<[u32; 2]>> = Some(path.clone());
                     let rp = parent_rp.clone();
-                    let (cands, dp) = candidate_seams(&energy, ink_l, ink_r, h, lp.as_deref(), rp.as_deref(), max_ink, &row_ink);
+                    let (cands, dp) = candidate_seams(&energy, child_right_start, child_right_end, h, lp.as_deref(), rp.as_deref(), max_ink, &row_ink);
                     for (col, cost) in &cands {
-                        heap.push(SeamEntry { cost: *cost + segment_penalty(ink_l, ink_r, *col, *cost), col: *col, seg_start: ink_l, seg_end: ink_r, seg_id: sid });
+                        heap.push(SeamEntry { cost: *cost + segment_penalty(child_right_start, child_right_end, *col, *cost), col: *col, seg_start: child_right_start, seg_end: child_right_end, seg_id: sid });
                     }
-                    trace_candidate_costs(&cands, &dp, ink_l, ink_r, &energy, &row_ink,
+                    trace_candidate_costs(&cands, &dp, child_right_start, child_right_end, &energy, &row_ink,
                         &segment_penalty, &ink_discount_for_path, seam_params().horizontal_cost, &mut candidate_paths);
                     seg_bounds.insert(sid, SegBounds { left_path: lp, right_path: rp });
                     dp_cache.insert(sid, dp);
