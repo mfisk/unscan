@@ -80,6 +80,32 @@ fn stash_obs_stats(min_d: f32, dists: &[(u32, f32)], sigma_sq: f32, med_nn: f32,
     });
 }
 
+/// Shared softmax probability computation over pre-computed squared distances.
+/// Both ImageModel and MmapNgramModel delegate here to avoid duplication.
+fn softmax_probs(dists: &[(u32, f32)], sigma_sq: f32, med_nn: f32) -> Vec<(u32, f32)> {
+    if dists.is_empty() { return Vec::new(); }
+    let sigma = if sigma_sq > 1e-30 {
+        sigma_sq
+    } else {
+        let p = 1.0 / dists.len() as f32;
+        return dists.iter().map(|(id, _)| (*id, p)).collect();
+    };
+    let inv2s = 1.0 / (2.0 * sigma);
+    let min_d = dists.iter().map(|(_, d)| *d).fold(f32::INFINITY, f32::min);
+    let raw: Vec<f32> = dists.iter().map(|(_, d)| (-(d - min_d) * inv2s).exp()).collect();
+    let sum: f32 = raw.iter().sum();
+    let softmax: Vec<(u32, f32)> = if sum < 1e-30 {
+        let p = 1.0 / dists.len() as f32;
+        dists.iter().map(|(id, _)| (*id, p)).collect()
+    } else {
+        dists.iter().zip(raw.iter()).map(|((id, _), &r)| (*id, r / sum)).collect()
+    };
+    stash_obs_stats(min_d, dists, sigma, med_nn, &softmax);
+    let mut probs = softmax;
+    probs.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
+    probs
+}
+
 // ---------------------------------------------------------------------------
 // Binary weight-file reader
 // ---------------------------------------------------------------------------
@@ -311,31 +337,10 @@ pub struct ImageModel {
 impl ImageModel {
     /// Probability of each font given a query vector, sorted descending.
     pub fn probabilities(&self, query: &[f32]) -> Vec<(u32, f32)> {
-        if self.centroids.is_empty() { return Vec::new(); }
         let dists: Vec<(u32, f32)> = self.centroids.iter()
             .map(|(id, stored)| (*id, sq_euclid(query, stored)))
             .collect();
-        let sigma = if self.sigma_sq > 1e-30 {
-            self.sigma_sq
-        } else {
-            let p = 1.0 / dists.len() as f32;
-            return dists.into_iter().map(|(id, _)| (id, p)).collect();
-        };
-        let inv2s = 1.0 / (2.0 * sigma);
-        let min_d = dists.iter().map(|(_, d)| *d).fold(f32::INFINITY, f32::min);
-        let raw: Vec<f32> = dists.iter().map(|(_, d)| (-(d - min_d) * inv2s).exp()).collect();
-        let sum: f32 = raw.iter().sum();
-        let softmax: Vec<(u32, f32)> = if sum < 1e-30 {
-            let p = 1.0 / dists.len() as f32;
-            dists.iter().map(|(id, _)| (*id, p)).collect::<Vec<_>>()
-        } else {
-            dists.iter().zip(raw.iter()).map(|((id, _), &r)| (*id, r / sum)).collect()
-        };
-        // Stash pre-blend stats for OOD diagnostics
-        stash_obs_stats(min_d, &dists, sigma, self.med_nn, &softmax);
-        let mut probs = softmax;
-        probs.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
-        probs
+        softmax_probs(&dists, self.sigma_sq, self.med_nn)
     }
 
     /// Top-k fonts by probability.
@@ -654,28 +659,7 @@ impl MmapNgramModel {
             let v = self.f32_slice(e.vecs_off + i * e.vec_dim * 4, e.vec_dim);
             dists.push((gids[i], sq_euclid(query, v)));
         }
-        let sigma = if e.sigma_sq > 1e-30 {
-            e.sigma_sq
-        } else {
-            let p = 1.0 / dists.len() as f32;
-            return Some(dists.into_iter().map(|(id, _)| (id, p)).collect());
-        };
-        let inv2s = 1.0 / (2.0 * sigma);
-        let min_d = dists.iter().map(|(_, d)| *d).fold(f32::INFINITY, f32::min);
-        let raw: Vec<f32> = dists.iter().map(|(_, d)| (-(d - min_d) * inv2s).exp()).collect();
-        let sum: f32 = raw.iter().sum();
-        let softmax: Vec<(u32, f32)> = if sum < 1e-30 {
-            let p = 1.0 / dists.len() as f32;
-            dists.iter().map(|(id, _)| (*id, p)).collect::<Vec<_>>()
-        } else {
-            dists.iter().zip(raw.iter())
-                .map(|((id, _), &r)| (*id, r / sum)).collect()
-        };
-        // Stash pre-blend stats for OOD diagnostics
-        stash_obs_stats(min_d, &dists, sigma, e.med_nn, &softmax);
-        let mut probs = softmax;
-        probs.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
-        Some(probs)
+        Some(softmax_probs(&dists, e.sigma_sq, e.med_nn))
     }
 
     /// Top-k fonts by probability for a given char.
