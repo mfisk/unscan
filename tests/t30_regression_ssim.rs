@@ -14,7 +14,7 @@ use common::{setup, test_doc, unscan_bin};
 use std::process::Command;
 
 /// Run unprint with --audit on a single-word fixture and parse audit.json
-/// Returns (ssim_score, font_matched) from the first text entry.
+/// Returns (similarity_score, font_matched) from the first text entry.
 fn run_and_parse(input: &std::path::Path, extra_args: &[&str]) -> (Option<f64>, Option<String>) {
     let audit_dir = std::env::temp_dir().join(format!("unprint-t30-{}-{}",
         std::process::id(),
@@ -41,8 +41,8 @@ fn run_and_parse(input: &std::path::Path, extra_args: &[&str]) -> (Option<f64>, 
     }
 
     let data = std::fs::read_to_string(&json_path).unwrap();
-    // Minimal JSON parsing — extract ssim_score and font_matched from first text_entry
-    let ssim = extract_json_f64(&data, "ssim_score");
+    // Minimal JSON parsing — extract similarity_score and font_matched from first text_entry
+    let ssim = extract_json_f64(&data, "similarity_score");
     let font = extract_json_string(&data, "font_matched");
 
     let _ = std::fs::remove_dir_all(&audit_dir);

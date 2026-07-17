@@ -27,6 +27,7 @@ pub mod ground_truth;
 pub mod report;
 mod font_pipeline;
 mod zncc_classifier;
+#[allow(dead_code)]
 mod ngram;
 mod atomic_file;
 

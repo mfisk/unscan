@@ -22,6 +22,7 @@ pub mod zncc_classifier;
 pub mod glyph_map;
 pub mod char_render;
 pub mod train;
+#[allow(dead_code)] // ngram training/LDA infrastructure — kept for future use
 pub mod ngram;
 pub mod hog;
 

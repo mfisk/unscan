@@ -320,10 +320,9 @@ pub fn rasterize_pdf_poppler(src: &Path, out_path: &Path, dpi: u32, aa: bool) ->
 /// Result of a specimen accuracy measurement run.
 pub struct AccuracyResult {
     pub hits: usize,
-    pub misses: usize,
-    pub unmatched: usize,
-    pub skipped: usize,
-    pub total: usize,
+    pub minor_misses: usize,
+    pub major_misses: usize,
+    pub similarity_failures: usize,
     pub compared: usize,
     pub accuracy: f64,
     pub report_path: PathBuf,
@@ -381,16 +380,12 @@ pub fn measure_accuracy(raster: &Path, vector: &Path, label: &str) -> AccuracyRe
         ));
 
     let compared = json["compared"].as_u64().unwrap_or(0) as usize;
-    let hits = json["primary_hits"].as_u64().unwrap_or(0) as usize;
+    let hits = json["hits"].as_u64().unwrap_or(0) as usize;
+    let minor_misses = json["minor_misses"].as_u64().unwrap_or(0) as usize;
     let major_misses = json["major_misses"].as_u64().unwrap_or(0) as usize;
-    let _minor_misses = json["minor_misses"].as_u64().unwrap_or(0) as usize;
-    let ssim_failures = json["ssim_failures"].as_u64().unwrap_or(0) as usize;
+    let similarity_failures = json["similarity_failures"].as_u64().unwrap_or(0) as usize;
 
-    let misses = compared.saturating_sub(hits);
-    let unmatched = major_misses;
-    let skipped = ssim_failures;
-    let total = compared;
     let accuracy = if compared > 0 { hits as f64 / compared as f64 } else { 0.0 };
 
-    AccuracyResult { hits, misses, unmatched, skipped, total, compared, accuracy, report_path }
+    AccuracyResult { hits, minor_misses, major_misses, similarity_failures, compared, accuracy, report_path }
 }

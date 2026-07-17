@@ -724,7 +724,7 @@ pub fn run_train(mut args: TrainArgs) {
     let chunk_size = 200;
     let n_seqs = sequences.len();
 
-    let seq_to_idx: HashMap<Vec<char>, usize> = sequences.iter().enumerate()
+    let _seq_to_idx: HashMap<Vec<char>, usize> = sequences.iter().enumerate()
         .map(|(i, seq)| (seq.clone(), i))
         .collect();
 
@@ -747,7 +747,7 @@ pub fn run_train(mut args: TrainArgs) {
     // ── Pre-warm character render cache + build GlyphMap ──
     // Render every (font, char) at default params, capturing the content hash.
     // Identical renders share a hash → same glyph equivalence class.
-    let mut glyph_map = {
+    let glyph_map = {
         use std::sync::atomic::{AtomicUsize, Ordering};
         let prewarm_done = AtomicUsize::new(0);
         let prewarm_total = catalog.len();

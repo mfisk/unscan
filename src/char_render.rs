@@ -380,7 +380,7 @@ pub fn glyph_metric_ratios<F: ab_glyph::Font>(
     chars: &[char],
     overrides: Option<&[(char, u16)]>,
 ) -> std::collections::HashMap<char, (f32, f32)> {
-    use ab_glyph::{Font, PxScale, point};
+    use ab_glyph::{PxScale, point};
 
     let scale = PxScale::from(100.0); // arbitrary reference scale; ratios are scale-invariant
     let sf = font.as_scaled(scale);

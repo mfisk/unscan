@@ -19,9 +19,13 @@ struct SeamParams {
     ink_row_weight: f32,    // multiplier for row_ink factor (0.0 = ignore)
     ink_row_power: f32,     // exponent on row_ink
     delta_weight: f32,      // entry penalty weight (was 4.0)
+    #[allow(dead_code)]
     delta_power: f32,       // exponent on darkness delta
+    #[allow(dead_code)]
     delta_scale_power: f32, // exponent on cur_dark/max_ink scaling
+    #[allow(dead_code)]
     delta_row_weight: f32,  // row_ink multiplier in delta (0.0 = ignore)
+    #[allow(dead_code)]
     delta_row_power: f32,   // exponent on row_ink in delta
     horizontal_cost: f32,   // cost per diagonal move
 }
@@ -53,7 +57,7 @@ fn seam_params() -> &'static SeamParams {
 /// Per-pixel ink score: base traversal cost for the seam path.
 #[inline]
 fn ink_score(darkness: f32, row: usize, row_ink: &[f32]) -> f32 {
-    let p = seam_params();
+    let _p = seam_params();
     let base = if p.ink_power == 1.0 { darkness } else { darkness.powf(p.ink_power) }
         / p.ink_norm;
     if p.ink_row_weight == 0.0 {
@@ -70,7 +74,7 @@ fn ink_score(darkness: f32, row: usize, row_ink: &[f32]) -> f32 {
 fn delta_ink_score(
     dark_cur: f32, dark_prev: f32,
     _row_cur: usize, _row_prev: usize,
-    _row_ink: &[f32], max_ink: f32,
+    _row_ink: &[f32], _max_ink: f32,
 ) -> f32 {
     if dark_cur <= dark_prev { return 0.0; }
     if !dark_cur.is_finite() || !dark_prev.is_finite() { return f32::INFINITY; }
@@ -193,7 +197,7 @@ fn segment_characters_inner(
         (left, right)
     }
 
-    let initial_ink = ink_extent(&col_has_ink_strict, 0, w);
+    let _initial_ink = ink_extent(&col_has_ink_strict, 0, w);
 
     // --- Pass 1: whitespace splitter ---
     // Find runs of consecutive zero-ink columns within the ink extent.
@@ -907,7 +911,7 @@ fn candidate_seams(
     // Row-ink discount removed from DP: it's gated on run length (≥11px),
     // which is column-dependent. VP uses it because it's a straight vertical
     // line; DP paths wander, so the discount doesn't apply.
-    let p = seam_params();
+    let _p = seam_params();
     let n_cells = h as usize * seg_w;
     let mut cost_fwd = vec![0.0f32; n_cells];
     let mut pred_fwd = vec![0u32; n_cells];
@@ -1193,7 +1197,7 @@ pub fn segment_line(
     let mut any_ligatures = false;
     let mut words_with_ligatures: HashSet<usize> = HashSet::new();
 
-    for (word_idx, &(orig_idx, word)) in sorted.iter().enumerate() {
+    for (_word_idx, &(orig_idx, word)) in sorted.iter().enumerate() {
         let chars_in_word: Vec<char> = word.text.chars().filter(|c| is_supported(*c)).collect();
         if chars_in_word.is_empty() {
             continue;

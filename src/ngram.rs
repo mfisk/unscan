@@ -13,7 +13,7 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 use image::GrayImage;
 use rayon::prelude::*;
 
-use crate::classifier::{NgramModel, MmapNgramModel, ImageModel};
+use crate::classifier::{MmapNgramModel, ImageModel};
 use crate::features::{self, compute_features, FEAT_LEN};
 use crate::font_scan::FontEntry;
 use crate::glyph_map::NgramGlyphMap;

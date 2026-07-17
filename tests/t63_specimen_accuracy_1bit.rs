@@ -13,7 +13,9 @@ mod common;
 use common::{test_doc, ensure_index};
 
 /// 1-bit is the hardest condition — expect lower accuracy than 8-bit no-AA.
-const MIN_ACCURACY: f64 = 0.86;
+/// Old metric (primary_hits) had 86% threshold.
+/// Strict metric (hit only) scores 46.5–54.4% (high variance from 1-bit rasterization).
+const MIN_ACCURACY: f64 = 0.44;
 
 #[test]
 fn specimen_font_accuracy_1bit() {
@@ -29,8 +31,8 @@ fn specimen_font_accuracy_1bit() {
         r.hits, r.compared, r.accuracy * 100.0, MIN_ACCURACY * 100.0,
     );
     eprintln!(
-        "  {} hits, {} misses ({} unmatched, {} wrong), {} skipped, {} total",
-        r.hits, r.misses, r.unmatched, r.misses.saturating_sub(r.unmatched), r.skipped, r.total,
+        "  {} hits, {} minor, {} major, {} sim_fail",
+        r.hits, r.minor_misses, r.major_misses, r.similarity_failures,
     );
     eprintln!("  Miss report: {}", r.report_path.display());
 

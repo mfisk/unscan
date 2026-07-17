@@ -206,7 +206,8 @@ pub fn assemble_lines(words: &[TextRegion]) -> Vec<TextLine> {
 ///
 /// Must run immediately after `assemble_lines()`, before any other
 /// post-processing.
-pub fn merge_overlapping_lines(lines: &mut Vec<TextLine>) {
+#[allow(unreachable_code)]
+pub fn merge_overlapping_lines(_lines: &mut Vec<TextLine>) {
     return; // DISABLED — split_merged_lines handles the multi-line case
     if lines.len() < 2 {
         return;

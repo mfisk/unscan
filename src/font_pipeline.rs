@@ -297,6 +297,7 @@ pub fn match_lines(
 
         let mut crop_store_plain: Vec<GrayImage> = Vec::new();
         let mut crop_store_lig: Vec<GrayImage> = Vec::new();
+        #[allow(unused_assignments)] // overwritten in the scoring block before use
         let mut plain_pos_map: Vec<(usize, usize)> = Vec::new();
         let (font_result, tie_candidates_audit, gt_font_key) = {
 

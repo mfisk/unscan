@@ -97,6 +97,7 @@ pub struct ObservationDetail {
 /// Result of `identify_fonts`: ranked font scores + per-observation detail.
 /// Minimum probability for an ngram observation to be included in font scoring.
 /// Observations with p < this threshold are excluded as noise.
+#[allow(dead_code)] // threshold for future ngram-based filtering
 const MIN_NGRAM_PROB: f32 = 0.001;
 
 /// scores are (font_key, aggregated_score) — globally consistent across observations.
@@ -130,6 +131,7 @@ pub fn identify_fonts(
         seq: Vec<char>,
         feat: CropFeatures,
         weight: f32,
+        #[allow(dead_code)]
         ood_weight: f32,
     }
 

@@ -13,8 +13,10 @@ mod common;
 
 use common::{test_doc, ensure_index};
 
-/// Minimum acceptable accuracy (primary_hits / compared).
-const MIN_ACCURACY: f64 = 0.72;
+/// Minimum acceptable accuracy (strict hits / compared).
+/// Old metric counted minor_misses as hits (primary_hits); scored 80.6%.
+/// Strict metric counts only exact font matches; scores 52.5% (265/505).
+const MIN_ACCURACY: f64 = 0.52;
 
 #[test]
 fn specimen_font_accuracy_aa() {
@@ -30,8 +32,8 @@ fn specimen_font_accuracy_aa() {
         r.hits, r.compared, r.accuracy * 100.0, MIN_ACCURACY * 100.0,
     );
     eprintln!(
-        "  {} hits, {} misses ({} unmatched, {} wrong), {} skipped, {} total",
-        r.hits, r.misses, r.unmatched, r.misses.saturating_sub(r.unmatched), r.skipped, r.total,
+        "  {} hits, {} minor, {} major, {} sim_fail",
+        r.hits, r.minor_misses, r.major_misses, r.similarity_failures,
     );
     eprintln!("  Miss report: {}", r.report_path.display());
 
@@ -63,9 +65,11 @@ fn specimen_vectorizes_enough_lines() {
     }
     std::fs::create_dir_all(&audit_dir).expect("create audit dir");
 
+    let output_path = audit_dir.join("output.pdf");
     let bin = common::unscan_bin();
     let result = std::process::Command::new(&bin)
         .arg(&input)
+        .args(["-o", output_path.to_str().unwrap()])
         .args(["--audit", audit_dir.to_str().unwrap()])
         .env("RUST_LOG", "info")
         .output()

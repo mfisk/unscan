@@ -324,19 +324,6 @@ fn sq_euclid(a: &[f32], b: &[f32]) -> f32 {
 ///
 /// Replaces the old split where weights lived in the Embedder and centroids
 /// lived in a separate NgramModel.
-/// Median pairwise squared distance among a set of centroids.
-pub fn pairwise_sigma_sq(centroids: &[(u32, Vec<f32>)]) -> f32 {
-    let n = centroids.len();
-    if n < 2 { return 0.0; }
-    let mut dists: Vec<f32> = Vec::with_capacity(n * (n - 1) / 2);
-    for i in 0..n {
-        for j in (i + 1)..n {
-            dists.push(sq_euclid(&centroids[i].1, &centroids[j].1));
-        }
-    }
-    dists.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
-    dists[dists.len() / 2]
-}
 
 
 // ---------------------------------------------------------------------------
@@ -462,7 +449,6 @@ impl NgramModel {
         magic: &[u8; 4],
         version: u32,
     ) -> std::io::Result<()> {
-        use std::io::Write;
         let n_entries = self.entries.len();
 
         // Build data section: for each entry, pack weights, glyph_ids, centroid vecs
@@ -475,7 +461,7 @@ impl NgramModel {
 
         // Sort entries for deterministic output
         let mut sorted_entries: Vec<_> = self.entries.iter().collect();
-        sorted_entries.sort_by_key(|(seq, _)| seq.clone());
+        sorted_entries.sort_by_key(|(seq, _)| (*seq).clone());
 
         for (seq, cm) in &sorted_entries {
             let weights_off = data_buf.len();
@@ -561,6 +547,7 @@ impl NgramModel {
 }
 
 /// Read a u32 LE from `data` at `*pos`, advancing `*pos`.
+#[allow(dead_code)] // read-side pair of the write serialization above
 fn read_u32(data: &[u8], pos: &mut usize) -> Result<u32, String> {
     if *pos + 4 > data.len() { return Err("truncated u32".into()); }
     let v = u32::from_le_bytes(data[*pos..*pos + 4].try_into().unwrap());
@@ -569,6 +556,7 @@ fn read_u32(data: &[u8], pos: &mut usize) -> Result<u32, String> {
 }
 
 /// Read `n` f32 LE values from `data` at `*pos`, advancing `*pos`.
+#[allow(dead_code)]
 fn read_f32s(data: &[u8], pos: &mut usize, n: usize) -> Result<Vec<f32>, String> {
     let need = n * 4;
     if *pos + need > data.len() { return Err("truncated f32 array".into()); }
@@ -650,6 +638,7 @@ pub struct MmapNgramModel {
     _file: std::fs::File,
     pub catalog_hash: u64,
     entries: HashMap<Vec<char>, MmapEntryIndex>,
+    #[allow(dead_code)] // stored for debugging/future use
     pub font_names: Vec<String>,
 }
 
@@ -698,6 +687,7 @@ impl MmapNgramModel {
     }
 
     /// Glyph ID slice for a character (zero-copy from mmap).
+    #[allow(dead_code)]
     fn glyph_ids(&self, seq: &[char]) -> &[u32] {
         match self.entries.get(seq) {
             Some(e) if e.n_centroids > 0 => self.u32_slice(e.glyph_ids_off, e.n_centroids),
@@ -706,6 +696,7 @@ impl MmapNgramModel {
     }
 
     /// Centroid vector data for a character — flat f32 slice, n_centroids × vec_dim (zero-copy).
+    #[allow(dead_code)]
     fn centroid_vecs(&self, seq: &[char]) -> &[f32] {
         match self.entries.get(seq) {
             Some(e) if e.n_centroids > 0 && e.vec_dim > 0 => {
@@ -721,6 +712,7 @@ impl MmapNgramModel {
     }
 
     /// Reconstruct an owned NgramModel from the mmap (for merge-and-rewrite).
+    #[allow(dead_code)]
     pub fn to_owned_model(&self) -> NgramModel {
         let mut entries = HashMap::with_capacity(self.entries.len());
         for (seq, idx) in &self.entries {
@@ -825,6 +817,7 @@ impl MmapNgramModel {
 
 /// Dispatches between owned NgramModel and zero-copy MmapNgramModel.
 pub enum CharModelStore {
+    #[allow(dead_code)]
     Owned(NgramModel),
     Mmap(MmapNgramModel),
 }
@@ -3336,6 +3329,7 @@ impl PerFontLda {
 
     /// Predict which character best matches the HOG features.
     /// Returns `(char, probability)` pairs sorted descending by probability.
+    #[allow(dead_code)] // character-level classification — not yet wired into pipeline
     pub fn predict(&self, feats: &[f32], k: usize) -> Vec<(char, f32)> {
         let feat_dim = self.feat_dim;
 
@@ -3380,6 +3374,7 @@ impl PerFontLda {
     }
 
     /// Predict top-1 character.
+    #[allow(dead_code)]
     pub fn predict_top1(&self, hog: &[f32]) -> Option<(char, f32)> {
         self.predict(hog, 1).into_iter().next()
     }

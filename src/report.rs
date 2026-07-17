@@ -293,7 +293,7 @@ fn classify_entries<'a>(
     entries: &'a [AuditEntry],
     gt: Option<&GroundTruth>,
     dpi: u32,
-    font_catalog: &[FontEntry],
+    _font_catalog: &[FontEntry],
     _glyph_map: &NgramGlyphMap,
 ) -> Vec<ClassifiedEntry<'a>> {
     entries
@@ -1633,7 +1633,7 @@ fn build_observation_table(
     for &(_idx, cv) in obs_to_show {
         let seq: &[char] = &cv.seq;
         let seq_label: String = seq.iter().collect();
-        let best_p = cv.best_prob;
+        let _best_p = cv.best_prob;
 
         // Crop image from disk
         let crop_uri = diag_dir.and_then(|dd| {

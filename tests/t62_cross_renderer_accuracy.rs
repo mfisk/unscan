@@ -20,9 +20,9 @@ mod common;
 use common::{test_doc, ensure_index};
 
 /// Poppler renders with different hinting than the CI's FreeType backend.
-/// Lower than t60's threshold to account for cross-renderer feature drift.
-/// Accuracy metric requires both correct font match AND SSIM pass.
-const MIN_ACCURACY_POPPLER_AA: f64 = 0.92;
+/// Old metric (primary_hits) had 92% threshold.
+/// Strict metric (hit only) scores 52.4% (264/504).
+const MIN_ACCURACY_POPPLER_AA: f64 = 0.52;
 
 #[test]
 fn specimen_font_accuracy_poppler() {
@@ -48,8 +48,8 @@ fn specimen_font_accuracy_poppler() {
         r.hits, r.compared, r.accuracy * 100.0, MIN_ACCURACY_POPPLER_AA * 100.0,
     );
     eprintln!(
-        "  {} hits, {} misses ({} unmatched, {} wrong), {} skipped, {} total",
-        r.hits, r.misses, r.unmatched, r.misses.saturating_sub(r.unmatched), r.skipped, r.total,
+        "  {} hits, {} minor, {} major, {} sim_fail",
+        r.hits, r.minor_misses, r.major_misses, r.similarity_failures,
     );
     eprintln!("  Miss report: {}", r.report_path.display());
 
