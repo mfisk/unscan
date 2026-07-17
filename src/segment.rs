@@ -266,12 +266,19 @@ fn segment_characters_inner(
     // (10 * avg_char_width / min_child_width)^2, applied additively to seam cost.
     // Penalizes based on the smallest segment CREATED by the split,
     // so splitting near the edge costs more than splitting in the middle.
+    let trailing_narrow_punct = word_text.map_or(false, |t| {
+        matches!(t.as_bytes().last(), Some(b'.' | b',' | b':' | b';'))
+    });
     let segment_penalty = |seg_start: u32, seg_end: u32, col: u32, cost: f32| -> f32 {
         if cost < 1.0 { return 0.0; }
         let left = (col - seg_start) as f32;
         let right = (seg_end - col) as f32;
-        let min_child = left.min(right);
+        let mut min_child = left.min(right);
         if min_child <= 0.0 { return f32::MAX; }
+        // Don't penalize narrow trailing punctuation (. , : ;)
+        if trailing_narrow_punct && right < left && seg_end == w {
+            min_child = left;
+        }
         let p = 10.0 * avg_char_width / min_child;
         p * p
     };

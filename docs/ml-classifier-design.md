@@ -182,19 +182,33 @@ Without confidence blending, a wrong crop (e.g., an `r` misclassified as
 `-` due to a segmentation failure) can produce extreme ×uniform values
 (28×, 36×) because the softmax still concentrates on whichever centroid
 happens to be geometrically closest, even though the query is nowhere near
-the true distribution of any glyph.  These inflated scores dominate the
-font score sum (`weighted_mean(ln(p))` in `aggregate_font_score()`) and
-can flip the font selection to the wrong font.
+the true distribution of any glyph.
 
-Confidence blending limits the damage: an OOD crop that lands far from all
-centroids gets a confidence near 0, so its probability converges to uniform
-and its contribution to font scoring is neutralized.
+Two mechanisms address this:
 
-### Limitations
+1. **Confidence blending** (classifier level): an OOD crop that lands far
+   from all centroids gets a confidence near 0, so its probability converges
+   to uniform and its contribution to font scoring is neutralized.
 
-The blending has no effect when the wrong crop happens to land *near* a
-real centroid in LDA space.  For example, an `r` crop may land near the
-em-dash centroid because LDA can't distinguish them — `d_min` is small,
-confidence ≈ 1.0, and the full softmax score passes through.  This case
-requires a scoring-level cap (not yet implemented) rather than
-classifier-level dampening.
+2. **OOD observation weighting** (scoring level): each observation's weight
+   is scaled by `min(1, med_nn / min_d)`.  When a crop is far from all
+   centroids (`min_d >> med_nn`), the observation's weight drops toward zero
+   regardless of softmax concentration.  This catches the case confidence
+   blending misses: when a wrong crop lands *near* a real centroid.
+
+### Font Score Aggregation
+
+Font scoring uses sum of squared deviations from the per-observation best:
+
+```
+score(font) = −Σᵢ (ln p_best_i − ln p_font_i)² · wᵢ
+```
+
+where `p_best_i` is the highest probability any candidate font achieves at
+observation `i`, and `wᵢ` incorporates both position weight and OOD weight.
+Highest score (closest to zero) wins.  Squaring amplifies discriminative
+observations: a single character where the font falls far behind contributes
+quadratically more than many characters where all candidates score alike.
+
+This replaces the earlier `weighted_mean(ln(p))` which was vulnerable to
+many non-discriminative observations outvoting a single informative one.

@@ -52,6 +52,21 @@ pub fn take_obs_stats() -> Option<ObsStats> {
     LAST_OBS_STATS.with(|cell| cell.borrow_mut().take())
 }
 
+thread_local! {
+    /// OOD confidence weight: min(1, med_nn / min_d). Always written by softmax_probs().
+    static LAST_OOD_WEIGHT: std::cell::Cell<f32> = const { std::cell::Cell::new(1.0) };
+}
+
+/// Retrieve the OOD confidence weight from the last softmax_probs() call.
+/// Returns min(1, med_nn / min_d): 1.0 when on-distribution, decaying toward 0 for OOD.
+pub fn take_ood_weight() -> f32 {
+    LAST_OOD_WEIGHT.with(|cell| {
+        let w = cell.get();
+        cell.set(1.0);
+        w
+    })
+}
+
 
 
 fn stash_obs_stats(min_d: f32, dists: &[(u32, f32)], sigma_sq: f32, med_nn: f32, softmax_probs: &[(u32, f32)]) {
@@ -100,6 +115,13 @@ fn softmax_probs(dists: &[(u32, f32)], sigma_sq: f32, med_nn: f32) -> Vec<(u32, 
     } else {
         dists.iter().zip(raw.iter()).map(|((id, _), &r)| (*id, r / sum)).collect()
     };
+    // Always stash OOD confidence weight (not gated by UNPRINT_OBS_STATS)
+    let ood_w = if min_d > 1e-30 && med_nn > 1e-30 {
+        (med_nn / min_d).min(1.0)
+    } else {
+        1.0
+    };
+    LAST_OOD_WEIGHT.with(|cell| cell.set(ood_w));
     stash_obs_stats(min_d, dists, sigma, med_nn, &softmax);
     let mut probs = softmax;
     probs.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));

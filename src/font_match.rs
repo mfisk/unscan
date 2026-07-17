@@ -27,19 +27,19 @@ pub struct FontMatchResult {
     pub best_dy: i32,
 }
 
-pub fn aggregate_font_score(log_probs: &[(f32, f32)], n_windows: usize) -> f32 {
-    let matched = log_probs.len();
-    let mut total_weight = 0.0_f32;
-    let mut weighted_sum = 0.0_f32;
-    for &(lp, w) in log_probs {
-        weighted_sum += lp * w;
-        total_weight += w;
-    }
-    // Missing glyphs: probability 0 → log-prob −∞ → score −∞
-    if matched < n_windows {
-        return f32::NEG_INFINITY;
-    }
-    weighted_sum / total_weight.max(1e-9)
+pub fn aggregate_font_score(log_probs: &[(f32, f32)], best_lps: &[f32]) -> f32 {
+    // Sum of squared deviations from the best log-prob at each observation,
+    // weighted by observation weight.  Negated so higher = better.
+    // Observations where all fonts score similarly contribute near-zero;
+    // observations where this font falls behind contribute quadratically.
+    debug_assert_eq!(log_probs.len(), best_lps.len());
+    let penalty: f32 = log_probs.iter().enumerate()
+        .map(|(i, &(lp, w))| {
+            let gap = best_lps[i] - lp;
+            gap * gap * w
+        })
+        .sum();
+    -penalty
 }
 
 /// Compute the overall font score for a single font using calibrated
@@ -108,7 +108,7 @@ pub struct FontIdResult {
     /// Top score computed with uniform weights (all observations weight 1.0).
     /// Used for path comparison (ligature vs plain) so observation weights
     /// don't bias the decision.
-    pub unweighted_top: f32,
+    pub path_score: f32,
 }
 
 pub fn identify_fonts(
@@ -121,7 +121,7 @@ pub fn identify_fonts(
     min_ngram_prob: f32,
 ) -> FontIdResult {
     if windows.is_empty() {
-        return FontIdResult { scores: Vec::new(), observations: Vec::new(), unweighted_top: f32::MIN };
+        return FontIdResult { scores: Vec::new(), observations: Vec::new(), path_score: f32::MIN };
     }
 
     // ── Pre-compute features ────────────────────────────────────────
@@ -130,6 +130,7 @@ pub fn identify_fonts(
         seq: Vec<char>,
         feat: CropFeatures,
         weight: f32,
+        ood_weight: f32,
     }
 
     let crop_data: Vec<WindowData> = windows
@@ -137,12 +138,12 @@ pub fn identify_fonts(
         .enumerate()
         .filter_map(|(i, w)| {
             let f = compute_features(w.crop, false)?;
-            Some(WindowData { window_idx: i, seq: w.seq.clone(), feat: f, weight: w.weight })
+            Some(WindowData { window_idx: i, seq: w.seq.clone(), feat: f, weight: w.weight, ood_weight: 1.0 })
         })
         .collect();
 
     if crop_data.is_empty() {
-        return FontIdResult { scores: Vec::new(), observations: Vec::new(), unweighted_top: f32::MIN };
+        return FontIdResult { scores: Vec::new(), observations: Vec::new(), path_score: f32::MIN };
     }
 
     let n_windows = crop_data.len();
@@ -150,9 +151,12 @@ pub fn identify_fonts(
     // ── Stage 1: per-window classification → candidate set ─────────
     let mut candidate_set: HashSet<String> = HashSet::new();
     let mut observations: Vec<ObservationDetail> = Vec::with_capacity(n_windows);
+    let mut ood_weights: Vec<f32> = Vec::with_capacity(n_windows);
 
     for wd in &crop_data {
         let picks = classifier.classify(&wd.seq, &wd.feat, 3);
+        let ood_w = classifier::take_ood_weight();
+        ood_weights.push(ood_w);
         if picks.is_empty() {
             continue;
         }
@@ -197,7 +201,7 @@ pub fn identify_fonts(
     }
 
     if candidate_set.is_empty() {
-        return FontIdResult { scores: Vec::new(), observations, unweighted_top: f32::MIN };
+        return FontIdResult { scores: Vec::new(), observations, path_score: f32::MIN };
     }
 
     // ── Stage 2a: filter ngrams — keep only windows where at least one
@@ -218,27 +222,49 @@ pub fn identify_fonts(
         .collect();
 
     // ── Stage 2b: score each candidate font on the surviving ngrams ──
+    // Two-pass approach: first collect per-font log-probs, then compute
+    // sum-of-squared-deviations from the per-observation best.
     let n_scoring = scoring_window_indices.len();
-    let mut best_unweighted = f32::MIN;
-    let mut scores: Vec<(String, f32)> = candidate_vec.into_iter()
+
+    // First pass: collect log-probs for all candidate fonts
+    let font_lps: Vec<(String, Vec<(f32, f32)>)> = candidate_vec.into_iter()
         .filter_map(|font_key| {
             let log_probs: Vec<(f32, f32)> = scoring_window_indices.iter()
                 .filter_map(|&i| {
                     let wd = &crop_data[i];
                     let glyph_id = glyph_map.glyph_id_for_font(&wd.seq, &font_key)?;
                     let p = classifier.probability(&wd.seq, &wd.feat, glyph_id)?;
-                    Some((p.ln(), wd.weight))
+                    Some((p.ln(), wd.weight * ood_weights[i]))
                 })
                 .collect();
-            if log_probs.is_empty() {
-                return None;
-            }
-            let score = aggregate_font_score(&log_probs, n_scoring);
+            if log_probs.len() < n_scoring { return None; }
+            Some((font_key, log_probs))
+        })
+        .collect();
+
+    // Find best log-prob per observation across all candidate fonts
+    let mut best_lps = vec![f32::NEG_INFINITY; n_scoring];
+    for (_, lps) in &font_lps {
+        for (i, &(lp, _)) in lps.iter().enumerate() {
+            if lp > best_lps[i] { best_lps[i] = lp; }
+        }
+    }
+
+    // Second pass: score using squared deviations from per-observation best
+    let mut best_path_score = f32::MIN;
+    let mut scores: Vec<(String, f32)> = font_lps.into_iter()
+        .filter_map(|(font_key, log_probs)| {
+            let score = aggregate_font_score(&log_probs, &best_lps);
             if score.is_finite() {
-                // Unweighted mean for path comparison (ignore weight bias)
-                let uw = log_probs.iter().map(|(lp, _)| lp).sum::<f32>()
-                    / log_probs.len() as f32;
-                if uw > best_unweighted { best_unweighted = uw; }
+                // Path comparison score: OOD-weighted (data quality) but not
+                // position-weighted, so garbage observations are downweighted
+                // without position bias affecting lig-vs-plain selection.
+                let ood_probs: Vec<(f32, f32)> = scoring_window_indices.iter()
+                    .zip(log_probs.iter())
+                    .map(|(&i, &(lp, _))| (lp, ood_weights[i]))
+                    .collect();
+                let ps = aggregate_font_score(&ood_probs, &best_lps);
+                if ps > best_path_score { best_path_score = ps; }
                 Some((font_key, score))
             } else { None }
         })
@@ -250,6 +276,6 @@ pub fn identify_fonts(
             .unwrap_or(std::cmp::Ordering::Equal)
     });
 
-    FontIdResult { scores, observations, unweighted_top: best_unweighted }
+    FontIdResult { scores, observations, path_score: best_path_score }
 }
 

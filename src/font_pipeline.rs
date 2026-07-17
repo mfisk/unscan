@@ -340,11 +340,11 @@ pub fn match_lines(
                 None
             };
             // ── Pick the winner: ligature vs plain segmentation ──
-            // We compare using unweighted (uniform) mean log-probs so
-            // weight doesn't bias the decision.
-            let plain_top = scoring_plain.unweighted_top;
+            // Compare lig vs plain using OOD-weighted path scores.
+            // Position weights are excluded so they don't bias the decision.
+            let plain_top = scoring_plain.path_score;
             let lig_top = scoring_lig.as_ref()
-                .map(|r| r.unweighted_top)
+                .map(|r| r.path_score)
                 .unwrap_or(f32::MIN);
             let use_lig = scoring_lig.is_some() && lig_top > plain_top;
 

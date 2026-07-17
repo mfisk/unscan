@@ -37,21 +37,33 @@ word-level SSIM reranking step — the CI #1 candidate wins directly. The SSIM
 verification in Pass 2 is a *gate* (reject bad matches), not a *selector*
 (choose between candidates).
 
-**Score aggregation:** Per-character distances are aggregated using a weighted
-geometric mean of log-distances. Characters are weighted by `char_weight()` —
-highly discriminative characters (ligatures at 2.0, structural letters at
-1.5) contribute more than simple/narrow ones (0.5).
+**Score aggregation:** For each observation (character or bigram crop),
+the classifier produces a softmax probability for every candidate font.
+The best log-probability across all candidates at each observation defines
+a reference.  Each font's score is the negated sum of squared deviations
+from those per-observation bests, weighted by observation weight and OOD
+weight:
 
-**Statistical cutoff (σ-based):** After scoring and sorting, candidates are
-pruned to the best score and any near-ties within `k·σ` of it (currently
-k=0.5). This adapts to each line's difficulty.
+```
+score(font) = −Σᵢ (ln p_best_i − ln p_font_i)² · wᵢ
+```
 
-**Always returns ≥1:** If the quorum gate drops all candidates, the single
-font with the lowest average distance is returned as a fallback.
+Highest score (closest to zero) wins.  Squaring amplifies discriminative
+observations — a single character where the font falls far behind matters
+more than many characters where all fonts score alike.  This is the same
+principle as a chi-squared test.
+
+**OOD observation weighting:** Each observation's weight is scaled by
+`min(1, med_nn / min_d)`, where `min_d` is the distance to the nearest
+centroid and `med_nn` is the median nearest-neighbor distance among centroids.
+Observations where the crop is far from all known glyphs (bad segmentation,
+unseen character) are downweighted geometrically.
 
 **Dual-path ligature support:** Common Latin ligatures (ff, fi, fl, ffi, ffl)
 are handled via dual-path segmentation: plain OCR characters vs.
-ligature-collapsed characters, with the higher-scoring path winning.
+ligature-collapsed characters, with the higher-scoring path winning.  Path
+comparison uses OOD-weighted scores only (no position weights) so garbage
+observations are downweighted without position bias affecting the selection.
 
 ## 2. SSIM Fast Path — Dominant Font Acceleration
 
@@ -111,8 +123,8 @@ For each line that misses the fast path:
 3. **CI search:** Per-character nearest-neighbor search against the
    pre-built index. Brute-force linear scan (~5000 fonts per character).
 
-4. **Score aggregation:** Weighted geometric mean across characters.
-   σ-based statistical cutoff prunes candidates.
+4. **Score aggregation:** Sum of squared deviations from per-observation
+   best log-probabilities, OOD-weighted.  Lowest penalty wins.
 
 5. **OCR correction gate:** If the best match for a character is
    catastrophically bad (d² > 0.5), all indexed characters are scanned

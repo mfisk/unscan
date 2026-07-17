@@ -138,6 +138,11 @@ segment_penalty(seg_start, seg_end, col):
     right = seg_end - col
     min_child = min(left, right)
     if min_child ≤ 0 → ∞
+    # Trailing narrow punctuation: if the word ends with . , : ;
+    # and the narrow child is on the right edge, use the left child
+    # width instead — a period is supposed to be narrow.
+    if trailing_punct and right < left and seg_end == word_width:
+        min_child = left
     penalty = (10.0 × avg_char_width / min_child)²
 ```
 
@@ -145,6 +150,12 @@ segment_penalty(seg_start, seg_end, col):
 whitespace gap is a definitive character boundary regardless of
 the resulting segment sizes — only splits through ink need the
 size-balance heuristic.
+
+**Trailing narrow punctuation is exempt.** When a word ends with
+`. , : ;`, the segment-size penalty for the rightmost segment uses
+the *left* child width instead of the narrow right child. Characters
+like periods are naturally much narrower than `avg_char_width`, and
+penalizing them forces the split to a worse column.
 
 The total cost on the heap is: `dp_cost + width_penalty + horizontal_cost + segment_size_penalty`.
 
