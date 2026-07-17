@@ -1,8 +1,9 @@
 //! t59: Seam split regression test.
 //!
-//! Generates a 3-line test PDF (p1:L72 LibreBodoni uppercase, p1:L73 LibreBodoni
-//! lowercase, p3:L45 Georgia uppercase) from the BAP audit, runs unprint with
-//! --audit, and verifies seam splits match known-good positions.
+//! Generates a 7-line test PDF covering LibreBodoni (uppercase, lowercase,
+//! lining figures), EBGaramond (body text), Arial Bold, Roboto Italic, and
+//! PlayfairDisplay (lining figures).  Runs unprint with --audit and verifies
+//! seam splits match known-good positions.
 //!
 //! Run:  cargo test --release --test t59_seam_regression -- --nocapture
 
@@ -12,11 +13,37 @@ use common::run_unscan;
 use std::path::PathBuf;
 use std::process::Command;
 
-/// Expected seam splits for each test line (updated Jul 16 2026 for HarfBuzz kerning).
-const EXPECTED: &[(&str, &[u32])] = &[
-    ("ABCDEFGHIJKLMNOPQRSTUVWXYZ.", &[25, 187, 216, 230, 276, 332, 471, 518, 545, 570, 604, 633, 656]),
-    ("abcdefghijklmnopqrstuvwxyz.", &[17, 112, 166, 199, 208, 395, 413, 440, 460]),
-    ("ABCDEFGHIJKLMNOPQRSTUVWXYZ.", &[26, 268, 292, 504, 531, 557, 592, 618, 642]),
+/// Expected seam splits for each test line, per word.
+/// Updated Jul 17 2026: expanded from 3 to 7 lines to match lob coverage.
+const EXPECTED: &[(&str, &[&[u32]])] = &[
+    // p1:L72 LibreBodoni lowercase
+    ("abcdefghijklmnopqrstuvwxyz.", &[
+        &[17, 112, 166, 199, 208, 395, 413, 440, 460],
+    ]),
+    // p1:L73 LibreBodoni lining figures
+    ("Lining figures: 0 1 2 3 4 5 6 7 8 9.", &[
+        &[14, 46], &[], &[], &[], &[], &[], &[], &[], &[], &[], &[], &[],
+    ]),
+    // p1:L71 LibreBodoni uppercase
+    ("ABCDEFGHIJKLMNOPQRSTUVWXYZ.", &[
+        &[25, 187, 216, 230, 276, 332, 471, 518, 545, 570, 604, 633, 656],
+    ]),
+    // p1:L10 EBGaramond body text
+    ("carved type into wood or imported it from Italy.", &[
+        &[99], &[41, 58], &[24, 39, 48, 64], &[11, 26], &[], &[27], &[11],
+    ]),
+    // p3:L45 Arial Bold
+    ("Bold: The quick brown fox jumps over.", &[
+        &[], &[], &[35], &[], &[], &[], &[12],
+    ]),
+    // p4:L46 Roboto Italic
+    ("Italic: The quick brown fox jumps over 1,234,567,890 lazy,", &[
+        &[85, 150], &[50], &[], &[32, 80], &[32, 64], &[8, 27, 45, 54], &[36], &[19], &[10, 31],
+    ]),
+    // p5:L79 PlayfairDisplay lining figures
+    ("Lining figures: CD 2 2 9 4 5 6 7 8 9.", &[
+        &[44], &[88], &[9], &[], &[], &[], &[], &[], &[], &[], &[], &[],
+    ]),
 ];
 
 #[test]
@@ -26,7 +53,7 @@ fn seam_splits_match_ground_truth() {
     // Generate test PDFs from BAP audit
     let gen_status = Command::new("python3")
         .arg(repo.join("test-docs/gen-line-test.py"))
-        .args(["1:72", "1:73", "3:45"])
+        .args(["1:72", "1:73", "1:71", "1:10", "3:45", "4:46", "5:79"])
         .current_dir(&repo)
         .status()
         .expect("failed to run gen-line-test.py");
@@ -70,20 +97,23 @@ fn seam_splits_match_ground_truth() {
     assert_eq!(entries.len(), EXPECTED.len(),
         "expected {} lines, got {}", EXPECTED.len(), entries.len());
 
-    for (i, (entry, &(expected_text, expected_splits))) in entries.iter().zip(EXPECTED.iter()).enumerate() {
+    for (i, (entry, &(expected_text, expected_word_splits))) in entries.iter().zip(EXPECTED.iter()).enumerate() {
         let text = entry["text"].as_str().unwrap_or("");
         assert_eq!(text, expected_text, "line {i}: text mismatch");
 
         let ws = entry["word_segmentation"].as_array().expect("no word_segmentation");
-        assert!(!ws.is_empty(), "line {i}: no words");
+        assert_eq!(ws.len(), expected_word_splits.len(),
+            "line {i} ({text}): word count mismatch — got {} words, expected {}",
+            ws.len(), expected_word_splits.len());
 
-        let splits: Vec<u32> = ws[0]["seam_splits"].as_array()
-            .expect("no seam_splits")
-            .iter()
-            .map(|v| v.as_u64().unwrap() as u32)
-            .collect();
+        for (j, (word, expected_splits)) in ws.iter().zip(expected_word_splits.iter()).enumerate() {
+            let splits: Vec<u32> = match word["seam_splits"].as_array() {
+                Some(arr) => arr.iter().map(|v| v.as_u64().unwrap() as u32).collect(),
+                None => vec![],
+            };
 
-        assert_eq!(splits, expected_splits,
-            "line {i} ({text}): seam splits mismatch\n  got:      {splits:?}\n  expected: {expected_splits:?}");
+            assert_eq!(splits, *expected_splits,
+                "line {i} word {j} ({text}): seam splits mismatch\n  got:      {splits:?}\n  expected: {expected_splits:?}");
+        }
     }
 }
