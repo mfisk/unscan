@@ -525,7 +525,7 @@ fn extract_page_spans(
             "cm" => {
                 if op.operands.len() >= 6 {
                     let m = extract_matrix(&op.operands);
-                    ctm = multiply_matrix(&ctm, &m);
+                    ctm = multiply_matrix(&m, &ctm);
                 }
             }
 
