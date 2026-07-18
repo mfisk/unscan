@@ -295,6 +295,18 @@ pub trait Classifier: Send + Sync {
     /// Called once per (glyph_id, char) pair during index build.
     fn add_glyph(&mut self, _glyph_id: usize, _seq: &[char], _features: &CropFeatures) {}
 
+    /// Ensure the model's storage is owned (convert mmap → owned) so add_glyph works.
+    fn ensure_owned(&mut self) {}
+
+    /// Recompute per-character σ² and med_nn after incremental additions.
+    fn recompute_stats(&mut self) {}
+
+    /// Update catalog_hash after incremental addition.
+    fn set_catalog_hash(&mut self, _hash: u64) {}
+
+    /// Persist the updated model to disk (for incremental updates).
+    fn save_to(&self, _path: &std::path::Path, _magic: &[u8; 4], _version: u32) -> Result<(), String> { Ok(()) }
+
     /// Catalog hash baked into the model at training time, if available.
     /// Used by load_or_train to detect stale weights when the font catalog changes.
     fn catalog_hash(&self) -> Option<u64> { None }
@@ -923,6 +935,69 @@ impl Classifier for EmbeddingClassifier {
             med_nn: 0.0,
         });
         cm.centroids.push((glyph_id as u32, embedded));
+    }
+
+    fn ensure_owned(&mut self) {
+        if let CharModelStore::Mmap(m) = &self.model {
+            let owned = m.to_owned_model();
+            self.model = CharModelStore::Owned(owned);
+        }
+    }
+
+    fn recompute_stats(&mut self) {
+        match &mut self.model {
+            CharModelStore::Owned(m) => {
+                for cm in m.entries.values_mut() {
+                    cm.compute_sigma_sq();
+                    cm.compute_med_nn();
+                }
+            }
+            CharModelStore::Mmap(_) => {} // should have been ensure_owned first
+        }
+    }
+
+    fn set_catalog_hash(&mut self, hash: u64) {
+        match &mut self.model {
+            CharModelStore::Owned(m) => m.catalog_hash = hash,
+            CharModelStore::Mmap(m) => {
+                // Convert to owned to allow mutation, then set
+                let mut owned = m.to_owned_model();
+                owned.catalog_hash = hash;
+                self.model = CharModelStore::Owned(owned);
+            }
+        }
+    }
+
+    fn save_to(&self, path: &std::path::Path, magic: &[u8; 4], version: u32) -> Result<(), String> {
+        let owned = match &self.model {
+            CharModelStore::Owned(m) => m,
+            CharModelStore::Mmap(m) => {
+                // Need owned view to write; clone to owned temporarily
+                // to_owned_model is cheap-ish compared to full retrain
+                // We can't move out of &self, so we do a full owned copy
+                // and write that.
+                let tmp_owned = m.to_owned_model();
+                // Write tmp_owned directly
+                let tmp_path = crate::atomic_file::tmp_for(path);
+                let f = std::fs::File::create(&tmp_path).map_err(|e| format!("create tmp: {e}"))?;
+                let mut w = std::io::BufWriter::new(f);
+                tmp_owned.write_bin(&mut w, magic, version).map_err(|e| format!("write: {e}"))?;
+                use std::io::Write;
+                w.flush().map_err(|e| format!("flush: {e}"))?;
+                drop(w);
+                std::fs::rename(&tmp_path, path).map_err(|e| format!("rename: {e}"))?;
+                return Ok(());
+            }
+        };
+        let tmp_path = crate::atomic_file::tmp_for(path);
+        let f = std::fs::File::create(&tmp_path).map_err(|e| format!("create tmp: {e}"))?;
+        let mut w = std::io::BufWriter::new(f);
+        owned.write_bin(&mut w, magic, version).map_err(|e| format!("write: {e}"))?;
+        use std::io::Write;
+        w.flush().map_err(|e| format!("flush: {e}"))?;
+        drop(w);
+        std::fs::rename(&tmp_path, path).map_err(|e| format!("rename: {e}"))?;
+        Ok(())
     }
 
     fn catalog_hash(&self) -> Option<u64> {
@@ -2919,6 +2994,41 @@ impl Classifier for FusionClassifier {
             child.add_glyph(glyph_id, seq, features);
         }
     }
+
+    fn ensure_owned(&mut self) {
+        for (_, child) in &mut self.children {
+            child.ensure_owned();
+        }
+    }
+
+    fn recompute_stats(&mut self) {
+        for (_, child) in &mut self.children {
+            child.recompute_stats();
+        }
+    }
+
+    fn set_catalog_hash(&mut self, hash: u64) {
+        for (_, child) in &mut self.children {
+            child.set_catalog_hash(hash);
+        }
+    }
+
+    fn save_to(&self, _path: &std::path::Path, _magic: &[u8; 4], _version: u32) -> Result<(), String> {
+        // Fusion doesn't have a single file; each child saves separately via build_classifier.
+        // For incremental, we propagate save to children using their default paths.
+        for (_, child) in &self.children {
+            // Determine child's default path by name
+            let (default_path, magic, version) = match child.name() {
+                "lda" => (default_lda_weights_path(), *b"LDAC", 8u32),
+                "perchar-fisher" | "fisher" => (default_fisher_weights_path(), *b"FISH", 3u32),
+                "mahalanobis" => (default_mahalanobis_weights_path(), *b"MAHA", 3u32),
+                "triplet" => (default_triplet_weights_path(), *b"TRIP", 3u32),
+                _ => continue,
+            };
+            let _ = child.save_to(&default_path, &magic, version);
+        }
+        Ok(())
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -3263,57 +3373,98 @@ pub fn build_classifier(
 // Each font's classifier is cached to its own file under
 // ~/.cache/unprint/per-font-lda/<hash>.bin
 
+/// Conforms to `src/font_cache.rs` pattern (shared LRU, same eviction/promotion logic).
+/// See `docs/debugging-segmentation.md` — "Font cache (shared LRU)" entry.
+
 use std::collections::VecDeque;
 use std::sync::Mutex;
 
-/// LRU cache for per-font classifiers — caps memory at ~16 fonts (~70-90M)
-/// instead of unbounded HashMap that could hold 79 fonts (~400M+).
-/// Front = least-recent, back = most-recent.
-struct PerFontLruCache {
-    map: HashMap<String, std::sync::Arc<PerFontLda>>,
+/// Default number of per-font LDA classifiers to keep in memory.
+/// Each classifier ~5-6 MB (HOG 144-dim → LDA 31-dim, ~100-200 centroids),
+/// so 16 ≈ 80-100 MB peak vs unbounded 79-font ≈ 400 MB+ which OOMs on 7.8G VM.
+pub const PER_FONT_CACHE_DEFAULT_CAPACITY: usize = 16;
+
+struct PerFontLruInner {
+    entries: HashMap<String, std::sync::Arc<PerFontLda>>,
     order: VecDeque<String>,
-    cap: usize,
+    capacity: usize,
+    hits: u64,
+    misses: u64,
+}
+
+struct PerFontLruCache {
+    inner: Mutex<PerFontLruInner>,
 }
 
 impl PerFontLruCache {
-    fn new(cap: usize) -> Self {
-        Self { map: HashMap::new(), order: VecDeque::new(), cap }
+    fn new(capacity: usize) -> Self {
+        Self {
+            inner: Mutex::new(PerFontLruInner {
+                entries: HashMap::with_capacity(capacity),
+                order: VecDeque::with_capacity(capacity),
+                capacity,
+                hits: 0,
+                misses: 0,
+            }),
+        }
     }
-    fn get(&mut self, key: &str) -> Option<std::sync::Arc<PerFontLda>> {
-        if let Some(v) = self.map.get(key) {
+
+    fn get(&self, key: &str) -> Option<std::sync::Arc<PerFontLda>> {
+        let mut inner = self.inner.lock().unwrap();
+        if let Some(v) = inner.entries.get(key).cloned() {
             // Promote to most-recent
-            if let Some(pos) = self.order.iter().position(|k| k == key) {
-                self.order.remove(pos);
+            if let Some(pos) = inner.order.iter().position(|k| k == key) {
+                inner.order.remove(pos);
             }
-            self.order.push_back(key.to_string());
-            Some(v.clone())
+            inner.order.push_back(key.to_string());
+            inner.hits += 1;
+            Some(v)
         } else {
+            inner.misses += 1;
             None
         }
     }
-    fn put(&mut self, key: String, value: std::sync::Arc<PerFontLda>) {
-        if self.map.contains_key(&key) {
-            self.map.insert(key.clone(), value);
-            if let Some(pos) = self.order.iter().position(|k| k == &key) {
-                self.order.remove(pos);
+
+    fn put(&self, key: String, value: std::sync::Arc<PerFontLda>) {
+        let mut inner = self.inner.lock().unwrap();
+        if inner.entries.contains_key(&key) {
+            inner.entries.insert(key.clone(), value);
+            if let Some(pos) = inner.order.iter().position(|k| k == &key) {
+                inner.order.remove(pos);
             }
-            self.order.push_back(key);
+            inner.order.push_back(key);
             return;
         }
-        if self.map.len() >= self.cap {
-            if let Some(old) = self.order.pop_front() {
-                self.map.remove(&old);
+        // Evict oldest if at capacity (while to handle shrink)
+        while inner.entries.len() >= inner.capacity {
+            if let Some(old) = inner.order.pop_front() {
+                inner.entries.remove(&old);
+            } else {
+                break;
             }
         }
-        self.order.push_back(key.clone());
-        self.map.insert(key, value);
+        inner.order.push_back(key.clone());
+        inner.entries.insert(key, value);
+    }
+
+    #[allow(dead_code)]
+    fn len(&self) -> usize {
+        self.inner.lock().unwrap().entries.len()
+    }
+
+    #[allow(dead_code)]
+    fn stats(&self) -> (u64, u64) {
+        let inner = self.inner.lock().unwrap();
+        (inner.hits, inner.misses)
     }
 }
 
 /// In-memory LRU cache of loaded per-font classifiers, keyed by font_key.
+/// Mirrors `src/font_cache.rs::FontCache` pattern: `Mutex<LruInner>`, `HashMap` + `VecDeque`,
+/// `while len >= capacity` eviction, `hits`/`misses` counters, `len()`/`stats()`.
 /// Cap 16 keeps peak ~80-100M vs unbounded ~400M+ for 79-font specimen.
-static PER_FONT_CACHE: std::sync::LazyLock<Mutex<PerFontLruCache>> =
-    std::sync::LazyLock::new(|| Mutex::new(PerFontLruCache::new(16)));
+static PER_FONT_CACHE: std::sync::LazyLock<PerFontLruCache> =
+    std::sync::LazyLock::new(|| PerFontLruCache::new(PER_FONT_CACHE_DEFAULT_CAPACITY));
 
 /// Per-font 1-gram LDA classifier using HOG features.
 ///
@@ -3359,11 +3510,8 @@ impl PerFontLda {
         ctx: &crate::train::TrainingContext,
     ) -> Option<std::sync::Arc<Self>> {
         // Check in-memory cache first (LRU, cap 16)
-        {
-            let mut cache = PER_FONT_CACHE.lock().unwrap();
-            if let Some(arc) = cache.get(font_key) {
-                return Some(arc.clone());
-            }
+        if let Some(arc) = PER_FONT_CACHE.get(font_key) {
+            return Some(arc);
         }
 
         // Try loading from disk
@@ -3371,7 +3519,7 @@ impl PerFontLda {
         if path.exists() {
             if let Some(clf) = Self::load(&path, font_key, ctx.catalog_hash) {
                 let arc = std::sync::Arc::new(clf);
-                PER_FONT_CACHE.lock().unwrap().put(font_key.to_string(), arc.clone());
+                PER_FONT_CACHE.put(font_key.to_string(), arc.clone());
                 return Some(arc);
             }
             // Stale or corrupt — fall through to retrain
@@ -3383,7 +3531,7 @@ impl PerFontLda {
             eprintln!("Warning: could not cache per-font LDA for {font_key}: {e}");
         }
         let arc = std::sync::Arc::new(clf);
-        PER_FONT_CACHE.lock().unwrap().put(font_key.to_string(), arc.clone());
+        PER_FONT_CACHE.put(font_key.to_string(), arc.clone());
         Some(arc)
     }
 

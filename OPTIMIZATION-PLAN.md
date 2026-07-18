@@ -181,11 +181,9 @@ Many of the optimizations identified below have been implemented. Status markers
 - **Proposed optimization:** Precompute column ink presence for the entire page (or per-line strip) as a `Vec<bool>`. One O(w × h) pass, then all word expansion queries become O(1) lookups.
 - **Expected impact:** **Medium** — `expand_words_to_ink` runs on every word but the per-word work is typically small (expansion distance ≤ 20px).
 
-### 3.3 `expand_bbox_to_ink` — redundant with `expand_words_to_ink`
-- **File:** `src/ocr.rs`, lines ~435–505
-- **Pattern:** Scans line-level ink extent, then `expand_words_to_ink` re-scans for word-level expansion. Both scan overlapping pixel regions.
-- **Proposed optimization:** Combine into a single pass that computes both line and word ink extent together.
-- **Expected impact:** **Low-Medium**
+### 3.3 `expand_bbox_to_ink` — **REMOVED** (2026-06-27, cee0eee)
+- Was redundant with `expand_words_to_ink`; deleted during deduplication refactor.
+- Line bbox is now derived from word-union (word bboxes are authoritative).
 
 ---
 

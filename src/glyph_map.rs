@@ -11,7 +11,7 @@
 // Supports arbitrary sequence lengths: seq_len=1 for single characters,
 // seq_len=2 for bigrams, etc.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 
 /// A group of font_keys that produce an identical rendered image.
@@ -80,25 +80,49 @@ impl NgramGlyphMap {
             .unwrap_or_default()
     }
 
+    /// All unique font_keys across all sequences (cached font_meta).
+    pub fn cached_font_keys(&self) -> HashSet<String> {
+        let mut set = HashSet::new();
+        for groups in self.groups.values() {
+            for g in groups {
+                for k in &g.font_keys {
+                    set.insert(k.clone());
+                }
+            }
+        }
+        set
+    }
+
+    /// Update catalog_hash after incremental addition.
+    pub fn set_catalog_hash(&mut self, hash: u64) {
+        if self.catalog_hash != hash {
+            self.catalog_hash = hash;
+            self.dirty = true;
+        }
+    }
+
     /// Register a rendered glyph: associate a font_key with an image hash
     /// for a given sequence. If the hash matches an existing group, the
     /// font_key is added to that group. Otherwise a new group is created.
-    pub fn register(&mut self, seq: &[char], font_key: &str, hash: u64) {
+    /// Returns (glyph_id, is_new_group).
+    pub fn register(&mut self, seq: &[char], font_key: &str, hash: u64) -> (usize, bool) {
         let groups = self.groups.entry(seq.to_vec()).or_default();
-        for group in groups.iter_mut() {
+        for (idx, group) in groups.iter_mut().enumerate() {
             if group.hash == hash {
                 if !group.font_keys.iter().any(|k| k == font_key) {
                     group.font_keys.push(font_key.to_string());
                     self.dirty = true;
                 }
-                return;
+                return (idx, false);
             }
         }
+        let new_id = groups.len();
         groups.push(GlyphGroup {
             hash,
             font_keys: vec![font_key.to_string()],
         });
         self.dirty = true;
+        (new_id, true)
     }
 
     /// Default cache path for the glyph map.

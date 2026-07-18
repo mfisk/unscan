@@ -266,7 +266,7 @@ fn run(args: &cli::Args, classifier: &mut dyn classifier::Classifier) -> Result<
     // Load glyph map (glyph dedup groups).  If missing or stale, retrain
     // the LDA classifier (which rebuilds the glyph map as a side effect).
     let gmap_path = glyph_map::NgramGlyphMap::default_path();
-    let glyph_map = match glyph_map::NgramGlyphMap::load(&gmap_path) {
+    let mut glyph_map = match glyph_map::NgramGlyphMap::load(&gmap_path) {
         Ok(g) => g,
         Err(e) => {
             eprintln!("Glyph map at {} stale or missing ({e}), retraining...", gmap_path.display());
@@ -286,6 +286,133 @@ fn run(args: &cli::Args, classifier: &mut dyn classifier::Classifier) -> Result<
                 })
         }
     };
+
+    // ── Incremental update: detect new fonts and add to index ──────
+    // Compare cached font_meta (glyph_map) against installed fonts.
+    // New fonts are indexed and added; removed fonts are kept.
+    {
+        use std::collections::HashSet;
+        let installed_keys: HashSet<String> = font_registry.entries().iter()
+            .map(|e| e.font_key())
+            .collect();
+        let cached_keys = glyph_map.cached_font_keys();
+
+        eprintln!("[incremental] installed={} cached={} (glyph_map has {} unique fonts)", installed_keys.len(), cached_keys.len(), cached_keys.len());
+
+        let new_keys: Vec<String> = installed_keys.difference(&cached_keys).cloned().collect();
+        let removed_keys: Vec<String> = cached_keys.difference(&installed_keys).cloned().collect();
+
+        if !removed_keys.is_empty() {
+            eprintln!("[incremental] Keeping {} removed fonts (trained data still valid for classification)", removed_keys.len());
+        }
+
+        if !new_keys.is_empty() {
+            eprintln!("[incremental] Detected {} new fonts, indexing and adding to classifier...", new_keys.len());
+            for k in &new_keys {
+                eprintln!("  + {k}");
+            }
+
+            // Build sequence list (same as training)
+            let sequences: Vec<Vec<char>> = {
+                let mut seqs: Vec<Vec<char>> = features::supported_chars().iter().map(|&c| vec![c]).collect();
+                seqs.extend(features::supported_sequences(2).iter().cloned());
+                seqs
+            };
+
+            // Map font_key -> FontEntry for quick lookup
+            let font_by_key: std::collections::HashMap<String, &font_scan::FontEntry> = font_registry.entries().iter()
+                .map(|e| (e.font_key(), e))
+                .collect();
+
+            let render_params = args.render_params();
+            let mut new_glyphs_added = 0usize;
+            let mut fonts_indexed = 0usize;
+
+            // Ensure classifier is in owned mode for mutation
+            classifier.ensure_owned();
+
+            for font_key in &new_keys {
+                let fe = match font_by_key.get(font_key) {
+                    Some(f) => *f,
+                    None => continue,
+                };
+
+                // Load font data
+                let font_data = match std::fs::read(&fe.path) {
+                    Ok(d) => d,
+                    Err(_) => continue,
+                };
+                let font = match ab_glyph::FontRef::try_from_slice(&font_data) {
+                    Ok(f) => f,
+                    Err(_) => continue,
+                };
+
+                let overrides = fe.glyph_overrides.as_deref();
+                fonts_indexed += 1;
+
+                for seq in &sequences {
+                    let gid_overrides: Vec<Option<ab_glyph::GlyphId>> = seq.iter().map(|c| {
+                        overrides.and_then(|ovs| ovs.iter().find(|(ch, _)| *ch == *c).map(|(_, g)| ab_glyph::GlyphId(*g)))
+                    }).collect();
+
+                    let img = match char_render::render_ngram_fresh(&font, seq, &gid_overrides, &render_params) {
+                        Some(img) => img,
+                        None => continue,
+                    };
+
+                    let hash = glyph_map::hash_image(&img);
+                    let (glyph_id, is_new_group) = glyph_map.register(seq, font_key, hash);
+
+                    if is_new_group {
+                        // New unique glyph — add centroid to classifier
+                        if let Some(feats) = features::compute_features(&img, false) {
+                            classifier.add_glyph(glyph_id, seq, &feats);
+                            new_glyphs_added += 1;
+                        }
+                    }
+                }
+            }
+
+            // Update catalog hashes to new installed hash (union semantics: keep removed fonts' data, but hash reflects installed)
+            let new_catalog_hash = {
+                use std::hash::{Hash, Hasher};
+                let mut hasher = std::collections::hash_map::DefaultHasher::new();
+                let mut sorted_keys: Vec<&String> = installed_keys.iter().collect();
+                sorted_keys.sort();
+                for k in sorted_keys {
+                    k.hash(&mut hasher);
+                }
+                hasher.finish()
+            };
+            glyph_map.set_catalog_hash(new_catalog_hash);
+            classifier.set_catalog_hash(new_catalog_hash);
+            classifier.recompute_stats();
+
+            // Persist updated glyph_map (dirty flag will trigger write on Drop, but also write explicitly)
+            if let Err(e) = glyph_map.write_bin(&gmap_path) {
+                eprintln!("warning: failed to write updated glyph map: {e}");
+            }
+
+            // Persist updated classifier
+            let clf_name = classifier.name().to_string();
+            let save_result = match clf_name.as_str() {
+                "lda" => classifier.save_to(&classifier::default_lda_weights_path(), b"LDAC", 8),
+                "perchar-fisher" | "fisher" => classifier.save_to(&classifier::default_fisher_weights_path(), b"FISH", 3),
+                "mahalanobis" => classifier.save_to(&classifier::default_mahalanobis_weights_path(), b"MAHA", 3),
+                "triplet" => classifier.save_to(&classifier::default_triplet_weights_path(), b"TRIP", 3),
+                "fusion" => {
+                    // Fusion saves each child via its trait impl
+                    classifier.save_to(&std::path::PathBuf::from("/tmp/fusion-dummy.bin"), b"LDAC", 8)
+                }
+                _ => Ok(()),
+            };
+            if let Err(e) = save_result {
+                eprintln!("warning: failed to persist updated classifier ({clf_name}): {e}");
+            }
+
+            eprintln!("[incremental] Indexed {fonts_indexed} new fonts, {new_glyphs_added} new glyph groups created");
+        }
+    }
 
     // All font access goes through the shared cache below.
 

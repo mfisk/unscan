@@ -324,8 +324,9 @@ modify the word bounding boxes:
 3. `clip_word_overlaps()` — clips horizontally overlapping word bboxes
 4. `drop_outlier_words()` — removes words with height ≥ 1.8× median
    word height AND confidence < 70 (filters image artifacts)
-5. `expand_bbox_to_ink()` — expands line bboxes to actual ink extent
-6. `expand_words_to_ink()` — expands word bboxes to actual ink extent
+5. `expand_words_to_ink()` — expands word bboxes to actual ink extent (line bbox is now derived as word-union; `expand_bbox_to_ink` was removed in cee0eee)
+
+Historical note: `expand_bbox_to_ink()` previously expanded line bboxes to ink extent for SSIM, but was replaced by word-union bbox (397d411) and removed (cee0eee). SSIM/verification now uses `word_union_bbox()` instead.
 
 The audit JSON stores both `word_bboxes_raw` (after step 1, before
 post-processing) and `word_bboxes` (after all steps) so the miss report
@@ -510,6 +511,32 @@ force it into CI candidate list.
 
 ---
 
+
+---
+
+## Cache Formats & Precision Audit (2026-07-18)
+
+All disk caches use minimal necessary precision — no f64 where f32 suffices, no u64 where u32 suffices:
+
+### On-disk types (all caches)
+- **Floats:** `f32` (4B) via `to_le_bytes()` / `from_le_bytes()` — `PerFontLda.projection`/`centroids`/`sigma_sq`, `MmapNgramModel` weights/vecs/sigma_sq/med_nn, `IndexedEntryFixed.sigma_sq_bits`/`med_nn_bits` (f32 bits stored as u32 for zero-copy alignment). **No f64 in any cache file.**
+- **Ints:** `u32` (4B) for counts, dims, offsets (`n_entries`, `n_centroids`, `vec_dim`, `seq_len`, `feat_dim`, `out_dim`, `n_classes`, `gids_off`, `weights_off`, `vecs_off`). File sizes <4GB so u32 offsets safe (not u64). `catalog_hash`/`image hash` = `u64` (8B) — justified for collision resistance (DefaultHasher 64-bit, stale-cache use on collision would be silent error). `char` codepoints = `u32` (Unicode scalar requires 21 bits). `hits`/`misses` = `u64` counters (2×8B per cache, negligible, never overflow).
+- **Potential savings (not worth complexity):**
+  - `seq_len` ≤16 could be `u8` (save 3B/entry), `n_groups`/`n_fonts` ≤256 could be `u16` (save 2B/group) — total <100KB for 70M glyph-map.
+  - `glyph_ids` (u32) per centroid: n_centroids <79 could be `u8`/`u16`, save ~200B/seq — negligible.
+  - `n_weights`/`vec_dim` ≤64 could be `u8`, but kept u32 for 4B alignment (required for `f32_slice` zero-copy).
+  - Font-key strings in `glyph-map.bin` dominate size (70M). String table + u16 indices would save ~20-30% but adds indirection.
+
+### In-memory LRU caches (conform to `src/font_cache.rs` contract)
+- `FontCache` and `PerFontLruCache` both: `Mutex<LruInner>` { `entries: HashMap<K, Arc<V>>`, `order: VecDeque<K>`, `capacity: usize`, `hits: u64`, `misses: u64` }, `HashMap::with_capacity(capacity)`, `VecDeque::with_capacity(capacity)`, promotion on `get()` via `order.remove(pos)` + `push_back()`, eviction via `while entries.len() >= capacity { pop_front() }`, `len()` + `stats()`.
+- `FontCache::DEFAULT_CAPACITY=64`, `PerFontLruCache::DEFAULT_CAPACITY=16` (16×~5-6MB ≈80-100MB peak vs unbounded 79-font ≈400MB+ → OOM on 7.8G no-swap VM).
+
+### Training-time f64 (not cached)
+- `src/classifier.rs` Fisher/Mahalanobis training uses `f64` for mean/variance/Cholesky for numerical stability, then converts to `f32` for cache. This is correct — not waste.
+
+**Conclusion:** No over-wide types in cache files. All caches already minimal precision. Only future win would be `f16` quantization for `lda-weights.bin` centroids/vecs (78M→~39M) but requires accuracy evaluation.
+
+
 ## Key Source Locations
 
 | What | File | Function / Line |
@@ -530,7 +557,11 @@ force it into CI candidate list.
 | CI search + scoring | `src/font_match.rs` | `identify_font()` |
 | Feature computation | `src/features.rs` | `compute_features()` |
 | Font-metric gap functions | `src/ocr.rs` | `font_ink_width()`, `font_pair_ink_gap()` |
-| Font cache (shared LRU) | `src/font_cache.rs` | `FontCache` |
+| Font cache (shared LRU) | `src/font_cache.rs` | `FontCache` — `Mutex<LruInner>` with `HashMap<PathBuf, Arc<Vec<u8>>>` + `VecDeque` ordering, `DEFAULT_CAPACITY=64`, `while len >= cap` eviction, `hits`/`misses` `(u64, u64)`. **All post-index font access via this cache.** |
+| Per-font LDA cache (shared LRU) | `src/classifier.rs` | `PerFontLruCache` — mirrors `FontCache` pattern: `Mutex<PerFontLruInner>` (`entries: HashMap<String, Arc<PerFontLda>>` + `order: VecDeque`, `capacity=16` ≈ 80-100 MB vs unbounded 79-font ≈400 MB), `while len >= cap` eviction, `hits`/`misses` counters, `len()`/`stats()`. **Conforms to `src/font_cache.rs` LRU contract.** |
+| Mmap Ngram caches (zero-copy) | `src/classifier.rs` | `MmapNgramModel::load_indexed()` — `memmap2::Mmap` for `lda-weights.bin` (78M), `fisher-weights.bin`, `triplet-weights.bin`, `mahalanobis-weights.bin`. Format: `IndexedHeader` (magic 4 + version u32 + catalog_hash u64 + n_fonts u32 + n_entries u32 + index_off u32 + data_off u32 = 32B), per-entry `IndexedEntryFixed` (n_weights u32, weights_off u32, n_centroids u32, gids_off u32, vecs_off u32, vec_dim u32, sigma_sq_bits u32, med_nn_bits u32 = 28B). All floats `f32` (4B), glyph IDs `u32`, offsets `u32` (<4GB). **Already mmap — not heap.** |
+| Glyph map cache | `src/glyph_map.rs` | `NgramGlyphMap` — `NGMP v3` binary (magic 4 + version u32 + catalog_hash u64 + n_entries u32 = 16B header). Per-entry: seq_len u32 + codepoints [u32; seq_len] + n_groups u32, per-group: hash u64 (image hash) + n_fonts u32 + per-font: key_len u32 + key bytes. `mmap` on load. **Precision:** `catalog_hash`/`hash` u64 (collision-safe), counts `u32` (max fonts <1000, could be u16 but 2B saving negligible), font keys as strings (dominant size — could use string table with u16 indices to save ~30% but adds complexity). |
+| Catalog / font-scan caches | `src/font_scan.rs`, `src/main.rs` | `catalog.bin` (`FONT` v1: magic 4 + version u32 + catalog_hash u64 + n_entries u32), `font_scan.bin` — font discovery results. `catalog_hash` = `DefaultHasher` of sorted `font_key`s (u64). Used for staleness detection of all derived caches. |
 | SSIM verification | `src/verify.rs` | `verify_text_region()` |
 | Segmentation diag overlay | `src/seg_diag.rs` | `save_split_overlay()` |
 | Span-level accuracy | `tools/verify-accuracy.py` | — |
