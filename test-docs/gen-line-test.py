@@ -1,39 +1,25 @@
 #!/usr/bin/env python3
-"""Generate a multi-line test PDF from scratch using shared font infrastructure.
+"""Generate a multi-line test PDF using WeasyPrint (Pango/HarfBuzz).
 
 Imports fc_find/SECTIONS from gen-specimen.py, canonical naming from
 pdf_font_annotate.py, and rasterization from rasterize.py.
 
 Usage:
-    python3 test-docs/gen-line-test.py <page> <line> [<line2> ...] [--audit-ref PATH]
+    python3 test-docs/gen-line-test.py <p:l> [<p:l> ...] [--audit-ref PATH]
 
 Reads BAP audit.json to find text/font for each line, then generates:
     test-docs/line-test-gt.pdf   — vector PDF with /UnprintCanonical metadata
     test-docs/line-test.pdf      — rasterized (300 DPI grayscale)
+
+Uses WeasyPrint (Pango/HarfBuzz backend) for proper OpenType kerning.
+Each line is rendered as a whole <p> element, producing proper per-word
+PDF text spans so ground-truth text lookup works correctly.
 """
 
 import importlib.util
 import json
-import os
 import sys
 from pathlib import Path
-
-import uharfbuzz as hb
-from reportlab.lib.pagesizes import letter
-from reportlab.pdfbase import pdfmetrics
-from reportlab.pdfbase.ttfonts import TTFont
-from reportlab.pdfgen import canvas as rl_canvas
-
-
-def _draw_edge_rules(canvas, doc):
-    """Draw horizontal rules at the very top and bottom edges of the page.
-    Gives detect_skew strong horizontal signal so it won't hallucinate
-    rotation on sparse pages. Placed far from text to avoid crop contamination."""
-    w, h = letter
-    canvas.setStrokeColor((0.3, 0.3, 0.3))
-    canvas.setLineWidth(1.0)
-    canvas.line(18, h - 18, w - 18, h - 18)  # top edge, 18pt from border
-    canvas.line(18, 18, w - 18, 18)            # bottom edge, 18pt from border
 
 SCRIPT_DIR = Path(__file__).resolve().parent
 REPO_ROOT = SCRIPT_DIR.parent
@@ -43,7 +29,7 @@ _spec = importlib.util.spec_from_file_location("gen_specimen", SCRIPT_DIR / "gen
 _gs = importlib.util.module_from_spec(_spec)
 _spec.loader.exec_module(_gs)
 fc_find = _gs.fc_find
-# Build family map from SECTIONS (FAMILIES is local to register_all_fonts)
+# Build family map from SECTIONS
 FAMILIES = {s["rl_font"]: s["font_family"] for s in _gs.SECTIONS}
 
 # Import shared tools
@@ -52,8 +38,13 @@ from pdf_font_annotate import read_postscript_name, make_weight_explicit, annota
 from rasterize import rasterize
 
 
+def _escape(text):
+    """Escape HTML special characters."""
+    return text.replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;").replace('"', "&quot;")
+
+
 def resolve_font(expected_font):
-    """Resolve expected_font string to (ttf_path, canonical_name)."""
+    """Resolve expected_font string to (ttf_path, canonical_name, css_weight, css_style)."""
     font_base = expected_font.split('-')[0] if '-' in expected_font else expected_font
     for suffix in ['Italic', 'It']:
         font_base = font_base.replace(suffix, '')
@@ -63,45 +54,24 @@ def resolve_font(expected_font):
         raise RuntimeError(f"'{font_base}' not in FAMILIES")
 
     style = "Regular"
+    css_weight = "400"
+    css_style = "normal"
     if "Bold" in expected_font or "-700" in expected_font or "-600" in expected_font:
         style = "Bold"
+        # The TTF is already the bold weight — tell Pango font-weight: normal
+        # so it doesn't append "-Bold" to the embedded PS name.
+        css_weight = "400"
     elif "Italic" in expected_font or "It" in expected_font.split('-')[-1]:
         style = "Italic"
+        css_style = "italic"
 
     ttf_path = fc_find(fc_family, style)
     _, canonical_name, _ = make_weight_explicit(ttf_path)
-    return ttf_path, canonical_name
-
-
-def shape_text(ttf_path, text, font_size):
-    """Shape text with HarfBuzz, returning per-character x positions in points.
-    Kerning is applied; ligatures are disabled to match specimen rendering."""
-    blob = hb.Blob.from_file_path(ttf_path)
-    face = hb.Face(blob)
-    font = hb.Font(face)
-    upem = face.upem
-    font.scale = (upem, upem)
-
-    buf = hb.Buffer()
-    buf.add_str(text)
-    buf.guess_segment_properties()
-    hb.shape(font, buf, {"kern": True, "liga": False, "clig": False})
-
-    scale = font_size / upem
-    positions = buf.glyph_positions
-    infos = buf.glyph_infos
-
-    result = []  # (cluster_index, x_pt)
-    x = 0.0
-    for info, pos in zip(infos, positions):
-        result.append((info.cluster, x * scale))
-        x += pos.x_advance
-
-    return result, x * scale
+    return ttf_path, canonical_name, css_weight, css_style
 
 
 def main():
-    # Parse args: page line1 [line2 ...] [--audit-ref PATH]
+    # Parse args: p:l [p:l ...] [--audit-ref PATH]
     args = sys.argv[1:]
     audit_ref = str(SCRIPT_DIR / "audit" / "audit.json")
     if "--audit-ref" in args:
@@ -109,8 +79,8 @@ def main():
         audit_ref = args[idx + 1]
         args = args[:idx] + args[idx + 2:]
 
-    if len(args) < 2:
-        print("Usage: gen-line-test.py <page> <line> [<line2> ...] or <p:l> [<p:l> ...]")
+    if len(args) < 1:
+        print("Usage: gen-line-test.py <p:l> [<p:l> ...] [--audit-ref PATH]")
         sys.exit(1)
 
     # Support both "page line1 line2" and "page:line page:line" formats
@@ -125,7 +95,10 @@ def main():
 
     # Collect entries and fonts for each line
     canonical_map = {}
-    lines = []  # (text, canonical_name, ttf_path)
+    lines = []  # (text, canonical_name, ttf_path, css_weight, css_style)
+    font_face_rules = []
+    seen_faces = set()
+
     for (page, li) in page_lines:
         entries = [e for e in audit['text_entries']
                    if e.get('page') == page and e.get('line_index') == li]
@@ -140,49 +113,77 @@ def main():
             text += '.'
         print(f"p{page}:L{li}: text='{text}', expected={expected_font}")
 
-        ttf_path, canonical_name = resolve_font(expected_font)
+        ttf_path, canonical_name, css_weight, css_style = resolve_font(expected_font)
         print(f"  font: {ttf_path}, canonical: {canonical_name}")
 
-        # Register if not already
-        try:
-            pdfmetrics.getFont(canonical_name)
-        except KeyError:
-            pdfmetrics.registerFont(TTFont(canonical_name, ttf_path))
-
         # Track for annotation
-        ps_name = read_postscript_name(ttf_path)
+        ps_name = read_postscript_name(str(ttf_path))
         canonical_map[ps_name] = canonical_name
         canonical_map[canonical_name] = canonical_name
 
-        lines.append((text, canonical_name, str(ttf_path)))
+        # Generate @font-face CSS (deduplicated)
+        face_key = (canonical_name, css_weight, css_style)
+        if face_key not in seen_faces:
+            seen_faces.add(face_key)
+            font_face_rules.append(
+                f"@font-face {{\n"
+                f"  font-family: '{canonical_name}';\n"
+                f"  src: url('file://{ttf_path}') format('truetype');\n"
+                f"  font-weight: {css_weight};\n"
+                f"  font-style: {css_style};\n"
+                f"}}"
+            )
 
-    # Build vector PDF with HarfBuzz-kerned text
+        lines.append((text, canonical_name, str(ttf_path), css_weight, css_style))
+
+    # Build HTML
+    font_face_css = "\n".join(font_face_rules)
+    font_size = 9  # pt
+
+    lines_html = []
+    for text, canonical_name, ttf_path, css_weight, css_style in lines:
+        lines_html.append(
+            f'<p style="font-family: \'{canonical_name}\'; '
+            f'font-weight: {css_weight}; font-style: {css_style};">'
+            f'{_escape(text)}</p>'
+        )
+
+    all_lines = "\n".join(lines_html)
+
+    html = f"""<!DOCTYPE html>
+<html>
+<head>
+<meta charset="utf-8">
+<style>
+{font_face_css}
+
+@page {{
+  size: 8.5in 11in;
+  margin: 1in 1in;
+}}
+
+body {{
+  font-size: {font_size}pt;
+  line-height: 1.2;
+  color: black;
+}}
+
+p {{
+  margin: 0;
+  padding: 0;
+}}
+</style>
+</head>
+<body>
+{all_lines}
+</body>
+</html>"""
+
+    # Render with WeasyPrint
+    import weasyprint
     gt_pdf = str(SCRIPT_DIR / "line-test-gt.pdf")
-    w, h = letter
-    font_size = 9
-    leading = 10.8
-    left_margin = 72
-
-    c = rl_canvas.Canvas(gt_pdf, pagesize=letter)
-
-    # Edge rules (same as before — gives detect_skew horizontal signal)
-    c.setStrokeColor((0.3, 0.3, 0.3))
-    c.setLineWidth(1.0)
-    c.line(18, h - 18, w - 18, h - 18)
-    c.line(18, 18, w - 18, 18)
-
-    # Draw each line with HarfBuzz kerning
-    y = h - 72 - font_size  # first baseline: top margin + descend one line
-    for text, canonical_name, ttf_path in lines:
-        c.setFont(canonical_name, font_size)
-        char_positions, total_w = shape_text(ttf_path, text, font_size)
-
-        for cluster_idx, x_pt in char_positions:
-            c.drawString(left_margin + x_pt, y, text[cluster_idx])
-
-        y -= leading
-
-    c.save()
+    doc = weasyprint.HTML(string=html, base_url=str(SCRIPT_DIR))
+    doc.write_pdf(gt_pdf)
     print(f"wrote: {gt_pdf}")
 
     # Annotate /UnprintCanonical
