@@ -40,8 +40,8 @@ debug = 0
 
 [alias]
 # fast iteration — uses 2 jobs for parallelism (safe: fastbuild is low-RAM)
-fastbuild = "build --profile fastbuild --config build.jobs=2"
-lob = "build --profile fastbuild --config build.jobs=2"
+fastbuild = "build --profile fastbuild --config build.jobs=1"
+lob = "build --profile fastbuild --config build.jobs=1"
 # super optimized — forced to 1 job to avoid OOM with fat LTO + codegen-units=1
 release-optimized = "build --profile release --config build.jobs=1"
 dist = "build --profile portable --config build.jobs=1 --config 'target.x86_64-unknown-linux-gnu.rustflags=[\"-C\", \"link-arg=-fuse-ld=mold\"]'"
