@@ -849,7 +849,7 @@ fn detect_ot_variants(data: &[u8]) -> Vec<(String, Vec<(char, u16)>)> {
 /// Ligature probe sequences: (input_chars, unicode_ligature_char).
 /// We shape the input chars with liga/dlig features and check if the
 /// shaper produces a single glyph (i.e. a ligature substitution fired).
-const LIGATURE_PROBES: &[(&str, char)] = &[
+pub(crate) const LIGATURE_PROBES: &[(&str, char)] = &[
     ("ff",  '\u{FB00}'),
     ("fi",  '\u{FB01}'),
     ("fl",  '\u{FB02}'),

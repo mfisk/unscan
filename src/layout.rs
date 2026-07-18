@@ -210,9 +210,24 @@ impl ShapedWord {
 pub fn shape_word(face: &rustybuzz::Face, features: &[rustybuzz::Feature], text: &str) -> Option<ShapedWord> {
     let units_per_em = face.units_per_em() as f64;
 
+    // Per-word ligature control: plain words like ['f','f'] (two f's) must be
+    // scored as two individual f's without ligature. Ligature words like
+    // ['\u{FB00}'] contain a ligature codepoint and must keep liga on to get
+    // a single combined bbox. Use canonical list from font_scan.
+    let is_lig_word = text.chars().any(|c| crate::font_scan::is_ligature_char(c));
+    let features_for_shape: Vec<rustybuzz::Feature> = if is_lig_word {
+        features.to_vec()
+    } else {
+        let mut v = Vec::with_capacity(features.len() + 2);
+        v.extend_from_slice(features);
+        v.push(rustybuzz::Feature::new(rustybuzz::ttf_parser::Tag::from_bytes(b"liga"), 0, ..));
+        v.push(rustybuzz::Feature::new(rustybuzz::ttf_parser::Tag::from_bytes(b"dlig"), 0, ..));
+        v
+    };
+
     let mut buffer = rustybuzz::UnicodeBuffer::new();
     buffer.push_str(text);
-    let glyphs = rustybuzz::shape(face, features, buffer);
+    let glyphs = rustybuzz::shape(face, &features_for_shape, buffer);
     let positions = glyphs.glyph_positions();
     let infos = glyphs.glyph_infos();
 

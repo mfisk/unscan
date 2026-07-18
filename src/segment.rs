@@ -1230,7 +1230,7 @@ fn collapse_ligature_chars(chars: &[char]) -> Vec<char> {
 
 /// Ligature sequences: (char_sequence, unicode_ligature_char).
 /// Longer sequences first so ffi/ffl match before ff/fi/fl.
-const LIGATURE_SEQUENCES: &[(&[char], char)] = &[
+pub(crate) const LIGATURE_SEQUENCES: &[(&[char], char)] = &[
     (&['f', 'f', 'i'], '\u{FB03}'),  // ffi
     (&['f', 'f', 'l'], '\u{FB04}'),  // ffl
     (&['f', 'f'],      '\u{FB00}'),  // ff
