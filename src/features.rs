@@ -540,10 +540,14 @@ pub fn compute_features(img: &GrayImage, pre_normalized: bool) -> Option<CropFea
     let bbox_area = ink_w * ink_h;
     let ink_density = ink_pixels as f32 / bbox_area.max(1.0);
     let v_center = (wy_sum / total_ink as f64) as f32 / h as f32;
-    let ink_mid_x = (min_x + max_x) / 2;
 
     let ink_w_u = (max_x - min_x + 1) as usize;
     let ink_h_u = (max_y - min_y + 1) as usize;
+    // h_balance: left-half ink / total ink, split at ink-bbox midpoint
+    // (not image midpoint w/2 — that would bias for off-center glyphs).
+    // Use local x within ink bbox: midpoint = (ink_w - 1)/2 ensures even
+    // widths split 2|2 rather than 3|1.
+    let ink_mid_lx = (ink_w_u - 1) / 2;
 
     // Second pass over ink bbox only: col_ink, row_ink, left_ink, ink_mask
     let mut col_ink = vec![0.0f32; ink_w_u];
@@ -561,7 +565,7 @@ pub fn compute_features(img: &GrayImage, pre_normalized: bool) -> Option<CropFea
                 col_ink[lx] += ink_val;
                 row_ink[ly] += ink_val;
                 ink_mask[ly * ink_w_u + lx] = true;
-                if x <= ink_mid_x {
+                if lx <= ink_mid_lx {
                     left_ink += ink_val as u64;
                 }
             }
