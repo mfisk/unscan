@@ -42,8 +42,8 @@ split-debuginfo = "off"
 
 [profile.release]
 opt-level = 3
-lto = "fat"
-codegen-units = 1
+lto = "thin"
+codegen-units = 2
 panic = "abort"
 strip = "debuginfo"
 
@@ -62,8 +62,8 @@ profile = ["pprof"]
 [profile.portable]
 inherits = "release"
 opt-level = 3
-lto = "fat"
-codegen-units = 1
+lto = "thin"
+codegen-units = 2
 panic = "abort"
 strip = "debuginfo"
 

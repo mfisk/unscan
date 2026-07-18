@@ -15,8 +15,8 @@ lto = false
 split-debuginfo = "off"
 
 [profile.release]
-codegen-units = 1
-lto = "fat"
+codegen-units = 2
+lto = "thin"
 opt-level = 3
 panic = "abort"
 strip = "debuginfo"
@@ -24,8 +24,8 @@ debug = 0
 split-debuginfo = "off"
 
 [profile.portable]
-codegen-units = 1
-lto = "fat"
+codegen-units = 2
+lto = "thin"
 opt-level = 3
 panic = "abort"
 strip = "debuginfo"
