@@ -3263,11 +3263,57 @@ pub fn build_classifier(
 // Each font's classifier is cached to its own file under
 // ~/.cache/unprint/per-font-lda/<hash>.bin
 
+use std::collections::VecDeque;
 use std::sync::Mutex;
 
-/// In-memory cache of loaded per-font classifiers, keyed by font_key.
-static PER_FONT_CACHE: std::sync::LazyLock<Mutex<HashMap<String, std::sync::Arc<PerFontLda>>>> =
-    std::sync::LazyLock::new(|| Mutex::new(HashMap::new()));
+/// LRU cache for per-font classifiers — caps memory at ~16 fonts (~70-90M)
+/// instead of unbounded HashMap that could hold 79 fonts (~400M+).
+/// Front = least-recent, back = most-recent.
+struct PerFontLruCache {
+    map: HashMap<String, std::sync::Arc<PerFontLda>>,
+    order: VecDeque<String>,
+    cap: usize,
+}
+
+impl PerFontLruCache {
+    fn new(cap: usize) -> Self {
+        Self { map: HashMap::new(), order: VecDeque::new(), cap }
+    }
+    fn get(&mut self, key: &str) -> Option<std::sync::Arc<PerFontLda>> {
+        if let Some(v) = self.map.get(key) {
+            // Promote to most-recent
+            if let Some(pos) = self.order.iter().position(|k| k == key) {
+                self.order.remove(pos);
+            }
+            self.order.push_back(key.to_string());
+            Some(v.clone())
+        } else {
+            None
+        }
+    }
+    fn put(&mut self, key: String, value: std::sync::Arc<PerFontLda>) {
+        if self.map.contains_key(&key) {
+            self.map.insert(key.clone(), value);
+            if let Some(pos) = self.order.iter().position(|k| k == &key) {
+                self.order.remove(pos);
+            }
+            self.order.push_back(key);
+            return;
+        }
+        if self.map.len() >= self.cap {
+            if let Some(old) = self.order.pop_front() {
+                self.map.remove(&old);
+            }
+        }
+        self.order.push_back(key.clone());
+        self.map.insert(key, value);
+    }
+}
+
+/// In-memory LRU cache of loaded per-font classifiers, keyed by font_key.
+/// Cap 16 keeps peak ~80-100M vs unbounded ~400M+ for 79-font specimen.
+static PER_FONT_CACHE: std::sync::LazyLock<Mutex<PerFontLruCache>> =
+    std::sync::LazyLock::new(|| Mutex::new(PerFontLruCache::new(16)));
 
 /// Per-font 1-gram LDA classifier using HOG features.
 ///
@@ -3312,9 +3358,9 @@ impl PerFontLda {
         font_key: &str,
         ctx: &crate::train::TrainingContext,
     ) -> Option<std::sync::Arc<Self>> {
-        // Check in-memory cache first
+        // Check in-memory cache first (LRU, cap 16)
         {
-            let cache = PER_FONT_CACHE.lock().unwrap();
+            let mut cache = PER_FONT_CACHE.lock().unwrap();
             if let Some(arc) = cache.get(font_key) {
                 return Some(arc.clone());
             }
@@ -3325,7 +3371,7 @@ impl PerFontLda {
         if path.exists() {
             if let Some(clf) = Self::load(&path, font_key, ctx.catalog_hash) {
                 let arc = std::sync::Arc::new(clf);
-                PER_FONT_CACHE.lock().unwrap().insert(font_key.to_string(), arc.clone());
+                PER_FONT_CACHE.lock().unwrap().put(font_key.to_string(), arc.clone());
                 return Some(arc);
             }
             // Stale or corrupt — fall through to retrain
@@ -3337,7 +3383,7 @@ impl PerFontLda {
             eprintln!("Warning: could not cache per-font LDA for {font_key}: {e}");
         }
         let arc = std::sync::Arc::new(clf);
-        PER_FONT_CACHE.lock().unwrap().insert(font_key.to_string(), arc.clone());
+        PER_FONT_CACHE.lock().unwrap().put(font_key.to_string(), arc.clone());
         Some(arc)
     }
 
