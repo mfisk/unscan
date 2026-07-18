@@ -27,3 +27,5 @@ pub mod ngram;
 pub mod hog;
 
 pub mod atomic_file;
+pub mod geo_cache;
+pub mod geometry_classifier;
