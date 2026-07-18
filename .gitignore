@@ -54,3 +54,6 @@ hill-climb-test.sh
 audit-prev.json
 *.bak*
 workspace/
+# JSON - ignore all (per 2026-07-18 cleanup)
+*.json
+**/*.json
