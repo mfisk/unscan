@@ -149,6 +149,12 @@ pub fn identify_fonts(
     }
 
     let n_windows = crop_data.len();
+    // Minimum coverage: require at least 40% of windows or 3 observations
+    // to prevent a font matching only 1/20 chars from getting a perfect
+    // score (gap=0 on a single observation → score=0).
+    let min_coverage = ((n_windows as f32 * 0.4).ceil() as usize)
+        .max(3)
+        .min(n_windows);
 
     // ── Stage 1: per-window classification → candidate set ─────────
     let mut candidate_set: HashSet<String> = HashSet::new();
@@ -240,6 +246,9 @@ pub fn identify_fonts(
                 })
                 .collect();
             if log_probs.len() < n_scoring { return None; }
+            // Require minimum character coverage so a font matching only
+            // 1/20 windows cannot get a perfect score.
+            if log_probs.len() < min_coverage { return None; }
             Some((font_key, log_probs))
         })
         .collect();
