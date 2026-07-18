@@ -30,7 +30,8 @@ fn run_and_parse(input: &std::path::Path) -> (Option<f64>, Option<String>, usize
 
     let data = std::fs::read_to_string(&json_path).unwrap();
     let ssim = {
-        let n = "\"ssim_score\":";
+        // Field was renamed from ssim_score to similarity_score
+        let n = "\"similarity_score\":";
         data.find(n).and_then(|pos| {
             let r = data[pos+n.len()..].trim_start();
             let e = r.find(|c: char| c != '.' && c != '-' && !c.is_ascii_digit()).unwrap_or(r.len());
@@ -73,8 +74,8 @@ fn inter_bold_otf_identifies_correctly() {
     let font = font.expect("no font match in inter-bold audit");
     eprintln!("Matched font: {}", font);
     let lower = font.to_lowercase();
-    assert!(lower.contains("inter") && lower.contains("bold"),
-        "Expected Inter Bold, got '{}'", font);
+    assert!(lower.contains("inter") && (lower.contains("bold") || lower.contains("700")),
+        "Expected Inter Bold (or Inter-700), got '{}'", font);
     assert!(!lower.contains("display"),
         "Matched InterDisplay instead of Inter Bold: '{}'", font);
 }

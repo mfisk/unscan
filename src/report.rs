@@ -293,7 +293,7 @@ fn classify_entries<'a>(
     entries: &'a [AuditEntry],
     gt: Option<&GroundTruth>,
     dpi: u32,
-    _font_catalog: &[FontEntry],
+    font_catalog: &[FontEntry],
     _glyph_map: &NgramGlyphMap,
 ) -> Vec<ClassifiedEntry<'a>> {
     entries
@@ -1624,7 +1624,7 @@ fn build_observation_table(
     gt_score: Option<f32>,
     font_data_cache: &mut FontDataCache,
     diag_dir: Option<&Path>,
-    font_catalog: &[FontEntry],
+    _font_catalog: &[FontEntry],
     glyph_map: &NgramGlyphMap,
     crop_dir_name: &str,
 ) -> String {

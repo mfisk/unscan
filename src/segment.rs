@@ -57,7 +57,7 @@ fn seam_params() -> &'static SeamParams {
 /// Per-pixel ink score: base traversal cost for the seam path.
 #[inline]
 fn ink_score(darkness: f32, row: usize, row_ink: &[f32]) -> f32 {
-    let _p = seam_params();
+    let p = seam_params();
     let base = if p.ink_power == 1.0 { darkness } else { darkness.powf(p.ink_power) }
         / p.ink_norm;
     if p.ink_row_weight == 0.0 {

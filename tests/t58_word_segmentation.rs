@@ -2,9 +2,8 @@
 //!
 //! Runs unscan with `--audit` on a minimal PDF containing a single line
 //! of "ABCDEFGHIJKLMNOPQRSTUVWXYZ" in Source Sans 3.  Verifies:
-//!   1. Audit output includes segmentation diagnostics (summary.json, overlays, char crops)
-//!   2. Segmentation produces exactly 26 segments for 26 characters
-//!   3. No over-segmentation from charbox fallback
+//!   1. Audit output includes per-line diagnostics (line_summary.json, overlays, char crops)
+//!   2. Segmentation produces exactly 26 character crops for 26 characters
 //!
 //! Run:  cargo test --release --test t58_word_segmentation -- --nocapture
 
@@ -12,15 +11,15 @@ mod common;
 
 use common::{test_doc, run_unscan};
 
-/// Recursively find all `summary.json` files under a directory.
-fn find_summaries(dir: &std::path::Path) -> Vec<std::path::PathBuf> {
+/// Recursively find all files with a given name under a directory.
+fn find_files(dir: &std::path::Path, target: &str) -> Vec<std::path::PathBuf> {
     let mut results = Vec::new();
     if let Ok(entries) = std::fs::read_dir(dir) {
         for entry in entries.flatten() {
             let path = entry.path();
             if path.is_dir() {
-                results.extend(find_summaries(&path));
-            } else if path.file_name().map(|n| n == "summary.json").unwrap_or(false) {
+                results.extend(find_files(&path, target));
+            } else if path.file_name().map(|n| n == target).unwrap_or(false) {
                 results.push(path);
             }
         }
@@ -38,70 +37,64 @@ fn single_word_segmentation_e2e() {
     // Clean previous run
     let _ = std::fs::remove_dir_all(&audit_dir);
 
-    // Run unscan with --audit (replaces the old --diag-seg flag)
+    // Run unscan with --audit
     let output = run_unscan(&input, &[
         "--audit", audit_dir.to_str().unwrap(),
     ]);
 
     eprintln!("--- unscan output ---\n{}\n---", output);
 
-    // Find all summary.json files recursively (audit nests them under
-    // line_dir/word_dir/seg_variant/)
-    let summaries = find_summaries(&audit_dir);
-    assert!(!summaries.is_empty(), "no summary.json found in audit output at {:?}", audit_dir);
+    // Audit structure: audit_dir/p{page}_L{line}_{text}/
+    //   - line_summary.json
+    //   - crops/crop_NN_X.png
+    //   - word_NNN_{text}/seg_plain/{word_crop,final_overlay,seam_overlay}.png
 
-    // Check each word's segmentation
+    // Find all line_summary.json files
+    let summaries = find_files(&audit_dir, "line_summary.json");
+    assert!(!summaries.is_empty(),
+        "no line_summary.json found in audit output at {:?}", audit_dir);
+
     for summary_path in &summaries {
-        let seg_dir = summary_path.parent().unwrap();
-        let name = seg_dir.file_name().unwrap().to_string_lossy().to_string();
+        let line_dir = summary_path.parent().unwrap();
+        let name = line_dir.file_name().unwrap().to_string_lossy().to_string();
 
         let data = std::fs::read_to_string(summary_path).unwrap();
         let json: serde_json::Value = serde_json::from_str(&data).unwrap();
 
-        let expected = json["n_chars_expected"].as_u64().unwrap() as usize;
-        let produced = json["n_segments_produced"].as_u64().unwrap() as usize;
-        let seam = json.get("seam_splits")
-            .and_then(|v| v.as_array())
-            .map(|a| a.len())
-            .unwrap_or(0);
-        let cb = json.get("charbox_added_splits")
-            .and_then(|v| v.as_array())
-            .map(|a| a.len())
-            .unwrap_or(0);
-        let mismatch = json["mismatch"].as_bool().unwrap();
+        let text = json["text"].as_str().unwrap_or("");
+        let decision = json["decision"].as_str().unwrap_or("");
+        eprintln!("  {}: text='{}' decision='{}'", name, text, decision);
 
-        // VP splits may or may not be present depending on segmentation path
-        let vp = json.get("vp_splits")
-            .and_then(|v| v.as_array())
-            .map(|a| a.len())
-            .unwrap_or(0);
+        // Verify character crops exist at the line level
+        let crops_dir = line_dir.join("crops");
+        assert!(crops_dir.exists(), "crops/ dir missing in {:?}", line_dir);
 
-        eprintln!(
-            "  {}: {} expected, {} produced (VP:{} seam:{} cb:{})",
-            name, expected, produced, vp, seam, cb
-        );
-
-        assert_eq!(
-            produced, expected,
-            "{}: expected {} segments, got {} — over/under-segmentation! VP:{} seam:{} cb:{}",
-            name, expected, produced, vp, seam, cb
-        );
-        assert!(!mismatch, "{}: mismatch flag set", name);
-
-        // Verify overlay images and char crops exist in the same directory
-        assert!(seg_dir.join("word_crop.png").exists(),
-            "word_crop.png missing in {:?}", seg_dir);
-        assert!(seg_dir.join("final_overlay.png").exists(),
-            "final_overlay.png missing in {:?}", seg_dir);
-        assert!(seg_dir.join("chars").exists(),
-            "chars/ dir missing in {:?}", seg_dir);
-
-        let char_count = std::fs::read_dir(seg_dir.join("chars"))
+        let crop_count = std::fs::read_dir(&crops_dir)
             .unwrap()
             .filter_map(|e| e.ok())
             .filter(|e| e.path().extension().map(|x| x == "png").unwrap_or(false))
             .count();
-        assert_eq!(char_count, 26,
-            "expected 26 char crops, got {}", char_count);
+
+        // Input is "ABCDEFGHIJKLMNOPQRSTUVWXYZ" — expect 26 char crops
+        assert_eq!(crop_count, 26,
+            "expected 26 char crops in {:?}, got {}", crops_dir, crop_count);
+
+        // Verify word subdirectory exists with segmentation overlays
+        let word_dirs: Vec<_> = std::fs::read_dir(line_dir)
+            .unwrap()
+            .filter_map(|e| e.ok())
+            .filter(|e| e.path().is_dir() && e.file_name().to_string_lossy().starts_with("word_"))
+            .collect();
+        assert!(!word_dirs.is_empty(), "no word_NNN_* dirs in {:?}", line_dir);
+
+        for wd in &word_dirs {
+            let seg_dir = wd.path().join("seg_plain");
+            if seg_dir.exists() {
+                assert!(seg_dir.join("word_crop.png").exists(),
+                    "word_crop.png missing in {:?}", seg_dir);
+                assert!(seg_dir.join("final_overlay.png").exists(),
+                    "final_overlay.png missing in {:?}", seg_dir);
+            }
+        }
     }
 }

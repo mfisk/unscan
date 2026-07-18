@@ -328,6 +328,20 @@ fn sq_euclid(a: &[f32], b: &[f32]) -> f32 {
 
 // ---------------------------------------------------------------------------
 
+#[allow(dead_code)] // called from ngram.rs (currently dead-code module)
+pub fn pairwise_sigma_sq(centroids: &[(u32, Vec<f32>)]) -> f32 {
+    let n = centroids.len();
+    if n < 2 { return 0.0; }
+    let mut dists: Vec<f32> = Vec::with_capacity(n * (n - 1) / 2);
+    for i in 0..n {
+        for j in (i + 1)..n {
+            dists.push(sq_euclid(&centroids[i].1, &centroids[j].1));
+        }
+    }
+    dists.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
+    dists[dists.len() / 2]
+}
+
 
 pub struct ImageModel {
     /// Classifier-specific weights as a flat f32 blob.
