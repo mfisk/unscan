@@ -1,2 +1,50 @@
 [build]
-rustflags = ["-C", "target-cpu=native", "-C", "link-arg=-fuse-ld=mold"]
+jobs = 1
+pipelining = true
+
+# default for x86_64 = AVX (native) + mold — fast local builds
+[target.x86_64-unknown-linux-gnu]
+linker = "clang"
+rustflags = ["-C", "link-arg=-fuse-ld=mold", "-C", "target-cpu=native"]
+
+[profile.fastbuild]
+codegen-units = 64
+incremental = true
+debug = 0
+lto = false
+split-debuginfo = "off"
+
+[profile.release]
+codegen-units = 1
+lto = "fat"
+opt-level = 3
+panic = "abort"
+strip = "debuginfo"
+debug = 0
+split-debuginfo = "off"
+
+[profile.portable]
+codegen-units = 1
+lto = "fat"
+opt-level = 3
+panic = "abort"
+strip = "debuginfo"
+debug = 0
+split-debuginfo = "off"
+
+[profile.test]
+inherits = "dev"
+
+[profile.dev.build-override]
+debug = 0
+
+[alias]
+# fast iteration — uses 2 jobs for parallelism (safe: fastbuild is low-RAM)
+fastbuild = "build --profile fastbuild --config build.jobs=2"
+lob = "build --profile fastbuild --config build.jobs=2"
+# super optimized — forced to 1 job to avoid OOM with fat LTO + codegen-units=1
+release-optimized = "build --profile release --config build.jobs=1"
+dist = "build --profile portable --config build.jobs=1 --config 'target.x86_64-unknown-linux-gnu.rustflags=[\"-C\", \"link-arg=-fuse-ld=mold\"]'"
+# portable = generic x86-64 (no native), + 1 job
+portable = "build --profile portable --config build.jobs=1 --config 'target.x86_64-unknown-linux-gnu.rustflags=[\"-C\", \"link-arg=-fuse-ld=mold\"]'"
+portable-release = "build --profile portable --config build.jobs=1 --config 'target.x86_64-unknown-linux-gnu.rustflags=[\"-C\", \"link-arg=-fuse-ld=mold\"]'"

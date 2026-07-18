@@ -30,15 +30,22 @@ subsetter = "0.2"
 base64 = "0.22.1"
 rand = { version = "0.8", features = ["small_rng"] }
 
-# Fast iteration: opt-level 1 gives ~10x runtime speedup over opt-level 0
-# while keeping incremental compilation fast
-[profile.dev]
-opt-level = 1
-split-debuginfo = "unpacked"
+# dev is left on cargo defaults (opt-level=0, debug=true, incremental) - fastest iteration with debuginfo
+# fastbuild is explicit fastest compile, no debuginfo, lowest RAM
+[profile.fastbuild]
+inherits = "dev"
+opt-level = 0
+debug = 0
+lto = false
+codegen-units = 64
+split-debuginfo = "off"
 
 [profile.release]
+opt-level = 3
 lto = "fat"
 codegen-units = 1
+panic = "abort"
+strip = "debuginfo"
 
 [dependencies.memmap2]
 version = "0.9"
@@ -50,3 +57,13 @@ optional = true
 
 [features]
 profile = ["pprof"]
+
+# portable = release build but without target-cpu=native — for distribution
+[profile.portable]
+inherits = "release"
+opt-level = 3
+lto = "fat"
+codegen-units = 1
+panic = "abort"
+strip = "debuginfo"
+
