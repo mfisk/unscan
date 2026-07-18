@@ -3,150 +3,43 @@
 
 Outputs:
   font-timeline-specimen.pdf        — vector PDF with embedded fonts
-  font-timeline-specimen-scanned.pdf — rasterized with scan artifacts
+  font-timeline-specimen-rasterized.pdf — rasterized version
 
 Uses WeasyPrint (Pango/HarfBuzz backend) for proper OpenType kerning.
 Each section is rendered in the font it describes.  The PDF is then annotated
 with /UnprintCanonical entries mapping raw PostScript names to weight-explicit
-canonical names, and a rasterized "scanned" version is generated.
+canonical names, and a rasterized version is generated.
+
+Refactored to share font resolution, HTML escaping, @font-face CSS, and PDF
+canonical-map logic via gen_common.py (single source of truth).
 """
 
-import os, sys, subprocess
 from pathlib import Path
 
 SCRIPT_DIR = Path(__file__).resolve().parent
 OUT_DIR = SCRIPT_DIR
 
-
-
-
-# ---------------------------------------------------------------------------
-# Font resolution via fontconfig
-# ---------------------------------------------------------------------------
-
-def fc_find(family, style="Regular"):
-    """Find a font file via fontconfig for the given family and style.
-
-    Resolution is strict and deterministic:
-    1. Query fontconfig for candidates matching family + style.
-    2. Filter to normal-width (.ttf) candidates with the exact target weight.
-       Prefer static fonts over variable fonts at this step.
-    3. If no exact-weight static font, find a variable font that covers the
-       target weight on its wght axis and instantiate it.
-    4. If none of the above, raise an error.  No silent fallbacks.
-    """
-    from fontTools.ttLib import TTFont as FTFont
-
-    STYLE_WEIGHTS = {
-        "Regular": 400, "Bold": 700, "Light": 300,
-        "Medium": 500, "SemiBold": 600, "ExtraBold": 800, "Black": 900,
-        "Italic": 400, "Bold Italic": 700,
-    }
-    target_weight = STYLE_WEIGHTS.get(style, 400)
-    NORMAL_WIDTH = 5  # usWidthClass: 5 = normal
-
-    candidates = []
-    for query in [f"{family}:style={style}", family]:
-        r = subprocess.run(
-            ["fc-list", query, "--format=%{file}\n"],
-            capture_output=True, text=True,
-        )
-        for line in r.stdout.strip().split("\n"):
-            if line and line.lower().endswith(".ttf") and line not in candidates:
-                candidates.append(line)
-
-    if not candidates:
-        raise RuntimeError(f"fc_find: no .ttf candidates for '{family}' style='{style}'")
-
-    exact_static = []
-    variable = []
-
-    for path in candidates:
-        try:
-            tt = FTFont(path)
-            wt = tt["OS/2"].usWeightClass
-            wd = tt["OS/2"].usWidthClass
-            fvar = tt.get("fvar")
-            is_var = fvar is not None
-            wght_range = None
-            if is_var:
-                for axis in fvar.axes:
-                    if axis.axisTag == "wght":
-                        wght_range = (axis.minValue, axis.maxValue)
-                        break
-            tt.close()
-        except Exception:
-            continue
-
-        if wd != NORMAL_WIDTH:
-            continue
-
-        if not is_var and wt == target_weight:
-            exact_static.append(path)
-        elif is_var and wght_range and wght_range[0] <= target_weight <= wght_range[1]:
-            variable.append(path)
-
-    if exact_static:
-        for p in exact_static:
-            if "/specimen-fonts/" not in p:
-                return p
-        return exact_static[0]
-
-    if variable:
-        # WeasyPrint/Pango handles variable fonts natively — no instantiation needed.
-        # The @font-face CSS specifies the target weight; Pango shapes at that weight.
-        return variable[0]
-
-    raise RuntimeError(
-        f"fc_find: no font for '{family}' style='{style}' (weight={target_weight}). "
-        f"Candidates: {candidates}"
-    )
-
-
-# Shared font annotation utilities
-sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", "tools"))
-from pdf_font_annotate import make_weight_explicit, annotate_canonical_names
+# Shared utilities — single source of truth for font finding / PDF pipeline
+from gen_common import (
+    FAMILIES,
+    fc_find,
+    escape_html as _escape,
+    build_font_face_css as _font_face_css_from_entries,
+    build_canonical_map_from_pdf,
+    render_html_to_pdf,
+)
+from pdf_font_annotate import annotate_canonical_names
 
 
 # ---------------------------------------------------------------------------
-# Font families to include in the specimen
+# Font families to include in the specimen — primary families only
 # ---------------------------------------------------------------------------
+# NOTE: Full family registry (including aliases like ArialMT -> Arial) lives
+# in gen_common.FAMILIES. We filter to primary specimen families here.
 
-FAMILIES = {
-    # Google Fonts
-    "EBGaramond": "EB Garamond",
-    "LibreCaslonText": "Libre Caslon Text",
-    "LibreBaskerville": "Libre Baskerville",
-    "LibreBodoni": "Libre Bodoni",
-    "ZillaSlab": "Zilla Slab",
-    "Jost": "Jost",
-    "PlayfairDisplay": "Playfair Display",
-    "Roboto": "Roboto",
-    "OpenSans": "Open Sans",
-    "Lato": "Lato",
-    "Merriweather": "Merriweather",
-    "SourceSans3": "Source Sans 3",
-    "SourceSerif4": "Source Serif 4",
-    "NotoSerif": "Noto Serif",
-    "PTSerif": "PT Serif",
-    "IBMPlexSans": "IBM Plex Sans",
-    "IBMPlexSerif": "IBM Plex Serif",
-    "IBMPlexMono": "IBM Plex Mono",
-    "Inter": "Inter",
-    "SpecialElite": "Special Elite",
-    # System / MS Core Fonts
-    "TimesNewRoman": "Times New Roman",
-    "CourierNew": "Courier New",
-    "NimbusSans": "Arial",
-    "Arial": "Arial",
-    "Georgia": "Georgia",
-    "Verdana": "Verdana",
-    "ComicSansMS": "Comic Sans MS",
-    "TrebuchetMS": "Trebuchet MS",
-    "Caladea": "Caladea",
-    "PrestigeElite": "Prestige Elite",
-}
-
+def _is_primary_family(base):
+    return base not in {"ArialMT", "Arial-BoldMT", "CourierNewPSMT", "TimesNewRomanPSMT",
+                         "PrestigeEliteNormal", "NimbusSansL"}
 
 def resolve_all_fonts():
     """Resolve all font families via fontconfig.
@@ -160,6 +53,8 @@ def resolve_all_fonts():
     seen = set()
 
     for base, family in FAMILIES.items():
+        if not _is_primary_family(base):
+            continue
         paths = {}
         reg = fc_find(family, "Regular")
         paths['regular'] = reg
@@ -196,185 +91,26 @@ def resolve_all_fonts():
     return font_paths, all_font_files
 
 
-def build_canonical_map(pdf_path, all_font_files):
-    """Build canonical_map by extracting PS names from embedded font data in the PDF.
-
-    WeasyPrint/Pango uses its own naming for PDF BaseFont entries that differs
-    from the fonts' PostScript names.  Rather than trying to predict those names,
-    we read the embedded font data (TrueType streams) from the PDF, extract the
-    real PostScript name (nameID 6) from each, and map through make_weight_explicit.
-
-    For variable fonts, Pango subsets the font at the requested weight but keeps
-    the same PS name (nameID 6).  We read the OS/2 usWeightClass from the embedded
-    subset — which reflects the actual rendered weight — and use that to construct
-    the correct canonical name via `unprint --weight-explicit`.
-
-    Returns canonical_map: raw BaseFont (subset-stripped) → canonical PS name.
-    """
-    import pikepdf, io, subprocess, os
-    from fontTools.ttLib import TTFont as FTFont
-
-    # Pre-compute canonical names from all font files for PS name → canonical lookup
-    ps_to_canonical = {}
-    # Also store original OS/2 weight per PS name for mismatch detection
-    ps_to_orig_weight = {}
-    for path in all_font_files:
-        orig_ps, canonical_ps, _ = make_weight_explicit(path)
-        if orig_ps and canonical_ps:
-            ps_to_canonical[orig_ps] = canonical_ps
-            try:
-                tt = FTFont(path)
-                ps_to_orig_weight[orig_ps] = tt['OS/2'].usWeightClass
-                tt.close()
-            except Exception:
-                pass
-
-    # Locate unprint binary for --weight-explicit calls
-    script_dir = os.path.dirname(os.path.abspath(__file__))
-    repo_root = os.path.dirname(script_dir)
-    unprint_bin = None
-    for bin_path in [
-        os.path.join(repo_root, "target", "release", "unprint"),
-        os.path.join(repo_root, "target", "release", "unscan"),
-        os.path.join(repo_root, "target", "debug", "unprint"),
-        os.path.join(repo_root, "target", "debug", "unscan"),
-    ]:
-        if os.path.exists(bin_path):
-            unprint_bin = bin_path
-            break
-    if unprint_bin is None:
-        unprint_bin = "unprint"
-
-    canonical_map = {}
-    pdf = pikepdf.open(pdf_path)
-
-    for page in pdf.pages:
-        resources = page.get("/Resources")
-        if resources is None:
-            continue
-        fonts = resources.get("/Font")
-        if fonts is None:
-            continue
-
-        for res_name in list(fonts.keys()):
-            font_dict = fonts[res_name]
-            base_font = font_dict.get("/BaseFont")
-            if base_font is None:
-                continue
-
-            bf_str = str(base_font).lstrip("/")
-            # Strip subset prefix (e.g. "ABCDEF+FontName" → "FontName")
-            if len(bf_str) > 7 and bf_str[6] == '+':
-                raw_bf = bf_str[7:]
-            else:
-                raw_bf = bf_str
-
-            if raw_bf in canonical_map:
-                continue
-
-            # Extract the embedded font stream and read its real PS name + weight
-            embedded_ps, embedded_weight = _extract_embedded_ps_and_weight(font_dict)
-            if not embedded_ps:
-                continue
-
-            # Check if the embedded weight differs from the original font file's
-            # default weight (variable font weight mismatch).
-            orig_weight = ps_to_orig_weight.get(embedded_ps)
-            if embedded_weight is not None and orig_weight is not None and embedded_weight != orig_weight:
-                # Variable font: the PS name is weight-agnostic.  Use the
-                # embedded OS/2 weight to get the correct canonical name.
-                r = subprocess.run(
-                    [unprint_bin, "--weight-explicit", f"{embedded_ps}:{embedded_weight}"],
-                    capture_output=True, text=True
-                )
-                if r.returncode == 0 and r.stdout.strip():
-                    canonical_map[raw_bf] = r.stdout.strip()
-                else:
-                    canonical_map[raw_bf] = embedded_ps
-            elif embedded_ps in ps_to_canonical:
-                canonical_map[raw_bf] = ps_to_canonical[embedded_ps]
-            else:
-                # PS name not in our pre-computed map (e.g. fonts WeasyPrint
-                # pulled via fontconfig that aren't in all_font_files).
-                # Run the same make_weight_explicit normalization the font DB
-                # scanner uses, so the canonical name matches the DB key.
-                if embedded_weight is not None:
-                    r = subprocess.run(
-                        [unprint_bin, "--weight-explicit", f"{embedded_ps}:{embedded_weight}"],
-                        capture_output=True, text=True
-                    )
-                    if r.returncode == 0 and r.stdout.strip():
-                        canonical_map[raw_bf] = r.stdout.strip()
-                    else:
-                        canonical_map[raw_bf] = embedded_ps
-                else:
-                    canonical_map[raw_bf] = embedded_ps
-
-    pdf.close()
-    return canonical_map
+def _font_face_css(font_paths):
+    """Generate @font-face CSS rules from resolved font paths."""
+    entries = []
+    for base, paths in font_paths.items():
+        for variant, path in paths.items():
+            weight = '700' if variant == 'bold' else '400'
+            style = 'italic' if variant == 'italic' else 'normal'
+            entries.append((base, path, weight, style))
+    return _font_face_css_from_entries(entries)
 
 
-def _extract_embedded_ps_and_weight(font_dict):
-    """Extract PS name and OS/2 weight from a PDF font dict's embedded font data.
-
-    Returns (ps_name, os2_weight) or (None, None).
-    Variable fonts embedded by WeasyPrint/Pango keep the same PS name (nameID 6)
-    regardless of the rendered weight, but the OS/2 usWeightClass reflects the
-    actual instantiated weight.
-    """
-    # Direct font (non-CID)
-    font_desc = font_dict.get("/FontDescriptor")
-    if font_desc is not None:
-        ps, w = _read_ps_and_weight_from_descriptor(font_desc)
-        if ps:
-            return ps, w
-
-    # CIDFont: check DescendantFonts
-    descendants = font_dict.get("/DescendantFonts")
-    if descendants is not None:
-        for desc in descendants:
-            font_desc = desc.get("/FontDescriptor")
-            if font_desc is not None:
-                ps, w = _read_ps_and_weight_from_descriptor(font_desc)
-                if ps:
-                    return ps, w
-
-    return None, None
-
-
-def _read_ps_and_weight_from_descriptor(font_desc):
-    """Read PS name and OS/2 weight from a font descriptor's embedded font stream."""
-    import io
-    from fontTools.ttLib import TTFont as FTFont
-
-    for key in ("/FontFile2", "/FontFile3", "/FontFile"):
-        stream = font_desc.get(key)
-        if stream is None:
-            continue
-        try:
-            data = bytes(stream.read_bytes())
-            tt = FTFont(io.BytesIO(data))
-            ps_name = ""
-            for rec in tt["name"].names:
-                if rec.nameID == 6:
-                    try:
-                        ps_name = rec.toUnicode()
-                        break
-                    except Exception:
-                        pass
-            os2_weight = None
-            try:
-                os2_weight = tt["OS/2"].usWeightClass
-            except Exception:
-                pass
-            tt.close()
-            if ps_name:
-                return ps_name, os2_weight
-        except Exception:
-            continue
-    return None, None
-
-
+def _img_tag(rel_path, css_class, max_w_pt=40, max_h_pt=55):
+    """Generate an <img> tag for a logo or headshot, if the file exists."""
+    full_path = SCRIPT_DIR / rel_path
+    if not full_path.exists():
+        return ""
+    return (
+        f'<img src="{rel_path}" class="{css_class}" '
+        f'style="max-width: {max_w_pt}pt; max-height: {max_h_pt}pt;">'
+    )
 
 
 SECTIONS = [
@@ -815,44 +551,9 @@ SECTIONS = [
     },
 ]
 
-
 # ---------------------------------------------------------------------------
 # HTML + CSS generation
 # ---------------------------------------------------------------------------
-
-def _font_face_css(font_paths):
-    """Generate @font-face CSS rules from resolved font paths."""
-    rules = []
-    for base, paths in font_paths.items():
-        for variant, path in paths.items():
-            weight = '700' if variant == 'bold' else '400'
-            style = 'italic' if variant == 'italic' else 'normal'
-            rules.append(
-                f"@font-face {{\n"
-                f"  font-family: '{base}';\n"
-                f"  src: url('file://{path}') format('truetype');\n"
-                f"  font-weight: {weight};\n"
-                f"  font-style: {style};\n"
-                f"}}"
-            )
-    return "\n".join(rules)
-
-
-def _img_tag(rel_path, css_class, max_w_pt=40, max_h_pt=55):
-    """Generate an <img> tag for a logo or headshot, if the file exists."""
-    full_path = SCRIPT_DIR / rel_path
-    if not full_path.exists():
-        return ""
-    return (
-        f'<img src="{rel_path}" class="{css_class}" '
-        f'style="max-width: {max_w_pt}pt; max-height: {max_h_pt}pt;">'
-    )
-
-
-def _escape(text):
-    """Escape HTML special characters."""
-    return text.replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;").replace('"', "&quot;")
-
 
 def generate_html(font_paths):
     """Generate the full HTML document for the specimen."""
@@ -1025,10 +726,18 @@ body {{
 </body>
 </html>"""
 
-
 # ---------------------------------------------------------------------------
 # PDF rendering + post-processing
 # ---------------------------------------------------------------------------
+
+def build_specimen(out_pdf, font_paths):
+    """Render the specimen HTML to PDF with WeasyPrint (via shared helper)."""
+    html = generate_html(font_paths)
+    render_html_to_pdf(html, out_pdf, base_url=SCRIPT_DIR)
+    return out_pdf
+
+
+# Remaining original main / rasterize logic (uses shared canonical map builder)
 
 def build_specimen(out_pdf, font_paths):
     """Render the specimen HTML to PDF with WeasyPrint."""
@@ -1056,7 +765,7 @@ def main():
 
     # Build canonical map from actual PDF BaseFont names
     print("Building canonical map from PDF font names...")
-    canonical_map = build_canonical_map(str(out_pdf), all_font_files)
+    canonical_map = build_canonical_map_from_pdf(str(out_pdf), all_font_files)
     print(f"  {len(canonical_map)} mappings built")
 
     # Annotate font dictionaries with /UnprintCanonical
