@@ -70,8 +70,6 @@ FAMILIES = {
     "NimbusSansL": "Arial",  # common alias for Nimbus Sans on some systems
 }
 
-# Inverse for debugging / display
-FAMILY_BY_FC = {v: k for k, v in FAMILIES.items()}
 
 
 # ---------------------------------------------------------------------------
@@ -208,7 +206,7 @@ def escape_html(text):
     return text.replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;").replace('"', "&quot;")
 
 
-def font_face_rule(family, ttf_path, weight="400", style="normal"):
+def _font_face_rule(family, ttf_path, weight="400", style="normal"):
     return (
         f"@font-face {{\n"
         f"  font-family: '{family}';\n"
@@ -235,7 +233,7 @@ def build_font_face_css(entries):
         if key in seen:
             continue
         seen.add(key)
-        rules.append(font_face_rule(family, path, weight, style))
+        rules.append(_font_face_rule(family, path, weight, style))
     return "\n".join(rules)
 
 
@@ -377,26 +375,3 @@ def build_canonical_map_from_pdf(pdf_path, all_font_files):
     return canonical_map
 
 
-def build_simple_canonical_map(ttf_paths):
-    """Simple PS->canonical map from a list of TTF paths (used by line-test)."""
-    m = {}
-    for p in ttf_paths:
-        orig_ps = read_postscript_name(str(p))
-        if not orig_ps:
-            continue
-        _, canon, _ = make_weight_explicit(str(p))
-        if canon:
-            m[orig_ps] = canon
-            m[canon] = canon
-    return m
-
-
-# ---------------------------------------------------------------------------
-# Common PDF pipeline: annotate + rasterize
-# ---------------------------------------------------------------------------
-def annotate_and_rasterize(vector_pdf, rasterized_pdf, canonical_map):
-    from rasterize import rasterize
-    annotated, missing = annotate_canonical_names(str(vector_pdf), canonical_map)
-    # Caller prints; return for logging
-    rasterize(str(vector_pdf), str(rasterized_pdf))
-    return annotated, missing
