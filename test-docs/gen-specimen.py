@@ -603,7 +603,8 @@ def generate_html(font_paths):
   <p class="blurb" style="font-family: '{rl}'; text-align: {align};">{blurb}</p>
   <p class="sample" style="font-family: '{rl}'; font-weight: bold; text-align: {align};">Bold: The quick brown fox jumps over 1,234,567,890 lazy dogs.</p>
   <p class="sample" style="font-family: '{rl}'; font-style: italic; text-align: {align};">Italic: The quick brown fox jumps over 1,234,567,890 lazy dogs.</p>
-  <p class="alpha" style="font-family: '{rl}';">ABCDEFGHIJKLMNOPQRSTUVWXYZ  abcdefghijklmnopqrstuvwxyz</p>
+  <p class="alpha" style="font-family: '{rl}';">ABCDEFGHIJKLMNOPQRSTUVWXYZ</p>
+  <p class="alpha" style="font-family: '{rl}';">abcdefghijklmnopqrstuvwxyz</p>
   <p class="alpha" style="font-family: '{rl}';">Lining figures: 0 1 2 3 4 5 6 7 8 9</p>
 </div>""")
 

@@ -194,7 +194,11 @@ def resolve_expected_font(expected_font):
         css_style = "italic"
 
     ttf_path = fc_find(fc_family, style)
-    _, canonical_name, _ = make_weight_explicit(ttf_path)
+    try:
+        _, canonical_name, _ = make_weight_explicit(ttf_path)
+    except FileNotFoundError:
+        # fallback if unprint not built - use PS name directly
+        canonical_name = read_postscript_name(ttf_path) or fc_family.replace(' ','')
     return ttf_path, canonical_name, css_weight, css_style
 
 
@@ -355,20 +359,26 @@ def build_canonical_map_from_pdf(pdf_path, all_font_files):
                 continue
             orig_weight = ps_to_orig_weight.get(embedded_ps)
             if embedded_weight is not None and orig_weight is not None and embedded_weight != orig_weight:
-                r = subprocess.run(
-                    [unprint_bin, "--weight-explicit", f"{embedded_ps}:{embedded_weight}"],
-                    capture_output=True, text=True
-                )
-                canonical_map[raw_bf] = r.stdout.strip() if r.returncode == 0 and r.stdout.strip() else embedded_ps
-            elif embedded_ps in ps_to_canonical:
-                canonical_map[raw_bf] = ps_to_canonical[embedded_ps]
-            else:
-                if embedded_weight is not None:
+                try:
                     r = subprocess.run(
                         [unprint_bin, "--weight-explicit", f"{embedded_ps}:{embedded_weight}"],
                         capture_output=True, text=True
                     )
                     canonical_map[raw_bf] = r.stdout.strip() if r.returncode == 0 and r.stdout.strip() else embedded_ps
+                except FileNotFoundError:
+                    canonical_map[raw_bf] = embedded_ps
+            elif embedded_ps in ps_to_canonical:
+                canonical_map[raw_bf] = ps_to_canonical[embedded_ps]
+            else:
+                if embedded_weight is not None:
+                    try:
+                        r = subprocess.run(
+                            [unprint_bin, "--weight-explicit", f"{embedded_ps}:{embedded_weight}"],
+                            capture_output=True, text=True
+                        )
+                        canonical_map[raw_bf] = r.stdout.strip() if r.returncode == 0 and r.stdout.strip() else embedded_ps
+                    except FileNotFoundError:
+                        canonical_map[raw_bf] = embedded_ps
                 else:
                     canonical_map[raw_bf] = embedded_ps
     pdf.close()

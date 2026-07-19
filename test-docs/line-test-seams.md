@@ -1,6 +1,6 @@
 # Line Test Seam Ground Truth
 
-Ground truth for gen-line-test.py pages (p1:L72, p1:L73, p3:L45).
+Ground truth for gen-line-test.py pages (p1:L72, p1:L73, p3:L79, p4:L80).
 Columns are relative to the word crop.
 
 ## L1: ABCDEFGHIJKLMNOPQRSTUVWXYZ. (p1:L72, LibreBodoni-400)
@@ -11,11 +11,11 @@ Columns are relative to the word crop.
 
 17, 112, 166, 199, 395, 415, 439, 460
 
-## L3: ABCDEFGHIJKLMNOPQRSTUVWXYZ. (p3:L45, Georgia-400)
+## L3: ABCDEFGHIJKLMNOPQRSTUVWXYZ. (p3:L79, Georgia-400)
 
 26, 268, 291, 504, 531, 557, 592, 619, 642
 
-## L4: abcdefghijklmnopqrstuvwxyz. (p4:L46, OpenSans-400)
+## L4: abcdefghijklmnopqrstuvwxyz. (p4:L80, OpenSans-400)
 
 TBD
 

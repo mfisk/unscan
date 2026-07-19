@@ -14,34 +14,35 @@ use std::path::PathBuf;
 use std::process::Command;
 
 /// Expected seam splits for each test line, per word.
-/// Updated Jul 17 2026: expanded from 3 to 7 lines to match lob coverage.
+/// Hardcoded fonts/strings — no audit dependency, no empty lines.
+/// Updated Jul 19 2026: switched to hardcoded fonts/strings.
 const EXPECTED: &[(&str, &[&[u32]])] = &[
-    // p1:L72 LibreBodoni lowercase
+    // LibreBodoni-400 lowercase
     ("abcdefghijklmnopqrstuvwxyz.", &[
         &[17, 112, 166, 199, 208, 395, 413, 440, 460],
     ]),
-    // p1:L73 LibreBodoni lining figures
+    // LibreBodoni-400 lining figures
     ("Lining figures: 0 1 2 3 4 5 6 7 8 9.", &[
         &[14, 46], &[], &[], &[], &[], &[], &[], &[], &[], &[], &[], &[],
     ]),
-    // p1:L71 LibreBodoni uppercase
+    // LibreBodoni-400 uppercase
     ("ABCDEFGHIJKLMNOPQRSTUVWXYZ.", &[
         &[25, 187, 216, 230, 276, 332, 471, 518, 545, 570, 604, 633, 656],
     ]),
-    // p1:L10 EBGaramond body text
+    // EBGaramond-400 body text
     ("carved type into wood or imported it from Italy.", &[
         &[99], &[41, 58], &[24, 39, 48, 64], &[11, 26], &[], &[27], &[11],
     ]),
-    // p3:L45 Arial Bold
+    // Arial-BoldMT-700 Bold
     ("Bold: The quick brown fox jumps over.", &[
         &[], &[], &[35], &[], &[], &[], &[12],
     ]),
-    // p4:L46 Roboto Italic
+    // Roboto-400It Italic
     ("Italic: The quick brown fox jumps over 1,234,567,890 lazy,", &[
         &[85, 150], &[50], &[], &[32, 80], &[32, 64], &[8, 27, 45, 54], &[36], &[19], &[10, 31],
     ]),
-    // p5:L79 PlayfairDisplay lining figures
-    ("Lining figures: CD 2 2 9 4 5 6 7 8 9.", &[
+    // PlayfairDisplay-400 lining figures (clean)
+    ("Lining figures: 0 1 2 3 4 5 6 7 8 9.", &[
         &[44], &[88], &[9], &[], &[], &[], &[], &[], &[], &[], &[], &[],
     ]),
 ];
@@ -50,14 +51,14 @@ const EXPECTED: &[(&str, &[&[u32]])] = &[
 fn seam_splits_match_ground_truth() {
     let repo = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
 
-    // Generate test PDFs from BAP audit
+    // Generate test PDFs from hardcoded fonts/strings (no audit dependency)
     let gen_status = Command::new("python3")
         .arg(repo.join("test-docs/gen-line-test.py"))
-        .args(["1:72", "1:73", "1:71", "1:10", "3:45", "4:46", "5:79"])
+        .arg("--hardcoded")
         .current_dir(&repo)
         .status()
         .expect("failed to run gen-line-test.py");
-    assert!(gen_status.success(), "gen-line-test.py failed");
+    assert!(gen_status.success(), "gen-line-test.py --hardcoded failed");
 
     // Copy to expected filenames
     std::fs::copy(

@@ -68,13 +68,16 @@ def make_weight_explicit(path):
     else:
         bin_path = "unprint"
 
-    r = subprocess.run(
-        [bin_path, "--weight-explicit", f"{orig_ps}:{weight}"],
-        capture_output=True, text=True
-    )
-    if r.returncode == 0:
-        new_ps = r.stdout.strip()
-    else:
+    try:
+        r = subprocess.run(
+            [bin_path, "--weight-explicit", f"{orig_ps}:{weight}"],
+            capture_output=True, text=True
+        )
+        if r.returncode == 0:
+            new_ps = r.stdout.strip()
+        else:
+            new_ps = orig_ps
+    except (FileNotFoundError, OSError):
         new_ps = orig_ps
 
     return orig_ps, new_ps, path
