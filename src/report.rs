@@ -26,6 +26,7 @@ pub struct ReportMeta {
     pub render_aa: String,
     pub render_binarize: Option<u8>,
     pub elapsed: std::time::Duration,
+    pub report_all: bool,
 }
 
 // ── Glyph helpers ───────────────────────────────────────────────────────────
@@ -2000,19 +2001,20 @@ pub fn generate_report(
 ) -> Result<(), String> {
     let classified = classify_entries(entries, gt, dpi, font_catalog, glyph_map);
 
-    let mut hits = 0usize;
+    let mut hits: Vec<&ClassifiedEntry> = Vec::new();
     let mut major_misses: Vec<&ClassifiedEntry> = Vec::new();
     let mut minor_misses: Vec<&ClassifiedEntry> = Vec::new();
     let mut similarity_failures: Vec<&ClassifiedEntry> = Vec::new();
     let mut kept_raster: Vec<&ClassifiedEntry> = Vec::new();
+    let mut no_ground_truth: Vec<&ClassifiedEntry> = Vec::new();
     for ce in &classified {
         match ce.kind {
-            MissKind::Hit => hits += 1,
+            MissKind::Hit => hits.push(ce),
             MissKind::MajorMiss => major_misses.push(ce),
             MissKind::MinorMiss => minor_misses.push(ce),
             MissKind::SimilarityFailure => similarity_failures.push(ce),
             MissKind::KeptRaster => kept_raster.push(ce),
-            MissKind::NoGroundTruth => {} // excluded from hit/miss denominator
+            MissKind::NoGroundTruth => no_ground_truth.push(ce),
         }
     }
 
@@ -2023,7 +2025,7 @@ pub fn generate_report(
         .collect();
 
     let all_misses = major_misses.len() + minor_misses.len() + similarity_failures.len();
-    let compared = hits + all_misses + kept_raster.len();
+    let compared = hits.len() + all_misses + kept_raster.len();
     // Primary metric: only major misses count against the score.
     let major_total = major_misses.len() + similarity_failures.len() + kept_raster.len();
     let primary_hits = compared - major_total;
@@ -2046,6 +2048,14 @@ pub fn generate_report(
     similarity_failures.sort_by(|a, b| {
         a.entry.similarity_score.partial_cmp(&b.entry.similarity_score).unwrap_or(std::cmp::Ordering::Equal)
     });
+    if meta.report_all {
+        hits.sort_by(|a, b| {
+            a.entry.similarity_score.partial_cmp(&b.entry.similarity_score).unwrap_or(std::cmp::Ordering::Equal)
+        });
+        no_ground_truth.sort_by(|a, b| {
+            a.entry.similarity_score.partial_cmp(&b.entry.similarity_score).unwrap_or(std::cmp::Ordering::Equal)
+        });
+    }
 
     let mut font_data_cache = FontDataCache::new();
 
@@ -2085,6 +2095,24 @@ pub fn generate_report(
         raster_blocks.push_str(&html);
     }
 
+    // Build hits / no_ground_truth blocks when --report-all
+    let mut hits_blocks = String::new();
+    let mut no_gt_blocks = String::new();
+    if meta.report_all {
+        for ce in &hits {
+            let (html, _chosen_zncc, _gt_zncc) = build_miss_block(
+                ce, audit_root, font_catalog, glyph_map, &mut font_data_cache, dpi,
+            );
+            hits_blocks.push_str(&html);
+        }
+        for ce in &no_ground_truth {
+            let (html, _chosen_zncc, _gt_zncc) = build_miss_block(
+                ce, audit_root, font_catalog, glyph_map, &mut font_data_cache, dpi,
+            );
+            no_gt_blocks.push_str(&html);
+        }
+    }
+
     // Build OCR miss blocks (font matched, OCR text wrong)
     let mut ocr_miss_blocks = String::new();
     for ce in &ocr_misses {
@@ -2120,6 +2148,26 @@ pub fn generate_report(
         String::new()
     };
 
+    let hits_section = if meta.report_all && !hits_blocks.is_empty() {
+        format!(
+            "<h2 style=\"margin-top:2em; color:#2a7;\">\
+             Hits ({} lines — all correct)</h2>{hits_blocks}",
+            hits.len()
+        )
+    } else {
+        String::new()
+    };
+
+    let no_gt_section = if meta.report_all && !no_gt_blocks.is_empty() {
+        format!(
+            "<h2 style=\"margin-top:2em; color:#888;\">\
+             No Ground Truth ({} lines)</h2>{no_gt_blocks}",
+            no_ground_truth.len()
+        )
+    } else {
+        String::new()
+    };
+
     // ── Summary line 1: Similarity ──────────────────────────────────
     let sim_summary = {
         let mut sim_vals: Vec<f32> = entries.iter()
@@ -2147,7 +2195,7 @@ pub fn generate_report(
     let font_summary = if compared > 0 {
         let major_correct = compared - major_misses.len() - similarity_failures.len();
         let major_pct = major_correct as f64 / compared as f64 * 100.0;
-        let minor_correct = hits; // hits = exact match
+        let minor_correct = hits.len(); // hits = exact match
         let minor_pct = minor_correct as f64 / compared as f64 * 100.0;
         format!(
             "Font accuracy: <b>{major_correct}/{compared} ({major_pct:.0}%)</b> major correct ·              <b>{minor_correct}/{compared} ({minor_pct:.0}%)</b> exact match"
@@ -2277,6 +2325,8 @@ pub fn generate_report(
          {sim_fail_section}\n\
          {raster_section}\n\
          {ocr_miss_section}\n\
+         {hits_section}\n\
+         {no_gt_section}\n\
          </body>\n\
          </html>",
         n_major = major_misses.len(),

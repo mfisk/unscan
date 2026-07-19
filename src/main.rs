@@ -222,6 +222,7 @@ fn write_audit_report(
         render_aa: args.render_aa.clone(),
         render_binarize: args.render_binarize,
         elapsed,
+        report_all: args.report_all,
     };
     let _ = report::generate_report(
         &report_path,

@@ -55,6 +55,10 @@ pub struct Args {
     #[arg(long, value_name = "DIR")]
     pub audit: Option<PathBuf>,
 
+    /// Include all lines (hits) in report.html, not just misses.
+    #[arg(long)]
+    pub report_all: bool,
+
     // train_lda removed — training happens automatically.
 
     /// Generate side-by-side comparison images (scan crop vs rendered font)
