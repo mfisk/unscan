@@ -83,9 +83,6 @@ const SIGMA_PITCH_PX: f64 = 0.435;
 /// `crop_ngram`'s masking and computes the word midpoint in the same pass.
 pub struct WordGeoMeasurement {
     pub chars: Vec<CharInkBounds>,
-    pub word_y_min: u32,
-    pub word_y_max: u32,
-    pub word_cy: f64,
 }
 
 pub fn measure_char_ink_bounds(
@@ -97,7 +94,7 @@ pub fn measure_char_ink_bounds(
     let (w, h) = word_img.dimensions();
     let n_chars = chars.len();
     if n_chars == 0 {
-        return WordGeoMeasurement { chars: Vec::new(), word_y_min: 0, word_y_max: h, word_cy: h as f64 * 0.5 };
+        return WordGeoMeasurement { chars: Vec::new() };
     }
     // If segmentation failed to produce n_chars+1 boundaries, fallback to uniform
     // partitioning instead of returning empty (which would kill geo for the whole line).
@@ -110,8 +107,6 @@ pub fn measure_char_ink_bounds(
     };
 
     let mut result = Vec::with_capacity(n_chars);
-    let mut word_y_min = h as usize;
-    let mut word_y_max = 0usize;
     for i in 0..n_chars {
         let b_left = bounds[i];
         let b_right = bounds[i + 1];
@@ -128,8 +123,6 @@ pub fn measure_char_ink_bounds(
                 y_min: 0,
                 y_max: h,
             });
-            word_y_min = word_y_min.min(0);
-            word_y_max = word_y_max.max(h as usize);
             continue;
         }
 
@@ -201,18 +194,9 @@ pub fn measure_char_ink_bounds(
                 y_max: y_max as u32,
             }
         };
-        word_y_min = word_y_min.min(cb.y_min as usize);
-        word_y_max = word_y_max.max(cb.y_max as usize);
         result.push(cb);
     }
-    if word_y_max < word_y_min {
-        word_y_min = 0;
-        word_y_max = h as usize;
-    }
-    let word_y_min_u = word_y_min as u32;
-    let word_y_max_u = word_y_max as u32;
-    let word_cy = (word_y_min as f64 + word_y_max as f64) * 0.5;
-    WordGeoMeasurement { chars: result, word_y_min: word_y_min_u, word_y_max: word_y_max_u, word_cy }
+    WordGeoMeasurement { chars: result }
 }
 
 /// Cached path: use GeometryCache predictions (fast, Unicode, keeps both GPOS Pair formats native).
@@ -264,14 +248,10 @@ fn per_char_geo_cached(
         // y is flipped: font y up → image y down
         let preds: Vec<(f64, f64)> = preds_fu.iter().map(|(x, y)| (x * scale, y * -scale)).collect();
 
-        // Midpoint of word ink — computed in same seam-aware crop that measured chars,
-        // so it doesn't include adjacent ink (g's top doesn't get f's ascender, etc.)
-        let obs_word_cy = wmeas.word_cy;
-
-        // Pred word ink midpoint: (min y_min + max y_max)/2 in font units, then scaled and flipped
-        let pred_word_y_min_fu = preds_fu_ext.iter().map(|(_,_,y0,_)| *y0).fold(f64::INFINITY, f64::min);
-        let pred_word_y_max_fu = preds_fu_ext.iter().map(|(_,_,_,y1)| *y1).fold(f64::NEG_INFINITY, f64::max);
-        let pred_word_cy = -scale * (pred_word_y_min_fu + pred_word_y_max_fu) * 0.5;
+        // Word vertical center: use mean of character centers so sum_v = 0 by construction
+        // (matches t64 theory: obs_word_cy = mean(obs_cy), pred_word_cy = mean(pred_cy))
+        let obs_word_cy = word_bounds.iter().map(|b| b.cy).sum::<f64>() / word_bounds.len() as f64;
+        let pred_word_cy = preds.iter().map(|(_, cy)| *cy).sum::<f64>() / preds.len() as f64;
 
         for (orig_idx, (bounds, (pred_cx, pred_cy))) in word_bounds.iter().zip(preds.iter()).enumerate() {
             let obs_cx = bounds.cx;
@@ -395,12 +375,9 @@ fn per_char_geo_shaped(
             .map(|(x, y)| (x * scale, y * -scale))
             .collect();
 
-        // Word midpoint — from same seam-aware crop that measured chars (no adjacent bleed)
-        let obs_word_cy = wmeas.word_cy;
-
-        let pred_word_y_min_fu = pred_y_mins_fu.iter().cloned().fold(f64::INFINITY, f64::min);
-        let pred_word_y_max_fu = pred_y_maxs_fu.iter().cloned().fold(f64::NEG_INFINITY, f64::max);
-        let pred_word_cy = -scale * (pred_word_y_min_fu + pred_word_y_max_fu) * 0.5;
+        // Word vertical center: mean of centers so sum_v = 0 by construction
+        let obs_word_cy = bounds_vec.iter().map(|b| b.cy).sum::<f64>() / bounds_vec.len() as f64;
+        let pred_word_cy = pred_positions_px.iter().map(|(_, cy)| *cy).sum::<f64>() / pred_positions_px.len() as f64;
 
         for (orig_idx, (bounds, (pred_cx, pred_cy))) in bounds_vec.iter().zip(pred_positions_px.iter()).enumerate() {
             let obs_cx = bounds.cx;

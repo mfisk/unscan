@@ -527,9 +527,9 @@ impl GeometryCache {
             let total_adv = adv + x_adv_adj;
             let cx = cursor + x_pla + (x0 + x1)*0.5;
             let cy = y_pla + (y0 + y1)*0.5;
-            let w = (x1 - x0) as f64;
-            let h = (y1 - y0) as f64;
-            out.push((cx,cy,w,h));
+            let y_min_a = y_pla + y0 as f64;
+            let y_max_a = y_pla + y1 as f64;
+            out.push((cx,cy,y_min_a,y_max_a));
             cursor += total_adv;
         }
         Some(out)
