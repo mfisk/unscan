@@ -59,6 +59,12 @@ pub struct Args {
     #[arg(long)]
     pub report_all: bool,
 
+    /// Include all lines (hits) in audit.json obs_votes and compute geo for all,
+    /// not just misses. Implies --report-all. Use for geo bias regression
+    /// tests where GT metrics on hits are needed (t64).
+    #[arg(long)]
+    pub audit_all: bool,
+
     // train_lda removed — training happens automatically.
 
     /// Generate side-by-side comparison images (scan crop vs rendered font)

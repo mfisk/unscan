@@ -137,13 +137,14 @@ fn build_audit_entry(
     use audit::{BBox, FontCandidate, ObservationVote, Decision, WordBBox};
     let font_result = &lm.font_result;
     let obs_vote = |d: &font_match::ObservationDetail, rp: &ObsRankProbs| {
-        let n_glyphs = classifier.glyph_count(&d.seq).max(1) as f32;
+        let seq = [d.ch];
+        let n_glyphs = classifier.glyph_count(&seq).max(1) as f32;
         let ch_h_ll = rp.chosen_geo_h_ll.get(&d.crop_index).copied();
         let ch_v_ll = rp.chosen_geo_v_ll.get(&d.crop_index).copied();
         let gt_h_ll = rp.gt_geo_h_ll.get(&d.crop_index).copied();
         let gt_v_ll = rp.gt_geo_v_ll.get(&d.crop_index).copied();
         ObservationVote {
-            seq: d.seq.clone(),
+            seq: vec![d.ch],
             weight: d.weight,
             crop_index: d.crop_index,
             best_prob: d.best_prob * n_glyphs,
@@ -240,7 +241,7 @@ fn write_audit_report(
         render_aa: args.render_aa.clone(),
         render_binarize: args.render_binarize,
         elapsed,
-        report_all: args.report_all,
+        report_all: args.report_all || args.audit_all,
     };
     let _ = report::generate_report(
         &report_path,

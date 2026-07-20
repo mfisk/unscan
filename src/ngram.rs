@@ -657,27 +657,10 @@ fn power_iteration_eigenvectors(mat: &[f64], n: usize, k: usize) -> Vec<f64> {
 /// exist for the pair.
 ///
 /// `bigram_crops` are the combined pair images extracted from word-image
-/// boundaries via `segment::extract_bigram_crops()`.
+/// Build per-character scoring windows for font identification.
 ///
-/// Returns `(font_key, score)` pairs sorted descending, same shape as
-/// `identify_fonts`.
-/// Build sliding-window observations and delegate to `identify_fonts`.
-///
-/// Walk a 2-observation window over word segments. At each position:
-///   - If a bigram model exists for the pair → use bigram classifier/glyph_map, weight 1.0.
-///   - If no bigram model and the left position is uncovered → use unigram, weight 0.5.
-///   - If no bigram model and the right position is last and uncovered → use unigram, weight 0.5.
-///   - Ligature codepoints (U+FB00–FB04) get weight 1.0 like bigrams.
-///
-/// Returns the same `FontIdResult` as `identify_fonts` — same structure, same audit detail.
-
-/// Weight for a 1-gram observation: ligature codepoints score 1.0 like bigrams.
-fn unigram_weight(c: char) -> f32 {
-    match c {
-        '\u{FB00}'..='\u{FB04}' => 1.0,
-        _ => 0.5,
-    }
-}
+/// Returns `(windows, position_map)` where `windows` are single characters
+/// and `position_map[i] = (seg_idx, char_pos)` for window `i`.
 
 pub fn build_scoring_windows<'a>(
     word_segs: &'a [crate::segment::WordSeg],
@@ -722,9 +705,9 @@ pub fn build_scoring_windows<'a>(
     let mut position_map: Vec<(usize, usize)> = Vec::with_capacity(metas.len());
     for (i, (seg_i, pos_i, c)) in metas.into_iter().enumerate() {
         windows.push(crate::font_match::ScoringWindow {
-            seq: vec![c],
+            ch: c,
             crop: &crop_store[base + i],
-            weight: unigram_weight(c),
+            weight: 1.0,
         });
         position_map.push((seg_i, pos_i));
     }

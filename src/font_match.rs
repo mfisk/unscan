@@ -45,14 +45,11 @@ pub fn aggregate_font_score(log_probs: &[(f32, f32)], best_lps: &[f32]) -> f32 {
 /// Compute the overall font score for a single font using calibrated
 /// probabilities.  Returns `None` if the font has no data for any observation.
 
-/// A single scored observation in the sliding-window pipeline.
-/// Can be a 1-gram (single character) or 2-gram (bigram) or any length.
+/// A single scored character.
 pub struct ScoringWindow<'a> {
-    /// The character sequence.
-    pub seq: Vec<char>,
+    pub ch: char,
     /// The cropped image for this observation.
     pub crop: &'a GrayImage,
-    /// Weight for score aggregation (0.5 for unigram fallback, 1.0 for bigram).
     pub weight: f32,
 }
 
@@ -60,12 +57,11 @@ pub struct ScoringWindow<'a> {
 // Matching — brute-force nearest-neighbor
 // ---------------------------------------------------------------------------
 
-/// Per-observation font-matching detail: one entry per scoring window (unigram or bigram).
+/// Per-character font-matching detail.
 #[derive(Debug, Clone)]
 pub struct ObservationDetail {
-    /// Full scored sequence (e.g. ['T','i'] for bigram, ['a'] for unigram).
-    pub seq: Vec<char>,
-    /// Weight used for this observation in scoring (0.5 for unigram, 1.0 for bigram).
+    pub ch: char,
+    /// Weight used for this observation in scoring.
     pub weight: f32,
     pub crop_index: usize,
     pub best_prob: f32,
@@ -134,7 +130,7 @@ pub fn identify_fonts(
     // ── Pre-compute features ────────────────────────────────────────
     struct WindowData {
         window_idx: usize,
-        seq: Vec<char>,
+        ch: char,
         feat: CropFeatures,
         weight: f32,
         #[allow(dead_code)]
@@ -146,7 +142,7 @@ pub fn identify_fonts(
         .enumerate()
         .filter_map(|(i, w)| {
             let f = compute_features(w.crop, false)?;
-            Some(WindowData { window_idx: i, seq: w.seq.clone(), feat: f, weight: w.weight, ood_weight: 1.0 })
+            Some(WindowData { window_idx: i, ch: w.ch, feat: f, weight: w.weight, ood_weight: 1.0 })
         })
         .collect();
 
@@ -168,7 +164,8 @@ pub fn identify_fonts(
     let mut ood_weights: Vec<f32> = Vec::with_capacity(n_windows);
 
     for wd in &crop_data {
-        let picks = classifier.classify(&wd.seq, &wd.feat, 3);
+        let seq = [wd.ch];
+        let picks = classifier.classify(&seq, &wd.feat, 3);
         let ood_w = classifier::take_ood_weight();
         ood_weights.push(ood_w);
         if picks.is_empty() {
@@ -177,7 +174,7 @@ pub fn identify_fonts(
 
         // Expand glyph_ids to font_keys
         for &(glyph_id, _prob) in &picks {
-            for fk in glyph_map.fonts_for_glyph(&wd.seq, glyph_id) {
+            for fk in glyph_map.fonts_for_glyph(&seq, glyph_id) {
                 candidate_set.insert(fk.clone());
             }
         }
@@ -192,7 +189,7 @@ pub fn identify_fonts(
             .collect();
 
         observations.push(ObservationDetail {
-            seq: wd.seq.clone(),
+            ch: wd.ch,
             weight: wd.weight,
             crop_index: wd.window_idx,
             best_prob,
@@ -218,49 +215,39 @@ pub fn identify_fonts(
         return FontIdResult { scores: Vec::new(), observations, path_score: f32::MIN };
     }
 
-    // ── Per-window cache: compute logits/probs once, not per-candidate (was 300× recompute = 76s)
-    // Formerly: candidate_vec.iter().any(|fk| glyph_id_for_font + classifier.probability)
-    //   → 27 windows × 300 candidates × (embed + 500-centroid scan) = 8k full scans/line
-    //   + glyph_id_for_font linear scan (32M memcmp). Now 27 scans total.
+    // ── Per-char cache: compute logits/probs once, not per-candidate
     let mut window_logit_maps: Vec<std::collections::HashMap<usize, f32>> = Vec::with_capacity(crop_data.len());
     let mut window_prob_maps: Vec<std::collections::HashMap<usize, f32>> = Vec::with_capacity(crop_data.len());
     for wd in &crop_data {
-        let logits = classifier.raw_logits(&wd.seq, &wd.feat);
-        let probs = classifier.probabilities(&wd.seq, &wd.feat);
+        let seq = [wd.ch];
+        let logits = classifier.raw_logits(&seq, &wd.feat);
+        let probs = classifier.probabilities(&seq, &wd.feat);
         window_logit_maps.push(logits.into_iter().collect());
         window_prob_maps.push(probs.into_iter().collect());
     }
 
-    // ── Stage 2a: filter ngrams — keep only windows where at least one
-    // candidate font scores above (min_ngram_prob × uniform). This ensures
-    // all fonts are scored on the same set of ngrams. ──
+    // ── Stage 2a: filter chars — keep only chars where at least one
+    // candidate font scores above (min_char_prob × uniform).
     let candidate_vec: Vec<String> = candidate_set.into_iter().collect();
     let scoring_window_indices: Vec<usize> = (0..crop_data.len())
         .filter(|&i| {
             let wd = &crop_data[i];
-            let n_glyphs = classifier.glyph_count(&wd.seq).max(1) as f32;
+            let seq = [wd.ch];
+            let n_glyphs = classifier.glyph_count(&seq).max(1) as f32;
             let threshold = min_ngram_prob / n_glyphs;
             let prob_map = &window_prob_maps[i];
             candidate_vec.iter().any(|font_key| {
-                glyph_map.glyph_id_for_font(&wd.seq, font_key)
+                glyph_map.glyph_id_for_font(&seq, font_key)
                     .and_then(|gid| prob_map.get(&gid))
                     .map_or(false, |p| *p >= threshold)
             })
         })
         .collect();
 
-    // ── Stage 2b: score each candidate font on the surviving ngrams ──
-    // Two-pass approach: first collect per-font log-probs, then compute
-    // sum-of-squared-deviations from the per-observation best.
+    // ── Stage 2b: score each candidate font on the surviving chars ──
     let n_scoring = scoring_window_indices.len();
 
     // ── Geo precompute: per-font per-char geometry log-likelihoods ──
-    // Called for each character right before ngram glyph classification.
-    // Ligature Unicode (FB00-FB04) ARE in cache and scored with geo as single glyphs.
-    // Multi-char ligature merges (e.g. "ff" plain -> 1 glyph) are skipped for geo,
-    // falling back to SSIM/n-gram only.
-    // Fonts with GPOS vertical/offsets are NOT cached; fonts with pure horizontal
-    // kerning ARE cached via bigram kern_pairs and scored with geo.
     let mut geo_per_font: std::collections::HashMap<String, std::collections::HashMap<(usize, usize), f32>> = std::collections::HashMap::new();
     if !word_segs.is_empty() && !wib.is_empty() {
         for font_key in &candidate_vec {
@@ -283,23 +270,17 @@ pub fn identify_fonts(
             let log_probs: Vec<(f32, f32)> = scoring_window_indices.iter()
                 .filter_map(|&i| {
                     let wd = &crop_data[i];
-                    let glyph_id = glyph_map.glyph_id_for_font(&wd.seq, &font_key)?;
-                    // Use raw logit -d²/(2σ²), NOT ln(softmax p). Don't softmax a softmax.
+                    let seq = [wd.ch];
+                    let glyph_id = glyph_map.glyph_id_for_font(&seq, &font_key)?;
+                    // Use raw logit -d²/(2σ²)
                     let logit = *window_logit_maps[i].get(&glyph_id)?;
                     let mut lp = logit;
-                    // Geo scoring: per character, right before ngram classification
+                    // Geo scoring: per character
                     if let Some(geo_map) = geo_per_font.get(&font_key) {
                         if let Some(&(seg_idx, char_pos)) = position_map.get(wd.window_idx) {
-                            let mut geo_ll = 0.0f32;
                             if let Some(&ll) = geo_map.get(&(seg_idx, char_pos)) {
-                                geo_ll += ll;
+                                lp += ll;
                             }
-                            if wd.seq.len() == 2 {
-                                if let Some(&ll2) = geo_map.get(&(seg_idx, char_pos + 1)) {
-                                    geo_ll += ll2;
-                                }
-                            }
-                            lp += geo_ll;
                         }
                     }
                     Some((lp, wd.weight * ood_weights[i]))

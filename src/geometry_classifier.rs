@@ -188,19 +188,22 @@ fn per_char_geo_cached(
             continue;
         }
 
-        // Scale from font units → px: use ink-width ratio (sum obs widths / sum pred ink widths)
-        // This is apples-to-apples vs advance which includes side bearings.
-        let obs_total_width = word_bounds.iter().map(|b| b.width).sum::<f64>().max(1.0);
-        let scale = if let Some(pred_ink_sum) = geo_cache.predict_word_ink_width_sum(font_key, &ws.chars) {
-            obs_total_width / pred_ink_sum.max(1.0)
+        // Scale from font units → px: center-span (unbiased by construction)
+        // For n>=2: scale = (obs_cx_last - obs_cx_first) / (pred_cx_last - pred_cx_first)
+        // This makes sum_h = 0 per word by construction, so any remaining bias is a bug.
+        // Longer words get more precise scale (pixel quantization / width).
+        let scale = if word_bounds.len() >= 2 {
+            let obs_span = (word_bounds.last().unwrap().cx - word_bounds.first().unwrap().cx).abs().max(0.5);
+            let pred_span = (preds_fu.last().unwrap().0 - preds_fu.first().unwrap().0).abs().max(0.5);
+            obs_span / pred_span
         } else {
-            // fallback: height ratio (robust when ink width unavailable)
-            let obs_avg_h = word_bounds.iter().map(|b| b.height).sum::<f64>() / word_bounds.len() as f64;
+            // single char: fall back to height ratio (h_err is None anyway)
+            let obs_h = word_bounds[0].height.max(1.0);
             let pred_h = geo_cache
                 .predict_word_ink_extent(font_key, &ws.chars, &[], 0.0)
                 .map(|(_, h)| h)
                 .unwrap_or(1000.0);
-            obs_avg_h / pred_h.max(1.0)
+            obs_h / pred_h.max(1.0)
         };
         // y is flipped: font y up → image y down
         let preds: Vec<(f64, f64)> = preds_fu.iter().map(|(x, y)| (x * scale, y * -scale)).collect();
@@ -221,7 +224,7 @@ fn per_char_geo_cached(
                 (None, None, None, 0.0)
             } else {
                 let prev = &word_bounds[orig_idx - 1];
-                let (_, prev_pred_cx) = &preds[orig_idx - 1];
+                let (prev_pred_cx, _) = &preds[orig_idx - 1];
                 let obs_pitch_val = obs_cx - prev.cx;
                 let pred_pitch_val = pred_cx - prev_pred_cx;
                 let h_err_val = obs_pitch_val - pred_pitch_val;
@@ -293,12 +296,10 @@ fn per_char_geo_shaped(
 
         let ttfp = face.as_ref();
         let mut pred_positions: Vec<(f64, f64)> = Vec::with_capacity(sw.glyph_ids.len());
-        let mut pred_ink_width_sum = 0.0f64;
         let mut cursor_fu = 0.0f64;
         for (i, gid) in sw.glyph_ids.iter().enumerate() {
             let glyph_id = rustybuzz::ttf_parser::GlyphId(*gid as u16);
             let bbox = ttfp.glyph_bounding_box(glyph_id).unwrap_or(rustybuzz::ttf_parser::Rect { x_min: 0, y_min: 0, x_max: 0, y_max: 0 });
-            pred_ink_width_sum += (bbox.x_max - bbox.x_min) as f64;
             let x_off = sw.x_offsets.get(i).copied().unwrap_or(0) as f64;
             let y_off = sw.y_offsets.get(i).copied().unwrap_or(0) as f64;
             let cx = cursor_fu + x_off + (bbox.x_min as f64 + bbox.x_max as f64) * 0.5;
@@ -307,10 +308,19 @@ fn per_char_geo_shaped(
             cursor_fu += sw.x_advances[i] as f64;
         }
 
-        let obs_total_width: f64 = bounds_vec.iter().map(|b| b.width).sum::<f64>().max(1.0);
-        // Use ink-width ratio (not advance) — apples-to-apples with obs_total_width
-        let pred_total_ink_width = pred_ink_width_sum.max(1.0);
-        let scale = obs_total_width / pred_total_ink_width;
+        // Center-span scaling (unbiased): scale from first..last center distance
+        let scale = if bounds_vec.len() >= 2 {
+            let obs_span = (bounds_vec.last().unwrap().cx - bounds_vec.first().unwrap().cx).abs().max(0.5);
+            let pred_span = (pred_positions.last().unwrap().0 - pred_positions.first().unwrap().0).abs().max(0.5);
+            obs_span / pred_span
+        } else {
+            let obs_h = bounds_vec[0].height.max(1.0);
+            // Use ink height from bbox for single char
+            let glyph_id = rustybuzz::ttf_parser::GlyphId(sw.glyph_ids[0] as u16);
+            let bbox = ttfp.glyph_bounding_box(glyph_id).unwrap_or(rustybuzz::ttf_parser::Rect { x_min: 0, y_min: -1000, x_max: 0, y_max: 0 });
+            let pred_h = (bbox.y_max - bbox.y_min) as f64;
+            obs_h / pred_h.max(1.0)
+        };
 
         let pred_positions_px: Vec<(f64, f64)> = pred_positions.iter()
             .map(|(x, y)| (x * scale, y * -scale))

@@ -170,7 +170,7 @@ fn format_char_detail(
     h_err: Option<f32>,
     v_err: Option<f32>,
 ) -> String {
-    // Requested: "rank 1, p=#×u. glyph: #, midpoint x,y (delta x,ypx)"
+    // Requested: "rank 1, p=#×u<br>glyph: #<br>midpoint x,y (delta x,ypx)"
     let mut out = String::new();
     if let Some(r) = rank {
         out.push_str(&format!("<span class='font-mini'>rank {r}</span>"));
@@ -182,7 +182,8 @@ fn format_char_detail(
     if out.is_empty() && glyph_score.is_none() && h_ll.is_none() && v_ll.is_none() && h_err.is_none() && v_err.is_none() {
         return String::new();
     }
-    if !out.is_empty() { out.push_str(". "); }
+    // line break between total score and glyph score
+    if !out.is_empty() { out.push_str("<br>"); }
     // glyph: raw logit -d²/(2σ²) — not ln(joint prob)
     if let Some(gs) = glyph_score {
         out.push_str(&format!("<span class='logprob'>glyph: {gs:.2}</span>"));
@@ -196,7 +197,8 @@ fn format_char_detail(
     let has_mid = h_ll.is_some() || v_ll.is_some();
     let has_delta = h_err.is_some() || v_err.is_some();
     if has_mid || has_delta {
-        if glyph_score.is_some() || prob_x_u.is_some() { out.push_str(", "); }
+        // line break between glyph score and midpoint scores
+        if glyph_score.is_some() || prob_x_u.is_some() { out.push_str("<br>"); }
         out.push_str("<span class='geo'>midpoint ");
         if let Some(h) = h_ll { out.push_str(&format!("h {h:.2}")); }
         if let Some(v) = v_ll {

@@ -107,7 +107,8 @@ fn compute_obs_rank_probs(
             Some(f) => f,
             None => continue,
         };
-        let probs = classifier.probabilities(&d.seq, &feat);
+        let seq = [d.ch];
+        let probs = classifier.probabilities(&seq, &feat);
         if probs.is_empty() { continue; }
 
         let lookup = |gid: usize| -> Option<(usize, f32)> {
@@ -117,7 +118,7 @@ fn compute_obs_rank_probs(
         };
 
         if let Some(fk) = chosen_font_key {
-            if let Some(gid) = glyph_map.glyph_id_for_font(&d.seq, fk) {
+            if let Some(gid) = glyph_map.glyph_id_for_font(&seq, fk) {
                 if let Some((rank, prob)) = lookup(gid) {
                     result.chosen_ranks.insert(d.crop_index, rank);
                     result.chosen_probs.insert(d.crop_index, prob);
@@ -125,7 +126,7 @@ fn compute_obs_rank_probs(
             }
         }
         if let Some(gtk) = gt_font_key {
-            if let Some(gid) = glyph_map.glyph_id_for_font(&d.seq, gtk) {
+            if let Some(gid) = glyph_map.glyph_id_for_font(&seq, gtk) {
                 if let Some((rank, prob)) = lookup(gid) {
                     result.gt_ranks.insert(d.crop_index, rank);
                     result.gt_probs.insert(d.crop_index, prob);
@@ -147,10 +148,8 @@ fn save_obs_crops(
     let _ = std::fs::create_dir_all(&crop_dir);
     for d in observations {
         if let Some(img) = crops.get(d.crop_index) {
-            let seq_label: String = d.seq.iter().map(|&c| {
-                if c.is_alphanumeric() { format!("{}", c) }
-                else { format!("U{:04X}", c as u32) }
-            }).collect();
+            let c = d.ch;
+            let seq_label: String = if c.is_alphanumeric() { format!("{}", c) } else { format!("U{:04X}", c as u32) };
             let path = crop_dir.join(format!("crop_{:02}_{}.png", d.crop_index, seq_label));
             let _ = img.save(&path);
         }
@@ -603,7 +602,6 @@ pub fn match_lines(
                 let mut char_to_obs: std::collections::HashMap<(usize, usize), usize> =
                     std::collections::HashMap::new();
                 for (obs_i, obs) in observations.iter().enumerate() {
-                    if obs.seq.len() != 1 { continue; }
                     if let Some(&(si, cp)) = winning_pos_map.get(obs.crop_index) {
                         char_to_obs.insert((si, cp), obs_i);
                     }
@@ -738,7 +736,7 @@ pub fn match_lines(
                         // Update observation
                         if let Some(&obs_i) = char_to_obs.get(&(pc.seg_idx, pc.char_pos)) {
                             observations[obs_i].ocr_corrected_from = Some(pc.ocr_char);
-                            observations[obs_i].seq = vec![top_char];
+                            observations[obs_i].ch = top_char;
                             observations[obs_i].pflda_replaced = true;
                         }
                         eprintln!("[pflda] CORRECTED \'{}\' → \'{}\' at seg[{}][{}] (word_idx={})",
@@ -766,8 +764,10 @@ pub fn match_lines(
         }
 
         // Per-observation probabilities and audit detail: only for miss lines when full audit is active
+        // --audit-all forces computation for all lines (hits too) for geo bias tests (t64).
         let has_ocr_correction = corrected_words.is_some();
-        let obs_rank_probs = if (is_miss || has_ocr_correction) && args.full_audit() {
+        let audit_all = args.audit_all || args.report_all;
+        let obs_rank_probs = if args.full_audit() && (is_miss || has_ocr_correction || audit_all) {
             let chosen_font_key: Option<String> = font_result.as_ref()
                 .filter(|fr| !fr.font_key.is_empty())
                 .map(|fr| fr.font_key.clone());
@@ -800,27 +800,11 @@ pub fn match_lines(
                     }
                     for d in observations.iter() {
                         if let Some(&(seg_idx, char_pos)) = win_pos_map.get(d.crop_index) {
-                            let mut h_ll_sum = 0.0f32;
-                            let mut v_ll_sum = 0.0f32;
-                            let mut h_err_sum = 0.0f32;
-                            let mut v_err_sum = 0.0f32;
-                            let mut ok = true;
-                            for k in 0..d.seq.len() {
-                                let cp = char_pos + k;
-                                if let Some(pg) = lookup.get(&(seg_idx, cp)) {
-                                    h_ll_sum += pg.h_ll as f32;
-                                    v_ll_sum += pg.v_ll as f32;
-                                    if let Some(he) = pg.h_err { h_err_sum += he as f32; }
-                                    v_err_sum += pg.v_err as f32;
-                                } else {
-                                    ok = false; break;
-                                }
-                            }
-                            if ok {
-                                h_ll_map.insert(d.crop_index, h_ll_sum);
-                                v_ll_map.insert(d.crop_index, v_ll_sum);
-                                h_err_map.insert(d.crop_index, h_err_sum);
-                                v_err_map.insert(d.crop_index, v_err_sum);
+                            if let Some(pg) = lookup.get(&(seg_idx, char_pos)) {
+                                h_ll_map.insert(d.crop_index, pg.h_ll as f32);
+                                v_ll_map.insert(d.crop_index, pg.v_ll as f32);
+                                h_err_map.insert(d.crop_index, pg.h_err.unwrap_or(0.0) as f32);
+                                v_err_map.insert(d.crop_index, pg.v_err as f32);
                             }
                         }
                     }
@@ -866,7 +850,8 @@ pub fn match_lines(
                         None => continue,
                     };
                     // Use raw logits -d²/(2σ²), NOT softmax probs — don't softmax a softmax.
-                    let raw = classifier.raw_logits(&d.seq, &feat);
+                    let seq = [d.ch];
+                    let raw = classifier.raw_logits(&seq, &feat);
                     if raw.is_empty() { continue; }
                     // map gid -> raw logit for quick lookup
                     let mut gid_to_logit: std::collections::HashMap<usize, f32> = std::collections::HashMap::with_capacity(raw.len());
@@ -875,14 +860,14 @@ pub fn match_lines(
                     }
                     // Capture raw glyph scores for chosen/GT before adding geo (for report)
                     if let Some(ref cfk) = chosen_font_key {
-                        if let Some(gid) = glyph_map.glyph_id_for_font(&d.seq, cfk) {
+                        if let Some(gid) = glyph_map.glyph_id_for_font(&seq, cfk) {
                             if let Some(&raw_logit) = gid_to_logit.get(&gid) {
                                 rp.chosen_glyph_scores.insert(d.crop_index, raw_logit);
                             }
                         }
                     }
                     if let Some(ref gfk) = gt_font_key {
-                        if let Some(gid) = glyph_map.glyph_id_for_font(&d.seq, gfk) {
+                        if let Some(gid) = glyph_map.glyph_id_for_font(&seq, gfk) {
                             if let Some(&raw_logit) = gid_to_logit.get(&gid) {
                                 rp.gt_glyph_scores.insert(d.crop_index, raw_logit);
                             }
@@ -893,23 +878,13 @@ pub fn match_lines(
                     let mut logits: Vec<(String, f32, usize)> = Vec::new(); // (font_key, logit, gid)
                     for fe in font_registry.iter() {
                         let fk = fe.font_key();
-                        let Some(gid) = glyph_map.glyph_id_for_font(&d.seq, &fk) else { continue; };
+                        let Some(gid) = glyph_map.glyph_id_for_font(&seq, &fk) else { continue; };
                         let Some(&raw_logit) = gid_to_logit.get(&gid) else { continue; };
                         let mut logit = raw_logit;
                         if let Some(sc) = sc_opt {
                             if let Some(geo_map) = all_geo.get(&fk) {
-                                let mut ok = true;
-                                let mut geo_sum = 0.0f32;
-                                for k in 0..d.seq.len() {
-                                    let cp = sc.1 + k;
-                                    if let Some(&(h_ll, v_ll)) = geo_map.get(&(sc.0, cp)) {
-                                        geo_sum += h_ll + v_ll;
-                                    } else {
-                                        ok = false; break;
-                                    }
-                                }
-                                if ok {
-                                    logit += geo_sum;
+                                if let Some(&(h_ll, v_ll)) = geo_map.get(&(sc.0, sc.1)) {
+                                    logit += h_ll + v_ll;
                                 }
                             }
                         }
@@ -990,18 +965,12 @@ pub fn match_lines(
                             }
                         }
                         for d in &observations {
-                            // Filename: bigrams use "U+0041_U+0042.png", unigrams "U+0041.png"
-                            let fname: String = d.seq.iter()
-                                .map(|&c| format!("U+{:04X}", c as u32))
-                                .collect::<Vec<_>>()
-                                .join("_")
-                                + ".png";
+                            let fname: String = format!("U+{:04X}.png", d.ch as u32);
+                            let seq = [d.ch];
                             let path = font_ref_dir.join(&fname);
                             if path.exists() { continue; }
-                            let gid_overrides: Vec<Option<ab_glyph::GlyphId>> = d.seq.iter()
-                                .map(|c| override_map.get(c).map(|&gid| ab_glyph::GlyphId(gid)))
-                                .collect();
-                            let ref_img = char_render::render_ngram_fresh(&font, &d.seq, &gid_overrides, &char_render::RenderParams::default());
+                            let gid_overrides: Vec<Option<ab_glyph::GlyphId>> = vec![override_map.get(&d.ch).copied().map(|gid| ab_glyph::GlyphId(gid))];
+                            let ref_img = char_render::render_ngram_fresh(&font, &seq, &gid_overrides, &char_render::RenderParams::default());
                             if let Some(img) = ref_img {
                                 let _ = img.save(&path);
                             }
