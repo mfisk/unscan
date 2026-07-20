@@ -97,9 +97,128 @@ fn img_td(uri: Option<&str>) -> String {
     }
 }
 
+/// Ink bounding-box midpoint (cx, cy) for a grayscale image.
+/// Ink = pixel < 200 (same threshold as geometry_classifier).
+/// Returns None for blank images.
+fn ink_midpoint(img: &GrayImage) -> Option<(f32, f32)> {
+    let (w, h) = img.dimensions();
+    let mut x_min = w as i32;
+    let mut x_max = -1i32;
+    let mut y_min = h as i32;
+    let mut y_max = -1i32;
+    for y in 0..h {
+        for x in 0..w {
+            if img.get_pixel(x, y).0[0] < 200 {
+                if (x as i32) < x_min { x_min = x as i32; }
+                if x as i32 > x_max { x_max = x as i32; }
+                if (y as i32) < y_min { y_min = y as i32; }
+                if y as i32 > y_max { y_max = y as i32; }
+            }
+        }
+    }
+    if x_max < 0 || y_max < 0 {
+        None
+    } else {
+        let cx = (x_min as f32 + x_max as f32) * 0.5;
+        let cy = (y_min as f32 + y_max as f32) * 0.5;
+        Some((cx, cy))
+    }
+}
 
+fn format_mid_delta(_mid_scan: Option<(f32, f32)>, _mid_ref: Option<(f32, f32)>) -> String {
+    // was: ink midpoint delta (Δh Δv) — duplicates geo Δh (h_err is pitch error).
+    // Removed to conserve space and avoid "2 delta h" per cell. Geo Δh/Δv in
+    // format_geo is the scoring signal; keep only that.
+    String::new()
+}
 
+fn format_log_prob(prob_x_u: Option<f32>) -> String {
+    if let Some(pu) = prob_x_u {
+        if pu > 0.0 {
+            let lp = pu.ln();
+            return format!("<span class='logprob'>{lp:.2}</span>");
+        }
+    }
+    String::new()
+}
 
+fn format_geo(h_ll: Option<f32>, v_ll: Option<f32>, _ll: Option<f32>, h_err: Option<f32>, v_err: Option<f32>) -> String {
+    // Legacy wrapper — kept for compatibility; new code uses format_char_detail
+    let mut parts = Vec::new();
+    if let Some(h) = h_ll { parts.push(format!("h {h:.2}")); }
+    if let Some(v) = v_ll { parts.push(format!("v {v:.2}")); }
+    let score = parts.join(" ");
+    let mut deltas = Vec::new();
+    if let Some(he) = h_err { deltas.push(format!("Δh{he:.2}")); }
+    if let Some(ve) = v_err { deltas.push(format!("Δv{ve:.2}")); }
+    if score.is_empty() && deltas.is_empty() { return String::new(); }
+    if deltas.is_empty() {
+        format!("<span class='geo'>{score}</span>")
+    } else if score.is_empty() {
+        format!("<span class='geo'>({}px)</span>", deltas.join(" "))
+    } else {
+        format!("<span class='geo'>{score} ({}px)</span>", deltas.join(" "))
+    }
+}
+
+fn format_char_detail(
+    rank: Option<usize>,
+    prob_x_u: Option<f32>,
+    glyph_score: Option<f32>,
+    h_ll: Option<f32>,
+    v_ll: Option<f32>,
+    h_err: Option<f32>,
+    v_err: Option<f32>,
+) -> String {
+    // Requested: "rank 1, p=#×u. glyph: #, midpoint x,y (delta x,ypx)"
+    let mut out = String::new();
+    if let Some(r) = rank {
+        out.push_str(&format!("<span class='font-mini'>rank {r}</span>"));
+    }
+    if let Some(pu) = prob_x_u {
+        if !out.is_empty() { out.push_str(", "); }
+        out.push_str(&format!("<span class='num'>p={pu:.1}×u</span>"));
+    }
+    if out.is_empty() && glyph_score.is_none() && h_ll.is_none() && v_ll.is_none() && h_err.is_none() && v_err.is_none() {
+        return String::new();
+    }
+    if !out.is_empty() { out.push_str(". "); }
+    // glyph: raw logit -d²/(2σ²) — not ln(joint prob)
+    if let Some(gs) = glyph_score {
+        out.push_str(&format!("<span class='logprob'>glyph: {gs:.2}</span>"));
+    } else if let Some(pu) = prob_x_u {
+        // fallback: if glyph_score missing (old audit), show ln(joint) as approximation
+        if pu > 0.0 {
+            out.push_str(&format!("<span class='logprob'>glyph: {:.2}</span>", pu.ln()));
+        }
+    }
+    // midpoint scores + deltas
+    let has_mid = h_ll.is_some() || v_ll.is_some();
+    let has_delta = h_err.is_some() || v_err.is_some();
+    if has_mid || has_delta {
+        if glyph_score.is_some() || prob_x_u.is_some() { out.push_str(", "); }
+        out.push_str("<span class='geo'>midpoint ");
+        if let Some(h) = h_ll { out.push_str(&format!("h {h:.2}")); }
+        if let Some(v) = v_ll {
+            if h_ll.is_some() { out.push(' '); }
+            out.push_str(&format!("v {v:.2}"));
+        }
+        if !has_mid && has_delta {
+            // no h_ll/v_ll, just deltas
+            out.push_str("—");
+        }
+        if has_delta {
+            out.push_str(" (");
+            let mut d = Vec::new();
+            if let Some(he) = h_err { d.push(format!("Δh{he:.2}")); }
+            if let Some(ve) = v_err { d.push(format!("Δv{ve:.2}")); }
+            out.push_str(&d.join(" "));
+            out.push_str("px)");
+        }
+        out.push_str("</span>");
+    }
+    out
+}
 
 fn truncate(s: &str, max: usize) -> &str {
     if s.len() <= max {
@@ -1626,93 +1745,85 @@ fn build_observation_table(
     font_data_cache: &mut FontDataCache,
     diag_dir: Option<&Path>,
     _font_catalog: &[FontEntry],
-    glyph_map: &NgramGlyphMap,
+    _glyph_map: &NgramGlyphMap,
     crop_dir_name: &str,
 ) -> String {
     let mut rows = String::new();
 
     for &(_idx, cv) in obs_to_show {
         let seq: &[char] = &cv.seq;
-        let seq_label: String = seq.iter().collect();
-        let _best_p = cv.best_prob;
 
-        // Crop image from disk
-        let crop_uri = diag_dir.and_then(|dd| {
-            find_crop_png_in(dd, crop_dir_name, cv.crop_index, &cv.seq)
-                .and_then(|p| file_to_b64_uri(&p))
-        });
-
-        // Correct font reference glyph — render via shared pipeline
-        let correct_ref_uri = correct_fe.and_then(|fe| {
-            let data = font_data_cache.load(&fe.path)?;
-            let mut font = FontRef::try_from_slice(data).ok()?;
-            if let Some(ref vars) = fe.variations {
-                use ab_glyph::VariableFont;
-                for (tag, val) in vars {
-                    font.set_variation(tag, *val);
-                }
+        // Crop image + midpoint
+        let (crop_uri, crop_mid) = if let Some(dd) = diag_dir {
+            if let Some(p) = find_crop_png_in(dd, crop_dir_name, cv.crop_index, &cv.seq) {
+                let uri = file_to_b64_uri(&p);
+                let mid = image::open(&p).ok().map(|i| i.to_luma8()).and_then(|im| ink_midpoint(&im));
+                (uri, mid)
+            } else {
+                (None, None)
             }
-            let gid_overrides: Vec<Option<ab_glyph::GlyphId>> = seq.iter().map(|c| {
-                fe.glyph_overrides.as_ref()
-                    .and_then(|ovs| ovs.iter().find(|(gc, _)| *gc == *c).map(|(_, g)| ab_glyph::GlyphId(*g)))
-            }).collect();
-            let img = char_render::render_ngram_fresh(&font, seq, &gid_overrides, &char_render::RenderParams::default())?;
-            Some(img_to_b64_uri(&img))
-        });
-
-        // Chosen font reference glyph — try on-disk font_refs first, then render
-        let chosen_ref_uri = chosen_fe.and_then(|fe| {
-            // Try on-disk first (only for single chars)
-            if seq.len() == 1 {
-                if let Some(path) = find_font_ref_ngram_png(audit_root, fe, seq[0]) {
-                    return file_to_b64_uri(&path);
-                }
-            }
-            // Render via shared pipeline
-            let data = font_data_cache.load(&fe.path)?;
-            let mut font = FontRef::try_from_slice(data).ok()?;
-            if let Some(ref vars) = fe.variations {
-                use ab_glyph::VariableFont;
-                for (tag, val) in vars {
-                    font.set_variation(tag, *val);
-                }
-            }
-            let gid_overrides: Vec<Option<ab_glyph::GlyphId>> = seq.iter().map(|c| {
-                fe.glyph_overrides.as_ref()
-                    .and_then(|ovs| ovs.iter().find(|(gc, _)| *gc == *c).map(|(_, g)| ab_glyph::GlyphId(*g)))
-            }).collect();
-            let img = char_render::render_ngram_fresh(&font, seq, &gid_overrides, &char_render::RenderParams::default())?;
-            Some(img_to_b64_uri(&img))
-        });
-
-        // OCR cell
-        let ngram_tag = if seq.len() > 1 {
-            format!(" <span class='font-mini'>{}gram w={}</span>", seq.len(), cv.weight)
-        } else if cv.weight != 1.0 {
-            format!(" <span class='font-mini'>w={}</span>", cv.weight)
         } else {
-            String::new()
+            (None, None)
         };
-        let ocr_label = format!("'{seq_label}'");
 
-        let mut ocr_parts = vec![format!("OCR: <b>{ocr_label}</b>{ngram_tag}")];
-
-        // Best-scoring font for this OCR observation (stage-1 diagnostic)
-        if let Some(&(gid, _np)) = cv.nearest.first() {
-            let font_name = glyph_display_key(glyph_map, seq, gid);
-            let short = font_name.rsplit('/').next().unwrap_or(&font_name);
-            ocr_parts.push(format!(
-                "<span class='font-mini'>{short}</span>"
-            ));
+        // Correct font reference glyph
+        let mut correct_ref_uri: Option<String> = None;
+        let mut correct_mid: Option<(f32, f32)> = None;
+        if let Some(fe) = correct_fe {
+            if let Some(data) = font_data_cache.load(&fe.path) {
+                if let Ok(mut font) = FontRef::try_from_slice(data) {
+                    if let Some(ref vars) = fe.variations {
+                        use ab_glyph::VariableFont;
+                        for (tag, val) in vars {
+                            let _ = font.set_variation(tag, *val);
+                        }
+                    }
+                    let gid_overrides: Vec<Option<ab_glyph::GlyphId>> = seq.iter().map(|c| {
+                        fe.glyph_overrides.as_ref()
+                            .and_then(|ovs| ovs.iter().find(|(gc, _)| *gc == *c).map(|(_, g)| ab_glyph::GlyphId(*g)))
+                    }).collect();
+                    if let Some(img) = char_render::render_ngram_fresh(&font, seq, &gid_overrides, &char_render::RenderParams::default()) {
+                        correct_mid = ink_midpoint(&img);
+                        correct_ref_uri = Some(img_to_b64_uri(&img));
+                    }
+                }
+            }
         }
 
+        // Chosen font reference glyph
+        let mut chosen_ref_uri: Option<String> = None;
+        let mut chosen_mid: Option<(f32, f32)> = None;
+        if let Some(fe) = chosen_fe {
+            if seq.len() == 1 {
+                if let Some(path) = find_font_ref_ngram_png(audit_root, fe, seq[0]) {
+                    chosen_ref_uri = file_to_b64_uri(&path);
+                    if let Ok(img) = image::open(&path) {
+                        chosen_mid = ink_midpoint(&img.to_luma8());
+                    }
+                }
+            }
+            if chosen_ref_uri.is_none() {
+                if let Some(data) = font_data_cache.load(&fe.path) {
+                    if let Ok(mut font) = FontRef::try_from_slice(data) {
+                        if let Some(ref vars) = fe.variations {
+                            use ab_glyph::VariableFont;
+                            for (tag, val) in vars {
+                                let _ = font.set_variation(tag, *val);
+                            }
+                        }
+                        let gid_overrides: Vec<Option<ab_glyph::GlyphId>> = seq.iter().map(|c| {
+                            fe.glyph_overrides.as_ref()
+                                .and_then(|ovs| ovs.iter().find(|(gc, _)| *gc == *c).map(|(_, g)| ab_glyph::GlyphId(*g)))
+                        }).collect();
+                        if let Some(img) = char_render::render_ngram_fresh(&font, seq, &gid_overrides, &char_render::RenderParams::default()) {
+                            chosen_mid = ink_midpoint(&img);
+                            chosen_ref_uri = Some(img_to_b64_uri(&img));
+                        }
+                    }
+                }
+            }
+        }
 
-
-        let ocr_cell = ocr_parts.join(" · ");
-
-        // Per-observation probability labels with color coding:
-        // Green background = this font scores better on this observation
-        // Red background = this font scores worse
         let (chosen_win_class, correct_win_class) = match (cv.chosen_prob, cv.gt_font_prob) {
             (Some(cp), Some(gp)) => {
                 if cp > gp {
@@ -1726,20 +1837,25 @@ fn build_observation_table(
             _ => ("", ""),
         };
 
-        let chosen_score_label = if let Some(xu) = cv.chosen_prob {
-            let rank_part = cv.chosen_rank
-                .map(|r| format!(" <span class='font-mini'>rank {r}</span>"))
-                .unwrap_or_default();
-            format!("<div class='sub {chosen_win_class}'><span class='num'>{xu:.1}×u</span>{rank_part}</div>")
+        let chosen_detail = format_char_detail(
+            cv.chosen_rank, cv.chosen_prob, cv.chosen_glyph_score,
+            cv.chosen_geo_h_ll, cv.chosen_geo_v_ll,
+            cv.chosen_geo_h_err, cv.chosen_geo_v_err
+        );
+        let correct_detail = format_char_detail(
+            cv.gt_font_rank, cv.gt_font_prob, cv.gt_glyph_score,
+            cv.gt_geo_h_ll, cv.gt_geo_v_ll,
+            cv.gt_geo_h_err, cv.gt_geo_v_err
+        );
+
+        let chosen_score_label = if !chosen_detail.is_empty() {
+            format!("<div class='sub {chosen_win_class}'>{chosen_detail}</div>")
         } else {
             String::new()
         };
 
-        let correct_score_label = if let Some(xu) = cv.gt_font_prob {
-            let rank_part = cv.gt_font_rank
-                .map(|r| format!(" <span class='font-mini'>rank {r}</span>"))
-                .unwrap_or_default();
-            format!("<div class='sub {correct_win_class}'><span class='num'>{xu:.1}×u</span>{rank_part}</div>")
+        let correct_score_label = if !correct_detail.is_empty() {
+            format!("<div class='sub {correct_win_class}'>{correct_detail}</div>")
         } else {
             String::new()
         };
@@ -1749,17 +1865,16 @@ fn build_observation_table(
              <td class=\"img-td\">{}</td>\
              <td class=\"img-td {correct_win_class}\"><div class=\"img-stat\">{}{}</div></td>\
              <td class=\"img-td {chosen_win_class}\"><div class=\"img-stat\">{}{}</div></td>\
-             <td class=\"ocr-col\">{}</td>\
              </tr>",
             img_td(crop_uri.as_deref()),
             img_td(correct_ref_uri.as_deref()),
             correct_score_label,
             img_td(chosen_ref_uri.as_deref()),
             chosen_score_label,
-            ocr_cell,
         ));
     }
 
+    // Column headers
     // Column headers
     let rank_str = match (gt_rank, gt_score) {
         (Some(r), Some(s)) => format!("font #{r}, score {s:.10}"),
@@ -1797,7 +1912,6 @@ fn build_observation_table(
          <th>Scan</th>\
          <th class=\"correct\">Correct: {correct_font_name}<br><span class='score'>{rank_str}</span></th>\
          <th class=\"chosen\">Unscan pick: {display_chosen}<br><span class='score'>{chosen_rank_info}</span></th>\
-         <th>OCR</th>\
          </tr>\
          {rows}\
          </table>"
@@ -1838,16 +1952,19 @@ td {
   padding: 2px 4px; vertical-align: middle;
   border-bottom: 1px solid #eee;
 }
-.img-td { text-align: center; vertical-align: middle; }
-.img-stat { display: flex; align-items: center; gap: 4px; justify-content: center; }
+.img-td { text-align: center; vertical-align: top; }
+.img-stat { display: flex; align-items: flex-start; gap: 4px; justify-content: center; }
 img.ci {
   height: 19px; image-rendering: pixelated; flex-shrink: 0;
   border: 1px solid #ddd;
   background: #f5f5f5;
 }
-.sub { font-size: 10px; color: #777; white-space: nowrap; }
+.sub { font-size: 9px; color: #777; line-height: 1.2; display: inline; white-space: nowrap; }
 .ocr-fix { color: #c62828; }
-.num { font-family: monospace; font-size: 12px; text-align: right; white-space: nowrap; }
+.num { font-family: monospace; font-size: 10px; text-align: left; white-space: nowrap; display: inline; }
+.mid-delta { font-family: monospace; font-size: 9px; color: #0066cc; white-space: nowrap; display: inline; }
+.logprob { font-family: monospace; font-size: 9px; color: #8855aa; white-space: nowrap; display: inline; }
+.geo { font-family: monospace; font-size: 9px; color: #d07a00; white-space: nowrap; display: inline; }
 .prob-win { background: #e8f5e9; border-left: 3px solid #4caf50; padding-left: 4px; }
 .prob-lose { background: #ffebee; border-left: 3px solid #ef5350; padding-left: 4px; }
 .per-word-sizes { font-family: monospace; font-size: 11px; line-height: 1.8; }

@@ -30,6 +30,8 @@ mod zncc_classifier;
 #[allow(dead_code)]
 mod ngram;
 mod atomic_file;
+mod geo_cache;
+mod geometry_classifier;
 
 use crate::font_pipeline::ObsRankProbs;
 use crate::audit::{AuditEntry, AuditLog, BBox, GeometryEntry, PageSummary};
@@ -136,6 +138,10 @@ fn build_audit_entry(
     let font_result = &lm.font_result;
     let obs_vote = |d: &font_match::ObservationDetail, rp: &ObsRankProbs| {
         let n_glyphs = classifier.glyph_count(&d.seq).max(1) as f32;
+        let ch_h_ll = rp.chosen_geo_h_ll.get(&d.crop_index).copied();
+        let ch_v_ll = rp.chosen_geo_v_ll.get(&d.crop_index).copied();
+        let gt_h_ll = rp.gt_geo_h_ll.get(&d.crop_index).copied();
+        let gt_v_ll = rp.gt_geo_v_ll.get(&d.crop_index).copied();
         ObservationVote {
             seq: d.seq.clone(),
             weight: d.weight,
@@ -156,6 +162,18 @@ fn build_audit_entry(
             chosen_prob: rp.chosen_probs.get(&d.crop_index).copied().map(|p| p * n_glyphs),
             gt_font_prob: rp.gt_probs.get(&d.crop_index).copied().map(|p| p * n_glyphs),
             obs_stats: d.obs_stats.clone(),
+            chosen_geo_h_ll: ch_h_ll,
+            chosen_geo_v_ll: ch_v_ll,
+            chosen_glyph_score: rp.chosen_glyph_scores.get(&d.crop_index).copied(),
+            gt_glyph_score: rp.gt_glyph_scores.get(&d.crop_index).copied(),
+            chosen_geo_h_err: rp.chosen_geo_h_err.get(&d.crop_index).copied(),
+            chosen_geo_v_err: rp.chosen_geo_v_err.get(&d.crop_index).copied(),
+            gt_geo_h_ll: gt_h_ll,
+            gt_geo_v_ll: gt_v_ll,
+            gt_geo_h_err: rp.gt_geo_h_err.get(&d.crop_index).copied(),
+            gt_geo_v_err: rp.gt_geo_v_err.get(&d.crop_index).copied(),
+            chosen_geo_ll: match (ch_h_ll, ch_v_ll) { (Some(h), Some(v)) => Some(h+v), (Some(h), None) => Some(h), (None, Some(v)) => Some(v), _ => None },
+            gt_geo_ll: match (gt_h_ll, gt_v_ll) { (Some(h), Some(v)) => Some(h+v), (Some(h), None) => Some(h), (None, Some(v)) => Some(v), _ => None },
         }
     };
     // Use corrected text if OCR corrections were applied
@@ -260,6 +278,7 @@ fn run(args: &cli::Args, classifier: &mut dyn classifier::Classifier) -> Result<
 
     // ── 1. Scan fonts and populate classifier ──────────────────────
     let font_registry = load_fonts(args, classifier)?;
+    eprintln!("[timing] load_fonts {:.2}s", run_start.elapsed().as_secs_f64());
     if font_registry.is_empty() {
         return Err(ScanTextError::NoFonts);
     }
@@ -267,6 +286,7 @@ fn run(args: &cli::Args, classifier: &mut dyn classifier::Classifier) -> Result<
     // Load glyph map (glyph dedup groups).  If missing or stale, retrain
     // the LDA classifier (which rebuilds the glyph map as a side effect).
     let gmap_path = glyph_map::NgramGlyphMap::default_path();
+    let t_gmap = std::time::Instant::now();
     let mut glyph_map = match glyph_map::NgramGlyphMap::load(&gmap_path) {
         Ok(g) => g,
         Err(e) => {
@@ -287,6 +307,7 @@ fn run(args: &cli::Args, classifier: &mut dyn classifier::Classifier) -> Result<
                 })
         }
     };
+    eprintln!("[timing] glyph_map load {:.2}s (total {:.2}s)", t_gmap.elapsed().as_secs_f64(), run_start.elapsed().as_secs_f64());
 
     // ── Incremental update: detect new fonts and add to index ──────
     // Compare cached font_meta (glyph_map) against installed fonts.
@@ -300,11 +321,46 @@ fn run(args: &cli::Args, classifier: &mut dyn classifier::Classifier) -> Result<
 
         eprintln!("[incremental] installed={} cached={} (glyph_map has {} unique fonts)", installed_keys.len(), cached_keys.len(), cached_keys.len());
 
-        let new_keys: Vec<String> = installed_keys.difference(&cached_keys).cloned().collect();
+        let mut new_keys: Vec<String> = installed_keys.difference(&cached_keys).cloned().collect();
         let removed_keys: Vec<String> = cached_keys.difference(&installed_keys).cloned().collect();
 
         if !removed_keys.is_empty() {
             eprintln!("[incremental] Keeping {} removed fonts (trained data still valid for classification)", removed_keys.len());
+        }
+
+        // Filter out non-Latin fonts that cannot render any supported_chars
+        // (NotoSansBamum, NotoSansGothic, NotoSerifLao etc. = 5898-5660 = 238).
+        // These have zero Latin coverage and would never register in glyph_map,
+        // causing the same 238 to be redetected every run.
+        {
+            let supported = features::supported_chars();
+            let mut filtered = Vec::with_capacity(new_keys.len());
+            let mut skipped = 0usize;
+            for font_key in &new_keys {
+                let Some(fe) = font_registry.by_key(font_key) else { continue };
+                let Ok(font_data) = std::fs::read(&fe.path) else { continue };
+                let Ok(face) = rustybuzz::ttf_parser::Face::parse(&font_data, 0) else { continue };
+                // Require at least one Latin letter (a-z) to avoid NotoColorEmoji (which has only digits 0-9)
+                // NotoColorEmoji has 0-9 but no letters -> would pass 'any supported char' and then hang indexing 11M CBDT
+                let has_latin = ('a'..='z').any(|c| face.glyph_index(c).map_or(false, |g| g.0 != 0));
+                if has_latin {
+                    filtered.push(font_key.clone());
+                } else {
+                    // Check fallback via overrides (rare)
+                    let has_override = fe.glyph_overrides.as_deref()
+                        .map(|ovs| ovs.iter().any(|(ch,_)| supported.contains(ch)))
+                        .unwrap_or(false);
+                    if has_override {
+                        filtered.push(font_key.clone());
+                    } else {
+                        skipped += 1;
+                    }
+                }
+            }
+            if skipped > 0 {
+                eprintln!("[incremental] Skipping {} non-Latin fonts (no supported_chars coverage)", skipped);
+            }
+            new_keys = filtered;
         }
 
         if !new_keys.is_empty() {
@@ -313,12 +369,8 @@ fn run(args: &cli::Args, classifier: &mut dyn classifier::Classifier) -> Result<
                 eprintln!("  + {k}");
             }
 
-            // Build sequence list (same as training)
-            let sequences: Vec<Vec<char>> = {
-                let mut seqs: Vec<Vec<char>> = features::supported_chars().iter().map(|&c| vec![c]).collect();
-                seqs.extend(features::supported_sequences(2).iter().cloned());
-                seqs
-            };
+            // Build sequence list (single-char only, bigrams disabled)
+            let sequences: Vec<Vec<char>> = features::supported_chars().iter().map(|&c| vec![c]).collect();
 
             // Map font_key -> FontEntry for quick lookup
             let font_by_key: std::collections::HashMap<String, &font_scan::FontEntry> = font_registry.entries().iter()
@@ -414,31 +466,45 @@ fn run(args: &cli::Args, classifier: &mut dyn classifier::Classifier) -> Result<
             eprintln!("[incremental] Indexed {fonts_indexed} new fonts, {new_glyphs_added} new glyph groups created");
         }
     }
+    eprintln!("[timing] incremental {:.2}s", run_start.elapsed().as_secs_f64());
 
     // All font access goes through the shared cache below.
 
     // ── 1c. Build runtime training data for per-font OCR correction ─
+    let t_rtd = std::time::Instant::now();
     let rtd = train::RuntimeTrainingData::from_registry(
         &font_registry, &glyph_map, &args.render_params(),
     );
+    eprintln!("[timing] rtd from_registry {:.2}s (total {:.2}s) -> {}", t_rtd.elapsed().as_secs_f64(), run_start.elapsed().as_secs_f64(), if rtd.is_some() { "Some" } else { "None" });
 
     // ── 1b''. Shared font cache for all post-index font access ──────
     let font_cache = font_cache::FontCache::new(font_cache::DEFAULT_CAPACITY);
+    eprintln!("[timing] font_cache new {:.2}s", run_start.elapsed().as_secs_f64());
+
+    // ── 1c''. Geometry cache for GPOS kerning + ligature-aware positioning ──
+    let t_geo = std::time::Instant::now();
+    let geo_cache = crate::geo_cache::GeometryCache::load_or_build(&font_registry, &font_cache);
+    eprintln!("[timing] geo_cache load_or_build {:.2}s (total {:.2}s)", t_geo.elapsed().as_secs_f64(), run_start.elapsed().as_secs_f64());
 
     // ── 2. Load input pages (with raster cache) ──────────────────────
     let cache_dir = page_cache::cache_key(input, args.dpi)
         .and_then(|key| page_cache::cache_dir(&key));
 
+    let t_pages = std::time::Instant::now();
     let (pages, _raster_cached) = page_cache::get_pages(input, args.dpi)?;
+    eprintln!("[timing] get_pages {} pages {:.2}s (total {:.2}s)", pages.len(), t_pages.elapsed().as_secs_f64(), run_start.elapsed().as_secs_f64());
 
     // ── 2b. Extract source image data for pass-through ───────────────
+    let t_extract = std::time::Instant::now();
     let source_images = if input.extension().and_then(|e| e.to_str()) == Some("pdf") {
         pdf_out::extract_source_images(input)
     } else {
         Vec::new()
     };
+    eprintln!("[timing] extract_source_images {:.2}s (total {:.2}s)", t_extract.elapsed().as_secs_f64(), run_start.elapsed().as_secs_f64());
 
     // ── 3. Process each page ─────────────────────────────────────────
+    eprintln!("[timing] before page loop {:.2}s", run_start.elapsed().as_secs_f64());
     let mut all_pages: Vec<pdf_out::PageContent> = Vec::new();
     let mut audit_text: Vec<AuditEntry> = Vec::new();
     let mut audit_geo: Vec<GeometryEntry> = Vec::new();
@@ -510,7 +576,7 @@ fn run(args: &cli::Args, classifier: &mut dyn classifier::Classifier) -> Result<
         // ── Pass 1: Match all lines ──────────────────────────────────
         let (mut line_matches, fp_hits) = font_pipeline::match_lines(
             &lines, &gray_page, page_img, page_num,
-            &font_registry, &font_cache, classifier,
+            &font_registry, &font_cache, &geo_cache, classifier,
             &glyph_map,
             ground_truth.as_ref(),
             dominant_font_candidate.as_ref(),
@@ -552,7 +618,7 @@ fn run(args: &cli::Args, classifier: &mut dyn classifier::Classifier) -> Result<
             let split_set: std::collections::HashSet<usize> = split_indices.iter().copied().collect();
             let (mut new_matches, _) = font_pipeline::match_lines(
                 &lines, &gray_page, page_img, page_num,
-                &font_registry, &font_cache, classifier,
+                &font_registry, &font_cache, &geo_cache, classifier,
                 &glyph_map,
                 ground_truth.as_ref(),
                 None,  // No fast path — re-score fully with new word splits

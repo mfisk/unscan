@@ -120,6 +120,12 @@ pub fn identify_fonts(
     _audit: bool,
     ensure_font_keys: &[&str],
     min_ngram_prob: f32,
+    word_segs: &[crate::segment::WordSeg],
+    wib: &[Vec<crate::geometry_classifier::CharInkBounds>],
+    font_registry: &crate::font_scan::FontRegistry,
+    font_cache: &crate::font_cache::FontCache,
+    geo_cache: &crate::geo_cache::GeometryCache,
+    position_map: &[(usize, usize)],
 ) -> FontIdResult {
     if windows.is_empty() {
         return FontIdResult { scores: Vec::new(), observations: Vec::new(), path_score: f32::MIN };
@@ -212,6 +218,19 @@ pub fn identify_fonts(
         return FontIdResult { scores: Vec::new(), observations, path_score: f32::MIN };
     }
 
+    // ── Per-window cache: compute logits/probs once, not per-candidate (was 300× recompute = 76s)
+    // Formerly: candidate_vec.iter().any(|fk| glyph_id_for_font + classifier.probability)
+    //   → 27 windows × 300 candidates × (embed + 500-centroid scan) = 8k full scans/line
+    //   + glyph_id_for_font linear scan (32M memcmp). Now 27 scans total.
+    let mut window_logit_maps: Vec<std::collections::HashMap<usize, f32>> = Vec::with_capacity(crop_data.len());
+    let mut window_prob_maps: Vec<std::collections::HashMap<usize, f32>> = Vec::with_capacity(crop_data.len());
+    for wd in &crop_data {
+        let logits = classifier.raw_logits(&wd.seq, &wd.feat);
+        let probs = classifier.probabilities(&wd.seq, &wd.feat);
+        window_logit_maps.push(logits.into_iter().collect());
+        window_prob_maps.push(probs.into_iter().collect());
+    }
+
     // ── Stage 2a: filter ngrams — keep only windows where at least one
     // candidate font scores above (min_ngram_prob × uniform). This ensures
     // all fonts are scored on the same set of ngrams. ──
@@ -221,10 +240,11 @@ pub fn identify_fonts(
             let wd = &crop_data[i];
             let n_glyphs = classifier.glyph_count(&wd.seq).max(1) as f32;
             let threshold = min_ngram_prob / n_glyphs;
+            let prob_map = &window_prob_maps[i];
             candidate_vec.iter().any(|font_key| {
                 glyph_map.glyph_id_for_font(&wd.seq, font_key)
-                    .and_then(|gid| classifier.probability(&wd.seq, &wd.feat, gid))
-                    .map_or(false, |p| p >= threshold)
+                    .and_then(|gid| prob_map.get(&gid))
+                    .map_or(false, |p| *p >= threshold)
             })
         })
         .collect();
@@ -234,6 +254,29 @@ pub fn identify_fonts(
     // sum-of-squared-deviations from the per-observation best.
     let n_scoring = scoring_window_indices.len();
 
+    // ── Geo precompute: per-font per-char geometry log-likelihoods ──
+    // Called for each character right before ngram glyph classification.
+    // Ligature Unicode (FB00-FB04) ARE in cache and scored with geo as single glyphs.
+    // Multi-char ligature merges (e.g. "ff" plain -> 1 glyph) are skipped for geo,
+    // falling back to SSIM/n-gram only.
+    // Fonts with GPOS vertical/offsets are NOT cached; fonts with pure horizontal
+    // kerning ARE cached via bigram kern_pairs and scored with geo.
+    let mut geo_per_font: std::collections::HashMap<String, std::collections::HashMap<(usize, usize), f32>> = std::collections::HashMap::new();
+    if !word_segs.is_empty() && !wib.is_empty() {
+        for font_key in &candidate_vec {
+            if let Some(geos) = crate::geometry_classifier::per_char_geo_for_font(
+                font_key, word_segs, wib, font_cache, geo_cache, font_registry
+            ) {
+                let mut map = std::collections::HashMap::new();
+                for g in geos {
+                    let ll = (g.h_ll + g.v_ll) as f32;
+                    map.insert((g.seg_idx, g.orig_idx), ll);
+                }
+                geo_per_font.insert(font_key.clone(), map);
+            }
+        }
+    }
+
     // First pass: collect log-probs for all candidate fonts
     let font_lps: Vec<(String, Vec<(f32, f32)>)> = candidate_vec.into_iter()
         .filter_map(|font_key| {
@@ -241,8 +284,25 @@ pub fn identify_fonts(
                 .filter_map(|&i| {
                     let wd = &crop_data[i];
                     let glyph_id = glyph_map.glyph_id_for_font(&wd.seq, &font_key)?;
-                    let p = classifier.probability(&wd.seq, &wd.feat, glyph_id)?;
-                    Some((p.ln(), wd.weight * ood_weights[i]))
+                    // Use raw logit -d²/(2σ²), NOT ln(softmax p). Don't softmax a softmax.
+                    let logit = *window_logit_maps[i].get(&glyph_id)?;
+                    let mut lp = logit;
+                    // Geo scoring: per character, right before ngram classification
+                    if let Some(geo_map) = geo_per_font.get(&font_key) {
+                        if let Some(&(seg_idx, char_pos)) = position_map.get(wd.window_idx) {
+                            let mut geo_ll = 0.0f32;
+                            if let Some(&ll) = geo_map.get(&(seg_idx, char_pos)) {
+                                geo_ll += ll;
+                            }
+                            if wd.seq.len() == 2 {
+                                if let Some(&ll2) = geo_map.get(&(seg_idx, char_pos + 1)) {
+                                    geo_ll += ll2;
+                                }
+                            }
+                            lp += geo_ll;
+                        }
+                    }
+                    Some((lp, wd.weight * ood_weights[i]))
                 })
                 .collect();
             if log_probs.len() < n_scoring { return None; }

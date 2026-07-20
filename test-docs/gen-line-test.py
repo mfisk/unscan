@@ -75,6 +75,11 @@ def parse_args():
     if args and any("=" in a for a in args):
         hardcoded = True
 
+    # Default: hardcoded 7-line seam test (no args = hardcoded)
+    if not args and not hardcoded:
+        hardcoded = True
+        args = [f"{font}={text}" for font, text in HARDCODED_7]
+
     return hardcoded, args, audit_ref
 
 def main():
@@ -82,9 +87,9 @@ def main():
 
     if len(args) < 1:
         print("Usage:")
-        print("  gen-line-test.py --hardcoded")
+        print("  gen-line-test.py --hardcoded  (default, 7-line seam test)")
         print("  gen-line-test.py 'LibreBodoni-400=abc.' 'EBGaramond-400=Hello.'")
-        print("  gen-line-test.py 1:72 1:73 ...  (legacy audit mode)")
+        print("  gen-line-test.py 1:72 1:73 ...  (legacy audit mode, deprecated)")
         sys.exit(1)
 
     ttf_paths_for_map = []

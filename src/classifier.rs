@@ -280,6 +280,22 @@ pub trait Classifier: Send + Sync {
             .map(|(_, p)| *p)
     }
 
+    /// Raw classifier logits ` -d²/(2σ²)` — NOT softmaxed.
+    /// Use for `softmax(logit + geo)`. Default falls back to `ln p`
+    /// (which differs by a per-query constant, so ranking and
+    /// `lp - best_lp` scoring are unchanged).
+    fn raw_logits(&self, seq: &[char], query: &CropFeatures) -> Vec<(usize, f32)> {
+        self.probabilities(seq, query).into_iter()
+            .map(|(id, p)| (id, if p > 0.0 { p.ln() } else { f32::NEG_INFINITY }))
+            .collect()
+    }
+
+    fn raw_logit(&self, seq: &[char], query: &CropFeatures, glyph_id: usize) -> Option<f32> {
+        self.raw_logits(seq, query).into_iter()
+            .find(|(id, _)| *id == glyph_id)
+            .map(|(_, l)| l)
+    }
+
     /// Short name for logging and cache invalidation.
     fn name(&self) -> &str;
 
@@ -376,6 +392,20 @@ impl ImageModel {
             .map(|(id, stored)| (*id, sq_euclid(query, stored)))
             .collect();
         softmax_probs(&dists, self.sigma_sq, self.med_nn)
+    }
+
+    /// Raw classifier logits (unnormalized log-probs) for each font.
+    /// `logit = -d² / (2·sigma_sq)`. Does NOT softmax — caller must softmax
+    /// after adding geometry terms. Returns uniform 0 when sigma_sq is degenerate
+    /// (equivalent to uniform softmax).
+    pub fn raw_logits(&self, query: &[f32]) -> Vec<(u32, f32)> {
+        if self.sigma_sq <= 1e-30 {
+            return self.centroids.iter().map(|(id, _)| (*id, 0.0f32)).collect();
+        }
+        let inv2s = 1.0 / (2.0 * self.sigma_sq);
+        self.centroids.iter()
+            .map(|(id, stored)| (*id, -sq_euclid(query, stored) * inv2s))
+            .collect()
     }
 
     /// Top-k fonts by probability.
@@ -699,6 +729,25 @@ impl MmapNgramModel {
         Some(softmax_probs(&dists, e.sigma_sq, e.med_nn))
     }
 
+    /// Raw logits ` -d² / (2·sigma_sq)` — NOT softmaxed. Use for `softmax(logit + geo)`.
+    pub fn raw_logits(&self, seq: &[char], query: &[f32]) -> Option<Vec<(u32, f32)>> {
+        let e = self.entries.get(seq)?;
+        if e.n_centroids == 0 { return Some(Vec::new()); }
+        if e.sigma_sq <= 1e-30 {
+            let gids = self.u32_slice(e.glyph_ids_off, e.n_centroids);
+            return Some(gids.iter().map(|&gid| (gid, 0.0f32)).collect());
+        }
+        let gids = self.u32_slice(e.glyph_ids_off, e.n_centroids);
+        let inv2s = 1.0 / (2.0 * e.sigma_sq);
+        let mut out = Vec::with_capacity(e.n_centroids);
+        for i in 0..e.n_centroids {
+            let v = self.f32_slice(e.vecs_off + i * e.vec_dim * 4, e.vec_dim);
+            let d2 = sq_euclid(query, v);
+            out.push((gids[i], -d2 * inv2s));
+        }
+        Some(out)
+    }
+
     /// Top-k fonts by probability for a given char.
     pub fn classify(&self, seq: &[char], query: &[f32], k: usize) -> Vec<(u32, f32)> {
         match self.probabilities(seq, query) {
@@ -860,6 +909,18 @@ impl CharModelStore {
         }
     }
 
+    /// Raw logits ( -d² / 2σ² ), NOT softmaxed. For correct `softmax(logit + geo)`.
+    pub fn raw_logits(&self, seq: &[char], query: &[f32]) -> Vec<(u32, f32)> {
+        match self {
+            CharModelStore::Owned(m) => {
+                m.entries.get(seq).map_or_else(Vec::new, |cm| cm.raw_logits(query))
+            }
+            CharModelStore::Mmap(m) => {
+                m.raw_logits(seq, query).unwrap_or_default()
+            }
+        }
+    }
+
     pub fn classify(&self, seq: &[char], query: &[f32], k: usize) -> Vec<(u32, f32)> {
         match self {
             CharModelStore::Owned(m) => {
@@ -916,6 +977,18 @@ impl Classifier for EmbeddingClassifier {
         probs.into_iter()
             .find(|(id, _)| *id as usize == glyph_id)
             .map(|(_, p)| p)
+    }
+
+    fn raw_logits(&self, seq: &[char], query: &CropFeatures) -> Vec<(usize, f32)> {
+        let q = self.embedder.embed(seq, query);
+        self.model.raw_logits(seq, &q).into_iter().map(|(id, l)| (id as usize, l)).collect()
+    }
+
+    fn raw_logit(&self, seq: &[char], query: &CropFeatures, glyph_id: usize) -> Option<f32> {
+        let q = self.embedder.embed(seq, query);
+        self.model.raw_logits(seq, &q).into_iter()
+            .find(|(id, _)| *id as usize == glyph_id)
+            .map(|(_, l)| l)
     }
 
     fn name(&self) -> &str {

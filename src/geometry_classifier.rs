@@ -79,14 +79,23 @@ pub fn measure_char_ink_bounds(
 ) -> Vec<CharInkBounds> {
     let (w, h) = word_img.dimensions();
     let n_chars = chars.len();
-    if n_chars == 0 || boundaries.len() < n_chars + 1 {
+    if n_chars == 0 {
         return Vec::new();
     }
+    // If segmentation failed to produce n_chars+1 boundaries, fallback to uniform
+    // partitioning instead of returning empty (which would kill geo for the whole line).
+    let mut owned_uniform: Vec<u32> = Vec::new();
+    let bounds: &[u32] = if boundaries.len() < n_chars + 1 {
+        owned_uniform = (0..=n_chars).map(|i| ((i as f32 * w as f32 / n_chars as f32).round() as u32).min(w)).collect();
+        &owned_uniform
+    } else {
+        boundaries
+    };
 
     let mut result = Vec::with_capacity(n_chars);
     for i in 0..n_chars {
-        let x0 = boundaries[i].min(w.saturating_sub(1)) as usize;
-        let x1 = boundaries[i + 1].min(w) as usize;
+        let x0 = bounds[i].min(w.saturating_sub(1)) as usize;
+        let x1 = bounds[i + 1].min(w) as usize;
         if x0 >= x1 {
             result.push(CharInkBounds {
                 cx: x0 as f64,
@@ -152,7 +161,7 @@ pub fn measure_char_ink_bounds(
     result
 }
 
-/// Cached path: use GeometryCache predictions (fast, ASCII only, no GPOS offsets).
+/// Cached path: use GeometryCache predictions (fast, Unicode, keeps both GPOS Pair formats native).
 fn per_char_geo_cached(
     font_key: &str,
     wib: &[Vec<CharInkBounds>],
@@ -168,13 +177,33 @@ fn per_char_geo_cached(
             continue;
         }
         // Try to get predictions for this word from cache.
-        // If any char is non-ASCII or ligature (FB00-FB04), cache will miss → fall back to shaped.
-        let preds = geo_cache.predict_glyph_positions(font_key, &ws.chars)?;
-        if preds.len() != word_bounds.len() {
+        // Cache contains full Unicode (cmap) + FB00-FB04 ligature codepoints.
+        // Non-BMP / missing cmap entries will miss and fall back to shaped path.
+        // Ligature codepoints (FB00-FB04) ARE in cache and score as single glyphs.
+        // Plain "ff" (['f','f']) is 2 chars, stays 2 glyphs (liga disabled for plain).
+        let preds_fu = geo_cache.predict_glyph_positions(font_key, &ws.chars)?;
+        if preds_fu.len() != word_bounds.len() {
             // Ligature merge: e.g. "ff" plain shaped to 1 glyph but we have 2 bounds → skip geo for this word.
             // Single-glyph cases (1 char word, or lig path with FB00) will have len==1 and pass.
             continue;
         }
+
+        // Scale from font units → px: use ink-width ratio (sum obs widths / sum pred ink widths)
+        // This is apples-to-apples vs advance which includes side bearings.
+        let obs_total_width = word_bounds.iter().map(|b| b.width).sum::<f64>().max(1.0);
+        let scale = if let Some(pred_ink_sum) = geo_cache.predict_word_ink_width_sum(font_key, &ws.chars) {
+            obs_total_width / pred_ink_sum.max(1.0)
+        } else {
+            // fallback: height ratio (robust when ink width unavailable)
+            let obs_avg_h = word_bounds.iter().map(|b| b.height).sum::<f64>() / word_bounds.len() as f64;
+            let pred_h = geo_cache
+                .predict_word_ink_extent(font_key, &ws.chars, &[], 0.0)
+                .map(|(_, h)| h)
+                .unwrap_or(1000.0);
+            obs_avg_h / pred_h.max(1.0)
+        };
+        // y is flipped: font y up → image y down
+        let preds: Vec<(f64, f64)> = preds_fu.iter().map(|(x, y)| (x * scale, y * -scale)).collect();
 
         let obs_word_cy = word_bounds.iter().map(|b| b.cy).sum::<f64>() / word_bounds.len() as f64;
         let pred_word_cy = preds.iter().map(|(_, y)| *y).sum::<f64>() / preds.len() as f64;
@@ -264,10 +293,12 @@ fn per_char_geo_shaped(
 
         let ttfp = face.as_ref();
         let mut pred_positions: Vec<(f64, f64)> = Vec::with_capacity(sw.glyph_ids.len());
+        let mut pred_ink_width_sum = 0.0f64;
         let mut cursor_fu = 0.0f64;
         for (i, gid) in sw.glyph_ids.iter().enumerate() {
             let glyph_id = rustybuzz::ttf_parser::GlyphId(*gid as u16);
             let bbox = ttfp.glyph_bounding_box(glyph_id).unwrap_or(rustybuzz::ttf_parser::Rect { x_min: 0, y_min: 0, x_max: 0, y_max: 0 });
+            pred_ink_width_sum += (bbox.x_max - bbox.x_min) as f64;
             let x_off = sw.x_offsets.get(i).copied().unwrap_or(0) as f64;
             let y_off = sw.y_offsets.get(i).copied().unwrap_or(0) as f64;
             let cx = cursor_fu + x_off + (bbox.x_min as f64 + bbox.x_max as f64) * 0.5;
@@ -277,8 +308,9 @@ fn per_char_geo_shaped(
         }
 
         let obs_total_width: f64 = bounds_vec.iter().map(|b| b.width).sum::<f64>().max(1.0);
-        let pred_total_advance = sw.total_advance_fu.max(1.0) as f64;
-        let scale = obs_total_width / pred_total_advance;
+        // Use ink-width ratio (not advance) — apples-to-apples with obs_total_width
+        let pred_total_ink_width = pred_ink_width_sum.max(1.0);
+        let scale = obs_total_width / pred_total_ink_width;
 
         let pred_positions_px: Vec<(f64, f64)> = pred_positions.iter()
             .map(|(x, y)| (x * scale, y * -scale))

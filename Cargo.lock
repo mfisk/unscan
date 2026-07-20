@@ -1980,6 +1980,7 @@ dependencies = [
  "subsetter",
  "tempfile",
  "thiserror 2.0.18",
+ "ttf-parser 0.24.1",
  "walkdir",
 ]
 

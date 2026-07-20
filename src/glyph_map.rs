@@ -29,6 +29,8 @@ pub struct GlyphGroup {
 pub struct NgramGlyphMap {
     /// seq → Vec<GlyphGroup>, where group index = glyph_id
     pub groups: HashMap<Vec<char>, Vec<GlyphGroup>>,
+    /// seq → font_key → glyph_id  (O(1) inverse index, rebuilt on load)
+    font_lookup: HashMap<Vec<char>, HashMap<String, usize>>,
     /// Catalog hash at build time, for staleness detection.
     pub catalog_hash: u64,
     /// Whether the map has been modified since last write.
@@ -37,7 +39,7 @@ pub struct NgramGlyphMap {
 
 impl NgramGlyphMap {
     pub fn new(catalog_hash: u64) -> Self {
-        Self { groups: HashMap::new(), catalog_hash, dirty: false }
+        Self { groups: HashMap::new(), font_lookup: HashMap::new(), catalog_hash, dirty: false }
     }
 
     /// Look up which font_keys share a glyph_id for a given sequence.
@@ -68,9 +70,18 @@ impl NgramGlyphMap {
 
     /// Find the glyph_id for a given (sequence, font_key).
     pub fn glyph_id_for_font(&self, seq: &[char], font_key: &str) -> Option<usize> {
+        if let Some(map) = self.font_lookup.get(seq) {
+            if let Some(&gid) = map.get(font_key) {
+                return Some(gid);
+            }
+        }
+        // Fallback: linear scan (cold path, only when lookup not yet built)
         self.groups.get(seq)?
             .iter()
-            .position(|group| group.font_keys.iter().any(|k| k == font_key))
+            .enumerate()
+            .find_map(|(gid, group)| {
+                if group.font_keys.iter().any(|k| k == font_key) { Some(gid) } else { None }
+            })
     }
 
     /// All font_keys across all groups for a sequence.
@@ -106,11 +117,22 @@ impl NgramGlyphMap {
     /// font_key is added to that group. Otherwise a new group is created.
     /// Returns (glyph_id, is_new_group).
     pub fn register(&mut self, seq: &[char], font_key: &str, hash: u64) -> (usize, bool) {
+        // Fast path: already known via lookup with matching hash
+        if let Some(map) = self.font_lookup.get(seq) {
+            if let Some(&gid) = map.get(font_key) {
+                if let Some(groups) = self.groups.get(seq) {
+                    if groups.get(gid).map_or(false, |g| g.hash == hash) {
+                        return (gid, false);
+                    }
+                }
+            }
+        }
         let groups = self.groups.entry(seq.to_vec()).or_default();
         for (idx, group) in groups.iter_mut().enumerate() {
             if group.hash == hash {
                 if !group.font_keys.iter().any(|k| k == font_key) {
                     group.font_keys.push(font_key.to_string());
+                    self.font_lookup.entry(seq.to_vec()).or_default().insert(font_key.to_string(), idx);
                     self.dirty = true;
                 }
                 return (idx, false);
@@ -121,6 +143,7 @@ impl NgramGlyphMap {
             hash,
             font_keys: vec![font_key.to_string()],
         });
+        self.font_lookup.entry(seq.to_vec()).or_default().insert(font_key.to_string(), new_id);
         self.dirty = true;
         (new_id, true)
     }
@@ -241,7 +264,19 @@ impl NgramGlyphMap {
             groups.insert(seq, entry_groups);
         }
 
-        Ok(Self { groups, catalog_hash, dirty: false })
+        // Rebuild O(1) inverse index: seq → font_key → gid
+        let mut font_lookup: HashMap<Vec<char>, HashMap<String, usize>> = HashMap::with_capacity(groups.len());
+        for (seq, entry_groups) in &groups {
+            let mut map = HashMap::with_capacity(entry_groups.iter().map(|g| g.font_keys.len()).sum());
+            for (gid, group) in entry_groups.iter().enumerate() {
+                for fk in &group.font_keys {
+                    map.insert(fk.clone(), gid);
+                }
+            }
+            font_lookup.insert(seq.clone(), map);
+        }
+
+        Ok(Self { groups, font_lookup, catalog_hash, dirty: false })
     }
 }
 

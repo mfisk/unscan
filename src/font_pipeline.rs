@@ -34,6 +34,18 @@ pub struct ObsRankProbs {
     pub chosen_probs: HashMap<usize, f32>,
     pub gt_ranks: HashMap<usize, usize>,
     pub gt_probs: HashMap<usize, f32>,
+    // Raw glyph scores ( -d²/(2σ²) ) before geo, for report display
+    pub chosen_glyph_scores: HashMap<usize, f32>,
+    pub gt_glyph_scores: HashMap<usize, f32>,
+    // Geo scores per observation (crop_index -> value)
+    pub chosen_geo_h_ll: HashMap<usize, f32>,
+    pub chosen_geo_v_ll: HashMap<usize, f32>,
+    pub chosen_geo_h_err: HashMap<usize, f32>,
+    pub chosen_geo_v_err: HashMap<usize, f32>,
+    pub gt_geo_h_ll: HashMap<usize, f32>,
+    pub gt_geo_v_ll: HashMap<usize, f32>,
+    pub gt_geo_h_err: HashMap<usize, f32>,
+    pub gt_geo_v_err: HashMap<usize, f32>,
 }
 
 /// Per-line font matching result produced by [`match_lines`].
@@ -152,6 +164,7 @@ pub fn match_lines(
     page_num: usize,
     font_registry: &font_scan::FontRegistry,
     font_cache: &font_cache::FontCache,
+    geo_cache: &crate::geo_cache::GeometryCache,
     classifier: &dyn classifier::Classifier,
     glyph_map: &NgramGlyphMap,
     ground_truth: Option<&ground_truth::GroundTruth>,
@@ -299,6 +312,14 @@ pub fn match_lines(
         let mut crop_store_lig: Vec<GrayImage> = Vec::new();
         #[allow(unused_assignments)] // overwritten in the scoring block before use
         let mut plain_pos_map: Vec<(usize, usize)> = Vec::new();
+        let mut lig_pos_map: Vec<(usize, usize)> = Vec::new();
+        // Precompute ink bounds for geo (plain) — used for scoring and audit
+        let wib_plain: Vec<Vec<crate::geometry_classifier::CharInkBounds>> = line_crops.word_segs.iter()
+            .map(|ws| crate::geometry_classifier::measure_char_ink_bounds(&ws.word_img, &ws.chars, &ws.boundaries))
+            .collect();
+        let wib_lig_opt: Option<Vec<Vec<crate::geometry_classifier::CharInkBounds>>> = line_crops.lig_word_segs.as_ref().map(|segs|
+            segs.iter().map(|ws| crate::geometry_classifier::measure_char_ink_bounds(&ws.word_img, &ws.chars, &ws.boundaries)).collect()
+        );
         let (font_result, tie_candidates_audit, gt_font_key) = {
 
             // Crop PNGs are saved after font matching, gated by ground-truth
@@ -319,24 +340,36 @@ pub fn match_lines(
 
             // ── Score: build sliding-window observations, run identify_fonts ──
 
-            let plain_windows;
-            {
-                let (w, pm) = crate::ngram::build_scoring_windows(
-                    &line_crops.word_segs, classifier, glyph_map,
-                    &mut crop_store_plain,
-                );
-                plain_windows = w;
-                plain_pos_map = pm;
-            }
-            let scoring_plain = font_match::identify_fonts(&plain_windows, classifier, glyph_map, args.thoroughness, args.full_audit(), &ensure_keys, args.min_ngram_prob);
+            let (plain_windows, plain_pos_map_tmp) = crate::ngram::build_scoring_windows(
+                &line_crops.word_segs, classifier, glyph_map,
+                &mut crop_store_plain,
+            );
+            plain_pos_map = plain_pos_map_tmp.clone();
+            let scoring_plain = font_match::identify_fonts(
+                &plain_windows, classifier, glyph_map,
+                args.thoroughness, args.full_audit(),
+                &ensure_keys, args.min_ngram_prob,
+                &line_crops.word_segs, &wib_plain,
+                font_registry, font_cache, geo_cache,
+                &plain_pos_map,
+            );
 
             // ── Score ligature path (if present) ─────────────────
             let scoring_lig = if let Some(ref lig_segs) = line_crops.lig_word_segs {
-                let (lig_windows, _lig_pos_map) = crate::ngram::build_scoring_windows(
+                let (lig_windows, lig_pm) = crate::ngram::build_scoring_windows(
                     lig_segs, classifier, glyph_map,
                     &mut crop_store_lig,
                 );
-                Some(font_match::identify_fonts(&lig_windows, classifier, glyph_map, args.thoroughness, args.full_audit(), &ensure_keys, args.min_ngram_prob))
+                lig_pos_map = lig_pm.clone();
+                let wib_lig = wib_lig_opt.as_ref().expect("wib_lig_opt should be Some when lig_segs present");
+                Some(font_match::identify_fonts(
+                    &lig_windows, classifier, glyph_map,
+                    args.thoroughness, args.full_audit(),
+                    &ensure_keys, args.min_ngram_prob,
+                    lig_segs, wib_lig,
+                    font_registry, font_cache, geo_cache,
+                    &lig_pos_map,
+                ))
             } else {
                 None
             };
@@ -738,11 +771,188 @@ pub fn match_lines(
             let chosen_font_key: Option<String> = font_result.as_ref()
                 .filter(|fr| !fr.font_key.is_empty())
                 .map(|fr| fr.font_key.clone());
-            let rp = compute_obs_rank_probs(
+            let mut rp = compute_obs_rank_probs(
                 &observations, winning_crops,
                 chosen_font_key.as_deref(), gt_font_key.as_deref(),
                 classifier, glyph_map,
             );
+            // ── Fill geo into rp for audit (chosen + gt) ───────────────
+            let (win_segs, win_wib, win_pos_map): (&[segment::WordSeg], &[Vec<crate::geometry_classifier::CharInkBounds>], &[(usize, usize)]) = if seg_winner.as_deref() == Some("ligature") {
+                if let (Some(lig_segs), Some(wib_lig)) = (line_crops.lig_word_segs.as_ref(), wib_lig_opt.as_ref()) {
+                    (lig_segs.as_slice(), wib_lig.as_slice(), lig_pos_map.as_slice())
+                } else {
+                    (line_crops.word_segs.as_slice(), wib_plain.as_slice(), plain_pos_map.as_slice())
+                }
+            } else {
+                (line_crops.word_segs.as_slice(), wib_plain.as_slice(), plain_pos_map.as_slice())
+            };
+            let mut fill_one = |font_key: &str,
+                                h_ll_map: &mut std::collections::HashMap<usize, f32>,
+                                v_ll_map: &mut std::collections::HashMap<usize, f32>,
+                                h_err_map: &mut std::collections::HashMap<usize, f32>,
+                                v_err_map: &mut std::collections::HashMap<usize, f32>| {
+                if let Some(geos) = crate::geometry_classifier::per_char_geo_for_font(
+                    font_key, win_segs, win_wib, font_cache, geo_cache, font_registry,
+                ) {
+                    let mut lookup: std::collections::HashMap<(usize, usize), &crate::geometry_classifier::PerCharGeo> = std::collections::HashMap::with_capacity(geos.len());
+                    for g in &geos {
+                        lookup.insert((g.seg_idx, g.orig_idx), g);
+                    }
+                    for d in observations.iter() {
+                        if let Some(&(seg_idx, char_pos)) = win_pos_map.get(d.crop_index) {
+                            let mut h_ll_sum = 0.0f32;
+                            let mut v_ll_sum = 0.0f32;
+                            let mut h_err_sum = 0.0f32;
+                            let mut v_err_sum = 0.0f32;
+                            let mut ok = true;
+                            for k in 0..d.seq.len() {
+                                let cp = char_pos + k;
+                                if let Some(pg) = lookup.get(&(seg_idx, cp)) {
+                                    h_ll_sum += pg.h_ll as f32;
+                                    v_ll_sum += pg.v_ll as f32;
+                                    if let Some(he) = pg.h_err { h_err_sum += he as f32; }
+                                    v_err_sum += pg.v_err as f32;
+                                } else {
+                                    ok = false; break;
+                                }
+                            }
+                            if ok {
+                                h_ll_map.insert(d.crop_index, h_ll_sum);
+                                v_ll_map.insert(d.crop_index, v_ll_sum);
+                                h_err_map.insert(d.crop_index, h_err_sum);
+                                v_err_map.insert(d.crop_index, v_err_sum);
+                            }
+                        }
+                    }
+                }
+            };
+            if let Some(ref cfk) = chosen_font_key {
+                fill_one(cfk, &mut rp.chosen_geo_h_ll, &mut rp.chosen_geo_v_ll, &mut rp.chosen_geo_h_err, &mut rp.chosen_geo_v_err);
+            }
+            if let Some(ref gfk) = gt_font_key {
+                fill_one(gfk, &mut rp.gt_geo_h_ll, &mut rp.gt_geo_v_ll, &mut rp.gt_geo_h_err, &mut rp.gt_geo_v_err);
+            }
+
+            // ── Final probability: softmax(classifier + midpoints) ────────
+            // Per user: summary should have final prob scaled to ×u which is
+            // softmax based on glyph classifier score + two midpoint scores
+            // (h_ll + v_ll). Recompute chosen/gt probs as combined softmax
+            // across all fonts, not classifier-only.
+            {
+                // Precompute geo for all fonts for this line (for combined logit)
+                let mut all_geo: std::collections::HashMap<String, std::collections::HashMap<(usize, usize), (f32,f32)>> = std::collections::HashMap::new();
+                for fe in font_registry.iter() {
+                    let fk = fe.font_key();
+                    // Only compute geo if this font has glyphs for any observation seq (quick filter)
+                    // but simple to just try per_char_geo_for_font — it returns None quickly if no matching segs
+                    if let Some(geos) = crate::geometry_classifier::per_char_geo_for_font(
+                        &fk, win_segs, win_wib, font_cache, geo_cache, font_registry,
+                    ) {
+                        let mut mp = std::collections::HashMap::new();
+                        for g in &geos {
+                            mp.insert((g.seg_idx, g.orig_idx), (g.h_ll as f32, g.v_ll as f32));
+                        }
+                        all_geo.insert(fk, mp);
+                    }
+                }
+
+                for d in observations.iter() {
+                    let crop = match winning_crops.get(d.crop_index) {
+                        Some(c) => c,
+                        None => continue,
+                    };
+                    let feat = match features::compute_features(crop, true) {
+                        Some(f) => f,
+                        None => continue,
+                    };
+                    // Use raw logits -d²/(2σ²), NOT softmax probs — don't softmax a softmax.
+                    let raw = classifier.raw_logits(&d.seq, &feat);
+                    if raw.is_empty() { continue; }
+                    // map gid -> raw logit for quick lookup
+                    let mut gid_to_logit: std::collections::HashMap<usize, f32> = std::collections::HashMap::with_capacity(raw.len());
+                    for (gid, logit) in &raw {
+                        gid_to_logit.insert(*gid as usize, *logit);
+                    }
+                    // Capture raw glyph scores for chosen/GT before adding geo (for report)
+                    if let Some(ref cfk) = chosen_font_key {
+                        if let Some(gid) = glyph_map.glyph_id_for_font(&d.seq, cfk) {
+                            if let Some(&raw_logit) = gid_to_logit.get(&gid) {
+                                rp.chosen_glyph_scores.insert(d.crop_index, raw_logit);
+                            }
+                        }
+                    }
+                    if let Some(ref gfk) = gt_font_key {
+                        if let Some(gid) = glyph_map.glyph_id_for_font(&d.seq, gfk) {
+                            if let Some(&raw_logit) = gid_to_logit.get(&gid) {
+                                rp.gt_glyph_scores.insert(d.crop_index, raw_logit);
+                            }
+                        }
+                    }
+                    // Need seg/char pos for geo lookup
+                    let sc_opt = win_pos_map.get(d.crop_index).copied();
+                    let mut logits: Vec<(String, f32, usize)> = Vec::new(); // (font_key, logit, gid)
+                    for fe in font_registry.iter() {
+                        let fk = fe.font_key();
+                        let Some(gid) = glyph_map.glyph_id_for_font(&d.seq, &fk) else { continue; };
+                        let Some(&raw_logit) = gid_to_logit.get(&gid) else { continue; };
+                        let mut logit = raw_logit;
+                        if let Some(sc) = sc_opt {
+                            if let Some(geo_map) = all_geo.get(&fk) {
+                                let mut ok = true;
+                                let mut geo_sum = 0.0f32;
+                                for k in 0..d.seq.len() {
+                                    let cp = sc.1 + k;
+                                    if let Some(&(h_ll, v_ll)) = geo_map.get(&(sc.0, cp)) {
+                                        geo_sum += h_ll + v_ll;
+                                    } else {
+                                        ok = false; break;
+                                    }
+                                }
+                                if ok {
+                                    logit += geo_sum;
+                                }
+                            }
+                        }
+                        logits.push((fk, logit, gid));
+                    }
+                    if logits.is_empty() { continue; }
+                    // softmax
+                    let max_logit = logits.iter().map(|(_, l, _)| *l).fold(f32::NEG_INFINITY, f32::max);
+                    let mut exps: Vec<(String, f32, usize, f32)> = Vec::with_capacity(logits.len());
+                    let mut sum_exp = 0.0f32;
+                    for (fk, logit, gid) in logits {
+                        let e = (logit - max_logit).exp();
+                        sum_exp += e;
+                        exps.push((fk, logit, gid, e));
+                    }
+                    if sum_exp <= 0.0 { continue; }
+                    // sort by final prob descending to get ranks
+                    let mut ranked: Vec<(String, f32, usize, f32)> = exps.iter().map(|(fk, logit, gid, e)| {
+                        let prob = e / sum_exp;
+                        (fk.clone(), *logit, *gid, prob)
+                    }).collect();
+                    ranked.sort_by(|a, b| b.3.partial_cmp(&a.3).unwrap_or(std::cmp::Ordering::Equal));
+                    // find chosen and GT ranks/probs
+                    if let Some(ref cfk) = chosen_font_key {
+                        for (rank, (fk, _logit, _gid, prob)) in ranked.iter().enumerate() {
+                            if fk == cfk {
+                                rp.chosen_ranks.insert(d.crop_index, rank + 1);
+                                rp.chosen_probs.insert(d.crop_index, *prob);
+                                break;
+                            }
+                        }
+                    }
+                    if let Some(ref gfk) = gt_font_key {
+                        for (rank, (fk, _logit, _gid, prob)) in ranked.iter().enumerate() {
+                            if fk == gfk {
+                                rp.gt_ranks.insert(d.crop_index, rank + 1);
+                                rp.gt_probs.insert(d.crop_index, *prob);
+                                break;
+                            }
+                        }
+                    }
+                }
+            }
 
             // Render font ref glyphs for miss lines
             if let (Some(ref audit_root), Some(ref fr)) = (&args.audit, &font_result) {

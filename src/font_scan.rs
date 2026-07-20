@@ -124,6 +124,10 @@ impl FontRegistry {
         hasher.finish()
     }
 
+    pub fn catalog_hash(&self) -> u64 {
+        self.catalog_hash
+    }
+
     pub fn by_key(&self, key: &str) -> Option<&FontEntry> {
         self.by_key.get(key).map(|&i| &self.entries[i])
     }

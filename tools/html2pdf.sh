@@ -10,7 +10,18 @@ fi
 INPUT="$1"
 OUTPUT="${2:-${INPUT%.html}.pdf}"
 
-google-chrome --headless --disable-gpu --no-sandbox \
+# Find chrome binary
+CHROME=""
+for c in google-chrome google-chrome-stable chromium-browser chromium /opt/meta-chromium/chrome /opt/google/chrome/chrome; do
+    if command -v "$c" >/dev/null 2>&1; then CHROME="$c"; break; fi
+    if [ -x "$c" ]; then CHROME="$c"; break; fi
+done
+if [ -z "$CHROME" ]; then
+    echo "No chrome binary found" >&2
+    exit 1
+fi
+
+"$CHROME" --headless --disable-gpu --no-sandbox \
     --host-resolver-rules="MAP * ~NOTFOUND" \
     --print-to-pdf="$OUTPUT" \
     --print-to-pdf-no-header \

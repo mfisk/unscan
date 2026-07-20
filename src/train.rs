@@ -646,7 +646,6 @@ pub fn run_train(mut args: TrainArgs) {
         vec![AaVariant::Native, AaVariant::Blur05, AaVariant::Sharpen]
     };
 
-    eprintln!("=== unprint all-in-one triplet trainer ===");
     eprintln!("Heights: {:?}{}", active_heights, if args.fast { " (fast)" } else { "" });
     eprintln!("AA variants: {}{}", aa_variants.len(), if args.fast { " (fast)" } else { "" });
     eprintln!("Epochs: {}", args.epochs);
@@ -667,16 +666,11 @@ pub fn run_train(mut args: TrainArgs) {
         eprintln!("  Limiting to {} fonts (--max-fonts)", args.max_fonts);
     }
 
-    // Build unified sequence list: unigrams + bigrams, all using the same code path.
-    let sequences: Vec<Vec<char>> = {
-        let mut seqs: Vec<Vec<char>> = features::supported_chars().iter().map(|&c| vec![c]).collect();
-        seqs.extend(features::supported_sequences(2).iter().cloned());
-        seqs
-    };
-    eprintln!("  {} sequences ({} unigrams + {} bigrams)",
+    // Single-char only — bigrams disabled per 2026-07-19, no bigram glyph building
+    let sequences: Vec<Vec<char>> = features::supported_chars().iter().map(|&c| vec![c]).collect();
+    eprintln!("  {} sequences ({} unigrams, bigrams disabled)",
         sequences.len(),
-        features::supported_chars().len(),
-        features::supported_sequences(2).len());
+        features::supported_chars().len());
 
     // ── 2. Render & extract features ──────────────────────────────
     // Write per-char binary feature files to disk to avoid OOM.
@@ -1174,7 +1168,8 @@ pub fn run_train(mut args: TrainArgs) {
     }
 
     // ── 3. Train per-character triplet networks ─────────────────────
-        let ctx = TrainingContext {
+    eprintln!("=== unprint all-in-one triplet trainer ===");
+    let ctx = TrainingContext {
             sequences: &sequences,
             seq_counts: &seq_counts,
             font_family: &font_family,
@@ -1486,11 +1481,7 @@ impl RuntimeTrainingData {
         glyph_map: &crate::glyph_map::NgramGlyphMap,
         render_params: &crate::char_render::RenderParams,
     ) -> Option<Self> {
-        let sequences: Vec<Vec<char>> = {
-            let mut seqs: Vec<Vec<char>> = crate::features::supported_chars().iter().map(|&c| vec![c]).collect();
-            seqs.extend(crate::features::supported_sequences(2).iter().cloned());
-            seqs
-        };
+        let sequences: Vec<Vec<char>> = crate::features::supported_chars().iter().map(|&c| vec![c]).collect();
         let n_seqs = sequences.len();
 
         // Get sorted catalog (same order as training)

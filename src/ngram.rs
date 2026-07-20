@@ -681,11 +681,12 @@ fn unigram_weight(c: char) -> f32 {
 
 pub fn build_scoring_windows<'a>(
     word_segs: &'a [crate::segment::WordSeg],
-    classifier: &'a dyn crate::classifier::Classifier,
+    _classifier: &'a dyn crate::classifier::Classifier,
     _glyph_map: &'a crate::glyph_map::NgramGlyphMap,
     crop_store: &'a mut Vec<GrayImage>,
 ) -> (Vec<crate::font_match::ScoringWindow<'a>>, Vec<(usize, usize)>) {
-    // Flatten characters across all words into (seg_idx, pos_in_word, character)
+    // Single-char only — bigrams disabled per 2026-07-19. Previously tried
+    // bigram pairs first, now directly emit unigram windows.
     let flat: Vec<(usize, usize, char)> = word_segs.iter().enumerate()
         .flat_map(|(seg_idx, seg)| {
             seg.chars.iter().enumerate()
@@ -699,94 +700,34 @@ pub fn build_scoring_windows<'a>(
         return (Vec::new(), Vec::new());
     }
 
-    // Pass 1: crop into crop_store, record entries.
-    // Try every adjacent pair as a bigram; unigrams fill gaps.
-    let mut covered = vec![false; n];
-    // entries: (flat_idx, store_idx, is_bigram)
-    let mut entries: Vec<(usize, usize, bool)> = Vec::new();
+    // Two-pass to satisfy borrow checker: first collect crops, then build windows
+    // that borrow from final crop_store (same pattern as original bigram code).
+    let base = crop_store.len();
+    let mut temp_crops: Vec<GrayImage> = Vec::with_capacity(n);
+    let mut metas: Vec<(usize, usize, char)> = Vec::with_capacity(n); // (seg_idx, pos, c)
 
-    for i in 0..n - 1 {
-        let (seg_i, pos_i, c1) = flat[i];
-        let (seg_j, pos_j, c2) = flat[i + 1];
-        let pair = [c1, c2];
-
-        if seg_i == seg_j && pos_j == pos_i + 1 && classifier.has_sequence(&pair) {
-            let seg = &word_segs[seg_i];
-            if let Some(crop) = crate::segment::crop_ngram(
-                &seg.word_img, pos_i, 2, &seg.boundaries, &seg.seam_paths, seg.crop_h,
-            ) {
-                let idx = crop_store.len();
-                crop_store.push(crop);
-                entries.push((i, idx, true));
-                covered[i] = true;
-                covered[i + 1] = true;
-            }
-        } else {
-            // Left position: score as unigram if not already covered by a prior bigram
-            if !covered[i] {
-                let seg = &word_segs[seg_i];
-                if let Some(crop) = crate::segment::crop_ngram(
-                    &seg.word_img, pos_i, 1, &seg.boundaries, &seg.seam_paths, seg.crop_h,
-                ) {
-                    let idx = crop_store.len();
-                    crop_store.push(crop);
-                    entries.push((i, idx, false));
-                    covered[i] = true;
-                }
-            }
-            // Right position: if it's the last and won't get another chance
-            if i + 1 == n - 1 && !covered[i + 1] {
-                let seg = &word_segs[seg_j];
-                if let Some(crop) = crate::segment::crop_ngram(
-                    &seg.word_img, pos_j, 1, &seg.boundaries, &seg.seam_paths, seg.crop_h,
-                ) {
-                    let idx = crop_store.len();
-                    crop_store.push(crop);
-                    entries.push((i + 1, idx, false));
-                    covered[i + 1] = true;
-                }
-            }
-        }
-    }
-
-    // Edge case: single character on the line
-    if n == 1 {
-        let (seg_i, pos_i, _c1) = flat[0];
+    for &(seg_i, pos_i, c) in &flat {
         let seg = &word_segs[seg_i];
         if let Some(crop) = crate::segment::crop_ngram(
             &seg.word_img, pos_i, 1, &seg.boundaries, &seg.seam_paths, seg.crop_h,
         ) {
-            let idx = crop_store.len();
-            crop_store.push(crop);
-            entries.push((0, idx, false));
+            temp_crops.push(crop);
+            metas.push((seg_i, pos_i, c));
         }
     }
 
-    // Pass 2: build ScoringWindows from entries
-    let mut windows: Vec<crate::font_match::ScoringWindow<'a>> = Vec::with_capacity(entries.len());
-    for &(fi, store_idx, is_bigram) in &entries {
-        if is_bigram {
-            let c1 = flat[fi].2;
-            let c2 = flat[fi + 1].2;
-            windows.push(crate::font_match::ScoringWindow {
-                seq: vec![c1, c2],
-                crop: &crop_store[store_idx],
-                weight: 1.0,
-            });
-        } else {
-            let c1 = flat[fi].2;
-            windows.push(crate::font_match::ScoringWindow {
-                seq: vec![c1],
-                crop: &crop_store[store_idx],
-                weight: unigram_weight(c1),
-            });
-        }
-    }
+    crop_store.extend(temp_crops);
 
-    // Position map: for each window, the (seg_idx, char_pos) of its first character
-    let position_map: Vec<(usize, usize)> = entries.iter()
-        .map(|&(fi, _, _)| (flat[fi].0, flat[fi].1))
-        .collect();
+    let mut windows: Vec<crate::font_match::ScoringWindow<'a>> = Vec::with_capacity(metas.len());
+    let mut position_map: Vec<(usize, usize)> = Vec::with_capacity(metas.len());
+    for (i, (seg_i, pos_i, c)) in metas.into_iter().enumerate() {
+        windows.push(crate::font_match::ScoringWindow {
+            seq: vec![c],
+            crop: &crop_store[base + i],
+            weight: unigram_weight(c),
+        });
+        position_map.push((seg_i, pos_i));
+    }
 
     (windows, position_map)
 }

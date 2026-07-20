@@ -191,9 +191,36 @@ pub struct ObservationVote {
     /// Calibrated posterior probability of the ground-truth font for this character.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub gt_font_prob: Option<f32>,
+    /// Raw glyph log-likelihood ( -d²/(2σ²) ) before adding geo, for report display.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub chosen_glyph_score: Option<f32>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub gt_glyph_score: Option<f32>,
     /// Raw classifier distance stats (populated when UNPRINT_OBS_STATS=1).
     #[serde(skip_serializing_if = "Option::is_none")]
     pub obs_stats: Option<ObsStats>,
+    // ── Geo scores ───────────────────────────────────────────────
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub chosen_geo_h_ll: Option<f32>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub chosen_geo_v_ll: Option<f32>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub chosen_geo_h_err: Option<f32>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub chosen_geo_v_err: Option<f32>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub gt_geo_h_ll: Option<f32>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub gt_geo_v_ll: Option<f32>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub gt_geo_h_err: Option<f32>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub gt_geo_v_err: Option<f32>,
+    /// Combined geo log-likelihood (h_ll + v_ll) for chosen and GT, for report display.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub chosen_geo_ll: Option<f32>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub gt_geo_ll: Option<f32>,
 }
 
 #[derive(Debug, Serialize, Clone)]
