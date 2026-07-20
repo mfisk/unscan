@@ -12,6 +12,7 @@
 //! SSIM/n-gram only.
 
 use image::GrayImage;
+use std::collections::HashMap;
 
 #[derive(Debug, Clone)]
 pub struct CharInkBounds {
@@ -65,22 +66,38 @@ pub struct PerCharGeo {
 // When expressed in em units, sigma_em = sigma_px / em_px, so sigma_em is a
 // function of how many pixels per em we sampled at. In pixel space sigma_px is
 // constant, which is why we compute h_ll/v_ll directly in pixels.
-const SIGMA_CENTER_PX: f64 = 0.2886751345948129; // 1/√12
-const SIGMA_PITCH_PX: f64 = 0.4082482904638630;  // 1/√6
+const SIGMA_CENTER_PX: f64 = 0.284;
+const SIGMA_PITCH_PX: f64 = 0.435;
 
 /// Measure ink bounds for each character in a word.
 ///
-/// Takes the word image, its characters, and their boundaries (x positions).
-/// Returns one `CharInkBounds` per character.
+/// Takes the word image, its characters, their boundaries, and the seam paths
+/// that define each character's true shape (same as `crop_ngram` uses to mask
+/// adjacent ink). Returns one `CharInkBounds` per character plus the word's
+/// ink midpoint.
+///
+/// When trimming bboxes to ink we must use the actual seam paths to avoid
+/// including ink from adjacent characters — otherwise g's top gets pulled
+/// up by f's ascender, p's bottom by q, etc., and the word ink midpoint
+/// (min y_min + max y_max)/2 is biased. This function now mirrors
+/// `crop_ngram`'s masking and computes the word midpoint in the same pass.
+pub struct WordGeoMeasurement {
+    pub chars: Vec<CharInkBounds>,
+    pub word_y_min: u32,
+    pub word_y_max: u32,
+    pub word_cy: f64,
+}
+
 pub fn measure_char_ink_bounds(
     word_img: &GrayImage,
     chars: &[char],
     boundaries: &[u32],
-) -> Vec<CharInkBounds> {
+    seam_paths: &HashMap<u32, Vec<[u32; 2]>>,
+) -> WordGeoMeasurement {
     let (w, h) = word_img.dimensions();
     let n_chars = chars.len();
     if n_chars == 0 {
-        return Vec::new();
+        return WordGeoMeasurement { chars: Vec::new(), word_y_min: 0, word_y_max: h, word_cy: h as f64 * 0.5 };
     }
     // If segmentation failed to produce n_chars+1 boundaries, fallback to uniform
     // partitioning instead of returning empty (which would kill geo for the whole line).
@@ -93,32 +110,59 @@ pub fn measure_char_ink_bounds(
     };
 
     let mut result = Vec::with_capacity(n_chars);
+    let mut word_y_min = h as usize;
+    let mut word_y_max = 0usize;
     for i in 0..n_chars {
-        let x0 = bounds[i].min(w.saturating_sub(1)) as usize;
-        let x1 = bounds[i + 1].min(w) as usize;
-        if x0 >= x1 {
+        let b_left = bounds[i];
+        let b_right = bounds[i + 1];
+        let x0_rect = b_left.min(w.saturating_sub(1)) as usize;
+        let x1_rect = b_right.min(w) as usize;
+        if x0_rect >= x1_rect {
             result.push(CharInkBounds {
-                cx: x0 as f64,
+                cx: x0_rect as f64,
                 cy: h as f64 / 2.0,
                 width: 0.0,
                 height: 0.0,
-                x_min: x0 as u32,
-                x_max: x0 as u32,
+                x_min: x0_rect as u32,
+                x_max: x0_rect as u32,
                 y_min: 0,
                 y_max: h,
             });
+            word_y_min = word_y_min.min(0);
+            word_y_max = word_y_max.max(h as usize);
             continue;
         }
 
-        // Find ink bounds within this character's x-range
-        let mut x_min = x1;
-        let mut x_max = x0;
+        let left_seam = seam_paths.get(&b_left);
+        let right_seam = seam_paths.get(&b_right);
+
+        // Find ink bounds within this character's seam-masked x-range
+        let mut x_min = x1_rect;
+        let mut x_max = x0_rect;
         let mut y_min = h as usize;
         let mut y_max = 0usize;
         let mut has_ink = false;
 
-        for x in x0..x1 {
-            for y in 0..h as usize {
+        for y in 0..h as usize {
+            // Determine per-row left/right limits from seams (same as crop_ngram)
+            let mut left_limit = x0_rect;
+            let mut right_limit = x1_rect;
+
+            if let Some(sp) = left_seam {
+                if let Some(seam_x) = sp.iter().filter(|p| p[0] as usize == y).map(|p| p[1] as usize).min() {
+                    // left seam: ink must be >= seam_x
+                    left_limit = seam_x.max(x0_rect).min(x1_rect);
+                }
+            }
+            if let Some(sp) = right_seam {
+                if let Some(seam_x) = sp.iter().filter(|p| p[0] as usize == y).map(|p| p[1] as usize).max() {
+                    // right seam: ink must be < seam_x (crop_ngram whites out >= seam_x)
+                    right_limit = seam_x.min(x1_rect).max(left_limit);
+                }
+            }
+            // For uniform fallback (no seams) left_limit==x0_rect, right_limit==x1_rect
+
+            for x in left_limit..right_limit {
                 let pixel = word_img.get_pixel(x as u32, y as u32).0[0];
                 if pixel < 200 {
                     has_ink = true;
@@ -130,23 +174,23 @@ pub fn measure_char_ink_bounds(
             }
         }
 
-        if !has_ink {
-            let cx = (x0 + x1) as f64 / 2.0;
+        let cb = if !has_ink {
+            let cx = (x0_rect + x1_rect) as f64 / 2.0;
             let cy = h as f64 / 2.0;
-            result.push(CharInkBounds {
+            CharInkBounds {
                 cx,
                 cy,
-                width: (x1 - x0) as f64,
+                width: (x1_rect - x0_rect) as f64,
                 height: h as f64,
-                x_min: x0 as u32,
-                x_max: x1 as u32,
+                x_min: x0_rect as u32,
+                x_max: x1_rect as u32,
                 y_min: 0,
                 y_max: h,
-            });
+            }
         } else {
             let cx = (x_min + x_max) as f64 / 2.0;
             let cy = (y_min + y_max) as f64 / 2.0;
-            result.push(CharInkBounds {
+            CharInkBounds {
                 cx,
                 cy,
                 width: (x_max - x_min + 1) as f64,
@@ -155,16 +199,26 @@ pub fn measure_char_ink_bounds(
                 x_max: x_max as u32,
                 y_min: y_min as u32,
                 y_max: y_max as u32,
-            });
-        }
+            }
+        };
+        word_y_min = word_y_min.min(cb.y_min as usize);
+        word_y_max = word_y_max.max(cb.y_max as usize);
+        result.push(cb);
     }
-    result
+    if word_y_max < word_y_min {
+        word_y_min = 0;
+        word_y_max = h as usize;
+    }
+    let word_y_min_u = word_y_min as u32;
+    let word_y_max_u = word_y_max as u32;
+    let word_cy = (word_y_min as f64 + word_y_max as f64) * 0.5;
+    WordGeoMeasurement { chars: result, word_y_min: word_y_min_u, word_y_max: word_y_max_u, word_cy }
 }
 
 /// Cached path: use GeometryCache predictions (fast, Unicode, keeps both GPOS Pair formats native).
 fn per_char_geo_cached(
     font_key: &str,
-    wib: &[Vec<CharInkBounds>],
+    wib: &[WordGeoMeasurement],
     word_segs: &[crate::segment::WordSeg],
     geo_cache: &crate::geo_cache::GeometryCache,
 ) -> Option<Vec<PerCharGeo>> {
@@ -172,7 +226,8 @@ fn per_char_geo_cached(
         return None;
     }
     let mut result = Vec::new();
-    for (seg_idx, (word_bounds, ws)) in wib.iter().zip(word_segs.iter()).enumerate() {
+    for (seg_idx, (wmeas, ws)) in wib.iter().zip(word_segs.iter()).enumerate() {
+        let word_bounds = &wmeas.chars;
         if word_bounds.is_empty() {
             continue;
         }
@@ -181,12 +236,13 @@ fn per_char_geo_cached(
         // Non-BMP / missing cmap entries will miss and fall back to shaped path.
         // Ligature codepoints (FB00-FB04) ARE in cache and score as single glyphs.
         // Plain "ff" (['f','f']) is 2 chars, stays 2 glyphs (liga disabled for plain).
-        let preds_fu = geo_cache.predict_glyph_positions(font_key, &ws.chars)?;
-        if preds_fu.len() != word_bounds.len() {
+        let preds_fu_ext = geo_cache.predict_glyph_positions_and_extents(font_key, &ws.chars)?;
+        if preds_fu_ext.len() != word_bounds.len() {
             // Ligature merge: e.g. "ff" plain shaped to 1 glyph but we have 2 bounds → skip geo for this word.
             // Single-glyph cases (1 char word, or lig path with FB00) will have len==1 and pass.
             continue;
         }
+        let preds_fu: Vec<(f64,f64)> = preds_fu_ext.iter().map(|(cx,cy,_,_)| (*cx,*cy)).collect();
 
         // Scale from font units → px: center-span (unbiased by construction)
         // For n>=2: scale = (obs_cx_last - obs_cx_first) / (pred_cx_last - pred_cx_first)
@@ -208,8 +264,14 @@ fn per_char_geo_cached(
         // y is flipped: font y up → image y down
         let preds: Vec<(f64, f64)> = preds_fu.iter().map(|(x, y)| (x * scale, y * -scale)).collect();
 
-        let obs_word_cy = word_bounds.iter().map(|b| b.cy).sum::<f64>() / word_bounds.len() as f64;
-        let pred_word_cy = preds.iter().map(|(_, y)| *y).sum::<f64>() / preds.len() as f64;
+        // Midpoint of word ink — computed in same seam-aware crop that measured chars,
+        // so it doesn't include adjacent ink (g's top doesn't get f's ascender, etc.)
+        let obs_word_cy = wmeas.word_cy;
+
+        // Pred word ink midpoint: (min y_min + max y_max)/2 in font units, then scaled and flipped
+        let pred_word_y_min_fu = preds_fu_ext.iter().map(|(_,_,y0,_)| *y0).fold(f64::INFINITY, f64::min);
+        let pred_word_y_max_fu = preds_fu_ext.iter().map(|(_,_,_,y1)| *y1).fold(f64::NEG_INFINITY, f64::max);
+        let pred_word_cy = -scale * (pred_word_y_min_fu + pred_word_y_max_fu) * 0.5;
 
         for (orig_idx, (bounds, (pred_cx, pred_cy))) in word_bounds.iter().zip(preds.iter()).enumerate() {
             let obs_cx = bounds.cx;
@@ -259,7 +321,7 @@ fn per_char_geo_cached(
 fn per_char_geo_shaped(
     font_key: &str,
     word_segs: &[crate::segment::WordSeg],
-    wib: &[Vec<CharInkBounds>],
+    wib: &[WordGeoMeasurement],
     font_cache: &crate::font_cache::FontCache,
     font_registry: &crate::font_scan::FontRegistry,
 ) -> Option<Vec<PerCharGeo>> {
@@ -275,7 +337,8 @@ fn per_char_geo_shaped(
     let base_features = crate::layout::ot_features(&fe.variant_tag);
 
     let mut result = Vec::new();
-    for (seg_idx, (ws, bounds_vec)) in word_segs.iter().zip(wib.iter()).enumerate() {
+    for (seg_idx, (ws, wmeas)) in word_segs.iter().zip(wib.iter()).enumerate() {
+        let bounds_vec = &wmeas.chars;
         if bounds_vec.is_empty() {
             continue;
         }
@@ -296,6 +359,8 @@ fn per_char_geo_shaped(
 
         let ttfp = face.as_ref();
         let mut pred_positions: Vec<(f64, f64)> = Vec::with_capacity(sw.glyph_ids.len());
+        let mut pred_y_mins_fu: Vec<f64> = Vec::with_capacity(sw.glyph_ids.len());
+        let mut pred_y_maxs_fu: Vec<f64> = Vec::with_capacity(sw.glyph_ids.len());
         let mut cursor_fu = 0.0f64;
         for (i, gid) in sw.glyph_ids.iter().enumerate() {
             let glyph_id = rustybuzz::ttf_parser::GlyphId(*gid as u16);
@@ -304,7 +369,11 @@ fn per_char_geo_shaped(
             let y_off = sw.y_offsets.get(i).copied().unwrap_or(0) as f64;
             let cx = cursor_fu + x_off + (bbox.x_min as f64 + bbox.x_max as f64) * 0.5;
             let cy = y_off + (bbox.y_min as f64 + bbox.y_max as f64) * 0.5;
+            let y_min_a = y_off + bbox.y_min as f64;
+            let y_max_a = y_off + bbox.y_max as f64;
             pred_positions.push((cx, cy));
+            pred_y_mins_fu.push(y_min_a);
+            pred_y_maxs_fu.push(y_max_a);
             cursor_fu += sw.x_advances[i] as f64;
         }
 
@@ -326,8 +395,12 @@ fn per_char_geo_shaped(
             .map(|(x, y)| (x * scale, y * -scale))
             .collect();
 
-        let obs_word_cy = bounds_vec.iter().map(|b| b.cy).sum::<f64>() / bounds_vec.len() as f64;
-        let pred_word_cy = pred_positions_px.iter().map(|(_, y)| *y).sum::<f64>() / pred_positions_px.len() as f64;
+        // Word midpoint — from same seam-aware crop that measured chars (no adjacent bleed)
+        let obs_word_cy = wmeas.word_cy;
+
+        let pred_word_y_min_fu = pred_y_mins_fu.iter().cloned().fold(f64::INFINITY, f64::min);
+        let pred_word_y_max_fu = pred_y_maxs_fu.iter().cloned().fold(f64::NEG_INFINITY, f64::max);
+        let pred_word_cy = -scale * (pred_word_y_min_fu + pred_word_y_max_fu) * 0.5;
 
         for (orig_idx, (bounds, (pred_cx, pred_cy))) in bounds_vec.iter().zip(pred_positions_px.iter()).enumerate() {
             let obs_cx = bounds.cx;
@@ -377,7 +450,7 @@ fn per_char_geo_shaped(
 pub fn per_char_geo_for_font(
     font_key: &str,
     word_segs: &[crate::segment::WordSeg],
-    wib: &[Vec<CharInkBounds>],
+    wib: &[WordGeoMeasurement],
     font_cache: &crate::font_cache::FontCache,
     geo_cache: &crate::geo_cache::GeometryCache,
     font_registry: &crate::font_scan::FontRegistry,

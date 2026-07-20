@@ -94,7 +94,7 @@ fn main() {
         let fg_path = std::path::Path::new("/tmp/lob-flamegraph.svg");
         let file = std::fs::File::create(fg_path).expect("create flamegraph file");
         report.flamegraph(file).expect("write flamegraph");
-        eprintln!("[profile] Wrote flamegraph to {}", fg_path.display());
+        if !args.quiet { eprintln!("[profile] Wrote flamegraph to {}", fg_path.display()); }
     }
 }
 
@@ -105,7 +105,7 @@ fn main() {
 /// so no runtime render+embed step is needed.
 fn load_fonts(args: &cli::Args, _classifier: &mut dyn classifier::Classifier) -> Result<font_scan::FontRegistry, ScanTextError> {
     let font_dirs = font_scan::default_font_dirs(&args.font_dir);
-    let entries = font_scan::scan_fonts(&font_dirs);
+    let entries = font_scan::scan_fonts(&font_dirs, args.quiet);
     if entries.is_empty() {
         return Err(ScanTextError::NoFonts);
     }
@@ -279,7 +279,7 @@ fn run(args: &cli::Args, classifier: &mut dyn classifier::Classifier) -> Result<
 
     // ── 1. Scan fonts and populate classifier ──────────────────────
     let font_registry = load_fonts(args, classifier)?;
-    eprintln!("[timing] load_fonts {:.2}s", run_start.elapsed().as_secs_f64());
+    if !args.quiet { eprintln!("[timing] load_fonts {:.2}s", run_start.elapsed().as_secs_f64()); }
     if font_registry.is_empty() {
         return Err(ScanTextError::NoFonts);
     }
@@ -308,36 +308,59 @@ fn run(args: &cli::Args, classifier: &mut dyn classifier::Classifier) -> Result<
                 })
         }
     };
-    eprintln!("[timing] glyph_map load {:.2}s (total {:.2}s)", t_gmap.elapsed().as_secs_f64(), run_start.elapsed().as_secs_f64());
+    if !args.quiet { eprintln!("[timing] glyph_map load {:.2}s (total {:.2}s)", t_gmap.elapsed().as_secs_f64(), run_start.elapsed().as_secs_f64()); }
 
     // ── Incremental update: detect new fonts and add to index ──────
     // Compare cached font_meta (glyph_map) against installed fonts.
     // New fonts are indexed and added; removed fonts are kept.
     {
+        // Fast path: if catalog hash matches, no new fonts (common warm case)
+        // Use mtime+size for fast check (per Mike) - catalog_hash is hash of sorted font_keys
+        if font_registry.catalog_hash() == glyph_map.catalog_hash {
+            if !args.quiet { eprintln!("[incremental] No new fonts (catalog hash match)"); }
+        } else {
         use std::collections::HashSet;
         let installed_keys: HashSet<String> = font_registry.entries().iter()
             .map(|e| e.font_key())
             .collect();
+        let t_cached_keys = std::time::Instant::now();
         let cached_keys = glyph_map.cached_font_keys();
+        if !args.quiet { eprintln!("[timing] incremental cached_keys {:.2}s", t_cached_keys.elapsed().as_secs_f64()); }
 
-        eprintln!("[incremental] installed={} cached={} (glyph_map has {} unique fonts)", installed_keys.len(), cached_keys.len(), cached_keys.len());
+        if !args.quiet { eprintln!("[incremental] installed={} cached={} (glyph_map has {} unique fonts)", installed_keys.len(), cached_keys.len(), cached_keys.len()); }
 
+        let t_diff = std::time::Instant::now();
         let mut new_keys: Vec<String> = installed_keys.difference(&cached_keys).cloned().collect();
         let removed_keys: Vec<String> = cached_keys.difference(&installed_keys).cloned().collect();
+        if !args.quiet { eprintln!("[timing] incremental diff {:.2}s (new={} removed={})", t_diff.elapsed().as_secs_f64(), new_keys.len(), removed_keys.len()); }
 
         if !removed_keys.is_empty() {
-            eprintln!("[incremental] Keeping {} removed fonts (trained data still valid for classification)", removed_keys.len());
+            if !args.quiet { eprintln!("[incremental] Keeping {} removed fonts (trained data still valid for classification)", removed_keys.len()); }
         }
 
         // Filter out non-Latin fonts that cannot render any supported_chars
         // (NotoSansBamum, NotoSansGothic, NotoSerifLao etc. = 5898-5660 = 238).
         // These have zero Latin coverage and would never register in glyph_map,
         // causing the same 238 to be redetected every run.
+        // Cache known non-Latin keys to avoid re-reading 238 font files every run (was 3s).
+        let t_nonlatin = std::time::Instant::now();
         {
+            let cache_path = std::env::var("HOME").map(|h| std::path::PathBuf::from(h).join(".cache").join("unprint")).unwrap_or_else(|_| std::path::PathBuf::from("/tmp")).join("non-latin-cache.json");
+            let mut known_non_latin: std::collections::HashSet<String> = if let Ok(data) = std::fs::read_to_string(&cache_path) {
+                serde_json::from_str(&data).unwrap_or_default()
+            } else {
+                std::collections::HashSet::new()
+            };
+            let mut updated_non_latin = false;
             let supported = features::supported_chars();
             let mut filtered = Vec::with_capacity(new_keys.len());
             let mut skipped = 0usize;
             for font_key in &new_keys {
+                // Fast path: known non-Latin from cache
+                if known_non_latin.contains(font_key) {
+                    skipped += 1;
+                    continue;
+                }
                 let Some(fe) = font_registry.by_key(font_key) else { continue };
                 let Ok(font_data) = std::fs::read(&fe.path) else { continue };
                 let Ok(face) = rustybuzz::ttf_parser::Face::parse(&font_data, 0) else { continue };
@@ -354,18 +377,26 @@ fn run(args: &cli::Args, classifier: &mut dyn classifier::Classifier) -> Result<
                     if has_override {
                         filtered.push(font_key.clone());
                     } else {
+                        // Remember this as known non-Latin for next run
+                        known_non_latin.insert(font_key.clone());
+                        updated_non_latin = true;
                         skipped += 1;
                     }
                 }
             }
+            if updated_non_latin {
+                let _ = std::fs::create_dir_all(cache_path.parent().unwrap());
+                let _ = std::fs::write(&cache_path, serde_json::to_string(&known_non_latin).unwrap_or_default());
+            }
             if skipped > 0 {
-                eprintln!("[incremental] Skipping {} non-Latin fonts (no supported_chars coverage)", skipped);
+                if !args.quiet { eprintln!("[incremental] Skipping {} non-Latin fonts (no supported_chars coverage)", skipped); }
             }
             new_keys = filtered;
         }
+        if !args.quiet { eprintln!("[timing] incremental non-latin filter {:.2}s (skipped={})", t_nonlatin.elapsed().as_secs_f64(), 238); }
 
         if !new_keys.is_empty() {
-            eprintln!("[incremental] Detected {} new fonts, indexing and adding to classifier...", new_keys.len());
+            if !args.quiet { eprintln!("[incremental] Detected {} new fonts, indexing and adding to classifier...", new_keys.len()); }
             for k in &new_keys {
                 eprintln!("  + {k}");
             }
@@ -464,10 +495,11 @@ fn run(args: &cli::Args, classifier: &mut dyn classifier::Classifier) -> Result<
                 eprintln!("warning: failed to persist updated classifier ({clf_name}): {e}");
             }
 
-            eprintln!("[incremental] Indexed {fonts_indexed} new fonts, {new_glyphs_added} new glyph groups created");
+            if !args.quiet { eprintln!("[incremental] Indexed {fonts_indexed} new fonts, {new_glyphs_added} new glyph groups created"); }
         }
+        } // end else (catalog hash mismatch)
     }
-    eprintln!("[timing] incremental {:.2}s", run_start.elapsed().as_secs_f64());
+    if !args.quiet { eprintln!("[timing] incremental {:.2}s", run_start.elapsed().as_secs_f64()); }
 
     // All font access goes through the shared cache below.
 
@@ -476,16 +508,16 @@ fn run(args: &cli::Args, classifier: &mut dyn classifier::Classifier) -> Result<
     let rtd = train::RuntimeTrainingData::from_registry(
         &font_registry, &glyph_map, &args.render_params(),
     );
-    eprintln!("[timing] rtd from_registry {:.2}s (total {:.2}s) -> {}", t_rtd.elapsed().as_secs_f64(), run_start.elapsed().as_secs_f64(), if rtd.is_some() { "Some" } else { "None" });
+    if !args.quiet { eprintln!("[timing] rtd from_registry {:.2}s (total {:.2}s) -> {}", t_rtd.elapsed().as_secs_f64(), run_start.elapsed().as_secs_f64(), if rtd.is_some() { "Some" } else { "None" }); }
 
     // ── 1b''. Shared font cache for all post-index font access ──────
     let font_cache = font_cache::FontCache::new(font_cache::DEFAULT_CAPACITY);
-    eprintln!("[timing] font_cache new {:.2}s", run_start.elapsed().as_secs_f64());
+    if !args.quiet { eprintln!("[timing] font_cache new {:.2}s", run_start.elapsed().as_secs_f64()); }
 
     // ── 1c''. Geometry cache for GPOS kerning + ligature-aware positioning ──
     let t_geo = std::time::Instant::now();
-    let geo_cache = crate::geo_cache::GeometryCache::load_or_build(&font_registry, &font_cache);
-    eprintln!("[timing] geo_cache load_or_build {:.2}s (total {:.2}s)", t_geo.elapsed().as_secs_f64(), run_start.elapsed().as_secs_f64());
+    let geo_cache = crate::geo_cache::GeometryCache::load_or_build(&font_registry, &font_cache, args.quiet);
+    if !args.quiet { eprintln!("[timing] geo_cache load_or_build {:.2}s (total {:.2}s)", t_geo.elapsed().as_secs_f64(), run_start.elapsed().as_secs_f64()); }
 
     // ── 2. Load input pages (with raster cache) ──────────────────────
     let cache_dir = page_cache::cache_key(input, args.dpi)
@@ -493,7 +525,7 @@ fn run(args: &cli::Args, classifier: &mut dyn classifier::Classifier) -> Result<
 
     let t_pages = std::time::Instant::now();
     let (pages, _raster_cached) = page_cache::get_pages(input, args.dpi)?;
-    eprintln!("[timing] get_pages {} pages {:.2}s (total {:.2}s)", pages.len(), t_pages.elapsed().as_secs_f64(), run_start.elapsed().as_secs_f64());
+    if !args.quiet { eprintln!("[timing] get_pages {} pages {:.2}s (total {:.2}s)", pages.len(), t_pages.elapsed().as_secs_f64(), run_start.elapsed().as_secs_f64()); }
 
     // ── 2b. Extract source image data for pass-through ───────────────
     let t_extract = std::time::Instant::now();
@@ -502,10 +534,10 @@ fn run(args: &cli::Args, classifier: &mut dyn classifier::Classifier) -> Result<
     } else {
         Vec::new()
     };
-    eprintln!("[timing] extract_source_images {:.2}s (total {:.2}s)", t_extract.elapsed().as_secs_f64(), run_start.elapsed().as_secs_f64());
+    if !args.quiet { eprintln!("[timing] extract_source_images {:.2}s (total {:.2}s)", t_extract.elapsed().as_secs_f64(), run_start.elapsed().as_secs_f64()); }
 
     // ── 3. Process each page ─────────────────────────────────────────
-    eprintln!("[timing] before page loop {:.2}s", run_start.elapsed().as_secs_f64());
+    if !args.quiet { eprintln!("[timing] before page loop {:.2}s", run_start.elapsed().as_secs_f64()); }
     let mut all_pages: Vec<pdf_out::PageContent> = Vec::new();
     let mut audit_text: Vec<AuditEntry> = Vec::new();
     let mut audit_geo: Vec<GeometryEntry> = Vec::new();

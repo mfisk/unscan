@@ -6,6 +6,10 @@ use image::GrayImage;
 use crate::features::{CropFeatures, compute_features};
 use crate::classifier::{self, ObsStats};
 
+const GEO_WEIGHT: f32 = 1.0;
+// Aggregation mode: false = squared gap (current), true = simple sum (generative)
+const USE_SUM_AGG: bool = false;
+
 // ---------------------------------------------------------------------------
 // Types
 // ---------------------------------------------------------------------------
@@ -28,6 +32,10 @@ pub struct FontMatchResult {
 }
 
 pub fn aggregate_font_score(log_probs: &[(f32, f32)], best_lps: &[f32]) -> f32 {
+    if USE_SUM_AGG {
+        // Generative: sum w*lp (proper log-likelihood under independence)
+        return log_probs.iter().map(|&(lp, w)| lp * w).sum();
+    }
     // Sum of squared deviations from the best log-prob at each observation,
     // weighted by observation weight.  Negated so higher = better.
     // Observations where all fonts score similarly contribute near-zero;
@@ -117,7 +125,7 @@ pub fn identify_fonts(
     ensure_font_keys: &[&str],
     min_ngram_prob: f32,
     word_segs: &[crate::segment::WordSeg],
-    wib: &[Vec<crate::geometry_classifier::CharInkBounds>],
+    wib: &[crate::geometry_classifier::WordGeoMeasurement],
     font_registry: &crate::font_scan::FontRegistry,
     font_cache: &crate::font_cache::FontCache,
     geo_cache: &crate::geo_cache::GeometryCache,
@@ -275,11 +283,11 @@ pub fn identify_fonts(
                     // Use raw logit -d²/(2σ²)
                     let logit = *window_logit_maps[i].get(&glyph_id)?;
                     let mut lp = logit;
-                    // Geo scoring: per character
+                    // Geo scoring: per character, scaled by GEO_WEIGHT
                     if let Some(geo_map) = geo_per_font.get(&font_key) {
                         if let Some(&(seg_idx, char_pos)) = position_map.get(wd.window_idx) {
                             if let Some(&ll) = geo_map.get(&(seg_idx, char_pos)) {
-                                lp += ll;
+                                lp += GEO_WEIGHT * ll;
                             }
                         }
                     }

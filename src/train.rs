@@ -655,7 +655,7 @@ pub fn run_train(mut args: TrainArgs) {
     // ── 1. Scan fonts ─────────────────────────────────────────────
     let font_dirs: Vec<PathBuf> = font_scan::default_font_dirs(&args.font_dir);
 
-    let mut catalog = font_scan::scan_fonts(&font_dirs);
+    let mut catalog = font_scan::scan_fonts(&font_dirs, false);
     // Sort by font_key for deterministic font_id assignment, matching
     // FontRegistry::new() ordering so runtime and training agree.
     catalog.sort_by(|a, b| a.font_key().cmp(&b.font_key()));

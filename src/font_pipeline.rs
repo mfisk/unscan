@@ -313,11 +313,13 @@ pub fn match_lines(
         let mut plain_pos_map: Vec<(usize, usize)> = Vec::new();
         let mut lig_pos_map: Vec<(usize, usize)> = Vec::new();
         // Precompute ink bounds for geo (plain) — used for scoring and audit
-        let wib_plain: Vec<Vec<crate::geometry_classifier::CharInkBounds>> = line_crops.word_segs.iter()
-            .map(|ws| crate::geometry_classifier::measure_char_ink_bounds(&ws.word_img, &ws.chars, &ws.boundaries))
+        // Uses seam paths to mask adjacent ink, same as char cropping (avoids g picking up f ascender, etc.)
+        // Also computes word ink midpoint in same pass.
+        let wib_plain: Vec<crate::geometry_classifier::WordGeoMeasurement> = line_crops.word_segs.iter()
+            .map(|ws| crate::geometry_classifier::measure_char_ink_bounds(&ws.word_img, &ws.chars, &ws.boundaries, &ws.seam_paths))
             .collect();
-        let wib_lig_opt: Option<Vec<Vec<crate::geometry_classifier::CharInkBounds>>> = line_crops.lig_word_segs.as_ref().map(|segs|
-            segs.iter().map(|ws| crate::geometry_classifier::measure_char_ink_bounds(&ws.word_img, &ws.chars, &ws.boundaries)).collect()
+        let wib_lig_opt: Option<Vec<crate::geometry_classifier::WordGeoMeasurement>> = line_crops.lig_word_segs.as_ref().map(|segs|
+            segs.iter().map(|ws| crate::geometry_classifier::measure_char_ink_bounds(&ws.word_img, &ws.chars, &ws.boundaries, &ws.seam_paths)).collect()
         );
         let (font_result, tie_candidates_audit, gt_font_key) = {
 
@@ -777,7 +779,7 @@ pub fn match_lines(
                 classifier, glyph_map,
             );
             // ── Fill geo into rp for audit (chosen + gt) ───────────────
-            let (win_segs, win_wib, win_pos_map): (&[segment::WordSeg], &[Vec<crate::geometry_classifier::CharInkBounds>], &[(usize, usize)]) = if seg_winner.as_deref() == Some("ligature") {
+            let (win_segs, win_wib, win_pos_map): (&[segment::WordSeg], &[crate::geometry_classifier::WordGeoMeasurement], &[(usize, usize)]) = if seg_winner.as_deref() == Some("ligature") {
                 if let (Some(lig_segs), Some(wib_lig)) = (line_crops.lig_word_segs.as_ref(), wib_lig_opt.as_ref()) {
                     (lig_segs.as_slice(), wib_lig.as_slice(), lig_pos_map.as_slice())
                 } else {

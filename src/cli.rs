@@ -134,6 +134,10 @@ pub struct Args {
     /// than random to count.
     #[arg(long, default_value_t = 0.0)]
     pub min_ngram_prob: f32,
+
+    /// Suppress progress and informational chatter (keeps warnings/errors)
+    #[arg(short, long)]
+    pub quiet: bool,
 }
 
 impl Args {

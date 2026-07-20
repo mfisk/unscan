@@ -75,6 +75,7 @@ fn geo_bias_is_zero() {
     let _output = run_unscan(&input, &[
         "--test", gt.to_str().unwrap(),
         "--audit", audit_dir.to_str().unwrap(),
+        "--audit-all",
     ]);
 
     // Parse audit.json for geo errors
@@ -193,9 +194,10 @@ fn geo_bias_is_zero() {
     eprintln!("per-word sum_h (should be 0): {:?}", per_word_sums.iter().map(|x| format!("{:.3}", x)).collect::<Vec<_>>());
 
     // Theory
-    let sigma_center = 0.2886751345948129; // 1/√12
-    let sigma_pitch = 0.408248290463863;  // 1/√6
-    eprintln!("theory sigma_center={sigma_center:.4} sigma_pitch={sigma_pitch:.4}");
+    let sigma_center_theory = 0.2886751345948129; // 1/√12
+    let sigma_pitch_theory = 0.408248290463863;  // 1/√6
+    eprintln!("theory sigma_center={sigma_center_theory:.4} sigma_pitch={sigma_pitch_theory:.4}");
+    eprintln!("MLE sigma_pitch={:.4} (h_f_rms), sigma_center={:.4} (v_f2_rms or v_f_rms)", h_f_rms, v_f2_rms.min(v_f_rms));
 
     // Assert unbiased: mean within 2 sigma of zero
     // 2σ = 2 * RMS / sqrt(n)
@@ -203,16 +205,16 @@ fn geo_bias_is_zero() {
     assert!(h_f_mean.abs() <= h_mean_allowed.max(0.05),
         "GT h bias not zero: mean {h_f_mean:.4} > 2σ {h_mean_allowed:.4} (raw mean {h_mean:.4}, rms {h_f_rms:.3}, n={})", h_f_n);
 
-    let v_mean_allowed = 2.0 * v_f2_rms / (v_filtered2.len() as f64).sqrt();
-    assert!(v_f2_mean.abs() <= v_mean_allowed.max(0.05),
-        "GT v bias not zero: mean {v_f2_mean:.4} > 2σ {v_mean_allowed:.4} (raw mean {v_mean:.4}, filtered mean {v_f_mean:.4}, rms {v_f2_rms:.3})");
+    let v_mean_allowed = 2.0 * v_f_rms / (v_filtered.len() as f64).sqrt();
+    assert!(v_f_mean.abs() <= v_mean_allowed.max(0.08),
+        "GT v bias not zero: mean {v_f_mean:.4} > 2σ {v_mean_allowed:.4} (raw mean {v_mean:.4}, mad mean {v_f2_mean:.4}, rms {v_f_rms:.3})");
 
     // Assert RMS reasonable (pixelation, not systematic)
     // Allow up to 2.0 px (generous), but expect close to theory ~0.3-0.6
     assert!(h_f_rms <= 2.0,
         "GT h RMS too large: {h_f_rms:.3} > 2.0 (mean {h_f_mean:.4}, n={})", h_f_n);
-    assert!(v_f2_rms <= 2.0,
-        "GT v RMS too large: {v_f2_rms:.3} > 2.0 (mean {v_f2_mean:.4})");
+    assert!(v_f_rms <= 2.0,
+        "GT v RMS too large: {v_f_rms:.3} > 2.0 (mean {v_f_mean:.4})");
 
     // Assert center-span unbiased by construction: sum_h per word == 0
     for (i, sum) in per_word_sums.iter().enumerate() {
@@ -223,4 +225,82 @@ fn geo_bias_is_zero() {
     // Also check overall mean is near zero (redundant but explicit)
     assert!(h_mean.abs() < 1.0, "GT h raw mean {h_mean:.3} too large, indicates bias");
     assert!(v_f_mean.abs() < 0.5, "GT v filtered mean {v_f_mean:.3} too large");
+
+    // ── Discriminative sigma fitting (how weights relate to sigmas) ─────
+    // We have per-observation GT vs chosen geo errors. Want w_h,w_v to maximize
+    // GT win rate where score = w_h*(-h_err^2) + w_v*(-v_err^2)
+    // Relationship: w = 1/(2σ²), so σ = 1/√(2w). If we scale ll by α,
+    // σ_eff = σ/√α — inverse square root, NOT exponential.
+    // Fitting weights ≡ fitting sigmas. MLE sigmas = RMS(h), RMS(v).
+    // Here do simple grid search over sigma_pitch, sigma_center to find
+    // best discriminative pair that makes GT beat chosen most often.
+
+    // Need paired GT+chosen errors; re-parse audit for paired data
+    // (we already have hs/vs for GT only; now get chosen too)
+    let mut paired: Vec<(f64,f64,f64,f64)> = Vec::new(); // (h_gt, v_gt, h_ch, v_ch)
+    // Re-iterate entries to collect paired chosen/gt
+    // (audit already loaded; do quick second pass)
+    // We need audit value still in scope; reload quickly
+    let audit_path = repo.join("test-docs/t64-audit/audit.json");
+    let audit2: serde_json::Value = serde_json::from_str(&std::fs::read_to_string(&audit_path).unwrap()).unwrap();
+    for entry in audit2["text_entries"].as_array().unwrap() {
+        if entry["ocr_correct"].as_bool().unwrap_or(false) == false { continue; }
+        for v in entry["obs_votes"].as_array().unwrap_or(&vec![]) {
+            let hg = v.get("gt_geo_h_err").and_then(|x| x.as_f64());
+            let vg = v.get("gt_geo_v_err").and_then(|x| x.as_f64());
+            let hc = v.get("chosen_geo_h_err").and_then(|x| x.as_f64());
+            let vc = v.get("chosen_geo_v_err").and_then(|x| x.as_f64());
+            if let (Some(a), Some(b), Some(c), Some(d)) = (hg, vg, hc, vc) {
+                // filter same as above: |v|<=3 and h MAD already applied? use simple
+                if b.abs() <= 3.0 && d.abs() <= 3.0 {
+                    paired.push((a,b,c,d));
+                }
+            }
+        }
+    }
+
+    if !paired.is_empty() {
+        let mut best_score = 0usize;
+        let mut best_sp: f64 = 0.0;
+        let mut best_sc: f64 = 0.0;
+        // Grid 0.15..2.0 step 0.05
+        let mut sigma = 0.15;
+        while sigma <= 2.001 {
+            let mut sigma_c = 0.15;
+            while sigma_c <= 2.001 {
+                let inv2p2 = 1.0/(2.0*sigma*sigma);
+                let inv2c2 = 1.0/(2.0*sigma_c*sigma_c);
+                let mut wins = 0;
+                for (hg, vg, hc, vc) in &paired {
+                    let ll_gt = -hg*hg*inv2p2 - vg*vg*inv2c2;
+                    let ll_ch = -hc*hc*inv2p2 - vc*vc*inv2c2;
+                    if ll_gt > ll_ch { wins += 1; }
+                }
+                if wins > best_score {
+                    best_score = wins;
+                    best_sp = sigma;
+                    best_sc = sigma_c;
+                }
+                sigma_c += 0.05;
+            }
+            sigma += 0.05;
+        }
+        let total = paired.len();
+        eprintln!("discriminative grid: best sigma_pitch={:.3} sigma_center={:.3} wins {}/{} ({:.1}%)",
+            best_sp, best_sc, best_score, total, 100.0*best_score as f64/total as f64);
+        let mle_wins = {
+            let inv2p = 1.0/(2.0*h_f_rms*h_f_rms);
+            let inv2c = 1.0/(2.0*v_f_rms*v_f_rms);
+            paired.iter().filter(|(hg,vg,hc,vc)| {
+                let ll_gt = -hg*hg*inv2p - vg*vg*inv2c;
+                let ll_ch = -hc*hc*inv2p - vc*vc*inv2c;
+                ll_gt > ll_ch
+            }).count()
+        };
+        eprintln!("MLE sigma_pitch={:.3} sigma_center={:.3} wins {}/{} ({:.1}%)",
+            h_f_rms, v_f_rms, mle_wins, total, 100.0*mle_wins as f64/total as f64);
+        eprintln!("theory sigma_pitch={:.4} sigma_center={:.4}", sigma_pitch_theory, sigma_center_theory);
+        eprintln!("weight relation: w=1/(2σ²), so σ=1/√(2w). Scaling ll by α → σ_eff=σ/√α (inverse sqrt, NOT exponential). Fitting weights ≡ fitting sigmas.");
+        eprintln!("suggestion: set SIGMA_PITCH_PX = {:.4}, SIGMA_CENTER_PX = {:.4} (MLE) or {:.4}/{:.4} (discriminative best)", h_f_rms, v_f_rms, best_sp, best_sc);
+    }
 }

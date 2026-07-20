@@ -37,7 +37,7 @@ use std::hash::{Hash, Hasher};
 use std::path::{Path, PathBuf};
 
 const BGEO_MAGIC: &[u8; 4] = b"BGEO";
-const BGEO_VERSION: u32 = 7;
+const BGEO_VERSION: u32 = 10;
 
 // ---------- BE helpers for OT parsing ----------
 #[inline]
@@ -96,8 +96,34 @@ fn pack_vals_4<W: std::io::Write>(w: &mut W, vals: &[i16;4], vf: u16) -> std::io
     Ok(())
 }
 
+fn file_meta_hash(path: &std::path::Path) -> u64 {
+    if let Ok(meta) = std::fs::metadata(path) {
+        let size = meta.len();
+        let mtime = meta.modified().ok()
+            .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
+            .map(|d| d.as_secs())
+            .unwrap_or(0);
+        // Combine mtime + size: good enough for fast start, per Mike
+        // Use FNV-1a on 16 bytes (mtime + size) for stable hash
+        const FNV_OFFSET: u64 = 14695981039346656037;
+        const FNV_PRIME: u64 = 1099511628211;
+        let mut h = FNV_OFFSET;
+        for &b in &mtime.to_le_bytes() {
+            h ^= b as u64;
+            h = h.wrapping_mul(FNV_PRIME);
+        }
+        for &b in &size.to_le_bytes() {
+            h ^= b as u64;
+            h = h.wrapping_mul(FNV_PRIME);
+        }
+        h
+    } else {
+        0
+    }
+}
+
 fn file_hash_bytes(data: &[u8]) -> u64 {
-    // FNV-1a 64 - stable across processes (DefaultHasher is SipHash with random keys)
+    // Legacy: FNV-1a of file content (kept for reference, no longer used for fast path)
     const FNV_OFFSET: u64 = 14695981039346656037;
     const FNV_PRIME: u64 = 1099511628211;
     let mut h = FNV_OFFSET;
@@ -465,6 +491,50 @@ impl GeometryCache {
         Some(out)
     }
 
+    pub fn predict_glyph_positions_and_extents(&self, font_key: &str, chars: &[char]) -> Option<Vec<(f64,f64,f64,f64)>> {
+        let f = self.fonts.get(font_key)?;
+        let mut gids: Vec<Option<u16>> = Vec::with_capacity(chars.len());
+        for &c in chars { gids.push(self.cmap_gid(f, c)); }
+        for g in &gids { if g.is_none() { return None; } }
+        let n = gids.len();
+        if n==0 { return Some(Vec::new()); }
+
+        let mut singles: Vec<[i32;4]> = Vec::with_capacity(n);
+        for i in 0..n {
+            singles.push(self.single_adjustment_full(f, gids[i].unwrap()));
+        }
+        let mut pair_firsts: Vec<[i32;4]> = vec![[0;4]; n];
+        let mut pair_seconds: Vec<[i32;4]> = vec![[0;4]; n];
+        if n>1 {
+            for i in 0..n-1 {
+                let (v1,v2) = self.pair_adjustment_full(f, gids[i].unwrap(), gids[i+1].unwrap());
+                pair_firsts[i] = v1;
+                pair_seconds[i+1] = v2;
+            }
+        }
+
+        let mut out = Vec::with_capacity(n);
+        let mut cursor = 0.0f64;
+        for i in 0..n {
+            let gid = gids[i].unwrap() as usize;
+            let (adv, x0, x1, y0, y1) = self.glyph_metrics(f, gid)?;
+            let s = singles[i];
+            let pf = pair_firsts[i];
+            let ps = pair_seconds[i];
+            let x_pla = (s[0] + pf[0] + ps[0]) as f64;
+            let y_pla = (s[1] + pf[1] + ps[1]) as f64;
+            let x_adv_adj = (s[2] + pf[2] + ps[2]) as f64;
+            let total_adv = adv + x_adv_adj;
+            let cx = cursor + x_pla + (x0 + x1)*0.5;
+            let cy = y_pla + (y0 + y1)*0.5;
+            let w = (x1 - x0) as f64;
+            let h = (y1 - y0) as f64;
+            out.push((cx,cy,w,h));
+            cursor += total_adv;
+        }
+        Some(out)
+    }
+
     pub fn predict_word_ink_extent(&self, font_key: &str, chars: &[char], _font_data: &[u8], _em_px: f64) -> Option<(f64,f64)> {
         let f = self.fonts.get(font_key)?;
         let mut gids: Vec<Option<u16>> = Vec::with_capacity(chars.len());
@@ -704,7 +774,7 @@ impl GeometryCache {
         }
     }
 
-    pub fn load_or_build(font_registry: &crate::font_scan::FontRegistry, font_cache: &crate::font_cache::FontCache) -> Self {
+    pub fn load_or_build(font_registry: &crate::font_scan::FontRegistry, font_cache: &crate::font_cache::FontCache, quiet: bool) -> Self {
         let cache_path = Self::default_path();
         let catalog_hash = font_registry.catalog_hash();
 
@@ -713,7 +783,7 @@ impl GeometryCache {
             match Self::load(&cache_path) {
                 Ok((old_cache, old_catalog_hash)) => {
                     if old_catalog_hash == catalog_hash {
-                        eprintln!("[geo-cache] Reusing valid v{} cache with {} fonts (hash match)", BGEO_VERSION, old_cache.fonts.len());
+                        if !quiet { eprintln!("[geo-cache] Reusing valid Font geometry cache with {} fonts (hash match)", old_cache.fonts.len()); }
                         return old_cache;
                     }
                     // Hash mismatch — incremental reuse but keep old_cache for reuse
@@ -722,16 +792,16 @@ impl GeometryCache {
                         let owned = old_cache.mmap_index_to_owned(idx);
                         old_owned.insert(k.clone(), owned);
                     }
-                    eprintln!("[geo-cache] Loaded old v{} cache with {} fonts for incremental reuse (hash mismatch)", BGEO_VERSION, old_owned.len());
-                    return Self::build_incremental(font_registry, font_cache, catalog_hash, cache_path, old_owned);
+                    if !quiet { eprintln!("[geo-cache] Loaded old Font geometry cache with {} fonts for incremental reuse (hash mismatch)", old_owned.len()); }
+                    return Self::build_incremental(font_registry, font_cache, catalog_hash, cache_path, old_owned, quiet);
                 }
                 Err(e) => {
-                    eprintln!("[geo-cache] Could not load old cache for reuse ({}), full rebuild", e);
+                    if !quiet { eprintln!("[geo-cache] Could not load old Font geometry cache for reuse ({}), full rebuild", e); }
                 }
             }
         }
         // No usable cache — full rebuild
-        Self::build_incremental(font_registry, font_cache, catalog_hash, cache_path, HashMap::new())
+        Self::build_incremental(font_registry, font_cache, catalog_hash, cache_path, HashMap::new(), quiet)
     }
 
     fn build_incremental(
@@ -740,8 +810,10 @@ impl GeometryCache {
         catalog_hash: u64,
         cache_path: std::path::PathBuf,
         old_owned: HashMap<String, OwnedFont>,
+        quiet: bool,
     ) -> Self {
-
+        let t_build_start = std::time::Instant::now();
+        let total_to_build = font_registry.iter().count();
         let mut owned_fonts: HashMap<String, OwnedFont> = HashMap::new();
         let mut n_total = 0usize;
         let mut n_reused = 0usize;
@@ -750,8 +822,10 @@ impl GeometryCache {
         for fe in font_registry.iter() {
             n_total += 1;
             let font_key = fe.font_key();
-            let font_data = match font_cache.load(&fe.path) { Ok(d) => d, Err(_) => continue, };
-            let fhash = file_hash_bytes(&font_data);
+            let fhash = file_meta_hash(&fe.path);
+            if fhash == 0 {
+                continue;
+            }
 
             if let Some(old) = old_owned.get(&font_key) {
                 if old.file_hash == fhash {
@@ -770,19 +844,109 @@ impl GeometryCache {
                 }
             }
 
+            let font_data = match font_cache.load(&fe.path) { Ok(d) => d, Err(_) => continue, };
+
+            // ── Efficient dedup for OT feature variants ──────────────
+            // OT variants (onum, smcp, ss01 etc.) have variations=None and share
+            // same file + same geometry as base font — reuse base's already-built
+            // metrics instead of re-parsing the same file.
+            if fe.variations.is_none() && !fe.variant_tag.is_empty() && !fe.variant_tag.starts_with("wght") {
+                // Try to find base font (same path, no variant) already built in this run
+                if let Some(base_key) = font_registry.entries().iter()
+                    .find(|e| e.path == fe.path && e.variant_tag.is_empty())
+                    .map(|e| e.font_key())
+                {
+                    if let Some(base_owned) = owned_fonts.get(&base_key) {
+                        owned_fonts.insert(font_key.clone(), OwnedFont {
+                            file_hash: fhash,
+                            units_per_em: base_owned.units_per_em,
+                            num_glyphs: base_owned.num_glyphs,
+                            glyphs: base_owned.glyphs.clone(),
+                            cmap: base_owned.cmap.clone(),
+                            single_tables: base_owned.single_tables.clone(),
+                            format1_tables: base_owned.format1_tables.clone(),
+                            format2_tables: base_owned.format2_tables.clone(),
+                        });
+                        n_reused += 1;
+                        continue;
+                    }
+                    // Also check old_owned for base (warm start)
+                    if let Some(old_base) = old_owned.get(&base_key) {
+                        if old_base.file_hash == fhash {
+                            owned_fonts.insert(font_key.clone(), OwnedFont {
+                                file_hash: fhash,
+                                units_per_em: old_base.units_per_em,
+                                num_glyphs: old_base.num_glyphs,
+                                glyphs: old_base.glyphs.clone(),
+                                cmap: old_base.cmap.clone(),
+                                single_tables: old_base.single_tables.clone(),
+                                format1_tables: old_base.format1_tables.clone(),
+                                format2_tables: old_base.format2_tables.clone(),
+                            });
+                            n_reused += 1;
+                            continue;
+                        }
+                    }
+                }
+            }
+
             let ttf_face = match ttf_parser::Face::parse(&font_data, 0) { Ok(f) => f, Err(_) => continue, };
             let upem = ttf_face.units_per_em() as f64;
             let num_glyphs = ttf_face.number_of_glyphs() as usize;
 
             let mut glyphs = Vec::with_capacity(num_glyphs);
-            for gid in 0..num_glyphs {
-                let gid_t = ttf_parser::GlyphId(gid as u16);
-                let adv = ttf_face.glyph_hor_advance(gid_t).unwrap_or(0) as f64;
-                let bbox = ttf_face.glyph_bounding_box(gid_t);
-                let (x_min, x_max, y_min, y_max) = if let Some(bb) = bbox {
-                    (bb.x_min as f64, bb.x_max as f64, bb.y_min as f64, bb.y_max as f64)
-                } else { (0.0, adv, 0.0, 0.0) };
-                glyphs.push(GlyphMetricsOwned { advance: adv, x_min, x_max, y_min, y_max });
+            if let Some(vars) = &fe.variations {
+                // Variable font weight instance — must apply variation for correct geometry
+                if let Ok(mut vf) = ab_glyph::FontRef::try_from_slice(&font_data) {
+                    {
+                        use ab_glyph::VariableFont;
+                        for (tag, val) in vars {
+                            let _ = vf.set_variation(tag, *val);
+                        }
+                    }
+                    {
+                        use ab_glyph::Font;
+                        // Use ab_glyph for varied metrics (gvar applied)
+                        for gid in 0..num_glyphs {
+                            let gid_ab = ab_glyph::GlyphId(gid as u16);
+                            let adv = vf.h_advance_unscaled(gid_ab) as f64;
+                            // bbox from outline bounds (font units)
+                            let (x_min, x_max, y_min, y_max) = if let Some(outline) = vf.outline(gid_ab) {
+                            let b = outline.bounds;
+                            (b.min.x as f64, b.max.x as f64, b.min.y as f64, b.max.y as f64)
+                        } else {
+                            // No outline (space, etc.) — fallback to ttf_parser bbox or 0,adv
+                            if let Some(bb) = ttf_face.glyph_bounding_box(ttf_parser::GlyphId(gid as u16)) {
+                                (bb.x_min as f64, bb.x_max as f64, bb.y_min as f64, bb.y_max as f64)
+                            } else {
+                                (0.0, adv, 0.0, 0.0)
+                            }
+                        };
+                        glyphs.push(GlyphMetricsOwned { advance: adv, x_min, x_max, y_min, y_max });
+                        }
+                    }
+                } else {
+                    // Failed to create ab_glyph FontRef — fallback to ttf_parser (default instance)
+                    for gid in 0..num_glyphs {
+                        let gid_t = ttf_parser::GlyphId(gid as u16);
+                        let adv = ttf_face.glyph_hor_advance(gid_t).unwrap_or(0) as f64;
+                        let bbox = ttf_face.glyph_bounding_box(gid_t);
+                        let (x_min, x_max, y_min, y_max) = if let Some(bb) = bbox {
+                            (bb.x_min as f64, bb.x_max as f64, bb.y_min as f64, bb.y_max as f64)
+                        } else { (0.0, adv, 0.0, 0.0) };
+                        glyphs.push(GlyphMetricsOwned { advance: adv, x_min, x_max, y_min, y_max });
+                    }
+                }
+            } else {
+                for gid in 0..num_glyphs {
+                    let gid_t = ttf_parser::GlyphId(gid as u16);
+                    let adv = ttf_face.glyph_hor_advance(gid_t).unwrap_or(0) as f64;
+                    let bbox = ttf_face.glyph_bounding_box(gid_t);
+                    let (x_min, x_max, y_min, y_max) = if let Some(bb) = bbox {
+                        (bb.x_min as f64, bb.x_max as f64, bb.y_min as f64, bb.y_max as f64)
+                    } else { (0.0, adv, 0.0, 0.0) };
+                    glyphs.push(GlyphMetricsOwned { advance: adv, x_min, x_max, y_min, y_max });
+                }
             }
 
             let mut cmap_map: HashMap<u32, u16> = HashMap::new();
@@ -853,16 +1017,25 @@ impl GeometryCache {
                 }
             }
 
+            let fk_clone = font_key.clone();
             owned_fonts.insert(font_key, OwnedFont { file_hash: fhash, units_per_em: upem, num_glyphs, glyphs, cmap, single_tables, format1_tables, format2_tables });
             n_built+=1;
+            if !quiet && (n_built == 1 || n_built % 500 == 0 || n_built == total_to_build) {
+                let elapsed = t_build_start.elapsed().as_secs_f64();
+                let rate = n_built as f64 / elapsed.max(0.1);
+                let remain = (total_to_build - n_built) as f64 / rate.max(0.1);
+                let pct = n_built * 100 / total_to_build.max(1);
+                eprintln!("[geo-cache] Building Font geometry cache ... {}/{} built ({}%), {:.1}/s, ETA {:.0}s — {}", n_built, total_to_build, pct, rate, remain.max(0.0), fk_clone);
+            }
         }
 
-        eprintln!("[geo-cache] Built v{} cache ({} total, {} reused, {} built, GPOS full incl singles, Unicode both formats)", BGEO_VERSION, n_total, n_reused, n_built);
+        let elapsed = t_build_start.elapsed().as_secs_f64();
+        if !quiet { eprintln!("[geo-cache] Built Font geometry cache in {:.1}s ({} total, {} reused, {} built, GPOS full incl singles, Unicode both formats)", elapsed, n_total, n_reused, n_built); }
         let tmp_cache = Self { mmap: unsafe { memmap2::MmapOptions::new().len(0).map_anon().unwrap().make_read_only().unwrap() }, fonts: HashMap::new(), _cache_path: cache_path.clone() };
         if let Err(e) = tmp_cache.write_bin_from_owned(&cache_path, catalog_hash, &owned_fonts) {
             eprintln!("warning: failed to write geo cache to {}: {e}", cache_path.display());
         } else {
-            eprintln!("[geo-cache] Wrote {} fonts to {}", owned_fonts.len(), cache_path.display());
+            if !quiet { eprintln!("[geo-cache] Wrote {} fonts to {}", owned_fonts.len(), cache_path.display()); }
         }
         match Self::load(&cache_path) {
             Ok((mmap_cache,_)) => mmap_cache,

@@ -58,3 +58,11 @@ ls /tmp/audit-out/<line_dir>/crops/
 - Audit per-char distances: precomputed crop features via `precompute_crop_features()` + `per_char_distances_precomputed()` — avoids redundant feature extraction across multiple fonts
 - Accuracy: 454/480 (94.6%) on font-timeline-specimen.pdf (t60 AA @ 300 DPI)
 - Index version: 8, FEAT_LEN: 99, NORM_H: 48
+
+## Font Identity — search space is font keys
+
+- **Each variant / weight / feature is a separate font key.** A single file (`MyFont-VF.ttf`) produces many distinct fonts in our search space: `MyFont-Regular` (base), `MyFont-VF|wght400` (`wght=400`), `MyFont-VF|wght700` (`wght=700`), `MyFont-Regular|onum`, `|smcp`, etc. Each has its own `font_key = postscript_name|variant_tag`, its own `variations: Option<Vec<([u8;4], f32)>>`, its own `glyph_overrides`. Classification, `geo-cache`, and `glyph-map` all key by `font_key` — never by file path alone.
+
+- **Dedup storage only when truly identical — never collapse distinct keys.** Map many keys to one shared value only when provably identical (same advance/bbox for every gid, same outlines, same metrics). OT feature variants (`variations=None`, `onum`/`smcp`) share base geometry — they only remap unicode→gid via `glyph_overrides`, the underlying gid metrics are identical → share one `OwnedFont`/`GlyphMetrics` block. Variable instances (`wght400` vs `wght700`) have different `gvar` deltas and must be separate entries, even though same file. A missed share wastes memory/time; a false share is a correctness bug.
+
+Generalize to any cache/map/index: key by logical identity, but internally `Arc`/reuse the value when the computed bytes are bit-identical. Verify with equality, not assumption.

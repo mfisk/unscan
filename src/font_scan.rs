@@ -438,7 +438,7 @@ fn write_scan_cache(path: &Path, entries: &[FontEntry]) -> std::io::Result<()> {
     Ok(())
 }
 
-fn read_scan_cache(path: &Path) -> Option<Vec<FontEntry>> {
+fn read_scan_cache(path: &Path, quiet: bool) -> Option<Vec<FontEntry>> {
     let data = std::fs::read(path).ok()?;
     let mut r: &[u8] = &data;
 
@@ -448,7 +448,7 @@ fn read_scan_cache(path: &Path) -> Option<Vec<FontEntry>> {
     r = &r[4..];
     let version = read_u32(&mut r)?;
     if version != FSCN_VERSION {
-        eprintln!("[scan] Font scan cache is v{version}, need v{FSCN_VERSION} — rescanning...");
+        if !quiet { eprintln!("[scan] Font scan cache is v{version}, need v{FSCN_VERSION} — rescanning..."); }
         return None;
     }
     let n = read_u32(&mut r)? as usize;
@@ -519,7 +519,7 @@ fn read_scan_cache(path: &Path) -> Option<Vec<FontEntry>> {
 
 /// Dedup font entries: drop variable-font weight instances covered by static
 /// fonts, then dedup by font_key.
-fn dedup_fonts(mut fonts: Vec<FontEntry>) -> Vec<FontEntry> {
+fn dedup_fonts(mut fonts: Vec<FontEntry>, quiet: bool) -> Vec<FontEntry> {
     // Prefer static fonts over variable-font weight instances
     {
         use std::collections::HashSet;
@@ -550,7 +550,7 @@ fn dedup_fonts(mut fonts: Vec<FontEntry>) -> Vec<FontEntry> {
         });
         let removed = before - fonts.len();
         if removed > 0 {
-            eprintln!("[scan] Dropped {} variable-font weight instances covered by static fonts", removed);
+            if !quiet { eprintln!("[scan] Dropped {} variable-font weight instances covered by static fonts", removed); }
         }
     }
 
@@ -562,7 +562,7 @@ fn dedup_fonts(mut fonts: Vec<FontEntry>) -> Vec<FontEntry> {
         fonts.retain(|f| seen_keys.insert(f.font_key()));
         let removed = before - fonts.len();
         if removed > 0 {
-            eprintln!("[scan] Deduped {} entries by font_key ({} → {})", removed, before, fonts.len());
+            if !quiet { eprintln!("[scan] Deduped {} entries by font_key ({} → {})", removed, before, fonts.len()); }
         }
     }
 
@@ -570,14 +570,14 @@ fn dedup_fonts(mut fonts: Vec<FontEntry>) -> Vec<FontEntry> {
 }
 
 /// Walk the given directories for .ttf / .otf files and return a catalogue.
-pub fn scan_fonts(dirs: &[PathBuf]) -> Vec<FontEntry> {
+pub fn scan_fonts(dirs: &[PathBuf], quiet: bool) -> Vec<FontEntry> {
     let current_paths = collect_font_paths(dirs);
     let cache_path = scan_cache_path();
 
     // Load cached entries indexed by source font file path
     let cached_by_path: std::collections::HashMap<PathBuf, Vec<FontEntry>> = {
         let mut map: std::collections::HashMap<PathBuf, Vec<FontEntry>> = std::collections::HashMap::new();
-        if let Some(entries) = read_scan_cache(&cache_path) {
+        if let Some(entries) = read_scan_cache(&cache_path, quiet) {
             for e in entries {
                 map.entry(e.path.clone()).or_default().push(e);
             }
@@ -598,15 +598,15 @@ pub fn scan_fonts(dirs: &[PathBuf]) -> Vec<FontEntry> {
             .collect();
         // Filter out tombstone entries (empty family_name = rejected font file)
         fonts.retain(|f| !f.family_name.is_empty());
-        eprintln!("[scan] Loaded {} font entries from cache", fonts.len());
-        return dedup_fonts(fonts);
+        if !quiet { eprintln!("[scan] Loaded {} font entries from cache", fonts.len()); }
+        return dedup_fonts(fonts, quiet);
     }
 
     if !removed.is_empty() {
-        eprintln!("[scan] {} font files removed", removed.len());
+        if !quiet { eprintln!("[scan] {} font files removed", removed.len()); }
     }
     if !added.is_empty() {
-        eprintln!("[scan] {} new font files to scan", added.len());
+        if !quiet { eprintln!("[scan] {} new font files to scan", added.len()); }
     }
 
     // Start with cached entries for paths that still exist
@@ -729,14 +729,14 @@ pub fn scan_fonts(dirs: &[PathBuf]) -> Vec<FontEntry> {
 
     // Write cache pre-dedup so every source path is represented
     if let Err(e) = write_scan_cache(&cache_path, &fonts) {
-        eprintln!("[scan] Warning: failed to write font scan cache: {}", e);
+        if !quiet { eprintln!("[scan] Warning: failed to write font scan cache: {}", e); }
     } else {
-        eprintln!("[scan] Wrote {} font entries to cache", fonts.len());
+        if !quiet { eprintln!("[scan] Wrote {} font entries to cache", fonts.len()); }
     }
 
     // Filter out tombstone entries before dedup
     fonts.retain(|f| !f.family_name.is_empty());
-    dedup_fonts(fonts)
+    dedup_fonts(fonts, quiet)
 }
 
 // ---------------------------------------------------------------------------

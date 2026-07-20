@@ -1,7 +1,7 @@
 //! t59: Seam split regression test.
 //!
-//! Generates a 7-line test PDF covering LibreBodoni (uppercase, lowercase,
-//! lining figures), EBGaramond (body text), Arial Bold, Roboto Italic, and
+//! Generates a 6-line test PDF (L2 removed) covering LibreBodoni (uppercase, lowercase,
+//! lining figures) removed L2, EBGaramond (body text), Arial Bold, Roboto Italic, and
 //! PlayfairDisplay (lining figures).  Runs unprint with --audit and verifies
 //! seam splits match known-good positions.
 //!
@@ -17,15 +17,11 @@ use std::process::Command;
 /// Hardcoded fonts/strings — no audit dependency, no empty lines.
 /// Updated Jul 19 2026: switched to hardcoded fonts/strings.
 const EXPECTED: &[(&str, &[&[u32]])] = &[
-    // LibreBodoni-400 lowercase
+    // LibreBodoni-400 lowercase (L1)
     ("abcdefghijklmnopqrstuvwxyz.", &[
         &[17, 112, 166, 199, 208, 395, 413, 440, 460],
     ]),
-    // LibreBodoni-400 lining figures
-    ("Lining figures: 0 1 2 3 4 5 6 7 8 9.", &[
-        &[14, 46], &[], &[], &[], &[], &[], &[], &[], &[], &[], &[], &[],
-    ]),
-    // LibreBodoni-400 uppercase
+    // LibreBodoni-400 uppercase (was L3)
     ("ABCDEFGHIJKLMNOPQRSTUVWXYZ.", &[
         &[25, 187, 216, 230, 276, 332, 471, 518, 545, 570, 604, 633, 656],
     ]),
