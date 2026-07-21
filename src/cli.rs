@@ -50,7 +50,7 @@ pub struct Args {
     #[arg(short, long, help_heading = "Output")]
     pub quiet: bool,
 
-    // ── Evaluation (visible, second heading) ───────────────────────
+    // ── Evaluation ─────────────────────────────────────────────────
     /// Ground-truth vector PDF for accuracy evaluation. Outputs performance
     /// stats as JSON to stdout. When --audit is also set, the audit report
     /// includes ground-truth hit/miss classification. Does not require --output.
@@ -64,86 +64,86 @@ pub struct Args {
     #[arg(long, value_name = "DIR", help_heading = "Evaluation")]
     pub audit: Option<PathBuf>,
 
+    /// Include all lines (hits) in report.html, not just misses.
+    #[arg(long, help_heading = "Evaluation")]
+    pub report_all: bool,
+
+    /// Include all lines (hits) in audit.json obs_votes and compute geo for all,
+    /// not just misses. Implies --report-all. Use for geo bias regression
+    /// tests where GT metrics on hits are needed (t64).
+    #[arg(long, help_heading = "Evaluation")]
+    pub audit_all: bool,
+
+    // ── Debug / Comparison ─────────────────────────────────────────
     /// Debug overlay mode: keep original raster in place and render vector
     /// text on top in semitransparent red. Useful for visually checking
     /// font matching and sizing accuracy.
     #[arg(long, help_heading = "Debug")]
     pub overlay: bool,
 
-    // ── Hidden / advanced (still usable, just not in --help) ───────
-    /// Minimum OCR confidence to consider vectorizing text (0–100).
-    #[arg(long, default_value = "0", hide = true)]
-    pub min_ocr_confidence: u32,
-
-    /// Include all lines (hits) in report.html, not just misses.
-    #[arg(long, hide = true)]
-    pub report_all: bool,
-
-    /// Include all lines (hits) in audit.json obs_votes and compute geo for all,
-    /// not just misses. Implies --report-all. Use for geo bias regression
-    /// tests where GT metrics on hits are needed (t64).
-    #[arg(long, hide = true)]
-    pub audit_all: bool,
-
-    // train_lda removed — training happens automatically.
-
     /// Generate side-by-side comparison images (scan crop vs rendered font)
     /// for every vectorized line. Output goes to <output_base>-compare/ directory.
-    #[arg(long, hide = true)]
+    #[arg(long, help_heading = "Debug")]
     pub compare: bool,
+
+    // ── Classifier options ─────────────────────────────────────────
+    /// Font matching classifier: 'lda' (default), 'fisher', 'triplet',
+    /// 'global-triplet', 'mlp', or 'fusion'.
+    #[arg(long, default_value = "lda", help_heading = "Classifier")]
+    pub classifier: String,
+
+    /// Path to classifier weights file.
+    #[arg(long, help_heading = "Classifier")]
+    pub triplet_weights: Option<PathBuf>,
 
     /// Thoroughness factor for font matching. Default 1.0.
     /// Higher values relax all font-matching thresholds (quorum, quality gate, search
     /// radius) so more candidate fonts survive to evaluation.
-    #[arg(long, default_value_t = 1.0, hide = true)]
+    #[arg(long, default_value_t = 1.0, help_heading = "Classifier")]
     pub thoroughness: f32,
 
-    /// Font matching classifier: 'lda' (default), 'fisher', 'triplet',
-    /// 'global-triplet', 'mlp', or 'fusion'.
-    #[arg(long, default_value = "lda", hide = true)]
-    pub classifier: String,
-
-    /// Path to classifier weights file.
-    #[arg(long, hide = true)]
-    pub triplet_weights: Option<PathBuf>,
-
-    /// Normalize PostScript name(s) to include explicit weight keywords.
-    /// Pass one or more "PSName:weight" pairs (e.g. "Lato-Italic:400").
-    /// Prints the normalized name(s) to stdout and exits.
-    #[arg(long, value_name = "PS:WEIGHT", hide = true)]
-    pub weight_explicit: Vec<String>,
-
-    // ── Render pipeline parameters (hidden) ────────────────────────
-    /// Render scale multiplier for reference character images.
-    #[arg(long, default_value = "1", hide = true)]
-    pub render_scale: u32,
-
-    /// AA variant for reference character images: native, blur_0.5, sharpen.
-    #[arg(long, default_value = "native", hide = true)]
-    pub render_aa: String,
-
-    /// Binarize threshold for reference character images (0–255).
-    #[arg(long, hide = true)]
-    pub render_binarize: Option<u8>,
+    /// Minimum OCR confidence to consider vectorizing text (0–100).
+    #[arg(long, default_value = "0", help_heading = "Classifier")]
+    pub min_ocr_confidence: u32,
 
     /// Minimum ngram probability as a multiplier on uniform (1/glyph_count).
     /// Ngram is kept only if a candidate scores above threshold × uniform.
     /// Default 0.0 = disabled; 6.0 = require 6× more likely than random.
-    #[arg(long, default_value_t = 0.0, hide = true)]
+    #[arg(long, default_value_t = 0.0, help_heading = "Classifier")]
     pub min_ngram_prob: f32,
 
+    /// Normalize PostScript name(s) to include explicit weight keywords.
+    /// Pass one or more "PSName:weight" pairs (e.g. "Lato-Italic:400").
+    /// Prints the normalized name(s) to stdout and exits.
+    #[arg(long, value_name = "PS:WEIGHT", help_heading = "Classifier")]
+    pub weight_explicit: Vec<String>,
+
+    // ── Render options ─────────────────────────────────────────────
+    /// Render scale multiplier for reference character images.
+    #[arg(long, default_value = "1", help_heading = "Render")]
+    pub render_scale: u32,
+
+    /// AA variant for reference character images: native, blur_0.5, sharpen.
+    #[arg(long, default_value = "native", help_heading = "Render")]
+    pub render_aa: String,
+
+    /// Binarize threshold for reference character images (0–255).
+    #[arg(long, help_heading = "Render")]
+    pub render_binarize: Option<u8>,
+
+    // ── Cache options ──────────────────────────────────────────────
     /// Alternate cache directory (default: ~/.cache/unprint). Env: UNPRINT_CACHE_DIR
-    #[arg(long, env = "UNPRINT_CACHE_DIR", hide = true)]
+    #[arg(long, env = "UNPRINT_CACHE_DIR", help_heading = "Cache")]
     pub cache_dir: Option<PathBuf>,
 
     /// Comma-separated list of font_keys or families to use, or @file.
     /// When used with --cache-dir, only these fonts are scanned and cached.
     /// Env: UNPRINT_FONT_ALLOWLIST
-    #[arg(long, env = "UNPRINT_FONT_ALLOWLIST", hide = true)]
+    #[arg(long, env = "UNPRINT_FONT_ALLOWLIST", help_heading = "Cache")]
     pub font_allowlist: Option<String>,
 
     /// Skip per-font LDA OCR correction (pflda). Env: UNPRINT_SKIP_PFLDA
-    #[arg(long, env = "UNPRINT_SKIP_PFLDA", hide = true)]
+    #[arg(long, env = "UNPRINT_SKIP_PFLDA", help_heading = "Cache")]
     pub skip_ocr_correction: bool,
 }
 
