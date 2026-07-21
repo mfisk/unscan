@@ -375,8 +375,8 @@ fn text_width_from_pdf(
 }
 
 /// Fallback width estimate when no /Widths available.
-fn text_width_estimate(operands: &[lopdf::Object], font_size: f32, ctm_x_scale: f32) -> f32 {
-    let n = text_length(operands);
+fn text_width_estimate(operands: &[lopdf::Object], font_size: f32, ctm_x_scale: f32, code_bytes: usize) -> f32 {
+    let n = text_length(operands, code_bytes);
     n as f32 * font_size.abs() * 0.5 * ctm_x_scale
 }
 
@@ -603,15 +603,25 @@ fn extract_page_spans(
                     tm[4] -= leading * tm[2];
                     tm[5] -= leading * tm[3];
                 }
-                let n_chars = text_length(&op.operands);
+                let mut code_bytes = tounicode_map.get(&current_font_resource).map(|(_, cb)| *cb).unwrap_or_else(|| infer_code_bytes(&op.operands));
+                if code_bytes == 1 {
+                    // ToUnicode claimed 1-byte but raw bytes look like UTF-16BE — trust the bytes
+                    let inferred = infer_code_bytes(&op.operands);
+                    if inferred == 2 { code_bytes = 2; }
+                }
+                let n_chars = text_length(&op.operands, code_bytes);
                 if n_chars > 0 && !current_font.is_empty() {
                     let (x, y) = transform_point(tm[4], tm[5], &ctm);
                     let h = font_size.abs() * ctm[3].abs().max(0.1);
                     let ctm_x = ctm[0].abs().max(0.1);
-                    let w = if let Some(fw) = font_widths_map.get(&current_font_resource) {
-                        text_width_from_pdf(&op.operands, fw, font_size, ctm_x, word_spacing)
+                    let w = if code_bytes == 1 {
+                        if let Some(fw) = font_widths_map.get(&current_font_resource) {
+                            text_width_from_pdf(&op.operands, fw, font_size, ctm_x, word_spacing)
+                        } else {
+                            text_width_estimate(&op.operands, font_size, ctm_x, code_bytes)
+                        }
                     } else {
-                        text_width_estimate(&op.operands, font_size, ctm_x)
+                        text_width_estimate(&op.operands, font_size, ctm_x, code_bytes)
                     };
                     spans.push(VectorSpan {
                         font_name: current_font.clone(),
@@ -622,15 +632,24 @@ fn extract_page_spans(
                 }
             }
             "TJ" => {
-                let n_chars = text_length(&op.operands);
+                let mut code_bytes = tounicode_map.get(&current_font_resource).map(|(_, cb)| *cb).unwrap_or_else(|| infer_code_bytes(&op.operands));
+                if code_bytes == 1 {
+                    let inferred = infer_code_bytes(&op.operands);
+                    if inferred == 2 { code_bytes = 2; }
+                }
+                let n_chars = text_length(&op.operands, code_bytes);
                 if n_chars > 0 && !current_font.is_empty() {
                     let (x, y) = transform_point(tm[4], tm[5], &ctm);
                     let h = font_size.abs() * ctm[3].abs().max(0.1);
                     let ctm_x = ctm[0].abs().max(0.1);
-                    let w = if let Some(fw) = font_widths_map.get(&current_font_resource) {
-                        text_width_from_pdf(&op.operands, fw, font_size, ctm_x, word_spacing)
+                    let w = if code_bytes == 1 {
+                        if let Some(fw) = font_widths_map.get(&current_font_resource) {
+                            text_width_from_pdf(&op.operands, fw, font_size, ctm_x, word_spacing)
+                        } else {
+                            text_width_estimate(&op.operands, font_size, ctm_x, code_bytes)
+                        }
                     } else {
-                        text_width_estimate(&op.operands, font_size, ctm_x)
+                        text_width_estimate(&op.operands, font_size, ctm_x, code_bytes)
                     };
                     spans.push(VectorSpan {
                         font_name: current_font.clone(),
@@ -800,16 +819,60 @@ fn decode_tounicode_dst(dst: &str) -> String {
     s
 }
 
-/// Count the number of text characters in the operands of a text-showing op.
-fn text_length(operands: &[lopdf::Object]) -> usize {
-    let mut count = 0;
+/// Infer code bytes (1 or 2) from raw Tj/TJ bytes when ToUnicode is missing.
+/// Heuristic: Identity-H strings are UTF-16BE with many 0x00 high bytes;
+/// if the first non-empty string has even length and contains a NUL, assume 2-byte.
+fn infer_code_bytes(operands: &[lopdf::Object]) -> usize {
     for op in operands {
         match op {
-            lopdf::Object::String(bytes, _) => count += bytes.len(),
+            lopdf::Object::String(bytes, _) if !bytes.is_empty() => {
+                if bytes.len() % 2 == 0 && bytes.contains(&0) {
+                    return 2;
+                }
+                // Even length with high proportion of 0x00 at even positions is also 2-byte
+                if bytes.len() >= 4 && bytes.len() % 2 == 0 {
+                    let zeros = bytes.iter().step_by(2).filter(|&&b| b == 0).count();
+                    if zeros * 2 >= bytes.len() / 2 {
+                        return 2;
+                    }
+                }
+                return 1;
+            }
             lopdf::Object::Array(arr) => {
                 for item in arr {
                     if let lopdf::Object::String(bytes, _) = item {
-                        count += bytes.len();
+                        if !bytes.is_empty() {
+                            if bytes.len() % 2 == 0 && bytes.contains(&0) {
+                                return 2;
+                            }
+                            if bytes.len() >= 4 && bytes.len() % 2 == 0 {
+                                let zeros = bytes.iter().step_by(2).filter(|&&b| b == 0).count();
+                                if zeros * 2 >= bytes.len() / 2 {
+                                    return 2;
+                                }
+                            }
+                            return 1;
+                        }
+                    }
+                }
+            }
+            _ => {}
+        }
+    }
+    1
+}
+
+/// Count the number of text characters (glyphs) in the operands of a text-showing op.
+/// For 2-byte fonts (Identity-H), each glyph is 2 bytes.
+fn text_length(operands: &[lopdf::Object], code_bytes: usize) -> usize {
+    let mut count = 0;
+    for op in operands {
+        match op {
+            lopdf::Object::String(bytes, _) => count += bytes.len() / code_bytes.max(1),
+            lopdf::Object::Array(arr) => {
+                for item in arr {
+                    if let lopdf::Object::String(bytes, _) = item {
+                        count += bytes.len() / code_bytes.max(1);
                     }
                 }
             }
