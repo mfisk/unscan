@@ -8,154 +8,142 @@ use std::path::{Path, PathBuf};
              Zero information loss: only replaces raster when BOTH OCR and font match\n\
              confidence are high. All remaining raster is kept at original quality.\n\
              Also vectorizes lines, rectangles, and solid fills.",
-    version
+    version,
+    arg_required_else_help = true,
+    help_template = "{before-help}{name} {version}\n{about-with-newline}\n{usage-heading} {usage}\n\n{all-args}{after-help}",
 )]
 pub struct Args {
+    // ── Input / Output (visible) ───────────────────────────────────
     /// Input file (PDF or image: PNG, JPEG, TIFF, BMP).
-    /// Not required when using --index.
+    #[arg(value_name = "INPUT", help_heading = "Input")]
     pub input: Option<PathBuf>,
 
     /// Output PDF path
-    #[arg(short, long)]
+    #[arg(short, long, value_name = "PDF", help_heading = "Output")]
     pub output: Option<PathBuf>,
 
     /// Additional font search directories (repeatable)
-    #[arg(long)]
+    #[arg(long, value_name = "DIR", help_heading = "Input")]
     pub font_dir: Vec<PathBuf>,
 
-    /// Minimum OCR confidence to consider vectorizing text (0–100).
-    /// Below this, the original raster is kept unconditionally.
-    #[arg(long, default_value = "0")]
-    pub min_ocr_confidence: u32,
+    /// Process only the given pages (1-indexed, comma-separated, ranges ok).
+    /// Examples: --pages 3  --pages 1,3,5  --pages 2-4,7
+    /// Omit to process all pages.
+    #[arg(long, value_name = "PAGES", help_heading = "Input")]
+    pub pages: Option<String>,
 
     /// DPI for PDF page rasterization
-    #[arg(long, default_value = "300")]
+    #[arg(long, default_value = "300", help_heading = "Processing")]
     pub dpi: u32,
 
     /// Skip geometry vectorization (lines, rectangles, fills)
-    #[arg(long)]
+    #[arg(long, help_heading = "Processing")]
     pub no_geometry: bool,
+
+    /// Smooth font sizes: unify per-word sizes within consecutive same-font
+    /// runs to their median, removing OCR bbox noise. Outlier words (>1pt
+    /// from the run mean) keep their natural size.
+    #[arg(long, help_heading = "Processing")]
+    pub smooth: bool,
+
+    /// Suppress progress and informational chatter (keeps warnings/errors)
+    #[arg(short, long, help_heading = "Output")]
+    pub quiet: bool,
+
+    // ── Evaluation (visible, second heading) ───────────────────────
+    /// Ground-truth vector PDF for accuracy evaluation. Outputs performance
+    /// stats as JSON to stdout. When --audit is also set, the audit report
+    /// includes ground-truth hit/miss classification. Does not require --output.
+    #[arg(long, value_name = "PDF", help_heading = "Evaluation")]
+    pub test: Option<PathBuf>,
+
+    /// Audit output directory. Writes audit.json and per-word segmentation
+    /// diagnostics (crops, seams, char overlays) into the given directory.
+    /// When --test is also set, generates report.html with ground-truth
+    /// hit/miss classification.
+    #[arg(long, value_name = "DIR", help_heading = "Evaluation")]
+    pub audit: Option<PathBuf>,
 
     /// Debug overlay mode: keep original raster in place and render vector
     /// text on top in semitransparent red. Useful for visually checking
     /// font matching and sizing accuracy.
-    #[arg(long)]
+    #[arg(long, help_heading = "Debug")]
     pub overlay: bool,
 
-    /// Smooth font sizes: unify per-word sizes within consecutive same-font
-    /// runs to their median, removing OCR bbox noise.  Outlier words (>1pt
-    /// from the run mean) keep their natural size.
-    #[arg(long)]
-    pub smooth: bool,
-
-    /// Audit output directory.  Writes audit.json and per-word segmentation
-    /// diagnostics (crops, seams, char overlays) into the given directory.
-    /// When --test is also set, generates report.html with ground-truth
-    /// hit/miss classification.
-    #[arg(long, value_name = "DIR")]
-    pub audit: Option<PathBuf>,
+    // ── Hidden / advanced (still usable, just not in --help) ───────
+    /// Minimum OCR confidence to consider vectorizing text (0–100).
+    #[arg(long, default_value = "0", hide = true)]
+    pub min_ocr_confidence: u32,
 
     /// Include all lines (hits) in report.html, not just misses.
-    #[arg(long)]
+    #[arg(long, hide = true)]
     pub report_all: bool,
 
     /// Include all lines (hits) in audit.json obs_votes and compute geo for all,
     /// not just misses. Implies --report-all. Use for geo bias regression
     /// tests where GT metrics on hits are needed (t64).
-    #[arg(long)]
+    #[arg(long, hide = true)]
     pub audit_all: bool,
 
     // train_lda removed — training happens automatically.
 
     /// Generate side-by-side comparison images (scan crop vs rendered font)
     /// for every vectorized line. Output goes to <output_base>-compare/ directory.
-    #[arg(long)]
+    #[arg(long, hide = true)]
     pub compare: bool,
 
     /// Thoroughness factor for font matching. Default 1.0.
     /// Higher values relax all font-matching thresholds (quorum, quality gate, search
     /// radius) so more candidate fonts survive to evaluation.
-    /// Useful for diagnosing why a known font isn't being matched.
-    #[arg(long, default_value_t = 1.0)]
+    #[arg(long, default_value_t = 1.0, hide = true)]
     pub thoroughness: f32,
 
-    /// Process only the given pages (1-indexed, comma-separated, ranges ok).
-    /// Examples: --pages 3  --pages 1,3,5  --pages 2-4,7
-    /// Omit to process all pages.
-    #[arg(long, value_name = "PAGES")]
-    pub pages: Option<String>,
-
-    /// Ground-truth vector PDF for accuracy evaluation.  Outputs performance
-    /// stats as JSON to stdout.  When --audit is also set, the audit report
-    /// includes ground-truth hit/miss classification.  Does not require --output.
-    #[arg(long, value_name = "PDF")]
-    pub test: Option<PathBuf>,
-
-    /// Render characters using the index-time render_glyph_at_ink_height() pipeline
-    /// Font matching classifier: 'lda' (default, LDA-projected kNN),
-    /// 'fisher' (Fisher-weighted kNN), 'triplet' (per-glyph learned embedding),
-    /// 'global-triplet' (single learned embedding), 'mlp' (direct multi-class
-    /// softmax per character), or 'fusion' (rank-fusion of LDA + Fisher).
-    #[arg(long, default_value = "lda")]
+    /// Font matching classifier: 'lda' (default), 'fisher', 'triplet',
+    /// 'global-triplet', 'mlp', or 'fusion'.
+    #[arg(long, default_value = "lda", hide = true)]
     pub classifier: String,
 
-    /// Path to classifier weights file.  Required for triplet, global-triplet,
-    /// perchar-fisher, mahalanobis, and mlp.  Optional for lda (auto-trained
-    /// if absent).  Not needed for fisher or fusion.
-    #[arg(long)]
+    /// Path to classifier weights file.
+    #[arg(long, hide = true)]
     pub triplet_weights: Option<PathBuf>,
 
     /// Normalize PostScript name(s) to include explicit weight keywords.
     /// Pass one or more "PSName:weight" pairs (e.g. "Lato-Italic:400").
     /// Prints the normalized name(s) to stdout and exits.
-    #[arg(long, value_name = "PS:WEIGHT")]
+    #[arg(long, value_name = "PS:WEIGHT", hide = true)]
     pub weight_explicit: Vec<String>,
 
-    // ── Render pipeline parameters ─────────────────────────────────
+    // ── Render pipeline parameters (hidden) ────────────────────────
     /// Render scale multiplier for reference character images.
-    /// 1 = render directly at target height, 3 = render at 3× then downscale.
-    #[arg(long, default_value = "1")]
+    #[arg(long, default_value = "1", hide = true)]
     pub render_scale: u32,
 
     /// AA variant for reference character images: native, blur_0.5, sharpen.
-    #[arg(long, default_value = "native")]
+    #[arg(long, default_value = "native", hide = true)]
     pub render_aa: String,
 
     /// Binarize threshold for reference character images (0–255).
-    /// Default: no binarization (keep native greyscale with AA).
-    #[arg(long)]
+    #[arg(long, hide = true)]
     pub render_binarize: Option<u8>,
 
     /// Minimum ngram probability as a multiplier on uniform (1/glyph_count).
-    /// An ngram is included in scoring only if at least one candidate font
-    /// scores above (threshold × uniform) for that ngram; otherwise the
-    /// ngram is discarded. All fonts are then scored on the same surviving
-    /// set of ngrams. Default 6.0 means a glyph must be 6× more likely
-    /// than random to count.
-    #[arg(long, default_value_t = 0.0)]
+    /// Ngram is kept only if a candidate scores above threshold × uniform.
+    /// Default 0.0 = disabled; 6.0 = require 6× more likely than random.
+    #[arg(long, default_value_t = 0.0, hide = true)]
     pub min_ngram_prob: f32,
 
-    /// Suppress progress and informational chatter (keeps warnings/errors)
-    #[arg(short, long)]
-    pub quiet: bool,
-
     /// Alternate cache directory (default: ~/.cache/unprint). Env: UNPRINT_CACHE_DIR
-    /// Use a separate directory when testing with --font-allowlist to avoid
-    /// rebuilding the main 5898-font cache.
-    #[arg(long, env = "UNPRINT_CACHE_DIR")]
+    #[arg(long, env = "UNPRINT_CACHE_DIR", hide = true)]
     pub cache_dir: Option<PathBuf>,
 
     /// Comma-separated list of font_keys or families to use, or @file.
-    /// Examples: "LibreBodoni-400,EBGaramond-400" or "@/tmp/my-fonts.txt".
     /// When used with --cache-dir, only these fonts are scanned and cached.
-    /// When used with default cache, filters at matching time only (main cache untouched).
     /// Env: UNPRINT_FONT_ALLOWLIST
-    #[arg(long, env = "UNPRINT_FONT_ALLOWLIST")]
+    #[arg(long, env = "UNPRINT_FONT_ALLOWLIST", hide = true)]
     pub font_allowlist: Option<String>,
 
-    /// Skip per-font LDA OCR correction (pflda). Useful for faster iteration
-    /// when OCR correction is not needed. Env: UNPRINT_SKIP_PFLDA
-    #[arg(long, env = "UNPRINT_SKIP_PFLDA")]
+    /// Skip per-font LDA OCR correction (pflda). Env: UNPRINT_SKIP_PFLDA
+    #[arg(long, env = "UNPRINT_SKIP_PFLDA", hide = true)]
     pub skip_ocr_correction: bool,
 }
 
