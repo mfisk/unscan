@@ -150,8 +150,7 @@ impl NgramGlyphMap {
 
     /// Default cache path for the glyph map.
     pub fn default_path() -> PathBuf {
-        let home = std::env::var("HOME").unwrap_or_else(|_| ".".to_string());
-        Path::new(&home).join(".cache").join("unprint").join("glyph-map.bin")
+        crate::cache::paths::glyph_map_bin()
     }
 
     // ---------------------------------------------------------------

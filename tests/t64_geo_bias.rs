@@ -21,7 +21,7 @@
 //!     sigma_center = 1/√12 ≈ 0.2887, sigma_pitch = √(2)/√12 = 1/√6 ≈ 0.4082
 //!
 //! Test procedure:
-//!   - Generate 7-line hardcoded test PDFs (same as t59 + lob)
+//!   - Generate 6-line hardcoded test PDFs (same as t59 + lob)
 //!   - Run unprint --test GT --audit
 //!   - Collect gt_geo_h_err / gt_geo_v_err for ocr_correct==True
 //!   - Filter outliers: |v| > 3 px (large vertical errors from descenders etc),
@@ -145,6 +145,15 @@ fn geo_bias_is_zero() {
     fn rms(arr: &[f64]) -> f64 {
         (arr.iter().map(|x| x*x).sum::<f64>() / arr.len() as f64).sqrt()
     }
+    fn stddev(arr: &[f64], m: f64) -> f64 {
+        (arr.iter().map(|x| (x-m)*(x-m)).sum::<f64>() / arr.len() as f64).sqrt()
+    }
+    fn min_max(arr: &[f64]) -> (f64,f64) {
+        let mut lo = f64::INFINITY;
+        let mut hi = f64::NEG_INFINITY;
+        for &x in arr { if x<lo { lo=x; } if x>hi { hi=x; } }
+        (lo, hi)
+    }
     fn median(arr: &mut [f64]) -> f64 {
         arr.sort_by(|a,b| a.partial_cmp(b).unwrap());
         let n = arr.len();
@@ -158,63 +167,43 @@ fn geo_bias_is_zero() {
         if m < 1e-9 { 1.0 } else { m }
     }
 
-    // Horizontal: outlier rejection via MAD (3*MAD)
-    let mut hs_sorted = hs.clone();
-    let h_med = median(&mut hs_sorted);
-    let h_mad = mad(&hs, h_med);
-    let h_filtered: Vec<f64> = hs.iter().copied()
-        .filter(|x| (x - h_med).abs() <= 3.0 * h_mad)
-        .collect();
+    // No outlier filtering on GT anymore — use raw errors (per Mike)
+    // It looks Gaussian so report stddev + min/max
     let h_mean = mean(&hs);
     let h_rms = rms(&hs);
-    let h_f_mean = mean(&h_filtered);
-    let h_f_rms = rms(&h_filtered);
-    let h_n = hs.len() as f64;
-    let h_f_n = h_filtered.len() as f64;
-
-    // Vertical: simple |v|>3 filter + MAD
-    let v_filtered: Vec<f64> = vs.iter().copied()
-        .filter(|x| x.abs() <= 3.0)
-        .collect();
-    let mut vs_sorted = vs.clone();
-    let v_med = median(&mut vs_sorted);
-    let v_mad = mad(&vs, v_med);
-    let v_filtered2: Vec<f64> = vs.iter().copied()
-        .filter(|x| (x - v_med).abs() <= 5.0 * v_mad && x.abs() <= 3.0)
-        .collect();
+    let h_std = stddev(&hs, h_mean);
+    let (h_min, h_max) = min_max(&hs);
     let v_mean = mean(&vs);
     let v_rms = rms(&vs);
-    let v_f_mean = mean(&v_filtered);
-    let v_f_rms = rms(&v_filtered);
-    let v_f2_mean = mean(&v_filtered2);
-    let v_f2_rms = rms(&v_filtered2);
+    let v_std = stddev(&vs, v_mean);
+    let (v_min, v_max) = min_max(&vs);
 
-    eprintln!("GT h raw mean {h_mean:.6} rms {h_rms:.3} n={} filtered mean {h_f_mean:.6} rms {h_f_rms:.3} n={}", hs.len(), h_filtered.len());
-    eprintln!("GT v raw mean {v_mean:.6} rms {v_rms:.3} n={} filtered |v|<=3 mean {v_f_mean:.6} rms {v_f_rms:.3} n={} mad-filtered mean {v_f2_mean:.6} rms {v_f2_rms:.3} n={}", vs.len(), v_filtered.len(), v_filtered2.len());
+    eprintln!("GT h mean {h_mean:.6} rms {h_rms:.3} std {h_std:.3} min {h_min:.3} max {h_max:.3} n={}", hs.len());
+    eprintln!("GT v mean {v_mean:.6} rms {v_rms:.3} std {v_std:.3} min {v_min:.3} max {v_max:.3} n={}", vs.len());
     eprintln!("per-word sum_h (should be 0): {:?}", per_word_sums.iter().map(|x| format!("{:.3}", x)).collect::<Vec<_>>());
 
     // Theory
     let sigma_center_theory = 0.2886751345948129; // 1/√12
     let sigma_pitch_theory = 0.408248290463863;  // 1/√6
     eprintln!("theory sigma_center={sigma_center_theory:.4} sigma_pitch={sigma_pitch_theory:.4}");
-    eprintln!("MLE sigma_pitch={:.4} (h_f_rms), sigma_center={:.4} (v_f2_rms or v_f_rms)", h_f_rms, v_f2_rms.min(v_f_rms));
+    eprintln!("MLE sigma_pitch={:.4} (h_rms), sigma_center={:.4} (v_rms)", h_rms, v_rms);
 
     // Assert unbiased: mean within 2 sigma of zero
     // 2σ = 2 * RMS / sqrt(n)
-    let h_mean_allowed = 2.0 * h_f_rms / h_f_n.sqrt();
-    assert!(h_f_mean.abs() <= h_mean_allowed.max(0.05),
-        "GT h bias not zero: mean {h_f_mean:.4} > 2σ {h_mean_allowed:.4} (raw mean {h_mean:.4}, rms {h_f_rms:.3}, n={})", h_f_n);
+    let h_mean_allowed = 2.0 * h_rms / (hs.len() as f64).sqrt();
+    assert!(h_mean.abs() <= h_mean_allowed.max(0.05),
+        "GT h bias not zero: mean {h_mean:.4} > 2σ {h_mean_allowed:.4} (rms {h_rms:.3}, n={})", hs.len());
 
-    let v_mean_allowed = 2.0 * v_f_rms / (v_filtered.len() as f64).sqrt();
-    assert!(v_f_mean.abs() <= v_mean_allowed.max(0.08),
-        "GT v bias not zero: mean {v_f_mean:.4} > 2σ {v_mean_allowed:.4} (raw mean {v_mean:.4}, mad mean {v_f2_mean:.4}, rms {v_f_rms:.3})");
+    let v_mean_allowed = 2.0 * v_rms / (vs.len() as f64).sqrt();
+    assert!(v_mean.abs() <= v_mean_allowed.max(0.08),
+        "GT v bias not zero: mean {v_mean:.4} > 2σ {v_mean_allowed:.4} (rms {v_rms:.3})");
 
     // Assert RMS reasonable (pixelation, not systematic)
     // Allow up to 2.0 px (generous), but expect close to theory ~0.3-0.6
-    assert!(h_f_rms <= 2.0,
-        "GT h RMS too large: {h_f_rms:.3} > 2.0 (mean {h_f_mean:.4}, n={})", h_f_n);
-    assert!(v_f_rms <= 2.0,
-        "GT v RMS too large: {v_f_rms:.3} > 2.0 (mean {v_f_mean:.4})");
+    assert!(h_rms <= 2.0,
+        "GT h RMS too large: {h_rms:.3} > 2.0 (mean {h_mean:.4}, n={})", hs.len());
+    assert!(v_rms <= 2.0,
+        "GT v RMS too large: {v_rms:.3} > 2.0 (mean {v_mean:.4})");
 
     // Assert center-span unbiased by construction: sum_h per word == 0
     for (i, sum) in per_word_sums.iter().enumerate() {
@@ -224,7 +213,7 @@ fn geo_bias_is_zero() {
 
     // Also check overall mean is near zero (redundant but explicit)
     assert!(h_mean.abs() < 1.0, "GT h raw mean {h_mean:.3} too large, indicates bias");
-    assert!(v_f_mean.abs() < 0.5, "GT v filtered mean {v_f_mean:.3} too large");
+    assert!(v_mean.abs() < 0.5, "GT v mean {v_mean:.3} too large");
 
     // ── Discriminative sigma fitting (how weights relate to sigmas) ─────
     // We have per-observation GT vs chosen geo errors. Want w_h,w_v to maximize
@@ -251,10 +240,7 @@ fn geo_bias_is_zero() {
             let hc = v.get("chosen_geo_h_err").and_then(|x| x.as_f64());
             let vc = v.get("chosen_geo_v_err").and_then(|x| x.as_f64());
             if let (Some(a), Some(b), Some(c), Some(d)) = (hg, vg, hc, vc) {
-                // filter same as above: |v|<=3 and h MAD already applied? use simple
-                if b.abs() <= 3.0 && d.abs() <= 3.0 {
-                    paired.push((a,b,c,d));
-                }
+                paired.push((a,b,c,d));
             }
         }
     }
@@ -289,8 +275,8 @@ fn geo_bias_is_zero() {
         eprintln!("discriminative grid: best sigma_pitch={:.3} sigma_center={:.3} wins {}/{} ({:.1}%)",
             best_sp, best_sc, best_score, total, 100.0*best_score as f64/total as f64);
         let mle_wins = {
-            let inv2p = 1.0/(2.0*h_f_rms*h_f_rms);
-            let inv2c = 1.0/(2.0*v_f_rms*v_f_rms);
+            let inv2p = 1.0/(2.0*h_rms*h_rms);
+            let inv2c = 1.0/(2.0*v_rms*v_rms);
             paired.iter().filter(|(hg,vg,hc,vc)| {
                 let ll_gt = -hg*hg*inv2p - vg*vg*inv2c;
                 let ll_ch = -hc*hc*inv2p - vc*vc*inv2c;
@@ -298,9 +284,9 @@ fn geo_bias_is_zero() {
             }).count()
         };
         eprintln!("MLE sigma_pitch={:.3} sigma_center={:.3} wins {}/{} ({:.1}%)",
-            h_f_rms, v_f_rms, mle_wins, total, 100.0*mle_wins as f64/total as f64);
+            h_rms, v_rms, mle_wins, total, 100.0*mle_wins as f64/total as f64);
         eprintln!("theory sigma_pitch={:.4} sigma_center={:.4}", sigma_pitch_theory, sigma_center_theory);
         eprintln!("weight relation: w=1/(2σ²), so σ=1/√(2w). Scaling ll by α → σ_eff=σ/√α (inverse sqrt, NOT exponential). Fitting weights ≡ fitting sigmas.");
-        eprintln!("suggestion: set SIGMA_PITCH_PX = {:.4}, SIGMA_CENTER_PX = {:.4} (MLE) or {:.4}/{:.4} (discriminative best)", h_f_rms, v_f_rms, best_sp, best_sc);
+        eprintln!("suggestion: set SIGMA_PITCH_PX = {:.4}, SIGMA_CENTER_PX = {:.4} (MLE) or {:.4}/{:.4} (discriminative best)", h_rms, v_rms, best_sp, best_sc);
     }
 }

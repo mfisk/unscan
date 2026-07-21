@@ -282,8 +282,7 @@ const FSCN_MAGIC: &[u8; 4] = b"FSCN";
 const FSCN_VERSION: u32 = 2;
 
 pub(crate) fn scan_cache_path() -> PathBuf {
-    let home = std::env::var("HOME").unwrap_or_else(|_| ".".to_string());
-    PathBuf::from(home).join(".cache").join("unprint").join("font_scan.bin")
+    crate::cache::paths::font_scan_bin()
 }
 
 /// Walk font directories and return deduplicated, sorted canonical paths
@@ -573,6 +572,8 @@ fn dedup_fonts(mut fonts: Vec<FontEntry>, quiet: bool) -> Vec<FontEntry> {
 pub fn scan_fonts(dirs: &[PathBuf], quiet: bool) -> Vec<FontEntry> {
     let current_paths = collect_font_paths(dirs);
     let cache_path = scan_cache_path();
+    let allowlist = crate::cache::font_allowlist();
+    let is_alt_cache = !crate::cache::is_default_cache_dir();
 
     // Load cached entries indexed by source font file path
     let cached_by_path: std::collections::HashMap<PathBuf, Vec<FontEntry>> = {
@@ -599,6 +600,16 @@ pub fn scan_fonts(dirs: &[PathBuf], quiet: bool) -> Vec<FontEntry> {
         // Filter out tombstone entries (empty family_name = rejected font file)
         fonts.retain(|f| !f.family_name.is_empty());
         if !quiet { eprintln!("[scan] Loaded {} font entries from cache", fonts.len()); }
+        // Apply allowlist filtering only when using alternate cache dir
+        if is_alt_cache {
+            if let Some(ref allow) = allowlist {
+                let before = fonts.len();
+                fonts.retain(|f| allow.contains(&f.font_key()));
+                if !quiet && before != fonts.len() {
+                    eprintln!("[scan] Font allowlist (fontkey format): filtered {} -> {} fonts", before, fonts.len());
+                }
+            }
+        }
         return dedup_fonts(fonts, quiet);
     }
 
@@ -615,6 +626,19 @@ pub fn scan_fonts(dirs: &[PathBuf], quiet: bool) -> Vec<FontEntry> {
         .flat_map(|p| cached_by_path.get(p).cloned().unwrap_or_default())
         .collect();
 
+    // Optimization: when using alt cache with allowlist that has no OT variant
+    // entries (no "|"), skip expensive OT feature probing (28 shapings per file).
+    // This saves ~70k shapings for 2497 files when testing with 6 static fonts.
+    let need_ot_variants = if is_alt_cache {
+        if let Some(ref allow) = allowlist {
+            allow.iter().any(|k| k.contains('|'))
+        } else {
+            true
+        }
+    } else {
+        true
+    };
+
     // Parse only the new font files
     let aliases = build_alias_table();
     for path in &added {
@@ -627,7 +651,12 @@ pub fn scan_fonts(dirs: &[PathBuf], quiet: bool) -> Vec<FontEntry> {
                 }
 
                 // Probe all OT features — emit a variant entry for each that changes glyphs
-                let variants = detect_ot_variants(&fe.data);
+                // Skip when allowlist has no variant entries (common for 6-font tests)
+                let variants = if need_ot_variants {
+                    detect_ot_variants(&fe.data)
+                } else {
+                    Vec::new()
+                };
                 for (tag, overrides) in &variants {
                     // Merge ligature overrides into each variant
                     let mut combined = overrides.clone();
@@ -727,6 +756,18 @@ pub fn scan_fonts(dirs: &[PathBuf], quiet: bool) -> Vec<FontEntry> {
         }
     }
 
+    // Apply allowlist filtering when using alternate cache dir (keep main cache untouched)
+    if is_alt_cache {
+        if let Some(ref allow) = allowlist {
+            let before = fonts.len();
+            // Keep tombstones (empty family_name) for now - they'll be filtered next
+            fonts.retain(|f| f.family_name.is_empty() || allow.contains(&f.font_key()));
+            if !quiet && before != fonts.len() {
+                eprintln!("[scan] Font allowlist (fontkey format): filtered {} -> {} fonts (pre-dedup)", before, fonts.len());
+            }
+        }
+    }
+
     // Write cache pre-dedup so every source path is represented
     if let Err(e) = write_scan_cache(&cache_path, &fonts) {
         if !quiet { eprintln!("[scan] Warning: failed to write font scan cache: {}", e); }
@@ -736,6 +777,12 @@ pub fn scan_fonts(dirs: &[PathBuf], quiet: bool) -> Vec<FontEntry> {
 
     // Filter out tombstone entries before dedup
     fonts.retain(|f| !f.family_name.is_empty());
+    // Re-apply allowlist after tombstone removal to ensure exact fontkey match
+    if is_alt_cache {
+        if let Some(ref allow) = allowlist {
+            fonts.retain(|f| allow.contains(&f.font_key()));
+        }
+    }
     dedup_fonts(fonts, quiet)
 }
 

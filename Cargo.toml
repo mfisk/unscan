@@ -14,7 +14,7 @@ name = "gen_training_data"
 path = "src/bin/gen_training_data.rs"
 
 [dependencies]
-clap = { version = "4", features = ["derive"] }
+clap = { version = "4", features = ["derive", "env"] }
 image = "0.25"
 ab_glyph = "0.2"
 lopdf = "0.34"

@@ -550,7 +550,9 @@ pub fn match_lines(
         // directly to line.words via source_word_idx.
         let mut corrected_words: Option<Vec<crate::ocr::TextRegion>> = None;
         let mut ocr_correction_audit: Vec<crate::audit::OcrCorrection> = Vec::new();
-        if let (Some(ref fr), Some(rtd)) = (&font_result, training_data) {
+        if args.skip_ocr_correction || std::env::var("UNPRINT_SKIP_PFLDA").is_ok() {
+            // skip pflda for t64 fast path
+        } else if let (Some(ref fr), Some(rtd)) = (&font_result, training_data) {
             eprintln!("[pflda] OCR correction pass for font_key={}", fr.font_key);
             let ctx = rtd.as_context(glyph_map);
             if let Some(pf_lda) = classifier::PerFontLda::load_or_train(&fr.font_key, &ctx) {

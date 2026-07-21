@@ -3110,38 +3110,32 @@ impl Classifier for FusionClassifier {
 
 /// Default path for cached LDA weights.
 pub fn default_lda_weights_path() -> std::path::PathBuf {
-    let home = std::env::var("HOME").unwrap_or_else(|_| ".".to_string());
-    std::path::PathBuf::from(home).join(".cache").join("unprint").join("lda-weights.bin")
+    crate::cache::paths::lda_weights_bin()
 }
 
 /// Default path for cached per-char Fisher weights.
 pub fn default_fisher_weights_path() -> std::path::PathBuf {
-    let home = std::env::var("HOME").unwrap_or_else(|_| ".".to_string());
-    std::path::PathBuf::from(home).join(".cache").join("unprint").join("fisher-weights.bin")
+    crate::cache::paths::fisher_weights_bin()
 }
 
 /// Default path for cached triplet weights.
 pub fn default_triplet_weights_path() -> std::path::PathBuf {
-    let home = std::env::var("HOME").unwrap_or_else(|_| ".".to_string());
-    std::path::PathBuf::from(home).join(".cache").join("unprint").join("triplet-weights.bin")
+    crate::cache::paths::triplet_weights_bin()
 }
 
 /// Default path for cached Mahalanobis weights.
 pub fn default_mahalanobis_weights_path() -> std::path::PathBuf {
-    let home = std::env::var("HOME").unwrap_or_else(|_| ".".to_string());
-    std::path::PathBuf::from(home).join(".cache").join("unprint").join("mahalanobis-weights.bin")
+    crate::cache::paths::mahalanobis_weights_bin()
 }
 
 /// Default path for cached MLP weights.
 pub fn default_mlp_weights_path() -> std::path::PathBuf {
-    let home = std::env::var("HOME").unwrap_or_else(|_| ".".to_string());
-    std::path::PathBuf::from(home).join(".cache").join("unprint").join("mlp-weights.bin")
+    crate::cache::paths::mlp_weights_bin()
 }
 
 /// Default path for the font catalog file.
 pub fn default_catalog_path() -> std::path::PathBuf {
-    let home = std::env::var("HOME").unwrap_or_else(|_| ".".to_string());
-    std::path::PathBuf::from(home).join(".cache").join("unprint").join("catalog.bin")
+    crate::cache::paths::catalog_bin()
 }
 
 /// Try to load a classifier from its cached weights, auto-training if missing.
@@ -3167,9 +3161,7 @@ fn training_features_stale() -> bool {
         Ok(t) => t,
         Err(_) => return false, // no font_scan cache → nothing to compare
     };
-    let home = std::env::var("HOME").unwrap_or_else(|_| ".".to_string());
-    let feat_dir = std::path::PathBuf::from(&home)
-        .join(".cache").join("unprint").join("training");
+    let feat_dir = crate::cache::paths::training_dir();
     let entries = match std::fs::read_dir(&feat_dir) {
         Ok(e) => e,
         Err(_) => return false, // no training dir → nothing stale
@@ -3197,9 +3189,7 @@ fn weights_older_than_features(weights_path: &std::path::Path) -> bool {
         Ok(t) => t,
         Err(_) => return false, // no weights file → nothing to compare
     };
-    let home = std::env::var("HOME").unwrap_or_else(|_| ".".to_string());
-    let feat_dir = std::path::PathBuf::from(&home)
-        .join(".cache").join("unprint").join("training");
+    let feat_dir = crate::cache::paths::training_dir();
     let entries = match std::fs::read_dir(&feat_dir) {
         Ok(e) => e,
         Err(_) => return false,
@@ -3563,8 +3553,7 @@ pub struct PerFontLda {
 impl PerFontLda {
     /// Cache directory for per-font LDA classifiers.
     fn cache_dir() -> std::path::PathBuf {
-        let home = std::env::var("HOME").unwrap_or_else(|_| ".".into());
-        std::path::Path::new(&home).join(".cache").join("unprint").join("per-font-lda")
+        crate::cache::paths::per_font_lda_dir()
     }
 
     /// Deterministic cache path for a font_key.

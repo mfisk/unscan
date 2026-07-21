@@ -209,7 +209,7 @@ fn main() {
     // ── 1. Scan all system fonts ──────────────────────────────────
     let font_dirs = font_scan::default_font_dirs(&args.font_dir);
     eprintln!("Scanning fonts from {:?}...", font_dirs);
-    let mut catalog = font_scan::scan_fonts(&font_dirs);
+    let mut catalog = font_scan::scan_fonts(&font_dirs, false);
     eprintln!("  {} font entries found", catalog.len());
 
     if args.max_fonts > 0 && catalog.len() > args.max_fonts {

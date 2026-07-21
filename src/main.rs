@@ -1,4 +1,5 @@
 mod audit;
+mod cache;
 mod classifier;
 mod cli;
 mod color;
@@ -56,6 +57,20 @@ fn main() {
         std::process::exit(1);
     }
 
+    // Initialize cache directory and font allowlist from CLI/env
+    crate::cache::init_cache_dir(args.cache_dir.as_deref());
+    crate::cache::init_allowlist(args.font_allowlist.as_deref());
+
+    // Warn if allowlist used with default cache (safe but slower than alt cache)
+    if let Some(ref allowlist_str) = args.font_allowlist {
+        if crate::cache::is_default_cache_dir() {
+            eprintln!("Note: --font-allowlist used with default cache dir; filtering at matching time only (main cache untouched). For faster iteration, use --cache-dir /tmp/unprint-6fonts with --font-allowlist.");
+        } else {
+            let count = allowlist_str.split(',').filter(|s| !s.trim().is_empty()).count();
+            eprintln!("Using alternate cache dir {:?} with font allowlist ({} entries)", crate::cache::cache_dir(), count);
+        }
+    }
+
     // train-lda removed — training happens automatically when weights are stale.
 
     // ── weight-explicit: normalize PS names and exit ─────────────────
@@ -90,11 +105,20 @@ fn main() {
 
     // ── Write flamegraph (cargo build --features profile) ────────
     #[cfg(feature = "profile")]
-    if let Ok(report) = pprof_guard.report().build() {
-        let fg_path = std::path::Path::new("/tmp/lob-flamegraph.svg");
-        let file = std::fs::File::create(fg_path).expect("create flamegraph file");
-        report.flamegraph(file).expect("write flamegraph");
-        if !args.quiet { eprintln!("[profile] Wrote flamegraph to {}", fg_path.display()); }
+    {
+        if let Ok(report) = pprof_guard.report().build() {
+            let ts = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_secs();
+            let pid = std::process::id();
+            let fg_path = std::path::Path::new("/tmp/lob-flamegraph.svg");
+            let fg_ts_path = format!("/tmp/unprint-flamegraph-{}-{}.svg", ts, pid);
+            if let Ok(file) = std::fs::File::create(fg_path) {
+                let _ = report.flamegraph(file);
+            }
+            if let Ok(file) = std::fs::File::create(&fg_ts_path) {
+                let _ = report.flamegraph(file);
+            }
+            if !args.quiet { eprintln!("[profile] Wrote flamegraph to {} and {}", fg_path.display(), fg_ts_path); }
+        }
     }
 }
 
@@ -345,7 +369,7 @@ fn run(args: &cli::Args, classifier: &mut dyn classifier::Classifier) -> Result<
         // Cache known non-Latin keys to avoid re-reading 238 font files every run (was 3s).
         let t_nonlatin = std::time::Instant::now();
         {
-            let cache_path = std::env::var("HOME").map(|h| std::path::PathBuf::from(h).join(".cache").join("unprint")).unwrap_or_else(|_| std::path::PathBuf::from("/tmp")).join("non-latin-cache.json");
+            let cache_path = crate::cache::cache_dir().join("non-latin-cache.json");
             let mut known_non_latin: std::collections::HashSet<String> = if let Ok(data) = std::fs::read_to_string(&cache_path) {
                 serde_json::from_str(&data).unwrap_or_default()
             } else {
@@ -1100,8 +1124,6 @@ fn run(args: &cli::Args, classifier: &mut dyn classifier::Classifier) -> Result<
 
     // ── 6. Report ────────────────────────────────────────────────────
     let (_cache_hits, _cache_misses) = font_cache.stats();
-
-
 
     Ok(())
 }

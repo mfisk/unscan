@@ -219,6 +219,12 @@ pub fn identify_fonts(
         candidate_set.insert(fk.to_string());
     }
 
+    // Apply font allowlist (fontkey format, exact match) - filters at matching time
+    // This keeps main cache untouched when using default cache dir.
+    if let Some(allow) = crate::cache::font_allowlist() {
+        candidate_set.retain(|fk| allow.contains(fk));
+    }
+
     if candidate_set.is_empty() {
         return FontIdResult { scores: Vec::new(), observations, path_score: f32::MIN };
     }

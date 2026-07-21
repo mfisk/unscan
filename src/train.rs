@@ -89,9 +89,8 @@ pub struct TrainArgs {
 
 impl Default for TrainArgs {
     fn default() -> Self {
-        let home = std::env::var("HOME").unwrap_or_else(|_| ".".to_string());
         Self {
-            output: PathBuf::from(home).join(".cache").join("unprint").join("lda-weights.bin"),
+            output: crate::cache::paths::lda_weights_bin(),
             heights: vec![],
             max_fonts: 0,
             font_dir: vec![],
@@ -728,11 +727,7 @@ pub fn run_train(mut args: TrainArgs) {
     let feat_dir = match &args.tmpdir {
         Some(d) => d.clone(),
         None => {
-            let home = std::env::var("HOME").unwrap_or_else(|_| "/tmp".to_string());
-            std::path::PathBuf::from(home)
-                .join(".cache")
-                .join("unprint")
-                .join("training")
+            crate::cache::paths::training_dir()
         }
     };
     std::fs::create_dir_all(&feat_dir).expect("create training cache dir");
@@ -741,16 +736,19 @@ pub fn run_train(mut args: TrainArgs) {
     // ── Pre-warm character render cache + build GlyphMap ──
     // Render every (font, char) at default params, capturing the content hash.
     // Identical renders share a hash → same glyph equivalence class.
+    // Memory-efficient: only one font's char crops in memory at a time per thread,
+    // no global Vec of all hashes (was OOM at 5898 fonts × 95 chars).
     let glyph_map = {
-        use std::sync::atomic::{AtomicUsize, Ordering};
+        use std::sync::{Mutex, atomic::{AtomicUsize, Ordering}};
         let prewarm_done = AtomicUsize::new(0);
         let prewarm_total = catalog.len();
         eprintln!("\nPre-warming character render cache + building GlyphMap ({} fonts × {} chars)...",
             prewarm_total, sequences.len());
         let prewarm_t0 = std::time::Instant::now();
 
-        // Each font returns Vec<(Vec<char>, hash, font_key)> for GlyphMap construction
-        let per_font_hashes: Vec<Vec<(Vec<char>, u64, String)>> = catalog.par_iter().map(|fe| {
+        let gmap = Mutex::new(crate::glyph_map::NgramGlyphMap::new(catalog_hash));
+
+        catalog.par_iter().for_each(|fe| {
             let font_data = match std::fs::read(&fe.path) {
                 Ok(d) => d,
                 Err(_) => {
@@ -758,7 +756,7 @@ pub fn run_train(mut args: TrainArgs) {
                     if done % 500 == 0 || done == prewarm_total {
                         eprintln!("  Pre-render [{}/{}]...", done, prewarm_total);
                     }
-                    return Vec::new();
+                    return;
                 }
             };
             let font = match ab_glyph::FontRef::try_from_slice(&font_data) {
@@ -768,13 +766,14 @@ pub fn run_train(mut args: TrainArgs) {
                     if done % 500 == 0 || done == prewarm_total {
                         eprintln!("  Pre-render [{}/{}]...", done, prewarm_total);
                     }
-                    return Vec::new();
+                    return;
                 }
             };
             let overrides = fe.glyph_overrides.as_deref();
             let fk = fe.font_key();
-            let mut hashes = Vec::with_capacity(sequences.len());
-            for seq in &sequences {
+            // Collect hashes for this font only (95 entries, not 560k)
+            let mut local_hashes: Vec<(usize, u64)> = Vec::with_capacity(sequences.len());
+            for (si, seq) in sequences.iter().enumerate() {
                 let gid_overrides: Vec<Option<ab_glyph::GlyphId>> = seq.iter().map(|c| {
                     overrides.and_then(|ovs| ovs.iter().find(|(ch, _)| *ch == *c).map(|(_, g)| ab_glyph::GlyphId(*g)))
                 }).collect();
@@ -788,23 +787,23 @@ pub fn run_train(mut args: TrainArgs) {
                         }
                         let _ = img.save(&path);
                     }
-                    hashes.push((seq.clone(), hash, fk.clone()));
+                    local_hashes.push((si, hash));
+                }
+            }
+            // Register this font's hashes - one lock per font, not per char
+            if !local_hashes.is_empty() {
+                let mut g = gmap.lock().unwrap();
+                for (si, hash) in local_hashes {
+                    g.register(&sequences[si], &fk, hash);
                 }
             }
             let done = prewarm_done.fetch_add(1, Ordering::Relaxed) + 1;
             if done % 500 == 0 || done == prewarm_total {
                 eprintln!("  Pre-render [{}/{}]...", done, prewarm_total);
             }
-            hashes
-        }).collect();
+        });
 
-        // Register all results into the glyph_map
-        let mut gmap = crate::glyph_map::NgramGlyphMap::new(catalog_hash);
-        for font_hashes in per_font_hashes {
-            for (seq, hash, font_key) in font_hashes {
-                gmap.register(&seq, &font_key, hash);
-            }
-        }
+        let gmap = gmap.into_inner().unwrap();
 
         let total_glyphs: usize = gmap.groups.values().map(|g| g.len()).sum();
         let total_deduped: usize = gmap.groups.values()
@@ -1517,10 +1516,7 @@ impl RuntimeTrainingData {
         let multi_variant_families = family_members.iter().filter(|m| m.len() > 1).count();
 
         // Find feature cache directory (same as run_train default)
-        let home = std::env::var("HOME").unwrap_or_else(|_| ".".into());
-        let feat_dir = std::path::Path::new(&home)
-            .join(".cache").join("unprint").join("training")
-            .to_path_buf();
+        let feat_dir = crate::cache::paths::training_dir();
         if !feat_dir.exists() { return None; }
 
         // Scan cached combos (same logic as run_train)

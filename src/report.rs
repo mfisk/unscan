@@ -1862,8 +1862,33 @@ fn build_observation_table(
             String::new()
         };
 
+        // OCR letter for this observation — show corrected char, and original if it was pflda-replaced
+        let ocr_label = {
+            let seq_str: String = cv.seq.iter().collect();
+            let mut esc = seq_str.replace('&', "&amp;").replace('<', "&lt;").replace('>', "&gt;");
+            if esc.trim().is_empty() {
+                esc = "·".to_string();
+            }
+            if let Some(orig) = cv.ocr_corrected_from {
+                let orig_esc = match orig {
+                    '<' => "&lt;".to_string(),
+                    '>' => "&gt;".to_string(),
+                    '&' => "&amp;".to_string(),
+                    _ => orig.to_string(),
+                };
+                if orig_esc != esc {
+                    format!("<span class='ocr-orig'>{orig_esc}</span>→<b>{esc}</b>")
+                } else {
+                    esc
+                }
+            } else {
+                esc
+            }
+        };
+
         rows.push_str(&format!(
             "<tr>\
+             <td class=\"ocr-col\"><span class=\"char-label\">{ocr_label}</span></td>\
              <td class=\"img-td\">{}</td>\
              <td class=\"img-td {correct_win_class}\"><div class=\"img-stat\">{}{}</div></td>\
              <td class=\"img-td {chosen_win_class}\"><div class=\"img-stat\">{}{}</div></td>\
@@ -1911,6 +1936,7 @@ fn build_observation_table(
     format!(
         "<table>\
          <tr>\
+         <th>OCR</th>\
          <th>Scan</th>\
          <th class=\"correct\">Correct: {correct_font_name}<br><span class='score'>{rank_str}</span></th>\
          <th class=\"chosen\">Unscan pick: {display_chosen}<br><span class='score'>{chosen_rank_info}</span></th>\

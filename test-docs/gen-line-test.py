@@ -64,21 +64,20 @@ def parse_args():
         audit_ref = args[idx + 1]
         args = args[:idx] + args[idx + 2:]
 
-    hardcoded = False
+    # --hardcoded is deprecated no-op; hardcoded is now the default
     if "--hardcoded" in args:
-        hardcoded = True
         args = [a for a in args if a != "--hardcoded"]
-        if not args:
-            args = [f"{font}={text}" for font, text in HARDCODED_7]
 
     # Detect hardcoded "Font=Text" form (contains '=')
     if args and any("=" in a for a in args):
         hardcoded = True
-
     # Default: hardcoded 6-line seam test (no args = hardcoded)
-    if not args and not hardcoded:
+    elif not args:
         hardcoded = True
         args = [f"{font}={text}" for font, text in HARDCODED_7]
+    else:
+        # Legacy audit mode 1:72
+        hardcoded = False
 
     return hardcoded, args, audit_ref
 

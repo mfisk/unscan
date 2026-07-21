@@ -50,13 +50,11 @@ impl Default for RenderParams {
 
 /// Return the cache directory for rendered characters.
 fn cache_dir() -> PathBuf {
-    dirs_cache_dir().join("chars")
+    crate::cache::paths::chars_dir()
 }
 
 fn dirs_cache_dir() -> PathBuf {
-    std::env::var("HOME")
-        .map(|h| PathBuf::from(h).join(".cache").join("unprint"))
-        .unwrap_or_else(|_| PathBuf::from(".cache/unprint"))
+    crate::cache::cache_dir()
 }
 
 /// Build the sequence directory name: `U+0061` for len-1, `U+0066_U+0069` for len-2, etc.

@@ -23,9 +23,8 @@ use crate::glyph_map::NgramGlyphMap;
 // ---------------------------------------------------------------------------
 
 fn ngram_feat_dir(seq_len: usize) -> PathBuf {
-    let home = std::env::var("HOME").unwrap_or_else(|_| ".".to_string());
     let dirname = if seq_len == 1 { "chars".to_string() } else { format!("ngram-{seq_len}") };
-    Path::new(&home).join(".cache").join("unprint").join("training").join(dirname)
+    crate::cache::paths::training_dir().join(dirname)
 }
 
 // ---------------------------------------------------------------------------

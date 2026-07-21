@@ -138,6 +138,25 @@ pub struct Args {
     /// Suppress progress and informational chatter (keeps warnings/errors)
     #[arg(short, long)]
     pub quiet: bool,
+
+    /// Alternate cache directory (default: ~/.cache/unprint). Env: UNPRINT_CACHE_DIR
+    /// Use a separate directory when testing with --font-allowlist to avoid
+    /// rebuilding the main 5898-font cache.
+    #[arg(long, env = "UNPRINT_CACHE_DIR")]
+    pub cache_dir: Option<PathBuf>,
+
+    /// Comma-separated list of font_keys or families to use, or @file.
+    /// Examples: "LibreBodoni-400,EBGaramond-400" or "@/tmp/my-fonts.txt".
+    /// When used with --cache-dir, only these fonts are scanned and cached.
+    /// When used with default cache, filters at matching time only (main cache untouched).
+    /// Env: UNPRINT_FONT_ALLOWLIST
+    #[arg(long, env = "UNPRINT_FONT_ALLOWLIST")]
+    pub font_allowlist: Option<String>,
+
+    /// Skip per-font LDA OCR correction (pflda). Useful for faster iteration
+    /// when OCR correction is not needed. Env: UNPRINT_SKIP_PFLDA
+    #[arg(long, env = "UNPRINT_SKIP_PFLDA")]
+    pub skip_ocr_correction: bool,
 }
 
 impl Args {
