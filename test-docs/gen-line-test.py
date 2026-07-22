@@ -36,25 +36,25 @@ from pdf_font_annotate import annotate_canonical_names
 from rasterize import rasterize
 
 # ---------------------------------------------------------------------------
-# Hardcoded 6-line seam test (L2 removed — was OCR error) — no audit, no empty lines, deterministic.
+# Hardcoded 7-line seam test — no audit, no empty lines, deterministic.
 # Matches tests/t59_seam_regression.rs EXPECTED and lob coverage.
 # ---------------------------------------------------------------------------
-HARDCODED_6 = [
-    # LibreBodoni lowercase (L1)
+HARDCODED_7 = [
+    # LibreBodoni lowercase
     ("LibreBodoni-400", "abcdefghijklmnopqrstuvwxyz."),
-    # LibreBodoni uppercase (L3, was L3)
+    # LibreBodoni lining figures
+    ("LibreBodoni-400", "Lining figures: 0 1 2 3 4 5 6 7 8 9."),
+    # LibreBodoni uppercase
     ("LibreBodoni-400", "ABCDEFGHIJKLMNOPQRSTUVWXYZ."),
-    # EBGaramond body text (L4)
+    # EBGaramond body text
     ("EBGaramond-400", "carved type into wood or imported it from Italy."),
-    # Arial Bold (L5)
+    # Arial Bold
     ("Arial-BoldMT-700", "Bold: The quick brown fox jumps over."),
-    # Roboto Italic (L6)
+    # Roboto Italic
     ("Roboto-400It", "Italic: The quick brown fox jumps over 1,234,567,890 lazy,"),
-    # PlayfairDisplay lining figures (L7, clean, no OCR corruption)
+    # PlayfairDisplay lining figures (clean, no OCR corruption)
     ("PlayfairDisplay-400", "Lining figures: 0 1 2 3 4 5 6 7 8 9."),
 ]
-# Keep old name for back-compat
-HARDCODED_7 = HARDCODED_6
 
 def parse_args():
     args = sys.argv[1:]
@@ -64,20 +64,16 @@ def parse_args():
         audit_ref = args[idx + 1]
         args = args[:idx] + args[idx + 2:]
 
-    # --hardcoded is deprecated no-op; hardcoded is now the default
+    hardcoded = False
     if "--hardcoded" in args:
+        hardcoded = True
         args = [a for a in args if a != "--hardcoded"]
+        if not args:
+            args = [f"{font}={text}" for font, text in HARDCODED_7]
 
     # Detect hardcoded "Font=Text" form (contains '=')
     if args and any("=" in a for a in args):
         hardcoded = True
-    # Default: hardcoded 6-line seam test (no args = hardcoded)
-    elif not args:
-        hardcoded = True
-        args = [f"{font}={text}" for font, text in HARDCODED_7]
-    else:
-        # Legacy audit mode 1:72
-        hardcoded = False
 
     return hardcoded, args, audit_ref
 
@@ -86,9 +82,9 @@ def main():
 
     if len(args) < 1:
         print("Usage:")
-        print("  gen-line-test.py --hardcoded  (default, 7-line seam test)")
+        print("  gen-line-test.py --hardcoded")
         print("  gen-line-test.py 'LibreBodoni-400=abc.' 'EBGaramond-400=Hello.'")
-        print("  gen-line-test.py 1:72 1:73 ...  (legacy audit mode, deprecated)")
+        print("  gen-line-test.py 1:72 1:73 ...  (legacy audit mode)")
         sys.exit(1)
 
     ttf_paths_for_map = []

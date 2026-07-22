@@ -320,11 +320,33 @@ Between Tesseract output and font matching, several post-processing steps
 modify the word bounding boxes:
 
 1. `assemble_lines()` — groups word-level regions into lines
-2. `merge_overlapping_lines()` — merges vertically overlapping lines
-3. `clip_word_overlaps()` — clips horizontally overlapping word bboxes
+2. `merge_overlapping_lines()` — merges vertically overlapping lines (currently
+   disabled, `split_merged_lines` handles the case)
+3. `clip_word_overlaps()` — clips horizontally overlapping word bboxes using
+   geometry only. This is the fast fallback that cuts the left word at the right
+   word's left edge. It does not look at ink, so it can leave trailing
+   whitespace inside the left word when Tesseract's box already includes it.
 4. `drop_outlier_words()` — removes words with height ≥ 1.8× median
    word height AND confidence < 70 (filters image artifacts)
-5. `expand_words_to_ink()` — expands word bboxes to actual ink extent (line bbox is now derived as word-union; `expand_bbox_to_ink` was removed in cee0eee)
+5. `expand_words_to_ink()` — expands word bboxes to actual ink extent using
+   `ink_threshold` as a gate and `blur` for the walk. The gate `has_edge_ink`
+   checks whether the current right or left edge already sits on ink. If
+   `has_edge_ink` is false, such as after a fixed 90 percent shrink that lands
+   in inter-glyph whitespace, the word will not expand and will stay truncated.
+   `gap_has_ink` is the companion gate on the left side that also checks the
+   gap between `limit` and `left_edge` because Tesseract often places the box
+   a few pixels right of the real glyph.
+6. `fix_overlapping_words_by_ink()` — reflows any remaining overlapping word
+   pairs to their natural whitespace gap. For any overlap, it looks at column
+   ink totals between the two word centers, collects all zero-ink whitespace
+   runs, and picks the run whose center is closest to the original overlap.
+   The left word ends at the run start and the right word starts after the run
+   end. This fixes the Georgia case (`1768+161=1929` overlaps `in`, trailing
+   10px whitespace left by `clip_word_overlaps` and missed by
+   `expand_words_to_ink` because `in` ink appears in Georgia's y-range) and it
+   avoids the 90 percent shrink problem which chops single-word lines like
+   `abcdefghijklmnopqrstuvwxyz.` where the new edge has no ink and
+   `has_edge_ink` becomes false.
 
 Historical note: `expand_bbox_to_ink()` previously expanded line bboxes to ink extent for SSIM, but was replaced by word-union bbox (397d411) and removed (cee0eee). SSIM/verification now uses `word_union_bbox()` instead.
 

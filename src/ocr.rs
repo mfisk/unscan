@@ -1,4 +1,34 @@
 //! OCR module — runs Tesseract via CLI to extract text with bounding boxes.
+//!
+//! # Word box pipeline
+//!
+//! Tesseract returns word boxes that often include trailing or leading
+//! whitespace and that occasionally overlap the next word. Unprint cleans them
+//! in stages so downstream font matching and segmentation see tight,
+//! ink-faithful boxes.
+//!
+//! 1. **Geometry-only assembly** in `postprocess_words` (no image needed):
+//!    - `assemble_lines` groups raw `TextRegion`s into `TextLine`s using
+//!      Tesseract's block/par/line numbers.
+//!    - `snapshot_raw_bboxes` saves original Tesseract boxes for debugging.
+//!    - `merge_overlapping_lines` is currently disabled; `split_merged_lines`
+//!      handles multi-line merges via vertical projection.
+//!    - `drop_outlier_words` removes tall, low-confidence image artifacts.
+//!    Pipeline: `assemble → snapshot → merge-disabled → split → drop`.
+//!
+//! 2. **Ink-aware refinement** in `page_cache.rs` after background detection:
+//!    - `expand_words_to_ink` grows each word to its true ink using a strict
+//!      ink threshold as a gate and a softer blur walk. It only expands when
+//!      the current box edge already sits on ink or the gap contains ink.
+//!      Vertical expansion is bounded by margin.
+//!    - `fix_overlapping_words_by_ink` reflows overlapping words to the natural
+//!      whitespace gap: scans between word centers for zero-ink runs, picks the
+//!      run closest to `(a_right+b_x)/2`, splits at `run_start` / `run_end+1`.
+//!      Single-word lines (`n<2`) are unchanged.
+//!    - `trim_words_to_ink` shrinks each word to its ink bounds using middle
+//!      60% of height to avoid adjacent-line contamination, removing trailing/
+//!      leading whitespace (e.g. Georgia final 'a' 10px ws). This replaces the
+//!      prior 90% shrink which regressed `abcdefghijklmnopqrstuvwxyz.` 489w→440w.
 
 use crate::error::ScanTextError;
 use ab_glyph::{Font, PxScale, ScaleFont, point};
@@ -105,6 +135,8 @@ pub fn extract_text_regions(
             "stdout",
             "--dpi",
             &dpi.to_string(),
+            "--psm",
+            "6",
             "-l",
             "eng",
             "tsv",
@@ -132,6 +164,8 @@ pub fn extract_text_regions(
             "stdout",
             "--dpi",
             &dpi.to_string(),
+            "--psm",
+            "6",
             "-l",
             "eng",
             "-c",
@@ -337,34 +371,244 @@ fn merge_overlapping_words(words: &mut Vec<TextRegion>) {
     }
 }
 
-/// Clip overlapping word bboxes within each line.
+/// Reflow overlapping word bboxes to the natural whitespace gap using ink.
 ///
-/// Tesseract occasionally returns word bboxes that extend into the next word's
-/// space, especially after contrast enhancement / sharpening.  When word A's
-/// right edge crosses word B's left edge, clip A's width so it stops at B's
-/// left edge (with a 1px gap).  Words must already be sorted by x within each
-/// line (assemble_lines does this).
-pub fn clip_word_overlaps(lines: &mut [TextLine]) {
-    let mut clipped = 0u32;
+/// When two word boxes overlap, the system has assigned trailing whitespace
+/// from one word to the next. The natural gap is found by looking at column
+/// ink totals between the two word centers. Every stretch of pure whitespace
+/// is collected, and the stretch whose middle is closest to where the boxes
+/// originally overlapped is chosen. The left word ends at the start of that
+/// stretch and the right word starts after it. This restores the true
+/// inter-word gap and removes trailing whitespace that simple clipping would
+/// leave. If no pure whitespace exists between the centers, the left word is
+/// cut at the left edge of the right word as a fallback.
+pub fn fix_overlapping_words_by_ink(
+    lines: &mut [TextLine],
+    gray: &GrayImage,
+    ink_threshold: u8,
+) {
+    let page_w = gray.width();
+    let page_h = gray.height();
+
     for line in lines.iter_mut() {
         let n = line.words.len();
         if n < 2 {
             continue;
         }
-        // Words are already sorted by x from assemble_lines.
         for i in 0..n - 1 {
-            let a_right = line.words[i].x + line.words[i].width;
-            let b_left = line.words[i + 1].x;
-            if a_right > b_left {
-                let new_width = b_left.saturating_sub(line.words[i].x);
-                if new_width > 0 {
-                    line.words[i].width = new_width;
-                    clipped += 1;
+            let a_x = line.words[i].x;
+            let a_right = a_x + line.words[i].width;
+            let b_x = line.words[i + 1].x;
+            let b_right = b_x + line.words[i + 1].width;
+
+            if a_right <= b_x {
+                continue;
+            }
+
+            let a_center = a_x + line.words[i].width / 2;
+            let b_center = b_x + line.words[i + 1].width / 2;
+
+            let search_left = a_center.min(page_w.saturating_sub(1));
+            let mut search_right = b_center.min(page_w);
+            if search_right <= search_left {
+                let new_w = b_x.saturating_sub(a_x);
+                if new_w > 0 {
+                    line.words[i].width = new_w;
+                }
+                continue;
+            }
+            let union_left = a_x.min(b_x);
+            let union_right = a_right.max(b_right).min(page_w);
+            let search_left = search_left.max(union_left);
+            search_right = search_right.min(union_right);
+            if search_right <= search_left {
+                let new_w = b_x.saturating_sub(a_x);
+                if new_w > 0 {
+                    line.words[i].width = new_w;
+                }
+                continue;
+            }
+
+            let y_top = line.words[i].y.min(line.words[i + 1].y);
+            let y_bot = (line.words[i].y + line.words[i].height)
+                .max(line.words[i + 1].y + line.words[i + 1].height)
+                .min(page_h);
+            if y_top >= y_bot {
+                let new_w = b_x.saturating_sub(a_x);
+                if new_w > 0 {
+                    line.words[i].width = new_w;
+                }
+                continue;
+            }
+
+            let mut col_has_ink = Vec::with_capacity((search_right - search_left) as usize);
+            for col in search_left..search_right {
+                let mut has = false;
+                for row in y_top..y_bot {
+                    if gray.get_pixel(col, row).0[0] < ink_threshold {
+                        has = true;
+                        break;
+                    }
+                }
+                col_has_ink.push(has);
+            }
+
+            let mut runs: Vec<(u32, u32)> = Vec::new();
+            let mut run_start: Option<u32> = None;
+            for (idx, has) in col_has_ink.iter().enumerate() {
+                let col = search_left + idx as u32;
+                if !*has {
+                    if run_start.is_none() {
+                        run_start = Some(col);
+                    }
+                } else if let Some(rs) = run_start.take() {
+                    runs.push((rs, col - 1));
+                }
+            }
+            if let Some(rs) = run_start {
+                runs.push((rs, search_right - 1));
+            }
+
+            if runs.is_empty() {
+                let new_w = b_x.saturating_sub(a_x);
+                if new_w > 0 {
+                    line.words[i].width = new_w;
+                }
+                continue;
+            }
+
+            let overlap_center = (a_right + b_x) / 2;
+
+            let mut best_idx = 0;
+            let mut best_dist = u32::MAX;
+            let mut best_width = 0;
+            for (idx, (rs, re)) in runs.iter().enumerate() {
+                let run_center = (rs + re) / 2;
+                let dist = run_center.abs_diff(overlap_center);
+                let width = re - rs;
+                if dist < best_dist || (dist == best_dist && width > best_width) {
+                    best_dist = dist;
+                    best_width = width;
+                    best_idx = idx;
+                }
+            }
+            let (best_rs, best_re) = runs[best_idx];
+
+            let new_a_width = best_rs.saturating_sub(a_x);
+            let new_b_x = best_re + 1;
+            if new_a_width == 0 || new_b_x >= b_right || new_b_x <= a_x {
+                let new_w = b_x.saturating_sub(a_x);
+                if new_w > 0 {
+                    line.words[i].width = new_w;
+                }
+                continue;
+            }
+            let new_b_width = b_right.saturating_sub(new_b_x);
+            if new_b_width == 0 {
+                continue;
+            }
+
+            line.words[i].width = new_a_width;
+            line.words[i + 1].x = new_b_x;
+            line.words[i + 1].width = new_b_width;
+        }
+    }
+}
+
+/// Trim each word bbox to its actual ink bounds.
+///
+/// Removes trailing/leading whitespace that Tesseract included in the word
+/// box (e.g. Georgia final 'a' with 10px trailing ws: image_w 153, ink 123-142).
+/// Must run after `expand_words_to_ink` and `fix_overlapping_words_by_ink`
+/// so boxes are already roughly correct.
+///
+/// To avoid false trimming from vertical overlap with other lines, we scan
+/// only the middle 60% of the word height (or full height if very short),
+/// and require at least 1 ink pixel per column.
+///
+/// This replaces the prior 90% shrink which could place edges inside
+/// inter-glyph whitespace and prevent later expansion from recovering.
+pub fn trim_words_to_ink(
+    lines: &mut [TextLine],
+    gray: &GrayImage,
+    ink_threshold: u8,
+) {
+    let page_w = gray.width();
+    let page_h = gray.height();
+
+    for line in lines.iter_mut() {
+        for word in line.words.iter_mut() {
+            if word.width <= 2 || word.height <= 2 {
+                continue;
+            }
+            let wx = word.x.min(page_w.saturating_sub(1));
+            let wy = word.y.min(page_h.saturating_sub(1));
+            let ww = word.width.min(page_w - wx);
+            let wh = word.height.min(page_h - wy);
+            if ww == 0 || wh == 0 {
+                continue;
+            }
+
+            // Use middle 60% of height to avoid ascenders/descenders from
+            // adjacent lines that vertically overlap (Georgia p3 L54).
+            let (y_top, y_bot) = if wh >= 10 {
+                let margin = wh * 20 / 100; // 20% top and bottom
+                (wy + margin, wy + wh - margin)
+            } else {
+                (wy, wy + wh)
+            };
+
+            // Find leftmost ink column
+            let mut left_ink = None;
+            for col in wx..wx+ww {
+                let has_ink = (y_top..y_bot).any(|row| {
+                    gray.get_pixel(col.min(page_w-1), row.min(page_h-1)).0[0] < ink_threshold
+                });
+                if has_ink {
+                    left_ink = Some(col);
+                    break;
+                }
+            }
+            // Find rightmost ink column (inclusive)
+            let mut right_ink = None;
+            for col in (wx..wx+ww).rev() {
+                let has_ink = (y_top..y_bot).any(|row| {
+                    gray.get_pixel(col.min(page_w-1), row.min(page_h-1)).0[0] < ink_threshold
+                });
+                if has_ink {
+                    right_ink = Some(col);
+                    break;
+                }
+            }
+
+            if let (Some(li), Some(ri)) = (left_ink, right_ink) {
+                // ri is inclusive, so new width = ri - li + 1
+                if ri >= li {
+                    let new_x = li;
+                    let new_w = ri - li + 1;
+                    // Only shrink, never expand (expand already did)
+                    // Allow up to 2px expansion for anti-aliasing edge?
+                    // For now, shrink only if it reduces width.
+                    if new_x >= wx && new_w <= ww {
+                        // Ensure we don't shift too far (keep within original)
+                        word.x = new_x;
+                        word.width = new_w;
+                    } else if new_x > wx {
+                        // Left trim even if width slightly larger due to off-by-1
+                        let shift = new_x - wx;
+                        if shift < ww {
+                            word.x = new_x;
+                            word.width = ww - shift;
+                            if new_w < word.width {
+                                word.width = new_w;
+                            }
+                        }
+                    } else if new_w < ww {
+                        word.width = new_w;
+                    }
                 }
             }
         }
-    }
-    if clipped > 0 {
     }
 }
 
@@ -743,8 +987,9 @@ fn walk_ink_edge_vertical(
 /// Uses `blur` threshold for expansion walks, `ink_threshold` for gates.
 /// `margin` bounds edge-word and vertical searches.
 ///
-/// Only **expands** — never shrinks.  Must run AFTER `clip_word_overlaps` so
-/// the word list is already gap-safe.
+/// Only **expands** — never shrinks. It assumes words do not overlap
+/// heavily because overlaps are fixed later by `fix_overlapping_words_by_ink`
+/// which uses column ink totals between centers.
 pub fn expand_words_to_ink(lines: &mut [TextLine], gray: &GrayImage, ink_threshold: u8, blur: u8, margin: u32) {
     let (page_w, page_h) = gray.dimensions();
 
@@ -1434,18 +1679,20 @@ fn font_pair_ink_gap<F: Font>(font: &F, scale: PxScale, ch_a: char, ch_b: char) 
 
 /// Assemble and post-process text lines from raw OCR word regions.
 ///
-/// Performs: line assembly → raw-bbox snapshot → overlap merging →
-/// word-overlap clipping → outlier removal.
+/// Performs: line assembly → raw-bbox snapshot → overlap merging (currently
+/// disabled) → split merged lines → drop.
 ///
 /// Does NOT include `expand_words_to_ink` (needs ink threshold from
-/// background-colour detection) or `split_wide_whitespace_words` (needs
-/// matched font data).  Those run as separate refinement passes.
+/// background-colour detection), `fix_overlapping_words_by_ink` (needs gray and
+/// ink threshold, finds natural gap between overlapping words by looking at
+/// column ink totals between centers), or `split_wide_whitespace_words` (needs
+/// matched font data). Those run as separate refinement passes in
+/// `page_cache.rs`.
 pub fn postprocess_words(word_regions: &[TextRegion]) -> Vec<TextLine> {
     let mut lines = assemble_lines(word_regions);
     snapshot_raw_bboxes(&mut lines);
     merge_overlapping_lines(&mut lines);
     split_merged_lines(&mut lines);
-    clip_word_overlaps(&mut lines);
     drop_outlier_words(&mut lines);
     lines
 }
