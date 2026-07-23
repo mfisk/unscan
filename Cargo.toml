@@ -1,3 +1,7 @@
+[workspace]
+members = ["crates/unprint-fonts"]
+resolver = "2"
+
 [package]
 name = "unprint"
 version = "0.2.0"
@@ -17,6 +21,7 @@ path = "src/bin/gen_training_data.rs"
 clap = { version = "4", features = ["derive", "env"] }
 image = "0.25"
 ab_glyph = "0.2"
+unprint-fonts = { path = "crates/unprint-fonts" }
 lopdf = "0.34"
 walkdir = "2"
 rayon = "1.10"

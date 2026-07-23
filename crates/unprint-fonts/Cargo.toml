@@ -1,0 +1,14 @@
+[package]
+name = "unprint-fonts"
+version = "0.1.0"
+edition = "2021"
+description = "Isolated font engine - owns ab_glyph, freetype, rustybuzz, ttf-parser"
+
+[dependencies]
+ab_glyph = "0.2"
+freetype-rs = "0.38"
+rustybuzz = "0.18"
+ttf-parser = { version = "0.24", features = ["opentype-layout", "variable-fonts"] }
+image = { version = "0.25", default-features = false, features = ["png", "jpeg"] }
+thiserror = "2"
+bitflags = "2"

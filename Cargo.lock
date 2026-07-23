@@ -1981,7 +1981,21 @@ dependencies = [
  "tempfile",
  "thiserror 2.0.18",
  "ttf-parser 0.24.1",
+ "unprint-fonts",
  "walkdir",
+]
+
+[[package]]
+name = "unprint-fonts"
+version = "0.1.0"
+dependencies = [
+ "ab_glyph",
+ "bitflags 2.11.1",
+ "freetype-rs",
+ "image",
+ "rustybuzz",
+ "thiserror 2.0.18",
+ "ttf-parser 0.24.1",
 ]
 
 [[package]]
