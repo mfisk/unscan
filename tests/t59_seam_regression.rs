@@ -14,36 +14,45 @@ use std::path::PathBuf;
 use std::process::Command;
 
 /// Expected seam splits for each test line, per word.
-/// Hardcoded fonts/strings — no audit dependency, no empty lines.
-/// Updated Jul 19 2026: switched to hardcoded fonts/strings.
+/// Generated 2026-07-23 from fresh audit after HARDCODED input changed to 8 lines.
+/// OpenSans and IBMPlexSans now OCR-split into multiple words, so EXPECTED reflects
+/// actual entry["text"] (display_text) and word_segmentation order as observed.
 const EXPECTED: &[(&str, &[&[u32]])] = &[
-    // LibreBodoni-400 lowercase — gold, must stay [17,112,166,199,208,395,413,440,460]
+    // 0: LibreBodoni-400 lowercase — gold
     ("abcdefghijklmnopqrstuvwxyz.", &[
         &[17, 112, 166, 199, 208, 395, 413, 440, 460],
     ]),
-    // LibreBodoni-400 lining figures - observed [42] with 10% margin trim
-    ("Lining figures: 0 1 2 3 4 5 6 7 8 9.", &[
-        &[42], &[], &[], &[], &[], &[], &[], &[], &[], &[], &[], &[],
-    ]),
-    // LibreBodoni-400 uppercase - updated after ocr.rs 10% margin
+    // 1: LibreBodoni-400 uppercase
     ("ABCDEFGHIJKLMNOPQRSTUVWXYZ.", &[
         &[25, 187, 216, 230, 275, 332, 360, 471, 518, 545, 570, 604, 633, 656],
     ]),
-    // EBGaramond-400 body text
-    ("carved type into wood or imported it from Italy.", &[
-        &[99], &[41, 58], &[24, 39, 48, 64], &[26], &[], &[27], &[12],
+    // 2: Georgia-400 uppercase — distinct metrics from LibreBodoni
+    ("ABCDEFGHIJKLMNOPQRSTUVWXYZ.", &[
+        &[26, 268, 292, 504, 531, 557, 592, 618, 642],
     ]),
-    // Arial-BoldMT-700 Bold - observed [79] for fox with SKIP_PFLDA
-    ("Bold: The quick brown fox jumps over.", &[
-        &[], &[], &[35], &[], &[79], &[], &[12],
+    // 3: OpenSans-400 lowercase — OCR now splits into 3 words: "a", "bcdefghij", "klmnopgrstuvwxyz."
+    //    word_segmentation order is [klm..., bcd..., a] as currently emitted
+    ("a bcdefghij klmnopgrstuvwxyz.", &[
+        &[241],
+        &[94, 146],
+        &[],
     ]),
-    // Roboto-400It Italic - OCR inserts space in numbers with SKIP_PFLDA, keep text as observed
-    ("Italic: The quick brown fox jumps over 1,234,5 67,890 lazy,", &[
-        &[50], &[33, 84], &[], &[], &[32, 80], &[32, 64], &[8, 46, 54], &[36], &[19], &[11, 31],
+    // 4: LibreBodoni-400Italic "dogs."
+    ("dogs.", &[
+        &[19, 40, 57, 73],
     ]),
-    // PlayfairDisplay-400 lining figures - OCR merges 0+1 to 01 and 8->0 with SKIP_PFLDA
-    ("Lining figures: 01 2 3 4 5 6 7 8 0 9.", &[
-        &[43], &[88], &[9], &[], &[], &[], &[], &[], &[], &[], &[], &[],
+    // 5: IBMPlexSans-400 lowercase — OCR splits into 2 words
+    ("abcdefghijklmn opqgrstuvwxyz.", &[
+        &[223],
+        &[],
+    ]),
+    // 6: SourceSerif4-400It "Mayr-Duffner."
+    ("Mayr-Duffner.", &[
+        &[35, 53, 72, 86, 146, 169, 219],
+    ]),
+    // 7: SourceSerif4-400It "Type"
+    ("Type", &[
+        &[14, 36],
     ]),
 ];
 
