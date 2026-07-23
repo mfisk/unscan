@@ -17,7 +17,7 @@
 //! the resulting glyph IDs against the default shaping. Only features
 //! that produce at least one different glyph ID are emitted as variants.
 
-use ab_glyph::{Font, FontRef, PxScale, ScaleFont};
+use unprint_fonts::ab_glyph::{Font, FontRef, PxScale, ScaleFont};
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use walkdir::WalkDir;
@@ -1076,8 +1076,8 @@ fn detect_oldstyle_figures(data: &[u8]) -> bool {
         return false;
     }
 
-    let g0 = gid_0.with_scale_and_position(scale, ab_glyph::point(0.0, ascent));
-    let g3 = gid_3.with_scale_and_position(scale, ab_glyph::point(0.0, ascent));
+    let g0 = gid_0.with_scale_and_position(scale, unprint_fonts::ab_glyph::point(0.0, ascent));
+    let g3 = gid_3.with_scale_and_position(scale, unprint_fonts::ab_glyph::point(0.0, ascent));
 
     let og0 = match font.outline_glyph(g0) {
         Some(o) => o,
@@ -1142,7 +1142,7 @@ struct WeightInstance {
 /// Only fires if the font has a `wght` axis.  All other axes are pinned
 /// to their defaults so the instance is fully determined.
 fn detect_weight_instances(path: &Path, _class: FontClass) -> Vec<WeightInstance> {
-    use ab_glyph::{FontRef, VariableFont};
+    use unprint_fonts::ab_glyph::{FontRef, VariableFont};
 
     let data = match std::fs::read(path) {
         Ok(d) => d,
@@ -1163,8 +1163,8 @@ fn detect_weight_instances(path: &Path, _class: FontClass) -> Vec<WeightInstance
 
     // Read named instances from fvar via ttf_parser
     let named_weights: Vec<u16> = {
-        use rustybuzz::ttf_parser;
-        match ttf_parser::Face::parse(&data, 0) {
+        use unprint_fonts::ttf_parser;
+        match unprint_fonts::ttf_parser::Face::parse(&data, 0) {
             Ok(face) => {
                 let mut weights = Vec::new();
                 // fvar named instances
@@ -1209,15 +1209,15 @@ fn detect_weight_instances(path: &Path, _class: FontClass) -> Vec<WeightInstance
 /// for common Latin characters. Returns a vec of (feature_tag, glyph_overrides)
 /// for each feature that changes at least one glyph.
 fn detect_ot_variants(data: &[u8]) -> Vec<(String, Vec<(char, u16)>)> {
-    let face = match rustybuzz::Face::from_slice(data, 0) {
+    let face = match unprint_fonts::rustybuzz::Face::from_slice(data, 0) {
         Some(f) => f,
         None => return Vec::new(),
     };
 
     // Shape with no extra features (default rendering)
-    let mut buf_default = rustybuzz::UnicodeBuffer::new();
+    let mut buf_default = unprint_fonts::rustybuzz::UnicodeBuffer::new();
     buf_default.push_str(PROBE_STRING);
-    let out_default = rustybuzz::shape(&face, &[], buf_default);
+    let out_default = unprint_fonts::rustybuzz::shape(&face, &[], buf_default);
     let default_ids: Vec<u16> = out_default
         .glyph_infos()
         .iter()
@@ -1232,12 +1232,12 @@ fn detect_ot_variants(data: &[u8]) -> Vec<(String, Vec<(char, u16)>)> {
     let mut variants = Vec::new();
 
     for tag_bytes in VARIANT_FEATURES {
-        let tag = rustybuzz::ttf_parser::Tag::from_bytes(tag_bytes);
-        let features = [rustybuzz::Feature::new(tag, 1, ..)];
+        let tag = unprint_fonts::ttf_parser::Tag::from_bytes(tag_bytes);
+        let features = [unprint_fonts::rustybuzz::Feature::new(tag, 1, ..)];
 
-        let mut buf = rustybuzz::UnicodeBuffer::new();
+        let mut buf = unprint_fonts::rustybuzz::UnicodeBuffer::new();
         buf.push_str(PROBE_STRING);
-        let out = rustybuzz::shape(&face, &features, buf);
+        let out = unprint_fonts::rustybuzz::shape(&face, &features, buf);
         let feat_ids: Vec<u16> = out
             .glyph_infos()
             .iter()
@@ -1293,7 +1293,7 @@ pub fn is_ligature_char(c: char) -> bool {
 /// features. Returns a vec of (unicode_ligature_char, glyph_id) for each
 /// ligature the font supports.
 fn detect_ligature_glyphs(data: &[u8]) -> Vec<(char, u16)> {
-    let face = match rustybuzz::Face::from_slice(data, 0) {
+    let face = match unprint_fonts::rustybuzz::Face::from_slice(data, 0) {
         Some(f) => f,
         None => return Vec::new(),
     };
@@ -1304,16 +1304,16 @@ fn detect_ligature_glyphs(data: &[u8]) -> Vec<(char, u16)> {
         let input_len = probe.chars().count();
 
         // Try with both liga and dlig enabled
-        let liga_tag = rustybuzz::ttf_parser::Tag::from_bytes(b"liga");
-        let dlig_tag = rustybuzz::ttf_parser::Tag::from_bytes(b"dlig");
+        let liga_tag = unprint_fonts::ttf_parser::Tag::from_bytes(b"liga");
+        let dlig_tag = unprint_fonts::ttf_parser::Tag::from_bytes(b"dlig");
         let features = [
-            rustybuzz::Feature::new(liga_tag, 1, ..),
-            rustybuzz::Feature::new(dlig_tag, 1, ..),
+            unprint_fonts::rustybuzz::Feature::new(liga_tag, 1, ..),
+            unprint_fonts::rustybuzz::Feature::new(dlig_tag, 1, ..),
         ];
 
-        let mut buf = rustybuzz::UnicodeBuffer::new();
+        let mut buf = unprint_fonts::rustybuzz::UnicodeBuffer::new();
         buf.push_str(probe);
-        let out = rustybuzz::shape(&face, &features, buf);
+        let out = unprint_fonts::rustybuzz::shape(&face, &features, buf);
         let infos = out.glyph_infos();
 
         // If shaping produced exactly 1 glyph from N input chars, it's a ligature
@@ -1413,8 +1413,8 @@ pub struct FontMetadata {
 
 /// Read all font metadata in a single ttf_parser parse pass.
 pub fn read_font_metadata(data: &[u8]) -> FontMetadata {
-    use rustybuzz::ttf_parser;
-    let face = match ttf_parser::Face::parse(data, 0) {
+    use unprint_fonts::ttf_parser;
+    let face = match unprint_fonts::ttf_parser::Face::parse(data, 0) {
         Ok(f) => f,
         Err(_) => return FontMetadata {
             nid1_family: String::new(),
@@ -1499,9 +1499,9 @@ impl FontIdentity {
 
 /// Read font identity from a font file path. Returns None on parse failure.
 pub fn read_font_identity(path: &Path) -> Option<FontIdentity> {
-    use rustybuzz::ttf_parser;
+    use unprint_fonts::ttf_parser;
     let data = std::fs::read(path).ok()?;
-    let face = ttf_parser::Face::parse(&data, 0).ok()?;
+    let face = unprint_fonts::ttf_parser::Face::parse(&data, 0).ok()?;
 
     // Name ID 16 (typographic family) if present, else name ID 1 (family).
     let mut nid1: Option<String> = None;
@@ -1526,7 +1526,7 @@ fn load_font_entry(path: &Path, aliases: &HashMap<String, Alias>) -> Option<Font
     let data = std::fs::read(path).ok()?;
 
     // Verify ab_glyph can parse it (reject corrupt files)
-    let _ = ab_glyph::FontRef::try_from_slice(&data).ok()?;
+    let _ = unprint_fonts::ab_glyph::FontRef::try_from_slice(&data).ok()?;
 
     let oldstyle_figures = detect_oldstyle_figures(&data);
     let meta = read_font_metadata(&data);

@@ -889,25 +889,25 @@ impl GeometryCache {
                 }
             }
 
-            let ttf_face = match ttf_parser::Face::parse(&font_data, 0) { Ok(f) => f, Err(_) => continue, };
+            let ttf_face = match unprint_fonts::ttf_parser::Face::parse(&font_data, 0) { Ok(f) => f, Err(_) => continue, };
             let upem = ttf_face.units_per_em() as f64;
             let num_glyphs = ttf_face.number_of_glyphs() as usize;
 
             let mut glyphs = Vec::with_capacity(num_glyphs);
             if let Some(vars) = &fe.variations {
                 // Variable font weight instance — must apply variation for correct geometry
-                if let Ok(mut vf) = ab_glyph::FontRef::try_from_slice(&font_data) {
+                if let Ok(mut vf) = unprint_fonts::ab_glyph::FontRef::try_from_slice(&font_data) {
                     {
-                        use ab_glyph::VariableFont;
+                        use unprint_fonts::ab_glyph::VariableFont;
                         for (tag, val) in vars {
                             let _ = vf.set_variation(tag, *val);
                         }
                     }
                     {
-                        use ab_glyph::Font;
+                        use unprint_fonts::ab_glyph::Font;
                         // Use ab_glyph for varied metrics (gvar applied)
                         for gid in 0..num_glyphs {
-                            let gid_ab = ab_glyph::GlyphId(gid as u16);
+                            let gid_ab = unprint_fonts::ab_glyph::GlyphId(gid as u16);
                             let adv = vf.h_advance_unscaled(gid_ab) as f64;
                             // bbox from outline bounds (font units)
                             let (x_min, x_max, y_min, y_max) = if let Some(outline) = vf.outline(gid_ab) {
@@ -915,7 +915,7 @@ impl GeometryCache {
                             (b.min.x as f64, b.max.x as f64, b.min.y as f64, b.max.y as f64)
                         } else {
                             // No outline (space, etc.) — fallback to ttf_parser bbox or 0,adv
-                            if let Some(bb) = ttf_face.glyph_bounding_box(ttf_parser::GlyphId(gid as u16)) {
+                            if let Some(bb) = ttf_face.glyph_bounding_box(unprint_fonts::ttf_parser::GlyphId(gid as u16)) {
                                 (bb.x_min as f64, bb.x_max as f64, bb.y_min as f64, bb.y_max as f64)
                             } else {
                                 (0.0, adv, 0.0, 0.0)
@@ -927,7 +927,7 @@ impl GeometryCache {
                 } else {
                     // Failed to create ab_glyph FontRef — fallback to ttf_parser (default instance)
                     for gid in 0..num_glyphs {
-                        let gid_t = ttf_parser::GlyphId(gid as u16);
+                        let gid_t = unprint_fonts::ttf_parser::GlyphId(gid as u16);
                         let adv = ttf_face.glyph_hor_advance(gid_t).unwrap_or(0) as f64;
                         let bbox = ttf_face.glyph_bounding_box(gid_t);
                         let (x_min, x_max, y_min, y_max) = if let Some(bb) = bbox {
@@ -938,7 +938,7 @@ impl GeometryCache {
                 }
             } else {
                 for gid in 0..num_glyphs {
-                    let gid_t = ttf_parser::GlyphId(gid as u16);
+                    let gid_t = unprint_fonts::ttf_parser::GlyphId(gid as u16);
                     let adv = ttf_face.glyph_hor_advance(gid_t).unwrap_or(0) as f64;
                     let bbox = ttf_face.glyph_bounding_box(gid_t);
                     let (x_min, x_max, y_min, y_max) = if let Some(bb) = bbox {
@@ -975,7 +975,7 @@ impl GeometryCache {
             let mut format1_tables: Vec<Format1TableOwned> = Vec::new();
             let mut format2_tables: Vec<Format2TableOwned> = Vec::new();
 
-            if let Some(gpos_data) = ttf_face.raw_face().table(ttf_parser::Tag::from_bytes(b"GPOS")) {
+            if let Some(gpos_data) = ttf_face.raw_face().table(unprint_fonts::ttf_parser::Tag::from_bytes(b"GPOS")) {
                 if let Some((s_tbls, f1_tbls, f2_tbls)) = Self::parse_gpos_full(gpos_data, num_glyphs) {
                     single_tables = s_tbls;
                     format1_tables = f1_tbls;
@@ -992,7 +992,7 @@ impl GeometryCache {
                         let mut map: BTreeMap<u16, Vec<(u16, Val4, Val4)>> = BTreeMap::new();
                         for &g1 in &uniq_gids {
                             for &g2 in &uniq_gids {
-                                if let Some(k) = subtable.glyphs_kerning(ttf_parser::GlyphId(g1), ttf_parser::GlyphId(g2)) {
+                                if let Some(k) = subtable.glyphs_kerning(unprint_fonts::ttf_parser::GlyphId(g1), unprint_fonts::ttf_parser::GlyphId(g2)) {
                                     if k!=0 {
                                         let v1 = [0,0,k,0];
                                         let v2 = [0,0,0,0];

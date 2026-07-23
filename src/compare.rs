@@ -1,7 +1,7 @@
 //! Diagnostic comparison output: side-by-side scan crop vs rendered font match
 //! for every vectorized line. Activated by `--compare`.
 
-use ab_glyph::{point, Font, FontRef, PxScale, ScaleFont};
+use unprint_fonts::ab_glyph::{point, Font, FontRef, PxScale, ScaleFont};
 use image::{GrayImage, Luma, RgbImage, Rgb as ImgRgb};
 use crate::pdf_out::PlacedText;
 use std::path::Path;
@@ -230,7 +230,7 @@ fn render_font_crop(
             );
 
             let mut cx = word_x_in_crop;
-            let mut prev: Option<ab_glyph::GlyphId> = None;
+            let mut prev: Option<unprint_fonts::ab_glyph::GlyphId> = None;
 
             for c in word.text.chars() {
                 let gid = crate::char_render::resolve_glyph(&font, c, overrides);
@@ -282,7 +282,7 @@ fn render_font_crop(
         // Start at left margin
         let margin = 4.0f32;
         let mut cx = margin;
-        let mut prev: Option<ab_glyph::GlyphId> = None;
+        let mut prev: Option<unprint_fonts::ab_glyph::GlyphId> = None;
 
         for c in line_text.chars() {
             let gid = crate::char_render::resolve_glyph(&font, c, overrides);

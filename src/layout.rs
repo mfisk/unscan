@@ -8,7 +8,7 @@
 // Having a single source of truth prevents alignment drift between the
 // overlay preview and the final output.
 
-use ab_glyph::{point, Font, FontRef, GlyphId, PxScale, ScaleFont};
+use unprint_fonts::ab_glyph::{point, Font, FontRef, GlyphId, PxScale, ScaleFont};
 use image::{GrayImage, Luma};
 
 /// Reference height used for measuring advance widths before rescaling.
@@ -20,7 +20,7 @@ const REF_H: f32 = 100.0;
 pub fn width_matched_em_px<F: Font>(font: &F, text: &str, target_width_px: f32, overrides: Option<&[(char, u16)]>) -> Option<f32> {
     let sf_ref = font.as_scaled(PxScale::from(REF_H));
     let mut adv = 0.0f32;
-    let mut prev: Option<ab_glyph::GlyphId> = None;
+    let mut prev: Option<unprint_fonts::ab_glyph::GlyphId> = None;
     for c in text.chars() {
         let gid = crate::char_render::resolve_glyph(font, c, overrides);
         if let Some(p) = prev {
@@ -157,14 +157,14 @@ pub fn baseline_aligned_baseline_pt<F: Font>(
 // ---------------------------------------------------------------------------
 
 /// Build OT feature list from a variant tag (e.g. "smcp", "onum").
-pub fn ot_features(variant_tag: &str) -> Vec<rustybuzz::Feature> {
+pub fn ot_features(variant_tag: &str) -> Vec<unprint_fonts::rustybuzz::Feature> {
     if !variant_tag.is_empty() && variant_tag.len() <= 4 {
         let mut tag_bytes = [b' '; 4];
         for (i, b) in variant_tag.as_bytes().iter().enumerate().take(4) {
             tag_bytes[i] = *b;
         }
-        let tag = rustybuzz::ttf_parser::Tag::from_bytes(&tag_bytes);
-        vec![rustybuzz::Feature::new(tag, 1, ..)]
+        let tag = unprint_fonts::ttf_parser::Tag::from_bytes(&tag_bytes);
+        vec![unprint_fonts::rustybuzz::Feature::new(tag, 1, ..)]
     } else {
         vec![]
     }
@@ -207,7 +207,7 @@ impl ShapedWord {
 }
 
 /// Shape a word using rustybuzz and compute sidebearing-corrected metrics.
-pub fn shape_word(face: &rustybuzz::Face, features: &[rustybuzz::Feature], text: &str) -> Option<ShapedWord> {
+pub fn shape_word(face: &unprint_fonts::rustybuzz::Face, features: &[unprint_fonts::rustybuzz::Feature], text: &str) -> Option<ShapedWord> {
     let units_per_em = face.units_per_em() as f64;
 
     // Per-word ligature control: plain words like ['f','f'] (two f's) must be
@@ -215,19 +215,19 @@ pub fn shape_word(face: &rustybuzz::Face, features: &[rustybuzz::Feature], text:
     // ['\u{FB00}'] contain a ligature codepoint and must keep liga on to get
     // a single combined bbox. Use canonical list from font_scan.
     let is_lig_word = text.chars().any(|c| crate::font_scan::is_ligature_char(c));
-    let features_for_shape: Vec<rustybuzz::Feature> = if is_lig_word {
+    let features_for_shape: Vec<unprint_fonts::rustybuzz::Feature> = if is_lig_word {
         features.to_vec()
     } else {
         let mut v = Vec::with_capacity(features.len() + 2);
         v.extend_from_slice(features);
-        v.push(rustybuzz::Feature::new(rustybuzz::ttf_parser::Tag::from_bytes(b"liga"), 0, ..));
-        v.push(rustybuzz::Feature::new(rustybuzz::ttf_parser::Tag::from_bytes(b"dlig"), 0, ..));
+        v.push(unprint_fonts::rustybuzz::Feature::new(unprint_fonts::ttf_parser::Tag::from_bytes(b"liga"), 0, ..));
+        v.push(unprint_fonts::rustybuzz::Feature::new(unprint_fonts::ttf_parser::Tag::from_bytes(b"dlig"), 0, ..));
         v
     };
 
-    let mut buffer = rustybuzz::UnicodeBuffer::new();
+    let mut buffer = unprint_fonts::rustybuzz::UnicodeBuffer::new();
     buffer.push_str(text);
-    let glyphs = rustybuzz::shape(face, &features_for_shape, buffer);
+    let glyphs = unprint_fonts::rustybuzz::shape(face, &features_for_shape, buffer);
     let positions = glyphs.glyph_positions();
     let infos = glyphs.glyph_infos();
 
@@ -243,12 +243,12 @@ pub fn shape_word(face: &rustybuzz::Face, features: &[rustybuzz::Feature], text:
 
     let ttfp = face.as_ref();
     let first_lsb_fu = infos.first().and_then(|gi| {
-        let gid = rustybuzz::ttf_parser::GlyphId(gi.glyph_id as u16);
+        let gid = unprint_fonts::ttf_parser::GlyphId(gi.glyph_id as u16);
         ttfp.glyph_bounding_box(gid).map(|bb| bb.x_min as f64)
     }).unwrap_or(0.0);
 
     let last_rsb = if let (Some(last_info), Some(last_pos)) = (infos.last(), positions.last()) {
-        let gid = rustybuzz::ttf_parser::GlyphId(last_info.glyph_id as u16);
+        let gid = unprint_fonts::ttf_parser::GlyphId(last_info.glyph_id as u16);
         if let Some(bb) = ttfp.glyph_bounding_box(gid) {
             let adv = last_pos.x_advance as f64;
             (adv - bb.x_max as f64).max(0.0)
@@ -278,10 +278,10 @@ pub fn shape_word(face: &rustybuzz::Face, features: &[rustybuzz::Feature], text:
 /// When `variant_tag` is non-empty (e.g. "smcp", "onum"), the corresponding
 /// OT feature is activated during shaping.
 pub fn width_matched_em_px_shaped(font_data: &[u8], text: &str, target_width_px: f32, variant_tag: &str, variations: Option<&[([u8; 4], f32)]>) -> Option<f32> {
-    let mut face = rustybuzz::Face::from_slice(font_data, 0)?;
+    let mut face = unprint_fonts::rustybuzz::Face::from_slice(font_data, 0)?;
     if let Some(vars) = variations {
         for (tag, val) in vars {
-            let t = rustybuzz::ttf_parser::Tag::from_bytes(tag);
+            let t = unprint_fonts::ttf_parser::Tag::from_bytes(tag);
             face.set_variation(t, *val);
         }
     }

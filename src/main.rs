@@ -387,7 +387,7 @@ fn run(args: &cli::Args, classifier: &mut dyn classifier::Classifier) -> Result<
                 }
                 let Some(fe) = font_registry.by_key(font_key) else { continue };
                 let Ok(font_data) = std::fs::read(&fe.path) else { continue };
-                let Ok(face) = rustybuzz::ttf_parser::Face::parse(&font_data, 0) else { continue };
+                let Ok(face) = unprint_fonts::ttf_parser::Face::parse(&font_data, 0) else { continue };
                 // Require at least one Latin letter (a-z) to avoid NotoColorEmoji (which has only digits 0-9)
                 // NotoColorEmoji has 0-9 but no letters -> would pass 'any supported char' and then hang indexing 11M CBDT
                 let has_latin = ('a'..='z').any(|c| face.glyph_index(c).map_or(false, |g| g.0 != 0));
@@ -451,7 +451,7 @@ fn run(args: &cli::Args, classifier: &mut dyn classifier::Classifier) -> Result<
                     Ok(d) => d,
                     Err(_) => continue,
                 };
-                let font = match ab_glyph::FontRef::try_from_slice(&font_data) {
+                let font = match unprint_fonts::ab_glyph::FontRef::try_from_slice(&font_data) {
                     Ok(f) => f,
                     Err(_) => continue,
                 };
@@ -460,8 +460,8 @@ fn run(args: &cli::Args, classifier: &mut dyn classifier::Classifier) -> Result<
                 fonts_indexed += 1;
 
                 for seq in &sequences {
-                    let gid_overrides: Vec<Option<ab_glyph::GlyphId>> = seq.iter().map(|c| {
-                        overrides.and_then(|ovs| ovs.iter().find(|(ch, _)| *ch == *c).map(|(_, g)| ab_glyph::GlyphId(*g)))
+                    let gid_overrides: Vec<Option<unprint_fonts::ab_glyph::GlyphId>> = seq.iter().map(|c| {
+                        overrides.and_then(|ovs| ovs.iter().find(|(ch, _)| *ch == *c).map(|(_, g)| unprint_fonts::ab_glyph::GlyphId(*g)))
                     }).collect();
 
                     let img = match char_render::render_ngram_fresh(&font, seq, &gid_overrides, &render_params) {

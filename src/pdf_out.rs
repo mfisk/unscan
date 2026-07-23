@@ -330,7 +330,7 @@ for tr in &page.text_regions {
             if !tr.words.is_empty() && tr.font_match.is_some() {
                 let fm = tr.font_match.as_ref().unwrap();
                 let font_bytes = font_cache.load(&fm.font_path).ok();
-                let font_ok = font_bytes.as_ref().and_then(|b| ab_glyph::FontRef::try_from_slice(b.as_slice()).ok());
+                let font_ok = font_bytes.as_ref().and_then(|b| unprint_fonts::ab_glyph::FontRef::try_from_slice(b.as_slice()).ok());
 
                 if overlay {
                     ops.push(op("gs", &[Object::Name(b"GS_overlay".to_vec())]));
@@ -342,7 +342,7 @@ for tr in &page.text_regions {
                     // font size, preserving natural letter spacing.  Width-matching
                     // would shrink/stretch spacing to fit OCR bbox widths.
                     let line_em_px = {
-                        use ab_glyph::{Font, PxScale, ScaleFont};
+                        use unprint_fonts::ab_glyph::{Font, PxScale, ScaleFont};
                         let sf = f.as_scaled(PxScale::from(1000.0));
                         let ink_h = sf.ascent() - sf.descent();
                         if ink_h > 0.1 {
@@ -498,9 +498,9 @@ fn embed_subsetted_font(
     used_chars: &HashSet<char>,
     overrides: Option<&[(char, u16)]>,
 ) -> Result<(lopdf::ObjectId, HashMap<char, u16>), ScanTextError> {
-    use ab_glyph::{Font, ScaleFont};
+    use unprint_fonts::ab_glyph::{Font, ScaleFont};
 
-    let ab_font = ab_glyph::FontRef::try_from_slice(font_data)
+    let ab_font = unprint_fonts::ab_glyph::FontRef::try_from_slice(font_data)
         .map_err(|e| ScanTextError::PdfGen(format!("parse font: {e}")))?;
 
     // Map chars → original glyph IDs (with variant overrides)
@@ -555,7 +555,7 @@ fn embed_subsetted_font(
     let file_id = doc.add_object(font_stream);
 
     // ── Font metrics ─────────────────────────────────────────────────
-    let sf = ab_font.as_scaled(ab_glyph::PxScale::from(1000.0));
+    let sf = ab_font.as_scaled(unprint_fonts::ab_glyph::PxScale::from(1000.0));
     let ascent = sf.ascent().round() as i64;
     let descent = sf.descent().round() as i64;
     let bbox = vec![

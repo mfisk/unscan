@@ -32,7 +32,7 @@
 //!      and the prior 60% which cut off baseline '.'.
 
 use crate::error::ScanTextError;
-use ab_glyph::{Font, PxScale, ScaleFont, point};
+use unprint_fonts::ab_glyph::{Font, PxScale, ScaleFont, point};
 use image::{DynamicImage, GrayImage};
 use std::process::Command;
 
@@ -136,8 +136,6 @@ pub fn extract_text_regions(
             "stdout",
             "--dpi",
             &dpi.to_string(),
-            "--psm",
-            "6",
             "-l",
             "eng",
             "tsv",
@@ -165,8 +163,6 @@ pub fn extract_text_regions(
             "stdout",
             "--dpi",
             &dpi.to_string(),
-            "--psm",
-            "6",
             "-l",
             "eng",
             "-c",
@@ -1197,7 +1193,7 @@ pub fn split_wide_whitespace_words(
         // Use the pre-identified font for this line (from the main font matching pass)
         let line_font_ref = line_fonts.get(line_idx)
             .and_then(|opt| opt.as_ref())
-            .and_then(|data| ab_glyph::FontRef::try_from_slice(data).ok());
+            .and_then(|data| unprint_fonts::ab_glyph::FontRef::try_from_slice(data).ok());
 
         for word in line.words.drain(..) {
             let wx = word.x.min(page_w.saturating_sub(1));
@@ -1294,11 +1290,11 @@ pub fn split_wide_whitespace_words(
                             return None;
                         };
                         let ref_scale = 100.0_f32;
-                        let ref_px = ab_glyph::PxScale { x: ref_scale, y: ref_scale };
+                        let ref_px = unprint_fonts::ab_glyph::PxScale { x: ref_scale, y: ref_scale };
                         let font_ink_w = font_ink_width(font, ref_px, chars[i])?;
                         if font_ink_w <= 0.0 { return None; }
                         let s = observed_ink_w / font_ink_w * ref_scale;
-                        let scale = ab_glyph::PxScale { x: s, y: s };
+                        let scale = unprint_fonts::ab_glyph::PxScale { x: s, y: s };
                         let expected = font_pair_ink_gap(font, scale, chars[i], chars[i + 1]);
                         let threshold = expected.round() as u32 + 5;
                         Some(threshold)

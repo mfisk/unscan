@@ -64,7 +64,7 @@ fn smooth_run(run: &mut [PlacedText], dpi: f32, font_cache: &crate::font_cache::
         },
         None => return,
     };
-    let font = match ab_glyph::FontRef::try_from_slice(&font_data) {
+    let font = match unprint_fonts::ab_glyph::FontRef::try_from_slice(&font_data) {
         Ok(f) => f,
         Err(_) => return,
     };

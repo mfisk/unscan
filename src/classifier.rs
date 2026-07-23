@@ -3732,7 +3732,7 @@ impl PerFontLda {
                 return None;
             }
         };
-        let mut font = match ab_glyph::FontVec::try_from_vec(font_data) {
+        let mut font = match unprint_fonts::ab_glyph::FontVec::try_from_vec(font_data) {
             Ok(f) => f,
             Err(e) => {
                 eprintln!("[pflda] FontVec parse failed for {font_key}: {e}");
@@ -3742,7 +3742,7 @@ impl PerFontLda {
 
         // Apply variable-font axis coordinates (e.g. weight)
         if let Some(ref vars) = font_entry.variations {
-            use ab_glyph::VariableFont;
+            use unprint_fonts::ab_glyph::VariableFont;
             for (tag, val) in vars {
                 font.set_variation(tag, *val);
             }

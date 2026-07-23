@@ -20,7 +20,6 @@ path = "src/bin/gen_training_data.rs"
 [dependencies]
 clap = { version = "4", features = ["derive", "env"] }
 image = "0.25"
-ab_glyph = "0.2"
 unprint-fonts = { path = "crates/unprint-fonts" }
 lopdf = "0.34"
 walkdir = "2"
@@ -29,9 +28,6 @@ thiserror = "2"
 tempfile = "3"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
-freetype-rs = "0.38"
-rustybuzz = "0.18"
-ttf-parser = { version = "0.24", features = ["opentype-layout"] }
 subsetter = "0.2"
 base64 = "0.22.1"
 rand = { version = "0.8", features = ["small_rng"] }

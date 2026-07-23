@@ -307,10 +307,10 @@ fn per_char_geo_shaped(
 ) -> Option<Vec<PerCharGeo>> {
     let fe = font_registry.by_key(font_key)?;
     let font_data = font_cache.load(&fe.path).ok()?;
-    let mut face = rustybuzz::Face::from_slice(&font_data, 0)?;
+    let mut face = unprint_fonts::rustybuzz::Face::from_slice(&font_data, 0)?;
     if let Some(vars) = &fe.variations {
         for (tag_bytes, val) in vars {
-            let t = rustybuzz::ttf_parser::Tag::from_bytes(tag_bytes);
+            let t = unprint_fonts::ttf_parser::Tag::from_bytes(tag_bytes);
             face.set_variation(t, *val);
         }
     }
@@ -328,8 +328,8 @@ fn per_char_geo_shaped(
         let is_lig_word = ws.chars.iter().any(|c| crate::font_scan::is_ligature_char(*c));
         let mut features = base_features.clone();
         if !is_lig_word {
-            features.push(rustybuzz::Feature::new(rustybuzz::ttf_parser::Tag::from_bytes(b"liga"), 0, ..));
-            features.push(rustybuzz::Feature::new(rustybuzz::ttf_parser::Tag::from_bytes(b"dlig"), 0, ..));
+            features.push(unprint_fonts::rustybuzz::Feature::new(unprint_fonts::ttf_parser::Tag::from_bytes(b"liga"), 0, ..));
+            features.push(unprint_fonts::rustybuzz::Feature::new(unprint_fonts::ttf_parser::Tag::from_bytes(b"dlig"), 0, ..));
         }
         let text: String = ws.chars.iter().collect();
         let sw = crate::layout::shape_word(&face, &features, &text)?;
@@ -343,8 +343,8 @@ fn per_char_geo_shaped(
         let mut pred_y_maxs_fu: Vec<f64> = Vec::with_capacity(sw.glyph_ids.len());
         let mut cursor_fu = 0.0f64;
         for (i, gid) in sw.glyph_ids.iter().enumerate() {
-            let glyph_id = rustybuzz::ttf_parser::GlyphId(*gid as u16);
-            let bbox = ttfp.glyph_bounding_box(glyph_id).unwrap_or(rustybuzz::ttf_parser::Rect { x_min: 0, y_min: 0, x_max: 0, y_max: 0 });
+            let glyph_id = unprint_fonts::ttf_parser::GlyphId(*gid as u16);
+            let bbox = ttfp.glyph_bounding_box(glyph_id).unwrap_or(unprint_fonts::ttf_parser::Rect { x_min: 0, y_min: 0, x_max: 0, y_max: 0 });
             let x_off = sw.x_offsets.get(i).copied().unwrap_or(0) as f64;
             let y_off = sw.y_offsets.get(i).copied().unwrap_or(0) as f64;
             let cx = cursor_fu + x_off + (bbox.x_min as f64 + bbox.x_max as f64) * 0.5;
@@ -365,8 +365,8 @@ fn per_char_geo_shaped(
         } else {
             let obs_h = bounds_vec[0].height.max(1.0);
             // Use ink height from bbox for single char
-            let glyph_id = rustybuzz::ttf_parser::GlyphId(sw.glyph_ids[0] as u16);
-            let bbox = ttfp.glyph_bounding_box(glyph_id).unwrap_or(rustybuzz::ttf_parser::Rect { x_min: 0, y_min: -1000, x_max: 0, y_max: 0 });
+            let glyph_id = unprint_fonts::ttf_parser::GlyphId(sw.glyph_ids[0] as u16);
+            let bbox = ttfp.glyph_bounding_box(glyph_id).unwrap_or(unprint_fonts::ttf_parser::Rect { x_min: 0, y_min: -1000, x_max: 0, y_max: 0 });
             let pred_h = (bbox.y_max - bbox.y_min) as f64;
             obs_h / pred_h.max(1.0)
         };

@@ -4,7 +4,7 @@
 //! v5: width-scaled SSIM for glyph-shape comparison + aspect-ratio penalty
 //! for catching fonts whose proportions don't match the original.
 
-use ab_glyph::{Font, FontRef, PxScale, ScaleFont};
+use unprint_fonts::ab_glyph::{Font, FontRef, PxScale, ScaleFont};
 use image::{GrayImage, Luma, RgbImage, Rgb};
 use crate::ocr::TextRegion;
 
@@ -16,16 +16,16 @@ use crate::ocr::TextRegion;
 ///
 /// Reads the fvar axis order from the raw font data (via ttf_parser) and maps
 /// the provided tag→value pairs to `FT_Set_Var_Design_Coordinates`.
-fn set_ft_variations<B>(ft_face: &freetype::Face<B>, font_data: &[u8], vars: &[([u8; 4], f32)]) {
-    use rustybuzz::ttf_parser;
+fn set_ft_variations<B>(ft_face: &unprint_fonts::freetype::Face<B>, font_data: &[u8], vars: &[([u8; 4], f32)]) {
+    use unprint_fonts::ttf_parser;
 
-    let parsed = match ttf_parser::Face::parse(font_data, 0) {
+    let parsed = match unprint_fonts::ttf_parser::Face::parse(font_data, 0) {
         Ok(f) => f,
         Err(_) => return,
     };
 
     // Get the axis list in fvar order
-    let axes: Vec<ttf_parser::VariationAxis> = parsed.variation_axes().into_iter().collect();
+    let axes: Vec<unprint_fonts::ttf_parser::VariationAxis> = parsed.variation_axes().into_iter().collect();
     if axes.is_empty() { return; }
 
     // Build coordinate array: each axis gets its value from vars, or its default
@@ -39,12 +39,12 @@ fn set_ft_variations<B>(ft_face: &freetype::Face<B>, font_data: &[u8], vars: &[(
     }).collect();
 
     // Call FT_Set_Var_Design_Coordinates via raw FFI
-    let raw_face: freetype::freetype_sys::FT_Face = ft_face.raw() as *const _ as *mut _;
+    let raw_face: unprint_fonts::freetype::freetype_sys::FT_Face = ft_face.raw() as *const _ as *mut _;
     unsafe {
-        freetype::freetype_sys::FT_Set_Var_Design_Coordinates(
+        unprint_fonts::freetype::freetype_sys::FT_Set_Var_Design_Coordinates(
             raw_face,
             coords.len() as u32,
-            coords.as_ptr() as *const freetype::freetype_sys::FT_Fixed,
+            coords.as_ptr() as *const unprint_fonts::freetype::freetype_sys::FT_Fixed,
         );
     }
 }
@@ -217,7 +217,7 @@ fn render_via_freetype(
     use std::cell::RefCell;
 
     thread_local! {
-        static FT_LIB: RefCell<Option<freetype::Library>> = RefCell::new(None);
+        static FT_LIB: RefCell<Option<unprint_fonts::freetype::Library>> = RefCell::new(None);
     }
 
     // Compute font size from ab_glyph (consistent with coarse scoring).
@@ -227,7 +227,7 @@ fn render_via_freetype(
     let mut font_ref = FontRef::try_from_slice(font_data).ok()?;
     // Apply variable-font axis coordinates
     if let Some(vars) = variations {
-        use ab_glyph::VariableFont;
+        use unprint_fonts::ab_glyph::VariableFont;
         for (tag, val) in vars {
             font_ref.set_variation(tag, *val);
         }
@@ -269,7 +269,7 @@ fn render_via_freetype(
     let ft_result: Option<GrayImage> = FT_LIB.with(|cell| {
         let mut borrow = cell.borrow_mut();
         if borrow.is_none() {
-            *borrow = freetype::Library::init().ok();
+            *borrow = unprint_fonts::freetype::Library::init().ok();
         }
         let lib = borrow.as_ref()?;
         let ft_face = lib.new_memory_face2(font_data.to_vec(), 0).ok()?;
@@ -282,10 +282,10 @@ fn render_via_freetype(
         }
 
     // Set up rustybuzz for shaping
-    let mut buzz_face = rustybuzz::Face::from_slice(font_data, 0)?;
+    let mut buzz_face = unprint_fonts::rustybuzz::Face::from_slice(font_data, 0)?;
     if let Some(vars) = variations {
         for (tag, val) in vars {
-            let t = rustybuzz::ttf_parser::Tag::from_bytes(tag);
+            let t = unprint_fonts::ttf_parser::Tag::from_bytes(tag);
             buzz_face.set_variation(t, *val);
         }
     }
@@ -319,7 +319,7 @@ fn render_via_freetype(
             let y_offset = shaped.y_offsets[i] as f64 * px_per_unit;
 
             // Load glyph in FreeType
-            ft_face.load_glyph(glyph_id, freetype::face::LoadFlag::RENDER | freetype::face::LoadFlag::NO_HINTING).ok()?;
+            ft_face.load_glyph(glyph_id, unprint_fonts::freetype::face::LoadFlag::RENDER | unprint_fonts::freetype::face::LoadFlag::NO_HINTING).ok()?;
             let glyph = ft_face.glyph();
             let bitmap = glyph.bitmap();
             let bmp_w = bitmap.width() as usize;
@@ -420,7 +420,7 @@ fn render_words_ab_glyph(
     canvas_h: u32,
     overrides: Option<&[(char, u16)]>,
 ) -> Option<GrayImage> {
-    use ab_glyph::point;
+    use unprint_fonts::ab_glyph::point;
     let font = FontRef::try_from_slice(font_data).ok()?;
     let mut canvas = GrayImage::from_pixel(canvas_w, canvas_h, Luma([255u8]));
 
@@ -446,7 +446,7 @@ fn render_words_ab_glyph(
 
         let natural_adv = {
             let mut adv = 0.0f32;
-            let mut prev: Option<ab_glyph::GlyphId> = None;
+            let mut prev: Option<unprint_fonts::ab_glyph::GlyphId> = None;
             for c in word.text.chars() {
                 let gid = crate::char_render::resolve_glyph(&font, c, overrides);
                 if let Some(p) = prev {
@@ -460,7 +460,7 @@ fn render_words_ab_glyph(
         let h_scale = if natural_adv > 0.1 { word.width as f32 / natural_adv } else { 1.0 };
 
         let mut cx = word.x_off as f32;
-        let mut prev: Option<ab_glyph::GlyphId> = None;
+        let mut prev: Option<unprint_fonts::ab_glyph::GlyphId> = None;
 
         for c in word.text.chars() {
             let gid = crate::char_render::resolve_glyph(&font, c, overrides);

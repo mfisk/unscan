@@ -16,7 +16,7 @@
 
 use std::path::PathBuf;
 
-use ab_glyph::{Font, GlyphId, PxScale, ScaleFont, point};
+use unprint_fonts::ab_glyph::{Font, GlyphId, PxScale, ScaleFont, point};
 use image::{GrayImage, Luma};
 
 use crate::features::{self as features, AaVariant, NORM_H};
@@ -130,7 +130,7 @@ pub fn render_ngram(
 
     // Cache miss: load font, render, update caches
     let font_data = std::fs::read(&fe.path).ok()?;
-    let font = ab_glyph::FontRef::try_from_slice(&font_data).ok()?;
+    let font = unprint_fonts::ab_glyph::FontRef::try_from_slice(&font_data).ok()?;
     let gid_overrides: Vec<Option<GlyphId>> = seq.iter().map(|c| {
         fe.glyph_overrides.as_deref()
             .and_then(|ovs| ovs.iter().find(|(ch, _)| *ch == *c).map(|(_, g)| GlyphId(*g)))
@@ -313,16 +313,16 @@ pub fn render_glyph_at_ink_height<F: Font>(font: &F, gid: GlyphId, target_ink_h:
 
 
 /// Falls back to the font's default cmap lookup if no override exists for this character.
-pub fn resolve_glyph<F: ab_glyph::Font>(font: &F, ch: char, overrides: Option<&[(char, u16)]>) -> ab_glyph::GlyphId {
+pub fn resolve_glyph<F: unprint_fonts::ab_glyph::Font>(font: &F, ch: char, overrides: Option<&[(char, u16)]>) -> unprint_fonts::ab_glyph::GlyphId {
     if let Some(ovs) = overrides {
         if let Some(&(_, gid)) = ovs.iter().find(|(c, _)| *c == ch) {
-            return ab_glyph::GlyphId(gid);
+            return unprint_fonts::ab_glyph::GlyphId(gid);
         }
     }
     font.glyph_id(ch)
 }
 pub fn render_ref_chars(json_str: &str) {
-    use ab_glyph::{Font, FontVec};
+    use unprint_fonts::ab_glyph::{Font, FontVec};
 
     #[derive(serde::Deserialize)]
     struct Req {
@@ -373,12 +373,12 @@ pub fn render_ref_chars(json_str: &str) {
 /// (ascent to descent).  0.0 = ascender line, 1.0 = descender line.
 ///
 /// Uses `outline_glyph` + `px_bounds` — no rasterisation, just outline math.
-pub fn glyph_metric_ratios<F: ab_glyph::Font>(
+pub fn glyph_metric_ratios<F: unprint_fonts::ab_glyph::Font>(
     font: &F,
     chars: &[char],
     overrides: Option<&[(char, u16)]>,
 ) -> std::collections::HashMap<char, (f32, f32)> {
-    use ab_glyph::{PxScale, point};
+    use unprint_fonts::ab_glyph::{PxScale, point};
 
     let scale = PxScale::from(100.0); // arbitrary reference scale; ratios are scale-invariant
     let sf = font.as_scaled(scale);

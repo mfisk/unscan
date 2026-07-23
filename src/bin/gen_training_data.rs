@@ -17,7 +17,7 @@
 ///   gen_training_data --aa native,blur_0.5             # subset of AA variants
 ///   gen_training_data --max-fonts 50                   # limit font count (for testing)
 
-use ab_glyph::{Font, FontRef};
+use unprint_fonts::ab_glyph::{Font, FontRef};
 use clap::Parser;
 use image::GrayImage;
 use rayon::prelude::*;
@@ -95,7 +95,7 @@ fn render_char_at_native_height<F: Font>(
     // Resolve glyph override for this character
     let glyph_override = overrides
         .and_then(|ovs| ovs.iter().find(|(ch, _)| *ch == c))
-        .map(|&(_, gid)| ab_glyph::GlyphId(gid));
+        .map(|&(_, gid)| unprint_fonts::ab_glyph::GlyphId(gid));
 
     // Render through the canonical pipeline — same code path as index-time
     let params = unprint::char_render::RenderParams {

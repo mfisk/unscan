@@ -1,5 +1,5 @@
 //! Dump CI index render for a specific char in a specific font
-use ab_glyph::{Font, FontRef};
+use unprint_fonts::ab_glyph::{Font, FontRef};
 use unprint::char_render::render_glyph_at_ink_height;
 use unprint::features::{normalize_to_ink_bounds, NORM_H};
 

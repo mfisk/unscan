@@ -57,7 +57,7 @@ pub fn build_ngram_glyph_map(
                 return Vec::new();
             }
         };
-        let font = match ab_glyph::FontRef::try_from_slice(&font_data) {
+        let font = match unprint_fonts::ab_glyph::FontRef::try_from_slice(&font_data) {
             Ok(f) => f,
             Err(_) => {
                 progress.fetch_add(1, Ordering::Relaxed);
@@ -70,8 +70,8 @@ pub fn build_ngram_glyph_map(
 
         let mut hashes = Vec::with_capacity(bigrams.len());
         for seq in bigrams {
-            let gid_overrides: Vec<Option<ab_glyph::GlyphId>> = seq.iter().map(|c| {
-                overrides.and_then(|ovs| ovs.iter().find(|(ch, _)| *ch == *c).map(|(_, g)| ab_glyph::GlyphId(*g)))
+            let gid_overrides: Vec<Option<unprint_fonts::ab_glyph::GlyphId>> = seq.iter().map(|c| {
+                overrides.and_then(|ovs| ovs.iter().find(|(ch, _)| *ch == *c).map(|(_, g)| unprint_fonts::ab_glyph::GlyphId(*g)))
             }).collect();
 
             if let Some(img) = crate::char_render::render_ngram_fresh(
@@ -174,7 +174,7 @@ pub fn generate_ngram_training_data(
                     return Vec::new();
                 }
             };
-            let font = match ab_glyph::FontRef::try_from_slice(&font_data) {
+            let font = match unprint_fonts::ab_glyph::FontRef::try_from_slice(&font_data) {
                 Ok(f) => f,
                 Err(_) => {
                     progress.fetch_add(1, Ordering::Relaxed);
@@ -204,8 +204,8 @@ pub fn generate_ngram_training_data(
                     continue;
                 }
 
-                let gid_overrides: Vec<Option<ab_glyph::GlyphId>> = [c1, c2].iter().map(|c| {
-                    overrides.and_then(|ovs| ovs.iter().find(|(ch, _)| *ch == *c).map(|(_, g)| ab_glyph::GlyphId(*g)))
+                let gid_overrides: Vec<Option<unprint_fonts::ab_glyph::GlyphId>> = [c1, c2].iter().map(|c| {
+                    overrides.and_then(|ovs| ovs.iter().find(|(ch, _)| *ch == *c).map(|(_, g)| unprint_fonts::ab_glyph::GlyphId(*g)))
                 }).collect();
 
                 for &ht in heights {

@@ -1,5 +1,5 @@
 //! Render two separate f glyphs side by side (no ligature) using ab_glyph
-use ab_glyph::{FontRef, Font, PxScale, ScaleFont, point};
+use unprint_fonts::ab_glyph::{FontRef, Font, PxScale, ScaleFont, point};
 use image::{GrayImage, Luma};
 
 fn main() {

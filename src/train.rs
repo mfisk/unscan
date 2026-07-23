@@ -801,7 +801,7 @@ pub fn run_train(mut args: TrainArgs) {
                         return;
                     }
                 };
-                let font = match ab_glyph::FontRef::try_from_slice(&font_data) {
+                let font = match unprint_fonts::ab_glyph::FontRef::try_from_slice(&font_data) {
                     Ok(f) => f,
                     Err(_) => {
                         prewarm_reused.fetch_add(reused, Ordering::Relaxed);
@@ -816,13 +816,13 @@ pub fn run_train(mut args: TrainArgs) {
                 let mut rendered = 0usize;
                 for si in need_render {
                     let seq = &sequences[si];
-                    let gid_overrides: Vec<Option<ab_glyph::GlyphId>> = seq
+                    let gid_overrides: Vec<Option<unprint_fonts::ab_glyph::GlyphId>> = seq
                         .iter()
                         .map(|c| {
                             overrides.and_then(|ovs| {
                                 ovs.iter()
                                     .find(|(ch, _)| *ch == *c)
-                                    .map(|(_, g)| ab_glyph::GlyphId(*g))
+                                    .map(|(_, g)| unprint_fonts::ab_glyph::GlyphId(*g))
                             })
                         })
                         .collect();
@@ -1013,7 +1013,7 @@ pub fn run_train(mut args: TrainArgs) {
                         return Vec::new();
                     }
                 };
-                let font = match ab_glyph::FontRef::try_from_slice(&font_data) {
+                let font = match unprint_fonts::ab_glyph::FontRef::try_from_slice(&font_data) {
                     Ok(f) => f,
                     Err(_) => {
                         progress.fetch_add(1, Ordering::Relaxed);
@@ -1041,8 +1041,8 @@ pub fn run_train(mut args: TrainArgs) {
                         continue;
                     }
 
-                    let gid_overrides: Vec<Option<ab_glyph::GlyphId>> = seq.iter().map(|c| {
-                        overrides.and_then(|ovs| ovs.iter().find(|(ch, _)| *ch == *c).map(|(_, g)| ab_glyph::GlyphId(*g)))
+                    let gid_overrides: Vec<Option<unprint_fonts::ab_glyph::GlyphId>> = seq.iter().map(|c| {
+                        overrides.and_then(|ovs| ovs.iter().find(|(ch, _)| *ch == *c).map(|(_, g)| unprint_fonts::ab_glyph::GlyphId(*g)))
                     }).collect();
 
                     for &(ht, aa_idx_all) in &needed_combos {

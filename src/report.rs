@@ -8,7 +8,7 @@
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 
-use ab_glyph::FontRef;
+use unprint_fonts::ab_glyph::FontRef;
 use base64::Engine;
 use image::{GrayImage, RgbImage};
 
@@ -1775,14 +1775,14 @@ fn build_observation_table(
             if let Some(data) = font_data_cache.load(&fe.path) {
                 if let Ok(mut font) = FontRef::try_from_slice(data) {
                     if let Some(ref vars) = fe.variations {
-                        use ab_glyph::VariableFont;
+                        use unprint_fonts::ab_glyph::VariableFont;
                         for (tag, val) in vars {
                             let _ = font.set_variation(tag, *val);
                         }
                     }
-                    let gid_overrides: Vec<Option<ab_glyph::GlyphId>> = seq.iter().map(|c| {
+                    let gid_overrides: Vec<Option<unprint_fonts::ab_glyph::GlyphId>> = seq.iter().map(|c| {
                         fe.glyph_overrides.as_ref()
-                            .and_then(|ovs| ovs.iter().find(|(gc, _)| *gc == *c).map(|(_, g)| ab_glyph::GlyphId(*g)))
+                            .and_then(|ovs| ovs.iter().find(|(gc, _)| *gc == *c).map(|(_, g)| unprint_fonts::ab_glyph::GlyphId(*g)))
                     }).collect();
                     if let Some(img) = char_render::render_ngram_fresh(&font, seq, &gid_overrides, &char_render::RenderParams::default()) {
                         correct_mid = ink_midpoint(&img);
@@ -1808,14 +1808,14 @@ fn build_observation_table(
                 if let Some(data) = font_data_cache.load(&fe.path) {
                     if let Ok(mut font) = FontRef::try_from_slice(data) {
                         if let Some(ref vars) = fe.variations {
-                            use ab_glyph::VariableFont;
+                            use unprint_fonts::ab_glyph::VariableFont;
                             for (tag, val) in vars {
                                 let _ = font.set_variation(tag, *val);
                             }
                         }
-                        let gid_overrides: Vec<Option<ab_glyph::GlyphId>> = seq.iter().map(|c| {
+                        let gid_overrides: Vec<Option<unprint_fonts::ab_glyph::GlyphId>> = seq.iter().map(|c| {
                             fe.glyph_overrides.as_ref()
-                                .and_then(|ovs| ovs.iter().find(|(gc, _)| *gc == *c).map(|(_, g)| ab_glyph::GlyphId(*g)))
+                                .and_then(|ovs| ovs.iter().find(|(gc, _)| *gc == *c).map(|(_, g)| unprint_fonts::ab_glyph::GlyphId(*g)))
                         }).collect();
                         if let Some(img) = char_render::render_ngram_fresh(&font, seq, &gid_overrides, &char_render::RenderParams::default()) {
                             chosen_mid = ink_midpoint(&img);

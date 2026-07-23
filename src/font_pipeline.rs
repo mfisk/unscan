@@ -553,26 +553,25 @@ pub fn match_lines(
         if args.skip_ocr_correction || std::env::var("UNPRINT_SKIP_PFLDA").is_ok() {
             // skip pflda for t64 fast path
         } else if let (Some(ref fr), Some(rtd)) = (&font_result, training_data) {
-            eprintln!("[pflda] OCR correction pass for font_key={}", fr.font_key);
-            let ctx = rtd.as_context(glyph_map);
+            if std::env::var("UNPRINT_VERBOSE_PFLDA").is_ok() { eprintln!("[pflda] OCR correction pass for font_key={}", fr.font_key); }
+}let ctx = rtd.as_context(glyph_map);
             if let Some(pf_lda) = classifier::PerFontLda::load_or_train(&fr.font_key, &ctx) {
                 let winning_word_segs: &[segment::WordSeg] = if seg_winner.as_deref() == Some("ligature") {
                     line_crops.lig_word_segs.as_deref().unwrap_or(&line_crops.word_segs)
                 } else {
                     &line_crops.word_segs
                 };
-                eprintln!("[pflda] Loaded/trained OK, checking chars across {} word_segs", winning_word_segs.len());
-
-                // -- Load font and compute glyph metric ratios ----------
+                if std::env::var("UNPRINT_VERBOSE_PFLDA").is_ok() { eprintln!("[pflda] Loaded/trained OK, checking chars across {} word_segs", winning_word_segs.len()); }
+}// -- Load font and compute glyph metric ratios ----------
                 // Used to validate OCR corrections: reject replacements
                 // whose vertical geometry is incompatible with the crop.
                 let glyph_metrics: std::collections::HashMap<char, (f32, f32)> = {
                     let font_entry = ctx.catalog.iter().find(|fe| fe.font_key() == fr.font_key);
                     if let Some(fe) = font_entry {
                         if let Ok(font_data) = std::fs::read(&fe.path) {
-                            if let Ok(mut font) = ab_glyph::FontVec::try_from_vec(font_data) {
+                            if let Ok(mut font) = unprint_fonts::ab_glyph::FontVec::try_from_vec(font_data) {
                                 if let Some(ref vars) = fe.variations {
-                                    use ab_glyph::VariableFont;
+                                    use unprint_fonts::ab_glyph::VariableFont;
                                     for (tag, val) in vars {
                                         font.set_variation(tag, *val);
                                     }
@@ -593,8 +592,8 @@ pub fn match_lines(
                     } else { std::collections::HashMap::new() }
                 };
                 if !glyph_metrics.is_empty() {
-                    eprintln!("[pflda] Loaded glyph metrics for {} chars", glyph_metrics.len());
-                }
+                    if std::env::var("UNPRINT_VERBOSE_PFLDA").is_ok() { eprintln!("[pflda] Loaded glyph metrics for {} chars", glyph_metrics.len()); }
+}}
 
                 // -- Build reverse map: (seg_idx, char_pos) → obs index ---
                 // Used to update observation audit fields alongside corrected_words.
@@ -668,10 +667,9 @@ pub fn match_lines(
                         top1_d2[top1_d2.len() / 2]
                     }
                 };
-                eprintln!("[pflda] inference σ²={:.6} (training σ²={:.6}, {} chars)",
-                    inference_sigma_sq, pf_lda.sigma_sq(), pflda_chars.len());
-
-                // -- Pass 2: softmax with inference σ², apply gate --------
+                if std::env::var("UNPRINT_VERBOSE_PFLDA").is_ok() { eprintln!("[pflda] inference σ²={:.6} (training σ²={:.6}, {} chars)",
+                    inference_sigma_sq, pf_lda.sigma_sq(), pflda_chars.len()); }
+// -- Pass 2: softmax with inference σ², apply gate --------
                 // corrections: (seg_idx, char_pos, from_char, to_char)
                 let mut corrections: Vec<(usize, usize, char, char)> = Vec::new();
 
@@ -694,7 +692,7 @@ pub fn match_lines(
                     let ocr_p = probs.iter().find(|(ch, _, _)| *ch == pc.ocr_char)
                         .map(|(_, p, _)| *p);
 
-                    eprintln!("[pflda] seg[{}][{}] ocr=\'{}\' | top1=\'{}\' p={:.4} d²={:.4} | gap1-2={:.4} | σ²_inf={:.4} | ocr_rank={} ocr_p={} | top5: {}",
+                    if std::env::var("UNPRINT_VERBOSE_PFLDA").is_ok() { eprintln!("[pflda] seg[{}][{}] ocr=\'{}\' | top1=\'{}\' p={:.4} d²={:.4} | gap1-2={:.4} | σ²_inf={:.4} | ocr_rank={} ocr_p={} | top5: {}",
                         pc.seg_idx,
                         pc.char_pos,
                         pc.ocr_char,
@@ -706,9 +704,8 @@ pub fn match_lines(
                         ocr_rank.map(|r| format!("{}", r + 1)).unwrap_or("ABSENT".into()),
                         ocr_p.map(|p| format!("{:.4}", p)).unwrap_or("?".into()),
                         probs.iter().take(5).map(|(c, p, d)| format!("\'{}\' ={:.4}(d²={:.3})", c, p, d)).collect::<Vec<_>>().join(" "),
-                    );
-
-                    // Update observation audit fields if we have the mapping
+                    ); }
+// Update observation audit fields if we have the mapping
                     if let Some(&obs_i) = char_to_obs.get(&(pc.seg_idx, pc.char_pos)) {
                         if top_char != pc.ocr_char {
                             observations[obs_i].best_alt_char = Some(top_char);
@@ -743,10 +740,10 @@ pub fn match_lines(
                             observations[obs_i].ch = top_char;
                             observations[obs_i].pflda_replaced = true;
                         }
-                        eprintln!("[pflda] CORRECTED \'{}\' → \'{}\' at seg[{}][{}] (word_idx={})",
+                        if std::env::var("UNPRINT_VERBOSE_PFLDA").is_ok() { eprintln!("[pflda] CORRECTED \'{}\' → \'{}\' at seg[{}][{}] (word_idx={})",
                             pc.ocr_char, top_char, pc.seg_idx, pc.char_pos,
-                            winning_word_segs[pc.seg_idx].source_word_idx);
-                    }
+                            winning_word_segs[pc.seg_idx].source_word_idx); }
+}
                 }
 
                 // -- Build corrected_words from corrections ---------------
@@ -960,10 +957,10 @@ pub fn match_lines(
                     .unwrap_or_default();
                 let font_data = font_cache.load(&fr.font_path).ok();
                 if let Some(ref fdata) = font_data {
-                    if let Ok(mut font) = ab_glyph::FontRef::try_from_slice(fdata) {
+                    if let Ok(mut font) = unprint_fonts::ab_glyph::FontRef::try_from_slice(fdata) {
                         // Apply variable-font axis coordinates
                         if let Some(vars) = fe_opt.and_then(|fe| fe.variations.as_ref()) {
-                            use ab_glyph::VariableFont;
+                            use unprint_fonts::ab_glyph::VariableFont;
                             for (tag, val) in vars {
                                 font.set_variation(tag, *val);
                             }
@@ -973,7 +970,7 @@ pub fn match_lines(
                             let seq = [d.ch];
                             let path = font_ref_dir.join(&fname);
                             if path.exists() { continue; }
-                            let gid_overrides: Vec<Option<ab_glyph::GlyphId>> = vec![override_map.get(&d.ch).copied().map(|gid| ab_glyph::GlyphId(gid))];
+                            let gid_overrides: Vec<Option<unprint_fonts::ab_glyph::GlyphId>> = vec![override_map.get(&d.ch).copied().map(|gid| unprint_fonts::ab_glyph::GlyphId(gid))];
                             let ref_img = char_render::render_ngram_fresh(&font, &seq, &gid_overrides, &char_render::RenderParams::default());
                             if let Some(img) = ref_img {
                                 let _ = img.save(&path);
@@ -1160,17 +1157,17 @@ pub fn compute_font_size_pt(
         Ok(b) => b,
         Err(_) => return fallback_pt,
     };
-    let mut f = match ab_glyph::FontRef::try_from_slice(font_bytes.as_slice()) {
+    let mut f = match unprint_fonts::ab_glyph::FontRef::try_from_slice(font_bytes.as_slice()) {
         Ok(f) => f,
         Err(_) => return fallback_pt,
     };
     if let Some(ref vars) = fm.variations {
-        use ab_glyph::VariableFont;
+        use unprint_fonts::ab_glyph::VariableFont;
         for (tag, val) in vars {
             f.set_variation(tag, *val);
         }
     }
-    use ab_glyph::{Font, PxScale, ScaleFont};
+    use unprint_fonts::ab_glyph::{Font, PxScale, ScaleFont};
     let ref_h = 100.0f32;
     let sf_ref = f.as_scaled(PxScale::from(ref_h));
     let ref_ink = sf_ref.ascent() - sf_ref.descent();
