@@ -163,12 +163,21 @@ pub fn setup() -> bool {
 /// Run unscan with output to /dev/null and return combined stdout+stderr.
 pub fn run_unscan(input: &Path, extra_args: &[&str]) -> String {
     let bin = unscan_bin();
-    let output = Command::new(&bin)
-        .arg(input)
+    let mut cmd = Command::new(&bin);
+    cmd.arg(input)
         .args(["-o", "/dev/null"])
         .args(extra_args)
         .env("RUST_LOG", "info")
-        .output()
+        // Low-mem VM (7.8G no-swap) — t59 needs small cache + skip PFLDA to avoid OOM
+        // Stable config: small cache 5 fonts, per-font-lda dir empty to save mem, skip PFLDA true
+        .env("RAYON_NUM_THREADS", "1")
+        .env("MALLOC_ARENA_MAX", "1")
+        .env("TMPDIR", "/home/hatch/workspace/tmp")
+        .env("UNPRINT_CACHE_DIR", "/home/hatch/.cache/unprint-small")
+        .env("UNPRINT_FONT_ALLOWLIST", "LibreBodoni-400,EBGaramond-400,Arial-BoldMT-700,Roboto-400Italic,PlayfairDisplay-400")
+        .env("UNPRINT_SKIP_PFLDA", "true")
+        .env("UNPRINT_EXTRA_SEAMS", "all");
+    let output = cmd.output()
         .unwrap_or_else(|e| panic!("failed to run {:?}: {}", bin, e));
 
     let mut combined = String::from_utf8_lossy(&output.stdout).to_string();

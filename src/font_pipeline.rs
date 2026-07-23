@@ -599,7 +599,7 @@ pub fn match_lines(
                 // -- Build reverse map: (seg_idx, char_pos) → obs index ---
                 // Used to update observation audit fields alongside corrected_words.
                 let winning_pos_map: &[(usize, usize)] = if seg_winner.as_deref() == Some("ligature") {
-                    &[] // ligature pos_map not tracked (rare path)
+                    &lig_pos_map
                 } else {
                     &plain_pos_map
                 };

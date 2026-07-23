@@ -734,62 +734,119 @@ pub fn run_train(mut args: TrainArgs) {
     eprintln!("Training cache: {}", feat_dir.display());
 
     // ── Pre-warm character render cache + build GlyphMap ──
-    // Render every (font, char) at default params, capturing the content hash.
-    // Identical renders share a hash → same glyph equivalence class.
-    // Memory-efficient: only one font's char crops in memory at a time per thread,
-    // no global Vec of all hashes (was OOM at 5898 fonts × 95 chars).
+    // Merge the existing glyph map with the current catalog. A known hash plus
+    // an existing PNG is enough to carry the entry forward without rendering.
+    // Missing hashes or missing PNGs are rendered once and recorded in the new map.
+    let prewarm_params = crate::char_render::RenderParams::default();
     let glyph_map = {
-        use std::sync::{Mutex, atomic::{AtomicUsize, Ordering}};
+        use std::sync::{
+            atomic::{AtomicUsize, Ordering},
+            Mutex,
+        };
         let prewarm_done = AtomicUsize::new(0);
+        let prewarm_reused = AtomicUsize::new(0);
+        let prewarm_rendered = AtomicUsize::new(0);
         let prewarm_total = catalog.len();
-        eprintln!("\nPre-warming character render cache + building GlyphMap ({} fonts × {} chars)...",
-            prewarm_total, sequences.len());
+        eprintln!(
+            "\nPre-warming character render cache + building GlyphMap ({} fonts × {} chars)...",
+            prewarm_total,
+            sequences.len()
+        );
         let prewarm_t0 = std::time::Instant::now();
 
+        let old_gmap_path = crate::glyph_map::NgramGlyphMap::default_path();
+        let old_gmap = match crate::glyph_map::NgramGlyphMap::load(&old_gmap_path) {
+            Ok(g) => {
+                eprintln!(
+                    "  Loaded existing GlyphMap hints from {}",
+                    old_gmap_path.display()
+                );
+                Some(g)
+            }
+            Err(e) => {
+                eprintln!("  No usable existing GlyphMap hints: {e}");
+                None
+            }
+        };
         let gmap = Mutex::new(crate::glyph_map::NgramGlyphMap::new(catalog_hash));
 
         catalog.par_iter().for_each(|fe| {
-            let font_data = match std::fs::read(&fe.path) {
-                Ok(d) => d,
-                Err(_) => {
-                    let done = prewarm_done.fetch_add(1, Ordering::Relaxed) + 1;
-                    if done % 500 == 0 || done == prewarm_total {
-                        eprintln!("  Pre-render [{}/{}]...", done, prewarm_total);
-                    }
-                    return;
-                }
-            };
-            let font = match ab_glyph::FontRef::try_from_slice(&font_data) {
-                Ok(f) => f,
-                Err(_) => {
-                    let done = prewarm_done.fetch_add(1, Ordering::Relaxed) + 1;
-                    if done % 500 == 0 || done == prewarm_total {
-                        eprintln!("  Pre-render [{}/{}]...", done, prewarm_total);
-                    }
-                    return;
-                }
-            };
-            let overrides = fe.glyph_overrides.as_deref();
             let fk = fe.font_key();
-            // Collect hashes for this font only (95 entries, not 560k)
             let mut local_hashes: Vec<(usize, u64)> = Vec::with_capacity(sequences.len());
+            let mut need_render: Vec<usize> = Vec::new();
+
             for (si, seq) in sequences.iter().enumerate() {
-                let gid_overrides: Vec<Option<ab_glyph::GlyphId>> = seq.iter().map(|c| {
-                    overrides.and_then(|ovs| ovs.iter().find(|(ch, _)| *ch == *c).map(|(_, g)| ab_glyph::GlyphId(*g)))
-                }).collect();
-                let params = crate::char_render::RenderParams::default();
-                if let Some(img) = crate::char_render::render_ngram_fresh(&font, seq, &gid_overrides, &params) {
-                    let hash = crate::glyph_map::hash_image(&img);
-                    let path = crate::char_render::ngram_cache_path(seq, hash, &params);
-                    if !path.exists() {
-                        if let Some(parent) = path.parent() {
-                            let _ = std::fs::create_dir_all(parent);
+                if let Some(old) = old_gmap.as_ref() {
+                    if let Some(hash) = old.hash_for_font(seq, &fk) {
+                        let path = crate::char_render::ngram_cache_path(seq, hash, &prewarm_params);
+                        if path.exists() {
+                            local_hashes.push((si, hash));
+                            continue;
                         }
-                        let _ = img.save(&path);
                     }
-                    local_hashes.push((si, hash));
                 }
+                need_render.push(si);
             }
+
+            let reused = local_hashes.len();
+            if !need_render.is_empty() {
+                let font_data = match std::fs::read(&fe.path) {
+                    Ok(d) => d,
+                    Err(_) => {
+                        prewarm_reused.fetch_add(reused, Ordering::Relaxed);
+                        let done = prewarm_done.fetch_add(1, Ordering::Relaxed) + 1;
+                        if done % 500 == 0 || done == prewarm_total {
+                            eprintln!("  Pre-render [{}/{}]...", done, prewarm_total);
+                        }
+                        return;
+                    }
+                };
+                let font = match ab_glyph::FontRef::try_from_slice(&font_data) {
+                    Ok(f) => f,
+                    Err(_) => {
+                        prewarm_reused.fetch_add(reused, Ordering::Relaxed);
+                        let done = prewarm_done.fetch_add(1, Ordering::Relaxed) + 1;
+                        if done % 500 == 0 || done == prewarm_total {
+                            eprintln!("  Pre-render [{}/{}]...", done, prewarm_total);
+                        }
+                        return;
+                    }
+                };
+                let overrides = fe.glyph_overrides.as_deref();
+                let mut rendered = 0usize;
+                for si in need_render {
+                    let seq = &sequences[si];
+                    let gid_overrides: Vec<Option<ab_glyph::GlyphId>> = seq
+                        .iter()
+                        .map(|c| {
+                            overrides.and_then(|ovs| {
+                                ovs.iter()
+                                    .find(|(ch, _)| *ch == *c)
+                                    .map(|(_, g)| ab_glyph::GlyphId(*g))
+                            })
+                        })
+                        .collect();
+                    if let Some(img) = crate::char_render::render_ngram_fresh(
+                        &font,
+                        seq,
+                        &gid_overrides,
+                        &prewarm_params,
+                    ) {
+                        let hash = crate::glyph_map::hash_image(&img);
+                        let path = crate::char_render::ngram_cache_path(seq, hash, &prewarm_params);
+                        if !path.exists() {
+                            if let Some(parent) = path.parent() {
+                                let _ = std::fs::create_dir_all(parent);
+                            }
+                            let _ = img.save(&path);
+                        }
+                        local_hashes.push((si, hash));
+                        rendered += 1;
+                    }
+                }
+                prewarm_rendered.fetch_add(rendered, Ordering::Relaxed);
+            }
+
             // Register this font's hashes - one lock per font, not per char
             if !local_hashes.is_empty() {
                 let mut g = gmap.lock().unwrap();
@@ -797,23 +854,41 @@ pub fn run_train(mut args: TrainArgs) {
                     g.register(&sequences[si], &fk, hash);
                 }
             }
+            prewarm_reused.fetch_add(reused, Ordering::Relaxed);
             let done = prewarm_done.fetch_add(1, Ordering::Relaxed) + 1;
             if done % 500 == 0 || done == prewarm_total {
                 eprintln!("  Pre-render [{}/{}]...", done, prewarm_total);
             }
         });
 
-        let gmap = gmap.into_inner().unwrap();
+        let mut gmap = gmap.into_inner().unwrap();
 
         let total_glyphs: usize = gmap.groups.values().map(|g| g.len()).sum();
-        let total_deduped: usize = gmap.groups.values()
+        let total_deduped: usize = gmap
+            .groups
+            .values()
             .flat_map(|gs| gs.iter())
             .filter(|g| g.font_keys.len() > 1)
             .map(|g| g.font_keys.len() - 1)
             .sum();
-        eprintln!("  GlyphMap: {} unique glyphs across {} sequences ({} duplicate renders eliminated)",
-            total_glyphs, gmap.groups.len(), total_deduped);
-        eprintln!("  Pre-warm + GlyphMap complete in {:.1}s", prewarm_t0.elapsed().as_secs_f64());
+        eprintln!(
+            "  GlyphMap: {} unique glyphs across {} sequences ({} duplicate renders eliminated)",
+            total_glyphs,
+            gmap.groups.len(),
+            total_deduped
+        );
+        eprintln!(
+            "  Pre-warm reused {} cached PNGs and rendered {} missing glyphs",
+            prewarm_reused.load(Ordering::Relaxed),
+            prewarm_rendered.load(Ordering::Relaxed)
+        );
+        if let Err(e) = gmap.write_bin(&crate::glyph_map::NgramGlyphMap::default_path()) {
+            eprintln!("warning: failed to write GlyphMap: {e}");
+        }
+        eprintln!(
+            "  Pre-warm + GlyphMap complete in {:.1}s",
+            prewarm_t0.elapsed().as_secs_f64()
+        );
         gmap
     };
 
@@ -974,9 +1049,31 @@ pub fn run_train(mut args: TrainArgs) {
                         let mut params = args.render_params.clone();
                         params.height = ht;
                         params.aa = all_aa[aa_idx_all];
-                        let img = match crate::char_render::render_ngram_fresh(
-                            &font, seq, &gid_overrides, &params,
-                        ) {
+                        let matches_prewarm_params = params.height == prewarm_params.height
+                            && params.render_scale == prewarm_params.render_scale
+                            && params.aa == prewarm_params.aa
+                            && params.binarize_threshold == prewarm_params.binarize_threshold;
+                        let img = if matches_prewarm_params {
+                            glyph_map
+                                .hash_for_font(seq, &fk)
+                                .and_then(|hash| crate::char_render::load_cached_ngram(seq, hash, &params))
+                                .or_else(|| {
+                                    crate::char_render::render_ngram_fresh(
+                                        &font,
+                                        seq,
+                                        &gid_overrides,
+                                        &params,
+                                    )
+                                })
+                        } else {
+                            crate::char_render::render_ngram_fresh(
+                                &font,
+                                seq,
+                                &gid_overrides,
+                                &params,
+                            )
+                        };
+                        let img = match img {
                             Some(img) => img,
                             None => continue,
                         };

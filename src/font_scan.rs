@@ -613,6 +613,36 @@ pub fn scan_fonts(dirs: &[PathBuf], quiet: bool) -> Vec<FontEntry> {
         return dedup_fonts(fonts, quiet);
     }
 
+    // Low-mem optimization for alt cache with allowlist: if cached entries already cover all allowlisted fonts,
+    // skip scanning 656 new files (which OOMs on 7.8G VM). Reuse cached entries.
+    if is_alt_cache {
+        if let Some(ref allow) = allowlist {
+            let cached_keys: std::collections::HashSet<String> = cached_by_path.values()
+                .flat_map(|v| v.iter().map(|e| e.font_key()))
+                .collect();
+            // Check if all allowlisted keys (or their base without |variant) are present
+            let all_present = allow.iter().all(|k| {
+                cached_keys.contains(k) || 
+                // also check if base key present when allowlist contains variant
+                cached_keys.contains(&k.split('|').next().unwrap_or("").to_string())
+            });
+            if all_present && !cached_by_path.is_empty() {
+                let mut fonts: Vec<FontEntry> = current_paths.iter()
+                    .filter(|p| cached_by_path.contains_key(*p))
+                    .flat_map(|p| cached_by_path.get(p).cloned().unwrap_or_default())
+                    .collect();
+                fonts.retain(|f| !f.family_name.is_empty());
+                let before = fonts.len();
+                fonts.retain(|f| allow.contains(&f.font_key()));
+                if !quiet {
+                    eprintln!("[scan] Low-mem alt-cache shortcut: reusing {} cached entries, filtered {} -> {} for allowlist (skipping {} new files)",
+                        before, before, fonts.len(), added.len());
+                }
+                return dedup_fonts(fonts, quiet);
+            }
+        }
+    }
+
     if !removed.is_empty() {
         if !quiet { eprintln!("[scan] {} font files removed", removed.len()); }
     }

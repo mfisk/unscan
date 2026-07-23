@@ -850,8 +850,8 @@ fn build_miss_block(
         _ => String::new(),
     };
 
-    // Per-character comparison table (skip for similarity-only failures)
-    let obs_table_html = if ce.kind == MissKind::SimilarityFailure || entry.obs_votes.is_empty() {
+    // Per-character comparison table (skip for similarity-only failures unless ligature path picked)
+    let obs_table_html = if entry.obs_votes.is_empty() || (ce.kind == MissKind::SimilarityFailure && entry.seg_winner.is_none()) {
         String::new()
     } else {
         let obs_to_show = pick_interesting_observations(&entry.obs_votes, 6, 0);

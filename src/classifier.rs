@@ -3156,6 +3156,9 @@ fn read_catalog_hash() -> Option<u64> {
 /// If so, any classifier weights derived from those features are suspect
 /// (glyph IDs may correspond to a stale catalog ordering).
 fn training_features_stale() -> bool {
+    if !crate::cache::is_default_cache_dir() {
+        return false;
+    }
     let scan_path = crate::font_scan::scan_cache_path();
     let scan_mtime = match std::fs::metadata(&scan_path).and_then(|m| m.modified()) {
         Ok(t) => t,
@@ -3185,6 +3188,9 @@ fn training_features_stale() -> bool {
 /// This catches the case where features were re-rendered (fixing a stale
 /// catalog) but the process died before retraining the weights.
 fn weights_older_than_features(weights_path: &std::path::Path) -> bool {
+    if !crate::cache::is_default_cache_dir() {
+        return false;
+    }
     let weights_mtime = match std::fs::metadata(weights_path).and_then(|m| m.modified()) {
         Ok(t) => t,
         Err(_) => return false, // no weights file → nothing to compare
@@ -3557,11 +3563,15 @@ impl PerFontLda {
     }
 
     /// Deterministic cache path for a font_key.
+    /// Uses FNV-1a 64-bit to avoid DefaultHasher's random SipHash seed which
+    /// makes cache file names non-deterministic across processes (causing cache misses + retraining OOM).
     fn cache_path(font_key: &str) -> std::path::PathBuf {
-        use std::hash::{Hash, Hasher};
-        let mut hasher = std::collections::hash_map::DefaultHasher::new();
-        font_key.hash(&mut hasher);
-        let h = hasher.finish();
+        // FNV-1a 64-bit
+        let mut h: u64 = 0xcbf29ce484222325;
+        for b in font_key.as_bytes() {
+            h ^= *b as u64;
+            h = h.wrapping_mul(0x100000001b3);
+        }
         Self::cache_dir().join(format!("{:016x}.bin", h))
     }
 

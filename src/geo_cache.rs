@@ -262,8 +262,7 @@ pub struct GeometryCache {
 
 impl GeometryCache {
     pub fn default_path() -> PathBuf {
-        let home = std::env::var("HOME").unwrap_or_else(|_| ".".to_string());
-        Path::new(&home).join(".cache").join("unprint").join("geo-cache.bin")
+        crate::cache::paths::geo_cache_bin()
     }
 
     pub fn has_font(&self, font_key: &str) -> bool { self.fonts.contains_key(font_key) }
@@ -775,7 +774,7 @@ impl GeometryCache {
     }
 
     pub fn load_or_build(font_registry: &crate::font_scan::FontRegistry, font_cache: &crate::font_cache::FontCache, quiet: bool) -> Self {
-        let cache_path = Self::default_path();
+        let cache_path = crate::cache::paths::geo_cache_bin();
         let catalog_hash = font_registry.catalog_hash();
 
         // Fast path: if cache exists and catalog hash matches, reuse directly (no cloning)

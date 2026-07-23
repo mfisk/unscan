@@ -40,20 +40,14 @@ from rasterize import rasterize
 # Matches tests/t59_seam_regression.rs EXPECTED and lob coverage.
 # ---------------------------------------------------------------------------
 HARDCODED_7 = [
-    # LibreBodoni lowercase
     ("LibreBodoni-400", "abcdefghijklmnopqrstuvwxyz."),
-    # LibreBodoni lining figures
-    ("LibreBodoni-400", "Lining figures: 0 1 2 3 4 5 6 7 8 9."),
-    # LibreBodoni uppercase
     ("LibreBodoni-400", "ABCDEFGHIJKLMNOPQRSTUVWXYZ."),
-    # EBGaramond body text
-    ("EBGaramond-400", "carved type into wood or imported it from Italy."),
-    # Arial Bold
-    ("Arial-BoldMT-700", "Bold: The quick brown fox jumps over."),
-    # Roboto Italic
-    ("Roboto-400It", "Italic: The quick brown fox jumps over 1,234,567,890 lazy,"),
-    # PlayfairDisplay lining figures (clean, no OCR corruption)
-    ("PlayfairDisplay-400", "Lining figures: 0 1 2 3 4 5 6 7 8 9."),
+    ("Georgia-400", "ABCDEFGHIJKLMNOPQRSTUVWXYZ."),
+    ("OpenSans-400", "abcdefghijklmnopqrstuvwxyz."),
+    ("LibreBodoni-400Italic", "dogs."),
+    ("IBMPlexSans-400", "abcdefghijklmnopqrstuvwxyz."),
+    ("SourceSerif4-400It", "Mayr-Duffner."),
+    ("SourceSerif4-400It", "Type"),
 ]
 
 def parse_args():

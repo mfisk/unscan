@@ -26,9 +26,10 @@
 //!      run closest to `(a_right+b_x)/2`, splits at `run_start` / `run_end+1`.
 //!      Single-word lines (`n<2`) are unchanged.
 //!    - `trim_words_to_ink` shrinks each word to its ink bounds using middle
-//!      60% of height to avoid adjacent-line contamination, removing trailing/
+//!      80% of height to avoid adjacent-line contamination, removing trailing/
 //!      leading whitespace (e.g. Georgia final 'a' 10px ws). This replaces the
-//!      prior 90% shrink which regressed `abcdefghijklmnopqrstuvwxyz.` 489w→440w.
+//!      prior 90% shrink which regressed `abcdefghijklmnopqrstuvwxyz.` 489w→440w,
+//!      and the prior 60% which cut off baseline '.'.
 
 use crate::error::ScanTextError;
 use ab_glyph::{Font, PxScale, ScaleFont, point};
@@ -523,7 +524,7 @@ pub fn fix_overlapping_words_by_ink(
 /// so boxes are already roughly correct.
 ///
 /// To avoid false trimming from vertical overlap with other lines, we scan
-/// only the middle 60% of the word height (or full height if very short),
+/// only the middle 80% of the word height (or full height if very short),
 /// and require at least 1 ink pixel per column.
 ///
 /// This replaces the prior 90% shrink which could place edges inside
@@ -549,10 +550,11 @@ pub fn trim_words_to_ink(
                 continue;
             }
 
-            // Use middle 60% of height to avoid ascenders/descenders from
-            // adjacent lines that vertically overlap (Georgia p3 L54).
+            // Use middle 80% of height to avoid ascenders/descenders from
+            // adjacent lines that vertically overlap (Georgia p3 L54) while
+            // keeping baseline punctuation like '.' which sits low (y 49-53 for h=59).
             let (y_top, y_bot) = if wh >= 10 {
-                let margin = wh * 20 / 100; // 20% top and bottom
+                let margin = wh * 10 / 100; // 10% top and bottom -> 80% middle
                 (wy + margin, wy + wh - margin)
             } else {
                 (wy, wy + wh)
