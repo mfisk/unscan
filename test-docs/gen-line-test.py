@@ -48,6 +48,7 @@ HARDCODED_7 = [
     ("IBMPlexSans-400", "abcdefghijklmnopqrstuvwxyz."),
     ("SourceSerif4-400It", "Mayr-Duffner."),
     ("SourceSerif4-400It", "Type"),
+    ("Georgia-400", "GEORGIA."),
 ]
 
 def parse_args():
