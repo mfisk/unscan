@@ -1463,3 +1463,119 @@ pub fn crop_ngram(
     normalize_to_ink_bounds(&crop, NORM_H)
 }
 
+/// Crop a character and return its normalized image plus ink metrics in word coordinates.
+/// Scan crop does seam handling (whitening outside winding divider); trim itself
+/// finds ink bounds and returns center in caller's (word) coordinate system.
+/// This is the single source of truth for both recognition crop and geometry midpoint,
+/// so trim is called exactly once per character.
+pub fn char_crop_and_metrics(
+    word_img: &GrayImage,
+    i: usize,
+    boundaries: &[u32],
+    seam_paths: &HashMap<u32, Vec<[u32; 2]>>,
+    crop_h: u32,
+) -> Option<(GrayImage, u32, u32, u32, u32, f64, f64)> {
+    let (ww, _) = word_img.dimensions();
+    if i + 1 >= boundaries.len() {
+        return None;
+    }
+    let b_left = boundaries[i];
+    let b_right = boundaries[i + 1];
+    let left_seam = seam_paths.get(&b_left);
+    let right_seam = seam_paths.get(&b_right);
+
+    let x0 = if let Some(sp) = left_seam {
+        sp.iter().map(|p| p[1]).min().unwrap_or(b_left).min(b_left)
+    } else {
+        b_left
+    }.min(ww);
+    let x1 = if let Some(sp) = right_seam {
+        sp.iter().map(|p| p[1]).max().unwrap_or(b_right).max(b_right).saturating_add(1)
+    } else {
+        b_right
+    }.min(ww);
+
+    if x1 <= x0 || (x1 - x0) < 2 {
+        return None;
+    }
+
+    let mut crop = image::imageops::crop_imm(word_img, x0, 0, x1 - x0, crop_h).to_image();
+    let crop_w = x1 - x0;
+    for y in 0..crop_h.min(crop.height()) {
+        if let Some(sp) = left_seam {
+            if let Some(seam_x) = sp.iter().filter(|p| p[0] == y).map(|p| p[1]).min() {
+                let limit = seam_x.saturating_sub(x0);
+                for cx in 0..limit.min(crop_w) {
+                    crop.put_pixel(cx, y, image::Luma([255u8]));
+                }
+            }
+        }
+        if let Some(sp) = right_seam {
+            if let Some(seam_x) = sp.iter().filter(|p| p[0] == y).map(|p| p[1]).max() {
+                let start = seam_x.saturating_sub(x0);
+                for cx in start..crop_w {
+                    crop.put_pixel(cx, y, image::Luma([255u8]));
+                }
+            }
+        }
+    }
+
+    // Trim to ink — single scan, no edge logic beyond the whitening already done.
+    const THRESH: u8 = 200;
+    let (cw, ch) = crop.dimensions();
+    if cw == 0 || ch == 0 {
+        return None;
+    }
+    let mut min_x = cw;
+    let mut max_x = 0u32;
+    let mut min_y = ch;
+    let mut max_y = 0u32;
+    for y in 0..ch {
+        for x in 0..cw {
+            if crop.get_pixel(x, y).0[0] < THRESH {
+                if x < min_x { min_x = x; }
+                if x > max_x { max_x = x; }
+                if y < min_y { min_y = y; }
+                if y > max_y { max_y = y; }
+            }
+        }
+    }
+    if min_x > max_x || min_y > max_y {
+        return None;
+    }
+
+    // Absolute bounds and center in word coordinates (caller's system)
+    let x_min_abs = x0 + min_x;
+    let x_max_abs = x0 + max_x;
+    let y_min_abs = min_y;
+    let y_max_abs = max_y;
+    let cx = (x_min_abs as f64 + x_max_abs as f64) * 0.5;
+    let cy = (y_min_abs as f64 + y_max_abs as f64) * 0.5;
+
+    // Build normalized image from the same ink bounds (no second scan)
+    let ink_w = max_x - min_x + 1;
+    let ink_h = max_y - min_y + 1;
+    let pad = 1u32;
+    let canvas_w = ink_w + 2 * pad;
+    let canvas_h = ink_h + 2 * pad;
+    let mut canvas = GrayImage::from_pixel(canvas_w, canvas_h, image::Luma([255u8]));
+    for y in min_y..=max_y {
+        for x in min_x..=max_x {
+            let px = crop.get_pixel(x, y);
+            canvas.put_pixel(x - min_x + pad, y - min_y + pad, *px);
+        }
+    }
+    let scaled_w = (canvas_w as f32 * NORM_H as f32 / canvas_h as f32).ceil() as u32;
+    if scaled_w < 2 {
+        return None;
+    }
+    let normalized = image::imageops::resize(
+        &canvas,
+        scaled_w,
+        NORM_H,
+        image::imageops::FilterType::Lanczos3,
+    );
+
+    Some((normalized, x_min_abs, x_max_abs, y_min_abs, y_max_abs, cx, cy))
+}
+

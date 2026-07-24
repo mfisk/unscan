@@ -312,15 +312,8 @@ pub fn match_lines(
         #[allow(unused_assignments)] // overwritten in the scoring block before use
         let mut plain_pos_map: Vec<(usize, usize)> = Vec::new();
         let mut lig_pos_map: Vec<(usize, usize)> = Vec::new();
-        // Precompute ink bounds for geo (plain) — used for scoring and audit
-        // Uses seam paths to mask adjacent ink, same as char cropping (avoids g picking up f ascender, etc.)
-        // Also computes word ink midpoint in same pass.
-        let wib_plain: Vec<crate::geometry_classifier::WordGeoMeasurement> = line_crops.word_segs.iter()
-            .map(|ws| crate::geometry_classifier::measure_char_ink_bounds(&ws.word_img, &ws.chars, &ws.boundaries, &ws.seam_paths))
-            .collect();
-        let wib_lig_opt: Option<Vec<crate::geometry_classifier::WordGeoMeasurement>> = line_crops.lig_word_segs.as_ref().map(|segs|
-            segs.iter().map(|ws| crate::geometry_classifier::measure_char_ink_bounds(&ws.word_img, &ws.chars, &ws.boundaries, &ws.seam_paths)).collect()
-        );
+        let mut wib_plain: Vec<crate::geometry_classifier::WordGeoMeasurement> = Vec::new();
+        let mut wib_lig_opt: Option<Vec<crate::geometry_classifier::WordGeoMeasurement>> = None;
         let (font_result, tie_candidates_audit, gt_font_key) = {
 
             // Crop PNGs are saved after font matching, gated by ground-truth
@@ -340,11 +333,14 @@ pub fn match_lines(
             let ensure_keys: Vec<&str> = gt_font_key.as_deref().into_iter().collect();
 
             // ── Score: build sliding-window observations, run identify_fonts ──
+            // Single scan per character: seam handling in scan-crop (whitening),
+            // trim returns center in word coords for both h and v. No double scan.
 
-            let (plain_windows, plain_pos_map_tmp) = crate::ngram::build_scoring_windows(
-                &line_crops.word_segs, classifier, glyph_map,
+            let (plain_windows, plain_pos_map_tmp, wib_plain_tmp) = crate::ngram::build_scoring_windows_with_geo(
+                &line_crops.word_segs,
                 &mut crop_store_plain,
             );
+            wib_plain = wib_plain_tmp;
             plain_pos_map = plain_pos_map_tmp.clone();
             let scoring_plain = font_match::identify_fonts(
                 &plain_windows, classifier, glyph_map,
@@ -357,17 +353,19 @@ pub fn match_lines(
 
             // ── Score ligature path (if present) ─────────────────
             let scoring_lig = if let Some(ref lig_segs) = line_crops.lig_word_segs {
-                let (lig_windows, lig_pm) = crate::ngram::build_scoring_windows(
-                    lig_segs, classifier, glyph_map,
+                let (lig_windows, lig_pm, wib_lig_tmp) = crate::ngram::build_scoring_windows_with_geo(
+                    lig_segs,
                     &mut crop_store_lig,
                 );
                 lig_pos_map = lig_pm.clone();
-                let wib_lig = wib_lig_opt.as_ref().expect("wib_lig_opt should be Some when lig_segs present");
+                wib_lig_opt = Some(wib_lig_tmp);
+                // Use a reference to the just-stored wib for scoring; clone for borrow checker safety
+                let wib_lig_ref = wib_lig_opt.as_ref().unwrap();
                 Some(font_match::identify_fonts(
                     &lig_windows, classifier, glyph_map,
                     args.thoroughness, args.full_audit(),
                     &ensure_keys, args.min_ngram_prob,
-                    lig_segs, wib_lig,
+                    lig_segs, wib_lig_ref,
                     font_registry, font_cache, geo_cache,
                     &lig_pos_map,
                 ))
@@ -554,7 +552,7 @@ pub fn match_lines(
             // skip pflda for t64 fast path
         } else if let (Some(ref fr), Some(rtd)) = (&font_result, training_data) {
             if std::env::var("UNPRINT_VERBOSE_PFLDA").is_ok() { eprintln!("[pflda] OCR correction pass for font_key={}", fr.font_key); }
-}let ctx = rtd.as_context(glyph_map);
+            let ctx = rtd.as_context(glyph_map);
             if let Some(pf_lda) = classifier::PerFontLda::load_or_train(&fr.font_key, &ctx) {
                 let winning_word_segs: &[segment::WordSeg] = if seg_winner.as_deref() == Some("ligature") {
                     line_crops.lig_word_segs.as_deref().unwrap_or(&line_crops.word_segs)
@@ -562,7 +560,7 @@ pub fn match_lines(
                     &line_crops.word_segs
                 };
                 if std::env::var("UNPRINT_VERBOSE_PFLDA").is_ok() { eprintln!("[pflda] Loaded/trained OK, checking chars across {} word_segs", winning_word_segs.len()); }
-}// -- Load font and compute glyph metric ratios ----------
+                // -- Load font and compute glyph metric ratios ----------
                 // Used to validate OCR corrections: reject replacements
                 // whose vertical geometry is incompatible with the crop.
                 let glyph_metrics: std::collections::HashMap<char, (f32, f32)> = {
@@ -593,7 +591,7 @@ pub fn match_lines(
                 };
                 if !glyph_metrics.is_empty() {
                     if std::env::var("UNPRINT_VERBOSE_PFLDA").is_ok() { eprintln!("[pflda] Loaded glyph metrics for {} chars", glyph_metrics.len()); }
-}}
+                }
 
                 // -- Build reverse map: (seg_idx, char_pos) → obs index ---
                 // Used to update observation audit fields alongside corrected_words.
@@ -669,7 +667,7 @@ pub fn match_lines(
                 };
                 if std::env::var("UNPRINT_VERBOSE_PFLDA").is_ok() { eprintln!("[pflda] inference σ²={:.6} (training σ²={:.6}, {} chars)",
                     inference_sigma_sq, pf_lda.sigma_sq(), pflda_chars.len()); }
-// -- Pass 2: softmax with inference σ², apply gate --------
+                // -- Pass 2: softmax with inference σ², apply gate --------
                 // corrections: (seg_idx, char_pos, from_char, to_char)
                 let mut corrections: Vec<(usize, usize, char, char)> = Vec::new();
 
@@ -705,7 +703,7 @@ pub fn match_lines(
                         ocr_p.map(|p| format!("{:.4}", p)).unwrap_or("?".into()),
                         probs.iter().take(5).map(|(c, p, d)| format!("\'{}\' ={:.4}(d²={:.3})", c, p, d)).collect::<Vec<_>>().join(" "),
                     ); }
-// Update observation audit fields if we have the mapping
+                    // Update observation audit fields if we have the mapping
                     if let Some(&obs_i) = char_to_obs.get(&(pc.seg_idx, pc.char_pos)) {
                         if top_char != pc.ocr_char {
                             observations[obs_i].best_alt_char = Some(top_char);
@@ -743,7 +741,7 @@ pub fn match_lines(
                         if std::env::var("UNPRINT_VERBOSE_PFLDA").is_ok() { eprintln!("[pflda] CORRECTED \'{}\' → \'{}\' at seg[{}][{}] (word_idx={})",
                             pc.ocr_char, top_char, pc.seg_idx, pc.char_pos,
                             winning_word_segs[pc.seg_idx].source_word_idx); }
-}
+                    }
                 }
 
                 // -- Build corrected_words from corrections ---------------

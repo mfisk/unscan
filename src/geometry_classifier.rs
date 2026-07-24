@@ -110,48 +110,69 @@ pub fn measure_char_ink_bounds(
     for i in 0..n_chars {
         let b_left = bounds[i];
         let b_right = bounds[i + 1];
-        let x0_rect = b_left.min(w.saturating_sub(1)) as usize;
-        let x1_rect = b_right.min(w) as usize;
-        if x0_rect >= x1_rect {
+        let left_seam = seam_paths.get(&b_left);
+        let right_seam = seam_paths.get(&b_right);
+
+        // Expanded crop bounds that include seam excursions, same as crop_ngram
+        // (scan crop does seam handling by whitening outside, trim itself uses no edges)
+        let x0_exp = if let Some(sp) = left_seam {
+            sp.iter().map(|p| p[1]).min().unwrap_or(b_left).min(b_left)
+        } else {
+            b_left
+        }.min(w) as usize;
+        let x1_exp = if let Some(sp) = right_seam {
+            sp.iter().map(|p| p[1]).max().unwrap_or(b_right).max(b_right).saturating_add(1)
+        } else {
+            b_right
+        }.min(w) as usize;
+
+        if x0_exp >= x1_exp {
             result.push(CharInkBounds {
-                cx: x0_rect as f64,
+                cx: x0_exp as f64,
                 cy: h as f64 / 2.0,
                 width: 0.0,
                 height: 0.0,
-                x_min: x0_rect as u32,
-                x_max: x0_rect as u32,
+                x_min: x0_exp as u32,
+                x_max: x0_exp as u32,
                 y_min: 0,
                 y_max: h,
             });
             continue;
         }
 
-        let left_seam = seam_paths.get(&b_left);
-        let right_seam = seam_paths.get(&b_right);
-
-        // Find ink bounds within this character's seam-masked x-range
-        let mut x_min = x1_rect;
-        let mut x_max = x0_rect;
+        // Find ink bounds within seam-masked crop — trim does not use edges,
+        // it only finds dark pixels in the already-masked crop (seam handling
+        // done by whitening in scan-crop creation, mirrored here).
+        let mut x_min = x1_exp;
+        let mut x_max = x0_exp;
         let mut y_min = h as usize;
         let mut y_max = 0usize;
         let mut has_ink = false;
 
         for y in 0..h as usize {
-            // Determine per-row left/right limits from seams (same as crop_ngram)
-            let mut left_limit = x0_rect;
-            let mut right_limit = x1_rect;
+            // Seam handling (whitening) is part of scan-crop, not trim.
+            // Here we mirror that whitening to get the same masked image,
+            // but trim itself is just min/max of remaining ink.
+            let mut left_limit = x0_exp;
+            let mut right_limit = x1_exp;
 
             if let Some(sp) = left_seam {
                 if let Some(seam_x) = sp.iter().filter(|p| p[0] as usize == y).map(|p| p[1] as usize).min() {
                     // left seam: ink must be >= seam_x
-                    left_limit = seam_x.max(x0_rect).min(x1_rect);
+                    left_limit = seam_x;
                 }
             }
             if let Some(sp) = right_seam {
                 if let Some(seam_x) = sp.iter().filter(|p| p[0] as usize == y).map(|p| p[1] as usize).max() {
-                    // right seam: ink must be < seam_x (crop_ngram whites out >= seam_x)
-                    right_limit = seam_x.min(x1_rect).max(left_limit);
+                    // right seam: ink must be < seam_x
+                    right_limit = seam_x;
                 }
+            }
+            // Clamp to image, keep ordering
+            left_limit = left_limit.min(w as usize);
+            right_limit = right_limit.min(w as usize);
+            if left_limit > right_limit {
+                continue;
             }
             // For uniform fallback (no seams) left_limit==x0_rect, right_limit==x1_rect
 
@@ -168,15 +189,15 @@ pub fn measure_char_ink_bounds(
         }
 
         let cb = if !has_ink {
-            let cx = (x0_rect + x1_rect) as f64 / 2.0;
+            let cx = (x0_exp + x1_exp) as f64 / 2.0;
             let cy = h as f64 / 2.0;
             CharInkBounds {
                 cx,
                 cy,
-                width: (x1_rect - x0_rect) as f64,
+                width: (x1_exp - x0_exp) as f64,
                 height: h as f64,
-                x_min: x0_rect as u32,
-                x_max: x1_rect as u32,
+                x_min: x0_exp as u32,
+                x_max: x1_exp as u32,
                 y_min: 0,
                 y_max: h,
             }
