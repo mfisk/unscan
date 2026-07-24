@@ -1,0 +1,256 @@
+use clap::Parser;
+use std::path::{Path, PathBuf};
+
+#[derive(Parser, Debug)]
+#[command(
+    name = "unprint",
+    about = "Replace scanned (raster) text with native (vector) text.\n\n\
+             Zero information loss: only replaces raster when BOTH OCR and font match\n\
+             confidence are high. All remaining raster is kept at original quality.\n\
+             Also vectorizes lines, rectangles, and solid fills.",
+    version,
+    arg_required_else_help = true,
+    help_template = "{before-help}{name} {version}\n{about-with-newline}\n{usage-heading} {usage}\n\n{all-args}{after-help}",
+)]
+pub struct Args {
+    // ── Input / Output (visible) ───────────────────────────────────
+    /// Input file (PDF or image: PNG, JPEG, TIFF, BMP).
+    #[arg(value_name = "INPUT", help_heading = "Input")]
+    pub input: Option<PathBuf>,
+
+    /// Output PDF path
+    #[arg(short, long, value_name = "PDF", help_heading = "Output")]
+    pub output: Option<PathBuf>,
+
+    /// Additional font search directories (repeatable)
+    #[arg(long, value_name = "DIR", help_heading = "Input")]
+    pub font_dir: Vec<PathBuf>,
+
+    /// Process only the given pages (1-indexed, comma-separated, ranges ok).
+    /// Examples: --pages 3  --pages 1,3,5  --pages 2-4,7
+    /// Omit to process all pages.
+    #[arg(long, value_name = "PAGES", help_heading = "Input")]
+    pub pages: Option<String>,
+
+    /// DPI for PDF page rasterization
+    #[arg(long, default_value = "300", help_heading = "Processing")]
+    pub dpi: u32,
+
+    /// Skip geometry vectorization (lines, rectangles, fills)
+    #[arg(long, help_heading = "Processing")]
+    pub no_geometry: bool,
+
+    /// Smooth font sizes: unify per-word sizes within consecutive same-font
+    /// runs to their median, removing OCR bbox noise. Outlier words (>1pt
+    /// from the run mean) keep their natural size.
+    #[arg(long, help_heading = "Processing")]
+    pub smooth: bool,
+
+    /// Suppress progress and informational chatter (keeps warnings/errors)
+    #[arg(short, long, help_heading = "Output")]
+    pub quiet: bool,
+
+    // ── Evaluation ─────────────────────────────────────────────────
+    /// Ground-truth vector PDF for accuracy evaluation. Outputs performance
+    /// stats as JSON to stdout. When --audit is also set, the audit report
+    /// includes ground-truth hit/miss classification. Does not require --output.
+    #[arg(long, value_name = "PDF", help_heading = "Evaluation")]
+    pub test: Option<PathBuf>,
+
+    /// Audit output directory. Writes audit.json and per-word segmentation
+    /// diagnostics (crops, seams, char overlays) into the given directory.
+    /// When --test is also set, generates report.html with ground-truth
+    /// hit/miss classification.
+    #[arg(long, value_name = "DIR", help_heading = "Evaluation")]
+    pub audit: Option<PathBuf>,
+
+    /// Include all lines (hits) in report.html, not just misses.
+    #[arg(long, help_heading = "Evaluation")]
+    pub report_all: bool,
+
+    /// Include all lines (hits) in audit.json obs_votes and compute geo for all,
+    /// not just misses. Implies --report-all. Use for geo bias regression
+    /// tests where GT metrics on hits are needed (t64).
+    #[arg(long, help_heading = "Evaluation")]
+    pub audit_all: bool,
+
+    // ── Debug / Comparison ─────────────────────────────────────────
+    /// Debug overlay mode: keep original raster in place and render vector
+    /// text on top in semitransparent red. Useful for visually checking
+    /// font matching and sizing accuracy.
+    #[arg(long, help_heading = "Debug")]
+    pub overlay: bool,
+
+    /// Generate side-by-side comparison images (scan crop vs rendered font)
+    /// for every vectorized line. Output goes to <output_base>-compare/ directory.
+    #[arg(long, help_heading = "Debug")]
+    pub compare: bool,
+
+    // ── Classifier options ─────────────────────────────────────────
+    /// Font matching classifier: 'lda' (default), 'fisher', 'triplet',
+    /// 'global-triplet', 'mlp', or 'fusion'.
+    #[arg(long, default_value = "lda", help_heading = "Classifier")]
+    pub classifier: String,
+
+    /// Path to classifier weights file.
+    #[arg(long, help_heading = "Classifier")]
+    pub triplet_weights: Option<PathBuf>,
+
+    /// Thoroughness factor for font matching. Default 1.0.
+    /// Higher values relax all font-matching thresholds (quorum, quality gate, search
+    /// radius) so more candidate fonts survive to evaluation.
+    #[arg(long, default_value_t = 1.0, help_heading = "Classifier")]
+    pub thoroughness: f32,
+
+    /// Minimum OCR confidence to consider vectorizing text (0–100).
+    #[arg(long, default_value = "0", help_heading = "Classifier")]
+    pub min_ocr_confidence: u32,
+
+    /// Minimum ngram probability as a multiplier on uniform (1/glyph_count).
+    /// Ngram is kept only if a candidate scores above threshold × uniform.
+    /// Default 0.0 = disabled; 6.0 = require 6× more likely than random.
+    #[arg(long, default_value_t = 0.0, help_heading = "Classifier")]
+    pub min_ngram_prob: f32,
+
+    /// Normalize PostScript name(s) to include explicit weight keywords.
+    /// Pass one or more "PSName:weight" pairs (e.g. "Lato-Italic:400").
+    /// Prints the normalized name(s) to stdout and exits.
+    #[arg(long, value_name = "PS:WEIGHT", help_heading = "Classifier")]
+    pub weight_explicit: Vec<String>,
+
+    // ── Render options ─────────────────────────────────────────────
+    /// Render scale multiplier for reference character images.
+    #[arg(long, default_value = "1", help_heading = "Render")]
+    pub render_scale: u32,
+
+    /// AA variant for reference character images: native, blur_0.5, sharpen.
+    #[arg(long, default_value = "native", help_heading = "Render")]
+    pub render_aa: String,
+
+    /// Binarize threshold for reference character images (0–255).
+    #[arg(long, help_heading = "Render")]
+    pub render_binarize: Option<u8>,
+
+    // ── Cache options ──────────────────────────────────────────────
+    /// Alternate cache directory (default: ~/.cache/unprint). Env: UNPRINT_CACHE_DIR
+    #[arg(long, env = "UNPRINT_CACHE_DIR", help_heading = "Cache")]
+    pub cache_dir: Option<PathBuf>,
+
+    /// Comma-separated list of font_keys or families to use, or @file.
+    /// When used with --cache-dir, only these fonts are scanned and cached.
+    /// Env: UNPRINT_FONT_ALLOWLIST
+    #[arg(long, env = "UNPRINT_FONT_ALLOWLIST", help_heading = "Cache")]
+    pub font_allowlist: Option<String>,
+
+    /// Skip per-font LDA OCR correction (pflda). Env: UNPRINT_SKIP_PFLDA
+    #[arg(long, env = "UNPRINT_SKIP_PFLDA", help_heading = "Cache")]
+    pub skip_ocr_correction: bool,
+}
+
+impl Args {
+    /// Build RenderParams from CLI flags. This is the single source of truth
+    /// for how reference characters are rendered — used by training, indexing,
+    /// and inference.
+    pub fn render_params(&self) -> crate::char_render::RenderParams {
+        use crate::features::AaVariant;
+        let aa = AaVariant::parse(&self.render_aa).unwrap_or(AaVariant::Native);
+        crate::char_render::RenderParams {
+            height: crate::features::NORM_H,
+            render_scale: self.render_scale,
+            aa,
+            binarize_threshold: self.render_binarize.filter(|&v| v > 0),
+        }
+    }
+
+    /// Resolve the audit JSON path.
+    /// With --audit DIR, it's DIR/audit.json.
+    /// Without --audit, falls back to <output>.audit.json.
+    pub fn audit_log_path(&self) -> PathBuf {
+        if let Some(ref dir) = self.audit {
+            dir.join("audit.json")
+        } else {
+            let out = self.output.as_ref().expect("output required for audit log");
+            let mut p = out.clone();
+            let stem = p
+                .file_stem()
+                .unwrap_or_default()
+                .to_string_lossy()
+                .to_string();
+            p.set_file_name(format!("{stem}.audit.json"));
+            p
+        }
+    }
+
+    /// Resolve the diag-seg directory (same as --audit DIR when set).
+    pub fn diag_seg_dir(&self) -> Option<&Path> {
+        self.audit.as_deref()
+    }
+
+    /// The ground-truth vector PDF path — from --test.
+    pub fn gt_vector_pdf(&self) -> Option<&PathBuf> {
+        self.test.as_ref()
+    }
+
+    /// Whether full audit I/O (crops, per-observation diagnostics, HTML) is enabled.
+    /// True when --audit is set.
+    pub fn full_audit(&self) -> bool {
+        self.audit.is_some()
+    }
+
+    /// Validate: require input and output (unless --test or non-scan mode).
+    pub fn validate(&self) -> Result<(), String> {
+        if !self.weight_explicit.is_empty() {
+            return Ok(());
+        }
+        if self.input.is_none() {
+            return Err("Input file required".to_string());
+        }
+        // --test mode doesn't require output
+        if self.test.is_some() {
+            return Ok(());
+        }
+        if self.output.is_none() {
+            return Err("Output path required (use -o / --output)".to_string());
+        }
+        Ok(())
+    }
+}
+
+pub fn parse() -> Args {
+    Args::parse()
+}
+
+/// Parse a page specification string into a set of 1-indexed page numbers.
+/// Accepts comma-separated values and ranges: "1,3,5" or "2-4,7" or "3".
+pub fn parse_pages(spec: &str) -> Result<std::collections::HashSet<usize>, String> {
+    let mut set = std::collections::HashSet::new();
+    for part in spec.split(',') {
+        let part = part.trim();
+        if part.is_empty() {
+            continue;
+        }
+        if let Some((a, b)) = part.split_once('-') {
+            let start: usize = a.trim().parse().map_err(|_| format!("bad page number: {a}"))?;
+            let end: usize = b.trim().parse().map_err(|_| format!("bad page number: {b}"))?;
+            if start == 0 || end == 0 {
+                return Err("page numbers are 1-indexed".into());
+            }
+            if start > end {
+                return Err(format!("invalid range: {start}-{end}"));
+            }
+            for p in start..=end {
+                set.insert(p);
+            }
+        } else {
+            let p: usize = part.parse().map_err(|_| format!("bad page number: {part}"))?;
+            if p == 0 {
+                return Err("page numbers are 1-indexed".into());
+            }
+            set.insert(p);
+        }
+    }
+    if set.is_empty() {
+        return Err("empty page specification".into());
+    }
+    Ok(set)
+}

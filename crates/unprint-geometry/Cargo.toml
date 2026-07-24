@@ -1,0 +1,9 @@
+[package]
+name = "unprint-geometry"
+version = "0.1.0"
+edition = "2021"
+description = "Pure geometry math for unprint - boxes, ink bounds, line detection, word gap logic. No heavy font deps."
+
+[dependencies]
+image = "0.25"
+serde = { version = "1", features = ["derive"] }

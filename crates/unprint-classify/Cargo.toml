@@ -1,0 +1,12 @@
+[package]
+name = "unprint-classify"
+version = "0.1.0"
+edition = "2021"
+description = "Font matching / classification — glyph bboxes, kerning table, scoring (depends on geometry+fonts)"
+
+[dependencies]
+unprint-geometry = { path = "../unprint-geometry" }
+unprint-fonts = { path = "../unprint-fonts" }
+image = "0.25"
+serde = { version = "1", features = ["derive"] }
+rayon = "1.10"

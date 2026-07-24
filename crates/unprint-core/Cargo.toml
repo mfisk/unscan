@@ -1,0 +1,33 @@
+[package]
+name = "unprint-core"
+version = "0.1.0"
+edition = "2021"
+description = "Core orchestration glue — pages, vectorization, PDF rebuild (depends on all lower crates)"
+
+[dependencies]
+unprint-geometry = { path = "../unprint-geometry" }
+unprint-ocr = { path = "../unprint-ocr" }
+unprint-classify = { path = "../unprint-classify" }
+unprint-fonts = { path = "../unprint-fonts" }
+anyhow = "1"
+image = "0.25"
+lopdf = "0.34"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+rayon = "1.10"
+thiserror = "2"
+tempfile = "3"
+memmap2 = "0.9"
+base64 = "0.22.1"
+rand = { version = "0.8", features = ["small_rng"] }
+subsetter = { version = "0.2", default-features = false }
+walkdir = "2"
+clap = { version = "4", features = ["derive", "env"] }
+
+[features]
+profile = ["pprof"]
+
+[dependencies.pprof]
+version = "0.14"
+features = ["flamegraph"]
+optional = true
