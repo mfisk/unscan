@@ -1505,7 +1505,9 @@ pub fn char_crop_and_metrics(
         if let Some(sp) = left_seam {
             if let Some(seam_x) = sp.iter().filter(|p| p[0] == y).map(|p| p[1]).min() {
                 let limit = seam_x.saturating_sub(x0);
-                for cx in 0..limit.min(crop_w) {
+                // flipped: seam pixel now belongs to left (previous) char, so remove it from current
+                let end = (limit + 1).min(crop_w);
+                for cx in 0..end {
                     crop.put_pixel(cx, y, image::Luma([255u8]));
                 }
             }
@@ -1513,7 +1515,9 @@ pub fn char_crop_and_metrics(
         if let Some(sp) = right_seam {
             if let Some(seam_x) = sp.iter().filter(|p| p[0] == y).map(|p| p[1]).max() {
                 let start = seam_x.saturating_sub(x0);
-                for cx in start..crop_w {
+                // flipped: seam pixel now stays with left char (this one), so keep it
+                let s = (start + 1).min(crop_w);
+                for cx in s..crop_w {
                     crop.put_pixel(cx, y, image::Luma([255u8]));
                 }
             }
