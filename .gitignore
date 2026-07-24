@@ -3,7 +3,6 @@
 *.png
 !/test-docs/font-timeline-specimen.pdf
 !/test-docs/font-timeline-specimen-scanned.pdf
-!/test-docs/line-test-seams-gt.pdf
 /test-docs/resolution-series/
 # Rasterized PDFs - never commit, regenerate via tools (3.2MB+ each)
 test-docs/*-rasterized*.pdf
