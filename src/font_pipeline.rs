@@ -204,6 +204,7 @@ pub fn match_lines(
                 fm.glyph_overrides.as_deref(),
                 &fm.variant_tag,
                 fm.variations.as_deref(),
+                true,
                 None,
                 Some(FAST_PATH_MIN_SSIM),
             );
@@ -452,6 +453,7 @@ pub fn match_lines(
                             line.x, line.y,
                             fe.glyph_overrides.as_deref(), &fe.variant_tag,
                             fe.variations.as_deref(),
+                            use_lig,
                             tie_audit_dir.as_deref(), None,
                         );
                         log_parts.push(format!("{:.4}({})", vr.score, fe.family_name));

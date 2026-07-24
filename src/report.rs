@@ -1442,11 +1442,13 @@ fn render_correct_font_comparison(
     }).collect();
 
     // Same pipeline as the chosen font — render, ZNCC, ink-crop for display
+    // For GT comparison renders, allow ligatures so "fi" can shape correctly
     let vr = crate::verify::verify_text_region(
         &scan_gray, font_data, &entry.text, &words,
         entry.bbox.x, entry.bbox.y,
         fe.glyph_overrides.as_ref().map(|v| v.as_slice()),
         &fe.variant_tag, fe.variations.as_deref(),
+        true,
         None, None,
     );
 
@@ -1491,6 +1493,7 @@ fn compute_inferred_font_size(
                 wb.width as f32,
                 variant_tag,
                 variations,
+                true,
             )?;
             Some(WordSizeDetail {
                 text: wb.text.clone(),

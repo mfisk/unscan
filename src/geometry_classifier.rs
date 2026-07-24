@@ -343,17 +343,25 @@ fn per_char_geo_shaped(
         if bounds_vec.is_empty() {
             continue;
         }
-        // Per-word liga control using canonical ligature list.
-        // Plain words like ['f','f'] have no FB00..FB04 -> disable liga/dlig so "ff" stays two glyphs.
-        // Ligature words like ['\u{FB00}'] or ['a','\u{FB04}','u',...] contain a ligature codepoint -> keep liga on.
+        // Ligature control is now propagated from segmentation winner:
+        // - ligature WordSegs have chars containing FB00..FB04 (collapsed)
+        // - plain WordSegs have no FB00..FB04
+        // For ligature segs we shape the original word_text ("figures") with
+        // liga enabled, so HarfBuzz's GSUB produces the fi glyph and glyph
+        // count matches the ligature segmentation (fi + g + ...). For plain
+        // segs we disable liga so "ff" stays two glyphs.
+        // Previously we shaped "\u{FB01}gures" which fails because most fonts
+        // lack a cmap entry for FB01; shaping the plain text with liga enabled
+        // is the correct way to get the ligature glyph.
         let is_lig_word = ws.chars.iter().any(|c| crate::font_scan::is_ligature_char(*c));
-        let mut features = base_features.clone();
-        if !is_lig_word {
-            features.push(unprint_fonts::rustybuzz::Feature::new(unprint_fonts::ttf_parser::Tag::from_bytes(b"liga"), 0, ..));
-            features.push(unprint_fonts::rustybuzz::Feature::new(unprint_fonts::ttf_parser::Tag::from_bytes(b"dlig"), 0, ..));
-        }
-        let text: String = ws.chars.iter().collect();
-        let sw = crate::layout::shape_word(&face, &features, &text)?;
+        let allow_liga = is_lig_word;
+        let text: String = if is_lig_word {
+            ws.word_text.clone()
+        } else {
+            ws.chars.iter().collect()
+        };
+        let features = base_features.clone();
+        let sw = crate::layout::shape_word(&face, &features, &text, allow_liga)?;
         if sw.glyph_ids.len() != bounds_vec.len() {
             continue;
         }

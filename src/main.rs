@@ -727,6 +727,7 @@ fn run(args: &cli::Args, classifier: &mut dyn classifier::Classifier) -> Result<
                             features::contrast_normalize_char(&raw)
                         };
                         let verify_words = lm.corrected_words.as_deref().unwrap_or(&line.words);
+                        let allow_liga = lm.seg_winner.as_deref() == Some("ligature");
                         let vr = verify::verify_text_region(
                             &norm_crop,
                             fd.as_slice(),
@@ -736,6 +737,7 @@ fn run(args: &cli::Args, classifier: &mut dyn classifier::Classifier) -> Result<
                             fm.glyph_overrides.as_deref(),
                             &fm.variant_tag,
                             fm.variations.as_deref(),
+                            allow_liga,
                             lm.diag_seg_dir.as_deref(),
                             None,
                         );
@@ -749,6 +751,7 @@ fn run(args: &cli::Args, classifier: &mut dyn classifier::Classifier) -> Result<
                                             let _ = std::fs::create_dir_all(&p);
                                             p
                                         });
+                                        let allow_liga_alt = lm.seg_winner.as_deref() != Some("ligature");
                                         let _alt_vr = verify::verify_text_region(
                                             &norm_crop,
                                             alt_fd.as_slice(),
@@ -758,6 +761,7 @@ fn run(args: &cli::Args, classifier: &mut dyn classifier::Classifier) -> Result<
                                             alt_fe.glyph_overrides.as_deref(),
                                             &alt_fe.variant_tag,
                                             alt_fe.variations.as_deref(),
+                                            allow_liga_alt,
                                             alt_audit_dir.as_deref(),
                                             None,
                                         );

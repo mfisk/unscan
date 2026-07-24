@@ -88,6 +88,7 @@ pub fn verify_text_region(
     overrides: Option<&[(char, u16)]>,
     variant_tag: &str,
     variations: Option<&[([u8; 4], f32)]>,
+    allow_liga: bool,
     audit_dir: Option<&std::path::Path>,
     bail_below: Option<f32>,
 ) -> VerifyResult {
@@ -115,7 +116,15 @@ pub fn verify_text_region(
     // draws as the "final" cyan-dashed boxes.
 
     let full_render = match render_via_freetype_scaled(
-        font_data, &placements, w, h, 1, overrides, variant_tag, variations,
+        font_data,
+        &placements,
+        w,
+        h,
+        1,
+        overrides,
+        variant_tag,
+        variations,
+        allow_liga,
     ) {
         Some(r) => r,
         None => return VerifyResult { score: 0.0, dy: 0, render_ink: None, diff: None },
@@ -195,12 +204,22 @@ fn render_via_freetype_scaled(
     _overrides: Option<&[(char, u16)]>,
     variant_tag: &str,
     variations: Option<&[([u8; 4], f32)]>,
+    allow_liga: bool,
 ) -> Option<GrayImage> {
     // NOTE: ab_glyph fallback disabled.  width_matched_em_px (ab_glyph) does
     // not compensate for sidebearings, so it systematically underestimates font
     // size (~3% too small).  The shaped path (rustybuzz + FreeType) handles
     // sidebearing correction and should be the only render path.
-    render_via_freetype(font_data, words, canvas_w, canvas_h, render_scale, variant_tag, variations)
+    render_via_freetype(
+        font_data,
+        words,
+        canvas_w,
+        canvas_h,
+        render_scale,
+        variant_tag,
+        variations,
+        allow_liga,
+    )
 }
 
 /// Render text using rustybuzz (OT shaping) + FreeType (rasterisation).
@@ -213,6 +232,7 @@ fn render_via_freetype(
     render_scale: u32,
     variant_tag: &str,
     variations: Option<&[([u8; 4], f32)]>,
+    allow_liga: bool,
 ) -> Option<GrayImage> {
     use std::cell::RefCell;
 
@@ -235,7 +255,14 @@ fn render_via_freetype(
     let mut all_em: Vec<f32> = words.iter()
         .filter(|w| !w.text.is_empty() && w.width >= 1)
         .filter_map(|w| {
-            crate::layout::width_matched_em_px_shaped(font_data, &w.text, w.width as f32, variant_tag, variations)
+            crate::layout::width_matched_em_px_shaped(
+                font_data,
+                &w.text,
+                w.width as f32,
+                variant_tag,
+                variations,
+                allow_liga,
+            )
         })
         .collect();
     if all_em.is_empty() {
@@ -300,8 +327,8 @@ fn render_via_freetype(
             continue;
         }
 
-        // Shape with shared helper
-        let shaped = match crate::layout::shape_word(&buzz_face, &ot_features, &word.text) {
+        // Shape with shared helper — ligature choice propagated from segmentation winner
+        let shaped = match crate::layout::shape_word(&buzz_face, &ot_features, &word.text, allow_liga) {
             Some(s) => s,
             None => continue,
         };
