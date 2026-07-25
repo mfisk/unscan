@@ -1345,11 +1345,11 @@ pub fn segment_line(
         }
 
         if has_ligatures {
-            // Need word_img for both plain and lig paths: clone once for plain, move original into lig
-            let plain_word_img = word_img.clone();
+            // Both plain and lig share same GrayImage — Arc clone cheap, zero GrayImage copy
+            let word_img_arc = Arc::new(word_img);
             word_segs.push(WordSeg {
                 source_word_idx: orig_idx,
-                word_img: Arc::new(plain_word_img),
+                word_img: word_img_arc.clone(),
                 chars: all_chars,
                 boundaries: bounds_plain,
                 seam_paths: Arc::new(seams_plain),
@@ -1370,14 +1370,14 @@ pub fn segment_line(
             // ── Path B: ligature segmentation (reduced n_chars) ─────
             let (bounds_lig, seams_lig, seg_summary_lig) = if let Some(ref wdir) = word_diag_dir {
                 let ldir = wdir.join("seg_lig");
-                segment_characters_diag(&word_img, lig_chars.len(), &ldir, &word.text)
+                segment_characters_diag(&word_img_arc, lig_chars.len(), &ldir, &word.text)
             } else {
-                segment_characters(&word_img, lig_chars.len())
+                segment_characters(&word_img_arc, lig_chars.len())
             };
 
             lig_word_segs.push(WordSeg {
                 source_word_idx: orig_idx,
-                word_img: Arc::new(word_img),
+                word_img: word_img_arc,
                 chars: lig_chars,
                 boundaries: bounds_lig,
                 seam_paths: Arc::new(seams_lig),
