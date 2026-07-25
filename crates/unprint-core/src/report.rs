@@ -1298,7 +1298,7 @@ fn build_scan_line_with_overlays(diag_dir: &Path, entry: &AuditEntry) -> String 
         // Seam paths — magenta diagonal paths (one x per row)
         // seam_paths now includes candidate (unused) paths too; only draw accepted ones.
         let seam_split_set: std::collections::HashSet<u32> = ws.seam_splits.iter().copied().collect();
-        for (col_key, path) in &ws.seam_paths {
+        for (col_key, path) in ws.seam_paths.iter() {
             if !seam_split_set.contains(col_key) { continue; }
             for entry in path.iter() {
                 let col_px = entry[1];

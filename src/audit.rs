@@ -1,6 +1,7 @@
 //! Audit log — single JSON sidecar with all pipeline decisions, font-matching detail,
 //! word-level similarity scores, and image references (crops + renders).
 use std::collections::HashMap;
+use std::sync::Arc;
 
 use crate::error::ScanTextError;
 use serde::Serialize;
@@ -21,8 +22,8 @@ pub struct WordSegSummary {
     pub mismatch: bool,
     pub ws_splits: Vec<u32>,
     pub seam_splits: Vec<u32>,
-    pub seam_paths: HashMap<u32, Vec<[u32; 2]>>,
-    pub seam_costs: HashMap<u32, crate::segment::SeamCost>,
+    pub seam_paths: Arc<HashMap<u32, Vec<[u32; 2]>>>,
+    pub seam_costs: Arc<HashMap<u32, crate::segment::SeamCost>>,
 }
 
 /// Per-text-region audit record.
