@@ -1324,6 +1324,18 @@ pub fn segment_line(
             segment_characters(&word_img, all_chars.len())
         };
 
+        // Destructure summary to allow moves instead of clones
+        let SegSummary {
+            image_w: plain_image_w,
+            image_h: plain_image_h,
+            n_chars_expected: plain_n_chars_expected,
+            n_segments_produced: plain_n_segments_produced,
+            mismatch: plain_mismatch,
+            ws_splits: plain_ws_splits,
+            seam_splits: plain_seam_splits,
+            seam_costs: plain_seam_costs,
+        } = seg_summary_plain;
+
         // Update char counts (for the word-skip optimisation)
         for &c in &all_chars {
             if is_supported(c) {
@@ -1331,25 +1343,27 @@ pub fn segment_line(
             }
         }
 
-        word_segs.push(WordSeg {
-            source_word_idx: orig_idx,
-            word_img: word_img.clone(),
-            chars: all_chars.clone(),
-            boundaries: bounds_plain.clone(),
-            seam_paths: seams_plain.clone(),
-            seam_costs: seg_summary_plain.seam_costs.clone(),
-            crop_h: word_h,
-            word_text: word.text.clone(),
-            image_w: seg_summary_plain.image_w,
-            image_h: seg_summary_plain.image_h,
-            n_chars_expected: seg_summary_plain.n_chars_expected,
-            n_segments_produced: seg_summary_plain.n_segments_produced,
-            mismatch: seg_summary_plain.mismatch,
-            ws_splits: seg_summary_plain.ws_splits.clone(),
-            seam_splits: seg_summary_plain.seam_splits.clone(),
-        });
-
         if has_ligatures {
+            // Need word_img for both plain and lig paths: clone once for plain, move original into lig
+            let plain_word_img = word_img.clone();
+            word_segs.push(WordSeg {
+                source_word_idx: orig_idx,
+                word_img: plain_word_img,
+                chars: all_chars,
+                boundaries: bounds_plain,
+                seam_paths: seams_plain,
+                seam_costs: plain_seam_costs,
+                crop_h: word_h,
+                word_text: word.text.clone(),
+                image_w: plain_image_w,
+                image_h: plain_image_h,
+                n_chars_expected: plain_n_chars_expected,
+                n_segments_produced: plain_n_segments_produced,
+                mismatch: plain_mismatch,
+                ws_splits: plain_ws_splits,
+                seam_splits: plain_seam_splits,
+            });
+
             any_ligatures = true;
             words_with_ligatures.insert(word_segs.len() - 1);
             // ── Path B: ligature segmentation (reduced n_chars) ─────
@@ -1362,7 +1376,7 @@ pub fn segment_line(
 
             lig_word_segs.push(WordSeg {
                 source_word_idx: orig_idx,
-                word_img: word_img.clone(),
+                word_img: word_img,
                 chars: lig_chars,
                 boundaries: bounds_lig,
                 seam_paths: seams_lig,
@@ -1377,7 +1391,27 @@ pub fn segment_line(
                 ws_splits: seg_summary_lig.ws_splits,
                 seam_splits: seg_summary_lig.seam_splits,
             });
+        } else {
+            // No ligatures: move everything, zero clones for image and segmentation data
+            word_segs.push(WordSeg {
+                source_word_idx: orig_idx,
+                word_img,
+                chars: all_chars,
+                boundaries: bounds_plain,
+                seam_paths: seams_plain,
+                seam_costs: plain_seam_costs,
+                crop_h: word_h,
+                word_text: word.text.clone(),
+                image_w: plain_image_w,
+                image_h: plain_image_h,
+                n_chars_expected: plain_n_chars_expected,
+                n_segments_produced: plain_n_segments_produced,
+                mismatch: plain_mismatch,
+                ws_splits: plain_ws_splits,
+                seam_splits: plain_seam_splits,
+            });
         }
+
     }
 
     // For the ligature path, non-ligature words use plain segmentation
