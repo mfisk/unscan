@@ -4,7 +4,6 @@
 //!
 //! Optimized: raw buffer access, no get_pixel, histogram Otsu without Vec alloc.
 
-use crate::color::Rgb;
 use image::{DynamicImage, GrayImage, RgbaImage};
 
 pub use unprint_geometry::{DetectedLine, DetectedFill, GeometryResult};
@@ -15,6 +14,7 @@ pub use unprint_geometry::{DetectedLine, DetectedFill, GeometryResult};
 
 /// Detect vectorisable geometry on `img`, ignoring pixels that fall inside
 /// any of the supplied `text_bboxes` (x, y, w, h).
+#[allow(dead_code)]
 pub fn detect_geometry(
     img: &DynamicImage,
     text_bboxes: &[(u32, u32, u32, u32)],
@@ -378,6 +378,7 @@ fn detect_fills_from_rgba(
 }
 
 // Backward compat wrapper that was previously used — now delegates to raw version.
+#[allow(dead_code)]
 fn detect_fills(
     img: &DynamicImage,
     text_mask: &[bool],

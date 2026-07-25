@@ -17,8 +17,6 @@ use crate::ocr::TextRegion;
 /// Reads the fvar axis order from the raw font data (via ttf_parser) and maps
 /// the provided tag→value pairs to `FT_Set_Var_Design_Coordinates`.
 fn set_ft_variations<B>(ft_face: &unprint_fonts::freetype::Face<B>, font_data: &[u8], vars: &[([u8; 4], f32)]) {
-    use unprint_fonts::ttf_parser;
-
     let parsed = match unprint_fonts::ttf_parser::Face::parse(font_data, 0) {
         Ok(f) => f,
         Err(_) => return,
@@ -553,14 +551,6 @@ fn render_words_ab_glyph(
         }
     }
 
-    // Need to drop canvas_raw borrow before returning canvas (which was borrowed mutably).
-    drop(canvas_raw);
-    // Reconstruct GrayImage from raw? canvas is still borrowed mutably, but we have raw as &mut [u8] that we just dropped.
-    // To return, we need to reconstitute via from_raw or just keep canvas as is (it was mutated through raw).
-    // Since we used as_mut() directly, canvas is already mutated, we can return it by converting raw back?
-    // Simplest: create new image from raw copy (but we mutated in place, so just re-create GrayImage via from_raw).
-    // However we cannot use canvas after drop of raw because we still have mutable borrow? Actually drop releases borrow.
-    // So we can return canvas directly after ensuring raw is dropped.
     Some(canvas)
 }
 

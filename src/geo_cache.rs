@@ -4,7 +4,8 @@
 //! with smallest types: u16/i16/u8, masked valueFormat (0x000F), only present
 //! fields are stored (popcount determines stride per table). No rejection for
 //! y/x placement offsets.
-//!
+#![allow(dead_code, unused_assignments)]
+
 //! File layout (all LE):
 //!   header: magic b"BGEO" | version u32=7 | catalog_hash u64 | n_fonts u32
 //!   per font:
@@ -33,7 +34,6 @@
 //!     }
 
 use std::collections::{BTreeMap, HashMap};
-use std::hash::{Hash, Hasher};
 use std::path::{Path, PathBuf};
 
 const BGEO_MAGIC: &[u8; 4] = b"BGEO";
@@ -1030,7 +1030,7 @@ impl GeometryCache {
 
         let elapsed = t_build_start.elapsed().as_secs_f64();
         if !quiet { eprintln!("[geo-cache] Built Font geometry cache in {:.1}s ({} total, {} reused, {} built, GPOS full incl singles, Unicode both formats)", elapsed, n_total, n_reused, n_built); }
-        let tmp_cache = Self { mmap: unsafe { memmap2::MmapOptions::new().len(0).map_anon().unwrap().make_read_only().unwrap() }, fonts: HashMap::new(), _cache_path: cache_path.clone() };
+        let tmp_cache = Self { mmap: memmap2::MmapOptions::new().len(0).map_anon().unwrap().make_read_only().unwrap(), fonts: HashMap::new(), _cache_path: cache_path.clone() };
         if let Err(e) = tmp_cache.write_bin_from_owned(&cache_path, catalog_hash, &owned_fonts) {
             eprintln!("warning: failed to write geo cache to {}: {e}", cache_path.display());
         } else {
@@ -1040,7 +1040,7 @@ impl GeometryCache {
             Ok((mmap_cache,_)) => mmap_cache,
             Err(e) => {
                 eprintln!("failed to reload just-written cache: {e}, returning empty");
-                let empty_mmap = unsafe { memmap2::MmapOptions::new().len(0).map_anon().unwrap().make_read_only().unwrap() };
+                let empty_mmap = memmap2::MmapOptions::new().len(0).map_anon().unwrap().make_read_only().unwrap();
                 Self { mmap: empty_mmap, fonts: HashMap::new(), _cache_path: cache_path }
             }
         }
@@ -1485,6 +1485,7 @@ impl GeometryCache {
         sz
     }
 
+    #[allow(unused_assignments)]
     fn parse_value_record(data: &[u8], off: usize, fmt: u16) -> Option<(i16,i16,i16,i16,bool)> {
         let mut p = off;
         let mut xpl = 0i16; let mut ypl = 0i16; let mut xad = 0i16; let mut yad = 0i16;

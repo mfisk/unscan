@@ -152,6 +152,7 @@ pub fn init_allowlist(cli_allowlist: Option<&str>) {
 
 /// Filter helper: returns true if font_key should be kept given allowlist.
 /// Allowlist is in fontkey format (exact match).
+#[allow(dead_code)]
 pub fn allowlist_keep(font_key: &str, allowlist: Option<&HashSet<String>>) -> bool {
     match allowlist {
         None => true,

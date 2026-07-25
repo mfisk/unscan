@@ -1,7 +1,7 @@
 //! Color utilities — background / text colour detection and text erasure.
 
 use crate::ocr::TextRegion;
-use image::{DynamicImage, GrayImage, Rgba, RgbaImage};
+use image::{DynamicImage, GrayImage, RgbaImage};
 
 pub type Rgb = (u8, u8, u8);
 
@@ -14,6 +14,7 @@ pub type Rgb = (u8, u8, u8);
 /// Fast path: crop to the region first so we only convert the small
 /// ROI to luma/rgba instead of the whole page, and iterate over raw
 /// buffers instead of `get_pixel`.
+#[allow(dead_code)]
 pub fn detect_text_color(page_img: &DynamicImage, region: &TextRegion) -> Rgb {
     let (iw, ih) = (page_img.width(), page_img.height());
 
@@ -172,6 +173,7 @@ pub fn detect_text_color_from_buffers(
 }
 
 /// Otsu's method: find threshold that maximises between-class variance.
+#[allow(dead_code)]
 pub fn otsu_threshold(vals: &[u8]) -> u8 {
     let mut hist = [0u32; 256];
     for &v in vals {

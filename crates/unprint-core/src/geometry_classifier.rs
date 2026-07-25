@@ -16,6 +16,7 @@ use std::collections::HashMap;
 
 pub use unprint_geometry::{CharInkBounds, WordGeoMeasurement};
 
+#[allow(dead_code)]
 #[derive(Debug, Clone)]
 pub struct PerCharGeo {
     pub seg_idx: usize,
@@ -71,6 +72,7 @@ const SIGMA_PITCH_PX: f64 = 0.435;
 /// up by f's ascender, p's bottom by q, etc., and the word ink midpoint
 /// (min y_min + max y_max)/2 is biased. This function now mirrors
 /// `crop_ngram`'s masking and computes the word midpoint in the same pass.
+#[allow(dead_code, unused_assignments)]
 pub fn measure_char_ink_bounds(
     word_img: &GrayImage,
     chars: &[char],
@@ -98,48 +100,69 @@ pub fn measure_char_ink_bounds(
     for i in 0..n_chars {
         let b_left = bounds[i];
         let b_right = bounds[i + 1];
-        let x0_rect = b_left.min(w.saturating_sub(1)) as usize;
-        let x1_rect = b_right.min(w) as usize;
-        if x0_rect >= x1_rect {
+        let left_seam = seam_paths.get(&b_left);
+        let right_seam = seam_paths.get(&b_right);
+
+        // Expanded crop bounds that include seam excursions, same as crop_ngram
+        // (scan crop does seam handling by whitening outside, trim itself uses no edges)
+        let x0_exp = if let Some(sp) = left_seam {
+            sp.iter().map(|p| p[1]).min().unwrap_or(b_left).min(b_left)
+        } else {
+            b_left
+        }.min(w) as usize;
+        let x1_exp = if let Some(sp) = right_seam {
+            sp.iter().map(|p| p[1]).max().unwrap_or(b_right).max(b_right).saturating_add(1)
+        } else {
+            b_right
+        }.min(w) as usize;
+
+        if x0_exp >= x1_exp {
             result.push(CharInkBounds {
-                cx: x0_rect as f64,
+                cx: x0_exp as f64,
                 cy: h as f64 / 2.0,
                 width: 0.0,
                 height: 0.0,
-                x_min: x0_rect as u32,
-                x_max: x0_rect as u32,
+                x_min: x0_exp as u32,
+                x_max: x0_exp as u32,
                 y_min: 0,
                 y_max: h,
             });
             continue;
         }
 
-        let left_seam = seam_paths.get(&b_left);
-        let right_seam = seam_paths.get(&b_right);
-
-        // Find ink bounds within this character's seam-masked x-range
-        let mut x_min = x1_rect;
-        let mut x_max = x0_rect;
+        // Find ink bounds within seam-masked crop — trim does not use edges,
+        // it only finds dark pixels in the already-masked crop (seam handling
+        // done by whitening in scan-crop creation, mirrored here).
+        let mut x_min = x1_exp;
+        let mut x_max = x0_exp;
         let mut y_min = h as usize;
         let mut y_max = 0usize;
         let mut has_ink = false;
 
         for y in 0..h as usize {
-            // Determine per-row left/right limits from seams (same as crop_ngram)
-            let mut left_limit = x0_rect;
-            let mut right_limit = x1_rect;
+            // Seam handling (whitening) is part of scan-crop, not trim.
+            // Here we mirror that whitening to get the same masked image,
+            // but trim itself is just min/max of remaining ink.
+            let mut left_limit = x0_exp;
+            let mut right_limit = x1_exp;
 
             if let Some(sp) = left_seam {
                 if let Some(seam_x) = sp.iter().filter(|p| p[0] as usize == y).map(|p| p[1] as usize).min() {
                     // left seam: ink must be >= seam_x
-                    left_limit = seam_x.max(x0_rect).min(x1_rect);
+                    left_limit = seam_x;
                 }
             }
             if let Some(sp) = right_seam {
                 if let Some(seam_x) = sp.iter().filter(|p| p[0] as usize == y).map(|p| p[1] as usize).max() {
-                    // right seam: ink must be < seam_x (crop_ngram whites out >= seam_x)
-                    right_limit = seam_x.min(x1_rect).max(left_limit);
+                    // right seam: ink must be < seam_x
+                    right_limit = seam_x;
                 }
+            }
+            // Clamp to image, keep ordering
+            left_limit = left_limit.min(w as usize);
+            right_limit = right_limit.min(w as usize);
+            if left_limit > right_limit {
+                continue;
             }
             // For uniform fallback (no seams) left_limit==x0_rect, right_limit==x1_rect
 
@@ -160,15 +183,15 @@ pub fn measure_char_ink_bounds(
         }
 
         let cb = if !has_ink {
-            let cx = (x0_rect + x1_rect) as f64 / 2.0;
+            let cx = (x0_exp + x1_exp) as f64 / 2.0;
             let cy = h as f64 / 2.0;
             CharInkBounds {
                 cx,
                 cy,
-                width: (x1_rect - x0_rect) as f64,
+                width: (x1_exp - x0_exp) as f64,
                 height: h as f64,
-                x_min: x0_rect as u32,
-                x_max: x1_rect as u32,
+                x_min: x0_exp as u32,
+                x_max: x1_exp as u32,
                 y_min: 0,
                 y_max: h,
             }
@@ -207,13 +230,11 @@ fn per_char_geo_cached(
         if word_bounds.is_empty() {
             continue;
         }
-        // Ligature words (FB00-FB04) need GPOS/kerning-aware shaping; cache has
-        // no kerning and uses bbox centers giving ~3.4px pitch error on italic
-        // Office. ffi. Force shaped path.
-        if ws.chars.iter().any(|c| crate::font_scan::is_ligature_char(*c)) {
-            continue;
-        }
         // Try to get predictions for this word from cache.
+        // Cache contains full Unicode (cmap) + FB00-FB04 ligature codepoints.
+        // Non-BMP / missing cmap entries will miss and fall back to shaped path.
+        // Ligature codepoints (FB00-FB04) ARE in cache and score as single glyphs.
+        // Plain "ff" (['f','f']) is 2 chars, stays 2 glyphs (liga disabled for plain).
         let preds_fu_ext = geo_cache.predict_glyph_positions_and_extents(font_key, &ws.chars)?;
         if preds_fu_ext.len() != word_bounds.len() {
             // Ligature merge: e.g. "ff" plain shaped to 1 glyph but we have 2 bounds → skip geo for this word.
@@ -242,10 +263,8 @@ fn per_char_geo_cached(
         // y is flipped: font y up → image y down
         let preds: Vec<(f64, f64)> = preds_fu.iter().map(|(x, y)| (x * scale, y * -scale)).collect();
 
-        // Word centers: mean of character centers so sum_v = sum_h = 0 by construction
-        // (matches t64 theory and ba5a316 vertical fix; now also for horizontal)
-        let obs_word_cx = word_bounds.iter().map(|b| b.cx).sum::<f64>() / word_bounds.len() as f64;
-        let pred_word_cx = preds.iter().map(|(cx, _)| *cx).sum::<f64>() / preds.len() as f64;
+        // Word vertical center: use mean of character centers so sum_v = 0 by construction
+        // (matches t64 theory: obs_word_cy = mean(obs_cy), pred_word_cy = mean(pred_cy))
         let obs_word_cy = word_bounds.iter().map(|b| b.cy).sum::<f64>() / word_bounds.len() as f64;
         let pred_word_cy = preds.iter().map(|(_, cy)| *cy).sum::<f64>() / preds.len() as f64;
 
@@ -258,19 +277,17 @@ fn per_char_geo_cached(
             let v_err = obs_cy_rel - pred_cy_rel;
             let v_ll = -v_err * v_err / (2.0 * SIGMA_CENTER_PX * SIGMA_CENTER_PX);
 
-            let obs_cx_rel = obs_cx - obs_word_cx;
-            let pred_cx_rel = pred_cx - pred_word_cx;
-            let h_err_val = obs_cx_rel - pred_cx_rel;
-            let h_ll_val = -h_err_val * h_err_val / (2.0 * SIGMA_CENTER_PX * SIGMA_CENTER_PX);
-            // Keep pitch values for audit visibility, but score using centered error
-            let (obs_pitch, pred_pitch) = if orig_idx == 0 {
-                (None, None)
+            let (obs_pitch, pred_pitch, h_err, h_ll) = if orig_idx == 0 {
+                (None, None, None, 0.0)
             } else {
                 let prev = &word_bounds[orig_idx - 1];
                 let (prev_pred_cx, _) = &preds[orig_idx - 1];
-                (Some(obs_cx - prev.cx), Some(pred_cx - prev_pred_cx))
+                let obs_pitch_val = obs_cx - prev.cx;
+                let pred_pitch_val = pred_cx - prev_pred_cx;
+                let h_err_val = obs_pitch_val - pred_pitch_val;
+                let h_ll_val = -h_err_val * h_err_val / (2.0 * SIGMA_PITCH_PX * SIGMA_PITCH_PX);
+                (Some(obs_pitch_val), Some(pred_pitch_val), Some(h_err_val), h_ll_val)
             };
-            let (h_err, h_ll) = (Some(h_err_val), h_ll_val);
 
             result.push(PerCharGeo {
                 seg_idx,
@@ -320,13 +337,25 @@ fn per_char_geo_shaped(
         if bounds_vec.is_empty() {
             continue;
         }
-        // Keep liga/dlig enabled. Disabling for plain "Office." (f+f+i)
-        // makes shaper emit 7 glyphs while segmenter collapsed ffi to 1 cluster
-        // (5 vs 5 bounds after collapse) causing mismatch and fallback to cache
-        // which has ~3.4px pitch error. Keeping liga on lets shaper produce ffi ligature.
+        // Ligature control is now propagated from segmentation winner:
+        // - ligature WordSegs have chars containing FB00..FB04 (collapsed)
+        // - plain WordSegs have no FB00..FB04
+        // For ligature segs we shape the original word_text ("figures") with
+        // liga enabled, so HarfBuzz's GSUB produces the fi glyph and glyph
+        // count matches the ligature segmentation (fi + g + ...). For plain
+        // segs we disable liga so "ff" stays two glyphs.
+        // Previously we shaped "\u{FB01}gures" which fails because most fonts
+        // lack a cmap entry for FB01; shaping the plain text with liga enabled
+        // is the correct way to get the ligature glyph.
+        let is_lig_word = ws.chars.iter().any(|c| crate::font_scan::is_ligature_char(*c));
+        let allow_liga = is_lig_word;
+        let text: String = if is_lig_word {
+            ws.word_text.clone()
+        } else {
+            ws.chars.iter().collect()
+        };
         let features = base_features.clone();
-        let text: String = ws.chars.iter().collect();
-        let sw = crate::layout::shape_word(&face, &features, &text)?;
+        let sw = crate::layout::shape_word(&face, &features, &text, allow_liga)?;
         if sw.glyph_ids.len() != bounds_vec.len() {
             continue;
         }
@@ -341,10 +370,6 @@ fn per_char_geo_shaped(
             let bbox = ttfp.glyph_bounding_box(glyph_id).unwrap_or(unprint_fonts::ttf_parser::Rect { x_min: 0, y_min: 0, x_max: 0, y_max: 0 });
             let x_off = sw.x_offsets.get(i).copied().unwrap_or(0) as f64;
             let y_off = sw.y_offsets.get(i).copied().unwrap_or(0) as f64;
-            // Ink midpoint = (leftmost + rightmost)/2 inclusive of tucks.
-            // bbox.x_min/x_max already include slanted overhang (parallelogram).
-            // Midpoint = start + (amount_right - amount_left)/2 where amount_left
-            // is distance ink extends left of origin, amount_right distance right.
             let cx = cursor_fu + x_off + (bbox.x_min as f64 + bbox.x_max as f64) * 0.5;
             let cy = y_off + (bbox.y_min as f64 + bbox.y_max as f64) * 0.5;
             let y_min_a = y_off + bbox.y_min as f64;
@@ -355,19 +380,25 @@ fn per_char_geo_shaped(
             cursor_fu += sw.x_advances[i] as f64;
         }
 
-        // Use the spread of the letters to work out the scale.
-        // Matching the middle of the first and last letter keeps the overall error centered at zero.
-        let obs_span = (bounds_vec.last().unwrap().cx - bounds_vec.first().unwrap().cx).abs().max(0.5);
-        let pred_span = (pred_positions.last().unwrap().0 - pred_positions.first().unwrap().0).abs().max(0.5);
-        let scale = (obs_span / pred_span).max(0.01);
+        // Center-span scaling (unbiased): scale from first..last center distance
+        let scale = if bounds_vec.len() >= 2 {
+            let obs_span = (bounds_vec.last().unwrap().cx - bounds_vec.first().unwrap().cx).abs().max(0.5);
+            let pred_span = (pred_positions.last().unwrap().0 - pred_positions.first().unwrap().0).abs().max(0.5);
+            obs_span / pred_span
+        } else {
+            let obs_h = bounds_vec[0].height.max(1.0);
+            // Use ink height from bbox for single char
+            let glyph_id = unprint_fonts::ttf_parser::GlyphId(sw.glyph_ids[0] as u16);
+            let bbox = ttfp.glyph_bounding_box(glyph_id).unwrap_or(unprint_fonts::ttf_parser::Rect { x_min: 0, y_min: -1000, x_max: 0, y_max: 0 });
+            let pred_h = (bbox.y_max - bbox.y_min) as f64;
+            obs_h / pred_h.max(1.0)
+        };
 
         let pred_positions_px: Vec<(f64, f64)> = pred_positions.iter()
             .map(|(x, y)| (x * scale, y * -scale))
             .collect();
 
-        // Word centers: mean of centers so sum_v = sum_h = 0 by construction (ba5a316 vertical fix, now horizontal too)
-        let obs_word_cx = bounds_vec.iter().map(|b| b.cx).sum::<f64>() / bounds_vec.len() as f64;
-        let pred_word_cx = pred_positions_px.iter().map(|(cx, _)| *cx).sum::<f64>() / pred_positions_px.len() as f64;
+        // Word vertical center: mean of centers so sum_v = 0 by construction
         let obs_word_cy = bounds_vec.iter().map(|b| b.cy).sum::<f64>() / bounds_vec.len() as f64;
         let pred_word_cy = pred_positions_px.iter().map(|(_, cy)| *cy).sum::<f64>() / pred_positions_px.len() as f64;
 
@@ -380,18 +411,17 @@ fn per_char_geo_shaped(
             let v_err = obs_cy_rel - pred_cy_rel;
             let v_ll = -v_err * v_err / (2.0 * SIGMA_CENTER_PX * SIGMA_CENTER_PX);
 
-            let obs_cx_rel = obs_cx - obs_word_cx;
-            let pred_cx_rel = pred_cx - pred_word_cx;
-            let h_err_val = obs_cx_rel - pred_cx_rel;
-            let h_ll_val = -h_err_val * h_err_val / (2.0 * SIGMA_CENTER_PX * SIGMA_CENTER_PX);
-            let (obs_pitch, pred_pitch) = if orig_idx == 0 {
-                (None, None)
+            let (obs_pitch, pred_pitch, h_err, h_ll) = if orig_idx == 0 {
+                (None, None, None, 0.0)
             } else {
                 let prev = &bounds_vec[orig_idx - 1];
                 let (prev_pred_cx, _) = &pred_positions_px[orig_idx - 1];
-                (Some(obs_cx - prev.cx), Some(pred_cx - prev_pred_cx))
+                let obs_pitch_val = obs_cx - prev.cx;
+                let pred_pitch_val = pred_cx - prev_pred_cx;
+                let h_err_val = obs_pitch_val - pred_pitch_val;
+                let h_ll_val = -h_err_val * h_err_val / (2.0 * SIGMA_PITCH_PX * SIGMA_PITCH_PX);
+                (Some(obs_pitch_val), Some(pred_pitch_val), Some(h_err_val), h_ll_val)
             };
-            let (h_err, h_ll) = (Some(h_err_val), h_ll_val);
 
             result.push(PerCharGeo {
                 seg_idx,

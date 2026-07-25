@@ -16,6 +16,7 @@ use std::collections::HashMap;
 
 pub use unprint_geometry::{CharInkBounds, WordGeoMeasurement};
 
+#[allow(dead_code)]
 #[derive(Debug, Clone)]
 pub struct PerCharGeo {
     pub seg_idx: usize,
@@ -71,6 +72,7 @@ const SIGMA_PITCH_PX: f64 = 0.435;
 /// up by f's ascender, p's bottom by q, etc., and the word ink midpoint
 /// (min y_min + max y_max)/2 is biased. This function now mirrors
 /// `crop_ngram`'s masking and computes the word midpoint in the same pass.
+#[allow(dead_code, unused_assignments)]
 pub fn measure_char_ink_bounds(
     word_img: &GrayImage,
     chars: &[char],

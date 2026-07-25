@@ -7,7 +7,7 @@
 //! classifier or the scan doesn't have enough characters for pairs.
 
 use std::collections::HashMap;
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
 use std::sync::atomic::{AtomicUsize, Ordering};
 
 use image::GrayImage;

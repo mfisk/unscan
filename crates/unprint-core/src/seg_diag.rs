@@ -7,7 +7,7 @@
 //!   word_NNN_TEXT_final.png   — all splits (VP red, seam blue) overlaid
 //!   word_NNN_TEXT_chars/      — per-character crop PNGs (00_A.png, 01_B.png, ...)
 
-use image::{GrayImage, Rgb, RgbImage};
+use image::{GrayImage, RgbImage};
 use std::path::Path;
 
 /// Save a grayscale image as RGB.

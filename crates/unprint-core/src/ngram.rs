@@ -7,7 +7,7 @@
 //! classifier or the scan doesn't have enough characters for pairs.
 
 use std::collections::HashMap;
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
 use std::sync::atomic::{AtomicUsize, Ordering};
 
 use image::GrayImage;
@@ -667,35 +667,80 @@ pub fn build_scoring_windows<'a>(
     _glyph_map: &'a crate::glyph_map::NgramGlyphMap,
     crop_store: &'a mut Vec<GrayImage>,
 ) -> (Vec<crate::font_match::ScoringWindow<'a>>, Vec<(usize, usize)>) {
-    // Single-char only — bigrams disabled per 2026-07-19. Previously tried
-    // bigram pairs first, now directly emit unigram windows.
-    let flat: Vec<(usize, usize, char)> = word_segs.iter().enumerate()
-        .flat_map(|(seg_idx, seg)| {
-            seg.chars.iter().enumerate()
-                .filter(|(_, c)| crate::features::is_supported(**c))
-                .map(move |(pos, &c)| (seg_idx, pos, c))
-        })
-        .collect();
+    let (windows, pos, _wib) = build_scoring_windows_with_geo(word_segs, crop_store);
+    (windows, pos)
+}
 
-    let n = flat.len();
-    if n == 0 {
-        return (Vec::new(), Vec::new());
+/// Build scoring windows plus geometry measurements in a single scan per character.
+/// Trim to ink is called exactly once per character via `char_crop_and_metrics`,
+/// which does seam handling (whitening) in scan-crop creation and returns center
+/// in caller's (word) coordinates. Both h and v midpoints come from that same trim.
+/// This eliminates the previous double scan (measure_char_ink_bounds + crop_ngram).
+pub fn build_scoring_windows_with_geo<'a>(
+    word_segs: &'a [crate::segment::WordSeg],
+    crop_store: &'a mut Vec<GrayImage>,
+) -> (
+    Vec<crate::font_match::ScoringWindow<'a>>,
+    Vec<(usize, usize)>,
+    Vec<crate::geometry_classifier::WordGeoMeasurement>,
+) {
+    use crate::geometry_classifier::{CharInkBounds, WordGeoMeasurement};
+
+    let base = crop_store.len();
+    let mut temp_crops: Vec<GrayImage> = Vec::new();
+    let mut metas: Vec<(usize, usize, char)> = Vec::new();
+
+    // Per-word geo, same order as word_segs, each inner Vec in char order
+    let mut wib: Vec<WordGeoMeasurement> = Vec::with_capacity(word_segs.len());
+    for _ in 0..word_segs.len() {
+        wib.push(WordGeoMeasurement { chars: Vec::new() });
     }
 
-    // Two-pass to satisfy borrow checker: first collect crops, then build windows
-    // that borrow from final crop_store (same pattern as original bigram code).
-    let base = crop_store.len();
-    let mut temp_crops: Vec<GrayImage> = Vec::with_capacity(n);
-    let mut metas: Vec<(usize, usize, char)> = Vec::with_capacity(n); // (seg_idx, pos, c)
+    for (seg_idx, seg) in word_segs.iter().enumerate() {
+        let mut char_bounds: Vec<CharInkBounds> = Vec::with_capacity(seg.chars.len());
+        for (pos, &c) in seg.chars.iter().enumerate() {
+            // Single scan per character: seam handling + trim, returns center in word coords
+            if let Some((norm, x_min, x_max, y_min, y_max, cx, cy)) =
+                crate::segment::char_crop_and_metrics(&seg.word_img, pos, &seg.boundaries, &seg.seam_paths, seg.crop_h)
+            {
+                let cb = CharInkBounds {
+                    cx,
+                    cy,
+                    width: (x_max - x_min + 1) as f64,
+                    height: (y_max - y_min + 1) as f64,
+                    x_min,
+                    x_max,
+                    y_min,
+                    y_max,
+                };
+                char_bounds.push(cb.clone());
 
-    for &(seg_i, pos_i, c) in &flat {
-        let seg = &word_segs[seg_i];
-        if let Some(crop) = crate::segment::crop_ngram(
-            &seg.word_img, pos_i, 1, &seg.boundaries, &seg.seam_paths, seg.crop_h,
-        ) {
-            temp_crops.push(crop);
-            metas.push((seg_i, pos_i, c));
+                if crate::features::is_supported(c) {
+                    temp_crops.push(norm);
+                    metas.push((seg_idx, pos, c));
+                }
+            } else {
+                // Fallback for missing ink: use uniform partition in word coords
+                let w = seg.word_img.width();
+                let n = seg.chars.len().max(1) as f32;
+                let b_l = (pos as f32 * w as f32 / n).round() as u32;
+                let b_r = ((pos + 1) as f32 * w as f32 / n).round() as u32;
+                let cx = (b_l as f64 + b_r as f64) * 0.5;
+                let cy = seg.word_img.height() as f64 * 0.5;
+                let cb = CharInkBounds {
+                    cx,
+                    cy,
+                    width: (b_r.saturating_sub(b_l)) as f64,
+                    height: seg.word_img.height() as f64,
+                    x_min: b_l,
+                    x_max: b_r,
+                    y_min: 0,
+                    y_max: seg.word_img.height(),
+                };
+                char_bounds.push(cb);
+            }
         }
+        wib[seg_idx].chars = char_bounds;
     }
 
     crop_store.extend(temp_crops);
@@ -711,5 +756,6 @@ pub fn build_scoring_windows<'a>(
         position_map.push((seg_i, pos_i));
     }
 
-    (windows, position_map)
+    (windows, position_map, wib)
 }
+

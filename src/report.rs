@@ -40,6 +40,7 @@ fn short_key(key: &str) -> String {
 
 /// Resolve a glyph_id for a character to a display-friendly font key.
 /// Falls back to "glyph#{id}" when the map has no entry.
+#[allow(dead_code)]
 fn glyph_display_key(glyph_map: &NgramGlyphMap, seq: &[char], glyph_id: usize) -> String {
     glyph_map.fonts_for_glyph(seq, glyph_id)
         .first()
@@ -129,6 +130,7 @@ fn ink_midpoint(img: &GrayImage) -> Option<(f32, f32)> {
     }
 }
 
+#[allow(dead_code)]
 fn format_mid_delta(_mid_scan: Option<(f32, f32)>, _mid_ref: Option<(f32, f32)>) -> String {
     // was: ink midpoint delta (Δh Δv) — duplicates geo Δh (h_err is pitch error).
     // Removed to conserve space and avoid "2 delta h" per cell. Geo Δh/Δv in
@@ -136,6 +138,7 @@ fn format_mid_delta(_mid_scan: Option<(f32, f32)>, _mid_ref: Option<(f32, f32)>)
     String::new()
 }
 
+#[allow(dead_code)]
 fn format_log_prob(prob_x_u: Option<f32>) -> String {
     if let Some(pu) = prob_x_u {
         if pu > 0.0 {
@@ -146,6 +149,7 @@ fn format_log_prob(prob_x_u: Option<f32>) -> String {
     String::new()
 }
 
+#[allow(dead_code)]
 fn format_geo(h_ll: Option<f32>, v_ll: Option<f32>, _ll: Option<f32>, h_err: Option<f32>, v_err: Option<f32>) -> String {
     // Legacy wrapper — kept for compatibility; new code uses format_char_detail
     let mut parts = Vec::new();
@@ -1742,6 +1746,7 @@ fn build_tie_break_block(
     )
 }
 
+#[allow(unused_variables, unused_assignments, unused_mut)]
 fn build_observation_table(
     entry: &AuditEntry,
     obs_to_show: &[(usize, &crate::audit::ObservationVote)],

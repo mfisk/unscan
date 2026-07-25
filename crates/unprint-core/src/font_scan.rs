@@ -1163,7 +1163,6 @@ fn detect_weight_instances(path: &Path, _class: FontClass) -> Vec<WeightInstance
 
     // Read named instances from fvar via ttf_parser
     let named_weights: Vec<u16> = {
-        use unprint_fonts::ttf_parser;
         match unprint_fonts::ttf_parser::Face::parse(&data, 0) {
             Ok(face) => {
                 let mut weights = Vec::new();
@@ -1413,7 +1412,6 @@ pub struct FontMetadata {
 
 /// Read all font metadata in a single ttf_parser parse pass.
 pub fn read_font_metadata(data: &[u8]) -> FontMetadata {
-    use unprint_fonts::ttf_parser;
     let face = match unprint_fonts::ttf_parser::Face::parse(data, 0) {
         Ok(f) => f,
         Err(_) => return FontMetadata {
@@ -1499,7 +1497,6 @@ impl FontIdentity {
 
 /// Read font identity from a font file path. Returns None on parse failure.
 pub fn read_font_identity(path: &Path) -> Option<FontIdentity> {
-    use unprint_fonts::ttf_parser;
     let data = std::fs::read(path).ok()?;
     let face = unprint_fonts::ttf_parser::Face::parse(&data, 0).ok()?;
 

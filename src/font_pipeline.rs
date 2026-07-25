@@ -316,6 +316,7 @@ pub fn match_lines(
         #[allow(unused_assignments)] // overwritten in the scoring block before use
         let mut plain_pos_map: Vec<(usize, usize)> = Vec::new();
         let mut lig_pos_map: Vec<(usize, usize)> = Vec::new();
+        #[allow(unused_assignments)]
         let mut wib_plain: Vec<crate::geometry_classifier::WordGeoMeasurement> = Vec::new();
         let mut wib_lig_opt: Option<Vec<crate::geometry_classifier::WordGeoMeasurement>> = None;
         let (font_result, tie_candidates_audit, gt_font_key) = {
@@ -790,7 +791,7 @@ pub fn match_lines(
             } else {
                 (line_crops.word_segs.as_slice(), wib_plain.as_slice(), plain_pos_map.as_slice())
             };
-            let mut fill_one = |font_key: &str,
+            let fill_one = |font_key: &str,
                                 h_ll_map: &mut std::collections::HashMap<usize, f32>,
                                 v_ll_map: &mut std::collections::HashMap<usize, f32>,
                                 h_err_map: &mut std::collections::HashMap<usize, f32>,

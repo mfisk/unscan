@@ -53,6 +53,7 @@ fn cache_dir() -> PathBuf {
     crate::cache::paths::chars_dir()
 }
 
+#[allow(dead_code)]
 fn dirs_cache_dir() -> PathBuf {
     crate::cache::cache_dir()
 }
