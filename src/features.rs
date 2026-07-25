@@ -573,7 +573,7 @@ pub fn compute_features(img: &GrayImage, pre_normalized: bool) -> Option<CropFea
     }
     let h_balance = left_ink as f32 / total_ink as f32;
 
-    let col_max = col_ink.iter().cloned().fold(0.0f32, f32::max);
+    let col_max = col_ink.iter().copied().fold(0.0f32, f32::max);
     if col_max > 0.0 {
         for v in &mut col_ink {
             *v /= col_max;
@@ -581,7 +581,7 @@ pub fn compute_features(img: &GrayImage, pre_normalized: bool) -> Option<CropFea
     }
     let profile = resample(&col_ink, PROFILE_BINS);
 
-    let row_max = row_ink.iter().cloned().fold(0.0f32, f32::max);
+    let row_max = row_ink.iter().copied().fold(0.0f32, f32::max);
     if row_max > 0.0 {
         for v in &mut row_ink {
             *v /= row_max;
