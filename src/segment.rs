@@ -1782,16 +1782,22 @@ pub fn char_crop_and_metrics(
             raw_canvas[dst_base..dst_base + len].copy_from_slice(&raw_crop[src_base..src_base + len]);
         }
     }
-    let scaled_w = (canvas_w as f32 * NORM_H as f32 / canvas_h as f32).ceil() as u32;
-    if scaled_w < 2 {
-        return None;
-    }
-    let normalized = image::imageops::resize(
-        &canvas,
-        scaled_w,
-        NORM_H,
-        image::imageops::FilterType::Lanczos3,
-    );
+    let normalized = if canvas_h == NORM_H {
+        // Identity: scaled_w == canvas_w when canvas_h == NORM_H
+        canvas
+    } else {
+        let scaled_w = (canvas_w as f32 * NORM_H as f32 / canvas_h as f32).ceil() as u32;
+        if scaled_w < 2 {
+            return None;
+        }
+        image::imageops::resize(
+            &canvas,
+            scaled_w,
+            NORM_H,
+            image::imageops::FilterType::Lanczos3,
+        )
+    };
+
 
     Some((normalized, x_min_abs, x_max_abs, y_min_abs, y_max_abs, cx, cy))
 }
