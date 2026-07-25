@@ -157,9 +157,13 @@ mod tests {
     fn hog_nonzero_for_real_image() {
         // Create a simple image with some structure
         let mut img = GrayImage::from_pixel(24, 24, image::Luma([255u8]));
-        // Draw a vertical line
-        for y in 2..22 {
-            img.put_pixel(12, y, image::Luma([0u8]));
+        // Draw a vertical line - raw buffer to avoid put_pixel in test.
+        {
+            let w = 24usize;
+            let raw = img.as_mut();
+            for y in 2..22 {
+                raw[y * w + 12] = 0;
+            }
         }
         let hog = compute_hog(&img);
         assert!(hog.is_some());

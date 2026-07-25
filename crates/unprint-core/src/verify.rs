@@ -5,7 +5,7 @@
 //! for catching fonts whose proportions don't match the original.
 
 use unprint_fonts::ab_glyph::{Font, FontRef, PxScale, ScaleFont};
-use image::{GrayImage, Luma, RgbImage, Rgb};
+use image::{GrayImage, Luma, RgbImage};
 use crate::ocr::TextRegion;
 
 // ---------------------------------------------------------------------------
@@ -88,6 +88,7 @@ pub fn verify_text_region(
     overrides: Option<&[(char, u16)]>,
     variant_tag: &str,
     variations: Option<&[([u8; 4], f32)]>,
+    allow_liga: bool,
     audit_dir: Option<&std::path::Path>,
     bail_below: Option<f32>,
 ) -> VerifyResult {
@@ -115,7 +116,15 @@ pub fn verify_text_region(
     // draws as the "final" cyan-dashed boxes.
 
     let full_render = match render_via_freetype_scaled(
-        font_data, &placements, w, h, 1, overrides, variant_tag, variations,
+        font_data,
+        &placements,
+        w,
+        h,
+        1,
+        overrides,
+        variant_tag,
+        variations,
+        allow_liga,
     ) {
         Some(r) => r,
         None => return VerifyResult { score: 0.0, dy: 0, render_ink: None, diff: None },
@@ -161,18 +170,30 @@ pub fn compute_colored_diff(a: &GrayImage, b: &GrayImage) -> RgbImage {
     };
     let ink_thresh: u8 = 180;
     let mut diff = RgbImage::new(aw, ah);
-    for y in 0..ah {
-        for x in 0..aw {
-            let pa = a.get_pixel(x, y).0[0];
-            let pb = b_resized.get_pixel(x, y).0[0];
+    // Raw-buffer version: no get_pixel/put_pixel.
+    let aw_us = aw as usize;
+    let ah_us = ah as usize;
+    let a_raw = a.as_raw();
+    let b_raw = b_resized.as_raw();
+    let d_raw = diff.as_mut();
+    for y in 0..ah_us {
+        let row_base = y * aw_us;
+        let d_row_base = row_base * 3;
+        for x in 0..aw_us {
+            let idx = row_base + x;
+            let pa = a_raw[idx];
+            let pb = b_raw[idx];
             let a_ink = pa < ink_thresh;
             let b_ink = pb < ink_thresh;
-            let color = match (a_ink, b_ink) {
-                (true, false) => Rgb([220, 30, 30]),   // scan-only: red
-                (false, true) => Rgb([30, 80, 220]),   // render-only: blue
-                _ => Rgb([255, 255, 255]),              // agreement: white
+            let (r, g, bcol) = match (a_ink, b_ink) {
+                (true, false) => (220, 30, 30),
+                (false, true) => (30, 80, 220),
+                _ => (255, 255, 255),
             };
-            diff.put_pixel(x, y, color);
+            let di = d_row_base + x * 3;
+            d_raw[di] = r;
+            d_raw[di + 1] = g;
+            d_raw[di + 2] = bcol;
         }
     }
     diff
@@ -195,12 +216,22 @@ fn render_via_freetype_scaled(
     _overrides: Option<&[(char, u16)]>,
     variant_tag: &str,
     variations: Option<&[([u8; 4], f32)]>,
+    allow_liga: bool,
 ) -> Option<GrayImage> {
     // NOTE: ab_glyph fallback disabled.  width_matched_em_px (ab_glyph) does
     // not compensate for sidebearings, so it systematically underestimates font
     // size (~3% too small).  The shaped path (rustybuzz + FreeType) handles
     // sidebearing correction and should be the only render path.
-    render_via_freetype(font_data, words, canvas_w, canvas_h, render_scale, variant_tag, variations)
+    render_via_freetype(
+        font_data,
+        words,
+        canvas_w,
+        canvas_h,
+        render_scale,
+        variant_tag,
+        variations,
+        allow_liga,
+    )
 }
 
 /// Render text using rustybuzz (OT shaping) + FreeType (rasterisation).
@@ -213,6 +244,7 @@ fn render_via_freetype(
     render_scale: u32,
     variant_tag: &str,
     variations: Option<&[([u8; 4], f32)]>,
+    allow_liga: bool,
 ) -> Option<GrayImage> {
     use std::cell::RefCell;
 
@@ -235,7 +267,14 @@ fn render_via_freetype(
     let mut all_em: Vec<f32> = words.iter()
         .filter(|w| !w.text.is_empty() && w.width >= 1)
         .filter_map(|w| {
-            crate::layout::width_matched_em_px_shaped(font_data, &w.text, w.width as f32, variant_tag, variations)
+            crate::layout::width_matched_em_px_shaped(
+                font_data,
+                &w.text,
+                w.width as f32,
+                variant_tag,
+                variations,
+                allow_liga,
+            )
         })
         .collect();
     if all_em.is_empty() {
@@ -294,14 +333,18 @@ fn render_via_freetype(
     let px_per_unit = render_em as f64 / units_per_em;
 
     let mut canvas = GrayImage::from_pixel(render_w, render_h, Luma([255u8]));
+    {
+        // Raw-buffer blit: hoist width and mutable slice for alpha blending.
+        let cw_us = render_w as usize;
+        let canvas_raw = canvas.as_mut();
 
-    for word in words {
+        for word in words {
         if word.text.is_empty() || word.width < 1 {
             continue;
         }
 
-        // Shape with shared helper
-        let shaped = match crate::layout::shape_word(&buzz_face, &ot_features, &word.text) {
+        // Shape with shared helper — ligature choice propagated from segmentation winner
+        let shaped = match crate::layout::shape_word(&buzz_face, &ot_features, &word.text, allow_liga) {
             Some(s) => s,
             None => continue,
         };
@@ -336,7 +379,7 @@ fn render_via_freetype(
             let blit_x = (pen_x + x_offset + glyph.bitmap_left() as f64).round() as i32;
             let blit_y = (pen_y - y_offset - glyph.bitmap_top() as f64).round() as i32;
 
-            // Blit the glyph bitmap onto the canvas
+            // Blit the glyph bitmap onto the canvas - raw buffer alpha blend.
             for row in 0..bmp_h {
                 for col in 0..bmp_w {
                     let cx = blit_x + col as i32;
@@ -348,40 +391,57 @@ fn render_via_freetype(
                     if alpha < 0.01 {
                         continue;
                     }
-                    let existing = canvas.get_pixel(cx as u32, cy as u32).0[0] as f32;
-                    let blended = existing * (1.0 - alpha); // black ink on white
-                    canvas.put_pixel(cx as u32, cy as u32, Luma([blended as u8]));
+                    let idx = cy as usize * cw_us + cx as usize;
+                    let existing = canvas_raw[idx] as f32;
+                    let blended = existing * (1.0 - alpha);
+                    canvas_raw[idx] = blended as u8;
                 }
             }
 
             pen_x += shaped.x_advances[i] as f64 * px_per_unit;
         }
     }
+    } // end raw blit scope, release canvas_raw borrow
 
     // Measure rendered ink extent and correct for advance-vs-ink mismatch.
     // width_matched_em_px matches advance width to target, but the OCR bbox
     // is ink extent (excluding sidebearings). Resize to match.
-    let target_ink_w = words.iter().map(|w| w.x_off as u32 + w.width).max().unwrap_or(canvas_w);
-    let rend_ink_right = {
+    // Raw-buffer ink scan: avoids get_pixel in hot any() loop.
+    let (rend_ink_left, rend_ink_right) = {
+        let raw = canvas.as_raw();
+        let w = canvas.width() as usize;
+        let h = canvas.height() as usize;
+        let mut left = w as u32;
+        for x in 0..w {
+            let mut found = false;
+            for y in 0..h {
+                if raw[y * w + x] < 240 {
+                    found = true;
+                    break;
+                }
+            }
+            if found {
+                left = x as u32;
+                break;
+            }
+        }
         let mut right = 0u32;
-        for x in (0..canvas.width()).rev() {
-            if (0..canvas.height()).any(|y| canvas.get_pixel(x, y).0[0] < 240) {
-                right = x + 1;
+        for x in (0..w).rev() {
+            let mut found = false;
+            for y in 0..h {
+                if raw[y * w + x] < 240 {
+                    found = true;
+                    break;
+                }
+            }
+            if found {
+                right = x as u32 + 1;
                 break;
             }
         }
-        right
+        (left, right)
     };
-    let rend_ink_left = {
-        let mut left = canvas.width();
-        for x in 0..canvas.width() {
-            if (0..canvas.height()).any(|y| canvas.get_pixel(x, y).0[0] < 240) {
-                left = x;
-                break;
-            }
-        }
-        left
-    };
+    let target_ink_w = words.iter().map(|w| w.x_off as u32 + w.width).max().unwrap_or(canvas_w);
     // Scale canvas horizontally so rendered ink extent matches scan ink extent (the OCR bbox).
     // Only apply if there's a meaningful difference (>1px) and rendered ink is non-empty.
     let rendered_ink_w = rend_ink_right.saturating_sub(rend_ink_left);
@@ -425,6 +485,9 @@ fn render_words_ab_glyph(
     let mut canvas = GrayImage::from_pixel(canvas_w, canvas_h, Luma([255u8]));
 
     let (cw, ch) = canvas.dimensions();
+    // Raw-buffer for ab_glyph fallback min-blend.
+    let cw_us = cw as usize;
+    let canvas_raw = canvas.as_mut();
 
     let mut all_em: Vec<f32> = words.iter()
         .filter(|w| !w.text.is_empty() && w.width >= 1)
@@ -477,8 +540,11 @@ fn render_words_ab_glyph(
                     let py = gy as i32 + by;
                     if px >= 0 && py >= 0 && (px as u32) < cw && (py as u32) < ch {
                         let val = (255.0 * (1.0 - cov)) as u8;
-                        let cur = canvas.get_pixel(px as u32, py as u32).0[0];
-                        canvas.put_pixel(px as u32, py as u32, Luma([cur.min(val)]));
+                        let idx = py as usize * cw_us + px as usize;
+                        let cur = canvas_raw[idx];
+                        if val < cur {
+                            canvas_raw[idx] = val;
+                        }
                     }
                 });
             }
@@ -487,6 +553,14 @@ fn render_words_ab_glyph(
         }
     }
 
+    // Need to drop canvas_raw borrow before returning canvas (which was borrowed mutably).
+    drop(canvas_raw);
+    // Reconstruct GrayImage from raw? canvas is still borrowed mutably, but we have raw as &mut [u8] that we just dropped.
+    // To return, we need to reconstitute via from_raw or just keep canvas as is (it was mutated through raw).
+    // Since we used as_mut() directly, canvas is already mutated, we can return it by converting raw back?
+    // Simplest: create new image from raw copy (but we mutated in place, so just re-create GrayImage via from_raw).
+    // However we cannot use canvas after drop of raw because we still have mutable borrow? Actually drop releases borrow.
+    // So we can return canvas directly after ensuring raw is dropped.
     Some(canvas)
 }
 
