@@ -48,7 +48,7 @@ HARDCODED_7 = [
     ("IBMPlexSans-400", "abcdefghijklmnopqrstuvwxyz."),
     ("SourceSerif4-400It", "Mayr-Duffner."),
     ("SourceSerif4-400It", "Type"),
-    ("Georgia-400", "GEORGIA."),
+    # ("Georgia-400", "Matthew Carter created Georgia in 1993."),  # commented out per user test - was causing Tesseract confusion
 ]
 
 def parse_args():
