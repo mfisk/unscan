@@ -728,13 +728,13 @@ fn segment_characters_inner(
             };
             candidate_paths.sort_by(|a, b| a.1.total.partial_cmp(&b.1.total).unwrap_or(std::cmp::Ordering::Equal));
             let mut added = 0usize;
-            for (col, sc, path) in &candidate_paths {
+            for (col, sc, path) in candidate_paths {
                 if let Some(limit) = extra_limit {
                     if added >= limit { break; }
                 }
-                if seam_paths.contains_key(col) { continue; }
-                seam_paths.insert(*col, path.clone());
-                seam_costs.insert(*col, sc.clone());
+                if seam_paths.contains_key(&col) { continue; }
+                seam_paths.insert(col, path);
+                seam_costs.insert(col, sc);
                 added += 1;
             }
         }
