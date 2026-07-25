@@ -787,16 +787,11 @@ fn segment_characters_inner(
 /// DP matrices from a seam candidate search.  Retaining these lets us
 /// trace the optimal path through any mid-row column without recomputing.
 struct SeamDp {
-    _cost_fwd: Vec<f32>,   // flat [row * seg_w + col]
-    _cost_rev: Vec<f32>,   // flat [row * seg_w + col]
-    pred_fwd: Vec<u32>,   // flat [row * seg_w + col] — packed (r, c) predecessor
-    pred_rev: Vec<u32>,   // flat [row * seg_w + col] — packed (r, c) predecessor
+    pred_fwd: Vec<u32>, // flat [row * seg_w + col] — packed (r, c) predecessor
+    pred_rev: Vec<u32>, // flat [row * seg_w + col] — packed (r, c) predecessor
     seg_start: u32,
-    _seg_end: u32,
     seg_w: usize,
     h: u32,
-    _max_ink: f32,
-    _row_ink: Vec<f32>,    // per-row ink fraction for ink_score/delta_ink_score
 }
 
 impl SeamDp {
@@ -883,7 +878,7 @@ fn candidate_seams(
 ) -> (Vec<(u32, f32)>, SeamDp) {
     let seg_w = (seg_end - seg_start) as usize;
     if seg_w < 3 || h < 1 {
-        let dp = SeamDp { _cost_fwd: Vec::new(), _cost_rev: Vec::new(), pred_fwd: Vec::new(), pred_rev: Vec::new(), seg_start, _seg_end: seg_end, seg_w: 0, h, _max_ink: max_ink, _row_ink: row_ink.to_vec() };
+        let dp = SeamDp { pred_fwd: Vec::new(), pred_rev: Vec::new(), seg_start, seg_w: 0, h };
         return (Vec::new(), dp);
     }
     let base = seg_start as usize;
@@ -1119,7 +1114,7 @@ fn candidate_seams(
         }
     }
 
-    let dp = SeamDp { _cost_fwd: cost_fwd, _cost_rev: cost_rev, pred_fwd, pred_rev, seg_start, _seg_end: seg_end, seg_w, h, _max_ink: max_ink, _row_ink: row_ink.to_vec() };
+    let dp = SeamDp { pred_fwd, pred_rev, seg_start, seg_w, h };
     (candidates, dp)
 }
 
