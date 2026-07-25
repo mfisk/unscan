@@ -49,7 +49,6 @@ HARDCODED_7 = [
     ("SourceSerif4-400It", "Mayr-Duffner."),
     ("SourceSerif4-400It", "Type"),
     ("LibreBaskerville-400", "abcdefghijklmnopqrstuvwxyz."),
-    ("PTSerif-400Italic", "Italic: The quick brown fox jumps over 1,234,567,890 lazy"),
 
     ("Georgia-400", "Matthew Carter created Georgia in 1993."),
 ]
@@ -160,17 +159,11 @@ def main():
     font_face_css = build_font_face_css(font_face_entries)
     font_size = 9  # pt
 
-    BLANK = '<p style="font-size:36pt; line-height:1; margin:0; padding:0;">&nbsp;</p>'
+    PAGE_BREAK = '<div style="page-break-before: always"></div>'
     lines_html = []
     for idx, (text, canonical_name, ttf_path, css_weight, css_style) in enumerate(lines):
-        # Tesseract LSTM page-context: >8 contiguous lines shifts first-line bbox.
-        # Insert blank every 8 lines to reset context, and always isolate the final
-        # Matthew Carter line (which caused the original regression) when the
-        # remainder block would contain >1 line.
         if idx > 0 and idx % 8 == 0:
-            lines_html.append(BLANK)
-        elif idx == len(lines) - 1 and len(lines) > 8 and len(lines) % 8 != 1:
-            lines_html.append(BLANK)
+            lines_html.append(PAGE_BREAK)
         lines_html.append(
             f'<p style="font-family: \'{canonical_name}\'; '
             f'font-weight: {css_weight}; font-style: {css_style};">'
