@@ -124,11 +124,18 @@ pub fn extract_text_regions(
         .tempfile()
         .map_err(ScanTextError::Io)?;
 
-    let gray = page_img.to_luma8();
+    // Fast path: if already Luma8, save directly without to_luma8() clone + DynamicImage wrapper
+    if let Some(gray_ref) = page_img.as_luma8() {
+        gray_ref
+            .save(tmp.path())
+            .map_err(|e| ScanTextError::Ocr(format!("Failed to save temp image: {e}")))?;
+    } else {
+        let gray = page_img.to_luma8();
 
-    DynamicImage::ImageLuma8(gray)
-        .save(tmp.path())
-        .map_err(|e| ScanTextError::Ocr(format!("Failed to save temp image: {e}")))?;
+        DynamicImage::ImageLuma8(gray)
+            .save(tmp.path())
+            .map_err(|e| ScanTextError::Ocr(format!("Failed to save temp image: {e}")))?;
+    }
 
     let output = Command::new("tesseract")
         .args([

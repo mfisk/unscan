@@ -36,7 +36,65 @@ use unprint_fonts::ab_glyph::{Font, PxScale, ScaleFont, point};
 use image::{DynamicImage, GrayImage};
 use std::process::Command;
 
-pub use unprint_geometry::{CharBox, TextRegion, TextLine, RawWordBBox};
+/// A character-level bounding box from Tesseract HOCR output.
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+pub struct CharBox {
+    pub ch: char,
+    pub x: u32,
+    pub y: u32,
+    pub width: u32,
+    pub height: u32,
+    pub confidence: f32,
+}
+
+/// A detected text region from OCR (word-level).
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+pub struct TextRegion {
+    pub text: String,
+    pub x: u32,
+    pub y: u32,
+    pub width: u32,
+    pub height: u32,
+    pub font_size_pt: f32,
+    pub confidence: f32,
+    pub level: u32,
+    pub block_num: u32,
+    pub par_num: u32,
+    pub line_num: u32,
+    #[allow(dead_code)]
+    pub word_num: u32,
+}
+
+/// A line of text assembled from word-level regions.
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+pub struct TextLine {
+    pub text: String,
+    pub x: u32,
+    pub y: u32,
+    pub width: u32,
+    pub height: u32,
+    pub font_size_pt: f32,
+    pub confidence: f32,
+    pub words: Vec<TextRegion>,
+    /// Snapshot of word bboxes as Tesseract originally reported them,
+    /// before merge/clip/expand post-processing.  Populated by
+    /// `snapshot_raw_bboxes()` right after `assemble_lines()`.
+    pub raw_words: Vec<RawWordBBox>,
+}
+
+impl TextLine {
+}
+
+/// Lightweight snapshot of a Tesseract word bbox before post-processing.
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+pub struct RawWordBBox {
+    pub text: String,
+    pub x: u32,
+    pub y: u32,
+    pub width: u32,
+    pub height: u32,
+    pub confidence: f32,
+}
 
 /// Capture a raw-bbox snapshot into each line's `raw_words` field.
 /// Call once, right after `assemble_lines()` and before any merge/clip/expand.
@@ -66,11 +124,18 @@ pub fn extract_text_regions(
         .tempfile()
         .map_err(ScanTextError::Io)?;
 
-    let gray = page_img.to_luma8();
+    // Fast path: if already Luma8, save directly without to_luma8() clone + DynamicImage wrapper
+    if let Some(gray_ref) = page_img.as_luma8() {
+        gray_ref
+            .save(tmp.path())
+            .map_err(|e| ScanTextError::Ocr(format!("Failed to save temp image: {e}")))?;
+    } else {
+        let gray = page_img.to_luma8();
 
-    DynamicImage::ImageLuma8(gray)
-        .save(tmp.path())
-        .map_err(|e| ScanTextError::Ocr(format!("Failed to save temp image: {e}")))?;
+        DynamicImage::ImageLuma8(gray)
+            .save(tmp.path())
+            .map_err(|e| ScanTextError::Ocr(format!("Failed to save temp image: {e}")))?;
+    }
 
     let output = Command::new("tesseract")
         .args([
@@ -891,6 +956,9 @@ fn walk_ink_edge(
 }
 
 /// Walk rows outward, same semantics as `walk_ink_edge` but vertical.
+/// Allows bridging small gaps (diacritics, i-dots) up to 5px, which is
+/// less than inter-line whitespace (15-18px at 9pt/300dpi) so it won't
+/// merge adjacent lines. Dot gap is ~4-5px.
 fn walk_ink_edge_vertical(
     gray: &GrayImage,
     start: u32,
@@ -903,20 +971,31 @@ fn walk_ink_edge_vertical(
     let page_w = gray.width();
     let page_h = gray.height();
     let mut edge = start;
+    const GAP_TOL: u32 = 5;
     if direction > 0 {
+        let mut empty = 0u32;
         for row in start..limit.min(page_h) {
             if (x_left..x_right.min(page_w)).any(|col| gray.as_raw()[(row) as usize * gray.width() as usize + (col) as usize] < blur) {
                 edge = row + 1;
+                empty = 0;
             } else {
-                break;
+                empty += 1;
+                if empty > GAP_TOL {
+                    break;
+                }
             }
         }
     } else {
+        let mut empty = 0u32;
         for row in (limit..start).rev() {
             if (x_left..x_right.min(page_w)).any(|col| gray.as_raw()[(row) as usize * gray.width() as usize + (col) as usize] < blur) {
                 edge = row;
+                empty = 0;
             } else {
-                break;
+                empty += 1;
+                if empty > GAP_TOL {
+                    break;
+                }
             }
         }
     }
@@ -932,8 +1011,16 @@ fn walk_ink_edge_vertical(
 /// which uses column ink totals between centers.
 pub fn expand_words_to_ink(lines: &mut [TextLine], gray: &GrayImage, ink_threshold: u8, blur: u8, margin: u32) {
     let (page_w, page_h) = gray.dimensions();
+    // Snapshot of original word bboxes for inter-line overlap checks.
+    // Used to prevent vertical expansion from merging adjacent lines when
+    // GAP_TOL would otherwise bridge the small inter-line whitespace.
+    // We clone only positions, not the whole image.
+    let orig_snapshot: Vec<Vec<(u32,u32,u32,u32)>> = lines
+        .iter()
+        .map(|l| l.words.iter().map(|w| (w.x, w.y, w.width, w.height)).collect())
+        .collect();
 
-    for line in lines.iter_mut() {
+    for (li_idx, line) in lines.iter_mut().enumerate() {
         let n = line.words.len();
 
         for i in 0..n {
@@ -1067,14 +1154,55 @@ pub fn expand_words_to_ink(lines: &mut [TextLine], gray: &GrayImage, ink_thresho
             }
 
             // ── Vertical expansion (bounded by ±margin) ─────────────
+            // Prevent merging adjacent lines: clamp search range to stay
+            // outside other lines' word bboxes that overlap horizontally.
+            // This allows GAP_TOL to bridge internal i-dot gaps (4-5px)
+            // which are inside the same line, but not the 3px inter-line
+            // gap in the 9-line synthetic test.  Dot gap < inter-line gap
+            // is false for that test, so we must distinguish by overlap
+            // with other lines rather than by absolute distance.
             {
                 let w = &line.words[i];
                 let wx = w.x;
                 let wr = (w.x + w.width).min(page_w);
                 let word_top = w.y;
                 let word_bot = w.y + w.height;
-                let search_top = word_top.saturating_sub(margin);
-                let search_bot = (word_bot + margin).min(page_h);
+                let mut search_top = word_top.saturating_sub(margin);
+                let mut search_bot = (word_bot + margin).min(page_h);
+
+                // Find nearest overlapping word above/below from snapshot.
+                let mut max_prev_bottom: Option<u32> = None;
+                let mut min_next_top: Option<u32> = None;
+                for (other_li, other_words) in orig_snapshot.iter().enumerate() {
+                    if other_li == li_idx { continue; }
+                    for &(ox, oy, ow, oh) in other_words {
+                        // Horizontal overlap?
+                        if ox >= wr || ox + ow <= wx { continue; }
+                        if oy + oh <= word_top {
+                            // Above
+                            let bottom = oy + oh;
+                            max_prev_bottom = Some(max_prev_bottom.map_or(bottom, |b| b.max(bottom)));
+                        } else if oy >= word_bot {
+                            let top = oy;
+                            min_next_top = Some(min_next_top.map_or(top, |t| t.min(top)));
+                        }
+                    }
+                }
+                // Clamp to preserve at least 2px gap from neighboring lines.
+                if let Some(prev_bot) = max_prev_bottom {
+                    // Don't search into or past the previous line's ink.
+                    // Keep at least 2px whitespace.
+                    let clamped = prev_bot.saturating_add(2);
+                    if clamped > search_top {
+                        search_top = clamped.min(word_top);
+                    }
+                }
+                if let Some(next_top) = min_next_top {
+                    let clamped = next_top.saturating_sub(2);
+                    if clamped < search_bot {
+                        search_bot = clamped.max(word_bot);
+                    }
+                }
 
                 let new_top = walk_ink_edge_vertical(gray, word_top, search_top, wx, wr, blur, -1);
                 let new_bot = walk_ink_edge_vertical(gray, word_bot, search_bot, wx, wr, blur, 1);
