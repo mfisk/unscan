@@ -865,6 +865,7 @@ impl SeamDp {
     }
 }
 
+#[allow(unused_assignments)]
 fn candidate_seams(
     energy: &[f32],
     img_w: usize, // word image width, for flat indexing r*img_w + col
@@ -887,32 +888,77 @@ fn candidate_seams(
     // Build per-row boundary arrays from [row, col] pairs.
     // Left boundary: max column per row (most conservative mask).
     // Right boundary: min column per row (most conservative mask).
-    let left_bound: Option<Vec<u32>> = left_path.map(|lp| {
-        let mut bound = vec![0u32; h as usize];
-        for entry in lp {
-            let r = entry[0] as usize;
-            if r < bound.len() && entry[1] > bound[r] { bound[r] = entry[1]; }
+    // Perf: avoid per-call heap allocation for typical h <= 1024 by using
+    // stack buffers.  Falls back to Vec only for unusually tall words.
+    let h_us = h as usize;
+    const BOUND_STACK_MAX: usize = 1024;
+    let mut left_stack = [0u32; BOUND_STACK_MAX];
+    let mut right_stack = [u32::MAX; BOUND_STACK_MAX];
+    let mut left_heap: Option<Vec<u32>> = None;
+    let mut right_heap: Option<Vec<u32>> = None;
+
+    let left_bound: Option<&[u32]> = if let Some(lp) = left_path {
+        if h_us <= BOUND_STACK_MAX {
+            for entry in lp {
+                let r = entry[0] as usize;
+                if r < h_us {
+                    let col = entry[1];
+                    if col > left_stack[r] {
+                        left_stack[r] = col;
+                    }
+                }
+            }
+            Some(&left_stack[..h_us])
+        } else {
+            let mut bound = vec![0u32; h_us];
+            for entry in lp {
+                let r = entry[0] as usize;
+                if r < bound.len() && entry[1] > bound[r] {
+                    bound[r] = entry[1];
+                }
+            }
+            left_heap = Some(bound);
+            Some(left_heap.as_ref().unwrap().as_slice())
         }
-        bound
-    });
-    let right_bound: Option<Vec<u32>> = right_path.map(|rp| {
-        let mut bound = vec![u32::MAX; h as usize];
-        for entry in rp {
-            let r = entry[0] as usize;
-            if r < bound.len() && entry[1] < bound[r] { bound[r] = entry[1]; }
+    } else {
+        None
+    };
+    let right_bound: Option<&[u32]> = if let Some(rp) = right_path {
+        if h_us <= BOUND_STACK_MAX {
+            for entry in rp {
+                let r = entry[0] as usize;
+                if r < h_us {
+                    let col = entry[1];
+                    if col < right_stack[r] {
+                        right_stack[r] = col;
+                    }
+                }
+            }
+            Some(&right_stack[..h_us])
+        } else {
+            let mut bound = vec![u32::MAX; h_us];
+            for entry in rp {
+                let r = entry[0] as usize;
+                if r < bound.len() && entry[1] < bound[r] {
+                    bound[r] = entry[1];
+                }
+            }
+            right_heap = Some(bound);
+            Some(right_heap.as_ref().unwrap().as_slice())
         }
-        bound
-    });
+    } else {
+        None
+    };
 
     // Masked energy: pixels outside diagonal boundaries are impassable.
     // Energy already includes the horizontal-context ink discount.
     // Flat layout: energy[r*img_w + abs_col]
     let masked_energy = |r: usize, c: usize| -> f32 {
         let abs_col = base + c;
-        if let Some(ref lb) = left_bound {
+        if let Some(lb) = left_bound {
             if abs_col <= lb[r] as usize { return f32::INFINITY; }
         }
-        if let Some(ref rb) = right_bound {
+        if let Some(rb) = right_bound {
             if abs_col >= rb[r] as usize { return f32::INFINITY; }
         }
         energy[r * img_w + abs_col]
