@@ -13,12 +13,17 @@ use std::path::Path;
 /// Save a grayscale image as RGB.
 fn gray_to_rgb(img: &GrayImage) -> RgbImage {
     let (w, h) = img.dimensions();
+    let w_us = w as usize;
+    let h_us = h as usize;
+    let src = img.as_raw();
     let mut rgb = RgbImage::new(w, h);
-    for y in 0..h {
-        for x in 0..w {
-            let g = img.get_pixel(x, y).0[0];
-            rgb.put_pixel(x, y, Rgb([g, g, g]));
-        }
+    let dst = rgb.as_mut();
+    for i in 0..w_us * h_us {
+        let g = src[i];
+        let di = i * 3;
+        dst[di] = g;
+        dst[di + 1] = g;
+        dst[di + 2] = g;
     }
     rgb
 }
@@ -31,22 +36,31 @@ pub fn save_vp_overlay(
     path: &Path,
 ) {
     let (w, h) = img.dimensions();
+    let w_us = w as usize;
+    let h_us = h as usize;
     let mut rgb = gray_to_rgb(img);
+    let buf = rgb.as_mut();
     for &(rs, re) in ws_runs {
-        for x in rs..re.min(w) {
-            for y in 0..h {
-                let p = rgb.get_pixel(x, y).0;
-                rgb.put_pixel(x, y, Rgb([
-                    p[0].saturating_sub(40),
-                    p[1].saturating_add(60),
-                    p[2].saturating_add(100),
-                ]));
+        let rs_us = rs as usize;
+        let re_us = (re.min(w) as usize).min(w_us);
+        for x in rs_us..re_us {
+            for y in 0..h_us {
+                let idx = (y * w_us + x) * 3;
+                let r = buf[idx];
+                let g = buf[idx + 1];
+                let b = buf[idx + 2];
+                buf[idx] = r.saturating_sub(40);
+                buf[idx + 1] = g.saturating_add(60);
+                buf[idx + 2] = b.saturating_add(100);
             }
         }
-        let mid = (rs + re) / 2;
-        if mid < w {
-            for y in 0..h {
-                rgb.put_pixel(mid, y, Rgb([255, 0, 0]));
+        let mid = ((rs + re) / 2) as usize;
+        if mid < w_us {
+            for y in 0..h_us {
+                let idx = (y * w_us + mid) * 3;
+                buf[idx] = 255;
+                buf[idx + 1] = 0;
+                buf[idx + 2] = 0;
             }
         }
     }
@@ -76,23 +90,45 @@ pub fn save_split_overlay_with_paths(
     path: &Path,
 ) {
     let (w, h) = img.dimensions();
+    let w_us = w as usize;
+    let h_us = h as usize;
     let mut rgb = gray_to_rgb(img);
+    let buf = rgb.as_mut();
     // VP splits: red vertical lines
     for &x in vp {
         if x < w {
-            for y in 0..h { rgb.put_pixel(x, y, Rgb([255, 0, 0])); }
+            let x_us = x as usize;
+            for y in 0..h_us {
+                let idx = (y * w_us + x_us) * 3;
+                buf[idx] = 255;
+                buf[idx + 1] = 0;
+                buf[idx + 2] = 0;
+            }
         }
     }
     // Seam splits: blue diagonal paths
     for (_col, sp) in seam_paths {
         for entry in sp.iter() {
-            let y = entry[0];
-            let x = entry[1];
-            if x < w && y < h {
-                rgb.put_pixel(x, y, Rgb([0, 100, 255]));
+            let y = entry[0] as usize;
+            let x = entry[1] as usize;
+            if x < w_us && y < h_us {
+                let idx = (y * w_us + x) * 3;
+                buf[idx] = 0;
+                buf[idx + 1] = 100;
+                buf[idx + 2] = 255;
                 // Thicken: draw ±1 pixel horizontally for visibility
-                if x > 0 { rgb.put_pixel(x - 1, y, Rgb([0, 100, 255])); }
-                if x + 1 < w { rgb.put_pixel(x + 1, y, Rgb([0, 100, 255])); }
+                if x > 0 {
+                    let idx2 = (y * w_us + (x - 1)) * 3;
+                    buf[idx2] = 0;
+                    buf[idx2 + 1] = 100;
+                    buf[idx2 + 2] = 255;
+                }
+                if x + 1 < w_us {
+                    let idx2 = (y * w_us + (x + 1)) * 3;
+                    buf[idx2] = 0;
+                    buf[idx2 + 1] = 100;
+                    buf[idx2 + 2] = 255;
+                }
             }
         }
     }

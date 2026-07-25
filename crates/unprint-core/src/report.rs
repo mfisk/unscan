@@ -102,13 +102,17 @@ fn img_td(uri: Option<&str>) -> String {
 /// Returns None for blank images.
 fn ink_midpoint(img: &GrayImage) -> Option<(f32, f32)> {
     let (w, h) = img.dimensions();
+    let w_us = w as usize;
+    let h_us = h as usize;
+    let raw = img.as_raw();
     let mut x_min = w as i32;
     let mut x_max = -1i32;
     let mut y_min = h as i32;
     let mut y_max = -1i32;
-    for y in 0..h {
-        for x in 0..w {
-            if img.get_pixel(x, y).0[0] < 200 {
+    for y in 0..h_us {
+        let row = y * w_us;
+        for x in 0..w_us {
+            if raw[row + x] < 200 {
                 if (x as i32) < x_min { x_min = x as i32; }
                 if x as i32 > x_max { x_max = x as i32; }
                 if (y as i32) < y_min { y_min = y as i32; }
@@ -1443,11 +1447,13 @@ fn render_correct_font_comparison(
     }).collect();
 
     // Same pipeline as the chosen font — render, ZNCC, ink-crop for display
+    // For GT comparison renders, allow ligatures so "fi" can shape correctly
     let vr = crate::verify::verify_text_region(
         &scan_gray, font_data, &entry.text, &words,
         entry.bbox.x, entry.bbox.y,
         fe.glyph_overrides.as_ref().map(|v| v.as_slice()),
         &fe.variant_tag, fe.variations.as_deref(),
+        true,
         None, None,
     );
 
@@ -1492,6 +1498,7 @@ fn compute_inferred_font_size(
                 wb.width as f32,
                 variant_tag,
                 variations,
+                true,
             )?;
             Some(WordSizeDetail {
                 text: wb.text.clone(),
