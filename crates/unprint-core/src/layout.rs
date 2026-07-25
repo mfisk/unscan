@@ -207,15 +207,19 @@ impl ShapedWord {
 }
 
 /// Shape a word using rustybuzz and compute sidebearing-corrected metrics.
-pub fn shape_word(face: &unprint_fonts::rustybuzz::Face, features: &[unprint_fonts::rustybuzz::Feature], text: &str) -> Option<ShapedWord> {
+pub fn shape_word(
+    face: &unprint_fonts::rustybuzz::Face,
+    features: &[unprint_fonts::rustybuzz::Feature],
+    text: &str,
+    allow_liga: bool,
+) -> Option<ShapedWord> {
     let units_per_em = face.units_per_em() as f64;
 
-    // Per-word ligature control: plain words like ['f','f'] (two f's) must be
-    // scored as two individual f's without ligature. Ligature words like
-    // ['\u{FB00}'] contain a ligature codepoint and must keep liga on to get
-    // a single combined bbox. Use canonical list from font_scan.
-    let is_lig_word = text.chars().any(|c| crate::font_scan::is_ligature_char(c));
-    let features_for_shape: Vec<unprint_fonts::rustybuzz::Feature> = if is_lig_word {
+    // Ligature control is now explicit via `allow_liga` (propagated from
+    // segmentation winner). When ligatures are allowed, keep `liga`/`dlig`
+    // enabled so "fi" can shape to a single glyph. When disallowed, force
+    // them off so "ff" stays two glyphs for plain scoring.
+    let features_for_shape: Vec<unprint_fonts::rustybuzz::Feature> = if allow_liga {
         features.to_vec()
     } else {
         let mut v = Vec::with_capacity(features.len() + 2);
@@ -277,7 +281,14 @@ pub fn shape_word(face: &unprint_fonts::rustybuzz::Face, features: &[unprint_fon
 /// More accurate than `width_matched_em_px` which uses ab_glyph (no GPOS).
 /// When `variant_tag` is non-empty (e.g. "smcp", "onum"), the corresponding
 /// OT feature is activated during shaping.
-pub fn width_matched_em_px_shaped(font_data: &[u8], text: &str, target_width_px: f32, variant_tag: &str, variations: Option<&[([u8; 4], f32)]>) -> Option<f32> {
+pub fn width_matched_em_px_shaped(
+    font_data: &[u8],
+    text: &str,
+    target_width_px: f32,
+    variant_tag: &str,
+    variations: Option<&[([u8; 4], f32)]>,
+    allow_liga: bool,
+) -> Option<f32> {
     let mut face = unprint_fonts::rustybuzz::Face::from_slice(font_data, 0)?;
     if let Some(vars) = variations {
         for (tag, val) in vars {
@@ -286,7 +297,7 @@ pub fn width_matched_em_px_shaped(font_data: &[u8], text: &str, target_width_px:
         }
     }
     let features = ot_features(variant_tag);
-    shape_word(&face, &features, text)?.ink_matched_em_px(target_width_px)
+    shape_word(&face, &features, text, allow_liga)?.ink_matched_em_px(target_width_px)
 }
 
 // ---------------------------------------------------------------------------
@@ -351,7 +362,9 @@ pub fn render_word_ab_glyph(
     let mut canvas = GrayImage::from_pixel(padded_w, h, Luma([255u8]));
     let (cw, ch) = canvas.dimensions();
 
-    // Second pass: draw
+    // Second pass: draw - raw-buffer min-blend, hoisted width/raw.
+    let cw_us = cw as usize;
+    let canvas_raw = canvas.as_mut();
     let mut cx = 0.0f32;
     let mut prev: Option<GlyphId> = None;
     for c in text.chars() {
@@ -369,8 +382,11 @@ pub fn render_word_ab_glyph(
                 let py = gy as i32 + by;
                 if px >= 0 && py >= 0 && (px as u32) < cw && (py as u32) < ch {
                     let val = (255.0 * (1.0 - cov)) as u8;
-                    let cur = canvas.get_pixel(px as u32, py as u32).0[0];
-                    canvas.put_pixel(px as u32, py as u32, Luma([cur.min(val)]));
+                    let idx = py as usize * cw_us + px as usize;
+                    let cur = canvas_raw[idx];
+                    if val < cur {
+                        canvas_raw[idx] = val;
+                    }
                 }
             });
         }

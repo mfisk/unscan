@@ -362,7 +362,9 @@ pub fn render_word_ab_glyph(
     let mut canvas = GrayImage::from_pixel(padded_w, h, Luma([255u8]));
     let (cw, ch) = canvas.dimensions();
 
-    // Second pass: draw
+    // Second pass: draw - raw-buffer min-blend, hoisted width/raw.
+    let cw_us = cw as usize;
+    let canvas_raw = canvas.as_mut();
     let mut cx = 0.0f32;
     let mut prev: Option<GlyphId> = None;
     for c in text.chars() {
@@ -380,8 +382,11 @@ pub fn render_word_ab_glyph(
                 let py = gy as i32 + by;
                 if px >= 0 && py >= 0 && (px as u32) < cw && (py as u32) < ch {
                     let val = (255.0 * (1.0 - cov)) as u8;
-                    let cur = canvas.get_pixel(px as u32, py as u32).0[0];
-                    canvas.put_pixel(px as u32, py as u32, Luma([cur.min(val)]));
+                    let idx = py as usize * cw_us + px as usize;
+                    let cur = canvas_raw[idx];
+                    if val < cur {
+                        canvas_raw[idx] = val;
+                    }
                 }
             });
         }
