@@ -2380,11 +2380,73 @@ pub fn generate_report(
         let major_pct = major_correct as f64 / compared as f64 * 100.0;
         let minor_correct = hits.len(); // hits = exact match
         let minor_pct = minor_correct as f64 / compared as f64 * 100.0;
+        let major_ignore = compared - major_misses.len();
+        let major_ignore_pct = major_ignore as f64 / compared as f64 * 100.0;
+        let exact_correct = hits.len() + similarity_failures.len();
+        let exact_pct = exact_correct as f64 / compared as f64 * 100.0;
         format!(
-            "Font accuracy: <b>{major_correct}/{compared} ({major_pct:.0}%)</b> major correct ·              <b>{minor_correct}/{compared} ({minor_pct:.0}%)</b> exact match"
+            "Font accuracy: <b>{major_correct}/{compared} ({major_pct:.0}%)</b> major correct · <b>{minor_correct}/{compared} ({minor_pct:.0}%)</b> exact match<br>Ignoring similarity threshold (<0.9 ZNCC): <b>{major_ignore}/{compared} ({major_ignore_pct:.0}%)</b> not major miss · <b>{exact_correct}/{compared} ({exact_pct:.0}%)</b> exact PS name"
         )
     } else {
         String::from("Font accuracy: no GT data")
+    };
+
+    // ── Independent attribute stats (each line can have multiple) ──────
+    // 4 independent booleans per GT line:
+    //   ocr_miss, zncc_miss, major_miss, major_right_but_not_exact (MinorMiss)
+    let (ocr_miss_cnt, zncc_miss_cnt, major_miss_ind_cnt, major_right_not_exact_cnt) = {
+        let mut ocr = 0usize;
+        let mut zncc = 0usize;
+        let mut major = 0usize;
+        let mut mrne = 0usize;
+        for ce in &classified {
+            if ce.actual_font.is_none() {
+                continue; // only GT lines
+            }
+            // ocr miss: ocr_correct == false (enriched in enrich_audit_entries)
+            if ce.entry.ocr_correct == Some(false) {
+                ocr += 1;
+            }
+            // zncc miss: similarity_pass == false regardless of ps_match
+            // This is the independent ZNCC attribute, not the mutually-exclusive SimilarityFailure.
+            if ce.entry.similarity_pass == Some(false) {
+                zncc += 1;
+            }
+            match ce.kind {
+                MissKind::MajorMiss => major += 1,
+                MissKind::MinorMiss => mrne += 1,
+                _ => {}
+            }
+        }
+        (ocr, zncc, major, mrne)
+    };
+    let independent_summary = if compared > 0 {
+        let ocr_pct = ocr_miss_cnt as f64 / compared as f64 * 100.0;
+        let zncc_pct = zncc_miss_cnt as f64 / compared as f64 * 100.0;
+        let major_pct = major_miss_ind_cnt as f64 / compared as f64 * 100.0;
+        let mrne_pct = major_right_not_exact_cnt as f64 / compared as f64 * 100.0;
+        // Complementary "right" stats
+        let ocr_ok = compared.saturating_sub(ocr_miss_cnt);
+        let ocr_ok_pct = ocr_ok as f64 / compared as f64 * 100.0;
+        let zncc_ok = compared.saturating_sub(zncc_miss_cnt);
+        let zncc_ok_pct = zncc_ok as f64 / compared as f64 * 100.0;
+        let not_major = compared.saturating_sub(major_miss_ind_cnt);
+        let not_major_pct = not_major as f64 / compared as f64 * 100.0;
+        let exact = hits.len() + similarity_failures.len();
+        let exact_pct = exact as f64 / compared as f64 * 100.0;
+        format!(
+            "<h3 style=\"margin:1em 0 0.3em;\">Independent attribute stats (each line can have multiple)</h3>\
+             <ul style=\"margin:0 0 0.5em 1.2em; line-height:1.6;\">\
+               <li>OCR miss: <b>{ocr_miss_cnt}/{compared} ({ocr_pct:.1}%)</b> — OCR correct: <b>{ocr_ok}/{compared} ({ocr_ok_pct:.1}%)</b></li>\
+               <li>ZNCC miss (&lt;0.9): <b>{zncc_miss_cnt}/{compared} ({zncc_pct:.1}%)</b> — ZNCC pass: <b>{zncc_ok}/{compared} ({zncc_ok_pct:.1}%)</b></li>\
+               <li>Major miss: <b>{major_miss_ind_cnt}/{compared} ({major_pct:.1}%)</b> — Not major miss: <b>{not_major}/{compared} ({not_major_pct:.1}%)</b></li>\
+               <li>Major-right but not exact (minor diff / weight variant): <b>{major_right_not_exact_cnt}/{compared} ({mrne_pct:.1}%)</b> — Exact PS name: <b>{exact}/{compared} ({exact_pct:.1}%)</b> (hit {hits_len} + sim_fail {sim_len})</li>\
+             </ul>",
+            hits_len = hits.len(),
+            sim_len = similarity_failures.len(),
+        )
+    } else {
+        String::from("<div>Independent stats: no GT data</div>")
     };
 
     // ── Summary line 3: OCR ──────────────────────────────────────────
@@ -2489,6 +2551,7 @@ pub fn generate_report(
          <h2>{report_title}</h2>\n\
          <div class=\"summary\">{sim_summary}</div>\n\
          <div class=\"summary\">{font_summary}</div>\n\
+         <div class=\"summary\">{independent_summary}</div>\n\
          <div class=\"summary\">{ocr_summary}</div>\n\
          <div class=\"summary\">{meta_str}</div>\n\
          <div class=\"score-legend\">\n\
