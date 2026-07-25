@@ -165,15 +165,19 @@ fn segment_characters_inner(
 
     let threshold = 200u8;
 
-    // Compute total ink per column (count of pixels above ink threshold).
-    let col_ink: Vec<u32> = (0..w)
+    // Compute total ink per column (count of pixels above ink threshold). Raw buffer.
+    let w_us = w as usize;
+    let h_us = h as usize;
+    let raw_img = img.as_raw();
+    let col_ink: Vec<u32> = (0..w_us)
         .map(|x| {
-            (0..h)
-                .map(|y| {
-                    let px = img.get_pixel(x, y).0[0];
-                    if px < threshold { 1u32 } else { 0 }
-                })
-                .sum()
+            let mut cnt = 0u32;
+            for y in 0..h_us {
+                if raw_img[y * w_us + x] < threshold {
+                    cnt += 1;
+                }
+            }
+            cnt
         })
         .collect();
 
@@ -317,15 +321,13 @@ fn segment_characters_inner(
         // couldn't distinguish between the interior of a dark stroke
         // (zero gradient) and a white gap (also zero gradient).
 
-        // Per-pixel darkness: 0.0 for white, 255.0 for black (raw).
-        // ink_score() applies the parameterized transform during DP scoring.
-        let darkness: Vec<Vec<f32>> = (0..h)
+        // Per-pixel darkness: 0.0 for white, 255.0 for black (raw). Raw buffer single pass.
+        let raw_dark = img.as_raw();
+        let w_us2 = w as usize;
+        let darkness: Vec<Vec<f32>> = (0..h as usize)
             .map(|y| {
-                (0..w)
-                    .map(|x| {
-                        255.0 - img.get_pixel(x, y).0[0] as f32
-                    })
-                    .collect()
+                let base = y * w_us2;
+                (0..w_us2).map(|x| 255.0 - raw_dark[base + x] as f32).collect()
             })
             .collect();
 
@@ -595,19 +597,24 @@ fn segment_characters_inner(
                     rb_by_row[p[0] as usize] = rb_by_row[p[0] as usize].min(p[1]);
                 }}
             }
+            let raw_seam = img.as_raw();
+            let w_us_seam = w as usize;
             let mut seam_ink_left: u32 = 0;
             let mut seam_ink_right: u32 = 0;
-            for row in 0..h {
-                let seam_col = seam_by_row[row as usize];
-                let lb = lb_by_row[row as usize];
-                let rb = rb_by_row[row as usize];
-                for c in lb..seam_col {
-                    let px = img.get_pixel(c, row).0[0];
-                    if px < 200 { seam_ink_left += 1; }
+            for row in 0..h as usize {
+                let base = row * w_us_seam;
+                let seam_col = seam_by_row[row] as usize;
+                let lb = lb_by_row[row] as usize;
+                let rb = rb_by_row[row] as usize;
+                for c in lb..seam_col.min(w_us_seam) {
+                    if raw_seam[base + c] < 200 {
+                        seam_ink_left += 1;
+                    }
                 }
-                for c in (seam_col + 1)..rb {
-                    let px = img.get_pixel(c, row).0[0];
-                    if px < 200 { seam_ink_right += 1; }
+                for c in (seam_col + 1)..rb.min(w_us_seam) {
+                    if raw_seam[base + c] < 200 {
+                        seam_ink_right += 1;
+                    }
                 }
             }
             if seam_ink_left < min_ink_for_symbol || seam_ink_right < min_ink_for_symbol {
@@ -1439,22 +1446,28 @@ pub fn crop_ngram(
     let mut crop = image::imageops::crop_imm(word_img, x0, 0, x1 - x0, crop_h).to_image();
 
     let crop_w = x1 - x0;
-    for y in 0..crop_h.min(crop.height()) {
-        if let Some(sp) = left_seam {
-            // Left seam: white out to the left of the min column at this row
-            if let Some(seam_x) = sp.iter().filter(|p| p[0] == y).map(|p| p[1]).min() {
-                let limit = seam_x.saturating_sub(x0);
-                for cx in 0..limit.min(crop_w) {
-                    crop.put_pixel(cx, y, image::Luma([255u8]));
+    {
+        let cw_us = crop_w as usize;
+        let ch_us = crop_h as usize;
+        let raw = crop.as_mut();
+        let stride = cw_us;
+        for y in 0..ch_us {
+            let base = y * stride;
+            if let Some(sp) = left_seam {
+                if let Some(seam_x) = sp.iter().filter(|p| p[0] == y as u32).map(|p| p[1]).min() {
+                    let limit = (seam_x.saturating_sub(x0)) as usize;
+                    let len = limit.min(cw_us);
+                    if len > 0 {
+                        raw[base..base + len].fill(255);
+                    }
                 }
             }
-        }
-        if let Some(sp) = right_seam {
-            // Right seam: white out to the right of the max column at this row
-            if let Some(seam_x) = sp.iter().filter(|p| p[0] == y).map(|p| p[1]).max() {
-                let start = seam_x.saturating_sub(x0);
-                for cx in start..crop_w {
-                    crop.put_pixel(cx, y, image::Luma([255u8]));
+            if let Some(sp) = right_seam {
+                if let Some(seam_x) = sp.iter().filter(|p| p[0] == y as u32).map(|p| p[1]).max() {
+                    let start = (seam_x.saturating_sub(x0)) as usize;
+                    if start < cw_us {
+                        raw[base + start..base + cw_us].fill(255);
+                    }
                 }
             }
         }

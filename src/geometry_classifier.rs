@@ -78,6 +78,8 @@ pub fn measure_char_ink_bounds(
     seam_paths: &HashMap<u32, Vec<[u32; 2]>>,
 ) -> WordGeoMeasurement {
     let (w, h) = word_img.dimensions();
+    let raw_word = word_img.as_raw();
+    let w_us = w as usize;
     let n_chars = chars.len();
     if n_chars == 0 {
         return WordGeoMeasurement { chars: Vec::new() };
@@ -163,7 +165,11 @@ pub fn measure_char_ink_bounds(
             // For uniform fallback (no seams) left_limit==x0_rect, right_limit==x1_rect
 
             for x in left_limit..right_limit {
-                let pixel = word_img.get_pixel(x as u32, y as u32).0[0];
+                // Raw buffer access: y*w + x, avoids per-pixel bounds check in ImageBuffer
+                let pixel = {
+                    let base = y * w_us;
+                    raw_word[base + x]
+                };
                 if pixel < 200 {
                     has_ink = true;
                     if x < x_min { x_min = x; }

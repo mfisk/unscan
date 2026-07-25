@@ -116,6 +116,7 @@ pub fn detect_skew(img: &GrayImage) -> f32 {
 fn compute_edges(img: &GrayImage, tw: usize, th: usize, scale: f32) -> Vec<bool> {
     let (w, h) = (img.width() as usize, img.height() as usize);
     let inv_scale = 1.0 / scale;
+    let raw = img.as_raw();
 
     let mut grad = vec![0i32; tw * th];
     let mut max_grad: i32 = 0;
@@ -129,11 +130,11 @@ fn compute_edges(img: &GrayImage, tw: usize, th: usize, scale: f32) -> Vec<bool>
                 continue;
             }
 
-            // Sobel-Y: detects horizontal edges
+            // Sobel-Y: detects horizontal edges - raw buffer, no get_pixel bounds checks
             let p = |dx: i32, dy: i32| -> i32 {
                 let px = (sx as i32 + dx) as usize;
                 let py = (sy as i32 + dy) as usize;
-                img.get_pixel(px as u32, py as u32).0[0] as i32
+                raw[py * w + px] as i32
             };
 
             let gy = -p(-1, -1) - 2 * p(0, -1) - p(1, -1)
