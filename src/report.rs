@@ -2508,9 +2508,9 @@ pub fn generate_report(
          {minor_miss_blocks}\n\
          {sim_fail_section}\n\
          {raster_section}\n\
-         {ocr_miss_section}\n\
          {hits_section}\n\
          {no_gt_section}\n\
+         {ocr_miss_section}\n\
          </body>\n\
          </html>",
         n_major = major_misses.len(),
