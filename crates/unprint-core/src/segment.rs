@@ -322,70 +322,81 @@ fn segment_characters_inner(
         // (zero gradient) and a white gap (also zero gradient).
 
         // Per-pixel darkness: 0.0 for white, 255.0 for black (raw). Raw buffer single pass.
+        // Flat vec optimization: single allocation vs h Vec allocations, better cache locality.
         let raw_dark = img.as_raw();
-        let w_us2 = w as usize;
-        let darkness: Vec<Vec<f32>> = (0..h as usize)
-            .map(|y| {
-                let base = y * w_us2;
-                (0..w_us2).map(|x| 255.0 - raw_dark[base + x] as f32).collect()
-            })
-            .collect();
+        let w_us = w as usize;
+        let h_us = h as usize;
+        let n = w_us * h_us;
+        let mut darkness = vec![0f32; n];
+        for y in 0..h_us {
+            let base = y * w_us;
+            // Manual loop for auto-vectorization; no per-row Vec alloc.
+            for x in 0..w_us {
+                darkness[base + x] = 255.0 - raw_dark[base + x] as f32;
+            }
+        }
 
         // Row ink fractions: what share of the word's total ink is in each
         // row.  Rows with heavy strokes are high; whitespace rows near zero.
-        let total_ink: f32 = darkness.iter()
-            .flat_map(|row| row.iter()).copied().sum();
-        let row_ink: Vec<f32> = darkness.iter()
-            .map(|row| {
-                if total_ink > 0.0 { row.iter().copied().sum::<f32>() / total_ink }
-                else { 0.0 }
-            })
-            .collect();
+        let total_ink: f32 = darkness.iter().copied().sum();
+        let mut row_ink = vec![0f32; h_us];
+        if total_ink > 0.0 {
+            for y in 0..h_us {
+                let base = y * w_us;
+                let mut sum = 0f32;
+                // Sum row slice
+                for x in 0..w_us {
+                    sum += darkness[base + x];
+                }
+                row_ink[y] = sum / total_ink;
+            }
+        }
 
         // Energy map: darkness with horizontal-context discount.
-        // If a pixel is lighter than the average of its two left neighbors
-        // AND the average of its two right neighbors, it sits at a narrow
-        // gap between heavier ink — discount its ink cost by half.
-        // Precomputing this here keeps the DP loop untouched.
-        let energy: Vec<Vec<f32>> = darkness.iter().map(|row| {
-            let w = row.len();
-            (0..w).map(|c| {
-                let d = row[c];
+        // Flat vec: same layout as darkness.
+        let mut energy = vec![0f32; n];
+        for y in 0..h_us {
+            let row_off = y * w_us;
+            for c in 0..w_us {
+                let d = darkness[row_off + c];
                 if d > 0.0 {
                     let left_avg = if c >= 2 {
-                        (row[c - 1] + row[c - 2]) * 0.5
+                        (darkness[row_off + c - 1] + darkness[row_off + c - 2]) * 0.5
                     } else if c >= 1 {
-                        row[c - 1]
+                        darkness[row_off + c - 1]
                     } else {
                         d
                     };
-                    let right_avg = if c + 2 < w {
-                        (row[c + 1] + row[c + 2]) * 0.5
-                    } else if c + 1 < w {
-                        row[c + 1]
+                    let right_avg = if c + 2 < w_us {
+                        (darkness[row_off + c + 1] + darkness[row_off + c + 2]) * 0.5
+                    } else if c + 1 < w_us {
+                        darkness[row_off + c + 1]
                     } else {
                         d
                     };
-                    if left_avg > d && right_avg > d { d * 0.5 } else { d }
+                    energy[row_off + c] = if left_avg > d && right_avg > d { d * 0.5 } else { d };
                 } else {
-                    d
+                    energy[row_off + c] = d;
                 }
-            }).collect()
-        }).collect();
+            }
+        }
+
 
         // Ink discount along a path: sum of (raw darkness - discounted energy)
-        // for each pixel on the path.
+        // for each pixel on the path. Flat layout: idx = r*w + c.
         let ink_discount_for_path = |path: &[[u32; 2]]| -> f32 {
             path.iter().map(|p| {
                 let r = p[0] as usize;
                 let c = p[1] as usize;
-                darkness[r][c] - energy[r][c]
+                let idx = r * w_us + c;
+                darkness[idx] - energy[idx]
             }).sum()
         };
 
         // Factor: trace all candidate seam paths and record their costs.
+        // Energy is now flat &[f32]; trace_path_through ignores it but keep param for compat.
         let trace_candidate_costs = |cands: &[(u32, f32)], dp: &SeamDp,
-            seg_start: u32, seg_end: u32, energy: &[Vec<f32>], row_ink: &[f32],
+            seg_start: u32, seg_end: u32, energy_flat: &[f32], row_ink: &[f32],
             seg_pen: &dyn Fn(u32, u32, u32, f32) -> f32,
             ink_disc: &dyn Fn(&[[u32; 2]]) -> f32,
             h_cost: f32,
@@ -394,7 +405,7 @@ fn segment_characters_inner(
             let mut sorted: Vec<(u32, f32)> = cands.to_vec();
             sorted.sort_by(|a, b| a.1.partial_cmp(&b.1).unwrap_or(std::cmp::Ordering::Equal));
             for &(col, cost) in sorted.iter() {
-                let path = dp.trace_path_through(energy, col, row_ink);
+                let path = dp.trace_path_through(energy_flat, col, row_ink);
                 let p_min = path.iter().map(|p| p[1]).min().unwrap_or(col);
                 let p_max = path.iter().map(|p| p[1]).max().unwrap_or(col);
                 let pw = (p_max - p_min) as f32;
@@ -414,12 +425,10 @@ fn segment_characters_inner(
 
         // Word-level max ink (p95 of raw darkness): used by delta_ink_score
         // to scale the entry penalty proportionally.
-        let mut ink_values: Vec<f32> = Vec::new();
-        for row in &darkness {
-            for &d in row {
-                if d > 0.0 {
-                    ink_values.push(d);
-                }
+        let mut ink_values: Vec<f32> = Vec::with_capacity(n);
+        for &d in &darkness {
+            if d > 0.0 {
+                ink_values.push(d);
             }
         }
         ink_values.sort_by(|a, b| a.partial_cmp(b).unwrap());
@@ -486,7 +495,7 @@ fn segment_characters_inner(
         for &(seg_start, seg_end) in &initial_segs {
             if seg_end > seg_start + 2 {
                 let sid = next_seg_id; next_seg_id += 1;
-                let (cands, dp) = candidate_seams(&energy, seg_start, seg_end, h, None, None, max_ink, &row_ink);
+                let (cands, dp) = candidate_seams(&energy, w_us, seg_start, seg_end, h, None, None, max_ink, &row_ink);
                 for (col, cost) in &cands {
                     heap.push(SeamEntry { cost: *cost + segment_penalty(seg_start, seg_end, *col, *cost), col: *col, seg_start, seg_end, seg_id: sid });
                 }
@@ -532,7 +541,7 @@ fn segment_characters_inner(
                         let parent_bounds = seg_bounds.get(&entry.seg_id);
                         let lp = parent_bounds.and_then(|b| b.left_path.clone());
                         let rp = parent_bounds.and_then(|b| b.right_path.clone());
-                        let (cands, dp) = candidate_seams(&energy, entry.seg_start, new_end, h, lp.as_deref(), rp.as_deref(), max_ink, &row_ink);
+                        let (cands, dp) = candidate_seams(&energy, w_us, entry.seg_start, new_end, h, lp.as_deref(), rp.as_deref(), max_ink, &row_ink);
                         for (col, cost) in &cands {
                             heap.push(SeamEntry { cost: *cost + segment_penalty(entry.seg_start, new_end, *col, *cost), col: *col, seg_start: entry.seg_start, seg_end: new_end, seg_id: sid });
                         }
@@ -550,7 +559,7 @@ fn segment_characters_inner(
                         let parent_bounds = seg_bounds.get(&entry.seg_id);
                         let lp = parent_bounds.and_then(|b| b.left_path.clone());
                         let rp = parent_bounds.and_then(|b| b.right_path.clone());
-                        let (cands, dp) = candidate_seams(&energy, new_start, entry.seg_end, h, lp.as_deref(), rp.as_deref(), max_ink, &row_ink);
+                        let (cands, dp) = candidate_seams(&energy, w_us, new_start, entry.seg_end, h, lp.as_deref(), rp.as_deref(), max_ink, &row_ink);
                         for (col, cost) in &cands {
                             heap.push(SeamEntry { cost: *cost + segment_penalty(new_start, entry.seg_end, *col, *cost), col: *col, seg_start: new_start, seg_end: entry.seg_end, seg_id: sid });
                         }
@@ -667,7 +676,7 @@ fn segment_characters_inner(
                     let sid = next_seg_id; next_seg_id += 1;
                     let lp = parent_lp.clone();
                     let rp: Option<Vec<[u32; 2]>> = Some(path.clone());
-                    let (cands, dp) = candidate_seams(&energy, child_left_start, child_left_end, h, lp.as_deref(), rp.as_deref(), max_ink, &row_ink);
+                    let (cands, dp) = candidate_seams(&energy, w_us, child_left_start, child_left_end, h, lp.as_deref(), rp.as_deref(), max_ink, &row_ink);
                     for (col, cost) in &cands {
                         heap.push(SeamEntry { cost: *cost + segment_penalty(child_left_start, child_left_end, *col, *cost), col: *col, seg_start: child_left_start, seg_end: child_left_end, seg_id: sid });
                     }
@@ -684,7 +693,7 @@ fn segment_characters_inner(
                     let sid = next_seg_id; next_seg_id += 1;
                     let lp: Option<Vec<[u32; 2]>> = Some(path.clone());
                     let rp = parent_rp.clone();
-                    let (cands, dp) = candidate_seams(&energy, child_right_start, child_right_end, h, lp.as_deref(), rp.as_deref(), max_ink, &row_ink);
+                    let (cands, dp) = candidate_seams(&energy, w_us, child_right_start, child_right_end, h, lp.as_deref(), rp.as_deref(), max_ink, &row_ink);
                     for (col, cost) in &cands {
                         heap.push(SeamEntry { cost: *cost + segment_penalty(child_right_start, child_right_end, *col, *cost), col: *col, seg_start: child_right_start, seg_end: child_right_end, seg_id: sid });
                     }
@@ -794,7 +803,7 @@ impl SeamDp {
 
     /// Backtrace the cheapest path constrained to pass through
     /// `target_col` at mid-row.
-    fn trace_path_through(&self, _energy: &[Vec<f32>], target_col: u32, _row_ink: &[f32]) -> Vec<[u32; 2]> {
+    fn trace_path_through(&self, _energy: &[f32], target_col: u32, _row_ink: &[f32]) -> Vec<[u32; 2]> {
         let seg_w = self.seg_w;
         let mid_r = (self.h / 2) as usize;
         let last_r = (self.h - 1) as usize;
@@ -862,7 +871,8 @@ impl SeamDp {
 }
 
 fn candidate_seams(
-    energy: &[Vec<f32>],
+    energy: &[f32],
+    img_w: usize, // word image width, for flat indexing r*img_w + col
     seg_start: u32,
     seg_end: u32,
     h: u32,
@@ -901,6 +911,7 @@ fn candidate_seams(
 
     // Masked energy: pixels outside diagonal boundaries are impassable.
     // Energy already includes the horizontal-context ink discount.
+    // Flat layout: energy[r*img_w + abs_col]
     let masked_energy = |r: usize, c: usize| -> f32 {
         let abs_col = base + c;
         if let Some(ref lb) = left_bound {
@@ -909,7 +920,7 @@ fn candidate_seams(
         if let Some(ref rb) = right_bound {
             if abs_col >= rb[r] as usize { return f32::INFINITY; }
         }
-        energy[r][abs_col]
+        energy[r * img_w + abs_col]
     };
 
     // Forward DP: cost_fwd[r * seg_w + c] = cheapest path from any top-row column
@@ -1474,5 +1485,142 @@ pub fn crop_ngram(
     }
 
     normalize_to_ink_bounds(&crop, NORM_H)
+}
+
+/// Crop a character and return its normalized image plus ink metrics in word coordinates.
+/// Scan crop does seam handling (whitening outside winding divider); trim itself
+/// finds ink bounds and returns center in caller's (word) coordinate system.
+/// This is the single source of truth for both recognition crop and geometry midpoint,
+/// so trim is called exactly once per character.
+pub fn char_crop_and_metrics(
+    word_img: &GrayImage,
+    i: usize,
+    boundaries: &[u32],
+    seam_paths: &HashMap<u32, Vec<[u32; 2]>>,
+    crop_h: u32,
+) -> Option<(GrayImage, u32, u32, u32, u32, f64, f64)> {
+    let (ww, _) = word_img.dimensions();
+    if i + 1 >= boundaries.len() {
+        return None;
+    }
+    let b_left = boundaries[i];
+    let b_right = boundaries[i + 1];
+    let left_seam = seam_paths.get(&b_left);
+    let right_seam = seam_paths.get(&b_right);
+
+    let x0 = if let Some(sp) = left_seam {
+        sp.iter().map(|p| p[1]).min().unwrap_or(b_left).min(b_left)
+    } else {
+        b_left
+    }.min(ww);
+    let x1 = if let Some(sp) = right_seam {
+        sp.iter().map(|p| p[1]).max().unwrap_or(b_right).max(b_right).saturating_add(1)
+    } else {
+        b_right
+    }.min(ww);
+
+    if x1 <= x0 || (x1 - x0) < 2 {
+        return None;
+    }
+
+    let mut crop = image::imageops::crop_imm(word_img, x0, 0, x1 - x0, crop_h).to_image();
+    let crop_w = x1 - x0;
+    {
+        let cw_us = crop_w as usize;
+        let ch_us = crop_h as usize;
+        let raw = crop.as_mut();
+        let stride = cw_us;
+        for y in 0..ch_us {
+            let base = y * stride;
+            if let Some(sp) = left_seam {
+                if let Some(seam_x) = sp.iter().filter(|p| p[0] == y as u32).map(|p| p[1]).min() {
+                    let limit = seam_x.saturating_sub(x0);
+                    let end = (limit + 1).min(crop_w) as usize;
+                    if end > 0 {
+                        raw[base..base + end].fill(255);
+                    }
+                }
+            }
+            if let Some(sp) = right_seam {
+                if let Some(seam_x) = sp.iter().filter(|p| p[0] == y as u32).map(|p| p[1]).max() {
+                    let start = seam_x.saturating_sub(x0);
+                    let s = (start + 1).min(crop_w) as usize;
+                    if s < cw_us {
+                        raw[base + s..base + cw_us].fill(255);
+                    }
+                }
+            }
+        }
+    }
+
+    // Trim to ink — single scan, raw buffer, no get_pixel.
+    const THRESH: u8 = 200;
+    let (cw, ch) = crop.dimensions();
+    if cw == 0 || ch == 0 {
+        return None;
+    }
+    let cw_us = cw as usize;
+    let ch_us = ch as usize;
+    let raw_crop = crop.as_raw();
+    let mut min_x = cw;
+    let mut max_x = 0u32;
+    let mut min_y = ch;
+    let mut max_y = 0u32;
+    for y in 0..ch_us {
+        let base = y * cw_us;
+        for x in 0..cw_us {
+            if raw_crop[base + x] < THRESH {
+                let xu = x as u32;
+                let yu = y as u32;
+                if xu < min_x { min_x = xu; }
+                if xu > max_x { max_x = xu; }
+                if yu < min_y { min_y = yu; }
+                if yu > max_y { max_y = yu; }
+            }
+        }
+    }
+    if min_x > max_x || min_y > max_y {
+        return None;
+    }
+
+    // Absolute bounds and center in word coordinates (caller's system)
+    let x_min_abs = x0 + min_x;
+    let x_max_abs = x0 + max_x;
+    let y_min_abs = min_y;
+    let y_max_abs = max_y;
+    let cx = (x_min_abs as f64 + x_max_abs as f64) * 0.5;
+    let cy = (y_min_abs as f64 + y_max_abs as f64) * 0.5;
+
+    // Build normalized image from the same ink bounds (no second scan) - raw blit.
+    let ink_w = max_x - min_x + 1;
+    let ink_h = max_y - min_y + 1;
+    let pad = 1u32;
+    let canvas_w = ink_w + 2 * pad;
+    let canvas_h = ink_h + 2 * pad;
+    let mut canvas = GrayImage::from_pixel(canvas_w, canvas_h, image::Luma([255u8]));
+    {
+        let cw_us = cw as usize;
+        let canvas_w_us = canvas_w as usize;
+        let raw_crop = crop.as_raw();
+        let raw_canvas = canvas.as_mut();
+        for y in min_y..=max_y {
+            let src_base = y as usize * cw_us + min_x as usize;
+            let dst_base = (y - min_y + pad) as usize * canvas_w_us + pad as usize;
+            let len = ink_w as usize;
+            raw_canvas[dst_base..dst_base + len].copy_from_slice(&raw_crop[src_base..src_base + len]);
+        }
+    }
+    let scaled_w = (canvas_w as f32 * NORM_H as f32 / canvas_h as f32).ceil() as u32;
+    if scaled_w < 2 {
+        return None;
+    }
+    let normalized = image::imageops::resize(
+        &canvas,
+        scaled_w,
+        NORM_H,
+        image::imageops::FilterType::Lanczos3,
+    );
+
+    Some((normalized, x_min_abs, x_max_abs, y_min_abs, y_max_abs, cx, cy))
 }
 

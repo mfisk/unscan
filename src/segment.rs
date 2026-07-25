@@ -322,70 +322,81 @@ fn segment_characters_inner(
         // (zero gradient) and a white gap (also zero gradient).
 
         // Per-pixel darkness: 0.0 for white, 255.0 for black (raw). Raw buffer single pass.
+        // Flat vec optimization: single allocation vs h Vec allocations, better cache locality.
         let raw_dark = img.as_raw();
-        let w_us2 = w as usize;
-        let darkness: Vec<Vec<f32>> = (0..h as usize)
-            .map(|y| {
-                let base = y * w_us2;
-                (0..w_us2).map(|x| 255.0 - raw_dark[base + x] as f32).collect()
-            })
-            .collect();
+        let w_us = w as usize;
+        let h_us = h as usize;
+        let n = w_us * h_us;
+        let mut darkness = vec![0f32; n];
+        for y in 0..h_us {
+            let base = y * w_us;
+            // Manual loop for auto-vectorization; no per-row Vec alloc.
+            for x in 0..w_us {
+                darkness[base + x] = 255.0 - raw_dark[base + x] as f32;
+            }
+        }
 
         // Row ink fractions: what share of the word's total ink is in each
         // row.  Rows with heavy strokes are high; whitespace rows near zero.
-        let total_ink: f32 = darkness.iter()
-            .flat_map(|row| row.iter()).copied().sum();
-        let row_ink: Vec<f32> = darkness.iter()
-            .map(|row| {
-                if total_ink > 0.0 { row.iter().copied().sum::<f32>() / total_ink }
-                else { 0.0 }
-            })
-            .collect();
+        let total_ink: f32 = darkness.iter().copied().sum();
+        let mut row_ink = vec![0f32; h_us];
+        if total_ink > 0.0 {
+            for y in 0..h_us {
+                let base = y * w_us;
+                let mut sum = 0f32;
+                // Sum row slice
+                for x in 0..w_us {
+                    sum += darkness[base + x];
+                }
+                row_ink[y] = sum / total_ink;
+            }
+        }
 
         // Energy map: darkness with horizontal-context discount.
-        // If a pixel is lighter than the average of its two left neighbors
-        // AND the average of its two right neighbors, it sits at a narrow
-        // gap between heavier ink — discount its ink cost by half.
-        // Precomputing this here keeps the DP loop untouched.
-        let energy: Vec<Vec<f32>> = darkness.iter().map(|row| {
-            let w = row.len();
-            (0..w).map(|c| {
-                let d = row[c];
+        // Flat vec: same layout as darkness.
+        let mut energy = vec![0f32; n];
+        for y in 0..h_us {
+            let row_off = y * w_us;
+            for c in 0..w_us {
+                let d = darkness[row_off + c];
                 if d > 0.0 {
                     let left_avg = if c >= 2 {
-                        (row[c - 1] + row[c - 2]) * 0.5
+                        (darkness[row_off + c - 1] + darkness[row_off + c - 2]) * 0.5
                     } else if c >= 1 {
-                        row[c - 1]
+                        darkness[row_off + c - 1]
                     } else {
                         d
                     };
-                    let right_avg = if c + 2 < w {
-                        (row[c + 1] + row[c + 2]) * 0.5
-                    } else if c + 1 < w {
-                        row[c + 1]
+                    let right_avg = if c + 2 < w_us {
+                        (darkness[row_off + c + 1] + darkness[row_off + c + 2]) * 0.5
+                    } else if c + 1 < w_us {
+                        darkness[row_off + c + 1]
                     } else {
                         d
                     };
-                    if left_avg > d && right_avg > d { d * 0.5 } else { d }
+                    energy[row_off + c] = if left_avg > d && right_avg > d { d * 0.5 } else { d };
                 } else {
-                    d
+                    energy[row_off + c] = d;
                 }
-            }).collect()
-        }).collect();
+            }
+        }
+
 
         // Ink discount along a path: sum of (raw darkness - discounted energy)
-        // for each pixel on the path.
+        // for each pixel on the path. Flat layout: idx = r*w + c.
         let ink_discount_for_path = |path: &[[u32; 2]]| -> f32 {
             path.iter().map(|p| {
                 let r = p[0] as usize;
                 let c = p[1] as usize;
-                darkness[r][c] - energy[r][c]
+                let idx = r * w_us + c;
+                darkness[idx] - energy[idx]
             }).sum()
         };
 
         // Factor: trace all candidate seam paths and record their costs.
+        // Energy is now flat &[f32]; trace_path_through ignores it but keep param for compat.
         let trace_candidate_costs = |cands: &[(u32, f32)], dp: &SeamDp,
-            seg_start: u32, seg_end: u32, energy: &[Vec<f32>], row_ink: &[f32],
+            seg_start: u32, seg_end: u32, energy_flat: &[f32], row_ink: &[f32],
             seg_pen: &dyn Fn(u32, u32, u32, f32) -> f32,
             ink_disc: &dyn Fn(&[[u32; 2]]) -> f32,
             h_cost: f32,
@@ -394,7 +405,7 @@ fn segment_characters_inner(
             let mut sorted: Vec<(u32, f32)> = cands.to_vec();
             sorted.sort_by(|a, b| a.1.partial_cmp(&b.1).unwrap_or(std::cmp::Ordering::Equal));
             for &(col, cost) in sorted.iter() {
-                let path = dp.trace_path_through(energy, col, row_ink);
+                let path = dp.trace_path_through(energy_flat, col, row_ink);
                 let p_min = path.iter().map(|p| p[1]).min().unwrap_or(col);
                 let p_max = path.iter().map(|p| p[1]).max().unwrap_or(col);
                 let pw = (p_max - p_min) as f32;
@@ -414,12 +425,10 @@ fn segment_characters_inner(
 
         // Word-level max ink (p95 of raw darkness): used by delta_ink_score
         // to scale the entry penalty proportionally.
-        let mut ink_values: Vec<f32> = Vec::new();
-        for row in &darkness {
-            for &d in row {
-                if d > 0.0 {
-                    ink_values.push(d);
-                }
+        let mut ink_values: Vec<f32> = Vec::with_capacity(n);
+        for &d in &darkness {
+            if d > 0.0 {
+                ink_values.push(d);
             }
         }
         ink_values.sort_by(|a, b| a.partial_cmp(b).unwrap());
@@ -486,7 +495,7 @@ fn segment_characters_inner(
         for &(seg_start, seg_end) in &initial_segs {
             if seg_end > seg_start + 2 {
                 let sid = next_seg_id; next_seg_id += 1;
-                let (cands, dp) = candidate_seams(&energy, seg_start, seg_end, h, None, None, max_ink, &row_ink);
+                let (cands, dp) = candidate_seams(&energy, w_us, seg_start, seg_end, h, None, None, max_ink, &row_ink);
                 for (col, cost) in &cands {
                     heap.push(SeamEntry { cost: *cost + segment_penalty(seg_start, seg_end, *col, *cost), col: *col, seg_start, seg_end, seg_id: sid });
                 }
@@ -532,7 +541,7 @@ fn segment_characters_inner(
                         let parent_bounds = seg_bounds.get(&entry.seg_id);
                         let lp = parent_bounds.and_then(|b| b.left_path.clone());
                         let rp = parent_bounds.and_then(|b| b.right_path.clone());
-                        let (cands, dp) = candidate_seams(&energy, entry.seg_start, new_end, h, lp.as_deref(), rp.as_deref(), max_ink, &row_ink);
+                        let (cands, dp) = candidate_seams(&energy, w_us, entry.seg_start, new_end, h, lp.as_deref(), rp.as_deref(), max_ink, &row_ink);
                         for (col, cost) in &cands {
                             heap.push(SeamEntry { cost: *cost + segment_penalty(entry.seg_start, new_end, *col, *cost), col: *col, seg_start: entry.seg_start, seg_end: new_end, seg_id: sid });
                         }
@@ -550,7 +559,7 @@ fn segment_characters_inner(
                         let parent_bounds = seg_bounds.get(&entry.seg_id);
                         let lp = parent_bounds.and_then(|b| b.left_path.clone());
                         let rp = parent_bounds.and_then(|b| b.right_path.clone());
-                        let (cands, dp) = candidate_seams(&energy, new_start, entry.seg_end, h, lp.as_deref(), rp.as_deref(), max_ink, &row_ink);
+                        let (cands, dp) = candidate_seams(&energy, w_us, new_start, entry.seg_end, h, lp.as_deref(), rp.as_deref(), max_ink, &row_ink);
                         for (col, cost) in &cands {
                             heap.push(SeamEntry { cost: *cost + segment_penalty(new_start, entry.seg_end, *col, *cost), col: *col, seg_start: new_start, seg_end: entry.seg_end, seg_id: sid });
                         }
@@ -667,7 +676,7 @@ fn segment_characters_inner(
                     let sid = next_seg_id; next_seg_id += 1;
                     let lp = parent_lp.clone();
                     let rp: Option<Vec<[u32; 2]>> = Some(path.clone());
-                    let (cands, dp) = candidate_seams(&energy, child_left_start, child_left_end, h, lp.as_deref(), rp.as_deref(), max_ink, &row_ink);
+                    let (cands, dp) = candidate_seams(&energy, w_us, child_left_start, child_left_end, h, lp.as_deref(), rp.as_deref(), max_ink, &row_ink);
                     for (col, cost) in &cands {
                         heap.push(SeamEntry { cost: *cost + segment_penalty(child_left_start, child_left_end, *col, *cost), col: *col, seg_start: child_left_start, seg_end: child_left_end, seg_id: sid });
                     }
@@ -684,7 +693,7 @@ fn segment_characters_inner(
                     let sid = next_seg_id; next_seg_id += 1;
                     let lp: Option<Vec<[u32; 2]>> = Some(path.clone());
                     let rp = parent_rp.clone();
-                    let (cands, dp) = candidate_seams(&energy, child_right_start, child_right_end, h, lp.as_deref(), rp.as_deref(), max_ink, &row_ink);
+                    let (cands, dp) = candidate_seams(&energy, w_us, child_right_start, child_right_end, h, lp.as_deref(), rp.as_deref(), max_ink, &row_ink);
                     for (col, cost) in &cands {
                         heap.push(SeamEntry { cost: *cost + segment_penalty(child_right_start, child_right_end, *col, *cost), col: *col, seg_start: child_right_start, seg_end: child_right_end, seg_id: sid });
                     }
@@ -794,7 +803,7 @@ impl SeamDp {
 
     /// Backtrace the cheapest path constrained to pass through
     /// `target_col` at mid-row.
-    fn trace_path_through(&self, _energy: &[Vec<f32>], target_col: u32, _row_ink: &[f32]) -> Vec<[u32; 2]> {
+    fn trace_path_through(&self, _energy: &[f32], target_col: u32, _row_ink: &[f32]) -> Vec<[u32; 2]> {
         let seg_w = self.seg_w;
         let mid_r = (self.h / 2) as usize;
         let last_r = (self.h - 1) as usize;
@@ -862,7 +871,8 @@ impl SeamDp {
 }
 
 fn candidate_seams(
-    energy: &[Vec<f32>],
+    energy: &[f32],
+    img_w: usize, // word image width, for flat indexing r*img_w + col
     seg_start: u32,
     seg_end: u32,
     h: u32,
@@ -901,6 +911,7 @@ fn candidate_seams(
 
     // Masked energy: pixels outside diagonal boundaries are impassable.
     // Energy already includes the horizontal-context ink discount.
+    // Flat layout: energy[r*img_w + abs_col]
     let masked_energy = |r: usize, c: usize| -> f32 {
         let abs_col = base + c;
         if let Some(ref lb) = left_bound {
@@ -909,7 +920,7 @@ fn candidate_seams(
         if let Some(ref rb) = right_bound {
             if abs_col >= rb[r] as usize { return f32::INFINITY; }
         }
-        energy[r][abs_col]
+        energy[r * img_w + abs_col]
     };
 
     // Forward DP: cost_fwd[r * seg_w + c] = cheapest path from any top-row column
