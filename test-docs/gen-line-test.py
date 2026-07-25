@@ -48,7 +48,8 @@ HARDCODED_7 = [
     ("IBMPlexSans-400", "abcdefghijklmnopqrstuvwxyz."),
     ("SourceSerif4-400It", "Mayr-Duffner."),
     ("SourceSerif4-400It", "Type"),
-    # ("Georgia-400", "Matthew Carter created Georgia in 1993."),  # commented out per user test - was causing Tesseract confusion
+
+    ("Georgia-400", "Matthew Carter created Georgia in 1993."),
 ]
 
 def parse_args():
@@ -158,7 +159,10 @@ def main():
     font_size = 9  # pt
 
     lines_html = []
-    for text, canonical_name, ttf_path, css_weight, css_style in lines:
+    for idx, (text, canonical_name, ttf_path, css_weight, css_style) in enumerate(lines):
+        # Insert a real blank line on the page before the final Matthew Carter line
+        if idx == len(lines) - 1 and len(lines) > 8:
+            lines_html.append('<p>&nbsp;</p>')
         lines_html.append(
             f'<p style="font-family: \'{canonical_name}\'; '
             f'font-weight: {css_weight}; font-style: {css_style};">'
