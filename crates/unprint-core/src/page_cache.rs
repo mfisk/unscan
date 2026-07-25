@@ -246,14 +246,13 @@ pub fn prepare_page(
         orig_gray
     };
 
-    // OCR (with cache)
-    let ocr_img = DynamicImage::ImageLuma8(deskewed_gray.clone());
+    // OCR (with cache) — direct GrayImage path avoids DynamicImage clone + to_luma8 clone
     let word_regions = if let Some((wr, _cb)) =
         cache_dir.and_then(|d| load_cached_ocr(d, page_idx))
     {
         wr
     } else {
-        let (wr, cb) = crate::ocr::extract_text_regions(&ocr_img, dpi)?;
+        let (wr, cb) = crate::ocr::extract_text_regions_from_gray(&deskewed_gray, dpi)?;
         if let Some(cdir) = cache_dir {
             save_cached_ocr(cdir, page_idx, &wr, &cb);
         }

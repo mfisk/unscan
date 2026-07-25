@@ -115,8 +115,8 @@ pub fn snapshot_raw_bboxes(lines: &mut [TextLine]) {
 /// character-level bounding boxes (from makebox output).
 /// Tesseract handles its own binarization and preprocessing internally
 /// via Leptonica — we just convert to grayscale and pass it through.
-pub fn extract_text_regions(
-    page_img: &DynamicImage,
+pub fn extract_text_regions_from_gray(
+    gray: &image::GrayImage,
     dpi: u32,
 ) -> Result<(Vec<TextRegion>, Vec<CharBox>), ScanTextError> {
     let tmp = tempfile::Builder::new()
@@ -124,18 +124,8 @@ pub fn extract_text_regions(
         .tempfile()
         .map_err(ScanTextError::Io)?;
 
-    // Fast path: if already Luma8, save directly without to_luma8() clone + DynamicImage wrapper
-    if let Some(gray_ref) = page_img.as_luma8() {
-        gray_ref
-            .save(tmp.path())
-            .map_err(|e| ScanTextError::Ocr(format!("Failed to save temp image: {e}")))?;
-    } else {
-        let gray = page_img.to_luma8();
-
-        DynamicImage::ImageLuma8(gray)
-            .save(tmp.path())
-            .map_err(|e| ScanTextError::Ocr(format!("Failed to save temp image: {e}")))?;
-    }
+    gray.save(tmp.path())
+        .map_err(|e| ScanTextError::Ocr(format!("Failed to save temp image: {e}")))?;
 
     let output = Command::new("tesseract")
         .args([
@@ -162,8 +152,6 @@ pub fn extract_text_regions(
     let regions = parse_tsv(&String::from_utf8_lossy(&output.stdout), dpi)?;
 
     // Second pass: get character-level bounding boxes via HOCR
-    // HOCR with hocr_char_boxes=1 gives per-character bboxes with confidence,
-    // structurally nested inside words (eliminates image-area contamination).
     let hocr_output = Command::new("tesseract")
         .args([
             tmp.path().to_str().unwrap(),
@@ -189,8 +177,19 @@ pub fn extract_text_regions(
         Vec::new()
     };
 
-
     Ok((regions, char_boxes))
+}
+
+pub fn extract_text_regions(
+    page_img: &DynamicImage,
+    dpi: u32,
+) -> Result<(Vec<TextRegion>, Vec<CharBox>), ScanTextError> {
+    // Fast path: if already Luma8, avoid to_luma8() clone
+    if let Some(gray_ref) = page_img.as_luma8() {
+        return extract_text_regions_from_gray(gray_ref, dpi);
+    }
+    let gray = page_img.to_luma8();
+    extract_text_regions_from_gray(&gray, dpi)
 }
 
 /// Group word regions into lines using Tesseract's block/par/line numbering.
