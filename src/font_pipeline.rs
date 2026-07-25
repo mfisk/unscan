@@ -829,21 +829,25 @@ pub fn match_lines(
             // across all fonts, not classifier-only.
             {
                 // Precompute geo for all fonts for this line (for combined logit)
-                let mut all_geo: std::collections::HashMap<String, std::collections::HashMap<(usize, usize), (f32,f32)>> = std::collections::HashMap::new();
-                for fe in font_registry.iter() {
-                    let fk = fe.font_key();
+                // Use usize font_idx as key to avoid String clone/hash overhead (2532 × 500 chars).
+                let mut all_geo: std::collections::HashMap<usize, std::collections::HashMap<(usize, usize), (f32,f32)>> = std::collections::HashMap::new();
+                for (font_idx, fe) in font_registry.iter().enumerate() {
+                    let fk = fe.font_key_ref();
                     // Only compute geo if this font has glyphs for any observation seq (quick filter)
                     // but simple to just try per_char_geo_for_font — it returns None quickly if no matching segs
                     if let Some(geos) = crate::geometry_classifier::per_char_geo_for_font(
-                        &fk, win_segs, win_wib, font_cache, geo_cache, font_registry,
+                        fk, win_segs, win_wib, font_cache, geo_cache, font_registry,
                     ) {
                         let mut mp = std::collections::HashMap::new();
                         for g in &geos {
                             mp.insert((g.seg_idx, g.orig_idx), (g.h_ll as f32, g.v_ll as f32));
                         }
-                        all_geo.insert(fk, mp);
+                        all_geo.insert(font_idx, mp);
                     }
                 }
+
+                let chosen_idx_opt = chosen_font_key.as_deref().and_then(|k| font_registry.index_of(k));
+                let gt_idx_opt = gt_font_key.as_deref().and_then(|k| font_registry.index_of(k));
 
                 for d in observations.iter() {
                     let crop = match winning_crops.get(d.crop_index) {
@@ -880,51 +884,49 @@ pub fn match_lines(
                     }
                     // Need seg/char pos for geo lookup
                     let sc_opt = win_pos_map.get(d.crop_index).copied();
-                    let mut logits: Vec<(String, f32, usize)> = Vec::new(); // (font_key, logit, gid)
-                    for fe in font_registry.iter() {
-                        let fk = fe.font_key();
-                        let Some(gid) = glyph_map.glyph_id_for_font(&seq, &fk) else { continue; };
+                    let mut logits: Vec<(usize, f32, usize)> = Vec::new(); // (font_idx, logit, gid)
+                    for (font_idx, fe) in font_registry.iter().enumerate() {
+                        let fk = fe.font_key_ref();
+                        let Some(gid) = glyph_map.glyph_id_for_font(&seq, fk) else { continue; };
                         let Some(&raw_logit) = gid_to_logit.get(&gid) else { continue; };
                         let mut logit = raw_logit;
                         if let Some(sc) = sc_opt {
-                            if let Some(geo_map) = all_geo.get(&fk) {
+                            if let Some(geo_map) = all_geo.get(&font_idx) {
                                 if let Some(&(h_ll, v_ll)) = geo_map.get(&(sc.0, sc.1)) {
                                     logit += h_ll + v_ll;
                                 }
                             }
                         }
-                        logits.push((fk, logit, gid));
+                        logits.push((font_idx, logit, gid));
                     }
                     if logits.is_empty() { continue; }
                     // softmax
                     let max_logit = logits.iter().map(|(_, l, _)| *l).fold(f32::NEG_INFINITY, f32::max);
-                    let mut exps: Vec<(String, f32, usize, f32)> = Vec::with_capacity(logits.len());
+                    let mut exps: Vec<(usize, f32, usize, f32)> = Vec::with_capacity(logits.len());
                     let mut sum_exp = 0.0f32;
-                    for (fk, logit, gid) in logits {
+                    for (font_idx, logit, gid) in logits {
                         let e = (logit - max_logit).exp();
                         sum_exp += e;
-                        exps.push((fk, logit, gid, e));
+                        exps.push((font_idx, logit, gid, e));
                     }
                     if sum_exp <= 0.0 { continue; }
-                    // sort by final prob descending to get ranks
-                    let mut ranked: Vec<(String, f32, usize, f32)> = exps.iter().map(|(fk, logit, gid, e)| {
-                        let prob = e / sum_exp;
-                        (fk.clone(), *logit, *gid, prob)
-                    }).collect();
-                    ranked.sort_by(|a, b| b.3.partial_cmp(&a.3).unwrap_or(std::cmp::Ordering::Equal));
+                    for e in &mut exps {
+                        e.3 /= sum_exp;
+                    }
+                    exps.sort_by(|a, b| b.3.partial_cmp(&a.3).unwrap_or(std::cmp::Ordering::Equal));
                     // find chosen and GT ranks/probs
-                    if let Some(ref cfk) = chosen_font_key {
-                        for (rank, (fk, _logit, _gid, prob)) in ranked.iter().enumerate() {
-                            if fk == cfk {
+                    if let Some(chosen_idx) = chosen_idx_opt {
+                        for (rank, (font_idx, _logit, _gid, prob)) in exps.iter().enumerate() {
+                            if *font_idx == chosen_idx {
                                 rp.chosen_ranks.insert(d.crop_index, rank + 1);
                                 rp.chosen_probs.insert(d.crop_index, *prob);
                                 break;
                             }
                         }
                     }
-                    if let Some(ref gfk) = gt_font_key {
-                        for (rank, (fk, _logit, _gid, prob)) in ranked.iter().enumerate() {
-                            if fk == gfk {
+                    if let Some(gt_idx) = gt_idx_opt {
+                        for (rank, (font_idx, _logit, _gid, prob)) in exps.iter().enumerate() {
+                            if *font_idx == gt_idx {
                                 rp.gt_ranks.insert(d.crop_index, rank + 1);
                                 rp.gt_probs.insert(d.crop_index, *prob);
                                 break;

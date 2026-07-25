@@ -180,6 +180,7 @@ pub fn extract_text_regions_from_gray(
     Ok((regions, char_boxes))
 }
 
+#[allow(dead_code)]
 pub fn extract_text_regions(
     page_img: &DynamicImage,
     dpi: u32,
