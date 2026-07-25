@@ -20,6 +20,8 @@ pub const HOG_CELLS_PER_SIDE: usize = 4;
 /// Total HOG feature length.
 pub const HOG_FEAT_LEN: usize = HOG_CELLS_PER_SIDE * HOG_CELLS_PER_SIDE * HOG_ORIENT_BINS;
 
+const TARGET: usize = 24;
+
 /// Compute HOG features from a normalized grayscale glyph crop.
 ///
 /// Returns `None` if the image is degenerate (< 3px in either dimension).
@@ -29,34 +31,33 @@ pub fn compute_hog(img: &GrayImage) -> Option<[f32; HOG_FEAT_LEN]> {
         return None;
     }
 
-    // ── 1. Resize to fixed 24×24 square ──────────────────────────────
-    // Pad the shorter axis to make a square, then resize.
-    let target = 24u32;
-    let square = if w == target && h == target {
-        img.clone()
-    } else {
-        // Letterbox: fit into target×target preserving aspect ratio,
-        // padding with white (255).
-        let scale = (target as f32 / w as f32).min(target as f32 / h as f32);
-        let new_w = (w as f32 * scale).round().max(1.0) as u32;
-        let new_h = (h as f32 * scale).round().max(1.0) as u32;
-        let resized = image::imageops::resize(
-            img, new_w, new_h,
-            image::imageops::FilterType::Lanczos3,
-        );
-        let mut sq = GrayImage::from_pixel(target, target, image::Luma([255u8]));
-        let ox = (target - new_w) / 2;
-        let oy = (target - new_h) / 2;
-        image::imageops::overlay(&mut sq, &resized, ox as i64, oy as i64);
-        sq
-    };
+    // Fast path: already 24×24 — use the input buffer directly, no clone.
+    if w == TARGET as u32 && h == TARGET as u32 {
+        return Some(hog_from_raw(img.as_raw(), TARGET, TARGET));
+    }
 
-    let sw = square.width() as usize;
-    let sh = square.height() as usize;
+    // ── 1. Letterbox to fixed 24×24 square ──────────────────────────
+    let target_u32 = TARGET as u32;
+    let scale = (target_u32 as f32 / w as f32).min(target_u32 as f32 / h as f32);
+    let new_w = (w as f32 * scale).round().max(1.0) as u32;
+    let new_h = (h as f32 * scale).round().max(1.0) as u32;
+    let resized = image::imageops::resize(
+        img,
+        new_w,
+        new_h,
+        image::imageops::FilterType::Lanczos3,
+    );
+    let mut sq = GrayImage::from_pixel(target_u32, target_u32, image::Luma([255u8]));
+    let ox = (target_u32 - new_w) / 2;
+    let oy = (target_u32 - new_h) / 2;
+    image::imageops::overlay(&mut sq, &resized, ox as i64, oy as i64);
 
-    // ── 2. Compute Sobel gradients ───────────────────────────────────
-    // Central differences; border pixels use forward/backward difference.
-    let pixels = square.as_raw();
+    Some(hog_from_raw(sq.as_raw(), TARGET, TARGET))
+}
+
+#[inline]
+fn hog_from_raw(pixels: &[u8], sw: usize, sh: usize) -> [f32; HOG_FEAT_LEN] {
+    // ── 2. Compute gradients (central differences) ──────────────────
     let mut gx = vec![0.0f32; sw * sh];
     let mut gy = vec![0.0f32; sw * sh];
 
@@ -84,11 +85,9 @@ pub fn compute_hog(img: &GrayImage) -> Option<[f32; HOG_FEAT_LEN]> {
     }
 
     // ── 3. Build cell histograms ─────────────────────────────────────
-    // Divide the image into a HOG_CELLS_PER_SIDE × HOG_CELLS_PER_SIDE grid.
-    // Each cell covers (target/cells_per_side) pixels per axis = 6×6 pixels.
     let cell_w = sw as f32 / HOG_CELLS_PER_SIDE as f32;
     let cell_h = sh as f32 / HOG_CELLS_PER_SIDE as f32;
-    let bin_width = std::f32::consts::PI / HOG_ORIENT_BINS as f32; // ~22.5°
+    let bin_width = std::f32::consts::PI / HOG_ORIENT_BINS as f32;
 
     let mut hog = [0.0f32; HOG_FEAT_LEN];
 
@@ -98,25 +97,22 @@ pub fn compute_hog(img: &GrayImage) -> Option<[f32; HOG_FEAT_LEN]> {
             let dy = gy[y * sw + x];
             let mag = (dx * dx + dy * dy).sqrt();
             if mag < 1e-6 {
-                continue; // skip flat regions
+                continue;
             }
 
-            // Unsigned angle in [0, π)
-            let mut angle = dy.atan2(dx); // [-π, π]
+            let mut angle = dy.atan2(dx);
             if angle < 0.0 {
-                angle += std::f32::consts::PI; // map to [0, π)
+                angle += std::f32::consts::PI;
             }
             if angle >= std::f32::consts::PI {
                 angle -= std::f32::consts::PI;
             }
 
-            // Bilinear interpolation across orientation bins
             let bin_f = angle / bin_width;
             let bin0 = bin_f.floor() as usize % HOG_ORIENT_BINS;
             let bin1 = (bin0 + 1) % HOG_ORIENT_BINS;
             let frac = bin_f - bin_f.floor();
 
-            // Which cell does this pixel belong to?
             let cx = ((x as f32 / cell_w).floor() as usize).min(HOG_CELLS_PER_SIDE - 1);
             let cy = ((y as f32 / cell_h).floor() as usize).min(HOG_CELLS_PER_SIDE - 1);
             let cell_offset = (cy * HOG_CELLS_PER_SIDE + cx) * HOG_ORIENT_BINS;
@@ -126,7 +122,7 @@ pub fn compute_hog(img: &GrayImage) -> Option<[f32; HOG_FEAT_LEN]> {
         }
     }
 
-    // ── 4. L2 normalize the whole descriptor ─────────────────────────
+    // ── 4. L2 normalize ──────────────────────────────────────────────
     let norm: f32 = hog.iter().map(|v| v * v).sum::<f32>().sqrt();
     if norm > 1e-6 {
         for v in &mut hog {
@@ -134,7 +130,7 @@ pub fn compute_hog(img: &GrayImage) -> Option<[f32; HOG_FEAT_LEN]> {
         }
     }
 
-    Some(hog)
+    hog
 }
 
 #[cfg(test)]
@@ -143,21 +139,17 @@ mod tests {
 
     #[test]
     fn hog_returns_correct_length() {
-        // 24×24 white image → all zeros (no gradients)
         let img = GrayImage::from_pixel(24, 24, image::Luma([255u8]));
         let hog = compute_hog(&img);
         assert!(hog.is_some());
         let h = hog.unwrap();
         assert_eq!(h.len(), HOG_FEAT_LEN);
-        // Flat image → zero gradients → all zeros
         assert!(h.iter().all(|&v| v == 0.0));
     }
 
     #[test]
     fn hog_nonzero_for_real_image() {
-        // Create a simple image with some structure
         let mut img = GrayImage::from_pixel(24, 24, image::Luma([255u8]));
-        // Draw a vertical line - raw buffer to avoid put_pixel in test.
         {
             let w = 24usize;
             let raw = img.as_mut();
@@ -168,13 +160,11 @@ mod tests {
         let hog = compute_hog(&img);
         assert!(hog.is_some());
         let h = hog.unwrap();
-        // Should have nonzero gradient energy
         assert!(h.iter().any(|&v| v > 0.0));
     }
 
     #[test]
     fn hog_narrow_image() {
-        // Narrow image (typical character crop: 12×24)
         let img = GrayImage::from_pixel(12, 24, image::Luma([128u8]));
         let hog = compute_hog(&img);
         assert!(hog.is_some());
