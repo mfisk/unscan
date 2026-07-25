@@ -623,6 +623,7 @@ fn run(args: &cli::Args, classifier: &mut dyn classifier::Classifier) -> Result<
         let prepared = page_cache::prepare_page(page_img, page_idx, args.dpi, cache_dir.as_deref())?;
         let mut lines = prepared.lines;
         let gray_page = prepared.gray;
+        let rgba_page = page_img.to_rgba8(); // hoisted once per page for geometry + color
         let bg_color = prepared.bg_color;
         let ink_thresh = prepared.ink_thresh;
 
@@ -632,7 +633,7 @@ fn run(args: &cli::Args, classifier: &mut dyn classifier::Classifier) -> Result<
 
         // ── Pass 1: Match all lines ──────────────────────────────────
         let (mut line_matches, fp_hits) = font_pipeline::match_lines(
-            &lines, &gray_page, page_img, page_num,
+            &lines, &gray_page, &rgba_page, page_img, page_num,
             &font_registry, &font_cache, &geo_cache, classifier,
             &glyph_map,
             ground_truth.as_ref(),
@@ -674,7 +675,7 @@ fn run(args: &cli::Args, classifier: &mut dyn classifier::Classifier) -> Result<
         if !split_indices.is_empty() {
             let split_set: std::collections::HashSet<usize> = split_indices.iter().copied().collect();
             let (mut new_matches, _) = font_pipeline::match_lines(
-                &lines, &gray_page, page_img, page_num,
+            &lines, &gray_page, &rgba_page, page_img, page_num,
                 &font_registry, &font_cache, &geo_cache, classifier,
                 &glyph_map,
                 ground_truth.as_ref(),
@@ -891,7 +892,7 @@ fn run(args: &cli::Args, classifier: &mut dyn classifier::Classifier) -> Result<
                 .collect();
 
             let min_line_len = (args.dpi / 4).max(30); // ~¼ inch
-            let geo = geometry::detect_geometry(page_img, &text_bboxes, min_line_len);
+            let geo = geometry::detect_geometry_from_buffers(&gray_page, &rgba_page, &text_bboxes, min_line_len);
 
             for l in &geo.lines {
                 audit_geo.push(GeometryEntry {

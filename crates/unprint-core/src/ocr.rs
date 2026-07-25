@@ -384,7 +384,7 @@ pub fn fix_overlapping_words_by_ink(
             for col in search_left..search_right {
                 let mut has = false;
                 for row in y_top..y_bot {
-                    if gray.get_pixel(col, row).0[0] < ink_threshold {
+                    if gray.as_raw()[(row) as usize * gray.width() as usize + (col) as usize] < ink_threshold {
                         has = true;
                         break;
                     }
@@ -502,7 +502,7 @@ pub fn trim_words_to_ink(
             let mut left_ink = None;
             for col in wx..wx+ww {
                 let has_ink = (y_top..y_bot).any(|row| {
-                    gray.get_pixel(col.min(page_w-1), row.min(page_h-1)).0[0] < ink_threshold
+                    gray.as_raw()[(row.min(page_h-1)) as usize * gray.width() as usize + (col.min(page_w-1)) as usize] < ink_threshold
                 });
                 if has_ink {
                     left_ink = Some(col);
@@ -513,7 +513,7 @@ pub fn trim_words_to_ink(
             let mut right_ink = None;
             for col in (wx..wx+ww).rev() {
                 let has_ink = (y_top..y_bot).any(|row| {
-                    gray.get_pixel(col.min(page_w-1), row.min(page_h-1)).0[0] < ink_threshold
+                    gray.as_raw()[(row.min(page_h-1)) as usize * gray.width() as usize + (col.min(page_w-1)) as usize] < ink_threshold
                 });
                 if has_ink {
                     right_ink = Some(col);
@@ -872,7 +872,7 @@ fn walk_ink_edge(
     let mut edge = start;
     if direction > 0 {
         for col in start..limit.min(page_w) {
-            if (y_top..y_bot).any(|row| gray.get_pixel(col, row).0[0] < blur) {
+            if (y_top..y_bot).any(|row| gray.as_raw()[(row) as usize * gray.width() as usize + (col) as usize] < blur) {
                 edge = col + 1;
             } else {
                 break;
@@ -880,7 +880,7 @@ fn walk_ink_edge(
         }
     } else {
         for col in (limit..start).rev() {
-            if (y_top..y_bot).any(|row| gray.get_pixel(col.min(page_w - 1), row).0[0] < blur) {
+            if (y_top..y_bot).any(|row| gray.as_raw()[(row) as usize * gray.width() as usize + (col.min(page_w - 1)) as usize] < blur) {
                 edge = col;
             } else {
                 break;
@@ -905,7 +905,7 @@ fn walk_ink_edge_vertical(
     let mut edge = start;
     if direction > 0 {
         for row in start..limit.min(page_h) {
-            if (x_left..x_right.min(page_w)).any(|col| gray.get_pixel(col, row).0[0] < blur) {
+            if (x_left..x_right.min(page_w)).any(|col| gray.as_raw()[(row) as usize * gray.width() as usize + (col) as usize] < blur) {
                 edge = row + 1;
             } else {
                 break;
@@ -913,7 +913,7 @@ fn walk_ink_edge_vertical(
         }
     } else {
         for row in (limit..start).rev() {
-            if (x_left..x_right.min(page_w)).any(|col| gray.get_pixel(col, row).0[0] < blur) {
+            if (x_left..x_right.min(page_w)).any(|col| gray.as_raw()[(row) as usize * gray.width() as usize + (col) as usize] < blur) {
                 edge = row;
             } else {
                 break;
@@ -952,7 +952,7 @@ pub fn expand_words_to_ink(lines: &mut [TextLine], gray: &GrayImage, ink_thresho
                     let y_top = w.y;
                     let y_bot = w.y + w.height;
                     let has_edge_ink = (y_top..y_bot)
-                        .any(|row| gray.get_pixel(check_col.min(page_w - 1), row).0[0] < ink_threshold);
+                        .any(|row| gray.as_raw()[(row) as usize * gray.width() as usize + (check_col.min(page_w - 1)) as usize] < ink_threshold);
 
                     if has_edge_ink {
                         let new_right = walk_ink_edge(gray, right_edge, limit, y_top, y_bot, blur, 1);
@@ -998,7 +998,7 @@ pub fn expand_words_to_ink(lines: &mut [TextLine], gray: &GrayImage, ink_thresho
                     let mut shrink_to = prev_right;
                     for col in (prev_x..prev_right).rev() {
                         let col_has_ink = (prev_y_top..prev_y_bot)
-                            .any(|row| gray.get_pixel(col.min(page_w - 1), row).0[0] < ink_threshold);
+                            .any(|row| gray.as_raw()[(row) as usize * gray.width() as usize + (col.min(page_w - 1)) as usize] < ink_threshold);
                         if col_has_ink {
                             shrink_to = col + 1;
                             break;
@@ -1025,7 +1025,7 @@ pub fn expand_words_to_ink(lines: &mut [TextLine], gray: &GrayImage, ink_thresho
                         for col in (scan_left..prev_right).rev() {
                             let ink: u32 = (scan_y_top..scan_y_bot)
                                 .map(|row| {
-                                    let px = gray.get_pixel(col.min(page_w - 1), row).0[0];
+                                    let px = gray.as_raw()[(row) as usize * gray.width() as usize + (col.min(page_w - 1)) as usize];
                                     if px < ink_threshold { 1 } else { 0 }
                                 })
                                 .sum();
@@ -1050,10 +1050,10 @@ pub fn expand_words_to_ink(lines: &mut [TextLine], gray: &GrayImage, ink_thresho
                     // placed the box several pixels right of the glyph.
                     let gap_has_ink = (limit..left_edge)
                         .any(|col| (y_top..y_bot)
-                            .any(|row| gray.get_pixel(col.min(page_w - 1), row).0[0] < ink_threshold));
+                            .any(|row| gray.as_raw()[(row) as usize * gray.width() as usize + (col.min(page_w - 1)) as usize] < ink_threshold));
 
                     let has_edge_ink = (y_top..y_bot)
-                        .any(|row| gray.get_pixel(left_edge.min(page_w - 1), row).0[0] < ink_threshold);
+                        .any(|row| gray.as_raw()[(row) as usize * gray.width() as usize + (left_edge.min(page_w - 1)) as usize] < ink_threshold);
 
                     if has_edge_ink || gap_has_ink {
                         let new_left = walk_ink_edge(gray, left_edge, limit, y_top, y_bot, blur, -1);
@@ -1178,7 +1178,7 @@ pub fn split_wide_whitespace_words(
                 for col in seg_i_left..seg_i_right {
                     if col < ww as usize {
                         let has_ink = (0..wh).any(|row| {
-                            word_img.get_pixel(col as u32, row).0[0] < ink_threshold
+                            word_img.as_raw()[(row) as usize * word_img.width() as usize + (col as u32) as usize] < ink_threshold
                         });
                         if has_ink {
                             left_ink_i = col;
@@ -1190,7 +1190,7 @@ pub fn split_wide_whitespace_words(
                 for col in (seg_i_left..seg_i_right).rev() {
                     if col < ww as usize {
                         let has_ink = (0..wh).any(|row| {
-                            word_img.get_pixel(col as u32, row).0[0] < ink_threshold
+                            word_img.as_raw()[(row) as usize * word_img.width() as usize + (col as u32) as usize] < ink_threshold
                         });
                         if has_ink {
                             right_ink = col;
@@ -1206,7 +1206,7 @@ pub fn split_wide_whitespace_words(
                 for col in seg_j_left..seg_j_right {
                     if col < ww as usize {
                         let has_ink = (0..wh).any(|row| {
-                            word_img.get_pixel(col as u32, row).0[0] < ink_threshold
+                            word_img.as_raw()[(row) as usize * word_img.width() as usize + (col as u32) as usize] < ink_threshold
                         });
                         if has_ink {
                             left_ink = col;
@@ -1280,7 +1280,7 @@ pub fn split_wide_whitespace_words(
                     let col = abs_x + col_off;
                     if col < page_w {
                         let has_ink = (wy..wy + wh).any(|row| {
-                            gray.get_pixel(col, row).0[0] < ink_threshold
+                            gray.as_raw()[(row) as usize * gray.width() as usize + (col) as usize] < ink_threshold
                         });
                         if has_ink {
                             ink_left = ink_left.min(col_off);
@@ -1343,7 +1343,7 @@ pub fn ink_vertical_extent(
 
     for row in search_top..search_bot {
         for col in x..x + w {
-            if gray.get_pixel(col, row).0[0] < threshold {
+            if gray.as_raw()[(row) as usize * gray.width() as usize + (col) as usize] < threshold {
                 if first_ink.is_none() {
                     first_ink = Some(row);
                 }

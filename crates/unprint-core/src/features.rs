@@ -429,7 +429,7 @@ fn detect_serif(img: &GrayImage) -> f32 {
     for y in 0..h {
         let mut count = 0u32;
         for x in 0..w {
-            if img.get_pixel(x, y).0[0] < threshold {
+            if img.as_raw()[(y) as usize * img.width() as usize + (x) as usize] < threshold {
                 count += 1;
             }
         }
@@ -516,7 +516,7 @@ pub fn compute_features(img: &GrayImage, pre_normalized: bool) -> Option<CropFea
 
     for y in 0..h {
         for x in 0..w {
-            let px = img.get_pixel(x, y).0[0];
+            let px = img.as_raw()[(y) as usize * img.width() as usize + (x) as usize];
             if px < threshold {
                 let ink_val = (255 - px) as u64;
                 total_ink += ink_val;
@@ -557,7 +557,7 @@ pub fn compute_features(img: &GrayImage, pre_normalized: bool) -> Option<CropFea
 
     for y in min_y..=max_y {
         for x in min_x..=max_x {
-            let px = img.get_pixel(x, y).0[0];
+            let px = img.as_raw()[(y) as usize * img.width() as usize + (x) as usize];
             if px < threshold {
                 let ink_val = (255 - px) as f32;
                 let lx = (x - min_x) as usize;
@@ -1349,7 +1349,7 @@ fn collect_ink_runs(img: &GrayImage) -> Vec<u32> {
     for y in 0..h {
         let mut run = 0u32;
         for x in 0..w {
-            if img.get_pixel(x, y).0[0] < threshold {
+            if img.as_raw()[(y) as usize * img.width() as usize + (x) as usize] < threshold {
                 run += 1;
             } else {
                 if run >= 2 { all_runs.push(run); }
@@ -1362,7 +1362,7 @@ fn collect_ink_runs(img: &GrayImage) -> Vec<u32> {
     for x in 0..w {
         let mut run = 0u32;
         for y in 0..h {
-            if img.get_pixel(x, y).0[0] < threshold {
+            if img.as_raw()[(y) as usize * img.width() as usize + (x) as usize] < threshold {
                 run += 1;
             } else {
                 if run >= 2 { all_runs.push(run); }
@@ -1441,7 +1441,7 @@ pub fn normalize_to_ink_bounds(img: &GrayImage, target_h: u32) -> Option<GrayIma
     let mut max_y = 0u32;
     for y in 0..h {
         for x in 0..w {
-            if img.get_pixel(x, y).0[0] < THRESH {
+            if img.as_raw()[(y) as usize * img.width() as usize + (x) as usize] < THRESH {
                 if x < min_x { min_x = x; }
                 if x > max_x { max_x = x; }
                 if y < min_y { min_y = y; }
@@ -1466,11 +1466,17 @@ pub fn normalize_to_ink_bounds(img: &GrayImage, target_h: u32) -> Option<GrayIma
     let canvas_w = ink_w + 2 * pad;
     let canvas_h = ink_h + 2 * pad;
     let mut canvas = GrayImage::from_pixel(canvas_w, canvas_h, Luma([255u8]));
-    // Copy ink region into canvas at (pad, pad)
-    for y in min_y..=max_y {
-        for x in min_x..=max_x {
-            let px = img.get_pixel(x, y);
-            canvas.put_pixel(x - min_x + pad, y - min_y + pad, *px);
+    // Copy ink region into canvas at (pad, pad) — raw blit
+    {
+        let src_w = img.width() as usize;
+        let dst_w = canvas_w as usize;
+        let src_raw = img.as_raw();
+        let dst_raw = canvas.as_mut();
+        let copy_w = (max_x - min_x + 1) as usize;
+        for y in min_y..=max_y {
+            let src_off = y as usize * src_w + min_x as usize;
+            let dst_off = (y - min_y + pad) as usize * dst_w + pad as usize;
+            dst_raw[dst_off..dst_off+copy_w].copy_from_slice(&src_raw[src_off..src_off+copy_w]);
         }
     }
     let scaled_w = (canvas_w as f32 * target_h as f32 / canvas_h as f32).ceil() as u32;

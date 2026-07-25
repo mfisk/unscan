@@ -30,14 +30,14 @@ pub fn ssim_global(a: &GrayImage, b: &GrayImage) -> f32 {
 
     let get_a = |x: u32, y: u32| -> f64 {
         if x < a.width() && y < a.height() {
-            a.get_pixel(x, y).0[0] as f64
+            a.as_raw()[(y) as usize * a.width() as usize + (x) as usize] as f64
         } else {
             255.0
         }
     };
     let get_b = |x: u32, y: u32| -> f64 {
         if x < b.width() && y < b.height() {
-            b.get_pixel(x, y).0[0] as f64
+            b.as_raw()[(y) as usize * b.width() as usize + (x) as usize] as f64
         } else {
             255.0
         }
@@ -240,10 +240,10 @@ pub fn ssim_windowed(a: &GrayImage, b: &GrayImage, b_dy: i32, bail_below: Option
                 let by = py as i32 + b_dy;
                 for kx in 0..11u32 {
                     let px = (cx as i32 - half + kx as i32) as u32;
-                    let va_u8 = a.get_pixel(px, py).0[0];
+                    let va_u8 = a.as_raw()[(py) as usize * a.width() as usize + (px) as usize];
                     // Read b with offset; out-of-bounds → 255 (white background)
                     let vb_u8 = if by >= 0 && by < bh && (px as i32) < bw {
-                        b.get_pixel(px, by as u32).0[0]
+                        b.as_raw()[(by as u32) as usize * b.width() as usize + (px) as usize]
                     } else {
                         255u8
                     };
@@ -321,7 +321,7 @@ pub fn trim_whitespace(img: &GrayImage) -> GrayImage {
     // Vertical: find first/last ink rows
     let row_ink: Vec<f32> = (0..h).map(|y| {
         let dark: u32 = (0..w).map(|x| {
-            if img.get_pixel(x, y).0[0] < INK_THRESH { 1u32 } else { 0 }
+            if img.as_raw()[(y) as usize * img.width() as usize + (x) as usize] < INK_THRESH { 1u32 } else { 0 }
         }).sum();
         dark as f32 / w as f32
     }).collect();
@@ -338,7 +338,7 @@ pub fn trim_whitespace(img: &GrayImage) -> GrayImage {
     // Horizontal: find first/last ink columns
     let col_ink: Vec<f32> = (0..w).map(|x| {
         let dark: u32 = (0..h).map(|y| {
-            if img.get_pixel(x, y).0[0] < INK_THRESH { 1u32 } else { 0 }
+            if img.as_raw()[(y) as usize * img.width() as usize + (x) as usize] < INK_THRESH { 1u32 } else { 0 }
         }).sum();
         dark as f32 / h as f32
     }).collect();
@@ -377,7 +377,7 @@ pub fn trim_whitespace_simple(img: &GrayImage) -> GrayImage {
 
     for y in 0..h {
         for x in 0..w {
-            if img.get_pixel(x, y).0[0] < thresh {
+            if img.as_raw()[(y) as usize * img.width() as usize + (x) as usize] < thresh {
                 min_x = min_x.min(x);
                 max_x = max_x.max(x);
                 min_y = min_y.min(y);
@@ -516,9 +516,9 @@ fn zncc_global_bailable(
     for y in 0..h {
         let by = y as i32 + b_dy;
         for x in 0..w {
-            let va = a.get_pixel(x, y).0[0] as f64;
+            let va = a.as_raw()[(y) as usize * a.width() as usize + (x) as usize] as f64;
             let vb = if by >= 0 && by < bh && (x as i32) < bw {
-                b.get_pixel(x, by as u32).0[0] as f64
+                b.as_raw()[(by as u32) as usize * b.width() as usize + (x) as usize] as f64
             } else {
                 255.0
             };
@@ -624,9 +624,9 @@ pub fn zncc_windowed(a: &GrayImage, b: &GrayImage, b_dy: i32, bail_below: Option
                 let by = py as i32 + b_dy;
                 for kx in 0..11u32 {
                     let px = (cx as i32 - half + kx as i32) as u32;
-                    let va_u8 = a.get_pixel(px, py).0[0];
+                    let va_u8 = a.as_raw()[(py) as usize * a.width() as usize + (px) as usize];
                     let vb_u8 = if by >= 0 && by < bh && (px as i32) < bw {
-                        b.get_pixel(px, by as u32).0[0]
+                        b.as_raw()[(by as u32) as usize * b.width() as usize + (px) as usize]
                     } else {
                         255u8
                     };
@@ -707,10 +707,10 @@ fn zncc_global(a: &GrayImage, b: &GrayImage) -> f32 {
     for y in 0..h {
         for x in 0..w {
             let va = if (x as u32) < a.width() && (y as u32) < a.height() {
-                a.get_pixel(x as u32, y as u32).0[0] as f64
+                a.as_raw()[(y as u32) as usize * a.width() as usize + (x as u32) as usize] as f64
             } else { 255.0 };
             let vb = if (x as u32) < b.width() && (y as u32) < b.height() {
-                b.get_pixel(x as u32, y as u32).0[0] as f64
+                b.as_raw()[(y as u32) as usize * b.width() as usize + (x as u32) as usize] as f64
             } else { 255.0 };
             sum_a += va;
             sum_b += vb;

@@ -159,6 +159,7 @@ fn save_obs_crops(
 pub fn match_lines(
     lines: &[TextLine],
     gray_page: &image::GrayImage,
+    rgba_page: &image::RgbaImage,
     page_img: &image::DynamicImage,
     page_num: usize,
     font_registry: &font_scan::FontRegistry,
@@ -209,8 +210,9 @@ pub fn match_lines(
             );
             if vr.score >= FAST_PATH_MIN_SSIM {
                 fast_path_hits.fetch_add(1, Ordering::Relaxed);
-                let text_color = color::detect_text_color(
-                    page_img,
+                let text_color = color::detect_text_color_from_buffers(
+                    gray_page,
+                    rgba_page,
                     &TextRegion {
                         text: line.text.clone(),
                         x: line.x, y: line.y,
@@ -251,8 +253,9 @@ pub fn match_lines(
             end
         };
 
-        let text_color = color::detect_text_color(
-            page_img,
+        let text_color = color::detect_text_color_from_buffers(
+            gray_page,
+            rgba_page,
             &TextRegion {
                 text: line.text.clone(),
                 x: line.x, y: line.y,
