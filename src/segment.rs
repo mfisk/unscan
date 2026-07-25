@@ -633,16 +633,24 @@ fn segment_characters_inner(
             let final_col = entry.col;
 
             splits.push(final_col);
-            seam_paths.insert(final_col, path.clone());
-            let path_cols_iter = seam_paths[&final_col].iter().map(|p| p[1]);
-            let path_min_col = path_cols_iter.clone().min().unwrap_or(final_col);
-            let path_max_col = path_cols_iter.max().unwrap_or(final_col);
+            // Perf: compute min/max/h_moves/id from &path directly, single pass, no iterator clone or map lookup
+            let mut path_min_col = u32::MAX;
+            let mut path_max_col = 0u32;
+            for p in &path {
+                let c = p[1];
+                if c < path_min_col { path_min_col = c; }
+                if c > path_max_col { path_max_col = c; }
+            }
+            if path_min_col == u32::MAX {
+                path_min_col = final_col;
+                path_max_col = final_col;
+            }
             let swp = (path_max_col - path_min_col) as f32;
             let seg_pen = segment_penalty(entry.seg_start, entry.seg_end, (path_min_col + path_max_col) / 2, entry.cost);
-            let h_moves = seam_paths[&final_col].windows(2)
+            let h_moves = path.windows(2)
                 .filter(|w| w[0][0] == w[1][0])
                 .count() as f32;
-            let id = ink_discount_for_path(&seam_paths[&final_col]);
+            let id = ink_discount_for_path(&path);
             seam_costs.insert(final_col, SeamCost {
                 dp_cost: entry.cost - seg_pen - swp - h_moves * seam_params().horizontal_cost,
                 seam_width_penalty: swp,
@@ -655,6 +663,9 @@ fn segment_characters_inner(
             // Capture parent's diagonal bounds before removing.
             let parent_lp = seg_bounds.get(&entry.seg_id).and_then(|b| b.left_path.clone());
             let parent_rp = seg_bounds.get(&entry.seg_id).and_then(|b| b.right_path.clone());
+
+            // Insert seam path into map (clone once, then move original into right child to save one clone)
+            seam_paths.insert(final_col, path.clone());
 
             // Mark old segment as dead — stale entries skipped on pop.
             let old_sid = entry.seg_id;
@@ -691,7 +702,7 @@ fn segment_characters_inner(
             {
                 if child_right_end > child_right_start + 2 {
                     let sid = next_seg_id; next_seg_id += 1;
-                    let lp: Option<Vec<[u32; 2]>> = Some(path.clone());
+                    let lp: Option<Vec<[u32; 2]>> = Some(path);
                     let rp = parent_rp.clone();
                     let (mut cands, dp) = candidate_seams(&energy, w_us, child_right_start, child_right_end, h, lp.as_deref(), rp.as_deref(), max_ink, &row_ink);
                     for (col, cost) in &cands {
