@@ -86,54 +86,91 @@ pub fn generate_comparison(
         // ── Build panel ──────────────────────────────────────────
         let panel_h = label_height + scaled_h + separator + label_height + scaled_h + separator;
         let mut panel = RgbImage::from_pixel(target_width, panel_h, ImgRgb([255, 255, 255]));
+        // Raw-buffer panel assembly: replaces nested get_pixel/put_pixel loops (6 regions).
+        {
+            let w_us = target_width as usize;
+            let lh_us = label_height as usize;
+            let sh_us = scaled_h as usize;
+            let sep_us = separator as usize;
+            let buf = panel.as_mut();
+            let scan_raw = scan_scaled.as_raw();
+            let rend_raw = rendered_scaled.as_raw();
 
-        // Label "SCAN" bar — light blue background
-        for py in 0..label_height {
-            for px in 0..target_width {
-                panel.put_pixel(px, py, ImgRgb([200, 220, 255]));
+            // Label "SCAN" bar — light blue [200,220,255]
+            for y in 0..lh_us {
+                let row = y * w_us * 3;
+                for x in 0..w_us {
+                    let i = row + x * 3;
+                    buf[i] = 200;
+                    buf[i + 1] = 220;
+                    buf[i + 2] = 255;
+                }
             }
-        }
 
-        // Paste scan crop
-        let scan_y_start = label_height;
-        for py in 0..scaled_h {
-            for px in 0..target_width {
-                let gray = scan_scaled.get_pixel(px, py).0[0];
-                panel.put_pixel(px, scan_y_start + py, ImgRgb([gray, gray, gray]));
+            // Paste scan crop (gray -> RGB)
+            let scan_y_start_us = lh_us;
+            for py in 0..sh_us {
+                let src_row = py * w_us;
+                let dst_row = (scan_y_start_us + py) * w_us * 3;
+                for px in 0..w_us {
+                    let g = scan_raw[src_row + px];
+                    let di = dst_row + px * 3;
+                    buf[di] = g;
+                    buf[di + 1] = g;
+                    buf[di + 2] = g;
+                }
             }
-        }
 
-        // Separator line — red
-        let sep1_y = scan_y_start + scaled_h;
-        for py in 0..separator {
-            for px in 0..target_width {
-                panel.put_pixel(px, sep1_y + py, ImgRgb([255, 0, 0]));
+            // Separator line — red [255,0,0]
+            let sep1_y_us = scan_y_start_us + sh_us;
+            for py in 0..sep_us {
+                let row = (sep1_y_us + py) * w_us * 3;
+                for x in 0..w_us {
+                    let i = row + x * 3;
+                    buf[i] = 255;
+                    buf[i + 1] = 0;
+                    buf[i + 2] = 0;
+                }
             }
-        }
 
-        // Label "RENDERED" bar — light green background
-        let render_label_y = sep1_y + separator;
-        for py in 0..label_height {
-            for px in 0..target_width {
-                panel.put_pixel(px, render_label_y + py, ImgRgb([200, 255, 200]));
+            // Label "RENDERED" bar — light green [200,255,200]
+            let render_label_y_us = sep1_y_us + sep_us;
+            for py in 0..lh_us {
+                let row = (render_label_y_us + py) * w_us * 3;
+                for x in 0..w_us {
+                    let i = row + x * 3;
+                    buf[i] = 200;
+                    buf[i + 1] = 255;
+                    buf[i + 2] = 200;
+                }
             }
-        }
 
-        // Paste rendered crop
-        let render_y_start = render_label_y + label_height;
-        for py in 0..scaled_h.min(panel_h - render_y_start) {
-            for px in 0..target_width {
-                let gray = rendered_scaled.get_pixel(px, py).0[0];
-                panel.put_pixel(px, render_y_start + py, ImgRgb([gray, gray, gray]));
+            // Paste rendered crop
+            let render_y_start_us = render_label_y_us + lh_us;
+            let h_copy = sh_us.min(panel_h as usize - render_y_start_us);
+            for py in 0..h_copy {
+                let src_row = py * w_us;
+                let dst_row = (render_y_start_us + py) * w_us * 3;
+                for px in 0..w_us {
+                    let g = rend_raw[src_row + px];
+                    let di = dst_row + px * 3;
+                    buf[di] = g;
+                    buf[di + 1] = g;
+                    buf[di + 2] = g;
+                }
             }
-        }
 
-        // Bottom separator — dark gray
-        let sep2_y = render_y_start + scaled_h;
-        if sep2_y + separator <= panel_h {
-            for py in 0..separator {
-                for px in 0..target_width {
-                    panel.put_pixel(px, sep2_y + py, ImgRgb([100, 100, 100]));
+            // Bottom separator — dark gray [100,100,100]
+            let sep2_y_us = render_y_start_us + sh_us;
+            if sep2_y_us + sep_us <= panel_h as usize {
+                for py in 0..sep_us {
+                    let row = (sep2_y_us + py) * w_us * 3;
+                    for x in 0..w_us {
+                        let i = row + x * 3;
+                        buf[i] = 100;
+                        buf[i + 1] = 100;
+                        buf[i + 2] = 100;
+                    }
                 }
             }
         }
@@ -160,14 +197,24 @@ pub fn generate_comparison(
     if !panels.is_empty() {
         let total_h: u32 = panels.iter().map(|p| p.height()).sum();
         let mut combined = RgbImage::from_pixel(target_width, total_h, ImgRgb([255, 255, 255]));
-        let mut y_off = 0u32;
-        for panel in &panels {
-            for py in 0..panel.height() {
-                for px in 0..target_width.min(panel.width()) {
-                    combined.put_pixel(px, y_off + py, *panel.get_pixel(px, py));
+        {
+            let w_us = target_width as usize;
+            let row_bytes = w_us * 3;
+            let combined_buf = combined.as_mut();
+            let mut y_off_us = 0usize;
+            for panel in &panels {
+                let ph = panel.height() as usize;
+                let pw = (target_width.min(panel.width())) as usize;
+                let panel_raw = panel.as_raw();
+                let copy_bytes = pw * 3;
+                for py in 0..ph {
+                    let src_off = py * w_us * 3;
+                    let dst_off = (y_off_us + py) * row_bytes;
+                    combined_buf[dst_off..dst_off + copy_bytes]
+                        .copy_from_slice(&panel_raw[src_off..src_off + copy_bytes]);
                 }
+                y_off_us += ph;
             }
-            y_off += panel.height();
         }
         let combined_path = output_dir.join(format!("p{}-combined.png", page_idx + 1));
         combined.save(&combined_path).map_err(|e| {
