@@ -48,6 +48,8 @@ HARDCODED_7 = [
     ("IBMPlexSans-400", "abcdefghijklmnopqrstuvwxyz."),
     ("SourceSerif4-400It", "Mayr-Duffner."),
     ("SourceSerif4-400It", "Type"),
+    ("LibreBaskerville-400", "abcdefghijklmnopqrstuvwxyz."),
+    ("PTSerif-400Italic", "Italic: The quick brown fox jumps over 1,234,567,890 lazy"),
 
     ("Georgia-400", "Matthew Carter created Georgia in 1993."),
 ]
@@ -158,11 +160,17 @@ def main():
     font_face_css = build_font_face_css(font_face_entries)
     font_size = 9  # pt
 
+    BLANK = '<p style="font-size:36pt; line-height:1; margin:0; padding:0;">&nbsp;</p>'
     lines_html = []
     for idx, (text, canonical_name, ttf_path, css_weight, css_style) in enumerate(lines):
-        # Insert a real blank line on the page before the final Matthew Carter line
-        if idx == len(lines) - 1 and len(lines) > 8:
-            lines_html.append('<p>&nbsp;</p>')
+        # Tesseract LSTM page-context: >8 contiguous lines shifts first-line bbox.
+        # Insert blank every 8 lines to reset context, and always isolate the final
+        # Matthew Carter line (which caused the original regression) when the
+        # remainder block would contain >1 line.
+        if idx > 0 and idx % 8 == 0:
+            lines_html.append(BLANK)
+        elif idx == len(lines) - 1 and len(lines) > 8 and len(lines) % 8 != 1:
+            lines_html.append(BLANK)
         lines_html.append(
             f'<p style="font-family: \'{canonical_name}\'; '
             f'font-weight: {css_weight}; font-style: {css_style};">'
@@ -180,12 +188,12 @@ def main():
 
 @page {{
   size: 8.5in 11in;
-  margin: 1in 1in;
+  margin: 0.6in 0.75in;
 }}
 
 body {{
   font-size: {font_size}pt;
-  line-height: 1.2;
+  line-height: 1.15;
   color: black;
 }}
 
