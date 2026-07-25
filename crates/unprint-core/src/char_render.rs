@@ -241,6 +241,9 @@ pub fn render_ngram_fresh<F: Font>(
     let ox = min_x.floor() as i32;
     let oy = min_y.floor() as i32;
 
+    // Raw-buffer min-blend: avoids get_pixel/put_pixel per glyph pixel.
+    let canvas_w = img_w as usize;
+    let canvas_raw = canvas.as_mut();
     for outlined in &outlines {
         let ob = outlined.px_bounds();
         outlined.draw(|gx, gy, cov| {
@@ -248,8 +251,12 @@ pub fn render_ngram_fresh<F: Font>(
             let py = gy as i32 + (ob.min.y.floor() as i32) - oy + 1;
             if px >= 0 && py >= 0 && (px as u32) < img_w && (py as u32) < img_h {
                 let val = (255.0 * (1.0 - cov)) as u8;
-                let cur = canvas.get_pixel(px as u32, py as u32).0[0];
-                canvas.put_pixel(px as u32, py as u32, Luma([cur.min(val)]));
+                let idx = py as usize * canvas_w + px as usize;
+                // SAFETY: bounds checked above, idx < canvas_raw.len()
+                let cur = canvas_raw[idx];
+                if val < cur {
+                    canvas_raw[idx] = val;
+                }
             }
         });
     }
@@ -298,13 +305,19 @@ pub fn render_glyph_at_ink_height<F: Font>(font: &F, gid: GlyphId, target_ink_h:
     let ox = b2.min.x.floor() as i32;
     let oy = b2.min.y.floor() as i32;
 
+    // Raw-buffer min-blend for glyph rasterization.
+    let cw = img_w as usize;
+    let craw = canvas.as_mut();
     outlined2.draw(|gx, gy, cov| {
         let px = gx as i32 + (b2.min.x.floor() as i32) - ox + 1;
         let py = gy as i32 + (b2.min.y.floor() as i32) - oy + 1;
         if px >= 0 && py >= 0 && (px as u32) < img_w && (py as u32) < img_h {
             let val = (255.0 * (1.0 - cov)) as u8;
-            let cur = canvas.get_pixel(px as u32, py as u32).0[0];
-            canvas.put_pixel(px as u32, py as u32, Luma([cur.min(val)]));
+            let idx = py as usize * cw + px as usize;
+            let cur = craw[idx];
+            if val < cur {
+                craw[idx] = val;
+            }
         }
     });
 
