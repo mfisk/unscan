@@ -3,6 +3,7 @@
 //! Given a word image and the expected number of characters, produce N+1
 //! boundaries that partition the image into N cells.
 
+use std::sync::Arc;
 use image::GrayImage;
 use std::collections::{HashMap, HashSet};
 use std::sync::OnceLock;
@@ -1211,10 +1212,10 @@ pub struct SegSummary {
 pub struct WordSeg {
     /// Index of the originating word in the input `words` slice (i.e. line.words).
     pub source_word_idx: usize,
-    pub word_img: GrayImage,
+    pub word_img: Arc<GrayImage>,
     pub chars: Vec<char>,
     pub boundaries: Vec<u32>,
-    pub seam_paths: HashMap<u32, Vec<[u32; 2]>>,
+    pub seam_paths: Arc<HashMap<u32, Vec<[u32; 2]>>>,
     pub seam_costs: HashMap<u32, SeamCost>,
     pub crop_h: u32,
     // Segmentation summary fields (for audit integration)
@@ -1348,10 +1349,10 @@ pub fn segment_line(
             let plain_word_img = word_img.clone();
             word_segs.push(WordSeg {
                 source_word_idx: orig_idx,
-                word_img: plain_word_img,
+                word_img: Arc::new(plain_word_img),
                 chars: all_chars,
                 boundaries: bounds_plain,
-                seam_paths: seams_plain,
+                seam_paths: Arc::new(seams_plain),
                 seam_costs: plain_seam_costs,
                 crop_h: word_h,
                 word_text: word.text.clone(),
@@ -1376,10 +1377,10 @@ pub fn segment_line(
 
             lig_word_segs.push(WordSeg {
                 source_word_idx: orig_idx,
-                word_img: word_img,
+                word_img: Arc::new(word_img),
                 chars: lig_chars,
                 boundaries: bounds_lig,
-                seam_paths: seams_lig,
+                seam_paths: Arc::new(seams_lig),
                 seam_costs: seg_summary_lig.seam_costs,
                 crop_h: word_h,
                 word_text: word.text.clone(),
@@ -1395,10 +1396,10 @@ pub fn segment_line(
             // No ligatures: move everything, zero clones for image and segmentation data
             word_segs.push(WordSeg {
                 source_word_idx: orig_idx,
-                word_img,
+                word_img: Arc::new(word_img),
                 chars: all_chars,
                 boundaries: bounds_plain,
-                seam_paths: seams_plain,
+                seam_paths: Arc::new(seams_plain),
                 seam_costs: plain_seam_costs,
                 crop_h: word_h,
                 word_text: word.text.clone(),

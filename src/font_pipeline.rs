@@ -1076,7 +1076,7 @@ pub fn match_lines(
                 mismatch: ws.mismatch,
                 ws_splits: ws.ws_splits.clone(),
                 seam_splits: ws.seam_splits.clone(),
-                seam_paths: ws.seam_paths.clone(),
+                seam_paths: (*ws.seam_paths).clone(),
                 seam_costs: ws.seam_costs.clone(),
             }).collect()
         };
