@@ -765,8 +765,7 @@ fn segment_characters_inner(
 
     // Diag: dump final overlay
     if let (Some(ddir), Some(_wtext)) = (diag_dir, word_text) {
-        let empty: Vec<u32> = Vec::new();
-        crate::seg_diag::save_split_overlay_with_paths(img, &vp_splits, &seam_splits, &empty, &seam_paths, &ddir.join("final_overlay.png"));
+        crate::seg_diag::save_split_overlay_with_paths(img, &vp_splits, &seam_splits, &[], &seam_paths, &ddir.join("final_overlay.png"));
 
         // NOTE: char crops are saved by extract_chars_from_boundaries
         // (the actual CI code path), not here — so diag shows exact CI inputs.
