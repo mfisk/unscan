@@ -1326,8 +1326,7 @@ pub fn contrast_normalize_char(img: &GrayImage) -> GrayImage {
 /// Contrast-normalize an RGBA image, preserving colour.
 /// Computes the stretch from luminance, applies it to R/G/B channels.
 pub fn contrast_normalize_rgba(img: &image::RgbaImage) -> image::RgbaImage {
-    use image::DynamicImage;
-    let gray = DynamicImage::ImageRgba8(img.clone()).into_luma8();
+    let gray = image::imageops::grayscale(img);
     let Some((p1, p99)) = contrast_percentiles(gray.as_raw()) else {
         return img.clone();
     };
