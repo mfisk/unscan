@@ -1036,6 +1036,10 @@ pub fn match_lines(
                     sx1 = sx1.max(rw.x + rw.width);
                     sy1 = sy1.max(rw.y + rw.height);
                 }
+                // Reapply upward expansion by 20% to capture i-dots / diacritics
+                let h = sy1.saturating_sub(sy0);
+                let up_expand = ((h as f32 * 0.20).ceil() as u32).max(1);
+                sy0 = sy0.saturating_sub(up_expand);
                 let surr_x = sx0.saturating_sub(pad).min(page_img.width().saturating_sub(1));
                 let surr_y = sy0.saturating_sub(pad).min(page_img.height().saturating_sub(1));
                 let surr_r = sx1.saturating_add(pad).min(page_img.width());
