@@ -380,6 +380,7 @@ impl FontDataCache {
 
 // ── Miss classification ─────────────────────────────────────────────────────
 
+#[derive(Clone)]
 struct ClassifiedEntry<'a> {
     entry: &'a AuditEntry,
     actual_font: Option<String>,
@@ -2313,6 +2314,31 @@ pub fn generate_report(
         String::new()
     };
 
+    // Full unfiltered listing when --audit-all / --report-all
+    // Shows every line in page/line order regardless of hit/miss.
+    let (all_lines_section, report_title) = if meta.report_all {
+        let mut all_sorted = classified.clone();
+        all_sorted.sort_by(|a, b| {
+            a.entry.page.cmp(&b.entry.page)
+                .then(a.entry.line_index.cmp(&b.entry.line_index))
+        });
+        let mut blocks = String::new();
+        for ce in &all_sorted {
+            let (html, _chosen_zncc, _gt_zncc) = build_miss_block(
+                ce, audit_root, font_catalog, glyph_map, &mut font_data_cache, dpi,
+            );
+            blocks.push_str(&html);
+        }
+        let section = format!(
+            "<h2 style=\"margin-top:2em;\">All Lines ({} lines)</h2>{}",
+            all_sorted.len(),
+            blocks
+        );
+        (section, format!("unprint full report — {primary_hits}/{compared} ({pct:.1}%)"))
+    } else {
+        (String::new(), format!("unprint miss report — {primary_hits}/{compared} ({pct:.1}%)"))
+    };
+
     // ── Summary line 1: Similarity ──────────────────────────────────
     let sim_summary = {
         let mut sim_vals: Vec<f32> = entries.iter()
@@ -2444,11 +2470,11 @@ pub fn generate_report(
          <html>\n\
          <head>\n\
          <meta charset=\"utf-8\">\n\
-         <title>unprint miss report — {primary_hits}/{compared} ({pct:.1}%)</title>\n\
+         <title>{report_title}</title>\n\
          </head>\n\
          <body style=\"background: white; color: #222;\">\n\
          {CSS}\n\
-         <h2>unprint miss report</h2>\n\
+         <h2>{report_title}</h2>\n\
          <div class=\"summary\">{sim_summary}</div>\n\
          <div class=\"summary\">{font_summary}</div>\n\
          <div class=\"summary\">{ocr_summary}</div>\n\
@@ -2463,6 +2489,7 @@ pub fn generate_report(
          <b>ZNCC</b> (per-line) = zero-mean normalized cross-correlation between scanned line \
          and re-render; <b>-1–1, higher = more similar</b>.\n\
          </div>\n\
+         {all_lines_section}\n\
          <h2>Major Misses ({n_major})</h2>\n\
          {major_miss_blocks}\n\
          <h2 style=\"margin-top:2em; color:#e90;\">Minor Misses ({n_minor})</h2>\n\
