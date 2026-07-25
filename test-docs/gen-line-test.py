@@ -127,7 +127,7 @@ def main():
 
     # Single-page large-gap: 80pt blank p resets Tesseract without multi-page drift.
     # Per-line size matches BAP specimen: alpha 9pt, sample/blurb 10pt.
-    LARGE_GAP = '<p style="font-size:80pt; line-height:1; margin:0; padding:0;">&nbsp;</p>'
+    LARGE_GAP = '<div style="height:120pt;"></div>'
     lines_html = []
     for idx, (text, canonical_name, ttf_path, css_weight, css_style) in enumerate(lines):
         stripped = text.rstrip('.').strip()
