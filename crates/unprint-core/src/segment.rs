@@ -395,16 +395,16 @@ fn segment_characters_inner(
 
         // Factor: trace all candidate seam paths and record their costs.
         // Energy is now flat &[f32]; trace_path_through ignores it but keep param for compat.
-        let trace_candidate_costs = |cands: &[(u32, f32)], dp: &SeamDp,
+        // Perf: sort cands in-place to avoid to_vec() clone (cands is small Vec, but called many times).
+        let trace_candidate_costs = |cands: &mut [(u32, f32)], dp: &SeamDp,
             seg_start: u32, seg_end: u32, energy_flat: &[f32], row_ink: &[f32],
             seg_pen: &dyn Fn(u32, u32, u32, f32) -> f32,
             ink_disc: &dyn Fn(&[[u32; 2]]) -> f32,
             h_cost: f32,
             paths: &mut Vec<(u32, SeamCost, Vec<[u32; 2]>)>|
         {
-            let mut sorted: Vec<(u32, f32)> = cands.to_vec();
-            sorted.sort_by(|a, b| a.1.partial_cmp(&b.1).unwrap_or(std::cmp::Ordering::Equal));
-            for &(col, cost) in sorted.iter() {
+            cands.sort_by(|a, b| a.1.partial_cmp(&b.1).unwrap_or(std::cmp::Ordering::Equal));
+            for &(col, cost) in cands.iter() {
                 let path = dp.trace_path_through(energy_flat, col, row_ink);
                 let p_min = path.iter().map(|p| p[1]).min().unwrap_or(col);
                 let p_max = path.iter().map(|p| p[1]).max().unwrap_or(col);
@@ -495,11 +495,11 @@ fn segment_characters_inner(
         for &(seg_start, seg_end) in &initial_segs {
             if seg_end > seg_start + 2 {
                 let sid = next_seg_id; next_seg_id += 1;
-                let (cands, dp) = candidate_seams(&energy, w_us, seg_start, seg_end, h, None, None, max_ink, &row_ink);
+                let (mut cands, dp) = candidate_seams(&energy, w_us, seg_start, seg_end, h, None, None, max_ink, &row_ink);
                 for (col, cost) in &cands {
                     heap.push(SeamEntry { cost: *cost + segment_penalty(seg_start, seg_end, *col, *cost), col: *col, seg_start, seg_end, seg_id: sid });
                 }
-                trace_candidate_costs(&cands, &dp, seg_start, seg_end, &energy, &row_ink,
+                trace_candidate_costs(&mut cands, &dp, seg_start, seg_end, &energy, &row_ink,
                     &segment_penalty, &ink_discount_for_path, seam_params().horizontal_cost, &mut candidate_paths);
                 seg_bounds.insert(sid, SegBounds { left_path: None, right_path: None });
                 dp_cache.insert(sid, dp);
@@ -676,11 +676,11 @@ fn segment_characters_inner(
                     let sid = next_seg_id; next_seg_id += 1;
                     let lp = parent_lp.clone();
                     let rp: Option<Vec<[u32; 2]>> = Some(path.clone());
-                    let (cands, dp) = candidate_seams(&energy, w_us, child_left_start, child_left_end, h, lp.as_deref(), rp.as_deref(), max_ink, &row_ink);
+                    let (mut cands, dp) = candidate_seams(&energy, w_us, child_left_start, child_left_end, h, lp.as_deref(), rp.as_deref(), max_ink, &row_ink);
                     for (col, cost) in &cands {
                         heap.push(SeamEntry { cost: *cost + segment_penalty(child_left_start, child_left_end, *col, *cost), col: *col, seg_start: child_left_start, seg_end: child_left_end, seg_id: sid });
                     }
-                    trace_candidate_costs(&cands, &dp, child_left_start, child_left_end, &energy, &row_ink,
+                    trace_candidate_costs(&mut cands, &dp, child_left_start, child_left_end, &energy, &row_ink,
                         &segment_penalty, &ink_discount_for_path, seam_params().horizontal_cost, &mut candidate_paths);
                     seg_bounds.insert(sid, SegBounds { left_path: lp, right_path: rp });
                     dp_cache.insert(sid, dp);
@@ -693,11 +693,11 @@ fn segment_characters_inner(
                     let sid = next_seg_id; next_seg_id += 1;
                     let lp: Option<Vec<[u32; 2]>> = Some(path.clone());
                     let rp = parent_rp.clone();
-                    let (cands, dp) = candidate_seams(&energy, w_us, child_right_start, child_right_end, h, lp.as_deref(), rp.as_deref(), max_ink, &row_ink);
+                    let (mut cands, dp) = candidate_seams(&energy, w_us, child_right_start, child_right_end, h, lp.as_deref(), rp.as_deref(), max_ink, &row_ink);
                     for (col, cost) in &cands {
                         heap.push(SeamEntry { cost: *cost + segment_penalty(child_right_start, child_right_end, *col, *cost), col: *col, seg_start: child_right_start, seg_end: child_right_end, seg_id: sid });
                     }
-                    trace_candidate_costs(&cands, &dp, child_right_start, child_right_end, &energy, &row_ink,
+                    trace_candidate_costs(&mut cands, &dp, child_right_start, child_right_end, &energy, &row_ink,
                         &segment_penalty, &ink_discount_for_path, seam_params().horizontal_cost, &mut candidate_paths);
                     seg_bounds.insert(sid, SegBounds { left_path: lp, right_path: rp });
                     dp_cache.insert(sid, dp);
