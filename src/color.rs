@@ -10,10 +10,12 @@ pub type Rgb = (u8, u8, u8);
 // ---------------------------------------------------------------------------
 
 /// Detect the foreground text colour in a bounding box.
+///
+/// Fast path: crop to the region first so we only convert the small
+/// ROI to luma/rgba instead of the whole page, and iterate over raw
+/// buffers instead of `get_pixel`.
 pub fn detect_text_color(page_img: &DynamicImage, region: &TextRegion) -> Rgb {
-    let rgba = page_img.to_rgba8();
-    let gray = page_img.to_luma8();
-    let (iw, ih) = rgba.dimensions();
+    let (iw, ih) = (page_img.width(), page_img.height());
 
     let x0 = region.x.min(iw.saturating_sub(1));
     let y0 = region.y.min(ih.saturating_sub(1));
@@ -23,37 +25,56 @@ pub fn detect_text_color(page_img: &DynamicImage, region: &TextRegion) -> Rgb {
     if x1 <= x0 || y1 <= y0 {
         return (0, 0, 0);
     }
+    let w = x1 - x0;
+    let h = y1 - y0;
 
-    // Collect luminance values for Otsu thresholding.
-    let mut vals: Vec<u8> = Vec::new();
-    for py in y0..y1 {
-        for px in x0..x1 {
-            vals.push(gray.get_pixel(px, py).0[0]);
-        }
-    }
-    if vals.is_empty() {
+    // Crop first — converting only the ROI is ~100-300x cheaper than
+    // converting the whole page (6 Mpx -> ~25 kpx for a line).
+    let sub = page_img.crop_imm(x0, y0, w, h);
+    let gray = sub.to_luma8();
+    let rgba = sub.to_rgba8();
+
+    let gray_raw = gray.as_raw();
+    if gray_raw.is_empty() {
         return (0, 0, 0);
     }
 
-    // Otsu threshold to separate text from background.
-    let threshold = otsu_threshold(&vals);
+    // Build histogram directly — no Vec<u8> allocation for vals.
+    let mut hist = [0u32; 256];
+    for &v in gray_raw {
+        hist[v as usize] += 1;
+    }
 
-    // Determine if text is dark or light: whichever side of the threshold
-    // has fewer pixels is the text (text is the minority).
-    let dark_count = vals.iter().filter(|&&v| v <= threshold).count();
-    let text_is_dark = dark_count <= vals.len() / 2;
+    // Otsu from histogram (same math as before).
+    let threshold = otsu_from_hist(&hist, gray_raw.len());
 
-    // Average the colour of text pixels.
+    // Dark count from histogram instead of re-scanning vals.
+    let mut dark_count: u32 = 0;
+    for i in 0..=threshold as usize {
+        dark_count += hist[i];
+    }
+    let text_is_dark = (dark_count as usize) <= gray_raw.len() / 2;
+
+    // Average colour of text pixels using raw buffers (no bounds checks).
+    let rgba_raw = rgba.as_raw(); // w*h*4
     let (mut rs, mut gs, mut bs, mut cnt) = (0u64, 0u64, 0u64, 0u64);
-    for py in y0..y1 {
-        for px in x0..x1 {
-            let gv = gray.get_pixel(px, py).0[0];
-            let is_text = if text_is_dark { gv <= threshold } else { gv > threshold };
-            if is_text {
-                let Rgba([r, g, b, _]) = *rgba.get_pixel(px, py);
-                rs += r as u64;
-                gs += g as u64;
-                bs += b as u64;
+    if text_is_dark {
+        for i in 0..gray_raw.len() {
+            if gray_raw[i] <= threshold {
+                let j = i * 4;
+                rs += rgba_raw[j] as u64;
+                gs += rgba_raw[j + 1] as u64;
+                bs += rgba_raw[j + 2] as u64;
+                cnt += 1;
+            }
+        }
+    } else {
+        for i in 0..gray_raw.len() {
+            if gray_raw[i] > threshold {
+                let j = i * 4;
+                rs += rgba_raw[j] as u64;
+                gs += rgba_raw[j + 1] as u64;
+                bs += rgba_raw[j + 2] as u64;
                 cnt += 1;
             }
         }
@@ -70,7 +91,14 @@ pub fn otsu_threshold(vals: &[u8]) -> u8 {
     for &v in vals {
         hist[v as usize] += 1;
     }
-    let total = vals.len() as f64;
+    otsu_from_hist(&hist, vals.len())
+}
+
+fn otsu_from_hist(hist: &[u32; 256], total_len: usize) -> u8 {
+    if total_len == 0 {
+        return 128;
+    }
+    let total = total_len as f64;
     let mut sum_total = 0.0f64;
     for (i, &c) in hist.iter().enumerate() {
         sum_total += i as f64 * c as f64;
