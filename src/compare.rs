@@ -193,6 +193,10 @@ fn render_font_crop(
     overrides: Option<&[(char, u16)]>,
 ) -> GrayImage {
     let mut canvas = GrayImage::from_pixel(canvas_w, canvas_h, Luma([255u8]));
+    // Raw-buffer hoist: min-blend glyph draws previously used canvas.get_pixel/put_pixel per coverage sample.
+    let cw_us = canvas_w as usize;
+    // Safe mutable slice; borrow ends after last use inside if/else, allowing return of canvas.
+    let canvas_buf: &mut [u8] = canvas.as_mut();
 
     let font = match FontRef::try_from_slice(font_data) {
         Ok(f) => f,
@@ -254,8 +258,11 @@ fn render_font_crop(
                             && (py as u32) < canvas_h
                         {
                             let val = (255.0 * (1.0 - cov)) as u8;
-                            let cur = canvas.get_pixel(px as u32, py as u32).0[0];
-                            canvas.put_pixel(px as u32, py as u32, Luma([cur.min(val)]));
+                            let idx = py as usize * cw_us + px as usize;
+                            let cur = canvas_buf[idx];
+                            if val < cur {
+                                canvas_buf[idx] = val;
+                            }
                         }
                     });
                 }
@@ -303,8 +310,11 @@ fn render_font_crop(
                         && (py as u32) < canvas_h
                     {
                         let val = (255.0 * (1.0 - cov)) as u8;
-                        let cur = canvas.get_pixel(px as u32, py as u32).0[0];
-                        canvas.put_pixel(px as u32, py as u32, Luma([cur.min(val)]));
+                        let idx = py as usize * cw_us + px as usize;
+                        let cur = canvas_buf[idx];
+                        if val < cur {
+                            canvas_buf[idx] = val;
+                        }
                     }
                 });
             }
