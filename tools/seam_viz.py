@@ -59,15 +59,51 @@ def steps_from_recorded_path(dark, path_data):
     """Walk a recorded seam path over the image.
     Path is a list of [row, col] pairs from the audit data — including
     pass-through pixels.  Show exactly what the audit contains.
+    Updated to handle up to 2 horizontal steps per vertical move.
     Returns (steps, tot_ink, tot_delta)."""
+    # Expand path to materialize intermediate pass-through pixels for
+    # single and double horizontal moves, so old audits with direct jumps
+    # and new audits both render without gaps.
+    expanded = []
+    def sign(x):
+        return 1 if x > 0 else -1 if x < 0 else 0
+    for i, entry in enumerate(path_data):
+        r, c = int(entry[0]), int(entry[1])
+        if i == 0:
+            expanded.append((r, c))
+            continue
+        pr, pc = int(path_data[i-1][0]), int(path_data[i-1][1])
+        dr = r - pr
+        dc = c - pc
+        if dr == 0 and abs(dc) == 2:
+            mid_c = pc + sign(dc)
+            expanded.append((pr, mid_c))
+        elif dr == 1 and abs(dc) == 2:
+            # double diagonal: (pr,pc) -> (pr,pc+sign) -> (pr,c) -> (r,c)
+            mid1_c = pc + sign(dc)
+            expanded.append((pr, mid1_c))
+            # second pass on same row at cur col, if not already same as mid1
+            if c != mid1_c:
+                expanded.append((pr, c))
+        elif dr == 1 and abs(dc) == 1:
+            # single diagonal missing its horizontal pass-through
+            # old paths sometimes went directly (pr,pc) -> (r,c)
+            # materialize (pr,c)
+            if pc != c:
+                expanded.append((pr, c))
+        # (dr==0, abs(dc)==1) and (dr==1, dc==0) are already adjacent, no insert
+        expanded.append((r, c))
+
     steps = []
     tot_ink = 0.0
     tot_delta = 0.0
     cum = 0.0
     prev_dark = 0.0  # boundary above
 
-    for entry in path_data:
-        r, c = int(entry[0]), int(entry[1])
+    for r, c in expanded:
+        # clamp to image bounds for safety
+        if r < 0 or r >= dark.shape[0] or c < 0 or c >= dark.shape[1]:
+            continue
         d = float(dark[r, c])
         dlt = delta_ink(d, prev_dark)
         cum += d + dlt

@@ -80,7 +80,7 @@ pub fn save_split_overlay(
 }
 
 /// Like save_split_overlay but draws actual diagonal seam paths instead of
-/// vertical lines for seam splits.
+/// vertical lines for seam splits. Updated to handle up to 2 horizontals.
 pub fn save_split_overlay_with_paths(
     img: &GrayImage,
     vp: &[u32],
@@ -106,11 +106,59 @@ pub fn save_split_overlay_with_paths(
             }
         }
     }
-    // Seam splits: blue diagonal paths
+    // Seam splits: blue diagonal paths (now up to 2 horizontals)
     for (_col, sp) in seam_paths {
+        let mut prev: Option<[u32; 2]> = None;
         for entry in sp.iter() {
             let y = entry[0] as usize;
             let x = entry[1] as usize;
+            // interpolate gaps for old audits that jump 2 cols without intermediate
+            if let Some(p) = prev {
+                let py = p[0] as usize;
+                let px = p[1] as usize;
+                let dy = y as i32 - py as i32;
+                let dx = x as i32 - px as i32;
+                if dy == 0 && dx.abs() == 2 {
+                    let mx = (px as i32 + dx.signum()) as usize;
+                    if mx < w_us && py < h_us {
+                        for &ox in &[-1i32, 0, 1] {
+                            let xx = mx as i32 + ox;
+                            if xx >= 0 && (xx as usize) < w_us {
+                                let idx = (py * w_us + xx as usize) * 3;
+                                buf[idx] = 0; buf[idx+1]=100; buf[idx+2]=255;
+                            }
+                        }
+                    }
+                } else if dy == 1 && dx.abs() == 2 {
+                    // double diagonal without intermediates: fill (py, px+sign) and (py, x)
+                    let s = dx.signum();
+                    let m1x = (px as i32 + s) as usize;
+                    let m2x = x;
+                    for &(ry, cx) in &[(py, m1x), (py, m2x)] {
+                        if cx < w_us && ry < h_us {
+                            for &ox in &[-1i32, 0, 1] {
+                                let xx = cx as i32 + ox;
+                                if xx >=0 && (xx as usize) < w_us {
+                                    let idx = (ry * w_us + xx as usize)*3;
+                                    buf[idx]=0; buf[idx+1]=100; buf[idx+2]=255;
+                                }
+                            }
+                        }
+                    }
+                } else if dy == 1 && dx.abs() == 1 {
+                    // single diagonal missing its horizontal pass-through in old data
+                    let pass_x = x;
+                    if pass_x < w_us && py < h_us {
+                        for &ox in &[-1i32, 0, 1] {
+                            let xx = pass_x as i32 + ox;
+                            if xx >=0 && (xx as usize) < w_us {
+                                let idx = (py * w_us + xx as usize)*3;
+                                buf[idx]=0; buf[idx+1]=100; buf[idx+2]=255;
+                            }
+                        }
+                    }
+                }
+            }
             if x < w_us && y < h_us {
                 let idx = (y * w_us + x) * 3;
                 buf[idx] = 0;
@@ -130,6 +178,7 @@ pub fn save_split_overlay_with_paths(
                     buf[idx2 + 2] = 255;
                 }
             }
+            prev = Some(*entry);
         }
     }
     let _ = rgb.save(path);

@@ -38,7 +38,6 @@ HARDCODED_7 = [
     ("Georgia-400", "ABCDEFGHIJKLMNOPQRSTUVWXYZ."),
     ("OpenSans-400", "abcdefghijklmnopqrstuvwxyz."),
     ("LibreBodoni-400Italic", "dogs."),
-    ("IBMPlexSans-400", "abcdefghijklmnopqrstuvwxyz."),
     ("SourceSerif4-400It", "Mayr-Duffner."),
     ("SourceSerif4-400It", "Type"),
     ("LibreBaskerville-400", "abcdefghijklmnopqrstuvwxyz."),

@@ -825,9 +825,15 @@ impl SeamDp {
                 let pr = pred / seg_w;
                 let pc = pred % seg_w;
                 if pr < r {
-                    if pc != c {
+                    let delta = pc as i32 - c as i32;
+                    if delta != 0 {
                         // Diagonal: pass-through at (pred_row, current_col)
                         top.push([pr as u32, self.seg_start + c as u32]);
+                        if delta.abs() == 2 {
+                            // double horizontal: intermediate pass at (pr, c+delta/2)
+                            let mid_c = c as i32 + delta / 2;
+                            top.push([pr as u32, self.seg_start + mid_c as u32]);
+                        }
                     }
                     top.push([pr as u32, self.seg_start + pc as u32]);
                     c = pc;
@@ -853,7 +859,13 @@ impl SeamDp {
                 let pr = pred / seg_w;
                 let pc = pred % seg_w;
                 if pr > r {
-                    if pc != c {
+                    let delta = pc as i32 - c as i32;
+                    if delta != 0 {
+                        if delta.abs() == 2 {
+                            // double: first intermediate on current row
+                            let mid_c = c as i32 + delta / 2;
+                            bottom.push([r as u32, self.seg_start + mid_c as u32]);
+                        }
                         // Diagonal: pass-through at (current_row, pred_col)
                         bottom.push([r as u32, self.seg_start + pc as u32]);
                     }
@@ -1033,6 +1045,44 @@ fn candidate_seams(
                 pred_fwd[row_off + c] = (prev_off + c + 1) as u32;
             }
         }
+        // Step 4: double diagonal from (r-1, c-2) → (r, c)
+        // Horizontal first: (r-1, c-2) → (r-1, c-1) → (r-1, c) → (r, c).
+        for c in 2..seg_w {
+            let cur_dark = masked_energy(r, c);
+            let cur_ink = ink_score(cur_dark, r, row_ink);
+            let prev_dark = masked_energy(r - 1, c - 2);
+            let p1_dark = masked_energy(r - 1, c - 1);
+            let p2_dark = masked_energy(r - 1, c);
+            let p1_ink = ink_score(p1_dark, r - 1, row_ink);
+            let p2_ink = ink_score(p2_dark, r - 1, row_ink);
+            let p1_entry = delta_ink_score(p1_dark, prev_dark, r - 1, r - 1, row_ink, max_ink);
+            let p2_entry = delta_ink_score(p2_dark, p1_dark, r - 1, r - 1, row_ink, max_ink);
+            let cur_entry = delta_ink_score(cur_dark, p2_dark, r, r - 1, row_ink, max_ink);
+            let via = cost_fwd[prev_off + c - 2] + p1_ink + p1_entry + p2_ink + p2_entry + cur_ink + cur_entry + 0.02;
+            if via < cost_fwd[row_off + c] {
+                cost_fwd[row_off + c] = via;
+                pred_fwd[row_off + c] = (prev_off + c - 2) as u32;
+            }
+        }
+        // Step 5: double diagonal from (r-1, c+2) → (r, c)
+        // Horizontal first: (r-1, c+2) → (r-1, c+1) → (r-1, c) → (r, c).
+        for c in 0..seg_w.saturating_sub(2) {
+            let cur_dark = masked_energy(r, c);
+            let cur_ink = ink_score(cur_dark, r, row_ink);
+            let prev_dark = masked_energy(r - 1, c + 2);
+            let p1_dark = masked_energy(r - 1, c + 1);
+            let p2_dark = masked_energy(r - 1, c);
+            let p1_ink = ink_score(p1_dark, r - 1, row_ink);
+            let p2_ink = ink_score(p2_dark, r - 1, row_ink);
+            let p1_entry = delta_ink_score(p1_dark, prev_dark, r - 1, r - 1, row_ink, max_ink);
+            let p2_entry = delta_ink_score(p2_dark, p1_dark, r - 1, r - 1, row_ink, max_ink);
+            let cur_entry = delta_ink_score(cur_dark, p2_dark, r, r - 1, row_ink, max_ink);
+            let via = cost_fwd[prev_off + c + 2] + p1_ink + p1_entry + p2_ink + p2_entry + cur_ink + cur_entry + 0.02;
+            if via < cost_fwd[row_off + c] {
+                cost_fwd[row_off + c] = via;
+                pred_fwd[row_off + c] = (prev_off + c + 2) as u32;
+            }
+        }
     }
 
     // Reverse DP: models downward continuation from (r, c) to bottom.
@@ -1088,6 +1138,44 @@ fn candidate_seams(
             if via_diag < cost_rev[row_off + c] {
                 cost_rev[row_off + c] = via_diag;
                 pred_rev[row_off + c] = (next_off + c + 1) as u32;
+            }
+        }
+        // Step 4: double diagonal from (r+1, c-2) → (r, c)
+        // Physical path: (r, c) → (r, c-1) → (r, c-2) → (r+1, c-2)
+        for c in 2..seg_w {
+            let cur_dark = masked_energy(r, c);
+            let cur_ink = ink_score(cur_dark, r, row_ink);
+            let child_dark = masked_energy(r + 1, c - 2);
+            let p1_dark = masked_energy(r, c - 1);
+            let p2_dark = masked_energy(r, c - 2);
+            let p1_ink = ink_score(p1_dark, r, row_ink);
+            let p2_ink = ink_score(p2_dark, r, row_ink);
+            let p1_entry = delta_ink_score(p1_dark, cur_dark, r, r, row_ink, max_ink);
+            let p2_entry = delta_ink_score(p2_dark, p1_dark, r, r, row_ink, max_ink);
+            let child_entry = delta_ink_score(child_dark, p2_dark, r + 1, r, row_ink, max_ink);
+            let via = cost_rev[next_off + c - 2] + cur_ink + p1_ink + p1_entry + p2_ink + p2_entry + child_entry + 0.02;
+            if via < cost_rev[row_off + c] {
+                cost_rev[row_off + c] = via;
+                pred_rev[row_off + c] = (next_off + c - 2) as u32;
+            }
+        }
+        // Step 5: double diagonal from (r+1, c+2) → (r, c)
+        // Physical path: (r, c) → (r, c+1) → (r, c+2) → (r+1, c+2)
+        for c in 0..seg_w.saturating_sub(2) {
+            let cur_dark = masked_energy(r, c);
+            let cur_ink = ink_score(cur_dark, r, row_ink);
+            let child_dark = masked_energy(r + 1, c + 2);
+            let p1_dark = masked_energy(r, c + 1);
+            let p2_dark = masked_energy(r, c + 2);
+            let p1_ink = ink_score(p1_dark, r, row_ink);
+            let p2_ink = ink_score(p2_dark, r, row_ink);
+            let p1_entry = delta_ink_score(p1_dark, cur_dark, r, r, row_ink, max_ink);
+            let p2_entry = delta_ink_score(p2_dark, p1_dark, r, r, row_ink, max_ink);
+            let child_entry = delta_ink_score(child_dark, p2_dark, r + 1, r, row_ink, max_ink);
+            let via = cost_rev[next_off + c + 2] + cur_ink + p1_ink + p1_entry + p2_ink + p2_entry + child_entry + 0.02;
+            if via < cost_rev[row_off + c] {
+                cost_rev[row_off + c] = via;
+                pred_rev[row_off + c] = (next_off + c + 2) as u32;
             }
         }
     }
