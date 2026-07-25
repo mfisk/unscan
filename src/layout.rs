@@ -219,19 +219,17 @@ pub fn shape_word(
     // segmentation winner). When ligatures are allowed, keep `liga`/`dlig`
     // enabled so "fi" can shape to a single glyph. When disallowed, force
     // them off so "ff" stays two glyphs for plain scoring.
-    let features_for_shape: Vec<unprint_fonts::rustybuzz::Feature> = if allow_liga {
-        features.to_vec()
+    let mut buffer = unprint_fonts::rustybuzz::UnicodeBuffer::new();
+    buffer.push_str(text);
+    let glyphs = if allow_liga {
+        unprint_fonts::rustybuzz::shape(face, features, buffer)
     } else {
         let mut v = Vec::with_capacity(features.len() + 2);
         v.extend_from_slice(features);
         v.push(unprint_fonts::rustybuzz::Feature::new(unprint_fonts::ttf_parser::Tag::from_bytes(b"liga"), 0, ..));
         v.push(unprint_fonts::rustybuzz::Feature::new(unprint_fonts::ttf_parser::Tag::from_bytes(b"dlig"), 0, ..));
-        v
+        unprint_fonts::rustybuzz::shape(face, &v, buffer)
     };
-
-    let mut buffer = unprint_fonts::rustybuzz::UnicodeBuffer::new();
-    buffer.push_str(text);
-    let glyphs = unprint_fonts::rustybuzz::shape(face, &features_for_shape, buffer);
     let positions = glyphs.glyph_positions();
     let infos = glyphs.glyph_infos();
 
