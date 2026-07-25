@@ -238,7 +238,8 @@ pub fn prepare_page(
     let orig_gray = page_img.to_luma8();
     let skew_angle = crate::deskew::detect_skew(&orig_gray);
     let deskewed_gray = if skew_angle.abs() > 5.0 {
-        orig_gray.clone()
+        // Large skew: treat as not deskewing (original was cloned before, now moved to avoid page-size clone)
+        orig_gray
     } else if skew_angle.abs() > 0.5 {
         crate::deskew::rotate_gray(&orig_gray, skew_angle)
     } else {
