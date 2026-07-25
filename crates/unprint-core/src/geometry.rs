@@ -13,31 +13,8 @@ use image::DynamicImage;
 // Types
 // ---------------------------------------------------------------------------
 
-#[derive(Debug, Clone)]
-pub struct DetectedLine {
-    pub x1: u32,
-    pub y1: u32,
-    pub x2: u32,
-    pub y2: u32,
-    pub thickness: u32,
-    pub color: Rgb,
-}
+pub use unprint_geometry::{DetectedLine, DetectedFill, GeometryResult};
 
-#[derive(Debug, Clone)]
-pub struct DetectedFill {
-    pub x: u32,
-    pub y: u32,
-    pub width: u32,
-    pub height: u32,
-    pub color: Rgb,
-}
-
-/// Everything detected on one page.
-#[derive(Debug, Clone)]
-pub struct GeometryResult {
-    pub lines: Vec<DetectedLine>,
-    pub fills: Vec<DetectedFill>,
-}
 
 // ---------------------------------------------------------------------------
 // Public API

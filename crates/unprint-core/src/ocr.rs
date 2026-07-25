@@ -36,65 +36,7 @@ use unprint_fonts::ab_glyph::{Font, PxScale, ScaleFont, point};
 use image::{DynamicImage, GrayImage};
 use std::process::Command;
 
-/// A character-level bounding box from Tesseract HOCR output.
-#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
-pub struct CharBox {
-    pub ch: char,
-    pub x: u32,
-    pub y: u32,
-    pub width: u32,
-    pub height: u32,
-    pub confidence: f32,
-}
-
-/// A detected text region from OCR (word-level).
-#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
-pub struct TextRegion {
-    pub text: String,
-    pub x: u32,
-    pub y: u32,
-    pub width: u32,
-    pub height: u32,
-    pub font_size_pt: f32,
-    pub confidence: f32,
-    pub level: u32,
-    pub block_num: u32,
-    pub par_num: u32,
-    pub line_num: u32,
-    #[allow(dead_code)]
-    pub word_num: u32,
-}
-
-/// A line of text assembled from word-level regions.
-#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
-pub struct TextLine {
-    pub text: String,
-    pub x: u32,
-    pub y: u32,
-    pub width: u32,
-    pub height: u32,
-    pub font_size_pt: f32,
-    pub confidence: f32,
-    pub words: Vec<TextRegion>,
-    /// Snapshot of word bboxes as Tesseract originally reported them,
-    /// before merge/clip/expand post-processing.  Populated by
-    /// `snapshot_raw_bboxes()` right after `assemble_lines()`.
-    pub raw_words: Vec<RawWordBBox>,
-}
-
-impl TextLine {
-}
-
-/// Lightweight snapshot of a Tesseract word bbox before post-processing.
-#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
-pub struct RawWordBBox {
-    pub text: String,
-    pub x: u32,
-    pub y: u32,
-    pub width: u32,
-    pub height: u32,
-    pub confidence: f32,
-}
+pub use unprint_geometry::{CharBox, TextRegion, TextLine, RawWordBBox};
 
 /// Capture a raw-bbox snapshot into each line's `raw_words` field.
 /// Call once, right after `assemble_lines()` and before any merge/clip/expand.

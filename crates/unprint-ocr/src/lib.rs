@@ -1,6 +1,6 @@
 //! OCR crate — text reading, depends only on geometry.
 
-pub use unprint_geometry::{TextRegion, TextLine, RawWordBBox, Rgb};
+pub use unprint_geometry::{CharBox, TextRegion, TextLine, RawWordBBox, Rgb};
 
 use image::{DynamicImage, GrayImage};
 use thiserror::Error;
@@ -11,13 +11,6 @@ pub enum OcrError {
     Ocr(String),
     #[error("IO error: {0}")]
     Io(#[from] std::io::Error),
-}
-
-#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
-pub struct CharBox {
-    pub ch: char,
-    pub x: u32, pub y: u32, pub width: u32, pub height: u32,
-    pub confidence: f32,
 }
 
 /// Batch API: one call per page — image in, lines out.

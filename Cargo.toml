@@ -21,6 +21,7 @@ path = "src/bin/gen_training_data.rs"
 clap = { version = "4", features = ["derive", "env"] }
 image = "0.25"
 unprint-fonts = { path = "crates/unprint-fonts" }
+unprint-geometry = { path = "crates/unprint-geometry" }
 lopdf = "0.34"
 walkdir = "2"
 rayon = "1.10"
