@@ -191,7 +191,7 @@ pub fn match_lines(
             let cw = line.width.min(iw - cx);
             let ch = line.height.min(ih - cy);
             let raw = image::imageops::crop_imm(gray_page, cx, cy, cw, ch).to_image();
-            features::contrast_normalize_char(&raw)
+            features::contrast_normalize_char(raw)
         };
 
         // ── Fast path: try dominant font via SSIM ────────────────

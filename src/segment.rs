@@ -1301,7 +1301,7 @@ pub fn segment_line(
         // segmenter sees consistent ink/background separation regardless
         // of scan brightness.  Individual char crops inherit this and are
         // not re-normalized downstream.
-        let word_img = contrast_normalize_char(&word_img);
+        let word_img = contrast_normalize_char(word_img);
 
         let (_word_w, word_h) = word_img.dimensions();
         let all_chars: Vec<char> = word.text.chars().collect();

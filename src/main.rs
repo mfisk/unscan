@@ -725,7 +725,7 @@ fn run(args: &cli::Args, classifier: &mut dyn classifier::Classifier) -> Result<
                             let cw = line.width.min(iw - cx);
                             let ch = line.height.min(ih - cy);
                             let raw = image::imageops::crop_imm(&gray_page, cx, cy, cw, ch).to_image();
-                            features::contrast_normalize_char(&raw)
+                            features::contrast_normalize_char(raw)
                         };
                         let verify_words = lm.corrected_words.as_deref().unwrap_or(&line.words);
                         let allow_liga = lm.seg_winner.as_deref() == Some("ligature");

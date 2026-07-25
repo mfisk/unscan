@@ -493,7 +493,7 @@ pub fn compute_features(img: &GrayImage, pre_normalized: bool) -> Option<CropFea
         // Contrast-normalize: ensures symmetric treatment between
         // training renders and inference crops.  On a clean render this
         // is effectively a no-op (p1≈0, p99≈255).
-        std::borrow::Cow::Owned(contrast_normalize_char(img))
+        std::borrow::Cow::Owned(contrast_normalize_char(img.clone()))
     };
     let (w, h) = img.dimensions();
     if w == 0 || h == 0 {
@@ -1311,16 +1311,15 @@ fn stretch(v: u8, p1: u8, range: f32) -> u8 {
 /// scanned/compressed pages get stretched to match
 /// the full-range black-on-white rendered index characters, regardless
 /// of how the source PDF was rasterized or compressed.
-pub fn contrast_normalize_char(img: &GrayImage) -> GrayImage {
+pub fn contrast_normalize_char(mut img: GrayImage) -> GrayImage {
     let Some((p1, p99)) = contrast_percentiles(img.as_raw()) else {
-        return img.clone();
+        return img;
     };
     let range = (p99 - p1) as f32;
-    let mut out = img.clone();
-    for px in out.as_mut() {
+    for px in img.as_mut() {
         *px = stretch(*px, p1, range);
     }
-    out
+    img
 }
 
 /// Contrast-normalize an RGBA image, preserving colour.
