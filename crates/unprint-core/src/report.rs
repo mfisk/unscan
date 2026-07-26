@@ -997,6 +997,50 @@ fn build_miss_block(
         String::new()
     };
 
+    // Font candidate scores — top N with GT and chosen markers, legible tie-break context
+    let font_scores_html = {
+        if entry.font_candidates.is_empty() {
+            String::new()
+        } else {
+            let mut rows = String::new();
+            let gt_key_str = gt_key.as_deref().unwrap_or("");
+            for (i, fc) in entry.font_candidates.iter().take(10).enumerate() {
+                let rank = i + 1;
+                let is_chosen = rank == 1;
+                let is_gt = !gt_key_str.is_empty() && fc.font_key == gt_key_str;
+                let marker = if is_chosen && is_gt {
+                    " ✓ GT"
+                } else if is_chosen {
+                    " ✓"
+                } else if is_gt {
+                    " GT"
+                } else {
+                    ""
+                };
+                let cls = if is_chosen { "tie-winner" } else if is_gt { "correct" } else { "" };
+                let score_str = fc.score.map(|s| format!("{s:.6}")).unwrap_or_else(|| "—".into());
+                rows.push_str(&format!(
+                    "<tr><td>{rank}</td><td class=\"{cls}\">{}<span style=\"font-size:10px;color:#888;\">{}</span></td><td class=\"mono\">{}</td></tr>",
+                    short_key(&fc.font_key), marker, score_str
+                ));
+            }
+            // If GT rank >10, show it as extra row
+            if let (Some(gr), Some(gs)) = (gt_rank, gt_score) {
+                if gr > 10 {
+                    let gk = gt_key.as_deref().unwrap_or("?");
+                    rows.push_str(&format!(
+                        "<tr><td>{gr}</td><td class=\"correct\">{}<span style=\"font-size:10px;color:#888;\"> GT</span></td><td class=\"mono\">{:.6}</td></tr>",
+                        short_key(gk), gs
+                    ));
+                }
+            }
+            format!(
+                "<div class=\"font-scores-block\"><b>Font candidates (top 10, score = higher is better, negative = penalty)</b>\
+                 <table class=\"obs-table\" style=\"margin:0.4em 0;\"><thead><tr><th>Rank</th><th>Font</th><th>Score</th></tr></thead><tbody>{rows}</tbody></table></div>"
+            )
+        }
+    };
+
     // OCR override table — separate from font-matching obs table.
     // OCR corrections table — from audit ocr_corrections data.
     let ocr_override_html = {
@@ -1035,10 +1079,11 @@ fn build_miss_block(
          {}\
          {}\
          {}\
+         {}\
          </div>",
         entry.page, entry.line_index, miss_kind_label, sim_html,
         text_preview,
-        seg_path_html, lig_compare_html, scan_line_html, sim_compare_html, tie_break_html, obs_table_html,
+        seg_path_html, font_scores_html, lig_compare_html, scan_line_html, sim_compare_html, tie_break_html, obs_table_html,
         obs_table_lig_html, ocr_override_html,
     );
     (html, entry.similarity_score, gt_sim)

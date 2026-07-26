@@ -14,9 +14,10 @@ const USE_SUM_AGG: bool = false;
 /// specimen is -10.1537 (SourceSerif4-400 'T' p5:23, 416 font-correct letters,
 /// ocr_correct=true, hit/minor_miss, p1=-4.99 p5=-1.90 median=-0.39). 
 /// We prune fonts where min_{chars}(h_ll+v_ll) < threshold.
-/// Threshold is scaled/loosened by --thoroughness: thr=1 => -10, thr=2 => -20 (looser),
-/// thr=0.5 => -5 (tighter). Clamped to >=0.1 to avoid zero.
-const MIDPOINT_PRUNE_BASE: f32 = -10.0;
+/// Threshold is scaled/loosened by --thoroughness: thr=1 => -12, thr=2 => -24 (looser),
+/// thr=0.5 => -6 (tighter). Clamped to >=0.1 to avoid zero.
+/// MIN_KEEP=10 ensures best_lps stability by keeping at least 10 best pruned fonts.
+const MIDPOINT_PRUNE_BASE: f32 = -12.0;
 
 // ---------------------------------------------------------------------------
 // Types
@@ -288,11 +289,14 @@ pub fn identify_fonts(
 
     // ── Midpoint pruning: prune fonts with very negative h_ll+v_ll ─────────
     // Worst correct-font letter on BAP is -10.1537 (416 letters, ocr_correct, hit/minor_miss).
-    // Threshold = BASE * thoroughness, thr=1 => -10, thr=2 => -20 looser, thr=0.5 => -5 tighter.
+    // Threshold = BASE * thoroughness, thr=1 => -12, thr=2 => -24 looser, thr=0.5 => -6 tighter.
     // We use min_ll (worst letter) to decide; keep ensure keys and fonts with no geo data.
+    // To keep best_lps stable across prune levels, we also keep at least 10 fonts with
+    // highest min_ll (least negative) so per-position best doesn't shift dramatically.
     let prune_threshold = MIDPOINT_PRUNE_BASE * thoroughness.max(0.1);
     let total_candidates = candidate_vec.len();
     let mut kept_candidates: Vec<String> = Vec::with_capacity(total_candidates);
+    let mut pruned_with_ll: Vec<(String, f32)> = Vec::new();
     let mut pruned_count: usize = 0;
     for fk in &candidate_vec {
         if ensure_font_keys.contains(&fk.as_str()) {
@@ -308,11 +312,22 @@ pub fn identify_fonts(
             let min_ll = gmap.values().cloned().fold(f32::INFINITY, f32::min);
             if min_ll < prune_threshold {
                 pruned_count += 1;
+                pruned_with_ll.push((fk.clone(), min_ll));
                 continue;
             }
         }
         // No geo data -> cannot evaluate, keep for safety
         kept_candidates.push(fk.clone());
+    }
+    // Keep at least MIN_KEEP best pruned fonts by min_ll to stabilize per-position best
+    const MIN_KEEP: usize = 10;
+    if kept_candidates.len() < MIN_KEEP && !pruned_with_ll.is_empty() {
+        pruned_with_ll.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
+        let need = MIN_KEEP.saturating_sub(kept_candidates.len());
+        for (fk, _ll) in pruned_with_ll.iter().take(need) {
+            kept_candidates.push(fk.clone());
+            pruned_count = pruned_count.saturating_sub(1);
+        }
     }
     // Avoid empty candidate set: keep at least the best by max geo (least negative min_ll)
     let candidate_vec: Vec<String> = if kept_candidates.is_empty() && !candidate_vec.is_empty() {
