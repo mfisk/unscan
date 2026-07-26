@@ -2394,7 +2394,7 @@ pub fn generate_report(
     // ── Independent attribute stats (each line can have multiple) ──────
     // 4 independent booleans per GT line:
     //   ocr_miss, zncc_miss, major_miss, major_right_but_not_exact (MinorMiss)
-    let (ocr_miss_cnt, zncc_miss_cnt, major_miss_ind_cnt, major_right_not_exact_cnt) = {
+    let (ocr_miss_cnt, zncc_miss_cnt, major_miss_ind_cnt, _major_right_not_exact_cnt) = {
         let mut ocr = 0usize;
         let mut zncc = 0usize;
         let mut major = 0usize;
@@ -2421,11 +2421,7 @@ pub fn generate_report(
         (ocr, zncc, major, mrne)
     };
     let independent_summary = if compared > 0 {
-        let ocr_pct = ocr_miss_cnt as f64 / compared as f64 * 100.0;
-        let zncc_pct = zncc_miss_cnt as f64 / compared as f64 * 100.0;
-        let major_pct = major_miss_ind_cnt as f64 / compared as f64 * 100.0;
-        let mrne_pct = major_right_not_exact_cnt as f64 / compared as f64 * 100.0;
-        // Complementary "right" stats
+        // Pass / hit counts only — misses are redundant (pass = compared - miss)
         let ocr_ok = compared.saturating_sub(ocr_miss_cnt);
         let ocr_ok_pct = ocr_ok as f64 / compared as f64 * 100.0;
         let zncc_ok = compared.saturating_sub(zncc_miss_cnt);
@@ -2435,15 +2431,13 @@ pub fn generate_report(
         let exact = hits.len() + similarity_failures.len();
         let exact_pct = exact as f64 / compared as f64 * 100.0;
         format!(
-            "<h3 style=\"margin:1em 0 0.3em;\">Independent attribute stats (each line can have multiple)</h3>\
+            "<h3 style=\"margin:1em 0 0.3em;\">Independent attribute stats — passes only (each line can have multiple)</h3>\
              <ul style=\"margin:0 0 0.5em 1.2em; line-height:1.6;\">\
-               <li>OCR miss: <b>{ocr_miss_cnt}/{compared} ({ocr_pct:.1}%)</b> — OCR correct: <b>{ocr_ok}/{compared} ({ocr_ok_pct:.1}%)</b></li>\
-               <li>ZNCC miss (&lt;0.9): <b>{zncc_miss_cnt}/{compared} ({zncc_pct:.1}%)</b> — ZNCC pass: <b>{zncc_ok}/{compared} ({zncc_ok_pct:.1}%)</b></li>\
-               <li>Major miss: <b>{major_miss_ind_cnt}/{compared} ({major_pct:.1}%)</b> — Not major miss: <b>{not_major}/{compared} ({not_major_pct:.1}%)</b></li>\
-               <li>Major-right but not exact (minor diff / weight variant): <b>{major_right_not_exact_cnt}/{compared} ({mrne_pct:.1}%)</b> — Exact PS name: <b>{exact}/{compared} ({exact_pct:.1}%)</b> (hit {hits_len} + sim_fail {sim_len})</li>\
+               <li>OCR correct: <b>{ocr_ok}/{compared} ({ocr_ok_pct:.1}%)</b></li>\
+               <li>ZNCC pass (≥0.9): <b>{zncc_ok}/{compared} ({zncc_ok_pct:.1}%)</b></li>\
+               <li>Major correct (not major miss): <b>{not_major}/{compared} ({not_major_pct:.1}%)</b></li>\
+               <li>Exact PS name match: <b>{exact}/{compared} ({exact_pct:.1}%)</b></li>\
              </ul>",
-            hits_len = hits.len(),
-            sim_len = similarity_failures.len(),
         )
     } else {
         String::from("<div>Independent stats: no GT data</div>")
