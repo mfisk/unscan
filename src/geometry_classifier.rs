@@ -63,7 +63,7 @@ const SIGMA_PITCH_PX: f64 = 0.435;
 // Quantized geometry – flat-top half-width configurable via env.
 //
 // Model: true continuous center lies in observed quantized bin [e-a, e+a]
-// where a = flat-top half-width (default 0.5 px, override via UNPRINT_FLAT_TOP
+// where a = flat-top half-width (default 0.45 px, override via UNPRINT_FLAT_TOP
 // env var, also accepts QUANT_HALF_WIDTH_PX and FLAT_TOP for compat).
 // Likelihood P = Φ((e+a)/σ) - Φ((e-a)/σ), log-likelihood = ln(P) - ln(2a).
 //
@@ -85,7 +85,7 @@ fn quant_half_width_px() -> f64 {
             .ok()
             .and_then(|s| s.parse::<f64>().ok())
             .filter(|&v| v > 0.0 && v < 10.0)
-            .unwrap_or(0.5)
+            .unwrap_or(0.45)
     })
 }
 
