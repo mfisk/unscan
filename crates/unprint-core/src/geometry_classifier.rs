@@ -60,6 +60,36 @@ pub struct PerCharGeo {
 const SIGMA_CENTER_PX: f64 = 0.284;
 const SIGMA_PITCH_PX: f64 = 0.435;
 
+// Flat-top quantized likelihood, matches src/geometry_classifier.rs
+// Default half-width 0.45 px, override via UNPRINT_FLAT_TOP env.
+use std::sync::OnceLock;
+static FLAT_TOP_CACHE: OnceLock<f64> = OnceLock::new();
+#[inline]
+fn quant_half_width_px() -> f64 {
+    *FLAT_TOP_CACHE.get_or_init(|| {
+        std::env::var("UNPRINT_FLAT_TOP")
+            .or_else(|_| std::env::var("QUANT_HALF_WIDTH_PX"))
+            .or_else(|_| std::env::var("FLAT_TOP"))
+            .or_else(|_| std::env::var("QUANT_HALF_WIDTH"))
+            .ok()
+            .and_then(|s| s.parse::<f64>().ok())
+            .filter(|&v| v > 0.0 && v < 10.0)
+            .unwrap_or(0.45)
+    })
+}
+#[inline]
+fn quantized_ll(e: f64, sigma: f64, half_width: f64) -> f64 {
+    let sigma = sigma.max(1e-12);
+    let a = half_width;
+    let upper = (e + a) / sigma;
+    let lower = (e - a) / sigma;
+    const FRAC_1_SQRT_2: f64 = std::f64::consts::FRAC_1_SQRT_2;
+    let phi_upper = 0.5 * (1.0 + libm::erf(upper * FRAC_1_SQRT_2));
+    let phi_lower = 0.5 * (1.0 + libm::erf(lower * FRAC_1_SQRT_2));
+    let prob = (phi_upper - phi_lower).max(1e-300);
+    prob.ln() - (2.0 * a).ln()
+}
+
 /// Measure ink bounds for each character in a word.
 ///
 /// Takes the word image, its characters, their boundaries, and the seam paths
@@ -235,7 +265,7 @@ fn per_char_geo_cached(
         // Non-BMP / missing cmap entries will miss and fall back to shaped path.
         // Ligature codepoints (FB00-FB04) ARE in cache and score as single glyphs.
         // Plain "ff" (['f','f']) is 2 chars, stays 2 glyphs (liga disabled for plain).
-        let preds_fu_ext = geo_cache.predict_glyph_positions_and_extents(font_key, &ws.chars)?;
+        let Some(preds_fu_ext) = geo_cache.predict_glyph_positions_and_extents(font_key, &ws.chars) else { continue; };
         if preds_fu_ext.len() != word_bounds.len() {
             // Ligature merge: e.g. "ff" plain shaped to 1 glyph but we have 2 bounds → skip geo for this word.
             // Single-glyph cases (1 char word, or lig path with FB00) will have len==1 and pass.
@@ -275,7 +305,7 @@ fn per_char_geo_cached(
             let obs_cy_rel = obs_cy - obs_word_cy;
             let pred_cy_rel = pred_cy - pred_word_cy;
             let v_err = obs_cy_rel - pred_cy_rel;
-            let v_ll = -v_err * v_err / (2.0 * SIGMA_CENTER_PX * SIGMA_CENTER_PX);
+            let v_ll = quantized_ll(v_err, SIGMA_CENTER_PX, quant_half_width_px());
 
             let (obs_pitch, pred_pitch, h_err, h_ll) = if orig_idx == 0 {
                 (None, None, None, 0.0)
@@ -285,7 +315,7 @@ fn per_char_geo_cached(
                 let obs_pitch_val = obs_cx - prev.cx;
                 let pred_pitch_val = pred_cx - prev_pred_cx;
                 let h_err_val = obs_pitch_val - pred_pitch_val;
-                let h_ll_val = -h_err_val * h_err_val / (2.0 * SIGMA_PITCH_PX * SIGMA_PITCH_PX);
+                let h_ll_val = quantized_ll(h_err_val, SIGMA_PITCH_PX, quant_half_width_px());
                 (Some(obs_pitch_val), Some(pred_pitch_val), Some(h_err_val), h_ll_val)
             };
 
@@ -409,7 +439,7 @@ fn per_char_geo_shaped(
             let obs_cy_rel = obs_cy - obs_word_cy;
             let pred_cy_rel = pred_cy - pred_word_cy;
             let v_err = obs_cy_rel - pred_cy_rel;
-            let v_ll = -v_err * v_err / (2.0 * SIGMA_CENTER_PX * SIGMA_CENTER_PX);
+            let v_ll = quantized_ll(v_err, SIGMA_CENTER_PX, quant_half_width_px());
 
             let (obs_pitch, pred_pitch, h_err, h_ll) = if orig_idx == 0 {
                 (None, None, None, 0.0)
@@ -419,7 +449,7 @@ fn per_char_geo_shaped(
                 let obs_pitch_val = obs_cx - prev.cx;
                 let pred_pitch_val = pred_cx - prev_pred_cx;
                 let h_err_val = obs_pitch_val - pred_pitch_val;
-                let h_ll_val = -h_err_val * h_err_val / (2.0 * SIGMA_PITCH_PX * SIGMA_PITCH_PX);
+                let h_ll_val = quantized_ll(h_err_val, SIGMA_PITCH_PX, quant_half_width_px());
                 (Some(obs_pitch_val), Some(pred_pitch_val), Some(h_err_val), h_ll_val)
             };
 

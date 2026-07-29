@@ -7,3 +7,4 @@ description = "Pure geometry math for unprint - boxes, ink bounds, line detectio
 [dependencies]
 image = "0.25"
 serde = { version = "1", features = ["derive"] }
+libm = "0.2"

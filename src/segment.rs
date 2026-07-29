@@ -1355,14 +1355,16 @@ pub fn segment_line(
 
     for (_word_idx, &(orig_idx, word)) in sorted.iter().enumerate() {
         let chars_in_word: Vec<char> = word.text.chars().filter(|c| is_supported(*c)).collect();
-        if chars_in_word.is_empty() {
+        // Include 2-letter words, only exclude single-letter (and empty)
+        if chars_in_word.len() <= 1 {
             continue;
         }
 
         let need_any = chars_in_word.iter().any(|c| {
             char_counts.get(c).copied().unwrap_or(0) < 2
         });
-        if !need_any {
+        // For 2-letter words, always keep them for geometry even if chars already seen
+        if chars_in_word.len() > 2 && !need_any {
             continue;
         }
 

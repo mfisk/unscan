@@ -149,6 +149,34 @@ pub struct PerCharError {
 const SIGMA_CENTER_PX: f64 = 0.284;
 const SIGMA_PITCH_PX: f64 = 0.435;
 
+// Flat-top quantized likelihood, matches src/geometry_classifier.rs default 0.45
+use std::sync::OnceLock;
+static FLAT_TOP_CACHE: OnceLock<f64> = OnceLock::new();
+#[inline]
+fn quant_half_width_px() -> f64 {
+    *FLAT_TOP_CACHE.get_or_init(|| {
+        std::env::var("UNPRINT_FLAT_TOP")
+            .or_else(|_| std::env::var("QUANT_HALF_WIDTH_PX"))
+            .or_else(|_| std::env::var("FLAT_TOP"))
+            .ok()
+            .and_then(|s| s.parse::<f64>().ok())
+            .filter(|&v| v > 0.0 && v < 10.0)
+            .unwrap_or(0.45)
+    })
+}
+#[inline]
+fn quantized_ll(e: f64, sigma: f64, half_width: f64) -> f64 {
+    let sigma = sigma.max(1e-12);
+    let a = half_width;
+    let upper = (e + a) / sigma;
+    let lower = (e - a) / sigma;
+    const FRAC_1_SQRT_2: f64 = std::f64::consts::FRAC_1_SQRT_2;
+    let phi_upper = 0.5 * (1.0 + libm::erf(upper * FRAC_1_SQRT_2));
+    let phi_lower = 0.5 * (1.0 + libm::erf(lower * FRAC_1_SQRT_2));
+    let prob = (phi_upper - phi_lower).max(1e-300);
+    prob.ln() - (2.0 * a).ln()
+}
+
 pub fn batch_per_char_errors(
     obs_cx: &[f64],
     obs_cy: &[f64],
@@ -164,14 +192,14 @@ pub fn batch_per_char_errors(
     let mut out = Vec::with_capacity(obs_cx.len());
     for i in 0..obs_cx.len() {
         let v_err = (obs_cy[i] - obs_word_cy) - (pred_cy[i] - pred_word_cy);
-        let v_ll = -v_err * v_err / (2.0 * SIGMA_CENTER_PX * SIGMA_CENTER_PX);
+        let v_ll = quantized_ll(v_err, SIGMA_CENTER_PX, quant_half_width_px());
         let (h_err, h_ll) = if i == 0 {
             (None, 0.0)
         } else {
             let obs_pitch = obs_cx[i] - obs_cx[i-1];
             let pred_pitch = pred_cx[i] - pred_cx[i-1];
             let he = obs_pitch - pred_pitch;
-            let hl = -he * he / (2.0 * SIGMA_PITCH_PX * SIGMA_PITCH_PX);
+            let hl = quantized_ll(he, SIGMA_PITCH_PX, quant_half_width_px());
             (Some(he), hl)
         };
         out.push(PerCharError { h_err, v_err, h_ll, v_ll });

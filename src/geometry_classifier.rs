@@ -277,7 +277,7 @@ fn per_char_geo_cached(
         // Non-BMP / missing cmap entries will miss and fall back to shaped path.
         // Ligature codepoints (FB00-FB04) ARE in cache and score as single glyphs.
         // Plain "ff" (['f','f']) is 2 chars, stays 2 glyphs (liga disabled for plain).
-        let preds_fu_ext = geo_cache.predict_glyph_positions_and_extents(font_key, &ws.chars)?;
+        let Some(preds_fu_ext) = geo_cache.predict_glyph_positions_and_extents(font_key, &ws.chars) else { continue; };
         if preds_fu_ext.len() != word_bounds.len() {
             // Ligature merge: e.g. "ff" plain shaped to 1 glyph but we have 2 bounds → skip geo for this word.
             // Single-glyph cases (1 char word, or lig path with FB00) will have len==1 and pass.
