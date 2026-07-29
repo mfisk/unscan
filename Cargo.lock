@@ -1967,6 +1967,7 @@ dependencies = [
  "base64",
  "clap",
  "image",
+ "libm",
  "lopdf",
  "memmap2",
  "pprof",

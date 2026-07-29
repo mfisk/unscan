@@ -8,7 +8,7 @@ use crate::classifier::{self, ObsStats};
 
 const GEO_WEIGHT: f32 = 1.0;
 // Aggregation mode: false = squared gap (current), true = simple sum (generative)
-const USE_SUM_AGG: bool = false;
+const USE_SUM_AGG: bool = true;
 
 /// Midpoint pruning: worst log-prob of a letter in a correct font measured on BAP
 /// specimen is -10.1537 (SourceSerif4-400 'T' p5:23, 416 font-correct letters,
