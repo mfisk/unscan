@@ -466,8 +466,10 @@ pub fn identify_fonts<'a>(
     }
 
     // Second pass: score using squared deviations from per-observation best
+    // Perf: sort borrowed &str keys to avoid moving/cloning String during sort,
+    // then materialize owned Strings after sort (preserves output, avoids String moves).
     let mut best_path_score = f32::MIN;
-    let mut scores: Vec<(String, f32)> = font_lps.into_iter()
+    let mut borrowed_scores: Vec<(&'a str, f32)> = font_lps.into_iter()
         .filter_map(|(font_key, log_probs)| {
             let score = aggregate_font_score(&log_probs, &best_lps);
             if score.is_finite() {
@@ -480,17 +482,21 @@ pub fn identify_fonts<'a>(
                     .collect();
                 let ps = aggregate_font_score(&ood_probs, &best_lps);
                 if ps > best_path_score { best_path_score = ps; }
-                Some((font_key.to_owned(), score))
+                Some((font_key, score))
             } else { None }
         })
         .collect();
 
     // Sort descending (higher = better = closer match). Deterministic tie-break by name.
-    scores.sort_unstable_by(|a, b| {
+    borrowed_scores.sort_unstable_by(|a, b| {
         b.1.partial_cmp(&a.1)
             .unwrap_or(std::cmp::Ordering::Equal)
-            .then_with(|| a.0.cmp(&b.0))
+            .then_with(|| a.0.cmp(b.0))
     });
+
+    let scores: Vec<(String, f32)> = borrowed_scores.into_iter()
+        .map(|(k, s)| (k.to_owned(), s))
+        .collect();
 
     FontIdResult { scores, observations, path_score: best_path_score }
 }
