@@ -252,30 +252,49 @@ pub fn identify_fonts<'a>(
     }
 
     // ── Per-char cache: compute logits/probs once, not per-candidate
-    // Perf slice 3b: dense Vec<Option<f32>> indexed by glyph_id, preserving Option semantics.
+    // Perf slice 3b/4: dense Vec<Option<f32>> indexed by glyph_id, preserving Option semantics.
     // Original HashMap<usize,f32> used get(&gid)? -> None if missing -> font filtered via len check.
     // Dense Vec must preserve None for missing, not NEG_INFINITY, to keep Stage 2a threshold
     // and Stage 2b scoring identical. Size by glyph_count, but grow if gid >= len (sparse ids).
+    // Slice 4: derive probs from logits to avoid second distance+softmax pass (2× sq_euclid).
+    // Previously called raw_logits + probabilities (each recomputed distances). Now single pass:
+    // logits = -d²/2σ², probs = softmax(logits) = exp(logit-max)/sum. Matches softmax_probs
+    // exactly (max_logit = -min_d/2σ²) and handles uniform fallback when sum<1e-30.
     let mut window_logit_maps: Vec<Vec<Option<f32>>> = Vec::with_capacity(crop_data.len());
     let mut window_prob_maps: Vec<Vec<Option<f32>>> = Vec::with_capacity(crop_data.len());
     for wd in &crop_data {
         let seq = [wd.ch];
-        let count = classifier.glyph_count(&seq).max(1);
-        let mut logit_vec: Vec<Option<f32>> = vec![None; count];
-        let mut prob_vec: Vec<Option<f32>> = vec![None; count];
         let logits = classifier.raw_logits(&seq, &wd.feat);
-        for (gid, v) in logits {
-            if gid >= logit_vec.len() {
-                logit_vec.resize(gid + 1, None);
-            }
-            logit_vec[gid] = Some(v);
+        let count = classifier.glyph_count(&seq).max(1);
+        let max_gid = logits.iter().map(|(gid, _)| *gid).max().unwrap_or(0);
+        let vec_len = count.max(max_gid + 1);
+        let mut logit_vec: Vec<Option<f32>> = vec![None; vec_len];
+        let mut prob_vec: Vec<Option<f32>> = vec![None; vec_len];
+        if logits.is_empty() {
+            window_logit_maps.push(logit_vec);
+            window_prob_maps.push(prob_vec);
+            continue;
         }
-        let probs = classifier.probabilities(&seq, &wd.feat);
-        for (gid, v) in probs {
-            if gid >= prob_vec.len() {
-                prob_vec.resize(gid + 1, None);
+        // max logit = -min_d/2σ², used for numerical stability (same as softmax_probs)
+        let max_logit = logits.iter().map(|(_, l)| *l).fold(f32::NEG_INFINITY, f32::max);
+        let mut sum_exp = 0.0f32;
+        let mut exps: Vec<f32> = Vec::with_capacity(logits.len());
+        for (_, logit) in &logits {
+            let e = (*logit - max_logit).exp();
+            sum_exp += e;
+            exps.push(e);
+        }
+        let uniform = sum_exp < 1e-30;
+        let uniform_p = if uniform { 1.0 / exps.len() as f32 } else { 0.0 };
+        for (i, (gid, logit)) in logits.into_iter().enumerate() {
+            if gid >= logit_vec.len() {
+                let new_len = gid + 1;
+                logit_vec.resize(new_len, None);
+                prob_vec.resize(new_len, None);
             }
-            prob_vec[gid] = Some(v);
+            logit_vec[gid] = Some(logit);
+            let p = if uniform { uniform_p } else { exps[i] / sum_exp };
+            prob_vec[gid] = Some(p);
         }
         window_logit_maps.push(logit_vec);
         window_prob_maps.push(prob_vec);
