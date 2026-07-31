@@ -1,9 +1,9 @@
-use ab_glyph::{Font, ScaleFont, PxScale, GlyphId};
+use unprint_fonts::ab_glyph::{Font, ScaleFont, PxScale, GlyphId};
 
 #[test]
 fn check_glyph_ids() {
     let data = std::fs::read("/usr/share/fonts/truetype/specimen-fonts/eb-garamond-700.ttf").unwrap();
-    let font = ab_glyph::FontRef::try_from_slice(&data).unwrap();
+    let font = unprint_fonts::ab_glyph::FontRef::try_from_slice(&data).unwrap();
     let scale = PxScale { x: 1000.0, y: 1000.0 };
     let sf = font.as_scaled(scale);
     

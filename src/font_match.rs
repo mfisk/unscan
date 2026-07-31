@@ -1,4 +1,17 @@
 //! Font match result type and font identification.
+//!
+//! Rule-out semantics: we effectively skip any font that does not contain a
+//! character present in the string. If `per_char_geo_cached` /
+//! `predict_glyph_positions_and_extents` returns `None` because the font lacks a
+//! cmap entry for any required character, that character's geometry log-likelihood
+//! is `-infinity` (infinitely bad). Therefore the whole-font log-likelihood is
+//! `-infinity`. The font is inserted into `cannot_render: HashSet<String>` and
+//! pruned as `f32::NEG_INFINITY`; `exp(-inf)=0` gives softmax probability 0, so
+//! the font contributes 0 probability and is excluded from ranking. Empty `Vec`
+//! is not an infinite penalty: it denotes ligature mismatch (no words had usable
+//! geo, e.g. “ff” → single glyph) and returns `Some(empty)` as valid, falling
+//! back to SSIM / n-gram only. Abort `None` is a valid short-circuit for an
+//! infinitely bad score because a missing glyph makes rendering impossible.
 
 use std::collections::HashSet;
 use std::path::PathBuf;
@@ -272,6 +285,7 @@ pub fn identify_fonts(
 
     // ── Geo precompute: per-font per-char geometry log-likelihoods ──
     let mut geo_per_font: std::collections::HashMap<String, std::collections::HashMap<(usize, usize), f32>> = std::collections::HashMap::new();
+    let mut cannot_render: std::collections::HashSet<String> = std::collections::HashSet::new();
     if !word_segs.is_empty() && !wib.is_empty() {
         for font_key in &candidate_vec {
             if let Some(geos) = crate::geometry_classifier::per_char_geo_for_font(
@@ -283,6 +297,14 @@ pub fn identify_fonts(
                     map.insert((g.seg_idx, g.orig_idx), ll);
                 }
                 geo_per_font.insert(font_key.clone(), map);
+            } else {
+                // Rule-out: per_char_geo returned None means the font lacks a cmap
+                // entry for a required character, so it cannot render that char.
+                // That char's geometry log-likelihood would be -infinity
+                // (infinitely bad), making the whole-font score -infinity.
+                // We short-circuit here — valid abort for an infinitely bad score —
+                // and mark the font as cannot_render so it gets pruned as -inf.
+                cannot_render.insert(font_key.clone());
             }
         }
     }
@@ -301,6 +323,16 @@ pub fn identify_fonts(
     for fk in &candidate_vec {
         if ensure_font_keys.contains(&fk.as_str()) {
             kept_candidates.push(fk.clone());
+            continue;
+        }
+        if cannot_render.contains(fk) {
+            // Rule-out short-circuit: font cannot render a required char → its
+            // per-char geometry ll is -infinity, so its total score is
+            // -infinity (infinitely bad). We prune it here as NEG_INFINITY;
+            // aborting instead of scoring the rest is valid because an
+            // infinitely bad component dominates the sum.
+            pruned_count += 1;
+            pruned_with_ll.push((fk.clone(), f32::NEG_INFINITY));
             continue;
         }
         if let Some(gmap) = geo_per_font.get(fk) {

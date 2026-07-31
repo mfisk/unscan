@@ -3,6 +3,9 @@ pub mod bbox;
 pub mod char_bounds;
 pub mod detect;
 pub mod word;
+pub mod params;
+
+pub use params::{SIGMA_CENTER_PX, SIGMA_PITCH_PX, quant_half_width_px, quantized_ll, audit_all_chars_enabled};
 
 pub use text::{CharBox, TextRegion, TextLine, RawWordBBox};
 pub use bbox::{Bbox, GlyphBBox, CharInkBounds, WordGeoMeasurement, center_span_scale, batch_center_span_scales, glyph_bboxes_batch_pure};

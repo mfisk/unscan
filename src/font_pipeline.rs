@@ -4,6 +4,17 @@
 //! - [`match_lines`]: Pass 1 — parallel font matching with SSIM fast path
 //! - [`update_dominant_font`]: dominant font candidate update after Pass 1
 //! - [`paragraph_font_grouping`]: Pass 1.5 — paragraph-level font grouping
+//!
+//! Rule-out via infinite penalty: if a font does not contain a character that
+//! appears in the string, `per_char_geo` returns `None` (cmap miss). The
+//! per-character geometry log-likelihood is `-infinity` (infinitely bad), so the
+//! whole-font score is `-infinity`. The pipeline inserts the font index into
+//! `cannot_render: HashSet<usize>` and skips it before softmax. This skip is
+//! mathematically correct because `exp(-inf)=0`, so softmax probability is 0.
+//! The abort is a valid short-circuit: a missing glyph cannot be rendered, so
+//! the font is ruled out without further scoring. Empty `Vec` is distinct: it
+//! means ligature mismatch (no usable words) and is kept as `Some(empty)` with
+//! SSIM-only scoring, not infinite penalty.
 
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
@@ -554,7 +565,9 @@ pub fn match_lines(
         // directly to line.words via source_word_idx.
         let mut corrected_words: Option<Vec<crate::ocr::TextRegion>> = None;
         let mut ocr_correction_audit: Vec<crate::audit::OcrCorrection> = Vec::new();
-        if args.skip_ocr_correction || std::env::var("UNPRINT_SKIP_PFLDA").is_ok() {
+        if args.skip_ocr_correction
+            || std::env::var("UNPRINT_SKIP_OCR_CORRECTION").is_ok()
+        {
             // skip pflda for t64 fast path
         } else if let (Some(ref fr), Some(rtd)) = (&font_result, training_data) {
             if std::env::var("UNPRINT_VERBOSE_PFLDA").is_ok() { eprintln!("[pflda] OCR correction pass for font_key={}", fr.font_key); }
@@ -625,7 +638,7 @@ pub fn match_lines(
 
                 for (seg_idx, seg) in winning_word_segs.iter().enumerate() {
                     for (char_pos, &ocr_char) in seg.chars.iter().enumerate() {
-                        if !crate::features::is_supported(ocr_char) { continue; }
+                        if !crate::features::audit_all_chars_enabled() && !crate::features::is_supported(ocr_char) { continue; }
                         let crop = match crate::segment::crop_ngram(
                             &seg.word_img, char_pos, 1,
                             &seg.boundaries, &seg.seam_paths, seg.crop_h,
@@ -831,10 +844,18 @@ pub fn match_lines(
                 // Precompute geo for all fonts for this line (for combined logit)
                 // Use usize font_idx as key to avoid String clone/hash overhead (2532 × 500 chars).
                 let mut all_geo: std::collections::HashMap<usize, std::collections::HashMap<(usize, usize), (f32,f32)>> = std::collections::HashMap::new();
+                let mut cannot_render: std::collections::HashSet<usize> = std::collections::HashSet::new();
                 for (font_idx, fe) in font_registry.iter().enumerate() {
                     let fk = fe.font_key_ref();
                     // Only compute geo if this font has glyphs for any observation seq (quick filter)
                     // but simple to just try per_char_geo_for_font — it returns None quickly if no matching segs
+                    //
+                    // Rule-out short-circuit: per_char_geo returns None when the font
+                    // lacks a cmap entry for a required char in this line. That char's
+                    // geometry ll is -infinity (infinitely bad), so the whole-line
+                    // font score is -infinity. Marking cannot_render and aborting
+                    // further geo for this font is valid — an infinitely bad component
+                    // dominates, so the font is ruled out no matter the other chars.
                     if let Some(geos) = crate::geometry_classifier::per_char_geo_for_font(
                         fk, win_segs, win_wib, font_cache, geo_cache, font_registry,
                     ) {
@@ -843,6 +864,9 @@ pub fn match_lines(
                             mp.insert((g.seg_idx, g.orig_idx), (g.h_ll as f32, g.v_ll as f32));
                         }
                         all_geo.insert(font_idx, mp);
+                    } else {
+                        // Font cannot render a required char in this line → infinitely bad score
+                        cannot_render.insert(font_idx);
                     }
                 }
 
@@ -889,6 +913,13 @@ pub fn match_lines(
                         let fk = fe.font_key_ref();
                         let Some(gid) = glyph_map.glyph_id_for_font(&seq, fk) else { continue; };
                         let Some(&raw_logit) = gid_to_logit.get(&gid) else { continue; };
+                        // Rule-out: if font cannot render any char in the line its
+                        // geometry score is -infinity (infinitely bad), so total score
+                        // is -infinity. Skip it here → softmax prob 0. The abort
+                        // above is the short-circuit for that infinitely bad case.
+                        if cannot_render.contains(&font_idx) {
+                            continue;
+                        }
                         let mut logit = raw_logit;
                         if let Some(sc) = sc_opt {
                             if let Some(geo_map) = all_geo.get(&font_idx) {

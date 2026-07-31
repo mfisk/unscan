@@ -10,6 +10,15 @@
 //! pitch is well-defined. Multi-char ligature words (e.g. "ff" plain where
 //! GSUB merges 2 chars -> 1 glyph) are skipped for geo and fall back to
 //! SSIM/n-gram only.
+//!
+//! Rule-out short-circuit: if `predict_glyph_positions_and_extents` returns
+//! `None` because the font lacks a cmap entry for a required character, the
+//! character cannot be rendered, so its geometry log-likelihood is `-infinity`
+//! (infinitely bad). Whole-font score is `-infinity`, so the font is ruled out
+//! immediately. We return `None` to signal abort; caller inserts into
+//! `cannot_render` and prunes as `NEG_INFINITY` with softmax prob 0. Empty
+//! `Vec` is not abort: it indicates ligature mismatch (0 usable words) and
+//! returns `Some(empty)` valid, keeping the font with SSIM-only scoring.
 
 use image::GrayImage;
 use std::collections::HashMap;
@@ -57,50 +66,7 @@ pub struct PerCharGeo {
 // When expressed in em units, sigma_em = sigma_px / em_px, so sigma_em is a
 // function of how many pixels per em we sampled at. In pixel space sigma_px is
 // constant, which is why we compute h_ll/v_ll directly in pixels.
-const SIGMA_CENTER_PX: f64 = 0.284;
-const SIGMA_PITCH_PX: f64 = 0.435;
-
-// Quantized geometry – flat-top half-width configurable via env.
-//
-// Model: true continuous center lies in observed quantized bin [e-a, e+a]
-// where a = flat-top half-width (default 0.45 px, override via UNPRINT_FLAT_TOP
-// env var, also accepts QUANT_HALF_WIDTH_PX and FLAT_TOP for compat).
-// Likelihood P = Φ((e+a)/σ) - Φ((e-a)/σ), log-likelihood = ln(P) - ln(2a).
-//
-// Φ via libm::erf. σ tuned: SIGMA_CENTER = 0.284 px, SIGMA_PITCH = 0.435 px.
-// Prior 1/√12 ≈0.2887 / 1/√6≈0.4082 close, tuned 0.284/0.435 wins.
-// No invented thresholds – pure probabilistic model.
-
-use std::sync::OnceLock;
-
-static FLAT_TOP_CACHE: OnceLock<f64> = OnceLock::new();
-
-#[inline]
-fn quant_half_width_px() -> f64 {
-    *FLAT_TOP_CACHE.get_or_init(|| {
-        std::env::var("UNPRINT_FLAT_TOP")
-            .or_else(|_| std::env::var("QUANT_HALF_WIDTH_PX"))
-            .or_else(|_| std::env::var("FLAT_TOP"))
-            .or_else(|_| std::env::var("QUANT_HALF_WIDTH"))
-            .ok()
-            .and_then(|s| s.parse::<f64>().ok())
-            .filter(|&v| v > 0.0 && v < 10.0)
-            .unwrap_or(0.45)
-    })
-}
-
-#[inline]
-fn quantized_ll(e: f64, sigma: f64, half_width: f64) -> f64 {
-    let sigma = sigma.max(1e-12);
-    let a = half_width;
-    let upper = (e + a) / sigma;
-    let lower = (e - a) / sigma;
-    const FRAC_1_SQRT_2: f64 = std::f64::consts::FRAC_1_SQRT_2;
-    let phi_upper = 0.5 * (1.0 + libm::erf(upper * FRAC_1_SQRT_2));
-    let phi_lower = 0.5 * (1.0 + libm::erf(lower * FRAC_1_SQRT_2));
-    let prob = (phi_upper - phi_lower).max(1e-300);
-    prob.ln() - (2.0 * a).ln()
-}
+use unprint_geometry::params::{quant_half_width_px, quantized_ll, SIGMA_CENTER_PX, SIGMA_PITCH_PX};
 
 /// Measure ink bounds for each character in a word.
 ///
@@ -277,10 +243,19 @@ fn per_char_geo_cached(
         // Non-BMP / missing cmap entries will miss and fall back to shaped path.
         // Ligature codepoints (FB00-FB04) ARE in cache and score as single glyphs.
         // Plain "ff" (['f','f']) is 2 chars, stays 2 glyphs (liga disabled for plain).
-        let Some(preds_fu_ext) = geo_cache.predict_glyph_positions_and_extents(font_key, &ws.chars) else { continue; };
+        //
+        // Rule-out short-circuit: if the font lacks a cmap entry for a required
+        // character it cannot render that character at all. Its geometry
+        // log-likelihood for that char would be -infinity (infinitely bad score),
+        // so the whole-font score is -infinity regardless of other chars.
+        // Abort (return None) is therefore a valid early short-circuit for an
+        // infinitely bad score — we rule the font out immediately without
+        // scoring remaining chars.
+        let Some(preds_fu_ext) = geo_cache.predict_glyph_positions_and_extents(font_key, &ws.chars) else { return None; };
         if preds_fu_ext.len() != word_bounds.len() {
             // Ligature merge: e.g. "ff" plain shaped to 1 glyph but we have 2 bounds → skip geo for this word.
             // Single-glyph cases (1 char word, or lig path with FB00) will have len==1 and pass.
+            // This is segmentation mismatch, not missing glyph, so skip word not abort font.
             continue;
         }
         let preds_fu: Vec<(f64,f64)> = preds_fu_ext.iter().map(|(cx,cy,_,_)| (*cx,*cy)).collect();
@@ -351,7 +326,9 @@ fn per_char_geo_cached(
             });
         }
     }
-    if result.is_empty() { None } else { Some(result) }
+    // Return Some even if empty: empty = no words had usable geo (ligature mismatch), not missing glyph.
+    // None is reserved for infinite penalty (cannot render char).
+    Some(result)
 }
 
 /// Shaped path: use HarfBuzz shaping per word (slow, but handles GPOS offsets, ligatures, non-ASCII).
@@ -397,6 +374,11 @@ fn per_char_geo_shaped(
             ws.chars.iter().collect()
         };
         let features = base_features.clone();
+        // Rule-out: shape_word returns None when HarfBuzz cannot shape because
+        // the font lacks a cmap entry — the char cannot be rendered. Its geometry
+        // ll would be -infinity (infinitely bad), so whole-font score is -infinity.
+        // The `?` here propagates None to the caller, which is a valid abort
+        // short-circuit: we rule the font out immediately as impossible.
         let sw = crate::layout::shape_word(&face, &features, &text, allow_liga)?;
         if sw.glyph_ids.len() != bounds_vec.len() {
             continue;
@@ -485,7 +467,8 @@ fn per_char_geo_shaped(
             });
         }
     }
-    if result.is_empty() { None } else { Some(result) }
+    // Empty = no usable words (ligature mismatch), not missing glyph → keep font, not infinite penalty.
+    Some(result)
 }
 
 /// Compute per-character geometry for a font.

@@ -175,7 +175,7 @@ pub fn run_unscan(input: &Path, extra_args: &[&str]) -> String {
         .env("TMPDIR", "/home/hatch/workspace/tmp")
         .env("UNPRINT_CACHE_DIR", "/home/hatch/.cache/unprint-small")
         .env("UNPRINT_FONT_ALLOWLIST", "LibreBodoni-400,EBGaramond-400,Arial-BoldMT-700,Roboto-400Italic,PlayfairDisplay-400")
-        .env("UNPRINT_SKIP_PFLDA", "true")
+        .env("UNPRINT_SKIP_OCR_CORRECTION", "true")
         .env("UNPRINT_EXTRA_SEAMS", "all");
     let output = cmd.output()
         .unwrap_or_else(|e| panic!("failed to run {:?}: {}", bin, e));

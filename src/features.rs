@@ -207,6 +207,8 @@ pub fn is_supported(c: char) -> bool {
     supported_chars().contains(&c)
 }
 
+pub use unprint_geometry::audit_all_chars_enabled;
+
 /// Common English bigrams (character pairs) for bigram classifiers.
 /// Includes frequent letter pairs, mixed-case pairs for sentence starts,
 /// and letter–punctuation pairs (period, comma) to capture relative size.

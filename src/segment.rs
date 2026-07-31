@@ -8,7 +8,7 @@ use image::GrayImage;
 use std::collections::{HashMap, HashSet};
 use std::sync::OnceLock;
 
-use crate::features::{contrast_normalize_char, is_supported, normalize_to_ink_bounds, NORM_H};
+use crate::features::{audit_all_chars_enabled, contrast_normalize_char, is_supported, normalize_to_ink_bounds, NORM_H};
 use crate::verify::WordPlacement;
 
 /// Seam carving scoring parameters, configurable via environment variables
@@ -1354,17 +1354,26 @@ pub fn segment_line(
     let mut words_with_ligatures: HashSet<usize> = HashSet::new();
 
     for (_word_idx, &(orig_idx, word)) in sorted.iter().enumerate() {
-        let chars_in_word: Vec<char> = word.text.chars().filter(|c| is_supported(*c)).collect();
-        // Include 2-letter words, only exclude single-letter (and empty)
-        if chars_in_word.len() <= 1 {
+        let audit_all = audit_all_chars_enabled();
+        let chars_in_word: Vec<char> = if audit_all {
+            word.text.chars().collect()
+        } else {
+            word.text.chars().filter(|c| is_supported(*c)).collect()
+        };
+        // Include 2-letter words, only exclude single-letter (and empty) unless audit-all requested
+        if !audit_all && chars_in_word.len() <= 1 {
             continue;
         }
 
-        let need_any = chars_in_word.iter().any(|c| {
-            char_counts.get(c).copied().unwrap_or(0) < 2
-        });
+        let need_any = if audit_all {
+            true
+        } else {
+            chars_in_word.iter().any(|c| {
+                char_counts.get(c).copied().unwrap_or(0) < 2
+            })
+        };
         // For 2-letter words, always keep them for geometry even if chars already seen
-        if chars_in_word.len() > 2 && !need_any {
+        if !audit_all && chars_in_word.len() > 2 && !need_any {
             continue;
         }
 
@@ -1429,7 +1438,7 @@ pub fn segment_line(
 
         // Update char counts (for the word-skip optimisation)
         for &c in &all_chars {
-            if is_supported(c) {
+            if audit_all || is_supported(c) {
                 *char_counts.entry(c).or_insert(0) += 1;
             }
         }
