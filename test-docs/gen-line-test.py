@@ -42,6 +42,7 @@ HARDCODED_7 = [
     ("SourceSerif4-400It", "Type"),
     ("LibreBaskerville-400", "abcdefghijklmnopqrstuvwxyz."),
     ("PTSerif-400Italic", "Italic: The quick brown fox jumps over 1,234,567,890 lazy"),
+    ("SourceSerif4-400It", "Font: Originally for IBM Executive typewriters — 12 characters per inch"),
     ("Georgia-400", "Matthew Carter created Georgia in 1993."),
 ]
 
@@ -125,8 +126,10 @@ def main():
     font_face_css = build_font_face_css(font_face_entries)
 
     # Single-page large-gap: 80pt blank p resets Tesseract without multi-page drift.
-    # Per-line size matches BAP specimen: alpha 9pt, sample/blurb 10pt.
-    LARGE_GAP = '<div style="height:120pt;"></div>'
+    # For 11-line set with many spaces (IBM line), page-level Word gap stats bleed
+    # across blocks causing alphabet j/k split. Use explicit page breaks to force
+    # per-page layout analysis reset.
+    LARGE_GAP = '<div style="height:120pt; page-break-after: always;"></div>'
     lines_html = []
     for idx, (text, canonical_name, ttf_path, css_weight, css_style) in enumerate(lines):
         stripped = text.rstrip('.').strip()
