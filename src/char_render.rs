@@ -265,14 +265,9 @@ pub fn render_ngram_fresh<F: Font>(
     // Normalize: ink-crop, 1px pad, resize to params.height
     let normalized = features::normalize_to_ink_bounds(&canvas, params.height)?;
 
-    // Optimized AA + binarize: avoid GrayImage clone for Native variant.
-    // Native previously did img.clone() inside apply(); now we move normalized
-    // directly when no post-processing is needed. Blur/Sharpen still allocate
-    // via imageops::blur (unavoidable), but binarize now uses in-place path.
-    let base = match params.aa {
-        features::AaVariant::Native => normalized,
-        _ => params.aa.apply(&normalized),
-    };
+    // Optimized AA + binarize: apply_inplace avoids clone for Native (0 alloc) and
+    // reuses buffer for Sharpen (1 alloc vs 2). Binarize uses in-place raw-buffer loop.
+    let base = params.aa.apply_inplace(normalized);
     match params.binarize_threshold {
         Some(t) => Some(features::binarize_inplace(base, t)),
         None => Some(base),

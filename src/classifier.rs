@@ -124,7 +124,8 @@ fn softmax_probs(dists: &[(u32, f32)], sigma_sq: f32, med_nn: f32) -> Vec<(u32, 
     LAST_OOD_WEIGHT.with(|cell| cell.set(ood_w));
     stash_obs_stats(min_d, dists, sigma, med_nn, &softmax);
     let mut probs = softmax;
-    probs.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
+    // Perf: order of equal probs irrelevant, use unstable sort (faster).
+    probs.sort_unstable_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
     probs
 }
 

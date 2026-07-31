@@ -368,18 +368,17 @@ fn per_char_geo_shaped(
         // is the correct way to get the ligature glyph.
         let is_lig_word = ws.chars.iter().any(|c| crate::font_scan::is_ligature_char(*c));
         let allow_liga = is_lig_word;
-        let text: String = if is_lig_word {
-            ws.word_text.clone()
-        } else {
-            ws.chars.iter().collect()
-        };
-        let features = base_features.clone();
+        // Perf: word_text already holds the original string for both lig and plain.
+        // Previous code cloned word_text for lig and collected chars for plain,
+        // both equivalent to &word_text. Avoid String alloc per word.
+        let text = &ws.word_text;
+        // base_features is immutable per font; no need to clone per word.
         // Rule-out: shape_word returns None when HarfBuzz cannot shape because
         // the font lacks a cmap entry — the char cannot be rendered. Its geometry
         // ll would be -infinity (infinitely bad), so whole-font score is -infinity.
         // The `?` here propagates None to the caller, which is a valid abort
         // short-circuit: we rule the font out immediately as impossible.
-        let sw = crate::layout::shape_word(&face, &features, &text, allow_liga)?;
+        let sw = crate::layout::shape_word(&face, &base_features, text, allow_liga)?;
         if sw.glyph_ids.len() != bounds_vec.len() {
             continue;
         }

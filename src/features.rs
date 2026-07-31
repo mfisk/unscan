@@ -65,11 +65,40 @@ impl AaVariant {
             AaVariant::Blur05 => image::imageops::blur(img, 0.5),
             AaVariant::Sharpen => {
                 // Unsharp mask: original + (original - blurred) * amount
+                // Raw-buffer path avoids Luma wrapper + iterator overhead.
                 let blurred = image::imageops::blur(img, 0.5);
                 let mut out = img.clone();
-                for (p, b) in out.pixels_mut().zip(blurred.pixels()) {
-                    let diff = p.0[0] as f32 - b.0[0] as f32;
-                    p.0[0] = (p.0[0] as f32 + diff * 0.5).clamp(0.0, 255.0) as u8;
+                let out_raw = out.as_mut();
+                let blur_raw = blurred.as_raw();
+                // SAFETY: both buffers same len (w*h) from same source dimensions.
+                for i in 0..out_raw.len() {
+                    let o = out_raw[i] as f32;
+                    let b = blur_raw[i] as f32;
+                    let diff = o - b;
+                    out_raw[i] = (o + diff * 0.5).clamp(0.0, 255.0) as u8;
+                }
+                out
+            }
+        }
+    }
+
+    /// In-place variant: takes ownership, avoids clone for Native and Sharpen.
+    /// For Native, returns the owned image directly (0 alloc).
+    /// For Sharpen, reuses the owned buffer as output (1 alloc for blur only, vs 2 before).
+    pub fn apply_inplace(&self, img: image::GrayImage) -> image::GrayImage {
+        match self {
+            AaVariant::Native => img,
+            AaVariant::Blur05 => image::imageops::blur(&img, 0.5),
+            AaVariant::Sharpen => {
+                let blurred = image::imageops::blur(&img, 0.5);
+                let mut out = img;
+                let blur_raw = blurred.as_raw();
+                let out_raw = out.as_mut();
+                for i in 0..out_raw.len() {
+                    let o = out_raw[i] as f32;
+                    let b = blur_raw[i] as f32;
+                    let diff = o - b;
+                    out_raw[i] = (o + diff * 0.5).clamp(0.0, 255.0) as u8;
                 }
                 out
             }
@@ -508,7 +537,8 @@ pub fn compute_features(img: &GrayImage, pre_normalized: bool) -> Option<CropFea
         // Contrast-normalize: ensures symmetric treatment between
         // training renders and inference crops.  On a clean render this
         // is effectively a no-op (p1≈0, p99≈255).
-        std::borrow::Cow::Owned(contrast_normalize_char(img.clone()))
+        // Perf: avoid clone when no stretch needed (common for clean renders).
+        contrast_normalize_char_cow(img)
     };
     let (w, h) = img.dimensions();
     if w == 0 || h == 0 {
@@ -1344,6 +1374,24 @@ pub fn contrast_normalize_char(mut img: GrayImage) -> GrayImage {
         *px = stretch(*px, p1, range);
     }
     img
+}
+
+/// Cow variant: avoids allocation when image is already full-range or flat.
+/// Checks percentiles on borrowed data first; only clones if stretch needed.
+pub fn contrast_normalize_char_cow(img: &GrayImage) -> std::borrow::Cow<'_, GrayImage> {
+    let Some((p1, p99)) = contrast_percentiles(img.as_raw()) else {
+        return std::borrow::Cow::Borrowed(img);
+    };
+    if p1 == 0 && p99 == 255 {
+        // Already full-range – no-op, avoid clone.
+        return std::borrow::Cow::Borrowed(img);
+    }
+    let range = (p99 - p1) as f32;
+    let mut out = img.clone();
+    for px in out.as_mut() {
+        *px = stretch(*px, p1, range);
+    }
+    std::borrow::Cow::Owned(out)
 }
 
 /// Contrast-normalize an RGBA image, preserving colour.
