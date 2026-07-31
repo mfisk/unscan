@@ -99,6 +99,12 @@ pub fn verify_text_region(
 
     // Page-level Hough deskew already corrected the full page before we get
     // here, so no per-line rotation needed.
+    //
+    // Word boxes are already tight ink bboxes produced upstream:
+    //   expand_words_to_ink -> fix_overlapping_words_by_ink -> trim_words_to_ink
+    // in page_cache.rs.  Do NOT re-derive ink runs, split, or merge words here —
+    // spacing and splitting are handled up front.  Use the boxes as-is with
+    // uniform line scale (midpoint-derived override_em_px).
     let placements: Vec<WordPlacement> = words
         .iter()
         .map(|wr| WordPlacement {

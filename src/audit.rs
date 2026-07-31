@@ -84,6 +84,11 @@ pub struct AuditEntry {
     /// Whether OCR text matches ground truth (None when GT unavailable).
     #[serde(skip_serializing_if = "Option::is_none")]
     pub ocr_correct: Option<bool>,
+    /// Midpoint-derived font size (em_px) used for verification.
+    /// When present, both chosen and GT renders should use this size
+    /// to avoid the bug where chosen==GT but ZNCC differs because GT used width-matched.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub midpoint_em_px: Option<f32>,
     /// Whether this line was matched via the dominant-font fast path
     /// (skipping full classification).
     #[serde(skip_serializing_if = "std::ops::Not::not")]

@@ -33,6 +33,7 @@ mod ngram;
 mod atomic_file;
 mod geo_cache;
 mod geometry_classifier;
+mod geometry_scale;
 
 use crate::font_pipeline::ObsRankProbs;
 use crate::audit::{AuditEntry, AuditLog, BBox, GeometryEntry, PageSummary};
@@ -241,6 +242,7 @@ fn build_audit_entry(
         gt_text: None,
         ocr_text: None,
         ocr_correct: None,
+        midpoint_em_px: lm.midpoint_em_px,
         fast_path: lm.fast_path,
         word_segmentation: lm.word_seg_summaries.clone(),
         ocr_corrections: lm.ocr_corrections.clone(),

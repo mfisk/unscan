@@ -260,14 +260,23 @@ fn per_char_geo_cached(
         }
         // Perf slice 3: avoid two intermediate Vec allocs (preds_fu, preds) per word per font.
         // preds_fu_ext is Vec<(cx,cy,y_min,y_max)> in font units. Scale from font units → px
-        // is center-span (unbiased). We compute scale directly from first/last cx in preds_fu_ext,
-        // then compute pred_word_cy as mean of cy * -scale without allocating.
+        // is center-span (unbiased). We compute scale via shared helper
+        // `geometry_scale::center_span_scale` — single source of truth for midpoint scaling.
         let scale = if word_bounds.len() >= 2 {
-            let obs_span = (word_bounds.last().unwrap().cx - word_bounds.first().unwrap().cx).abs().max(0.5);
-            let pred_first_cx = preds_fu_ext.first().unwrap().0;
-            let pred_last_cx = preds_fu_ext.last().unwrap().0;
-            let pred_span = (pred_last_cx - pred_first_cx).abs().max(0.5);
-            obs_span / pred_span
+            let obs_first = word_bounds.first().unwrap().cx;
+            let obs_last = word_bounds.last().unwrap().cx;
+            let pred_first = preds_fu_ext.first().unwrap().0;
+            let pred_last = preds_fu_ext.last().unwrap().0;
+            crate::geometry_scale::center_span_scale(obs_first, obs_last, pred_first, pred_last)
+                .unwrap_or_else(|| {
+                    // fallback to height ratio if span degenerate (should be rare)
+                    let obs_h = word_bounds.iter().map(|b| b.height).fold(0.0_f64, f64::max).max(1.0);
+                    let pred_h = geo_cache
+                        .predict_word_ink_extent(font_key, &ws.chars, &[], 0.0)
+                        .map(|(_, h)| h)
+                        .unwrap_or(1000.0);
+                    obs_h / pred_h.max(1.0)
+                })
         } else {
             // single char: fall back to height ratio (h_err is None anyway)
             let obs_h = word_bounds[0].height.max(1.0);
@@ -411,11 +420,20 @@ fn per_char_geo_shaped(
             cursor_fu += sw.x_advances[i] as f64;
         }
 
-        // Center-span scaling (unbiased): scale from first..last center distance
+        // Center-span scaling (unbiased): single source of truth via geometry_scale
         let scale = if bounds_vec.len() >= 2 {
-            let obs_span = (bounds_vec.last().unwrap().cx - bounds_vec.first().unwrap().cx).abs().max(0.5);
-            let pred_span = (pred_positions.last().unwrap().0 - pred_positions.first().unwrap().0).abs().max(0.5);
-            obs_span / pred_span
+            let obs_first = bounds_vec.first().unwrap().cx;
+            let obs_last = bounds_vec.last().unwrap().cx;
+            let pred_first = pred_positions.first().unwrap().0;
+            let pred_last = pred_positions.last().unwrap().0;
+            crate::geometry_scale::center_span_scale(obs_first, obs_last, pred_first, pred_last)
+                .unwrap_or_else(|| {
+                    let obs_h = bounds_vec.iter().map(|b| b.height).fold(0.0_f64, f64::max).max(1.0);
+                    let glyph_id = unprint_fonts::ttf_parser::GlyphId(sw.glyph_ids[0] as u16);
+                    let bbox = ttfp.glyph_bounding_box(glyph_id).unwrap_or(unprint_fonts::ttf_parser::Rect { x_min: 0, y_min: -1000, x_max: 0, y_max: 0 });
+                    let pred_h = (bbox.y_max - bbox.y_min) as f64;
+                    obs_h / pred_h.max(1.0)
+                })
         } else {
             let obs_h = bounds_vec[0].height.max(1.0);
             // Use ink height from bbox for single char
@@ -515,62 +533,52 @@ pub fn median_em_px_from_midpoints(
     wib: &[WordGeoMeasurement],
     geo_cache: &crate::geo_cache::GeometryCache,
 ) -> Option<f32> {
-    if segs.len() != wib.len() {
-        return None;
-    }
-    let upem = geo_cache.units_per_em(font_key)? as f32;
+    let upem = geo_cache.units_per_em(font_key)? as f64;
     if upem <= 0.0 {
         return None;
     }
-    let mut ems: Vec<f32> = Vec::with_capacity(segs.len());
+    // Reuse the shared word-scales path — single loop, cheaper predict (cx only),
+    // no y-extents, no duplicate math. This removes the previous duplicate
+    // `predict_glyph_positions_and_extents` call that geometry scoring had already done.
+    let scales = word_scales_for_font(font_key, segs, wib, geo_cache);
+    em_from_word_scales(&scales, upem)
+}
 
+/// Compute per-word center-span scales for a font without re-shaping twice.
+/// This is the shared path that both geometry scoring and sizing can use,
+/// removing the previous redundant `predict_glyph_positions_and_extents` call
+/// in sizing that geometry had already done.
+///
+/// Returns scales in same order as `segs`/`wib` (only for valid anchors).
+pub fn word_scales_for_font(
+    font_key: &str,
+    segs: &[crate::segment::WordSeg],
+    wib: &[WordGeoMeasurement],
+    geo_cache: &crate::geo_cache::GeometryCache,
+) -> Vec<f64> {
+    let mut scales = Vec::with_capacity(segs.len());
+    if segs.len() != wib.len() {
+        return scales;
+    }
     for (seg, meas) in segs.iter().zip(wib.iter()) {
-        // Require at least 2 chars for a span; single-char words have no span
-        if meas.chars.len() < 2 || seg.chars.len() < 2 {
+        if meas.chars.len() != seg.chars.len() || meas.chars.len() < 2 {
             continue;
         }
-        if meas.chars.len() != seg.chars.len() {
-            // Ligature merge or segmentation mismatch — skip for sizing
+        if !crate::geometry_scale::is_sizing_anchor(&seg.chars) {
             continue;
         }
-        // Good sizing anchor: at least one alphabetic character
-        // (excludes pure numbers / punctuation like "1,234,567,890")
-        let has_alpha = seg.chars.iter().any(|c| c.is_alphabetic());
-        if !has_alpha {
-            continue;
-        }
-
         let obs_first = meas.chars.first().unwrap().cx;
         let obs_last = meas.chars.last().unwrap().cx;
-        let obs_span = (obs_last - obs_first).abs();
-        if obs_span < 0.5 {
-            continue;
-        }
-
-        let pred = match geo_cache.predict_glyph_positions_and_extents(font_key, &seg.chars) {
-            Some(p) => p,
-            None => continue,
-        };
-        if pred.len() != seg.chars.len() || pred.len() < 2 {
-            continue;
-        }
-        let pred_first = pred.first().unwrap().0;
-        let pred_last = pred.last().unwrap().0;
-        let pred_span = (pred_last - pred_first).abs();
-        if pred_span < 0.5 {
-            continue;
-        }
-
-        let scale = obs_span / pred_span; // px per font unit
-        let em_px = (scale * upem as f64) as f32;
-        if em_px.is_finite() && em_px >= 4.0 && em_px <= 500.0 {
-            ems.push(em_px);
-        }
+        let Some(pred) = geo_cache.predict_glyph_positions(font_key, &seg.chars) else { continue };
+        if pred.len() < 2 { continue; }
+        let Some(s) = crate::geometry_scale::center_span_scale(obs_first, obs_last, pred[0].0, pred[pred.len()-1].0) else { continue };
+        scales.push(s);
     }
+    scales
+}
 
-    if ems.is_empty() {
-        return None;
-    }
-    ems.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
-    Some(ems[ems.len() / 2])
+pub fn em_from_word_scales(scales: &[f64], upem: f64) -> Option<f32> {
+    if scales.is_empty() || upem <= 0.0 { return None; }
+    let mut ems: Vec<f32> = scales.iter().map(|&s| crate::geometry_scale::em_from_scale(s, upem)).collect();
+    crate::geometry_scale::median_f32(&mut ems)
 }

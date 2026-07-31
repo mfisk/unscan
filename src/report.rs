@@ -809,12 +809,27 @@ fn build_miss_block(
     let (gt_render_uri, gt_diff_uri, gt_sim) =
         render_correct_font_comparison(entry, correct_fe, font_data_cache, diag_dir.as_deref());
     // Compute font sizes for comparison
+    // GT size is ground-truth from PDF.
+    // Unprint size must be midpoint-derived (obs_span/pred_span * upem) per user intent,
+    // not width-matched. entry.midpoint_em_px is the median midpoint scale already computed
+    // in geometry_classifier::median_em_px_from_midpoints and used for ZNCC rendering.
     let gt_font_size_pt = ce.gt_font_size_pt;
+    let scale = 72.0 / dpi as f32;
+    let midpoint_pt = entry.midpoint_em_px.map(|em| em * scale);
     let inferred_size = chosen_fe.and_then(|fe| {
         let data = font_data_cache.load(&fe.path)?;
         compute_inferred_font_size(data, &entry.word_bboxes, &fe.variant_tag, fe.variations.as_deref(), dpi)
     });
-    let unprint_font_size_pt = inferred_size.as_ref().map(|s| s.median_pt);
+    // Prefer midpoint for the main Size value; fall back to width-matched only if midpoint missing
+    let unprint_font_size_pt = midpoint_pt.or_else(|| inferred_size.as_ref().map(|s| s.median_pt));
+    // Per-word breakdown is width-matched only. When we have a midpoint median, showing width-matched
+    // per-word values would make the pct column misleading (median vs width-matched word), so hide it
+    // in the midpoint case. Fallback case (no midpoint) keeps the old width-matched breakdown.
+    let per_word_for_block = if midpoint_pt.is_some() {
+        None
+    } else {
+        inferred_size.as_ref().map(|s| s.per_word.as_slice())
+    };
 
     let sim_compare_html = if let Some(ref dd) = diag_dir {
         build_similarity_block(
@@ -822,7 +837,7 @@ fn build_miss_block(
             gt_render_uri.as_deref(), gt_diff_uri.as_deref(),
             gt_sim,
             gt_font_size_pt, unprint_font_size_pt,
-            inferred_size.as_ref().map(|s| s.per_word.as_slice()),
+            per_word_for_block,
         )
     } else {
         String::new()
@@ -1497,6 +1512,9 @@ fn render_correct_font_comparison(
 
     // Same pipeline as the chosen font — render, ZNCC, ink-crop for display
     // For GT comparison renders, allow ligatures so "fi" can shape correctly
+    // Fix: use midpoint_em_px when available so GT==Chosen doesn't get different ZNCC
+    // due to width-matched vs midpoint sizing. Previously GT always used None (width-matched)
+    // while chosen used midpoint, causing L9 PTSerif to show different renders even when equal.
     let vr = crate::verify::verify_text_region(
         &scan_gray, font_data, &entry.text, &words,
         entry.bbox.x, entry.bbox.y,
@@ -1504,7 +1522,7 @@ fn render_correct_font_comparison(
         &fe.variant_tag, fe.variations.as_deref(),
         true,
         None, None,
-        None,
+        entry.midpoint_em_px,
     );
 
     let render_uri = vr.render_ink.as_ref().map(|r| img_to_b64_uri(r));
