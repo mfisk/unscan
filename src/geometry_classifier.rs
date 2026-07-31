@@ -258,15 +258,15 @@ fn per_char_geo_cached(
             // This is segmentation mismatch, not missing glyph, so skip word not abort font.
             continue;
         }
-        let preds_fu: Vec<(f64,f64)> = preds_fu_ext.iter().map(|(cx,cy,_,_)| (*cx,*cy)).collect();
-
-        // Scale from font units → px: center-span (unbiased by construction)
-        // For n>=2: scale = (obs_cx_last - obs_cx_first) / (pred_cx_last - pred_cx_first)
-        // This makes sum_h = 0 per word by construction, so any remaining bias is a bug.
-        // Longer words get more precise scale (pixel quantization / width).
+        // Perf slice 3: avoid two intermediate Vec allocs (preds_fu, preds) per word per font.
+        // preds_fu_ext is Vec<(cx,cy,y_min,y_max)> in font units. Scale from font units → px
+        // is center-span (unbiased). We compute scale directly from first/last cx in preds_fu_ext,
+        // then compute pred_word_cy as mean of cy * -scale without allocating.
         let scale = if word_bounds.len() >= 2 {
             let obs_span = (word_bounds.last().unwrap().cx - word_bounds.first().unwrap().cx).abs().max(0.5);
-            let pred_span = (preds_fu.last().unwrap().0 - preds_fu.first().unwrap().0).abs().max(0.5);
+            let pred_first_cx = preds_fu_ext.first().unwrap().0;
+            let pred_last_cx = preds_fu_ext.last().unwrap().0;
+            let pred_span = (pred_last_cx - pred_first_cx).abs().max(0.5);
             obs_span / pred_span
         } else {
             // single char: fall back to height ratio (h_err is None anyway)
@@ -277,15 +277,21 @@ fn per_char_geo_cached(
                 .unwrap_or(1000.0);
             obs_h / pred_h.max(1.0)
         };
-        // y is flipped: font y up → image y down
-        let preds: Vec<(f64, f64)> = preds_fu.iter().map(|(x, y)| (x * scale, y * -scale)).collect();
 
-        // Word vertical center: use mean of character centers so sum_v = 0 by construction
-        // (matches t64 theory: obs_word_cy = mean(obs_cy), pred_word_cy = mean(pred_cy))
+        // Word vertical center: mean of centers so sum_v = 0 by construction
         let obs_word_cy = word_bounds.iter().map(|b| b.cy).sum::<f64>() / word_bounds.len() as f64;
-        let pred_word_cy = preds.iter().map(|(_, cy)| *cy).sum::<f64>() / preds.len() as f64;
+        // pred_word_cy = mean(pred_cy) where pred_cy = cy_fu * -scale
+        let pred_word_cy = {
+            let sum: f64 = preds_fu_ext.iter().map(|(_, cy, _, _)| cy * -scale).sum();
+            sum / preds_fu_ext.len() as f64
+        };
 
-        for (orig_idx, (bounds, (pred_cx, pred_cy))) in word_bounds.iter().zip(preds.iter()).enumerate() {
+        // Second pass: emit PerCharGeo without allocating preds Vec. Keep prev_pred_cx for pitch.
+        let mut prev_obs_cx: Option<f64> = None;
+        let mut prev_pred_cx: Option<f64> = None;
+        for (orig_idx, (bounds, (cx_fu, cy_fu, _, _))) in word_bounds.iter().zip(preds_fu_ext.iter()).enumerate() {
+            let pred_cx = cx_fu * scale;
+            let pred_cy = cy_fu * -scale;
             let obs_cx = bounds.cx;
             let obs_cy = bounds.cy;
 
@@ -297,10 +303,10 @@ fn per_char_geo_cached(
             let (obs_pitch, pred_pitch, h_err, h_ll) = if orig_idx == 0 {
                 (None, None, None, 0.0)
             } else {
-                let prev = &word_bounds[orig_idx - 1];
-                let (prev_pred_cx, _) = &preds[orig_idx - 1];
-                let obs_pitch_val = obs_cx - prev.cx;
-                let pred_pitch_val = pred_cx - prev_pred_cx;
+                let prev_cx = prev_obs_cx.unwrap();
+                let ppcx = prev_pred_cx.unwrap();
+                let obs_pitch_val = obs_cx - prev_cx;
+                let pred_pitch_val = pred_cx - ppcx;
                 let h_err_val = obs_pitch_val - pred_pitch_val;
                 let h_ll_val = quantized_ll(h_err_val, SIGMA_PITCH_PX, quant_half_width_px());
                 (Some(obs_pitch_val), Some(pred_pitch_val), Some(h_err_val), h_ll_val)
@@ -311,8 +317,8 @@ fn per_char_geo_cached(
                 orig_idx,
                 obs_cx,
                 obs_cy,
-                pred_cx: *pred_cx,
-                pred_cy: *pred_cy,
+                pred_cx,
+                pred_cy,
                 obs_word_cy,
                 pred_word_cy,
                 obs_pitch,
@@ -324,6 +330,8 @@ fn per_char_geo_cached(
                 v_err,
                 v_ll,
             });
+            prev_obs_cx = Some(obs_cx);
+            prev_pred_cx = Some(pred_cx);
         }
     }
     // Return Some even if empty: empty = no words had usable geo (ligature mismatch), not missing glyph.

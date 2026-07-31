@@ -124,8 +124,8 @@ fn softmax_probs(dists: &[(u32, f32)], sigma_sq: f32, med_nn: f32) -> Vec<(u32, 
     LAST_OOD_WEIGHT.with(|cell| cell.set(ood_w));
     stash_obs_stats(min_d, dists, sigma, med_nn, &softmax);
     let mut probs = softmax;
-    // Perf: order of equal probs irrelevant, use unstable sort (faster).
-    probs.sort_unstable_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
+    // Perf: prob tie → glyph_id asc for deterministic top-k (affects candidate fonts & path winner, needed for stable t59).
+    probs.sort_unstable_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal).then_with(|| a.0.cmp(&b.0)));
     probs
 }
 
