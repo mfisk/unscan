@@ -37,13 +37,18 @@ use std::collections::{BTreeMap, HashMap};
 use std::path::{Path, PathBuf};
 
 const BGEO_MAGIC: &[u8; 4] = b"BGEO";
-const BGEO_VERSION: u32 = 10;
+const BGEO_VERSION: u32 = 11;
 
 // ---------- BE helpers for OT parsing ----------
 #[inline]
 fn be_u16(d: &[u8], off: usize) -> Option<u16> {
     if off + 2 > d.len() { return None; }
     Some(u16::from_be_bytes([d[off], d[off+1]]))
+}
+#[inline]
+fn be_u32(d: &[u8], off: usize) -> Option<u32> {
+    if off + 4 > d.len() { return None; }
+    Some(u32::from_be_bytes([d[off], d[off+1], d[off+2], d[off+3]]))
 }
 #[inline]
 fn be_i16(d: &[u8], off: usize) -> Option<i16> { be_u16(d, off).map(|v| v as i16) }
@@ -1354,33 +1359,50 @@ impl GeometryCache {
             let lookup_off = be_u16(data, off_pos)? as usize + lookup_list_off;
             if lookup_off + 6 > data.len() { continue; }
             let lookup_type = be_u16(data, lookup_off)?;
+            // Handle GPOS types 1 Single, 2 Pair, and 9 ExtensionPos (which wraps 1 or 2)
+            if lookup_type != 1 && lookup_type != 2 && lookup_type != 9 { continue; }
             let subtable_count = be_u16(data, lookup_off+4)? as usize;
             for si in 0..subtable_count {
                 let sub_off_pos = lookup_off + 6 + si*2;
                 let sub_off = be_u16(data, sub_off_pos)? as usize + lookup_off;
                 if sub_off + 2 > data.len() { continue; }
-                if lookup_type == 1 {
+                // Unwrap extension if needed
+                let mut inner_type = lookup_type;
+                let mut inner_off = sub_off;
+                if lookup_type == 9 {
+                    // ExtensionPos: Format (u16)=1, ExtensionLookupType (u16), ExtensionOffset (u32)
+                    if sub_off + 8 > data.len() { continue; }
+                    let ext_fmt = be_u16(data, sub_off)?;
+                    if ext_fmt != 1 { continue; }
+                    let ext_lookup_type = be_u16(data, sub_off+2)?;
+                    let ext_offset = be_u32(data, sub_off+4)? as usize;
+                    inner_type = ext_lookup_type;
+                    inner_off = sub_off + ext_offset;
+                    if inner_off + 2 > data.len() { continue; }
+                    if inner_type != 1 && inner_type != 2 { continue; }
+                }
+                if inner_type == 1 {
                     // SinglePos
-                    let fmt = be_u16(data, sub_off)?;
+                    let fmt = be_u16(data, inner_off)?;
                     if fmt == 1 {
                         // SinglePos Format1: CoverageOffset, ValueFormat, ValueRecord (single)
-                        if sub_off + 6 > data.len() { continue; }
-                        let cov_off = be_u16(data, sub_off+2)? as usize + sub_off;
-                        let val_fmt_full = be_u16(data, sub_off+4)?;
+                        if inner_off + 6 > data.len() { continue; }
+                        let cov_off = be_u16(data, inner_off+2)? as usize + inner_off;
+                        let val_fmt_full = be_u16(data, inner_off+4)?;
                         let val_fmt = vf_mask(val_fmt_full);
                         let coverage = Self::parse_coverage(data, cov_off)?;
-                        let (xpl,ypl,xad,yad,_) = Self::parse_value_record(data, sub_off+6, val_fmt_full)?;
+                        let (xpl,ypl,xad,yad,_) = Self::parse_value_record(data, inner_off+6, val_fmt_full)?;
                         let val = [xpl,ypl,xad,yad];
                         single_tables.push(SingleTableOwned { coverage: coverage.clone(), value_format: val_fmt, values: vec![val; coverage.len()], is_single: true });
                     } else if fmt == 2 {
-                        if sub_off + 8 > data.len() { continue; }
-                        let cov_off = be_u16(data, sub_off+2)? as usize + sub_off;
-                        let val_fmt_full = be_u16(data, sub_off+4)?;
+                        if inner_off + 8 > data.len() { continue; }
+                        let cov_off = be_u16(data, inner_off+2)? as usize + inner_off;
+                        let val_fmt_full = be_u16(data, inner_off+4)?;
                         let val_fmt = vf_mask(val_fmt_full);
-                        let val_count = be_u16(data, sub_off+6)? as usize;
+                        let val_count = be_u16(data, inner_off+6)? as usize;
                         let coverage = Self::parse_coverage(data, cov_off)?;
                         let mut values = Vec::with_capacity(val_count);
-                        let mut p = sub_off + 8;
+                        let mut p = inner_off + 8;
                         let val_size = Self::value_format_size(val_fmt_full);
                         for _ in 0..val_count {
                             if p + val_size > data.len() { break; }
@@ -1390,21 +1412,21 @@ impl GeometryCache {
                         }
                         single_tables.push(SingleTableOwned { coverage, value_format: val_fmt, values, is_single: false });
                     }
-                } else if lookup_type == 2 {
-                    let fmt = be_u16(data, sub_off)?;
+                } else if inner_type == 2 {
+                    let fmt = be_u16(data, inner_off)?;
                     if fmt == 1 {
-                        if sub_off + 10 > data.len() { continue; }
-                        let cov_off = be_u16(data, sub_off+2)? as usize + sub_off;
-                        let val_fmt1_full = be_u16(data, sub_off+4)?;
-                        let val_fmt2_full = be_u16(data, sub_off+6)?;
+                        if inner_off + 10 > data.len() { continue; }
+                        let cov_off = be_u16(data, inner_off+2)? as usize + inner_off;
+                        let val_fmt1_full = be_u16(data, inner_off+4)?;
+                        let val_fmt2_full = be_u16(data, inner_off+6)?;
                         let val_fmt1 = vf_mask(val_fmt1_full);
                         let val_fmt2 = vf_mask(val_fmt2_full);
-                        let pair_set_count = be_u16(data, sub_off+8)? as usize;
+                        let pair_set_count = be_u16(data, inner_off+8)? as usize;
                         let coverage = Self::parse_coverage(data, cov_off)?;
                         let mut pair_sets: Vec<Vec<(u16,Val4,Val4)>> = Vec::with_capacity(pair_set_count);
                         for psi in 0..pair_set_count {
-                            let ps_off_pos = sub_off + 10 + psi*2;
-                            let ps_off = be_u16(data, ps_off_pos)? as usize + sub_off;
+                            let ps_off_pos = inner_off + 10 + psi*2;
+                            let ps_off = be_u16(data, ps_off_pos)? as usize + inner_off;
                             if ps_off + 2 > data.len() { pair_sets.push(Vec::new()); continue; }
                             let pair_val_count = be_u16(data, ps_off)? as usize;
                             let mut pairs = Vec::with_capacity(pair_val_count);
@@ -1433,16 +1455,16 @@ impl GeometryCache {
                         while pair_sets.len() < coverage.len() { pair_sets.push(Vec::new()); }
                         f1_tables.push(Format1TableOwned { coverage, val_fmt1, val_fmt2, pair_sets });
                     } else if fmt == 2 {
-                        if sub_off + 16 > data.len() { continue; }
-                        let cov_off = be_u16(data, sub_off+2)? as usize + sub_off;
-                        let val_fmt1_full = be_u16(data, sub_off+4)?;
-                        let val_fmt2_full = be_u16(data, sub_off+6)?;
+                        if inner_off + 16 > data.len() { continue; }
+                        let cov_off = be_u16(data, inner_off+2)? as usize + inner_off;
+                        let val_fmt1_full = be_u16(data, inner_off+4)?;
+                        let val_fmt2_full = be_u16(data, inner_off+6)?;
                         let val_fmt1 = vf_mask(val_fmt1_full);
                         let val_fmt2 = vf_mask(val_fmt2_full);
-                        let cd1_off = be_u16(data, sub_off+8)? as usize + sub_off;
-                        let cd2_off = be_u16(data, sub_off+10)? as usize + sub_off;
-                        let c1_count = be_u16(data, sub_off+12)? as usize;
-                        let c2_count = be_u16(data, sub_off+14)? as usize;
+                        let cd1_off = be_u16(data, inner_off+8)? as usize + inner_off;
+                        let cd2_off = be_u16(data, inner_off+10)? as usize + inner_off;
+                        let c1_count = be_u16(data, inner_off+12)? as usize;
+                        let c2_count = be_u16(data, inner_off+14)? as usize;
                         let coverage = Self::parse_coverage(data, cov_off)?;
                         let (cd1, cd1_parse) = Self::parse_class_def_with_raw(data, cd1_off, num_glyphs)?;
                         let (cd2, cd2_parse) = Self::parse_class_def_with_raw(data, cd2_off, num_glyphs)?;
@@ -1460,7 +1482,7 @@ impl GeometryCache {
                         let val2_size = Self::value_format_size(val_fmt2_full);
                         let rec_size = val1_size + val2_size;
                         let mut matrix = Vec::with_capacity(c1_count * c2_count);
-                        let mut p = sub_off + 16;
+                        let mut p = inner_off + 16;
                         for _ in 0..c1_count*c2_count {
                             if p + rec_size > data.len() { break; }
                             let (xpl1,ypl1,xad1,yad1,_) = Self::parse_value_record(data, p, val_fmt1_full)?;
