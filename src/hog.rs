@@ -31,25 +31,40 @@ pub fn compute_hog(img: &GrayImage) -> Option<[f32; HOG_FEAT_LEN]> {
         return None;
     }
 
+    const TARGET_U32: u32 = TARGET as u32;
+
     // Fast path: already 24×24 — use the input buffer directly, no clone.
-    if w == TARGET as u32 && h == TARGET as u32 {
+    if w == TARGET_U32 && h == TARGET_U32 {
         return Some(hog_from_raw(img.as_raw(), TARGET, TARGET));
     }
 
     // ── 1. Letterbox to fixed 24×24 square ──────────────────────────
-    let target_u32 = TARGET as u32;
-    let scale = (target_u32 as f32 / w as f32).min(target_u32 as f32 / h as f32);
+    let scale = (TARGET_U32 as f32 / w as f32).min(TARGET_U32 as f32 / h as f32);
     let new_w = (w as f32 * scale).round().max(1.0) as u32;
     let new_h = (h as f32 * scale).round().max(1.0) as u32;
+
+    // Trivial win: most glyphs after NORM_H=24 normalization are h=24, w=10..20,
+    // so scale=1.0 and new_w==w, new_h==h. The generic resize path would allocate
+    // a new image and copy (image 0.25 detects same dims but still allocates a
+    // buffer_like + copy). Skip the Lanczos3 resize entirely and overlay the
+    // source directly — output identical, zero alloc for the resize step.
+    if new_w == w && new_h == h {
+        let mut sq = GrayImage::from_pixel(TARGET_U32, TARGET_U32, image::Luma([255u8]));
+        let ox = (TARGET_U32 - w) / 2;
+        let oy = (TARGET_U32 - h) / 2;
+        image::imageops::overlay(&mut sq, img, ox as i64, oy as i64);
+        return Some(hog_from_raw(sq.as_raw(), TARGET, TARGET));
+    }
+
     let resized = image::imageops::resize(
         img,
         new_w,
         new_h,
         image::imageops::FilterType::Lanczos3,
     );
-    let mut sq = GrayImage::from_pixel(target_u32, target_u32, image::Luma([255u8]));
-    let ox = (target_u32 - new_w) / 2;
-    let oy = (target_u32 - new_h) / 2;
+    let mut sq = GrayImage::from_pixel(TARGET_U32, TARGET_U32, image::Luma([255u8]));
+    let ox = (TARGET_U32 - new_w) / 2;
+    let oy = (TARGET_U32 - new_h) / 2;
     image::imageops::overlay(&mut sq, &resized, ox as i64, oy as i64);
 
     Some(hog_from_raw(sq.as_raw(), TARGET, TARGET))

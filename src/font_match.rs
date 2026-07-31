@@ -23,14 +23,19 @@ const GEO_WEIGHT: f32 = 1.0;
 // Aggregation mode: false = squared gap (current), true = simple sum (generative)
 const USE_SUM_AGG: bool = true;
 
-/// Midpoint pruning: worst log-prob of a letter in a correct font measured on BAP
-/// specimen is -10.1537 (SourceSerif4-400 'T' p5:23, 416 font-correct letters,
-/// ocr_correct=true, hit/minor_miss, p1=-4.99 p5=-1.90 median=-0.39). 
-/// We prune fonts where min_{chars}(h_ll+v_ll) < threshold.
-/// Threshold is scaled/loosened by --thoroughness: thr=1 => -12, thr=2 => -24 (looser),
-/// thr=0.5 => -6 (tighter). Clamped to >=0.1 to avoid zero.
+/// Midpoint pruning: prune fonts where min_{chars}(h_ll+v_ll) < threshold.
+/// Threshold = BASE * thoroughness, thr=1 => BASE. Base was -12.0 (worst correct
+/// letter -10.1537 on old BAP, SourceSerif4-400 'T' p5:23). Sweep 2026-07-31 on
+/// font-timeline-specimen (505 entries, 494 GT, baseline 352 hits 71.3% zncc 0.8988):
+///   thr 0.9 (-10.8) 352 hits pruned 0.723
+///   thr 0.8 (-9.6)  352 hits pruned 0.746
+///   thr 0.7 (-8.4)  352 hits pruned 0.768
+///   thr 0.6 (-7.2)  352 hits pruned 0.788  <- tightest with no accuracy loss
+///   thr 0.5 (-6.0)  351 hits (-1) pruned 0.812
+/// So optimal default is -7.2: minimizes glyph measurement (keeps ~21% candidates
+/// vs ~30% at -12) with zero hit loss. Clamped thoroughness >=0.1.
 /// MIN_KEEP=10 ensures best_lps stability by keeping at least 10 best pruned fonts.
-const MIDPOINT_PRUNE_BASE: f32 = -12.0;
+const MIDPOINT_PRUNE_BASE: f32 = -7.2;
 
 // ---------------------------------------------------------------------------
 // Types
@@ -348,8 +353,11 @@ pub fn identify_fonts<'a>(
     }
 
     // ── Midpoint pruning: prune fonts with very negative h_ll+v_ll ─────────
-    // Worst correct-font letter on BAP is -10.1537 (416 letters, ocr_correct, hit/minor_miss).
-    // Threshold = BASE * thoroughness, thr=1 => -12, thr=2 => -24 looser, thr=0.5 => -6 tighter.
+    // Threshold = BASE * thoroughness, BASE=-7.2 optimal per 2026-07-31 sweep
+    // (thr=1 => -7.2, thr=2 => -14.4 looser, thr=0.5 => -3.6 tighter). Previous
+    // worst correct -10.15 on old BAP led to BASE=-12, but sweep on current
+    // 505-entry BAP shows -7.2 maintains 352/494 hits (71.3%) while pruning
+    // ~78.8% vs ~72% at -10.8, minimizing glyph measurement with no accuracy loss.
     // We use min_ll (worst letter) to decide; keep ensure keys and fonts with no geo data.
     // To keep best_lps stable across prune levels, we also keep at least 10 fonts with
     // highest min_ll (least negative) so per-position best doesn't shift dramatically.

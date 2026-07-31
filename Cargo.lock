@@ -1973,6 +1973,7 @@ dependencies = [
  "pprof",
  "rand 0.8.6",
  "rayon",
+ "rustc-hash",
  "serde",
  "serde_json",
  "subsetter",
