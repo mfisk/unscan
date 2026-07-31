@@ -5,6 +5,7 @@
 
 use std::sync::Arc;
 use image::GrayImage;
+use rustc_hash::FxHashMap;
 use std::collections::{HashMap, HashSet};
 use std::sync::OnceLock;
 
@@ -467,7 +468,7 @@ fn segment_characters_inner(
         let mut heap: BinaryHeap<SeamEntry> = BinaryHeap::new();
         // Cache DP matrices by segment ID so we can trace paths
         // from the same matrices that computed candidate costs.
-        let mut dp_cache: std::collections::HashMap<u32, SeamDp> = std::collections::HashMap::new();
+        let mut dp_cache: FxHashMap<u32, SeamDp> = FxHashMap::default();
         // Diagonal bounds per segment: seam paths that bound each side.
         // Pixels at or beyond these paths are unusable in the DP.
         // left_path[r] = seam col; pixels with col <= left_path[r] are masked.
@@ -477,7 +478,7 @@ fn segment_characters_inner(
             left_path: Option<std::sync::Arc<Vec<[u32; 2]>>>,
             right_path: Option<std::sync::Arc<Vec<[u32; 2]>>>,
         }
-        let mut seg_bounds: std::collections::HashMap<u32, SegBounds> = std::collections::HashMap::new();
+        let mut seg_bounds: FxHashMap<u32, SegBounds> = FxHashMap::default();
         let mut next_seg_id: u32 = 0;
 
         // Build initial segments from VP splits and seed the heap.

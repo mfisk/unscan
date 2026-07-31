@@ -13,7 +13,7 @@
 //! back to SSIM / n-gram only. Abort `None` is a valid short-circuit for an
 //! infinitely bad score because a missing glyph makes rendering impossible.
 
-use std::collections::HashSet;
+use rustc_hash::{FxHashMap, FxHashSet};
 use std::path::PathBuf;
 use image::GrayImage;
 use crate::features::{CropFeatures, compute_features};
@@ -194,7 +194,7 @@ pub fn identify_fonts<'a>(
         .min(n_windows);
 
     // ── Stage 1: per-window classification → candidate set ─────────
-    let mut candidate_set: HashSet<&'a str> = HashSet::new();
+    let mut candidate_set: FxHashSet<&'a str> = FxHashSet::default();
     let mut observations: Vec<ObservationDetail> = Vec::with_capacity(n_windows);
     let mut ood_weights: Vec<f32> = Vec::with_capacity(n_windows);
 
@@ -327,14 +327,14 @@ pub fn identify_fonts<'a>(
     let n_scoring = scoring_window_indices.len();
 
     // ── Geo precompute: per-font per-char geometry log-likelihoods ──
-    let mut geo_per_font: std::collections::HashMap<&'a str, std::collections::HashMap<(usize, usize), f32>> = std::collections::HashMap::new();
-    let mut cannot_render: std::collections::HashSet<&'a str> = std::collections::HashSet::new();
+    let mut geo_per_font: FxHashMap<&'a str, FxHashMap<(usize, usize), f32>> = FxHashMap::default();
+    let mut cannot_render: FxHashSet<&'a str> = FxHashSet::default();
     if !word_segs.is_empty() && !wib.is_empty() {
         for &font_key in &candidate_vec {
             if let Some(geos) = crate::geometry_classifier::per_char_geo_for_font(
                 font_key, word_segs, wib, font_cache, geo_cache, font_registry
             ) {
-                let mut map = std::collections::HashMap::new();
+                let mut map = FxHashMap::default();
                 for g in geos {
                     let ll = (g.h_ll + g.v_ll) as f32;
                     map.insert((g.seg_idx, g.orig_idx), ll);
