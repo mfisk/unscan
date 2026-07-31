@@ -82,6 +82,10 @@ pub struct LineMatch {
     pub fast_path: bool,
     /// ZNCC verify score from the fast-path check (so pass 2a can skip re-verification).
     pub fast_path_score: Option<f32>,
+    /// Median em_px derived from midpoint center-span scales (obs_span/pred_span * upem).
+    /// This reuses the exact scale calculation from geometry scoring for font-size,
+    /// fixing L9 fox/jumps too-small issue where width-matched median was dragged down.
+    pub midpoint_em_px: Option<f32>,
     /// Per-word segmentation summaries for audit integration.
     pub word_seg_summaries: Vec<crate::audit::WordSegSummary>,
     /// PFLDA OCR corrections with decision data.
@@ -219,6 +223,7 @@ pub fn match_lines(
                 true,
                 None,
                 Some(FAST_PATH_MIN_SSIM),
+                None,
             );
             if vr.score >= FAST_PATH_MIN_SSIM {
                 fast_path_hits.fetch_add(1, Ordering::Relaxed);
@@ -251,6 +256,7 @@ pub fn match_lines(
                     corrected_words: None,
                     fast_path: true,
                     fast_path_score: Some(vr.score),
+                    midpoint_em_px: None,
                     word_seg_summaries: Vec::new(),
                     ocr_corrections: Vec::new(),
                 };
@@ -457,6 +463,16 @@ pub fn match_lines(
                             let _ = std::fs::create_dir_all(&p);
                             p
                         });
+                        // Use midpoint-derived scale for font size (obs_span/pred_span * upem)
+                        // instead of width-matched median — this is the scale computed for
+                        // geometry scoring, which is robust to sidebearings and numeric fragments.
+                        // This directly addresses L9 fox/jumps too-small issue.
+                        let midpoint_em_px = crate::geometry_classifier::median_em_px_from_midpoints(
+                            font_key,
+                            &line_crops.word_segs,
+                            &wib_plain,
+                            geo_cache,
+                        );
                         let vr = verify::verify_text_region(
                             &norm_crop, &fd, &line.text,
                             &line.words,
@@ -465,6 +481,7 @@ pub fn match_lines(
                             fe.variations.as_deref(),
                             use_lig,
                             tie_audit_dir.as_deref(), None,
+                            midpoint_em_px,
                         );
                         log_parts.push(format!("{:.4}({})", vr.score, fe.family_name));
                         tie_sim_results.push((fe.font_key(), fe.family_name.clone(), vr.score));
@@ -1110,7 +1127,28 @@ pub fn match_lines(
             }).collect()
         };
 
-        LineMatch { font_result, text_color, font_scores, observations, font_scores_lig, observations_lig, seg_winner, diag_seg_dir, obs_rank_probs, alt_obs_rank_probs, tie_candidates: tie_candidates_audit, corrected_words, fast_path: false, fast_path_score: None, word_seg_summaries, ocr_corrections: ocr_correction_audit }
+        // Compute midpoint-derived font size for this winning font.
+        // This reuses the exact center-span scale from geometry scoring
+        // (obs_span/pred_span * upem) and is robust to sidebearings.
+        // Stored in LineMatch and later used as override for ZNCC verification
+        // and for report Size row, fixing L9 fox/jumps too-small.
+        let midpoint_em_px = if let Some(ref fm) = font_result {
+            let (win_segs_ref, win_wib_ref): (&[segment::WordSeg], &[crate::geometry_classifier::WordGeoMeasurement]) =
+                if seg_winner.as_deref() == Some("ligature") {
+                    if let (Some(lig_segs), Some(wib_lig)) = (line_crops.lig_word_segs.as_ref(), wib_lig_opt.as_ref()) {
+                        (lig_segs.as_slice(), wib_lig.as_slice())
+                    } else {
+                        (line_crops.word_segs.as_slice(), wib_plain.as_slice())
+                    }
+                } else {
+                    (line_crops.word_segs.as_slice(), wib_plain.as_slice())
+                };
+            crate::geometry_classifier::median_em_px_from_midpoints(&fm.font_key, win_segs_ref, win_wib_ref, geo_cache)
+        } else {
+            None
+        };
+
+        LineMatch { font_result, text_color, font_scores, observations, font_scores_lig, observations_lig, seg_winner, diag_seg_dir, obs_rank_probs, alt_obs_rank_probs, tie_candidates: tie_candidates_audit, corrected_words, fast_path: false, fast_path_score: None, midpoint_em_px, word_seg_summaries, ocr_corrections: ocr_correction_audit }
     }).collect();
 
     let fp_hits = fast_path_hits.load(Ordering::Relaxed);

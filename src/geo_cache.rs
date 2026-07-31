@@ -267,6 +267,10 @@ impl GeometryCache {
 
     pub fn has_font(&self, font_key: &str) -> bool { self.fonts.contains_key(font_key) }
 
+    pub fn units_per_em(&self, font_key: &str) -> Option<f64> {
+        self.fonts.get(font_key).map(|f| f.upem)
+    }
+
     #[inline] fn data(&self) -> &[u8] { &self.mmap }
 
     #[inline]

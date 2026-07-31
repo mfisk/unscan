@@ -741,6 +741,7 @@ fn run(args: &cli::Args, classifier: &mut dyn classifier::Classifier) -> Result<
                             allow_liga,
                             lm.diag_seg_dir.as_deref(),
                             None,
+                            lm.midpoint_em_px,
                         );
                         // Verify alt segmentation path's top font for ZNCC comparison
                         if lm.seg_winner.is_some() && !lm.font_scores_lig.is_empty() {
@@ -764,6 +765,7 @@ fn run(args: &cli::Args, classifier: &mut dyn classifier::Classifier) -> Result<
                                             alt_fe.variations.as_deref(),
                                             allow_liga_alt,
                                             alt_audit_dir.as_deref(),
+                                            None,
                                             None,
                                         );
                                     }

@@ -492,3 +492,85 @@ pub fn per_char_geo_for_font(
     }
     per_char_geo_shaped(font_key, word_segs, wib, font_cache, font_registry)
 }
+
+/// Median font size (em_px) derived from midpoint center-span scales.
+///
+/// This reuses the exact scale calculation that geometry scoring uses for
+/// midpoint log-likelihoods: for each word,
+///   obs_span  = last observed cx - first observed cx   (px, from segmentation)
+///   pred_span = last predicted cx - first predicted cx (font units, from GPOS-aware cache)
+///   scale     = obs_span / pred_span                    (px per font unit)
+///   em_px     = scale * upem
+///
+/// The median across words is robust and does NOT use advance-width matching,
+/// so it is not distorted by sidebearings, punctuation, or numeric fragments.
+/// This is the "midpoint scale" the user asked to leverage for font-size.
+///
+/// We filter to alphabetic anchors (at least one alphabetic char) so pure
+/// numbers like "1,234,567,890" don't participate, matching the sizing-anchor
+/// heuristic but now via geometry rather than width.
+pub fn median_em_px_from_midpoints(
+    font_key: &str,
+    segs: &[crate::segment::WordSeg],
+    wib: &[WordGeoMeasurement],
+    geo_cache: &crate::geo_cache::GeometryCache,
+) -> Option<f32> {
+    if segs.len() != wib.len() {
+        return None;
+    }
+    let upem = geo_cache.units_per_em(font_key)? as f32;
+    if upem <= 0.0 {
+        return None;
+    }
+    let mut ems: Vec<f32> = Vec::with_capacity(segs.len());
+
+    for (seg, meas) in segs.iter().zip(wib.iter()) {
+        // Require at least 2 chars for a span; single-char words have no span
+        if meas.chars.len() < 2 || seg.chars.len() < 2 {
+            continue;
+        }
+        if meas.chars.len() != seg.chars.len() {
+            // Ligature merge or segmentation mismatch — skip for sizing
+            continue;
+        }
+        // Good sizing anchor: at least one alphabetic character
+        // (excludes pure numbers / punctuation like "1,234,567,890")
+        let has_alpha = seg.chars.iter().any(|c| c.is_alphabetic());
+        if !has_alpha {
+            continue;
+        }
+
+        let obs_first = meas.chars.first().unwrap().cx;
+        let obs_last = meas.chars.last().unwrap().cx;
+        let obs_span = (obs_last - obs_first).abs();
+        if obs_span < 0.5 {
+            continue;
+        }
+
+        let pred = match geo_cache.predict_glyph_positions_and_extents(font_key, &seg.chars) {
+            Some(p) => p,
+            None => continue,
+        };
+        if pred.len() != seg.chars.len() || pred.len() < 2 {
+            continue;
+        }
+        let pred_first = pred.first().unwrap().0;
+        let pred_last = pred.last().unwrap().0;
+        let pred_span = (pred_last - pred_first).abs();
+        if pred_span < 0.5 {
+            continue;
+        }
+
+        let scale = obs_span / pred_span; // px per font unit
+        let em_px = (scale * upem as f64) as f32;
+        if em_px.is_finite() && em_px >= 4.0 && em_px <= 500.0 {
+            ems.push(em_px);
+        }
+    }
+
+    if ems.is_empty() {
+        return None;
+    }
+    ems.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
+    Some(ems[ems.len() / 2])
+}

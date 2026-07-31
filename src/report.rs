@@ -1504,6 +1504,7 @@ fn render_correct_font_comparison(
         &fe.variant_tag, fe.variations.as_deref(),
         true,
         None, None,
+        None,
     );
 
     let render_uri = vr.render_ink.as_ref().map(|r| img_to_b64_uri(r));
