@@ -33,11 +33,13 @@
 //!       matrix: [class1_count*class2_count] * { val1[popcnt(vf1) i16], val2[popcnt(vf2) i16] }
 //!     }
 
-use std::collections::{BTreeMap, HashMap};
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::path::{Path, PathBuf};
 
 const BGEO_MAGIC: &[u8; 4] = b"BGEO";
-const BGEO_VERSION: u32 = 11;
+// Bump to 13 to invalidate caches after extension + lookup-aware fix.
+// v11 was extension handling, v12 was lookup-aware without extension, v13 merges both.
+const BGEO_VERSION: u32 = 13;
 
 // ---------- BE helpers for OT parsing ----------
 #[inline]
@@ -151,6 +153,8 @@ struct SingleTableOwned {
     value_format: u16, // masked 0xF
     values: Vec<Val4>, // len = coverage.len() (or 1 if is_single, expanded on read)
     is_single: bool, // true if original was Format1 single-value (one record for all)
+    lookup_id: u16,
+    subtable_pos: u16,
 }
 
 #[derive(Clone, Debug)]
@@ -159,6 +163,8 @@ struct Format1TableOwned {
     val_fmt1: u16, // masked
     val_fmt2: u16, // masked
     pair_sets: Vec<Vec<(u16, Val4, Val4)>>, // per left gid: Vec<(second_gid, val1, val2)>
+    lookup_id: u16,
+    subtable_pos: u16,
 }
 
 #[derive(Clone, Debug)]
@@ -177,6 +183,8 @@ struct Format2TableOwned {
     val_fmt1: u16,
     val_fmt2: u16,
     matrix: Vec<(Val4, Val4)>, // len = class1_count*class2_count, each (val1,val2)
+    lookup_id: u16,
+    subtable_pos: u16,
 }
 
 struct OwnedFont {
@@ -199,6 +207,8 @@ struct SingleIndex {
     is_single: bool,
     values_off: usize,
     stride: usize, // popcnt in i16 units
+    lookup_id: u16,
+    subtable_pos: u16,
 }
 
 #[derive(Debug)]
@@ -213,6 +223,8 @@ struct Format1Index {
     sz1: usize,
     sz2: usize,
     pair_sets: Vec<PairSetIndex>,
+    lookup_id: u16,
+    subtable_pos: u16,
 }
 
 #[derive(Debug)]
@@ -234,6 +246,14 @@ struct Format2Index {
     class1_def: ClassDefIndex,
     class2_def: ClassDefIndex,
     matrix_off: usize,
+    lookup_id: u16,
+    subtable_pos: u16,
+}
+
+// Helper for lookup-aware pair resolution: reference to either Format1 or Format2 subtable within a lookup.
+enum PairSubtableRef<'a> {
+    F1(&'a Format1Index),
+    F2(&'a Format2Index),
 }
 
 #[derive(Debug)]
@@ -352,13 +372,19 @@ impl GeometryCache {
         None
     }
 
-    // single adjustment sum across all single tables, returns [xPla,yPla,xAdv,yAdv] as i32
+    // single adjustment sum across lookups, first matching subtable per lookup wins
+    // GPOS spec: within a lookup, subtables are tried in order; first that applies wins.
+    // Across lookups, adjustments are summed.
     fn single_adjustment_full(&self, f: &FontMmapIndex, gid: u16) -> [i32;4] {
         let d = self.data();
         let mut acc = [0i32;4];
-        for tbl in &f.single_tables {
+        let mut seen_lookups: HashSet<u16> = HashSet::new();
+        // Ensure deterministic subtable order per lookup (parse order already is, but sort to be safe)
+        let mut tables: Vec<&SingleIndex> = f.single_tables.iter().collect();
+        tables.sort_by_key(|t| (t.lookup_id, t.subtable_pos));
+        for tbl in tables {
+            if seen_lookups.contains(&tbl.lookup_id) { continue; }
             let idx_opt = if tbl.is_single {
-                // single value applies to all in coverage - need to know if gid in coverage
                 if self.coverage_contains(tbl.coverage_off, tbl.coverage_len, gid).is_none() { continue; }
                 Some(0usize)
             } else {
@@ -369,75 +395,104 @@ impl GeometryCache {
             let sz = tbl.stride;
             let off = tbl.values_off + idx*sz*2;
             if off + sz*2 > d.len() { continue; }
-            // unpack in order
             let mut p = off;
             if vf & 0x0001 != 0 { acc[0] += le_i16_at(d,p) as i32; p+=2; }
             if vf & 0x0002 != 0 { acc[1] += le_i16_at(d,p) as i32; p+=2; }
             if vf & 0x0004 != 0 { acc[2] += le_i16_at(d,p) as i32; p+=2; }
             if vf & 0x0008 != 0 { acc[3] += le_i16_at(d,p) as i32; }
+            seen_lookups.insert(tbl.lookup_id);
         }
         acc
     }
 
     // pair adjustment for adjacent gids, returns (val1, val2) each [xPla,yPla,xAdv,yAdv] summed
+    // Correct GPOS semantics: for each lookup, try subtables in order (by subtable_pos);
+    // first subtable where coverage contains gid1 AND second glyph matches (for Format1) wins for that lookup.
+    // Sum across lookups. Format1 and Format2 subtables can coexist in same lookup, so we merge them by pos.
     fn pair_adjustment_full(&self, f: &FontMmapIndex, gid1: u16, gid2: u16) -> ([i32;4],[i32;4]) {
         let d = self.data();
         let mut v1_acc = [0i32;4];
         let mut v2_acc = [0i32;4];
-        // Format1
+
+        // Group candidates by lookup_id
+        let mut by_lookup: BTreeMap<u16, Vec<(u16, PairSubtableRef<'_>)>> = BTreeMap::new();
         for tbl in &f.format1_tables {
-            let cov_idx = match self.coverage_contains(tbl.coverage_off, tbl.coverage_len, gid1) {
-                Some(i)=>i, None=>continue,
-            };
-            let ps = &tbl.pair_sets[cov_idx];
-            // binary search second gid in pairs
-            let mut lo = 0usize;
-            let mut hi = ps.pair_count;
-            let mut found_off: Option<usize> = None;
-            while lo < hi {
-                let mid = (lo+hi)/2;
-                let rec_size = 2 + tbl.sz1*2 + tbl.sz2*2;
-                let off = ps.pairs_off + mid*rec_size;
-                if off+2 > d.len() { break; }
-                let sg = le_u16_at(d, off);
-                if sg < gid2 { lo = mid+1; }
-                else if sg > gid2 { hi = mid; }
-                else { found_off = Some(off); break; }
-            }
-            let off = match found_off { Some(o)=>o, None=>continue };
-            let mut p = off + 2;
-            let vf1 = tbl.val_fmt1;
-            if vf1 & 0x0001 != 0 { v1_acc[0] += le_i16_at(d,p) as i32; p+=2; }
-            if vf1 & 0x0002 != 0 { v1_acc[1] += le_i16_at(d,p) as i32; p+=2; }
-            if vf1 & 0x0004 != 0 { v1_acc[2] += le_i16_at(d,p) as i32; p+=2; }
-            if vf1 & 0x0008 != 0 { v1_acc[3] += le_i16_at(d,p) as i32; p+=2; }
-            let vf2 = tbl.val_fmt2;
-            if vf2 & 0x0001 != 0 { v2_acc[0] += le_i16_at(d,p) as i32; p+=2; }
-            if vf2 & 0x0002 != 0 { v2_acc[1] += le_i16_at(d,p) as i32; p+=2; }
-            if vf2 & 0x0004 != 0 { v2_acc[2] += le_i16_at(d,p) as i32; p+=2; }
-            if vf2 & 0x0008 != 0 { v2_acc[3] += le_i16_at(d,p) as i32; }
+            by_lookup.entry(tbl.lookup_id).or_default().push((tbl.subtable_pos, PairSubtableRef::F1(tbl)));
         }
-        // Format2
         for tbl in &f.format2_tables {
-            if self.coverage_contains(tbl.coverage_off, tbl.coverage_len, gid1).is_none() { continue; }
-            let c1 = self.class_get(&tbl.class1_def, gid1);
-            let c2 = self.class_get(&tbl.class2_def, gid2);
-            if c1 >= tbl.class1_count || c2 >= tbl.class2_count { continue; }
-            let idx = c1 * tbl.class2_count + c2;
-            let rec_size = (tbl.sz1 + tbl.sz2)*2;
-            let off = tbl.matrix_off + idx*rec_size;
-            if off + rec_size > d.len() { continue; }
-            let mut p = off;
-            let vf1 = tbl.val_fmt1;
-            if vf1 & 0x0001 != 0 { v1_acc[0] += le_i16_at(d,p) as i32; p+=2; }
-            if vf1 & 0x0002 != 0 { v1_acc[1] += le_i16_at(d,p) as i32; p+=2; }
-            if vf1 & 0x0004 != 0 { v1_acc[2] += le_i16_at(d,p) as i32; p+=2; }
-            if vf1 & 0x0008 != 0 { v1_acc[3] += le_i16_at(d,p) as i32; p+=2; }
-            let vf2 = tbl.val_fmt2;
-            if vf2 & 0x0001 != 0 { v2_acc[0] += le_i16_at(d,p) as i32; p+=2; }
-            if vf2 & 0x0002 != 0 { v2_acc[1] += le_i16_at(d,p) as i32; p+=2; }
-            if vf2 & 0x0004 != 0 { v2_acc[2] += le_i16_at(d,p) as i32; p+=2; }
-            if vf2 & 0x0008 != 0 { v2_acc[3] += le_i16_at(d,p) as i32; }
+            by_lookup.entry(tbl.lookup_id).or_default().push((tbl.subtable_pos, PairSubtableRef::F2(tbl)));
+        }
+
+        for (_lookup_id, mut cands) in by_lookup {
+            cands.sort_by_key(|(pos, _)| *pos);
+            let mut matched = false;
+            for (_pos, cand) in cands {
+                match cand {
+                    PairSubtableRef::F1(tbl) => {
+                        let cov_idx = match self.coverage_contains(tbl.coverage_off, tbl.coverage_len, gid1) {
+                            Some(i)=>i, None=>continue,
+                        };
+                        let ps = &tbl.pair_sets[cov_idx];
+                        // binary search second gid
+                        let mut lo = 0usize;
+                        let mut hi = ps.pair_count;
+                        let mut found_off: Option<usize> = None;
+                        while lo < hi {
+                            let mid = (lo+hi)/2;
+                            let rec_size = 2 + tbl.sz1*2 + tbl.sz2*2;
+                            let off = ps.pairs_off + mid*rec_size;
+                            if off+2 > d.len() { break; }
+                            let sg = le_u16_at(d, off);
+                            if sg < gid2 { lo = mid+1; }
+                            else if sg > gid2 { hi = mid; }
+                            else { found_off = Some(off); break; }
+                        }
+                        let off = match found_off { Some(o)=>o, None=>continue };
+                        let mut p = off + 2;
+                        let vf1 = tbl.val_fmt1;
+                        if vf1 & 0x0001 != 0 { v1_acc[0] += le_i16_at(d,p) as i32; p+=2; }
+                        if vf1 & 0x0002 != 0 { v1_acc[1] += le_i16_at(d,p) as i32; p+=2; }
+                        if vf1 & 0x0004 != 0 { v1_acc[2] += le_i16_at(d,p) as i32; p+=2; }
+                        if vf1 & 0x0008 != 0 { v1_acc[3] += le_i16_at(d,p) as i32; p+=2; }
+                        let vf2 = tbl.val_fmt2;
+                        if vf2 & 0x0001 != 0 { v2_acc[0] += le_i16_at(d,p) as i32; p+=2; }
+                        if vf2 & 0x0002 != 0 { v2_acc[1] += le_i16_at(d,p) as i32; p+=2; }
+                        if vf2 & 0x0004 != 0 { v2_acc[2] += le_i16_at(d,p) as i32; p+=2; }
+                        if vf2 & 0x0008 != 0 { v2_acc[3] += le_i16_at(d,p) as i32; }
+                        matched = true;
+                        break;
+                    }
+                    PairSubtableRef::F2(tbl) => {
+                        let cov_opt = self.coverage_contains(tbl.coverage_off, tbl.coverage_len, gid1);
+                        if cov_opt.is_none() {
+                            continue;
+                        }
+                        let c1 = self.class_get(&tbl.class1_def, gid1);
+                        let c2 = self.class_get(&tbl.class2_def, gid2);
+                        if c1 >= tbl.class1_count || c2 >= tbl.class2_count {
+                            continue;
+                        }
+                        let idx = c1 * tbl.class2_count + c2;
+                        let rec_size = (tbl.sz1 + tbl.sz2)*2;
+                        let off = tbl.matrix_off + idx*rec_size;
+                        if off + rec_size > d.len() { continue; }
+                        let mut p = off;
+                        let vf1 = tbl.val_fmt1;
+                        if vf1 & 0x0001 != 0 { v1_acc[0] += le_i16_at(d,p) as i32; p+=2; }
+                        if vf1 & 0x0002 != 0 { v1_acc[1] += le_i16_at(d,p) as i32; p+=2; }
+                        if vf1 & 0x0004 != 0 { v1_acc[2] += le_i16_at(d,p) as i32; p+=2; }
+                        if vf1 & 0x0008 != 0 { v1_acc[3] += le_i16_at(d,p) as i32; p+=2; }
+                        let vf2 = tbl.val_fmt2;
+                        if vf2 & 0x0001 != 0 { v2_acc[0] += le_i16_at(d,p) as i32; p+=2; }
+                        if vf2 & 0x0002 != 0 { v2_acc[1] += le_i16_at(d,p) as i32; p+=2; }
+                        if vf2 & 0x0004 != 0 { v2_acc[2] += le_i16_at(d,p) as i32; p+=2; }
+                        if vf2 & 0x0008 != 0 { v2_acc[3] += le_i16_at(d,p) as i32; }
+                        matched = true;
+                        break;
+                    }
+                }
+            }
+            let _ = matched;
         }
         (v1_acc, v2_acc)
     }
@@ -642,7 +697,7 @@ impl GeometryCache {
                 let v = values[0];
                 values = vec![v; coverage.len()];
             }
-            single_tables.push(SingleTableOwned { coverage, value_format: vf, values, is_single: tbl.is_single });
+            single_tables.push(SingleTableOwned { coverage, value_format: vf, values, is_single: tbl.is_single, lookup_id: tbl.lookup_id, subtable_pos: tbl.subtable_pos });
         }
         // format1
         let mut format1_tables = Vec::with_capacity(findex.format1_tables.len());
@@ -680,7 +735,7 @@ impl GeometryCache {
                 }
                 pair_sets.push(pairs);
             }
-            format1_tables.push(Format1TableOwned { coverage, val_fmt1: vf1, val_fmt2: vf2, pair_sets });
+            format1_tables.push(Format1TableOwned { coverage, val_fmt1: vf1, val_fmt2: vf2, pair_sets, lookup_id: tbl.lookup_id, subtable_pos: tbl.subtable_pos });
         }
         // format2
         let mut format2_tables = Vec::with_capacity(findex.format2_tables.len());
@@ -767,6 +822,8 @@ impl GeometryCache {
                 val_fmt1: vf1,
                 val_fmt2: vf2,
                 matrix,
+                lookup_id: tbl.lookup_id,
+                subtable_pos: tbl.subtable_pos,
             });
         }
 
@@ -1018,7 +1075,7 @@ impl GeometryCache {
                                 coverage.push(left);
                                 pair_sets.push(pairs);
                             }
-                            format1_tables.push(Format1TableOwned { coverage, val_fmt1: 0x0004, val_fmt2: 0x0000, pair_sets });
+                            format1_tables.push(Format1TableOwned { coverage, val_fmt1: 0x0004, val_fmt2: 0x0000, pair_sets, lookup_id: 0, subtable_pos: 0 });
                             break;
                         }
                     }
@@ -1086,9 +1143,11 @@ impl GeometryCache {
             w.write_all(&(of.single_tables.len() as u16).to_le_bytes())?;
             w.write_all(&(of.format1_tables.len() as u16).to_le_bytes())?;
             w.write_all(&(of.format2_tables.len() as u16).to_le_bytes())?;
-            // singles
+            // singles — v12 layout: cov_len, lookup_id, subtable_pos, coverage, value_format, is_single, values
             for tbl in &of.single_tables {
                 w.write_all(&(tbl.coverage.len() as u16).to_le_bytes())?;
+                w.write_all(&tbl.lookup_id.to_le_bytes())?;
+                w.write_all(&tbl.subtable_pos.to_le_bytes())?;
                 for gid in &tbl.coverage { w.write_all(&gid.to_le_bytes())?; }
                 w.write_all(&tbl.value_format.to_le_bytes())?;
                 w.write_all(&[if tbl.is_single {1u8} else {0u8}])?;
@@ -1098,9 +1157,11 @@ impl GeometryCache {
                     pack_vals_4(&mut w, v, tbl.value_format)?;
                 }
             }
-            // format1
+            // format1 — v12: cov_len, lookup_id, subtable_pos, coverage, val_fmt1, val_fmt2, pair_sets
             for tbl in &of.format1_tables {
                 w.write_all(&(tbl.coverage.len() as u16).to_le_bytes())?;
+                w.write_all(&tbl.lookup_id.to_le_bytes())?;
+                w.write_all(&tbl.subtable_pos.to_le_bytes())?;
                 for gid in &tbl.coverage { w.write_all(&gid.to_le_bytes())?; }
                 w.write_all(&tbl.val_fmt1.to_le_bytes())?;
                 w.write_all(&tbl.val_fmt2.to_le_bytes())?;
@@ -1113,9 +1174,11 @@ impl GeometryCache {
                     }
                 }
             }
-            // format2
+            // format2 — v12: cov_len, lookup_id, subtable_pos, coverage, class1_count, class2_count, val_fmt1, val_fmt2, ...
             for tbl in &of.format2_tables {
                 w.write_all(&(tbl.coverage.len() as u16).to_le_bytes())?;
+                w.write_all(&tbl.lookup_id.to_le_bytes())?;
+                w.write_all(&tbl.subtable_pos.to_le_bytes())?;
                 for gid in &tbl.coverage { w.write_all(&gid.to_le_bytes())?; }
                 w.write_all(&(tbl.class1_count as u16).to_le_bytes())?;
                 w.write_all(&(tbl.class2_count as u16).to_le_bytes())?;
@@ -1192,6 +1255,9 @@ impl GeometryCache {
             for _ in 0..n_single {
                 if pos+2 > data.len() { return Err("trunc single cov_len".into()); }
                 let cov_len = u16::from_le_bytes(data[pos..pos+2].try_into().unwrap()) as usize; pos+=2;
+                if pos+4 > data.len() { return Err("trunc single lookup ids".into()); }
+                let lookup_id = u16::from_le_bytes(data[pos..pos+2].try_into().unwrap()); pos+=2;
+                let subtable_pos = u16::from_le_bytes(data[pos..pos+2].try_into().unwrap()); pos+=2;
                 let cov_off = pos;
                 if pos+cov_len*2 > data.len() { return Err("trunc single coverage".into()); }
                 pos+=cov_len*2;
@@ -1205,13 +1271,16 @@ impl GeometryCache {
                 let bytes = cnt*sz*2;
                 if pos+bytes > data.len() { return Err("trunc single values".into()); }
                 pos+=bytes;
-                single_tables.push(SingleIndex { coverage_off: cov_off, coverage_len: cov_len, value_format: vf, is_single, values_off, stride: sz });
+                single_tables.push(SingleIndex { coverage_off: cov_off, coverage_len: cov_len, value_format: vf, is_single, values_off, stride: sz, lookup_id, subtable_pos });
             }
 
             let mut f1_tables = Vec::with_capacity(n_f1);
             for _ in 0..n_f1 {
                 if pos+2 > data.len() { return Err("trunc f1 cov_len".into()); }
                 let cov_len = u16::from_le_bytes(data[pos..pos+2].try_into().unwrap()) as usize; pos+=2;
+                if pos+4 > data.len() { return Err("trunc f1 lookup ids".into()); }
+                let lookup_id = u16::from_le_bytes(data[pos..pos+2].try_into().unwrap()); pos+=2;
+                let subtable_pos = u16::from_le_bytes(data[pos..pos+2].try_into().unwrap()); pos+=2;
                 let cov_off = pos;
                 if pos+cov_len*2 > data.len() { return Err("trunc f1 coverage".into()); }
                 pos+=cov_len*2;
@@ -1231,13 +1300,16 @@ impl GeometryCache {
                     pos+=bytes;
                     pair_sets.push(PairSetIndex { pairs_off, pair_count: pc });
                 }
-                f1_tables.push(Format1Index { coverage_off: cov_off, coverage_len: cov_len, val_fmt1: vf1, val_fmt2: vf2, sz1, sz2, pair_sets });
+                f1_tables.push(Format1Index { coverage_off: cov_off, coverage_len: cov_len, val_fmt1: vf1, val_fmt2: vf2, sz1, sz2, pair_sets, lookup_id, subtable_pos });
             }
 
             let mut f2_tables = Vec::with_capacity(n_f2);
             for _ in 0..n_f2 {
                 if pos+2 > data.len() { return Err("trunc f2 cov_len".into()); }
                 let cov_len = u16::from_le_bytes(data[pos..pos+2].try_into().unwrap()) as usize; pos+=2;
+                if pos+4 > data.len() { return Err("trunc f2 lookup ids".into()); }
+                let lookup_id = u16::from_le_bytes(data[pos..pos+2].try_into().unwrap()); pos+=2;
+                let subtable_pos = u16::from_le_bytes(data[pos..pos+2].try_into().unwrap()); pos+=2;
                 let cov_off = pos;
                 if pos+cov_len*2 > data.len() { return Err("trunc f2 coverage".into()); }
                 pos+=cov_len*2;
@@ -1291,7 +1363,7 @@ impl GeometryCache {
                 let matrix_bytes = c1c*c2c*(sz1+sz2)*2;
                 if pos+matrix_bytes > data.len() { return Err("trunc f2 matrix".into()); }
                 pos+=matrix_bytes;
-                f2_tables.push(Format2Index { coverage_off: cov_off, coverage_len: cov_len, class1_count: c1c, class2_count: c2c, val_fmt1: vf1u, val_fmt2: vf2u, sz1, sz2, class1_def: cd1, class2_def: cd2, matrix_off });
+                f2_tables.push(Format2Index { coverage_off: cov_off, coverage_len: cov_len, class1_count: c1c, class2_count: c2c, val_fmt1: vf1u, val_fmt2: vf2u, sz1, sz2, class1_def: cd1, class2_def: cd2, matrix_off, lookup_id, subtable_pos });
             }
 
             fonts.insert(font_key, FontMmapIndex { file_hash, upem, num_glyphs, glyphs_off, cmap_off, cmap_len, single_tables, format1_tables: f1_tables, format2_tables: f2_tables });
@@ -1359,7 +1431,7 @@ impl GeometryCache {
             let lookup_off = be_u16(data, off_pos)? as usize + lookup_list_off;
             if lookup_off + 6 > data.len() { continue; }
             let lookup_type = be_u16(data, lookup_off)?;
-            // Handle GPOS types 1 Single, 2 Pair, and 9 ExtensionPos (which wraps 1 or 2)
+            // Allow 1=Single, 2=Pair, 9=ExtensionPos (which wraps 1 or 2)
             if lookup_type != 1 && lookup_type != 2 && lookup_type != 9 { continue; }
             let subtable_count = be_u16(data, lookup_off+4)? as usize;
             for si in 0..subtable_count {
@@ -1370,7 +1442,7 @@ impl GeometryCache {
                 let mut inner_type = lookup_type;
                 let mut inner_off = sub_off;
                 if lookup_type == 9 {
-                    // ExtensionPos: Format (u16)=1, ExtensionLookupType (u16), ExtensionOffset (u32)
+                    // ExtensionPos Format 1: Format(u16)=1, ExtensionLookupType(u16), ExtensionOffset(u32)
                     if sub_off + 8 > data.len() { continue; }
                     let ext_fmt = be_u16(data, sub_off)?;
                     if ext_fmt != 1 { continue; }
@@ -1393,7 +1465,7 @@ impl GeometryCache {
                         let coverage = Self::parse_coverage(data, cov_off)?;
                         let (xpl,ypl,xad,yad,_) = Self::parse_value_record(data, inner_off+6, val_fmt_full)?;
                         let val = [xpl,ypl,xad,yad];
-                        single_tables.push(SingleTableOwned { coverage: coverage.clone(), value_format: val_fmt, values: vec![val; coverage.len()], is_single: true });
+                        single_tables.push(SingleTableOwned { coverage: coverage.clone(), value_format: val_fmt, values: vec![val; coverage.len()], is_single: true, lookup_id: li as u16, subtable_pos: si as u16 });
                     } else if fmt == 2 {
                         if inner_off + 8 > data.len() { continue; }
                         let cov_off = be_u16(data, inner_off+2)? as usize + inner_off;
@@ -1410,7 +1482,7 @@ impl GeometryCache {
                             values.push([xpl,ypl,xad,yad]);
                             p += val_size;
                         }
-                        single_tables.push(SingleTableOwned { coverage, value_format: val_fmt, values, is_single: false });
+                        single_tables.push(SingleTableOwned { coverage, value_format: val_fmt, values, is_single: false, lookup_id: li as u16, subtable_pos: si as u16 });
                     }
                 } else if inner_type == 2 {
                     let fmt = be_u16(data, inner_off)?;
@@ -1441,19 +1513,15 @@ impl GeometryCache {
                                 let (xpl2,ypl2,xad2,yad2,_) = Self::parse_value_record(data, rp+2+val1_size, val_fmt2_full)?;
                                 let v1 = [xpl1,ypl1,xad1,yad1];
                                 let v2 = [xpl2,ypl2,xad2,yad2];
-                                // keep even if all zero? keep non-zero to save space, but keep all for correctness
                                 if v1!=[0,0,0,0] || v2!=[0,0,0,0] {
                                     pairs.push((second_gid, v1, v2));
-                                } else {
-                                    // still need to keep zero kern? previous code dropped zero kern, we keep zero as well? To reduce size we can drop pure zero, but then pair search will miss zero (which is fine). Keep drop-zero to save space.
                                 }
                                 rp += rec_size;
                             }
                             pair_sets.push(pairs);
                         }
-                        // pad pair_sets to coverage len if needed (should be equal)
                         while pair_sets.len() < coverage.len() { pair_sets.push(Vec::new()); }
-                        f1_tables.push(Format1TableOwned { coverage, val_fmt1, val_fmt2, pair_sets });
+                        f1_tables.push(Format1TableOwned { coverage, val_fmt1, val_fmt2, pair_sets, lookup_id: li as u16, subtable_pos: si as u16 });
                     } else if fmt == 2 {
                         if inner_off + 16 > data.len() { continue; }
                         let cov_off = be_u16(data, inner_off+2)? as usize + inner_off;
@@ -1468,7 +1536,6 @@ impl GeometryCache {
                         let coverage = Self::parse_coverage(data, cov_off)?;
                         let (cd1, cd1_parse) = Self::parse_class_def_with_raw(data, cd1_off, num_glyphs)?;
                         let (cd2, cd2_parse) = Self::parse_class_def_with_raw(data, cd2_off, num_glyphs)?;
-                        // we need owned versions of class defs for later write
                         let cd1_owned = match cd1_parse {
                             ClassDefParse::Format1{start,classes} => ClassDefOwned::Format1{start,classes},
                             ClassDefParse::Format2{ranges} => ClassDefOwned::Format2{ranges},
@@ -1477,7 +1544,7 @@ impl GeometryCache {
                             ClassDefParse::Format1{start,classes} => ClassDefOwned::Format1{start,classes},
                             ClassDefParse::Format2{ranges} => ClassDefOwned::Format2{ranges},
                         };
-                        let _ = (cd1, cd2); // keep for count
+                        let _ = (cd1, cd2);
                         let val1_size = Self::value_format_size(val_fmt1_full);
                         let val2_size = Self::value_format_size(val_fmt2_full);
                         let rec_size = val1_size + val2_size;
@@ -1490,7 +1557,7 @@ impl GeometryCache {
                             matrix.push(([xpl1,ypl1,xad1,yad1],[xpl2,ypl2,xad2,yad2]));
                             p += rec_size;
                         }
-                        f2_tables.push(Format2TableOwned { coverage, class_def1: cd1_owned, class_def2: cd2_owned, class1_count: c1_count, class2_count: c2_count, val_fmt1, val_fmt2, matrix });
+                        f2_tables.push(Format2TableOwned { coverage, class_def1: cd1_owned, class_def2: cd2_owned, class1_count: c1_count, class2_count: c2_count, val_fmt1, val_fmt2, matrix, lookup_id: li as u16, subtable_pos: si as u16 });
                     }
                 }
             }
