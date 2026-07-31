@@ -368,7 +368,7 @@ pub fn match_lines(
             );
 
             // ── Score ligature path (if present) ─────────────────
-            let scoring_lig = if let Some(ref lig_segs) = line_crops.lig_word_segs {
+            let mut scoring_lig = if let Some(ref lig_segs) = line_crops.lig_word_segs {
                 let (lig_windows, lig_pm, wib_lig_tmp) = crate::ngram::build_scoring_windows_with_geo(
                     lig_segs,
                     &mut crop_store_lig,
@@ -397,48 +397,43 @@ pub fn match_lines(
                 .unwrap_or(f32::MIN);
             let use_lig = scoring_lig.is_some() && lig_top > plain_top;
 
-            let scoring = if use_lig {
-                scoring_lig.as_ref().unwrap()
+            // Optimized: move owned Vecs instead of cloning Strings per score.
+            // No String clone per font; ownership is transferred via into_iter().
+            if use_lig {
+                let lig_res = scoring_lig.take().unwrap();
+                let plain_res = scoring_plain;
+                font_scores = lig_res.scores.into_iter().map(|(k, s)| (k, Some(s))).collect();
+                observations = lig_res.observations;
+                font_scores_lig = plain_res.scores.into_iter().map(|(k, s)| (k, Some(s))).collect();
+                observations_lig = plain_res.observations;
+                seg_winner = Some("ligature".to_string());
             } else {
-                &scoring_plain
-            };
-
-            // Store both paths for audit
-            font_scores = scoring.scores.iter()
-                .map(|(fk, score)| (fk.clone(), Some(*score))).collect();
-            observations = scoring.observations.clone();
-
-            // Store the alternate path for audit
-            let (scores_lig_audit, obs_lig_audit) = if let Some(ref lig_result) = scoring_lig {
-                (lig_result.scores.iter().map(|(fk, s)| (fk.clone(), Some(*s))).collect::<Vec<_>>(),
-                 lig_result.observations.clone())
-            } else {
-                (Vec::new(), Vec::new())
-            };
-            let (scores_plain_audit, obs_plain_audit) = (
-                scoring_plain.scores.iter().map(|(fk, s)| (fk.clone(), Some(*s))).collect::<Vec<_>>(),
-                scoring_plain.observations.clone(),
-            );
-
-            // Store both in the LineMatch for audit output
-            font_scores_lig = if use_lig { scores_plain_audit } else { scores_lig_audit };
-            observations_lig = if use_lig { obs_plain_audit } else { obs_lig_audit };
-            seg_winner = if scoring_lig.is_some() {
-                Some(if use_lig { "ligature".to_string() } else { "plain".to_string() })
-            } else {
-                None
-            };
+                let plain_res = scoring_plain;
+                let lig_opt = scoring_lig.take();
+                font_scores = plain_res.scores.into_iter().map(|(k, s)| (k, Some(s))).collect();
+                observations = plain_res.observations;
+                if let Some(lig_res) = lig_opt {
+                    font_scores_lig = lig_res.scores.into_iter().map(|(k, s)| (k, Some(s))).collect();
+                    observations_lig = lig_res.observations;
+                    seg_winner = Some("plain".to_string());
+                } else {
+                    font_scores_lig = Vec::new();
+                    observations_lig = Vec::new();
+                    seg_winner = None;
+                }
+            }
 
 
             // Crop PNGs saved after font matching (see below).
 
             // ── Font selection: font #1, with SSIM tie-break ───────
             let mut tie_candidates_audit: Vec<audit::TieCandidate> = Vec::new();
-            if let Some((ref _top_key, top_score)) = scoring.scores.first() {
-                let top_score = *top_score;
-                // Collect all candidates that share the top font score
-                let tied: Vec<&(String, f32)> = scoring.scores.iter()
-                    .take_while(|(_, s)| *s == top_score)
+            if let Some((ref _top_key, Some(top_score_opt))) = font_scores.first() {
+                let top_score = *top_score_opt;
+                // Collect all candidates that share the top font score (now from font_scores, no clone)
+                let tied: Vec<&String> = font_scores.iter()
+                    .take_while(|(_, os)| os.map_or(false, |s| s == top_score))
+                    .map(|(k, _)| k)
                     .collect();
 
                 if tied.len() >= 2 {
@@ -447,7 +442,7 @@ pub fn match_lines(
                     let mut log_parts: Vec<String> = Vec::new();
                     let mut tie_sim_results: Vec<(String, String, f32)> = Vec::new();
                     let mut ti = 0usize;
-                    for (font_key, _) in tied.iter().map(|&&(ref fk, s)| (fk, s)) {
+                    for font_key in tied.iter() {
                         let fe = match font_registry.by_key(font_key) {
                             Some(fe) => fe,
                             None => continue,
@@ -503,8 +498,9 @@ pub fn match_lines(
                     }
                     (best.map(|(fm, _)| fm), tie_candidates_audit, gt_font_key)
                 } else {
-                    // No tie — use font #1 directly, font_key already resolved
-                    let (ref font_key, score) = *tied[0];
+                    // No tie — use font #1 directly, font_key already resolved (perf: tied is &String, no clone)
+                    let font_key = tied[0];
+                    let score = top_score;
                     let fm = font_registry.by_key(font_key)
                         .map(|fe| font_match::FontMatchResult {
                             font_name: fe.font_key(),

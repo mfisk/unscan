@@ -472,9 +472,10 @@ fn segment_characters_inner(
         // Pixels at or beyond these paths are unusable in the DP.
         // left_path[r] = seam col; pixels with col <= left_path[r] are masked.
         // right_path[r] = seam col; pixels with col >= right_path[r] are masked.
+        // Perf: store as Arc to make clone cheap (atomic inc vs Vec copy O(h)).
         struct SegBounds {
-            left_path: Option<Vec<[u32; 2]>>,
-            right_path: Option<Vec<[u32; 2]>>,
+            left_path: Option<std::sync::Arc<Vec<[u32; 2]>>>,
+            right_path: Option<std::sync::Arc<Vec<[u32; 2]>>>,
         }
         let mut seg_bounds: std::collections::HashMap<u32, SegBounds> = std::collections::HashMap::new();
         let mut next_seg_id: u32 = 0;
@@ -542,7 +543,7 @@ fn segment_characters_inner(
                         let parent_bounds = seg_bounds.get(&entry.seg_id);
                         let lp = parent_bounds.and_then(|b| b.left_path.clone());
                         let rp = parent_bounds.and_then(|b| b.right_path.clone());
-                        let (cands, dp) = candidate_seams(&energy, w_us, entry.seg_start, new_end, h, lp.as_deref(), rp.as_deref(), max_ink, &row_ink);
+                        let (cands, dp) = candidate_seams(&energy, w_us, entry.seg_start, new_end, h, lp.as_ref().map(|a| a.as_slice()), rp.as_ref().map(|a| a.as_slice()), max_ink, &row_ink);
                         for (col, cost) in &cands {
                             heap.push(SeamEntry { cost: *cost + segment_penalty(entry.seg_start, new_end, *col, *cost), col: *col, seg_start: entry.seg_start, seg_end: new_end, seg_id: sid });
                         }
@@ -560,7 +561,7 @@ fn segment_characters_inner(
                         let parent_bounds = seg_bounds.get(&entry.seg_id);
                         let lp = parent_bounds.and_then(|b| b.left_path.clone());
                         let rp = parent_bounds.and_then(|b| b.right_path.clone());
-                        let (cands, dp) = candidate_seams(&energy, w_us, new_start, entry.seg_end, h, lp.as_deref(), rp.as_deref(), max_ink, &row_ink);
+                        let (cands, dp) = candidate_seams(&energy, w_us, new_start, entry.seg_end, h, lp.as_ref().map(|a| a.as_slice()), rp.as_ref().map(|a| a.as_slice()), max_ink, &row_ink);
                         for (col, cost) in &cands {
                             heap.push(SeamEntry { cost: *cost + segment_penalty(new_start, entry.seg_end, *col, *cost), col: *col, seg_start: new_start, seg_end: entry.seg_end, seg_id: sid });
                         }
@@ -661,12 +662,14 @@ fn segment_characters_inner(
                 total: entry.cost,
             });
 
-            // Capture parent's diagonal bounds before removing.
+            // Capture parent's diagonal bounds before removing (Arc clone = cheap).
             let parent_lp = seg_bounds.get(&entry.seg_id).and_then(|b| b.left_path.clone());
             let parent_rp = seg_bounds.get(&entry.seg_id).and_then(|b| b.right_path.clone());
 
-            // Insert seam path into map (clone once, then move original into right child to save one clone)
-            seam_paths.insert(final_col, path.clone());
+            // Perf: wrap path in Arc once (moves Vec, no clone), then Arc clones for bounds.
+            // seam_paths map stores Vec for external API compat — clone once from Arc (1 Vec copy vs 2 before).
+            let arc_path = std::sync::Arc::new(path);
+            seam_paths.insert(final_col, (*arc_path).clone());
 
             // Mark old segment as dead — stale entries skipped on pop.
             let old_sid = entry.seg_id;
@@ -687,8 +690,8 @@ fn segment_characters_inner(
                 if child_left_end > child_left_start + 2 {
                     let sid = next_seg_id; next_seg_id += 1;
                     let lp = parent_lp.clone();
-                    let rp: Option<Vec<[u32; 2]>> = Some(path.clone());
-                    let (mut cands, dp) = candidate_seams(&energy, w_us, child_left_start, child_left_end, h, lp.as_deref(), rp.as_deref(), max_ink, &row_ink);
+                    let rp: Option<std::sync::Arc<Vec<[u32; 2]>>> = Some(std::sync::Arc::clone(&arc_path));
+                    let (mut cands, dp) = candidate_seams(&energy, w_us, child_left_start, child_left_end, h, lp.as_ref().map(|a| a.as_slice()), rp.as_ref().map(|a| a.as_slice()), max_ink, &row_ink);
                     for (col, cost) in &cands {
                         heap.push(SeamEntry { cost: *cost + segment_penalty(child_left_start, child_left_end, *col, *cost), col: *col, seg_start: child_left_start, seg_end: child_left_end, seg_id: sid });
                     }
@@ -703,9 +706,9 @@ fn segment_characters_inner(
             {
                 if child_right_end > child_right_start + 2 {
                     let sid = next_seg_id; next_seg_id += 1;
-                    let lp: Option<Vec<[u32; 2]>> = Some(path);
+                    let lp: Option<std::sync::Arc<Vec<[u32; 2]>>> = Some(arc_path);
                     let rp = parent_rp.clone();
-                    let (mut cands, dp) = candidate_seams(&energy, w_us, child_right_start, child_right_end, h, lp.as_deref(), rp.as_deref(), max_ink, &row_ink);
+                    let (mut cands, dp) = candidate_seams(&energy, w_us, child_right_start, child_right_end, h, lp.as_ref().map(|a| a.as_slice()), rp.as_ref().map(|a| a.as_slice()), max_ink, &row_ink);
                     for (col, cost) in &cands {
                         heap.push(SeamEntry { cost: *cost + segment_penalty(child_right_start, child_right_end, *col, *cost), col: *col, seg_start: child_right_start, seg_end: child_right_end, seg_id: sid });
                     }

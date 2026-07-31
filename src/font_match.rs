@@ -354,7 +354,7 @@ pub fn identify_fonts(
     // Keep at least MIN_KEEP best pruned fonts by min_ll to stabilize per-position best
     const MIN_KEEP: usize = 10;
     if kept_candidates.len() < MIN_KEEP && !pruned_with_ll.is_empty() {
-        pruned_with_ll.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
+        pruned_with_ll.sort_unstable_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
         let need = MIN_KEEP.saturating_sub(kept_candidates.len());
         for (fk, _ll) in pruned_with_ll.iter().take(need) {
             kept_candidates.push(fk.clone());
@@ -447,8 +447,8 @@ pub fn identify_fonts(
         })
         .collect();
 
-    // Sort descending (higher = better = closer match).
-    scores.sort_by(|a, b| {
+    // Sort descending (higher = better = closer match). Unstable sort: equal-score order irrelevant.
+    scores.sort_unstable_by(|a, b| {
         b.1.partial_cmp(&a.1)
             .unwrap_or(std::cmp::Ordering::Equal)
     });

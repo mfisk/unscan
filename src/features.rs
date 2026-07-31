@@ -80,11 +80,19 @@ impl AaVariant {
 /// Binarize a greyscale image at the given threshold.
 /// Pixels with value < threshold → 0 (black ink), >= threshold → 255 (white).
 pub fn binarize(img: &image::GrayImage, threshold: u8) -> image::GrayImage {
-    let mut out = img.clone();
-    for p in out.pixels_mut() {
-        p.0[0] = if p.0[0] < threshold { 0 } else { 255 };
+    binarize_inplace(img.clone(), threshold)
+}
+
+/// Binarize in place without an extra clone.
+/// Takes ownership and mutates the buffer directly — saves one GrayImage clone
+/// per char when the caller already owns the image (common path in char_render).
+pub fn binarize_inplace(mut img: image::GrayImage, threshold: u8) -> image::GrayImage {
+    // Raw-buffer loop: avoid iterator overhead and Luma wrapper per pixel.
+    let raw = img.as_mut();
+    for px in raw.iter_mut() {
+        *px = if *px < threshold { 0 } else { 255 };
     }
-    out
+    img
 }
 
 /// Number of horizontal crossing scan lines.
