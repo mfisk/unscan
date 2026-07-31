@@ -125,19 +125,20 @@ def main():
 
     font_face_css = build_font_face_css(font_face_entries)
 
-    # Single-page large-gap: 80pt blank p resets Tesseract without multi-page drift.
-    # For 11-line set with many spaces (IBM line), page-level Word gap stats bleed
-    # across blocks causing alphabet j/k split. Use explicit page breaks to force
-    # per-page layout analysis reset.
-    LARGE_GAP = '<div style="height:120pt; page-break-after: always;"></div>'
+    # Single-page large-gap: 120pt blank div resets Tesseract line grouping
+    # without multi-page drift. Keeping p1+p2 on same page preserves fox line's
+    # word-gap statistics, which raises Tesseract's word-gap threshold and
+    # prevents alphabet j/k split (abcdefghij / klmn...). Page-break isolation
+    # makes p1 gap stats too small, causing alphabet to split.
+    LARGE_GAP = '<div style="height:120pt;"></div>'
     lines_html = []
     for idx, (text, canonical_name, ttf_path, css_weight, css_style) in enumerate(lines):
         stripped = text.rstrip('.').strip()
         is_alpha = stripped in ("abcdefghijklmnopqrstuvwxyz", "ABCDEFGHIJKLMNOPQRSTUVWXYZ")
         pt = 9 if is_alpha else 10
-        if idx > 0 and idx % 8 == 0:
-            lines_html.append(LARGE_GAP)
-        elif idx == len(lines) - 1 and len(lines) > 8 and len(lines) % 8 != 1:
+        # Keep first 10 lines (8 + 2) together to share word-gap stats and prevent
+        # alphabet j/k split. Only isolate the final Matthew Carter line.
+        if idx == len(lines) - 1 and len(lines) > 8:
             lines_html.append(LARGE_GAP)
         lines_html.append(
             f'<p style="font-family: \'{canonical_name}\'; '
