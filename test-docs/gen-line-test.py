@@ -146,6 +146,9 @@ def main():
             f'font-size: {pt}pt; white-space: nowrap; margin:0; padding:0;">'
             f'{_escape(text)}</p>'
         )
+        # hrule between each line for visual separation / tesseract line isolation
+        if idx < len(lines) - 1:
+            lines_html.append('<hr style="border:none; border-top:0.5pt solid #999; margin:14pt 0; height:0;" />')
 
     all_lines = "\n".join(lines_html)
 
@@ -161,12 +164,13 @@ def main():
 }}
 body {{
   font-size: 9pt;
-  line-height: 1.2;
+  line-height: 2.0;
   color: black;
 }}
 p {{
   margin: 0;
   padding: 0;
+  line-height: 2.0;
 }}
 </style>
 </head>

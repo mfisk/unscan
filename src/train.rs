@@ -651,14 +651,61 @@ pub fn run_train(mut args: TrainArgs) {
     eprintln!("Learning rate: {}", args.lr);
     eprintln!("Margin: {}", args.margin);
 
-    // ── 1. Scan fonts ─────────────────────────────────────────────
+    // ── 1. Scan fonts (base + vintage, matching runtime load_fonts) ──
+    // Runtime load_fonts adds vintage variants from msttcorefonts via
+    // ensure_vintage_fonts. Training must include the same set, otherwise
+    // catalog_hash (base only) != catalog.bin (base+vintage) and LDA
+    // weights are considered stale forever → infinite retrain loop.
     let font_dirs: Vec<PathBuf> = font_scan::default_font_dirs(&args.font_dir);
 
     let mut catalog = font_scan::scan_fonts(&font_dirs, false);
+    let base_count = catalog.len();
+
+    // Generate / reuse vintage fonts exactly like main::load_fonts
+    let vintage_eras = crate::vintage_cache::DEFAULT_ERAS;
+    let vintage_paths = {
+        let mstt_dir = std::path::PathBuf::from("/usr/share/fonts/truetype/msttcorefonts");
+        let mstt_bases = if mstt_dir.exists() {
+            font_scan::scan_fonts_uncached(&[mstt_dir])
+        } else {
+            Vec::new()
+        };
+        crate::vintage_cache::ensure_vintage_fonts(&mstt_bases, vintage_eras)
+    };
+    let alias_table = font_scan::build_alias_table();
+    let mut vintage_entries: Vec<crate::font_scan::FontEntry> = Vec::with_capacity(vintage_paths.len());
+    for vp in &vintage_paths {
+        let fname = vp.file_name().and_then(|n| n.to_str()).unwrap_or("");
+        let mut found_era = None;
+        for &era in vintage_eras {
+            if fname.contains(era.name()) { found_era = Some(era); break; }
+        }
+        if found_era.is_none() {
+            for &era in crate::vintage_cache::ALL_ERAS {
+                if fname.contains(era.name()) { found_era = Some(era); break; }
+            }
+        }
+        let era = found_era.unwrap_or(crate::vintage_cache::Era::PostScript);
+        if let Some(mut fe) = font_scan::load_font_entry(vp, &alias_table) {
+            let era_tag = era.name().to_string();
+            fe.vintage_era = Some(era_tag.clone());
+            if !fe.family_name.to_lowercase().contains(&era_tag) {
+                fe.family_name = format!("{} [{}]", fe.family_name, era.name());
+            }
+            fe.data = Vec::new();
+            fe.recompute_font_key_cache();
+            vintage_entries.push(fe);
+        }
+    }
+    if !vintage_entries.is_empty() {
+        eprintln!("[vintage] loaded {} vintage variants into training catalog ({} total with base)", vintage_entries.len(), base_count + vintage_entries.len());
+    }
+    catalog.extend(vintage_entries);
+
     // Sort by font_key for deterministic font_id assignment, matching
     // FontRegistry::new() ordering so runtime and training agree.
     catalog.sort_by(|a, b| a.font_key().cmp(&b.font_key()));
-    eprintln!("  {} font entries found", catalog.len());
+    eprintln!("  {} font entries found (base {} + vintage {})", catalog.len(), base_count, catalog.len() - base_count);
 
     if args.max_fonts > 0 && catalog.len() > args.max_fonts {
         catalog.truncate(args.max_fonts);
@@ -1586,7 +1633,11 @@ impl RuntimeTrainingData {
             .collect();
         catalog.sort_by(|a, b| a.font_key().cmp(&b.font_key()));
 
-        let catalog_hash = glyph_map.catalog_hash;
+        // FIX: use registry hash, not glyph_map hash. glyph_map may be stale
+        // during incremental updates (set_catalog_hash lags) and caused
+        // training to emit LDA weights with a hash that never matches
+        // catalog.bin → infinite stale→retrain loop.
+        let catalog_hash = font_registry.catalog_hash();
 
         // Build font_id_map and family info
         let font_id_map: HashMap<String, u32> = catalog.iter().enumerate()

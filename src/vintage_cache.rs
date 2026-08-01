@@ -662,31 +662,33 @@ fn sanitize_family(family: &str) -> String {
     }
 }
 
-/// Hash base path + era + file len/mtime for cache key stability.
-fn hash_base_era(base_path: &Path, era: Era, metadata_hint: Option<(u64, u64)>) -> u64 {
+/// Hash base identity + era for cache key stability.
+/// Previously hashed base_path string + mtime/len, which caused duplicate
+/// msttcorefonts files (Arial.TTF vs Arial.ttf vs symlink arial.ttf) to produce
+/// different cache filenames for the same logical font, leading to 301 duplicate
+/// font_keys and geo-cache Wrote 2748 vs 3049. Now hashes logical identity
+/// (postscript_name + variant_tag) so same font maps to same cache file.
+fn hash_base_era(base: &FontEntry, era: Era) -> u64 {
     let mut hasher = DefaultHasher::new();
-    base_path.to_string_lossy().hash(&mut hasher);
+    base.postscript_name.hash(&mut hasher);
+    base.variant_tag.hash(&mut hasher);
+    // vintage_era on base should be None (base is not vintage), but include for completeness
+    if let Some(ref ve) = base.vintage_era {
+        ve.hash(&mut hasher);
+    }
     era.name().hash(&mut hasher);
     era.start_year().hash(&mut hasher);
-    if let Some((len, mtime)) = metadata_hint {
-        len.hash(&mut hasher);
-        mtime.hash(&mut hasher);
-    }
     hasher.finish()
 }
 
 /// Full cache path for a given base font and era.
 /// New naming uses readable slugs: e.g. `arial-word6-a1b2c3...ttf` not `arial-word6_1993-...`
-/// Old files with year-suffixed slugs (`ps1985`, `word6_1993`) are orphaned intentionally.
+/// Old files with year-suffixed slugs (`ps1985`, `word6_1993`) or path-hashed names are orphaned intentionally;
+/// they will be left on disk and ignored after dedup, and can be GC'd separately.
 pub fn vintage_cache_path(base: &FontEntry, era: Era) -> PathBuf {
     let dir = vintage_cache_dir();
     let fam = sanitize_family(&base.family_name);
-    let meta = std::fs::metadata(&base.path).ok().and_then(|m| {
-        let len = m.len();
-        let mtime = m.modified().ok().and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok()).map(|d| d.as_secs()).unwrap_or(0);
-        Some((len, mtime))
-    });
-    let h = hash_base_era(&base.path, era, meta);
+    let h = hash_base_era(base, era);
     dir.join(format!("{}-{}-{:016x}.ttf", fam, era.name(), h))
 }
 
@@ -969,9 +971,24 @@ pub fn ensure_vintage_fonts(base_fonts: &[FontEntry], eras: &[Era]) -> Vec<PathB
         return Vec::new();
     }
 
+    // Deduplicate base_fonts by logical identity before generating vintage.
+    // /usr/share/fonts/truetype/msttcorefonts contains duplicate files like
+    // Arial.TTF + Arial.ttf + symlink arial.ttf -> Arial.ttf which would otherwise
+    // generate 2-3 vintage cache files with different path-hashed names but identical font_key,
+    // leading to 301 duplicate keys and geo-cache Wrote 2748 vs 3049 mismatch.
+    let mut seen_base_keys: std::collections::HashSet<String> = std::collections::HashSet::new();
+    let mut deduped_bases: Vec<&FontEntry> = Vec::with_capacity(base_fonts.len());
+    for b in base_fonts {
+        // Use font_key as canonical identity (PostScript name + variant)
+        if seen_base_keys.insert(b.font_key()) {
+            deduped_bases.push(b);
+        }
+    }
+    let base_fonts_deduped = deduped_bases;
+
     // Debug: count proprietary originals
-    let mstt_total = base_fonts.iter().filter(|b| b.path.to_string_lossy().to_ascii_lowercase().contains("msttcorefonts")).count();
-    eprintln!("[vintage] debug: scanned_bases={} msttcore_candidates={}", base_fonts.len(), mstt_total);
+    let mstt_total = base_fonts_deduped.iter().filter(|b| b.path.to_string_lossy().to_ascii_lowercase().contains("msttcorefonts")).count();
+    eprintln!("[vintage] debug: scanned_bases={} (deduped from {}) msttcore_candidates={}", base_fonts_deduped.len(), base_fonts.len(), mstt_total);
 
     let mut generated: Vec<PathBuf> = Vec::new();
     let mut skipped_unknown = 0usize;
@@ -983,7 +1000,7 @@ pub fn ensure_vintage_fonts(base_fonts: &[FontEntry], eras: &[Era]) -> Vec<PathB
     // Avoid generating vintage from vintage (prevent recursion)
     let dir_canon = dir.canonicalize().unwrap_or(dir.clone());
 
-    for base in base_fonts {
+    for &base in &base_fonts_deduped {
         // Skip if base is already inside vintage cache dir
         if base.path.starts_with(&dir_canon) || base.path.to_string_lossy().contains("/vintage/") {
             continue;
@@ -1068,8 +1085,8 @@ pub fn ensure_vintage_fonts(base_fonts: &[FontEntry], eras: &[Era]) -> Vec<PathB
         }
     }
 
-    eprintln!("[vintage] summary: created={} reused={} skipped_unknown={} skipped_too_new={} skipped_not_shipped={} total_cached={} scanned_bases={}",
-        created, reused, skipped_unknown, skipped_too_new, skipped_not_shipped, generated.len(), base_fonts.len());
+    eprintln!("[vintage] summary: created={} reused={} skipped_unknown={} skipped_too_new={} skipped_not_shipped={} total_cached={} scanned_bases={} (deduped from {})",
+        created, reused, skipped_unknown, skipped_too_new, skipped_not_shipped, generated.len(), base_fonts_deduped.len(), base_fonts.len());
 
     generated
 }

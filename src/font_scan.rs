@@ -164,6 +164,20 @@ pub struct FontRegistry {
 
 impl FontRegistry {
     pub fn new(mut entries: Vec<FontEntry>) -> Self {
+        // Deduplicate by font_key to guarantee registry contains unique keys.
+        // Callers may assemble entries from multiple sources (base + vintage) where
+        // duplicate msttcorefonts paths (Arial.TTF vs Arial.ttf) produce identical
+        // font_keys. Without dedup, iter().count() != owned_fonts.len() and geo-cache
+        // reports Wrote < total.
+        {
+            use std::collections::HashSet;
+            let mut seen: HashSet<String> = HashSet::with_capacity(entries.len());
+            let before = entries.len();
+            entries.retain(|e| seen.insert(e.font_key()));
+            if before != entries.len() {
+                eprintln!("[scan] FontRegistry deduped {} -> {} entries by font_key", before, entries.len());
+            }
+        }
         // Sort by font_key for deterministic ordering and stable font_ids.
         entries.sort_by(|a, b| a.font_key_ref().cmp(b.font_key_ref()));
         let by_key = entries.iter().enumerate()

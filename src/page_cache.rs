@@ -67,15 +67,25 @@ fn save_source_meta(cache_dir: &Path, meta: &SourceMeta) {
 /// Build a cache key string from input file metadata + DPI.
 /// The key is stable across runs for the same file path + size + DPI;
 /// staleness is checked separately via `is_cache_stale`.
+/// Fix 2026-08-01: include content hash, not just size, because gen-line-test
+/// 10-line and 11-line PDFs both compress to 85356 bytes, causing same key
+/// and stale OCR reuse when mtime granularity misses the overwrite.
+/// Hash is cheap (85KB) and makes key unique per content.
 pub fn cache_key(path: &Path, dpi: u32) -> Option<String> {
     let file_name = path.file_name()?.to_string_lossy();
-    let meta = std::fs::metadata(path).ok()?;
-    let size = meta.len();
+    let content = std::fs::read(path).ok()?;
+    let size = content.len() as u64;
+    // Fast content hash: DefaultHasher (SipHash) of file bytes
+    use std::hash::{Hash, Hasher};
+    let mut hasher = std::collections::hash_map::DefaultHasher::new();
+    content.hash(&mut hasher);
+    let content_hash = hasher.finish();
+    // Sanitize filename: replace anything that isn't alphanumeric, dot, or hyphen
     let safe_name: String = file_name
         .chars()
-        .map(|c| if c.is_alphanumeric() || c == '.' || c == '-' { c } else { '_' })
+        .map(|c| if c.is_alphanumeric() || c == '.' || c == '-' { c } else { '_' } )
         .collect();
-    Some(format!("{}-{}-{}dpi", safe_name, size, dpi))
+    Some(format!("{}-{}-{:016x}-{}dpi", safe_name, size, content_hash, dpi))
 }
 
 /// Return true if the source file is newer / different size than the cached

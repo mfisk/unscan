@@ -203,6 +203,21 @@ fn load_fonts(args: &cli::Args, _classifier: &mut dyn classifier::Classifier) ->
     let mut all_entries = base_entries;
     all_entries.extend(vintage_entries);
 
+    // Deduplicate by font_key to eliminate duplicate vintage files created from
+    // duplicate msttcorefonts paths (Arial.TTF vs Arial.ttf). Without this,
+    // FontRegistry contains duplicate keys, owned_fonts HashMap overwrites them,
+    // and geo-cache reports Wrote N < total.
+    {
+        use std::collections::HashSet;
+        let mut seen: HashSet<String> = HashSet::with_capacity(all_entries.len());
+        let before = all_entries.len();
+        all_entries.retain(|e| seen.insert(e.font_key()));
+        let after = all_entries.len();
+        if before != after {
+            eprintln!("[vintage] deduped all_entries {} -> {} (removed {} duplicate keys)", before, after, before - after);
+        }
+    }
+
     let registry = font_scan::FontRegistry::new(all_entries);
 
     // Write catalog.bin so classifier loaders can validate against it.
