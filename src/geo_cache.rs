@@ -37,9 +37,10 @@ use std::collections::{BTreeMap, HashMap, HashSet};
 use std::path::{Path, PathBuf};
 
 const BGEO_MAGIC: &[u8; 4] = b"BGEO";
-// Bump to 13 to invalidate caches after extension + lookup-aware fix.
-// v11 was extension handling, v12 was lookup-aware without extension, v13 merges both.
-const BGEO_VERSION: u32 = 13;
+// Bump to 15 to invalidate caches after correctly handling case/cpsp as conditional features.
+// v14 excluded case/cpsp entirely, which fixed non-caps gt_geo_v_err but lost correctness for all-caps.
+// v15 stores case/cpsp separately and applies them only in all-caps context.
+const BGEO_VERSION: u32 = 15;
 
 // ---------- BE helpers for OT parsing ----------
 #[inline]
@@ -196,6 +197,9 @@ struct OwnedFont {
     single_tables: Vec<SingleTableOwned>,
     format1_tables: Vec<Format1TableOwned>,
     format2_tables: Vec<Format2TableOwned>,
+    case_single_tables: Vec<SingleTableOwned>,
+    case_format1_tables: Vec<Format1TableOwned>,
+    case_format2_tables: Vec<Format2TableOwned>,
 }
 
 // ---------- Mmap index (runtime) ----------
@@ -267,6 +271,9 @@ struct FontMmapIndex {
     single_tables: Vec<SingleIndex>,
     format1_tables: Vec<Format1Index>,
     format2_tables: Vec<Format2Index>,
+    case_single_tables: Vec<SingleIndex>,
+    case_format1_tables: Vec<Format1Index>,
+    case_format2_tables: Vec<Format2Index>,
 }
 
 // ---------- Backward compat parse structs for test_gpos ----------
@@ -497,6 +504,133 @@ impl GeometryCache {
         (v1_acc, v2_acc)
     }
 
+    // ── v15 case/cpsp conditional application ──
+    // OpenType `case` : shifts punctuation/symbols to align with caps when the run is all caps / caps+figures / punct between caps.
+    // `cpsp` (capital spacing) is similar: extra spacing for all-caps runs.
+    // Correctness requires we keep base tables clean and apply case deltas only when the context is all-caps.
+    #[inline]
+    fn is_all_caps_context(chars: &[char]) -> bool {
+        // No lowercase letters anywhere, at least one uppercase letter.
+        // Digits, punctuation, symbols, whitespace are neutral and allowed between caps.
+        let mut has_upper = false;
+        for &ch in chars {
+            if ch.is_lowercase() {
+                return false;
+            }
+            if ch.is_uppercase() {
+                has_upper = true;
+            }
+            // titlecase counts as cased upper for caps context
+            // Unicode doesn't have is_titlecase in std, check via to_uppercase != to_lowercase heuristics is overkill;
+            // treat Other Letter with uppercase property via is_uppercase already covered.
+        }
+        has_upper
+    }
+
+    fn case_single_adjustment_full(&self, f: &FontMmapIndex, gid: u16) -> [i32;4] {
+        let d = self.data();
+        let mut acc = [0i32;4];
+        let mut seen_lookups: HashSet<u16> = HashSet::new();
+        let mut tables: Vec<&SingleIndex> = f.case_single_tables.iter().collect();
+        tables.sort_by_key(|t| (t.lookup_id, t.subtable_pos));
+        for tbl in tables {
+            if seen_lookups.contains(&tbl.lookup_id) { continue; }
+            let idx_opt = if tbl.is_single {
+                if self.coverage_contains(tbl.coverage_off, tbl.coverage_len, gid).is_none() { continue; }
+                Some(0usize)
+            } else {
+                self.coverage_contains(tbl.coverage_off, tbl.coverage_len, gid)
+            };
+            let idx = match idx_opt { Some(i)=>i, None=>continue };
+            let vf = tbl.value_format;
+            let sz = tbl.stride;
+            let off = tbl.values_off + idx*sz*2;
+            if off + sz*2 > d.len() { continue; }
+            let mut p = off;
+            if vf & 0x0001 != 0 { acc[0] += le_i16_at(d,p) as i32; p+=2; }
+            if vf & 0x0002 != 0 { acc[1] += le_i16_at(d,p) as i32; p+=2; }
+            if vf & 0x0004 != 0 { acc[2] += le_i16_at(d,p) as i32; p+=2; }
+            if vf & 0x0008 != 0 { acc[3] += le_i16_at(d,p) as i32; }
+            seen_lookups.insert(tbl.lookup_id);
+        }
+        acc
+    }
+
+    fn case_pair_adjustment_full(&self, f: &FontMmapIndex, gid1: u16, gid2: u16) -> ([i32;4],[i32;4]) {
+        let d = self.data();
+        let mut v1_acc = [0i32;4];
+        let mut v2_acc = [0i32;4];
+        let mut by_lookup: BTreeMap<u16, Vec<(u16, PairSubtableRef<'_>)>> = BTreeMap::new();
+        for tbl in &f.case_format1_tables {
+            by_lookup.entry(tbl.lookup_id).or_default().push((tbl.subtable_pos, PairSubtableRef::F1(tbl)));
+        }
+        for tbl in &f.case_format2_tables {
+            by_lookup.entry(tbl.lookup_id).or_default().push((tbl.subtable_pos, PairSubtableRef::F2(tbl)));
+        }
+        for (_lookup_id, mut cands) in by_lookup {
+            cands.sort_by_key(|(pos, _)| *pos);
+            for (_pos, cand) in cands {
+                match cand {
+                    PairSubtableRef::F1(tbl) => {
+                        let cov_idx = match self.coverage_contains(tbl.coverage_off, tbl.coverage_len, gid1) {
+                            Some(i)=>i, None=>continue,
+                        };
+                        let ps = &tbl.pair_sets[cov_idx];
+                        let mut lo = 0usize;
+                        let mut hi = ps.pair_count;
+                        let mut found_off: Option<usize> = None;
+                        while lo < hi {
+                            let mid = (lo+hi)/2;
+                            let rec_size = 2 + tbl.sz1*2 + tbl.sz2*2;
+                            let off = ps.pairs_off + mid*rec_size;
+                            if off+2 > d.len() { break; }
+                            let sg = le_u16_at(d, off);
+                            if sg < gid2 { lo = mid+1; }
+                            else if sg > gid2 { hi = mid; }
+                            else { found_off = Some(off); break; }
+                        }
+                        let off = match found_off { Some(o)=>o, None=>continue };
+                        let mut p = off + 2;
+                        let vf1 = tbl.val_fmt1;
+                        if vf1 & 0x0001 != 0 { v1_acc[0] += le_i16_at(d,p) as i32; p+=2; }
+                        if vf1 & 0x0002 != 0 { v1_acc[1] += le_i16_at(d,p) as i32; p+=2; }
+                        if vf1 & 0x0004 != 0 { v1_acc[2] += le_i16_at(d,p) as i32; p+=2; }
+                        if vf1 & 0x0008 != 0 { v1_acc[3] += le_i16_at(d,p) as i32; p+=2; }
+                        let vf2 = tbl.val_fmt2;
+                        if vf2 & 0x0001 != 0 { v2_acc[0] += le_i16_at(d,p) as i32; p+=2; }
+                        if vf2 & 0x0002 != 0 { v2_acc[1] += le_i16_at(d,p) as i32; p+=2; }
+                        if vf2 & 0x0004 != 0 { v2_acc[2] += le_i16_at(d,p) as i32; p+=2; }
+                        if vf2 & 0x0008 != 0 { v2_acc[3] += le_i16_at(d,p) as i32; }
+                        break;
+                    }
+                    PairSubtableRef::F2(tbl) => {
+                        if self.coverage_contains(tbl.coverage_off, tbl.coverage_len, gid1).is_none() { continue; }
+                        let c1 = self.class_get(&tbl.class1_def, gid1);
+                        let c2 = self.class_get(&tbl.class2_def, gid2);
+                        if c1 >= tbl.class1_count || c2 >= tbl.class2_count { continue; }
+                        let idx = c1 * tbl.class2_count + c2;
+                        let rec_size = (tbl.sz1 + tbl.sz2)*2;
+                        let off = tbl.matrix_off + idx*rec_size;
+                        if off + rec_size > d.len() { continue; }
+                        let mut p = off;
+                        let vf1 = tbl.val_fmt1;
+                        if vf1 & 0x0001 != 0 { v1_acc[0] += le_i16_at(d,p) as i32; p+=2; }
+                        if vf1 & 0x0002 != 0 { v1_acc[1] += le_i16_at(d,p) as i32; p+=2; }
+                        if vf1 & 0x0004 != 0 { v1_acc[2] += le_i16_at(d,p) as i32; p+=2; }
+                        if vf1 & 0x0008 != 0 { v1_acc[3] += le_i16_at(d,p) as i32; p+=2; }
+                        let vf2 = tbl.val_fmt2;
+                        if vf2 & 0x0001 != 0 { v2_acc[0] += le_i16_at(d,p) as i32; p+=2; }
+                        if vf2 & 0x0002 != 0 { v2_acc[1] += le_i16_at(d,p) as i32; p+=2; }
+                        if vf2 & 0x0004 != 0 { v2_acc[2] += le_i16_at(d,p) as i32; p+=2; }
+                        if vf2 & 0x0008 != 0 { v2_acc[3] += le_i16_at(d,p) as i32; }
+                        break;
+                    }
+                }
+            }
+        }
+        (v1_acc, v2_acc)
+    }
+
     #[inline]
     fn kern_for_gids(&self, f: &FontMmapIndex, gid1: u16, gid2: u16) -> i32 {
         // legacy: sum of xAdvance adjustments (val1[2] + val2[2])
@@ -514,13 +648,13 @@ impl GeometryCache {
         let n = gids.len();
         if n==0 { return Some(Vec::new()); }
 
-        // precompute singles
+        // precompute singles (default only)
         let mut singles: Vec<[i32;4]> = Vec::with_capacity(n);
         for i in 0..n {
             let gid = gids[i].unwrap();
             singles.push(self.single_adjustment_full(f, gid));
         }
-        // precompute pair adjs
+        // precompute pair adjs (default)
         let mut pair_firsts: Vec<[i32;4]> = vec![[0;4]; n];
         let mut pair_seconds: Vec<[i32;4]> = vec![[0;4]; n];
         if n>1 {
@@ -530,7 +664,23 @@ impl GeometryCache {
                 let (v1,v2) = self.pair_adjustment_full(f, g1, g2);
                 pair_firsts[i] = v1;
                 pair_seconds[i+1] = v2;
-                // also need cross? v1 belongs to i, v2 belongs to i+1
+            }
+        }
+        // ── case/cpsp conditional ──
+        let apply_case = Self::is_all_caps_context(chars);
+        let mut case_singles: Vec<[i32;4]> = vec![[0;4]; n];
+        let mut case_pair_firsts: Vec<[i32;4]> = vec![[0;4]; n];
+        let mut case_pair_seconds: Vec<[i32;4]> = vec![[0;4]; n];
+        if apply_case {
+            for i in 0..n {
+                case_singles[i] = self.case_single_adjustment_full(f, gids[i].unwrap());
+            }
+            if n>1 {
+                for i in 0..n-1 {
+                    let (v1,v2) = self.case_pair_adjustment_full(f, gids[i].unwrap(), gids[i+1].unwrap());
+                    case_pair_firsts[i] = v1;
+                    case_pair_seconds[i+1] = v2;
+                }
             }
         }
 
@@ -542,9 +692,12 @@ impl GeometryCache {
             let s = singles[i];
             let pf = pair_firsts[i];
             let ps = pair_seconds[i];
-            let x_pla = (s[0] + pf[0] + ps[0]) as f64;
-            let y_pla = (s[1] + pf[1] + ps[1]) as f64;
-            let x_adv_adj = (s[2] + pf[2] + ps[2]) as f64;
+            let cs = case_singles[i];
+            let cpf = case_pair_firsts[i];
+            let cps = case_pair_seconds[i];
+            let x_pla = (s[0] + pf[0] + ps[0] + cs[0] + cpf[0] + cps[0]) as f64;
+            let y_pla = (s[1] + pf[1] + ps[1] + cs[1] + cpf[1] + cps[1]) as f64;
+            let x_adv_adj = (s[2] + pf[2] + ps[2] + cs[2] + cpf[2] + cps[2]) as f64;
             let total_adv = adv + x_adv_adj;
             let cx = cursor + x_pla + (x0 + x1)*0.5;
             let cy = y_pla + (y0 + y1)*0.5;
@@ -575,6 +728,19 @@ impl GeometryCache {
                 pair_seconds[i+1] = v2;
             }
         }
+        let apply_case = Self::is_all_caps_context(chars);
+        let mut case_singles: Vec<[i32;4]> = vec![[0;4]; n];
+        let mut case_pair_firsts: Vec<[i32;4]> = vec![[0;4]; n];
+        let mut case_pair_seconds: Vec<[i32;4]> = vec![[0;4]; n];
+        if apply_case {
+            for i in 0..n { case_singles[i] = self.case_single_adjustment_full(f, gids[i].unwrap()); }
+            if n>1 {
+                for i in 0..n-1 {
+                    let (v1,v2) = self.case_pair_adjustment_full(f, gids[i].unwrap(), gids[i+1].unwrap());
+                    case_pair_firsts[i]=v1; case_pair_seconds[i+1]=v2;
+                }
+            }
+        }
 
         let mut out = Vec::with_capacity(n);
         let mut cursor = 0.0f64;
@@ -584,9 +750,12 @@ impl GeometryCache {
             let s = singles[i];
             let pf = pair_firsts[i];
             let ps = pair_seconds[i];
-            let x_pla = (s[0] + pf[0] + ps[0]) as f64;
-            let y_pla = (s[1] + pf[1] + ps[1]) as f64;
-            let x_adv_adj = (s[2] + pf[2] + ps[2]) as f64;
+            let cs = case_singles[i];
+            let cpf = case_pair_firsts[i];
+            let cps = case_pair_seconds[i];
+            let x_pla = (s[0] + pf[0] + ps[0] + cs[0] + cpf[0] + cps[0]) as f64;
+            let y_pla = (s[1] + pf[1] + ps[1] + cs[1] + cpf[1] + cps[1]) as f64;
+            let x_adv_adj = (s[2] + pf[2] + ps[2] + cs[2] + cpf[2] + cps[2]) as f64;
             let total_adv = adv + x_adv_adj;
             let cx = cursor + x_pla + (x0 + x1)*0.5;
             let cy = y_pla + (y0 + y1)*0.5;
@@ -615,6 +784,17 @@ impl GeometryCache {
             pair_firsts[i]=v1;
             pair_seconds[i+1]=v2;
         }
+        let apply_case = Self::is_all_caps_context(chars);
+        let mut case_singles: Vec<[i32;4]> = vec![[0;4]; n];
+        let mut case_pair_firsts: Vec<[i32;4]> = vec![[0;4]; n];
+        let mut case_pair_seconds: Vec<[i32;4]> = vec![[0;4]; n];
+        if apply_case {
+            for i in 0..n { case_singles[i]=self.case_single_adjustment_full(f, gids[i].unwrap()); }
+            for i in 0..n.saturating_sub(1) {
+                let (v1,v2)=self.case_pair_adjustment_full(f, gids[i].unwrap(), gids[i+1].unwrap());
+                case_pair_firsts[i]=v1; case_pair_seconds[i+1]=v2;
+            }
+        }
 
         let mut total_adv = 0.0f64;
         let mut min_y = f64::INFINITY;
@@ -625,8 +805,11 @@ impl GeometryCache {
             let s = singles[i];
             let pf = pair_firsts[i];
             let ps = pair_seconds[i];
-            let y_pla = (s[1] + pf[1] + ps[1]) as f64;
-            let x_adv_adj = (s[2] + pf[2] + ps[2]) as f64;
+            let cs = case_singles[i];
+            let cpf = case_pair_firsts[i];
+            let cps = case_pair_seconds[i];
+            let y_pla = (s[1] + pf[1] + ps[1] + cs[1] + cpf[1] + cps[1]) as f64;
+            let x_adv_adj = (s[2] + pf[2] + ps[2] + cs[2] + cpf[2] + cps[2]) as f64;
             total_adv += adv + x_adv_adj;
             let y0a = y0 + y_pla;
             let y1a = y1 + y_pla;
@@ -826,6 +1009,154 @@ impl GeometryCache {
                 subtable_pos: tbl.subtable_pos,
             });
         }
+        // ── case tables (v15) ──
+        let mut case_single_tables = Vec::with_capacity(findex.case_single_tables.len());
+        for tbl in &findex.case_single_tables {
+            let mut coverage = Vec::with_capacity(tbl.coverage_len);
+            for i in 0..tbl.coverage_len {
+                let off = tbl.coverage_off + i*2;
+                if off+2 > d.len() { break; }
+                coverage.push(le_u16_at(d, off));
+            }
+            let vf = tbl.value_format;
+            let mut values = Vec::new();
+            let count = if tbl.is_single { 1 } else { tbl.coverage_len };
+            for i in 0..count {
+                let off = tbl.values_off + i*tbl.stride*2;
+                if off + tbl.stride*2 > d.len() { break; }
+                let (vals, _) = unpack_vals_4(d, off, vf);
+                values.push(vals);
+            }
+            if tbl.is_single && values.len()==1 && coverage.len()>1 {
+                let v = values[0];
+                values = vec![v; coverage.len()];
+            }
+            case_single_tables.push(SingleTableOwned { coverage, value_format: vf, values, is_single: tbl.is_single, lookup_id: tbl.lookup_id, subtable_pos: tbl.subtable_pos });
+        }
+        let mut case_format1_tables = Vec::with_capacity(findex.case_format1_tables.len());
+        for tbl in &findex.case_format1_tables {
+            let mut coverage = Vec::with_capacity(tbl.coverage_len);
+            for i in 0..tbl.coverage_len {
+                let off = tbl.coverage_off + i*2;
+                if off+2 > d.len() { break; }
+                coverage.push(le_u16_at(d, off));
+            }
+            let vf1 = tbl.val_fmt1;
+            let vf2 = tbl.val_fmt2;
+            let sz1 = tbl.sz1;
+            let sz2 = tbl.sz2;
+            let rec_sz = 2 + sz1*2 + sz2*2;
+            let mut pair_sets = Vec::with_capacity(tbl.coverage_len);
+            for ps in &tbl.pair_sets {
+                let mut pairs = Vec::with_capacity(ps.pair_count);
+                for i in 0..ps.pair_count {
+                    let off = ps.pairs_off + i*rec_sz;
+                    if off+rec_sz > d.len() { break; }
+                    let second = le_u16_at(d, off);
+                    let mut p = off+2;
+                    let mut v1=[0i16;4];
+                    let mut v2=[0i16;4];
+                    if vf1 & 0x0001 !=0 { v1[0]=le_i16_at(d,p); p+=2; }
+                    if vf1 & 0x0002 !=0 { v1[1]=le_i16_at(d,p); p+=2; }
+                    if vf1 & 0x0004 !=0 { v1[2]=le_i16_at(d,p); p+=2; }
+                    if vf1 & 0x0008 !=0 { v1[3]=le_i16_at(d,p); p+=2; }
+                    if vf2 & 0x0001 !=0 { v2[0]=le_i16_at(d,p); p+=2; }
+                    if vf2 & 0x0002 !=0 { v2[1]=le_i16_at(d,p); p+=2; }
+                    if vf2 & 0x0004 !=0 { v2[2]=le_i16_at(d,p); p+=2; }
+                    if vf2 & 0x0008 !=0 { v2[3]=le_i16_at(d,p); }
+                    pairs.push((second, v1, v2));
+                }
+                pair_sets.push(pairs);
+            }
+            case_format1_tables.push(Format1TableOwned { coverage, val_fmt1: vf1, val_fmt2: vf2, pair_sets, lookup_id: tbl.lookup_id, subtable_pos: tbl.subtable_pos });
+        }
+        let mut case_format2_tables = Vec::with_capacity(findex.case_format2_tables.len());
+        for tbl in &findex.case_format2_tables {
+            let mut coverage = Vec::with_capacity(tbl.coverage_len);
+            for i in 0..tbl.coverage_len {
+                let off = tbl.coverage_off + i*2;
+                if off+2 > d.len() { break; }
+                coverage.push(le_u16_at(d, off));
+            }
+            let cd1 = match &tbl.class1_def {
+                ClassDefIndex::Format1 { start, count, classes_off } => {
+                    let mut classes = Vec::with_capacity(*count);
+                    for i in 0..*count {
+                        let off = *classes_off + i*2;
+                        if off+2 > d.len() { break; }
+                        classes.push(le_u16_at(d, off));
+                    }
+                    ClassDefOwned::Format1 { start: *start, classes }
+                }
+                ClassDefIndex::Format2 { count, ranges_off } => {
+                    let mut ranges = Vec::with_capacity(*count);
+                    for i in 0..*count {
+                        let off = *ranges_off + i*6;
+                        if off+6 > d.len() { break; }
+                        let s=le_u16_at(d, off);
+                        let e=le_u16_at(d, off+2);
+                        let c=le_u16_at(d, off+4);
+                        ranges.push((s,e,c));
+                    }
+                    ClassDefOwned::Format2 { ranges }
+                }
+            };
+            let cd2 = match &tbl.class2_def {
+                ClassDefIndex::Format1 { start, count, classes_off } => {
+                    let mut classes = Vec::with_capacity(*count);
+                    for i in 0..*count {
+                        let off = *classes_off + i*2;
+                        if off+2 > d.len() { break; }
+                        classes.push(le_u16_at(d, off));
+                    }
+                    ClassDefOwned::Format1 { start: *start, classes }
+                }
+                ClassDefIndex::Format2 { count, ranges_off } => {
+                    let mut ranges = Vec::with_capacity(*count);
+                    for i in 0..*count {
+                        let off = *ranges_off + i*6;
+                        if off+6 > d.len() { break; }
+                        let s=le_u16_at(d, off);
+                        let e=le_u16_at(d, off+2);
+                        let c=le_u16_at(d, off+4);
+                        ranges.push((s,e,c));
+                    }
+                    ClassDefOwned::Format2 { ranges }
+                }
+            };
+            let vf1 = tbl.val_fmt1;
+            let vf2 = tbl.val_fmt2;
+            let mut matrix = Vec::with_capacity(tbl.class1_count*tbl.class2_count);
+            let rec_sz = (tbl.sz1 + tbl.sz2)*2;
+            for i in 0..tbl.class1_count*tbl.class2_count {
+                let off = tbl.matrix_off + i*rec_sz;
+                if off+rec_sz > d.len() { break; }
+                let mut p = off;
+                let mut v1=[0i16;4];
+                let mut v2=[0i16;4];
+                if vf1 & 0x0001 !=0 { v1[0]=le_i16_at(d,p); p+=2; }
+                if vf1 & 0x0002 !=0 { v1[1]=le_i16_at(d,p); p+=2; }
+                if vf1 & 0x0004 !=0 { v1[2]=le_i16_at(d,p); p+=2; }
+                if vf1 & 0x0008 !=0 { v1[3]=le_i16_at(d,p); p+=2; }
+                if vf2 & 0x0001 !=0 { v2[0]=le_i16_at(d,p); p+=2; }
+                if vf2 & 0x0002 !=0 { v2[1]=le_i16_at(d,p); p+=2; }
+                if vf2 & 0x0004 !=0 { v2[2]=le_i16_at(d,p); p+=2; }
+                if vf2 & 0x0008 !=0 { v2[3]=le_i16_at(d,p); }
+                matrix.push((v1,v2));
+            }
+            case_format2_tables.push(Format2TableOwned {
+                coverage,
+                class_def1: cd1,
+                class_def2: cd2,
+                class1_count: tbl.class1_count,
+                class2_count: tbl.class2_count,
+                val_fmt1: vf1,
+                val_fmt2: vf2,
+                matrix,
+                lookup_id: tbl.lookup_id,
+                subtable_pos: tbl.subtable_pos,
+            });
+        }
 
         OwnedFont {
             file_hash: findex.file_hash,
@@ -836,6 +1167,9 @@ impl GeometryCache {
             single_tables,
             format1_tables,
             format2_tables,
+            case_single_tables,
+            case_format1_tables,
+            case_format2_tables,
         }
     }
 
@@ -903,6 +1237,9 @@ impl GeometryCache {
                         single_tables: old.single_tables.clone(),
                         format1_tables: old.format1_tables.clone(),
                         format2_tables: old.format2_tables.clone(),
+                        case_single_tables: old.case_single_tables.clone(),
+                        case_format1_tables: old.case_format1_tables.clone(),
+                        case_format2_tables: old.case_format2_tables.clone(),
                     });
                     n_reused += 1;
                     continue;
@@ -931,6 +1268,9 @@ impl GeometryCache {
                             single_tables: base_owned.single_tables.clone(),
                             format1_tables: base_owned.format1_tables.clone(),
                             format2_tables: base_owned.format2_tables.clone(),
+                            case_single_tables: base_owned.case_single_tables.clone(),
+                            case_format1_tables: base_owned.case_format1_tables.clone(),
+                            case_format2_tables: base_owned.case_format2_tables.clone(),
                         });
                         n_reused += 1;
                         continue;
@@ -947,6 +1287,9 @@ impl GeometryCache {
                                 single_tables: old_base.single_tables.clone(),
                                 format1_tables: old_base.format1_tables.clone(),
                                 format2_tables: old_base.format2_tables.clone(),
+                                case_single_tables: old_base.case_single_tables.clone(),
+                                case_format1_tables: old_base.case_format1_tables.clone(),
+                                case_format2_tables: old_base.case_format2_tables.clone(),
                             });
                             n_reused += 1;
                             continue;
@@ -1040,12 +1383,18 @@ impl GeometryCache {
             let mut single_tables: Vec<SingleTableOwned> = Vec::new();
             let mut format1_tables: Vec<Format1TableOwned> = Vec::new();
             let mut format2_tables: Vec<Format2TableOwned> = Vec::new();
+            let mut case_single_tables: Vec<SingleTableOwned> = Vec::new();
+            let mut case_format1_tables: Vec<Format1TableOwned> = Vec::new();
+            let mut case_format2_tables: Vec<Format2TableOwned> = Vec::new();
 
             if let Some(gpos_data) = ttf_face.raw_face().table(unprint_fonts::ttf_parser::Tag::from_bytes(b"GPOS")) {
-                if let Some((s_tbls, f1_tbls, f2_tbls)) = Self::parse_gpos_full(gpos_data, num_glyphs) {
+                if let Some((s_tbls, f1_tbls, f2_tbls, cs_tbls, cf1_tbls, cf2_tbls)) = Self::parse_gpos_full(gpos_data, num_glyphs) {
                     single_tables = s_tbls;
                     format1_tables = f1_tbls;
                     format2_tables = f2_tbls;
+                    case_single_tables = cs_tbls;
+                    case_format1_tables = cf1_tbls;
+                    case_format2_tables = cf2_tbls;
                 }
             }
 
@@ -1083,7 +1432,7 @@ impl GeometryCache {
             }
 
             let fk_clone = font_key.clone();
-            owned_fonts.insert(font_key, OwnedFont { file_hash: fhash, units_per_em: upem, num_glyphs, glyphs, cmap, single_tables, format1_tables, format2_tables });
+            owned_fonts.insert(font_key, OwnedFont { file_hash: fhash, units_per_em: upem, num_glyphs, glyphs, cmap, single_tables, format1_tables, format2_tables, case_single_tables, case_format1_tables, case_format2_tables });
             n_built+=1;
             if !quiet && (n_built == 1 || n_built % 500 == 0 || n_built == total_to_build) {
                 let elapsed = t_build_start.elapsed().as_secs_f64();
@@ -1176,6 +1525,77 @@ impl GeometryCache {
             }
             // format2 — v12: cov_len, lookup_id, subtable_pos, coverage, class1_count, class2_count, val_fmt1, val_fmt2, ...
             for tbl in &of.format2_tables {
+                w.write_all(&(tbl.coverage.len() as u16).to_le_bytes())?;
+                w.write_all(&tbl.lookup_id.to_le_bytes())?;
+                w.write_all(&tbl.subtable_pos.to_le_bytes())?;
+                for gid in &tbl.coverage { w.write_all(&gid.to_le_bytes())?; }
+                w.write_all(&(tbl.class1_count as u16).to_le_bytes())?;
+                w.write_all(&(tbl.class2_count as u16).to_le_bytes())?;
+                w.write_all(&tbl.val_fmt1.to_le_bytes())?;
+                w.write_all(&tbl.val_fmt2.to_le_bytes())?;
+                match &tbl.class_def1 {
+                    ClassDefOwned::Format1 { start, classes } => {
+                        w.write_all(&[1u8,0])?; w.write_all(&(classes.len() as u16).to_le_bytes())?;
+                        w.write_all(&start.to_le_bytes())?;
+                        for c in classes { w.write_all(&c.to_le_bytes())?; }
+                    }
+                    ClassDefOwned::Format2 { ranges } => {
+                        w.write_all(&[2u8,0])?; w.write_all(&(ranges.len() as u16).to_le_bytes())?;
+                        w.write_all(&[0,0])?;
+                        for (s,e,c) in ranges { w.write_all(&s.to_le_bytes())?; w.write_all(&e.to_le_bytes())?; w.write_all(&c.to_le_bytes())?; }
+                    }
+                }
+                match &tbl.class_def2 {
+                    ClassDefOwned::Format1 { start, classes } => {
+                        w.write_all(&[1u8,0])?; w.write_all(&(classes.len() as u16).to_le_bytes())?;
+                        w.write_all(&start.to_le_bytes())?;
+                        for c in classes { w.write_all(&c.to_le_bytes())?; }
+                    }
+                    ClassDefOwned::Format2 { ranges } => {
+                        w.write_all(&[2u8,0])?; w.write_all(&(ranges.len() as u16).to_le_bytes())?;
+                        w.write_all(&[0,0])?;
+                        for (s,e,c) in ranges { w.write_all(&s.to_le_bytes())?; w.write_all(&e.to_le_bytes())?; w.write_all(&c.to_le_bytes())?; }
+                    }
+                }
+                for (v1,v2) in &tbl.matrix {
+                    pack_vals_4(&mut w, v1, tbl.val_fmt1)?;
+                    pack_vals_4(&mut w, v2, tbl.val_fmt2)?;
+                }
+            }
+            // ── v15: case/cpsp tables (conditional) ──
+            w.write_all(&(of.case_single_tables.len() as u16).to_le_bytes())?;
+            w.write_all(&(of.case_format1_tables.len() as u16).to_le_bytes())?;
+            w.write_all(&(of.case_format2_tables.len() as u16).to_le_bytes())?;
+            for tbl in &of.case_single_tables {
+                w.write_all(&(tbl.coverage.len() as u16).to_le_bytes())?;
+                w.write_all(&tbl.lookup_id.to_le_bytes())?;
+                w.write_all(&tbl.subtable_pos.to_le_bytes())?;
+                for gid in &tbl.coverage { w.write_all(&gid.to_le_bytes())?; }
+                w.write_all(&tbl.value_format.to_le_bytes())?;
+                w.write_all(&[if tbl.is_single {1u8} else {0u8}])?;
+                let cnt = if tbl.is_single { 1 } else { tbl.coverage.len() };
+                for i in 0..cnt {
+                    let v = if i < tbl.values.len() { &tbl.values[i] } else { &[0,0,0,0] };
+                    pack_vals_4(&mut w, v, tbl.value_format)?;
+                }
+            }
+            for tbl in &of.case_format1_tables {
+                w.write_all(&(tbl.coverage.len() as u16).to_le_bytes())?;
+                w.write_all(&tbl.lookup_id.to_le_bytes())?;
+                w.write_all(&tbl.subtable_pos.to_le_bytes())?;
+                for gid in &tbl.coverage { w.write_all(&gid.to_le_bytes())?; }
+                w.write_all(&tbl.val_fmt1.to_le_bytes())?;
+                w.write_all(&tbl.val_fmt2.to_le_bytes())?;
+                for ps in &tbl.pair_sets {
+                    w.write_all(&(ps.len() as u16).to_le_bytes())?;
+                    for (sg, v1, v2) in ps {
+                        w.write_all(&sg.to_le_bytes())?;
+                        pack_vals_4(&mut w, v1, tbl.val_fmt1)?;
+                        pack_vals_4(&mut w, v2, tbl.val_fmt2)?;
+                    }
+                }
+            }
+            for tbl in &of.case_format2_tables {
                 w.write_all(&(tbl.coverage.len() as u16).to_le_bytes())?;
                 w.write_all(&tbl.lookup_id.to_le_bytes())?;
                 w.write_all(&tbl.subtable_pos.to_le_bytes())?;
@@ -1366,7 +1786,124 @@ impl GeometryCache {
                 f2_tables.push(Format2Index { coverage_off: cov_off, coverage_len: cov_len, class1_count: c1c, class2_count: c2c, val_fmt1: vf1u, val_fmt2: vf2u, sz1, sz2, class1_def: cd1, class2_def: cd2, matrix_off, lookup_id, subtable_pos });
             }
 
-            fonts.insert(font_key, FontMmapIndex { file_hash, upem, num_glyphs, glyphs_off, cmap_off, cmap_len, single_tables, format1_tables: f1_tables, format2_tables: f2_tables });
+            // ── v15 case/cpsp tables ──
+            if pos+6 > data.len() { return Err("trunc case counts".into()); }
+            let n_case_single = u16::from_le_bytes(data[pos..pos+2].try_into().unwrap()) as usize; pos+=2;
+            let n_case_f1 = u16::from_le_bytes(data[pos..pos+2].try_into().unwrap()) as usize; pos+=2;
+            let n_case_f2 = u16::from_le_bytes(data[pos..pos+2].try_into().unwrap()) as usize; pos+=2;
+
+            let mut case_single_tables = Vec::with_capacity(n_case_single);
+            for _ in 0..n_case_single {
+                if pos+2 > data.len() { return Err("trunc case single cov_len".into()); }
+                let cov_len = u16::from_le_bytes(data[pos..pos+2].try_into().unwrap()) as usize; pos+=2;
+                if pos+4 > data.len() { return Err("trunc case single lookup ids".into()); }
+                let lookup_id = u16::from_le_bytes(data[pos..pos+2].try_into().unwrap()); pos+=2;
+                let subtable_pos = u16::from_le_bytes(data[pos..pos+2].try_into().unwrap()); pos+=2;
+                let cov_off = pos;
+                if pos+cov_len*2 > data.len() { return Err("trunc case single coverage".into()); }
+                pos+=cov_len*2;
+                if pos+2 > data.len() { return Err("trunc case single vf".into()); }
+                let vf = u16::from_le_bytes(data[pos..pos+2].try_into().unwrap()); pos+=2;
+                if pos+1 > data.len() { return Err("trunc case single is_single".into()); }
+                let is_single = data[pos]!=0; pos+=1;
+                let sz = popcnt4(vf);
+                let values_off = pos;
+                let cnt = if is_single { 1 } else { cov_len };
+                let bytes = cnt*sz*2;
+                if pos+bytes > data.len() { return Err("trunc case single values".into()); }
+                pos+=bytes;
+                case_single_tables.push(SingleIndex { coverage_off: cov_off, coverage_len: cov_len, value_format: vf, is_single, values_off, stride: sz, lookup_id, subtable_pos });
+            }
+            let mut case_f1_tables = Vec::with_capacity(n_case_f1);
+            for _ in 0..n_case_f1 {
+                if pos+2 > data.len() { return Err("trunc case f1 cov_len".into()); }
+                let cov_len = u16::from_le_bytes(data[pos..pos+2].try_into().unwrap()) as usize; pos+=2;
+                if pos+4 > data.len() { return Err("trunc case f1 lookup ids".into()); }
+                let lookup_id = u16::from_le_bytes(data[pos..pos+2].try_into().unwrap()); pos+=2;
+                let subtable_pos = u16::from_le_bytes(data[pos..pos+2].try_into().unwrap()); pos+=2;
+                let cov_off = pos;
+                if pos+cov_len*2 > data.len() { return Err("trunc case f1 coverage".into()); }
+                pos+=cov_len*2;
+                if pos+4 > data.len() { return Err("trunc case f1 vf1/vf2".into()); }
+                let vf1 = u16::from_le_bytes(data[pos..pos+2].try_into().unwrap()); pos+=2;
+                let vf2 = u16::from_le_bytes(data[pos..pos+2].try_into().unwrap()); pos+=2;
+                let sz1 = popcnt4(vf1);
+                let sz2 = popcnt4(vf2);
+                let rec_sz = 2 + sz1*2 + sz2*2;
+                let mut pair_sets = Vec::with_capacity(cov_len);
+                for _ in 0..cov_len {
+                    if pos+2 > data.len() { return Err("trunc case f1 pair_count".into()); }
+                    let pc = u16::from_le_bytes(data[pos..pos+2].try_into().unwrap()) as usize; pos+=2;
+                    let pairs_off = pos;
+                    let bytes = pc*rec_sz;
+                    if pos+bytes > data.len() { return Err("trunc case f1 pairs".into()); }
+                    pos+=bytes;
+                    pair_sets.push(PairSetIndex { pairs_off, pair_count: pc });
+                }
+                case_f1_tables.push(Format1Index { coverage_off: cov_off, coverage_len: cov_len, val_fmt1: vf1, val_fmt2: vf2, sz1, sz2, pair_sets, lookup_id, subtable_pos });
+            }
+            let mut case_f2_tables = Vec::with_capacity(n_case_f2);
+            for _ in 0..n_case_f2 {
+                if pos+2 > data.len() { return Err("trunc case f2 cov_len".into()); }
+                let cov_len = u16::from_le_bytes(data[pos..pos+2].try_into().unwrap()) as usize; pos+=2;
+                if pos+4 > data.len() { return Err("trunc case f2 lookup ids".into()); }
+                let lookup_id = u16::from_le_bytes(data[pos..pos+2].try_into().unwrap()); pos+=2;
+                let subtable_pos = u16::from_le_bytes(data[pos..pos+2].try_into().unwrap()); pos+=2;
+                let cov_off = pos;
+                if pos+cov_len*2 > data.len() { return Err("trunc case f2 coverage".into()); }
+                pos+=cov_len*2;
+                if pos+4 > data.len() { return Err("trunc case f2 c1c/c2c".into()); }
+                let c1c = u16::from_le_bytes(data[pos..pos+2].try_into().unwrap()) as usize; pos+=2;
+                let c2c = u16::from_le_bytes(data[pos..pos+2].try_into().unwrap()) as usize; pos+=2;
+                if pos+4 > data.len() { return Err("trunc case f2 vf1/vf2".into()); }
+                let vf1 = u16::from_le_bytes(data[pos..pos+2].try_into().unwrap()) as usize; pos+=2;
+                let vf2 = u16::from_le_bytes(data[pos..pos+2].try_into().unwrap()) as usize; pos+=2;
+                let vf1u = vf1 as u16;
+                let vf2u = vf2 as u16;
+                let sz1 = popcnt4(vf1u);
+                let sz2 = popcnt4(vf2u);
+                if pos+2 > data.len() { return Err("trunc case f2 cd1 fmt".into()); }
+                let fmt1 = data[pos]; pos+=2;
+                if pos+2 > data.len() { return Err("trunc case f2 cd1 cnt".into()); }
+                let cd1_cnt = u16::from_le_bytes(data[pos..pos+2].try_into().unwrap()) as usize; pos+=2;
+                if pos+2 > data.len() { return Err("trunc case f2 cd1 start".into()); }
+                let cd1_start = u16::from_le_bytes(data[pos..pos+2].try_into().unwrap()); pos+=2;
+                let cd1 = if fmt1==1 {
+                    let classes_off = pos;
+                    if pos+cd1_cnt*2 > data.len() { return Err("trunc case f2 cd1 classes".into()); }
+                    pos+=cd1_cnt*2;
+                    ClassDefIndex::Format1 { start: cd1_start, count: cd1_cnt, classes_off }
+                } else {
+                    let ranges_off = pos;
+                    if pos+cd1_cnt*6 > data.len() { return Err("trunc case f2 cd1 ranges".into()); }
+                    pos+=cd1_cnt*6;
+                    ClassDefIndex::Format2 { count: cd1_cnt, ranges_off }
+                };
+                if pos+2 > data.len() { return Err("trunc case f2 cd2 fmt".into()); }
+                let fmt2 = data[pos]; pos+=2;
+                if pos+2 > data.len() { return Err("trunc case f2 cd2 cnt".into()); }
+                let cd2_cnt = u16::from_le_bytes(data[pos..pos+2].try_into().unwrap()) as usize; pos+=2;
+                if pos+2 > data.len() { return Err("trunc case f2 cd2 start".into()); }
+                let cd2_start = u16::from_le_bytes(data[pos..pos+2].try_into().unwrap()); pos+=2;
+                let cd2 = if fmt2==1 {
+                    let classes_off = pos;
+                    if pos+cd2_cnt*2 > data.len() { return Err("trunc case f2 cd2 classes".into()); }
+                    pos+=cd2_cnt*2;
+                    ClassDefIndex::Format1 { start: cd2_start, count: cd2_cnt, classes_off }
+                } else {
+                    let ranges_off = pos;
+                    if pos+cd2_cnt*6 > data.len() { return Err("trunc case f2 cd2 ranges".into()); }
+                    pos+=cd2_cnt*6;
+                    ClassDefIndex::Format2 { count: cd2_cnt, ranges_off }
+                };
+                let matrix_off = pos;
+                let matrix_bytes = c1c*c2c*(sz1+sz2)*2;
+                if pos+matrix_bytes > data.len() { return Err("trunc case f2 matrix".into()); }
+                pos+=matrix_bytes;
+                case_f2_tables.push(Format2Index { coverage_off: cov_off, coverage_len: cov_len, class1_count: c1c, class2_count: c2c, val_fmt1: vf1u, val_fmt2: vf2u, sz1, sz2, class1_def: cd1, class2_def: cd2, matrix_off, lookup_id, subtable_pos });
+            }
+
+            fonts.insert(font_key, FontMmapIndex { file_hash, upem, num_glyphs, glyphs_off, cmap_off, cmap_len, single_tables, format1_tables: f1_tables, format2_tables: f2_tables, case_single_tables, case_format1_tables: case_f1_tables, case_format2_tables: case_f2_tables });
         }
         Ok((Self { mmap, fonts, _cache_path: path.to_path_buf() }, catalog_hash))
     }
@@ -1374,7 +1911,7 @@ impl GeometryCache {
     // compatibility for tests - returns old kern-only view
     pub fn test_parse_gpos(data: &[u8], num_glyphs: usize) -> Option<(Vec<Format1Parse>, Vec<Format2Parse>, bool)> {
         // call new full parser, then convert to old structs for display
-        let (singles, f1_full, f2_full) = Self::parse_gpos_full(data, num_glyphs)?;
+        let (singles, f1_full, f2_full, _case_s, _case_f1, _case_f2) = Self::parse_gpos_full(data, num_glyphs)?;
         // convert f1
         let mut f1_old = Vec::with_capacity(f1_full.len());
         for tbl in f1_full {
@@ -1409,7 +1946,7 @@ impl GeometryCache {
         Some((f1_old, f2_old, false))
     }
 
-    fn parse_gpos_full(data: &[u8], num_glyphs: usize) -> Option<(Vec<SingleTableOwned>, Vec<Format1TableOwned>, Vec<Format2TableOwned>)> {
+    fn parse_gpos_full(data: &[u8], num_glyphs: usize) -> Option<(Vec<SingleTableOwned>, Vec<Format1TableOwned>, Vec<Format2TableOwned>, Vec<SingleTableOwned>, Vec<Format1TableOwned>, Vec<Format2TableOwned>)> {
         Self::parse_gpos_inner(data, num_glyphs)
     }
 
@@ -1418,15 +1955,60 @@ impl GeometryCache {
         None
     }
 
-    fn parse_gpos_inner(data: &[u8], num_glyphs: usize) -> Option<(Vec<SingleTableOwned>, Vec<Format1TableOwned>, Vec<Format2TableOwned>)> {
+    fn parse_gpos_inner(data: &[u8], num_glyphs: usize) -> Option<(Vec<SingleTableOwned>, Vec<Format1TableOwned>, Vec<Format2TableOwned>, Vec<SingleTableOwned>, Vec<Format1TableOwned>, Vec<Format2TableOwned>)> {
         if data.len() < 10 { return None; }
+        let feature_list_off = be_u16(data, 6)? as usize;
         let lookup_list_off = be_u16(data, 8)? as usize;
         if lookup_list_off + 2 > data.len() { return None; }
+        // ── Build exclusion set for non-default features (case, cpsp) ──
+        // GPOS FeatureList: u16 featureCount, array of FeatureRecord (Tag u32 + Offset u16), then Feature tables.
+        // We want to skip lookups that are used *only* for `case` (case-sensitive forms) and `cpsp` (capital spacing),
+        // because those should not be applied by default. `case` in PT Serif moves parens up by 100fu, causing
+        // gt_geo_v_err ~4.4px for "(ParaType)" when the specimen was rendered without `case` enabled.
+        // We collect lookups referenced by `case`/`cpsp` and exclude them; lookups also referenced by `kern` etc. are kept.
+        let mut case_lookups: std::collections::HashSet<usize> = std::collections::HashSet::new();
+        let mut kern_lookups: std::collections::HashSet<usize> = std::collections::HashSet::new();
+        if feature_list_off + 2 <= data.len() {
+            if let Some(feature_count) = be_u16(data, feature_list_off) {
+                let fc = feature_count as usize;
+                for fi in 0..fc {
+                    let rec_off = feature_list_off + 2 + fi*6;
+                    if rec_off + 6 > data.len() { continue; }
+                    // Tag is 4 bytes at rec_off
+                    let tag_bytes = &data[rec_off..rec_off+4];
+                    let tag = std::str::from_utf8(tag_bytes).unwrap_or("");
+                    let feat_offset = be_u16(data, rec_off+4)? as usize + feature_list_off;
+                    if feat_offset + 4 > data.len() { continue; }
+                    // Feature table: FeatureParams(2), LookupCount(u16), LookupListIndices[]
+                    let lookup_count = be_u16(data, feat_offset+2)? as usize;
+                    let mut lids = Vec::with_capacity(lookup_count);
+                    for li in 0..lookup_count {
+                        let pos = feat_offset + 4 + li*2;
+                        if pos+2 > data.len() { break; }
+                        if let Some(lid) = be_u16(data, pos) { lids.push(lid as usize); }
+                    }
+                    if tag == "case" || tag == "cpsp" {
+                        for &lid in &lids { case_lookups.insert(lid); }
+                    } else {
+                        // any other feature (kern, mark, mkmk, etc.) counts as default-eligible
+                        for &lid in &lids { kern_lookups.insert(lid); }
+                    }
+                }
+            }
+        }
+        // Split lookups that are *only* in case/cpsp and not shared with a default feature.
+        // Shared lookups stay in default (they are needed without case). Pure case/cpsp go to conditional tables.
+        let case_only_lookups: std::collections::HashSet<usize> = case_lookups.difference(&kern_lookups).cloned().collect();
+
         let lookup_count = be_u16(data, lookup_list_off)? as usize;
         let mut single_tables = Vec::new();
         let mut f1_tables = Vec::new();
         let mut f2_tables = Vec::new();
+        let mut case_single_tables: Vec<SingleTableOwned> = Vec::new();
+        let mut case_f1_tables: Vec<Format1TableOwned> = Vec::new();
+        let mut case_f2_tables: Vec<Format2TableOwned> = Vec::new();
         for li in 0..lookup_count {
+            let is_case_only = case_only_lookups.contains(&li);
             let off_pos = lookup_list_off + 2 + li*2;
             let lookup_off = be_u16(data, off_pos)? as usize + lookup_list_off;
             if lookup_off + 6 > data.len() { continue; }
@@ -1465,7 +2047,8 @@ impl GeometryCache {
                         let coverage = Self::parse_coverage(data, cov_off)?;
                         let (xpl,ypl,xad,yad,_) = Self::parse_value_record(data, inner_off+6, val_fmt_full)?;
                         let val = [xpl,ypl,xad,yad];
-                        single_tables.push(SingleTableOwned { coverage: coverage.clone(), value_format: val_fmt, values: vec![val; coverage.len()], is_single: true, lookup_id: li as u16, subtable_pos: si as u16 });
+                        let entry = SingleTableOwned { coverage: coverage.clone(), value_format: val_fmt, values: vec![val; coverage.len()], is_single: true, lookup_id: li as u16, subtable_pos: si as u16 };
+                        if is_case_only { case_single_tables.push(entry); } else { single_tables.push(entry); }
                     } else if fmt == 2 {
                         if inner_off + 8 > data.len() { continue; }
                         let cov_off = be_u16(data, inner_off+2)? as usize + inner_off;
@@ -1482,7 +2065,8 @@ impl GeometryCache {
                             values.push([xpl,ypl,xad,yad]);
                             p += val_size;
                         }
-                        single_tables.push(SingleTableOwned { coverage, value_format: val_fmt, values, is_single: false, lookup_id: li as u16, subtable_pos: si as u16 });
+                        let entry = SingleTableOwned { coverage, value_format: val_fmt, values, is_single: false, lookup_id: li as u16, subtable_pos: si as u16 };
+                        if is_case_only { case_single_tables.push(entry); } else { single_tables.push(entry); }
                     }
                 } else if inner_type == 2 {
                     let fmt = be_u16(data, inner_off)?;
@@ -1521,7 +2105,8 @@ impl GeometryCache {
                             pair_sets.push(pairs);
                         }
                         while pair_sets.len() < coverage.len() { pair_sets.push(Vec::new()); }
-                        f1_tables.push(Format1TableOwned { coverage, val_fmt1, val_fmt2, pair_sets, lookup_id: li as u16, subtable_pos: si as u16 });
+                        let entry = Format1TableOwned { coverage, val_fmt1, val_fmt2, pair_sets, lookup_id: li as u16, subtable_pos: si as u16 };
+                        if is_case_only { case_f1_tables.push(entry); } else { f1_tables.push(entry); }
                     } else if fmt == 2 {
                         if inner_off + 16 > data.len() { continue; }
                         let cov_off = be_u16(data, inner_off+2)? as usize + inner_off;
@@ -1557,12 +2142,13 @@ impl GeometryCache {
                             matrix.push(([xpl1,ypl1,xad1,yad1],[xpl2,ypl2,xad2,yad2]));
                             p += rec_size;
                         }
-                        f2_tables.push(Format2TableOwned { coverage, class_def1: cd1_owned, class_def2: cd2_owned, class1_count: c1_count, class2_count: c2_count, val_fmt1, val_fmt2, matrix, lookup_id: li as u16, subtable_pos: si as u16 });
+                        let entry = Format2TableOwned { coverage, class_def1: cd1_owned, class_def2: cd2_owned, class1_count: c1_count, class2_count: c2_count, val_fmt1, val_fmt2, matrix, lookup_id: li as u16, subtable_pos: si as u16 };
+                        if is_case_only { case_f2_tables.push(entry); } else { f2_tables.push(entry); }
                     }
                 }
             }
         }
-        Some((single_tables, f1_tables, f2_tables))
+        Some((single_tables, f1_tables, f2_tables, case_single_tables, case_f1_tables, case_f2_tables))
     }
 
     fn value_format_size(fmt: u16) -> usize {
