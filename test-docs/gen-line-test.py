@@ -32,7 +32,7 @@ from rasterize import rasterize
 # p3: 1 line (Matthew Carter) isolated to avoid bbox shift.
 # Matches t59 + extensions requested: LibreBaskerville lower, PTSerif italic numbers.
 # ---------------------------------------------------------------------------
-HARDCODED_7 = [
+HARDCODED = [
     ("LibreBodoni-400", "abcdefghijklmnopqrstuvwxyz."),
     ("LibreBodoni-400", "ABCDEFGHIJKLMNOPQRSTUVWXYZ."),
     ("Georgia-400", "ABCDEFGHIJKLMNOPQRSTUVWXYZ."),
@@ -58,7 +58,7 @@ def parse_args():
         hardcoded = True
         args = [a for a in args if a != "--hardcoded"]
         if not args:
-            args = [f"{font}={text}" for font, text in HARDCODED_7]
+            args = [f"{font}={text}" for font, text in HARDCODED]
     if args and any("=" in a for a in args):
         hardcoded = True
     return hardcoded, args, audit_ref
