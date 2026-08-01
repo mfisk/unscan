@@ -223,11 +223,16 @@ pub fn measure_char_ink_bounds(
 }
 
 /// Cached path: use GeometryCache predictions (fast, Unicode, keeps both GPOS Pair formats native).
-fn per_char_geo_cached(
+/// If `prune_threshold` is Some(t), we do vertical-first short-circuit:
+/// `h_ll <= 0` always, so `h_ll+v_ll <= v_ll`. If any `v_ll < t`, the sum will be `< t`
+/// regardless of h, so the font will be pruned. We can abort without computing h or remaining chars.
+/// Same for `v_ll + h_ll < t` on subsequent chars.
+fn per_char_geo_cached_with_threshold(
     font_key: &str,
     wib: &[WordGeoMeasurement],
     word_segs: &[crate::segment::WordSeg],
     geo_cache: &crate::geo_cache::GeometryCache,
+    prune_threshold: Option<f32>,
 ) -> Option<Vec<PerCharGeo>> {
     if !geo_cache.has_font(font_key) {
         return None;
@@ -309,6 +314,14 @@ fn per_char_geo_cached(
             let v_err = obs_cy_rel - pred_cy_rel;
             let v_ll = quantized_ll(v_err, SIGMA_CENTER_PX, quant_half_width_px());
 
+            // Vertical-first short-circuit: h_ll <= 0 always, so h_ll+v_ll <= v_ll.
+            // If v_ll alone is already below threshold, the sum will be too, no need to compute h.
+            if let Some(t) = prune_threshold {
+                if (v_ll as f32) < t {
+                    return None;
+                }
+            }
+
             let (obs_pitch, pred_pitch, h_err, h_ll) = if orig_idx == 0 {
                 (None, None, None, 0.0)
             } else {
@@ -320,6 +333,13 @@ fn per_char_geo_cached(
                 let h_ll_val = quantized_ll(h_err_val, SIGMA_PITCH_PX, quant_half_width_px());
                 (Some(obs_pitch_val), Some(pred_pitch_val), Some(h_err_val), h_ll_val)
             };
+
+            // Check full sum after h is known (for orig_idx>0, h may push sum below threshold)
+            if let Some(t) = prune_threshold {
+                if ((v_ll + h_ll) as f32) < t {
+                    return None;
+                }
+            }
 
             result.push(PerCharGeo {
                 seg_idx,
@@ -348,13 +368,23 @@ fn per_char_geo_cached(
     Some(result)
 }
 
+fn per_char_geo_cached(
+    font_key: &str,
+    wib: &[WordGeoMeasurement],
+    word_segs: &[crate::segment::WordSeg],
+    geo_cache: &crate::geo_cache::GeometryCache,
+) -> Option<Vec<PerCharGeo>> {
+    per_char_geo_cached_with_threshold(font_key, wib, word_segs, geo_cache, None)
+}
+
 /// Shaped path: use HarfBuzz shaping per word (slow, but handles GPOS offsets, ligatures, non-ASCII).
-fn per_char_geo_shaped(
+fn per_char_geo_shaped_with_threshold(
     font_key: &str,
     word_segs: &[crate::segment::WordSeg],
     wib: &[WordGeoMeasurement],
     font_cache: &crate::font_cache::FontCache,
     font_registry: &crate::font_scan::FontRegistry,
+    prune_threshold: Option<f32>,
 ) -> Option<Vec<PerCharGeo>> {
     let fe = font_registry.by_key(font_key)?;
     let font_data = font_cache.load(&fe.path).ok()?;
@@ -460,6 +490,13 @@ fn per_char_geo_shaped(
             let v_err = obs_cy_rel - pred_cy_rel;
             let v_ll = quantized_ll(v_err, SIGMA_CENTER_PX, quant_half_width_px());
 
+            // Vertical-first short-circuit: h <=0, so if v < threshold, sum < threshold
+            if let Some(t) = prune_threshold {
+                if (v_ll as f32) < t {
+                    return None;
+                }
+            }
+
             let (obs_pitch, pred_pitch, h_err, h_ll) = if orig_idx == 0 {
                 (None, None, None, 0.0)
             } else {
@@ -471,6 +508,12 @@ fn per_char_geo_shaped(
                 let h_ll_val = quantized_ll(h_err_val, SIGMA_PITCH_PX, quant_half_width_px());
                 (Some(obs_pitch_val), Some(pred_pitch_val), Some(h_err_val), h_ll_val)
             };
+
+            if let Some(t) = prune_threshold {
+                if ((v_ll + h_ll) as f32) < t {
+                    return None;
+                }
+            }
 
             result.push(PerCharGeo {
                 seg_idx,
@@ -494,6 +537,32 @@ fn per_char_geo_shaped(
     }
     // Empty = no usable words (ligature mismatch), not missing glyph → keep font, not infinite penalty.
     Some(result)
+}
+
+fn per_char_geo_shaped(
+    font_key: &str,
+    word_segs: &[crate::segment::WordSeg],
+    wib: &[WordGeoMeasurement],
+    font_cache: &crate::font_cache::FontCache,
+    font_registry: &crate::font_scan::FontRegistry,
+) -> Option<Vec<PerCharGeo>> {
+    per_char_geo_shaped_with_threshold(font_key, word_segs, wib, font_cache, font_registry, None)
+}
+
+/// Compute per-character geometry for a font.
+pub fn per_char_geo_for_font_with_threshold(
+    font_key: &str,
+    word_segs: &[crate::segment::WordSeg],
+    wib: &[WordGeoMeasurement],
+    font_cache: &crate::font_cache::FontCache,
+    geo_cache: &crate::geo_cache::GeometryCache,
+    font_registry: &crate::font_scan::FontRegistry,
+    prune_threshold: Option<f32>,
+) -> Option<Vec<PerCharGeo>> {
+    if let Some(cached) = per_char_geo_cached_with_threshold(font_key, wib, word_segs, geo_cache, prune_threshold) {
+        return Some(cached);
+    }
+    per_char_geo_shaped_with_threshold(font_key, word_segs, wib, font_cache, font_registry, prune_threshold)
 }
 
 /// Compute per-character geometry for a font.
