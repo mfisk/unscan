@@ -38,6 +38,7 @@ rand = { version = "0.8", features = ["small_rng"] }
 write-fonts = "0.3"
 read-fonts = { version = "0.1", features = ["std"] }
 font-types = "0.2"
+flate2 = "1.1"
 
 # dev is left on cargo defaults (opt-level=0, debug=true, incremental) - fastest iteration with debuginfo
 # fastbuild is explicit fastest compile, no debuginfo, lowest RAM

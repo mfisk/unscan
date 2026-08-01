@@ -2011,6 +2011,7 @@ version = "0.2.0"
 dependencies = [
  "base64",
  "clap",
+ "flate2",
  "font-types 0.2.0",
  "image",
  "libm",
