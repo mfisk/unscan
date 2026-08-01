@@ -74,14 +74,15 @@ pub fn quantized_ll(e: f64, sigma: f64, half_width: f64) -> f64 {
 
 static AUDIT_ALL_CHARS_CACHE: OnceLock<bool> = OnceLock::new();
 
-/// Env toggle for full-char audit logging. Checks `UNPRINT_AUDIT_ALL_CHARS` then `UNPRINT_AUDIT_ALL`.
+/// Env toggle for full-char audit logging. Set `UNPRINT_AUDIT_ALL_CHARS=1` to
+/// include all chars (not just supported) in segmentation and geo.
 /// Accepts 1|true|yes|on case-insensitive. Defaults off.
+/// Note: old `UNPRINT_AUDIT_ALL` alias removed to avoid collision with
+/// CLI `--audit-all` / `--audit-all-lines`; use `UNPRINT_AUDIT_ALL_CHARS`.
 #[inline]
 pub fn audit_all_chars_enabled() -> bool {
     *AUDIT_ALL_CHARS_CACHE.get_or_init(|| {
-        let v = std::env::var("UNPRINT_AUDIT_ALL_CHARS")
-            .or_else(|_| std::env::var("UNPRINT_AUDIT_ALL"))
-            .unwrap_or_default();
+        let v = std::env::var("UNPRINT_AUDIT_ALL_CHARS").unwrap_or_default();
         matches!(v.to_ascii_lowercase().as_str(), "1" | "true" | "yes" | "on")
     })
 }

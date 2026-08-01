@@ -70,8 +70,9 @@ pub struct Args {
 
     /// Include all lines (hits) in audit.json obs_votes and compute geo for all,
     /// not just misses. Implies --report-all. Use for geo bias regression
-    /// tests where GT metrics on hits are needed (t64).
-    #[arg(long, help_heading = "Evaluation")]
+    /// tests where GT metrics on hits are needed (t64). Primary flag is
+    /// --audit-all-lines; --audit-all is kept as an alias for backwards compat.
+    #[arg(long = "audit-all-lines", alias = "audit-all", help_heading = "Evaluation")]
     pub audit_all: bool,
 
     // ── Debug / Comparison ─────────────────────────────────────────

@@ -67,8 +67,10 @@ fn geo_bias_is_zero() {
 
     let bin = unscan_bin();
 
-    // All-chars GT path: env toggle, not --audit-all flag. --audit-all is report_all,
-    // audit_all_chars_enabled() checks UNPRINT_AUDIT_ALL_CHARS / UNPRINT_AUDIT_ALL env.
+    // All-chars GT path: env toggle, not --audit-all-lines flag. --audit-all-lines
+    // (aka --audit-all alias) is "audit all lines" for report; env is "audit all chars".
+    // audit_all_chars_enabled() now checks only UNPRINT_AUDIT_ALL_CHARS (old
+    // UNPRINT_AUDIT_ALL alias removed).
     // Do NOT set UNPRINT_EXTRA_SEAMS — we are not debugging seam splits.
     let output = Command::new(&bin)
         .arg(&input)
