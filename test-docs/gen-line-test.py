@@ -27,11 +27,10 @@ from pdf_font_annotate import annotate_canonical_names
 from rasterize import rasterize
 
 # ---------------------------------------------------------------------------
-# Hardcoded 10-line test — page-break isolation for Tesseract LSTM reset
-# p1: 8 lines (L01-L08), p2: 1 line (LibreBaskerville lower),
-# p2 cont: 1 line (PTSerif italic fox with numbers) together with first 8 to
-# preserve word-gap stats, p3: 1 line (Matthew Carter) isolated.
-# Matches t59 contract: HARDCODED_10 is single source of truth.
+# Hardcoded 11-line test — page-break isolation for Tesseract LSTM reset
+# p1: 8 lines (L01-L08), p2: 2 lines (LibreBaskerville + PTSerif italic fox with numbers),
+# p3: 1 line (Matthew Carter) isolated to avoid bbox shift.
+# Matches t59 + extensions requested: LibreBaskerville lower, PTSerif italic numbers.
 # ---------------------------------------------------------------------------
 HARDCODED_7 = [
     ("LibreBodoni-400", "abcdefghijklmnopqrstuvwxyz."),
@@ -43,6 +42,7 @@ HARDCODED_7 = [
     ("SourceSerif4-400It", "Type"),
     ("LibreBaskerville-400", "abcdefghijklmnopqrstuvwxyz."),
     ("PTSerif-400Italic", "Italic: The quick brown fox jumps over 1,234,567,890 lazy"),
+    ("SourceSerif4-400It", "Font: Originally for IBM Executive typewriters — 12 characters per inch"),
     ("Georgia-400", "Matthew Carter created Georgia in 1993."),
 ]
 
