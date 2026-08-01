@@ -29,3 +29,5 @@ pub mod hog;
 pub mod atomic_file;
 pub mod geo_cache;
 pub mod geometry_classifier;
+pub mod vintage_cache;
+pub mod font_history;
