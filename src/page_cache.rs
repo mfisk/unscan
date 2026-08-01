@@ -177,8 +177,6 @@ fn try_extract_raster_pages(path: &Path) -> Option<Vec<DynamicImage>> {
     }
     let mut out = Vec::with_capacity(pages.len());
 
-    // pages BTreeMap<u32, ObjectId> sorted by page number already, but get_pages()
-    // uses page_iter which is in document order. BTreeMap ensures 1..N ordering.
     for (_pnum, &page_id) in pages.iter() {
         let images = doc.get_page_images(page_id).ok()?;
         if images.len() != 1 {
@@ -186,7 +184,6 @@ fn try_extract_raster_pages(path: &Path) -> Option<Vec<DynamicImage>> {
         }
         let img = &images[0];
 
-        // Validate basics
         let w = img.width as u32;
         let h = img.height as u32;
         if w == 0 || h == 0 || w > 10000 || h > 10000 {
@@ -194,92 +191,176 @@ fn try_extract_raster_pages(path: &Path) -> Option<Vec<DynamicImage>> {
         }
         let bpc = img.bits_per_component.unwrap_or(8);
         if bpc != 8 {
-            // Only 8bpc fast path for now; could add 1bpc later
             return None;
         }
         let cs = img.color_space.as_deref().unwrap_or("DeviceGray");
-        let is_gray = cs == "DeviceGray" || cs == "DeviceGray" || cs.contains("Gray");
+        let is_gray = cs == "DeviceGray" || cs.contains("Gray");
         let is_rgb = cs == "DeviceRGB" || cs.contains("RGB");
         if !is_gray && !is_rgb {
             return None;
         }
 
+        // Parse DecodeParms for PNG Predictor
+        let mut predictor: i64 = 1;
+        let mut columns: usize = w as usize;
+        let mut colors: usize = if is_gray { 1 } else { 3 };
+        let mut has_decode_parms = false;
+        if let Ok(obj) = img.origin_dict.get(b"DecodeParms") {
+            // Can be Dict or Array of Dicts
+            let mut dict_opt: Option<&lopdf::Dictionary> = None;
+            if let Ok(d) = obj.as_dict() {
+                dict_opt = Some(d);
+            } else if let Ok(arr) = obj.as_array() {
+                for item in arr {
+                    if let Ok(d) = item.as_dict() {
+                        if d.get(b"Predictor").is_ok() {
+                            dict_opt = Some(d);
+                            break;
+                        }
+                    }
+                }
+                // fallback: first dict if no Predictor found
+                if dict_opt.is_none() {
+                    for item in arr {
+                        if let Ok(d) = item.as_dict() {
+                            dict_opt = Some(d);
+                            break;
+                        }
+                    }
+                }
+            }
+            if let Some(dict) = dict_opt {
+                has_decode_parms = true;
+                if let Ok(p) = dict.get(b"Predictor").and_then(|o| o.as_i64()) {
+                    predictor = p;
+                }
+                if let Ok(c) = dict.get(b"Columns").and_then(|o| o.as_i64()) {
+                    if c > 0 {
+                        columns = c as usize;
+                    }
+                }
+                if let Ok(clr) = dict.get(b"Colors").and_then(|o| o.as_i64()) {
+                    if clr > 0 {
+                        colors = clr as usize;
+                    }
+                }
+            }
+        }
+
         let filters = img.filters.clone().unwrap_or_default();
-        let data: Vec<u8> = if filters.iter().any(|f| f == "FlateDecode" || f == "Fl") {
-            // Decompress zlib/deflate stream
-            // lopdf stores raw compressed bytes in `content`; decompress via flate2
+        let is_flate = filters.iter().any(|f| f == "FlateDecode" || f == "Fl");
+        let is_dct = filters.iter().any(|f| f == "DCTDecode" || f == "DCT");
+
+        let data: Vec<u8> = if is_flate {
             let mut decoder = flate2::read::ZlibDecoder::new(img.content);
-            let mut buf = Vec::with_capacity((w as usize) * (h as usize) * if is_gray {1} else {3});
-            if decoder.read_to_end(&mut buf).is_err() {
-                // Fallback: try raw deflate (no zlib header) – some producers use it
+            let mut buf = Vec::with_capacity((w as usize) * (h as usize) * if is_gray { 1 } else { 3 } + h as usize);
+            let ok = decoder.read_to_end(&mut buf).is_ok();
+            if !ok {
                 let mut decoder2 = flate2::read::DeflateDecoder::new(img.content);
                 buf.clear();
                 if decoder2.read_to_end(&mut buf).is_err() {
                     return None;
                 }
-                buf
+            }
+            // PNG Predictor handling (Predictor 10-15 per PDF spec, maps to PNG filters)
+            if predictor >= 10 {
+                let bpp = colors;
+                match lopdf::filters::png::decode_frame(&buf, bpp, columns) {
+                    Ok(decoded) => decoded,
+                    Err(e) => {
+                        eprintln!("png predictor decode failed (predictor={} columns={} colors={} bpp={}): {} -> fallback to pdftoppm", predictor, columns, colors, bpp, e);
+                        return None;
+                    }
+                }
+            } else if !has_decode_parms {
+                let row_len = w as usize * if is_gray { 1 } else { 3 };
+                if buf.len() == (row_len + 1) * h as usize {
+                    let bpp = if is_gray { 1 } else { 3 };
+                    if let Ok(decoded) = lopdf::filters::png::decode_frame(&buf, bpp, w as usize) {
+                        decoded
+                    } else {
+                        let mut all_zero = true;
+                        for row in 0..h as usize {
+                            if buf[row * (row_len + 1)] != 0 {
+                                all_zero = false;
+                                break;
+                            }
+                        }
+                        if all_zero {
+                            let mut stripped = Vec::with_capacity(row_len * h as usize);
+                            for row in 0..h as usize {
+                                let off = row * (row_len + 1) + 1;
+                                stripped.extend_from_slice(&buf[off..off + row_len]);
+                            }
+                            stripped
+                        } else {
+                            return None;
+                        }
+                    }
+                } else {
+                    buf
+                }
             } else {
+                if predictor == 2 {
+                    eprintln!("TIFF predictor 2 not implemented, fallback");
+                    return None;
+                }
                 buf
             }
-        } else if filters.iter().any(|f| f == "DCTDecode" || f == "DCT") {
-            // JPEG bytes – decode via image crate
+        } else if is_dct {
             let dyn_img = image::load_from_memory(img.content).ok()?;
             out.push(dyn_img);
             continue;
         } else if filters.is_empty() {
-            // Raw uncompressed
             img.content.to_vec()
         } else {
-            // Unsupported filter (JPXDecode, etc) → fall back
             return None;
         };
 
-        // Validate decompressed size
-        let expected = (w as usize) * (h as usize) * if is_gray {1} else {3};
-        if data.len() != expected {
-            // Some PDFs have PNG predictor bytes (1 byte per row)
-            let row_len = w as usize * if is_gray {1} else {3};
+        let expected = (w as usize) * (h as usize) * if is_gray { 1 } else { 3 };
+        let expected_alt = columns * colors * h as usize;
+        let valid = data.len() == expected || (columns != w as usize && data.len() == expected_alt);
+        if !valid {
+            let row_len = w as usize * if is_gray { 1 } else { 3 };
             if data.len() == (row_len + 1) * h as usize {
-                let mut stripped = Vec::with_capacity(expected);
-                let mut offset = 0usize;
-                for _ in 0..h {
-                    offset += 1; // predictor tag
-                    if offset + row_len > data.len() { return None; }
-                    stripped.extend_from_slice(&data[offset..offset+row_len]);
-                    offset += row_len;
+                let bpp = if is_gray { 1 } else { 3 };
+                if let Ok(decoded) = lopdf::filters::png::decode_frame(&data, bpp, w as usize) {
+                    if decoded.len() == expected {
+                        if is_gray {
+                            let gray = GrayImage::from_raw(w, h, decoded)?;
+                            out.push(DynamicImage::ImageLuma8(gray));
+                        } else {
+                            let rgb = image::RgbImage::from_raw(w, h, decoded)?;
+                            out.push(DynamicImage::ImageRgb8(rgb));
+                        }
+                        continue;
+                    }
                 }
-                if is_gray {
-                    let gray = GrayImage::from_raw(w, h, stripped)?;
-                    out.push(DynamicImage::ImageLuma8(gray));
-                } else {
-                    let rgb = image::RgbImage::from_raw(w, h, stripped)?;
-                    let dyn_rgb = DynamicImage::ImageRgb8(rgb);
-                    out.push(dyn_rgb);
-                }
-                continue;
-            } else {
-                return None;
             }
+            return None;
+        }
+
+        if data.len() != expected {
+            return None;
         }
 
         if is_gray {
             let gray = GrayImage::from_raw(w, h, data)?;
             out.push(DynamicImage::ImageLuma8(gray));
         } else {
-            // DeviceRGB → to_luma8 for OCR pipeline compatibility (same as pdftoppm png → to_luma8 later)
             let rgb = image::RgbImage::from_raw(w, h, data)?;
-            let dyn_rgb = DynamicImage::ImageRgb8(rgb);
-            out.push(dyn_rgb);
+            out.push(DynamicImage::ImageRgb8(rgb));
         }
     }
 
     if out.len() == pages.len() {
-        eprintln!("fast raster extract: {} pages via Flate/DCT ({}x{} DeviceGray)", out.len(), out[0].width(), out[0].height());
+        eprintln!("fast raster extract: {} pages via Flate/DCT ({}x{} {})", out.len(), out[0].width(), out[0].height(), if out[0].color().has_alpha() { "RGBA" } else { "Gray/RGB" });
         Some(out)
     } else {
         None
     }
 }
+
 
 // ---------------------------------------------------------------------------
 // Rasterize stage entry point

@@ -21,12 +21,22 @@ if [ -z "$CHROME" ]; then
     exit 1
 fi
 
+USER_DATA_DIR="${TMPDIR:-/home/hatch/workspace/tmp}/chrome-pdf-$$"
+mkdir -p "$USER_DATA_DIR"
+
 "$CHROME" --headless --disable-gpu --no-sandbox \
+    --user-data-dir="$USER_DATA_DIR" \
+    --disable-dev-shm-usage \
     --host-resolver-rules="MAP * ~NOTFOUND" \
     --print-to-pdf="$OUTPUT" \
     --print-to-pdf-no-header \
     --run-all-compositor-stages-before-draw \
-    --virtual-time-budget=5000 \
+    --virtual-time-budget=15000 \
     "$INPUT" 2>/dev/null
+RET=$?
+rm -rf "$USER_DATA_DIR" 2>/dev/null || true
+if [ $RET -ne 0 ]; then
+  exit $RET
+fi
 
 echo "$OUTPUT"
