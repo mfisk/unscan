@@ -31,16 +31,44 @@ pub fn quant_half_width_px() -> f64 {
 
 /// Quantized likelihood: ln[ Φ((e+a)/σ) - Φ((e-a)/σ) ] - ln(2a)
 /// Φ via libm::erf. a = half-width, σ = per-axis sigma.
+///
+/// Stable for large |e|: for |e|>a the interval is one-sided, use erfc difference
+/// which retains precision up to ~1e-300. When erfc underflows, fall back to
+/// Gaussian pdf approximation: ln[ N(e;0,σ²) ] = -0.5*(e/σ)² - ln(σ√2π)
 #[inline]
 pub fn quantized_ll(e: f64, sigma: f64, half_width: f64) -> f64 {
     let sigma = sigma.max(1e-12);
     let a = half_width;
-    let upper = (e + a) / sigma;
-    let lower = (e - a) / sigma;
+    let e_abs = e.abs();
+    // Two-sided case: interval straddles 0 (|e| <= a). Difference of CDFs includes ~0.5,
+    // erf is stable here.
+    if e_abs <= a {
+        let upper = (e + a) / sigma;
+        let lower = (e - a) / sigma;
+        const FRAC_1_SQRT_2: f64 = std::f64::consts::FRAC_1_SQRT_2;
+        let phi_upper = 0.5 * (1.0 + libm::erf(upper * FRAC_1_SQRT_2));
+        let phi_lower = 0.5 * (1.0 + libm::erf(lower * FRAC_1_SQRT_2));
+        let prob = (phi_upper - phi_lower).max(1e-300);
+        return prob.ln() - (2.0 * a).ln();
+    }
+    // One-sided: |e| > a, interval entirely positive (after folding via symmetry).
+    // prob = Φ((|e|+a)/σ) - Φ((|e|-a)/σ) = 0.5*erfc((|e|-a)/σ/√2) - 0.5*erfc((|e|+a)/σ/√2)
+    let lower_abs = (e_abs - a) / sigma;
+    let upper_abs = (e_abs + a) / sigma;
     const FRAC_1_SQRT_2: f64 = std::f64::consts::FRAC_1_SQRT_2;
-    let phi_upper = 0.5 * (1.0 + libm::erf(upper * FRAC_1_SQRT_2));
-    let phi_lower = 0.5 * (1.0 + libm::erf(lower * FRAC_1_SQRT_2));
-    let prob = (phi_upper - phi_lower).max(1e-300);
+    let z_lower = lower_abs * FRAC_1_SQRT_2;
+    let z_upper = upper_abs * FRAC_1_SQRT_2;
+    let erfc_lower = libm::erfc(z_lower);
+    let erfc_upper = libm::erfc(z_upper);
+    let mut prob = 0.5 * (erfc_lower - erfc_upper);
+    if prob <= 1e-300 || !prob.is_finite() || prob <= 0.0 {
+        // Asymptotic Gaussian pdf approximation for extreme tails.
+        // prob ≈ (2a) * N(e;0,σ²)  =>  prob/(2a) ≈ N(e)  =>  ll = ln N(e)
+        // ln N(e) = -0.5*(e/σ)² - ln(σ√2π)
+        let log_norm = -0.5 * (e_abs / sigma) * (e_abs / sigma) - (sigma * (2.0 * std::f64::consts::PI).sqrt()).ln();
+        return log_norm;
+    }
+    prob = prob.max(1e-300);
     prob.ln() - (2.0 * a).ln()
 }
 

@@ -108,74 +108,52 @@ pub fn measure_char_ink_bounds(
     for i in 0..n_chars {
         let b_left = bounds[i];
         let b_right = bounds[i + 1];
-        let left_seam = seam_paths.get(&b_left);
-        let right_seam = seam_paths.get(&b_right);
-
-        // Expanded crop bounds that include seam excursions, same as crop_ngram
-        // (scan crop does seam handling by whitening outside, trim itself uses no edges)
-        let x0_exp = if let Some(sp) = left_seam {
-            sp.iter().map(|p| p[1]).min().unwrap_or(b_left).min(b_left)
-        } else {
-            b_left
-        }.min(w) as usize;
-        let x1_exp = if let Some(sp) = right_seam {
-            sp.iter().map(|p| p[1]).max().unwrap_or(b_right).max(b_right).saturating_add(1)
-        } else {
-            b_right
-        }.min(w) as usize;
-
-        if x0_exp >= x1_exp {
+        let x0_rect = b_left.min(w.saturating_sub(1)) as usize;
+        let x1_rect = b_right.min(w) as usize;
+        if x0_rect >= x1_rect {
             result.push(CharInkBounds {
-                cx: x0_exp as f64,
+                cx: x0_rect as f64,
                 cy: h as f64 / 2.0,
                 width: 0.0,
                 height: 0.0,
-                x_min: x0_exp as u32,
-                x_max: x0_exp as u32,
+                x_min: x0_rect as u32,
+                x_max: x0_rect as u32,
                 y_min: 0,
                 y_max: h,
             });
             continue;
         }
 
-        // Find ink bounds within seam-masked crop — trim does not use edges,
-        // it only finds dark pixels in the already-masked crop (seam handling
-        // done by whitening in scan-crop creation, mirrored here).
-        let mut x_min = x1_exp;
-        let mut x_max = x0_exp;
+        let left_seam = seam_paths.get(&b_left);
+        let right_seam = seam_paths.get(&b_right);
+
+        // Find ink bounds within this character's seam-masked x-range
+        let mut x_min = x1_rect;
+        let mut x_max = x0_rect;
         let mut y_min = h as usize;
         let mut y_max = 0usize;
         let mut has_ink = false;
 
         for y in 0..h as usize {
-            // Seam handling (whitening) is part of scan-crop, not trim.
-            // Here we mirror that whitening to get the same masked image,
-            // but trim itself is just min/max of remaining ink.
-            let mut left_limit = x0_exp;
-            let mut right_limit = x1_exp;
+            // Determine per-row left/right limits from seams (same as crop_ngram)
+            let mut left_limit = x0_rect;
+            let mut right_limit = x1_rect;
 
             if let Some(sp) = left_seam {
                 if let Some(seam_x) = sp.iter().filter(|p| p[0] as usize == y).map(|p| p[1] as usize).min() {
                     // left seam: ink must be >= seam_x
-                    left_limit = seam_x;
+                    left_limit = seam_x.max(x0_rect).min(x1_rect);
                 }
             }
             if let Some(sp) = right_seam {
                 if let Some(seam_x) = sp.iter().filter(|p| p[0] as usize == y).map(|p| p[1] as usize).max() {
-                    // right seam: ink must be < seam_x
-                    right_limit = seam_x;
+                    // right seam: ink must be < seam_x (crop_ngram whites out >= seam_x)
+                    right_limit = seam_x.min(x1_rect).max(left_limit);
                 }
-            }
-            // Clamp to image, keep ordering
-            left_limit = left_limit.min(w as usize);
-            right_limit = right_limit.min(w as usize);
-            if left_limit > right_limit {
-                continue;
             }
             // For uniform fallback (no seams) left_limit==x0_rect, right_limit==x1_rect
 
             for x in left_limit..right_limit {
-                // Raw buffer access: y*w + x, avoids per-pixel bounds check in ImageBuffer
                 let pixel = {
                     let base = y * w_us;
                     raw_word[base + x]
@@ -191,15 +169,15 @@ pub fn measure_char_ink_bounds(
         }
 
         let cb = if !has_ink {
-            let cx = (x0_exp + x1_exp) as f64 / 2.0;
+            let cx = (x0_rect + x1_rect) as f64 / 2.0;
             let cy = h as f64 / 2.0;
             CharInkBounds {
                 cx,
                 cy,
-                width: (x1_exp - x0_exp) as f64,
+                width: (x1_rect - x0_rect) as f64,
                 height: h as f64,
-                x_min: x0_exp as u32,
-                x_max: x1_exp as u32,
+                x_min: x0_rect as u32,
+                x_max: x1_rect as u32,
                 y_min: 0,
                 y_max: h,
             }
@@ -234,6 +212,7 @@ fn per_char_geo_cached_with_threshold(
     geo_cache: &crate::geo_cache::GeometryCache,
     prune_threshold: Option<f32>,
 ) -> Option<Vec<PerCharGeo>> {
+    let _ = prune_threshold; // threshold no longer aborts; pruning happens in font_match on min_ll
     if !geo_cache.has_font(font_key) {
         return None;
     }
@@ -258,9 +237,14 @@ fn per_char_geo_cached_with_threshold(
         // scoring remaining chars.
         let Some(preds_fu_ext) = geo_cache.predict_glyph_positions_and_extents(font_key, &ws.chars) else { return None; };
         if preds_fu_ext.len() != word_bounds.len() {
-            // Ligature merge: e.g. "ff" plain shaped to 1 glyph but we have 2 bounds → skip geo for this word.
-            // Single-glyph cases (1 char word, or lig path with FB00) will have len==1 and pass.
-            // This is segmentation mismatch, not missing glyph, so skip word not abort font.
+            // Ligature path mismatch: font cannot render the ligature segmentation (e.g. lacks ff liga
+            // or lacks FB00 cmap with correct advance). For lig path this font is invalid for this
+            // segmentation — it would get empty geo (0 penalty) and unfairly beat fonts that do
+            // support the ligature and incur small negative geo. Prune it from this path.
+            if ws.chars.iter().any(|c| crate::font_scan::is_ligature_char(*c)) {
+                return None;
+            }
+            // Plain path "ff" → 1 glyph (liga enabled elsewhere) but we have 2 bounds — skip word, not font.
             continue;
         }
         // Perf slice 3: avoid two intermediate Vec allocs (preds_fu, preds) per word per font.
@@ -314,14 +298,6 @@ fn per_char_geo_cached_with_threshold(
             let v_err = obs_cy_rel - pred_cy_rel;
             let v_ll = quantized_ll(v_err, SIGMA_CENTER_PX, quant_half_width_px());
 
-            // Vertical-first short-circuit: h_ll <= 0 always, so h_ll+v_ll <= v_ll.
-            // If v_ll alone is already below threshold, the sum will be too, no need to compute h.
-            if let Some(t) = prune_threshold {
-                if (v_ll as f32) < t {
-                    return None;
-                }
-            }
-
             let (obs_pitch, pred_pitch, h_err, h_ll) = if orig_idx == 0 {
                 (None, None, None, 0.0)
             } else {
@@ -333,13 +309,6 @@ fn per_char_geo_cached_with_threshold(
                 let h_ll_val = quantized_ll(h_err_val, SIGMA_PITCH_PX, quant_half_width_px());
                 (Some(obs_pitch_val), Some(pred_pitch_val), Some(h_err_val), h_ll_val)
             };
-
-            // Check full sum after h is known (for orig_idx>0, h may push sum below threshold)
-            if let Some(t) = prune_threshold {
-                if ((v_ll + h_ll) as f32) < t {
-                    return None;
-                }
-            }
 
             result.push(PerCharGeo {
                 seg_idx,
@@ -386,6 +355,8 @@ fn per_char_geo_shaped_with_threshold(
     font_registry: &crate::font_scan::FontRegistry,
     prune_threshold: Option<f32>,
 ) -> Option<Vec<PerCharGeo>> {
+    let _ = prune_threshold; // see cached version: no early abort
+
     let fe = font_registry.by_key(font_key)?;
     let font_data = font_cache.load(&fe.path).ok()?;
     let mut face = unprint_fonts::rustybuzz::Face::from_slice(&font_data, 0)?;
@@ -427,6 +398,12 @@ fn per_char_geo_shaped_with_threshold(
         // short-circuit: we rule the font out immediately as impossible.
         let sw = crate::layout::shape_word(&face, &base_features, text, allow_liga)?;
         if sw.glyph_ids.len() != bounds_vec.len() {
+            if is_lig_word {
+                // Font on lig path without ligature support would get empty geo (0 penalty)
+                // and beat fonts that do support the ligature. For correctness, prune it
+                // from lig path entirely — it can only compete on plain path.
+                return None;
+            }
             continue;
         }
 
@@ -490,13 +467,6 @@ fn per_char_geo_shaped_with_threshold(
             let v_err = obs_cy_rel - pred_cy_rel;
             let v_ll = quantized_ll(v_err, SIGMA_CENTER_PX, quant_half_width_px());
 
-            // Vertical-first short-circuit: h <=0, so if v < threshold, sum < threshold
-            if let Some(t) = prune_threshold {
-                if (v_ll as f32) < t {
-                    return None;
-                }
-            }
-
             let (obs_pitch, pred_pitch, h_err, h_ll) = if orig_idx == 0 {
                 (None, None, None, 0.0)
             } else {
@@ -508,12 +478,6 @@ fn per_char_geo_shaped_with_threshold(
                 let h_ll_val = quantized_ll(h_err_val, SIGMA_PITCH_PX, quant_half_width_px());
                 (Some(obs_pitch_val), Some(pred_pitch_val), Some(h_err_val), h_ll_val)
             };
-
-            if let Some(t) = prune_threshold {
-                if ((v_ll + h_ll) as f32) < t {
-                    return None;
-                }
-            }
 
             result.push(PerCharGeo {
                 seg_idx,

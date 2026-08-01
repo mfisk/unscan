@@ -720,17 +720,24 @@ pub fn build_scoring_windows_with_geo<'a>(
                     metas.push((seg_idx, pos, c));
                 }
             } else {
-                // Fallback for missing ink: use uniform partition in word coords
-                let w = seg.word_img.width();
-                let n = seg.chars.len().max(1) as f32;
-                let b_l = (pos as f32 * w as f32 / n).round() as u32;
-                let b_r = ((pos + 1) as f32 * w as f32 / n).round() as u32;
+                // Fallback for missing ink: use boundaries when available, else uniform.
+                // Uniform (pos*W/n) is inaccurate for proportional fonts and causes 5px h_err -> -690 ll.
+                // Using b_left/b_right from segmentation preserves proportional spacing.
+                let (b_l, b_r) = if pos + 1 < seg.boundaries.len() {
+                    (seg.boundaries[pos], seg.boundaries[pos + 1])
+                } else {
+                    let w = seg.word_img.width();
+                    let n = seg.chars.len().max(1) as f32;
+                    let l = (pos as f32 * w as f32 / n).round() as u32;
+                    let r = ((pos + 1) as f32 * w as f32 / n).round() as u32;
+                    (l, r)
+                };
                 let cx = (b_l as f64 + b_r as f64) * 0.5;
                 let cy = seg.word_img.height() as f64 * 0.5;
                 let cb = CharInkBounds {
                     cx,
                     cy,
-                    width: (b_r.saturating_sub(b_l)) as f64,
+                    width: b_r.saturating_sub(b_l) as f64,
                     height: seg.word_img.height() as f64,
                     x_min: b_l,
                     x_max: b_r,

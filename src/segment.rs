@@ -1625,6 +1625,8 @@ pub fn crop_ngram(
     let left_seam = seam_paths.get(&b_left);
     let right_seam = seam_paths.get(&b_right);
 
+    // Expanded bounds to include winding seam excursions (pre-1cfca57 crop_ngram behavior),
+    // but with clamped, ordered limits to avoid 5px h_err -> -690 ll.
     let x0 = if let Some(sp) = left_seam {
         sp.iter().map(|p| p[1]).min().unwrap_or(b_left).min(b_left)
     } else {
@@ -1651,22 +1653,31 @@ pub fn crop_ngram(
         let stride = cw_us;
         for y in 0..ch_us {
             let base = y * stride;
+            // Clamped, ordered limits - mirrors measure_char_ink_bounds pre-1cfca57
+            let mut left_limit = x0;
+            let mut right_limit = x1;
             if let Some(sp) = left_seam {
                 if let Some(seam_x) = sp.iter().filter(|p| p[0] == y as u32).map(|p| p[1]).min() {
-                    let limit = (seam_x.saturating_sub(x0)) as usize;
-                    let len = limit.min(cw_us);
-                    if len > 0 {
-                        raw[base..base + len].fill(255);
-                    }
+                    left_limit = seam_x.max(x0).min(x1);
                 }
             }
             if let Some(sp) = right_seam {
                 if let Some(seam_x) = sp.iter().filter(|p| p[0] == y as u32).map(|p| p[1]).max() {
-                    let start = (seam_x.saturating_sub(x0)) as usize;
-                    if start < cw_us {
-                        raw[base + start..base + cw_us].fill(255);
-                    }
+                    let r = seam_x.max(x0).min(x1);
+                    right_limit = r.max(left_limit);
                 }
+            }
+            if left_limit >= x1 || right_limit <= x0 {
+                raw[base..base + cw_us].fill(255);
+                continue;
+            }
+            let l = (left_limit - x0) as usize;
+            let r = (right_limit - x0) as usize;
+            if l > 0 {
+                raw[base..base + l.min(cw_us)].fill(255);
+            }
+            if r < cw_us {
+                raw[base + r..base + cw_us].fill(255);
             }
         }
     }
@@ -1695,6 +1706,12 @@ pub fn char_crop_and_metrics(
     let left_seam = seam_paths.get(&b_left);
     let right_seam = seam_paths.get(&b_right);
 
+    // Restore original clamped bounds: use nominal b_left/b_right, not expanded
+    // seam excursions. Expanded bounds shift cx for narrow glyphs (v,w,x,l,n) and
+    // Single source crop: expanded bounds to include winding seam excursions
+    // (avoids clipping ffi etc), but with clamped, ordered seam limits to avoid
+    // 5px h_err -> -690 ll. This merges pre-1cfca57 measure_char_ink_bounds (clamped)
+    // with pre-1cfca57 crop_ngram (expanded) into one correct implementation.
     let x0 = if let Some(sp) = left_seam {
         sp.iter().map(|p| p[1]).min().unwrap_or(b_left).min(b_left)
     } else {
@@ -1719,23 +1736,40 @@ pub fn char_crop_and_metrics(
         let stride = cw_us;
         for y in 0..ch_us {
             let base = y * stride;
+            // Determine per-row clamped limits from seams (mirrors measure_char_ink_bounds)
+            let mut left_limit = x0;
+            let mut right_limit = x1;
+
             if let Some(sp) = left_seam {
                 if let Some(seam_x) = sp.iter().filter(|p| p[0] == y as u32).map(|p| p[1]).min() {
-                    let limit = seam_x.saturating_sub(x0);
-                    let end = (limit + 1).min(crop_w) as usize;
-                    if end > 0 {
-                        raw[base..base + end].fill(255);
-                    }
+                    // clamp seam to [x0, x1] and require ink >= seam
+                    left_limit = seam_x.max(x0).min(x1);
                 }
             }
             if let Some(sp) = right_seam {
                 if let Some(seam_x) = sp.iter().filter(|p| p[0] == y as u32).map(|p| p[1]).max() {
-                    let start = seam_x.saturating_sub(x0);
-                    let s = (start + 1).min(crop_w) as usize;
-                    if s < cw_us {
-                        raw[base + s..base + cw_us].fill(255);
-                    }
+                    // clamp and ensure ordering: right >= left
+                    let r = seam_x.max(x0).min(x1);
+                    right_limit = r.max(left_limit);
                 }
+            }
+            // right_limit is at least left_limit by construction
+            if left_limit >= x1 {
+                // left seam at/ beyond right edge: no ink can satisfy
+                raw[base..base + cw_us].fill(255);
+                continue;
+            }
+            if right_limit <= x0 {
+                raw[base..base + cw_us].fill(255);
+                continue;
+            }
+            let l = (left_limit - x0) as usize;
+            let r = (right_limit - x0) as usize;
+            if l > 0 {
+                raw[base..base + l.min(cw_us)].fill(255);
+            }
+            if r < cw_us {
+                raw[base + r..base + cw_us].fill(255);
             }
         }
     }
