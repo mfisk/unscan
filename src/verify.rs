@@ -89,6 +89,7 @@ pub fn verify_text_region(
     allow_liga: bool,
     audit_dir: Option<&std::path::Path>,
     bail_below: Option<f32>,
+    override_em_px: Option<f32>,
 ) -> VerifyResult {
     let (w, h) = scan_crop.dimensions();
 
@@ -98,6 +99,12 @@ pub fn verify_text_region(
 
     // Page-level Hough deskew already corrected the full page before we get
     // here, so no per-line rotation needed.
+    //
+    // Word boxes are already tight ink bboxes produced upstream:
+    //   expand_words_to_ink -> fix_overlapping_words_by_ink -> trim_words_to_ink
+    // in page_cache.rs.  Do NOT re-derive ink runs, split, or merge words here —
+    // spacing and splitting are handled up front.  Use the boxes as-is with
+    // uniform line scale (midpoint-derived override_em_px).
     let placements: Vec<WordPlacement> = words
         .iter()
         .map(|wr| WordPlacement {
@@ -123,6 +130,7 @@ pub fn verify_text_region(
         variant_tag,
         variations,
         allow_liga,
+        override_em_px,
     ) {
         Some(r) => r,
         None => return VerifyResult { score: 0.0, dy: 0, render_ink: None, diff: None },
@@ -215,6 +223,7 @@ fn render_via_freetype_scaled(
     variant_tag: &str,
     variations: Option<&[([u8; 4], f32)]>,
     allow_liga: bool,
+    override_em_px: Option<f32>,
 ) -> Option<GrayImage> {
     // NOTE: ab_glyph fallback disabled.  width_matched_em_px (ab_glyph) does
     // not compensate for sidebearings, so it systematically underestimates font
@@ -229,6 +238,7 @@ fn render_via_freetype_scaled(
         variant_tag,
         variations,
         allow_liga,
+        override_em_px,
     )
 }
 
@@ -243,6 +253,7 @@ fn render_via_freetype(
     variant_tag: &str,
     variations: Option<&[([u8; 4], f32)]>,
     allow_liga: bool,
+    override_em_px: Option<f32>,
 ) -> Option<GrayImage> {
     use std::cell::RefCell;
 
@@ -262,24 +273,33 @@ fn render_via_freetype(
             font_ref.set_variation(tag, *val);
         }
     }
-    let mut all_em: Vec<f32> = words.iter()
-        .filter(|w| !w.text.is_empty() && w.width >= 1)
-        .filter_map(|w| {
-            crate::layout::width_matched_em_px_shaped(
-                font_data,
-                &w.text,
-                w.width as f32,
-                variant_tag,
-                variations,
-                allow_liga,
-            )
-        })
-        .collect();
-    if all_em.is_empty() {
-        return None;
-    }
-    all_em.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
-    let line_em_px = all_em[all_em.len() / 2];
+    // Font size: prefer midpoint-derived override (scale = obs_span/pred_span * upem)
+    // which reuses the exact scale calculation from geometry scoring.
+    // If no override is provided, fall back to width-matched median (legacy).
+    let line_em_px: f32 = if let Some(ov) = override_em_px {
+        if ov.is_finite() && ov >= 4.0 && ov <= 500.0 {
+            ov
+        } else {
+            // Invalid override — fall through to width-matched
+            let mut ems: Vec<f32> = words.iter()
+                .filter(|w| !w.text.is_empty() && w.width >= 1)
+                .filter_map(|w| crate::layout::width_matched_em_px_shaped(
+                    font_data, &w.text, w.width as f32, variant_tag, variations, allow_liga,
+                )).collect();
+            if ems.is_empty() { return None; }
+            ems.sort_by(|a,b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
+            ems[ems.len()/2]
+        }
+    } else {
+        let mut ems: Vec<f32> = words.iter()
+            .filter(|w| !w.text.is_empty() && w.width >= 1)
+            .filter_map(|w| crate::layout::width_matched_em_px_shaped(
+                font_data, &w.text, w.width as f32, variant_tag, variations, allow_liga,
+            )).collect();
+        if ems.is_empty() { return None; }
+        ems.sort_by(|a,b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
+        ems[ems.len()/2]
+    };
 
     // Pad the render canvas so italic overshoot / wide terminal strokes
     // aren't clipped.  After rendering, we trim back to the scan width.

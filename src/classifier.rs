@@ -97,23 +97,33 @@ fn stash_obs_stats(min_d: f32, dists: &[(u32, f32)], sigma_sq: f32, med_nn: f32,
 
 /// Shared softmax probability computation over pre-computed squared distances.
 /// Both ImageModel and MmapNgramModel delegate here to avoid duplication.
-fn softmax_probs(dists: &[(u32, f32)], sigma_sq: f32, med_nn: f32) -> Vec<(u32, f32)> {
-    if dists.is_empty() { return Vec::new(); }
+/// Returns probabilities in input order plus uniform flag (true when all p equal).
+#[inline]
+fn softmax_unsorted(dists: &[(u32, f32)], sigma_sq: f32, med_nn: f32) -> (Vec<(u32, f32)>, bool) {
+    if dists.is_empty() { return (Vec::new(), true); }
     let sigma = if sigma_sq > 1e-30 {
         sigma_sq
     } else {
         let p = 1.0 / dists.len() as f32;
-        return dists.iter().map(|(id, _)| (*id, p)).collect();
+        let uniform: Vec<(u32, f32)> = dists.iter().map(|(id, _)| (*id, p)).collect();
+        // For degenerate sigma, OOD weight is 1.0 and min_d is 0 → stash with min_d=0
+        // to match previous early-return behaviour (no min_d calc originally).
+        // Compute min_d for stash consistency anyway.
+        let min_d = dists.iter().map(|(_, d)| *d).fold(f32::INFINITY, f32::min);
+        let ood_w = 1.0;
+        LAST_OOD_WEIGHT.with(|cell| cell.set(ood_w));
+        stash_obs_stats(min_d, dists, sigma_sq, med_nn, &uniform);
+        return (uniform, true);
     };
     let inv2s = 1.0 / (2.0 * sigma);
     let min_d = dists.iter().map(|(_, d)| *d).fold(f32::INFINITY, f32::min);
     let raw: Vec<f32> = dists.iter().map(|(_, d)| (-(d - min_d) * inv2s).exp()).collect();
     let sum: f32 = raw.iter().sum();
-    let softmax: Vec<(u32, f32)> = if sum < 1e-30 {
+    let (softmax, is_uniform) = if sum < 1e-30 {
         let p = 1.0 / dists.len() as f32;
-        dists.iter().map(|(id, _)| (*id, p)).collect()
+        (dists.iter().map(|(id, _)| (*id, p)).collect::<Vec<(u32, f32)>>(), true)
     } else {
-        dists.iter().zip(raw.iter()).map(|((id, _), &r)| (*id, r / sum)).collect()
+        (dists.iter().zip(raw.iter()).map(|((id, _), &r)| (*id, r / sum)).collect::<Vec<(u32, f32)>>(), false)
     };
     // Always stash OOD confidence weight (not gated by UNPRINT_OBS_STATS)
     let ood_w = if min_d > 1e-30 && med_nn > 1e-30 {
@@ -123,8 +133,42 @@ fn softmax_probs(dists: &[(u32, f32)], sigma_sq: f32, med_nn: f32) -> Vec<(u32, 
     };
     LAST_OOD_WEIGHT.with(|cell| cell.set(ood_w));
     stash_obs_stats(min_d, dists, sigma, med_nn, &softmax);
-    let mut probs = softmax;
-    probs.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
+    (softmax, is_uniform)
+}
+
+/// Shared softmax probability computation over pre-computed squared distances.
+/// Both ImageModel and MmapNgramModel delegate here to avoid duplication.
+fn softmax_probs(dists: &[(u32, f32)], sigma_sq: f32, med_nn: f32) -> Vec<(u32, f32)> {
+    let (mut probs, is_uniform) = softmax_unsorted(dists, sigma_sq, med_nn);
+    if is_uniform {
+        // Preserve original behaviour: uniform returns input order (no sort)
+        return probs;
+    }
+    // Perf: prob tie → glyph_id asc for deterministic top-k (affects candidate fonts & path winner, needed for stable t59).
+    probs.sort_unstable_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal).then_with(|| a.0.cmp(&b.0)));
+    probs
+}
+
+/// Select top-k by (prob desc, id asc) without full sort.
+/// Preserves original uniform-input-order behaviour for uniform case.
+#[inline]
+fn top_k_by_prob(mut probs: Vec<(u32, f32)>, k: usize, is_uniform: bool) -> Vec<(u32, f32)> {
+    if probs.len() <= k || is_uniform {
+        // Uniform: keep input order, just truncate, to match original softmax_probs→truncate
+        // Non-uniform small vec: full sort is cheaper than select_nth overhead
+        if !is_uniform && probs.len() > 1 {
+            probs.sort_unstable_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal).then_with(|| a.0.cmp(&b.0)));
+        }
+        probs.truncate(k);
+        return probs;
+    }
+    // Partial selection O(n) + sort top k O(k log k)
+    let kth = k - 1;
+    probs.select_nth_unstable_by(kth, |a, b| {
+        b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal).then_with(|| a.0.cmp(&b.0))
+    });
+    probs.truncate(k);
+    probs.sort_unstable_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal).then_with(|| a.0.cmp(&b.0)));
     probs
 }
 
@@ -408,11 +452,15 @@ impl ImageModel {
             .collect()
     }
 
-    /// Top-k fonts by probability.
+    /// Top-k fonts by probability – uses partial selection O(n) + sort top k,
+    /// not full O(n log n) sort, preserving deterministic tie-break (prob desc, id asc).
     pub fn classify(&self, query: &[f32], k: usize) -> Vec<(u32, f32)> {
-        let mut probs = self.probabilities(query);
-        probs.truncate(k);
-        probs
+        if k == 0 { return Vec::new(); }
+        let dists: Vec<(u32, f32)> = self.centroids.iter()
+            .map(|(id, stored)| (*id, sq_euclid(query, stored)))
+            .collect();
+        let (probs, is_uniform) = softmax_unsorted(&dists, self.sigma_sq, self.med_nn);
+        top_k_by_prob(probs, k, is_uniform)
     }
 
     /// Compute σ² from stored centroids (median pairwise squared distance).
@@ -748,12 +796,22 @@ impl MmapNgramModel {
         Some(out)
     }
 
-    /// Top-k fonts by probability for a given char.
+    /// Top-k fonts by probability for a given char – O(n)+ O(k log k) partial selection.
     pub fn classify(&self, seq: &[char], query: &[f32], k: usize) -> Vec<(u32, f32)> {
-        match self.probabilities(seq, query) {
-            Some(mut probs) => { probs.truncate(k); probs }
-            None => Vec::new(),
+        if k == 0 { return Vec::new(); }
+        let e = match self.entries.get(seq) {
+            Some(e) => e,
+            None => return Vec::new(),
+        };
+        if e.n_centroids == 0 { return Vec::new(); }
+        let gids = self.u32_slice(e.glyph_ids_off, e.n_centroids);
+        let mut dists: Vec<(u32, f32)> = Vec::with_capacity(e.n_centroids);
+        for i in 0..e.n_centroids {
+            let v = self.f32_slice(e.vecs_off + i * e.vec_dim * 4, e.vec_dim);
+            dists.push((gids[i], sq_euclid(query, v)));
         }
+        let (probs, is_uniform) = softmax_unsorted(&dists, e.sigma_sq, e.med_nn);
+        top_k_by_prob(probs, k, is_uniform)
     }
 
     /// Number of centroids (fonts) for a character.

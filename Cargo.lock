@@ -2009,26 +2009,49 @@ checksum = "ebc1c04c71510c7f702b52b7c350734c9ff1295c464a03335b00bb84fc54f853"
 name = "unprint"
 version = "0.2.0"
 dependencies = [
- "ab_glyph",
  "base64",
  "clap",
  "font-types 0.2.0",
- "freetype-rs",
  "image",
+ "libm",
  "lopdf",
  "memmap2",
  "pprof",
  "rand 0.8.6",
  "rayon",
  "read-fonts 0.1.4",
- "rustybuzz",
+ "rustc-hash",
  "serde",
  "serde_json",
  "subsetter",
  "tempfile",
  "thiserror 2.0.18",
+ "unprint-fonts",
+ "unprint-geometry",
  "walkdir",
  "write-fonts 0.3.6",
+]
+
+[[package]]
+name = "unprint-fonts"
+version = "0.1.0"
+dependencies = [
+ "ab_glyph",
+ "bitflags 2.11.1",
+ "freetype-rs",
+ "image",
+ "rustybuzz",
+ "thiserror 2.0.18",
+ "ttf-parser 0.24.1",
+]
+
+[[package]]
+name = "unprint-geometry"
+version = "0.1.0"
+dependencies = [
+ "image",
+ "libm",
+ "serde",
 ]
 
 [[package]]

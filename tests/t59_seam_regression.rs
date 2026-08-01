@@ -29,12 +29,13 @@ const EXPECTED: &[(&str, &[&[u32]])] = &[
     ("ABCDEFGHIJKLMNOPQRSTUVWXYZ.", &[
         &[26, 268, 290, 504, 531, 557, 592, 619, 642],
     ]),
-    // 3: OpenSans-400 lowercase — OCR splits into 3 words: "a", "bcdefghij", "klmnopgrstuvwxyz."
-    //    word_segmentation order is [klm..., bcd..., a] as emitted (debug profile)
+    // 3: OpenSans-400 lowercase — OCR splits into 3 words but single-letter "a"
+    //    excluded by segment_line filter chars_in_word.len() <= 1 (commit 7dca36a).
+    //    Remains: "bcdefghij", "klmnopgrstuvwxyz." -> 2 words
+    //    word_segmentation order is [klm..., bcd...] as emitted
     ("abcdefghijklmnopqrstuvwxyz.", &[
         &[241],
         &[94, 146],
-        &[],
     ]),
     // 4: LibreBodoni-400Italic "dogs."
     ("dogs.", &[

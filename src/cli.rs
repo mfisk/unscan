@@ -142,8 +142,8 @@ pub struct Args {
     #[arg(long, env = "UNPRINT_FONT_ALLOWLIST", help_heading = "Cache")]
     pub font_allowlist: Option<String>,
 
-    /// Skip per-font LDA OCR correction (pflda). Env: UNPRINT_SKIP_PFLDA
-    #[arg(long, env = "UNPRINT_SKIP_PFLDA", help_heading = "Cache")]
+    /// Skip per-font LDA OCR correction. Env: UNPRINT_SKIP_OCR_CORRECTION
+    #[arg(long, env = "UNPRINT_SKIP_OCR_CORRECTION", help_heading = "Cache")]
     pub skip_ocr_correction: bool,
 }
 

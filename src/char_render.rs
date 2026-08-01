@@ -265,11 +265,12 @@ pub fn render_ngram_fresh<F: Font>(
     // Normalize: ink-crop, 1px pad, resize to params.height
     let normalized = features::normalize_to_ink_bounds(&canvas, params.height)?;
 
-    // Apply AA variant and optional binarization
-    let aa_applied = params.aa.apply(&normalized);
+    // Optimized AA + binarize: apply_inplace avoids clone for Native (0 alloc) and
+    // reuses buffer for Sharpen (1 alloc vs 2). Binarize uses in-place raw-buffer loop.
+    let base = params.aa.apply_inplace(normalized);
     match params.binarize_threshold {
-        Some(t) => Some(features::binarize(&aa_applied, t)),
-        None => Some(aa_applied),
+        Some(t) => Some(features::binarize_inplace(base, t)),
+        None => Some(base),
     }
 }
 

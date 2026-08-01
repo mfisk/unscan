@@ -4,6 +4,17 @@
 //! - [`match_lines`]: Pass 1 — parallel font matching with SSIM fast path
 //! - [`update_dominant_font`]: dominant font candidate update after Pass 1
 //! - [`paragraph_font_grouping`]: Pass 1.5 — paragraph-level font grouping
+//!
+//! Rule-out via infinite penalty: if a font does not contain a character that
+//! appears in the string, `per_char_geo` returns `None` (cmap miss). The
+//! per-character geometry log-likelihood is `-infinity` (infinitely bad), so the
+//! whole-font score is `-infinity`. The pipeline inserts the font index into
+//! `cannot_render: HashSet<usize>` and skips it before softmax. This skip is
+//! mathematically correct because `exp(-inf)=0`, so softmax probability is 0.
+//! The abort is a valid short-circuit: a missing glyph cannot be rendered, so
+//! the font is ruled out without further scoring. Empty `Vec` is distinct: it
+//! means ligature mismatch (no usable words) and is kept as `Some(empty)` with
+//! SSIM-only scoring, not infinite penalty.
 
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
@@ -71,6 +82,10 @@ pub struct LineMatch {
     pub fast_path: bool,
     /// ZNCC verify score from the fast-path check (so pass 2a can skip re-verification).
     pub fast_path_score: Option<f32>,
+    /// Median em_px derived from midpoint center-span scales (obs_span/pred_span * upem).
+    /// This reuses the exact scale calculation from geometry scoring for font-size,
+    /// fixing L9 fox/jumps too-small issue where width-matched median was dragged down.
+    pub midpoint_em_px: Option<f32>,
     /// Per-word segmentation summaries for audit integration.
     pub word_seg_summaries: Vec<crate::audit::WordSegSummary>,
     /// PFLDA OCR corrections with decision data.
@@ -208,6 +223,7 @@ pub fn match_lines(
                 true,
                 None,
                 Some(FAST_PATH_MIN_SSIM),
+                None,
             );
             if vr.score >= FAST_PATH_MIN_SSIM {
                 fast_path_hits.fetch_add(1, Ordering::Relaxed);
@@ -240,6 +256,7 @@ pub fn match_lines(
                     corrected_words: None,
                     fast_path: true,
                     fast_path_score: Some(vr.score),
+                    midpoint_em_px: None,
                     word_seg_summaries: Vec::new(),
                     ocr_corrections: Vec::new(),
                 };
@@ -357,7 +374,7 @@ pub fn match_lines(
             );
 
             // ── Score ligature path (if present) ─────────────────
-            let scoring_lig = if let Some(ref lig_segs) = line_crops.lig_word_segs {
+            let mut scoring_lig = if let Some(ref lig_segs) = line_crops.lig_word_segs {
                 let (lig_windows, lig_pm, wib_lig_tmp) = crate::ngram::build_scoring_windows_with_geo(
                     lig_segs,
                     &mut crop_store_lig,
@@ -386,48 +403,43 @@ pub fn match_lines(
                 .unwrap_or(f32::MIN);
             let use_lig = scoring_lig.is_some() && lig_top > plain_top;
 
-            let scoring = if use_lig {
-                scoring_lig.as_ref().unwrap()
+            // Optimized: move owned Vecs instead of cloning Strings per score.
+            // No String clone per font; ownership is transferred via into_iter().
+            if use_lig {
+                let lig_res = scoring_lig.take().unwrap();
+                let plain_res = scoring_plain;
+                font_scores = lig_res.scores.into_iter().map(|(k, s)| (k, Some(s))).collect();
+                observations = lig_res.observations;
+                font_scores_lig = plain_res.scores.into_iter().map(|(k, s)| (k, Some(s))).collect();
+                observations_lig = plain_res.observations;
+                seg_winner = Some("ligature".to_string());
             } else {
-                &scoring_plain
-            };
-
-            // Store both paths for audit
-            font_scores = scoring.scores.iter()
-                .map(|(fk, score)| (fk.clone(), Some(*score))).collect();
-            observations = scoring.observations.clone();
-
-            // Store the alternate path for audit
-            let (scores_lig_audit, obs_lig_audit) = if let Some(ref lig_result) = scoring_lig {
-                (lig_result.scores.iter().map(|(fk, s)| (fk.clone(), Some(*s))).collect::<Vec<_>>(),
-                 lig_result.observations.clone())
-            } else {
-                (Vec::new(), Vec::new())
-            };
-            let (scores_plain_audit, obs_plain_audit) = (
-                scoring_plain.scores.iter().map(|(fk, s)| (fk.clone(), Some(*s))).collect::<Vec<_>>(),
-                scoring_plain.observations.clone(),
-            );
-
-            // Store both in the LineMatch for audit output
-            font_scores_lig = if use_lig { scores_plain_audit } else { scores_lig_audit };
-            observations_lig = if use_lig { obs_plain_audit } else { obs_lig_audit };
-            seg_winner = if scoring_lig.is_some() {
-                Some(if use_lig { "ligature".to_string() } else { "plain".to_string() })
-            } else {
-                None
-            };
+                let plain_res = scoring_plain;
+                let lig_opt = scoring_lig.take();
+                font_scores = plain_res.scores.into_iter().map(|(k, s)| (k, Some(s))).collect();
+                observations = plain_res.observations;
+                if let Some(lig_res) = lig_opt {
+                    font_scores_lig = lig_res.scores.into_iter().map(|(k, s)| (k, Some(s))).collect();
+                    observations_lig = lig_res.observations;
+                    seg_winner = Some("plain".to_string());
+                } else {
+                    font_scores_lig = Vec::new();
+                    observations_lig = Vec::new();
+                    seg_winner = None;
+                }
+            }
 
 
             // Crop PNGs saved after font matching (see below).
 
             // ── Font selection: font #1, with SSIM tie-break ───────
             let mut tie_candidates_audit: Vec<audit::TieCandidate> = Vec::new();
-            if let Some((ref _top_key, top_score)) = scoring.scores.first() {
-                let top_score = *top_score;
-                // Collect all candidates that share the top font score
-                let tied: Vec<&(String, f32)> = scoring.scores.iter()
-                    .take_while(|(_, s)| *s == top_score)
+            if let Some((ref _top_key, Some(top_score_opt))) = font_scores.first() {
+                let top_score = *top_score_opt;
+                // Collect all candidates that share the top font score (now from font_scores, no clone)
+                let tied: Vec<&String> = font_scores.iter()
+                    .take_while(|(_, os)| os.map_or(false, |s| s == top_score))
+                    .map(|(k, _)| k)
                     .collect();
 
                 if tied.len() >= 2 {
@@ -436,7 +448,7 @@ pub fn match_lines(
                     let mut log_parts: Vec<String> = Vec::new();
                     let mut tie_sim_results: Vec<(String, String, f32)> = Vec::new();
                     let mut ti = 0usize;
-                    for (font_key, _) in tied.iter().map(|&&(ref fk, s)| (fk, s)) {
+                    for font_key in tied.iter() {
                         let fe = match font_registry.by_key(font_key) {
                             Some(fe) => fe,
                             None => continue,
@@ -451,6 +463,16 @@ pub fn match_lines(
                             let _ = std::fs::create_dir_all(&p);
                             p
                         });
+                        // Use midpoint-derived scale for font size (obs_span/pred_span * upem)
+                        // instead of width-matched median — this is the scale computed for
+                        // geometry scoring, which is robust to sidebearings and numeric fragments.
+                        // This directly addresses L9 fox/jumps too-small issue.
+                        let midpoint_em_px = crate::geometry_classifier::median_em_px_from_midpoints(
+                            font_key,
+                            &line_crops.word_segs,
+                            &wib_plain,
+                            geo_cache,
+                        );
                         let vr = verify::verify_text_region(
                             &norm_crop, &fd, &line.text,
                             &line.words,
@@ -459,6 +481,7 @@ pub fn match_lines(
                             fe.variations.as_deref(),
                             use_lig,
                             tie_audit_dir.as_deref(), None,
+                            midpoint_em_px,
                         );
                         log_parts.push(format!("{:.4}({})", vr.score, fe.family_name));
                         tie_sim_results.push((fe.font_key(), fe.family_name.clone(), vr.score));
@@ -492,8 +515,9 @@ pub fn match_lines(
                     }
                     (best.map(|(fm, _)| fm), tie_candidates_audit, gt_font_key)
                 } else {
-                    // No tie — use font #1 directly, font_key already resolved
-                    let (ref font_key, score) = *tied[0];
+                    // No tie — use font #1 directly, font_key already resolved (perf: tied is &String, no clone)
+                    let font_key = tied[0];
+                    let score = top_score;
                     let fm = font_registry.by_key(font_key)
                         .map(|fe| font_match::FontMatchResult {
                             font_name: fe.font_key(),
@@ -554,7 +578,9 @@ pub fn match_lines(
         // directly to line.words via source_word_idx.
         let mut corrected_words: Option<Vec<crate::ocr::TextRegion>> = None;
         let mut ocr_correction_audit: Vec<crate::audit::OcrCorrection> = Vec::new();
-        if args.skip_ocr_correction || std::env::var("UNPRINT_SKIP_PFLDA").is_ok() {
+        if args.skip_ocr_correction
+            || std::env::var("UNPRINT_SKIP_OCR_CORRECTION").is_ok()
+        {
             // skip pflda for t64 fast path
         } else if let (Some(ref fr), Some(rtd)) = (&font_result, training_data) {
             if std::env::var("UNPRINT_VERBOSE_PFLDA").is_ok() { eprintln!("[pflda] OCR correction pass for font_key={}", fr.font_key); }
@@ -625,7 +651,7 @@ pub fn match_lines(
 
                 for (seg_idx, seg) in winning_word_segs.iter().enumerate() {
                     for (char_pos, &ocr_char) in seg.chars.iter().enumerate() {
-                        if !crate::features::is_supported(ocr_char) { continue; }
+                        if !crate::features::audit_all_chars_enabled() && !crate::features::is_supported(ocr_char) { continue; }
                         let crop = match crate::segment::crop_ngram(
                             &seg.word_img, char_pos, 1,
                             &seg.boundaries, &seg.seam_paths, seg.crop_h,
@@ -829,21 +855,36 @@ pub fn match_lines(
             // across all fonts, not classifier-only.
             {
                 // Precompute geo for all fonts for this line (for combined logit)
-                let mut all_geo: std::collections::HashMap<String, std::collections::HashMap<(usize, usize), (f32,f32)>> = std::collections::HashMap::new();
-                for fe in font_registry.iter() {
-                    let fk = fe.font_key();
+                // Use usize font_idx as key to avoid String clone/hash overhead (2532 × 500 chars).
+                let mut all_geo: std::collections::HashMap<usize, std::collections::HashMap<(usize, usize), (f32,f32)>> = std::collections::HashMap::new();
+                let mut cannot_render: std::collections::HashSet<usize> = std::collections::HashSet::new();
+                for (font_idx, fe) in font_registry.iter().enumerate() {
+                    let fk = fe.font_key_ref();
                     // Only compute geo if this font has glyphs for any observation seq (quick filter)
                     // but simple to just try per_char_geo_for_font — it returns None quickly if no matching segs
+                    //
+                    // Rule-out short-circuit: per_char_geo returns None when the font
+                    // lacks a cmap entry for a required char in this line. That char's
+                    // geometry ll is -infinity (infinitely bad), so the whole-line
+                    // font score is -infinity. Marking cannot_render and aborting
+                    // further geo for this font is valid — an infinitely bad component
+                    // dominates, so the font is ruled out no matter the other chars.
                     if let Some(geos) = crate::geometry_classifier::per_char_geo_for_font(
-                        &fk, win_segs, win_wib, font_cache, geo_cache, font_registry,
+                        fk, win_segs, win_wib, font_cache, geo_cache, font_registry,
                     ) {
                         let mut mp = std::collections::HashMap::new();
                         for g in &geos {
                             mp.insert((g.seg_idx, g.orig_idx), (g.h_ll as f32, g.v_ll as f32));
                         }
-                        all_geo.insert(fk, mp);
+                        all_geo.insert(font_idx, mp);
+                    } else {
+                        // Font cannot render a required char in this line → infinitely bad score
+                        cannot_render.insert(font_idx);
                     }
                 }
+
+                let chosen_idx_opt = chosen_font_key.as_deref().and_then(|k| font_registry.index_of(k));
+                let gt_idx_opt = gt_font_key.as_deref().and_then(|k| font_registry.index_of(k));
 
                 for d in observations.iter() {
                     let crop = match winning_crops.get(d.crop_index) {
@@ -880,51 +921,56 @@ pub fn match_lines(
                     }
                     // Need seg/char pos for geo lookup
                     let sc_opt = win_pos_map.get(d.crop_index).copied();
-                    let mut logits: Vec<(String, f32, usize)> = Vec::new(); // (font_key, logit, gid)
-                    for fe in font_registry.iter() {
-                        let fk = fe.font_key();
-                        let Some(gid) = glyph_map.glyph_id_for_font(&seq, &fk) else { continue; };
+                    let mut logits: Vec<(usize, f32, usize)> = Vec::new(); // (font_idx, logit, gid)
+                    for (font_idx, fe) in font_registry.iter().enumerate() {
+                        let fk = fe.font_key_ref();
+                        let Some(gid) = glyph_map.glyph_id_for_font(&seq, fk) else { continue; };
                         let Some(&raw_logit) = gid_to_logit.get(&gid) else { continue; };
+                        // Rule-out: if font cannot render any char in the line its
+                        // geometry score is -infinity (infinitely bad), so total score
+                        // is -infinity. Skip it here → softmax prob 0. The abort
+                        // above is the short-circuit for that infinitely bad case.
+                        if cannot_render.contains(&font_idx) {
+                            continue;
+                        }
                         let mut logit = raw_logit;
                         if let Some(sc) = sc_opt {
-                            if let Some(geo_map) = all_geo.get(&fk) {
+                            if let Some(geo_map) = all_geo.get(&font_idx) {
                                 if let Some(&(h_ll, v_ll)) = geo_map.get(&(sc.0, sc.1)) {
                                     logit += h_ll + v_ll;
                                 }
                             }
                         }
-                        logits.push((fk, logit, gid));
+                        logits.push((font_idx, logit, gid));
                     }
                     if logits.is_empty() { continue; }
                     // softmax
                     let max_logit = logits.iter().map(|(_, l, _)| *l).fold(f32::NEG_INFINITY, f32::max);
-                    let mut exps: Vec<(String, f32, usize, f32)> = Vec::with_capacity(logits.len());
+                    let mut exps: Vec<(usize, f32, usize, f32)> = Vec::with_capacity(logits.len());
                     let mut sum_exp = 0.0f32;
-                    for (fk, logit, gid) in logits {
+                    for (font_idx, logit, gid) in logits {
                         let e = (logit - max_logit).exp();
                         sum_exp += e;
-                        exps.push((fk, logit, gid, e));
+                        exps.push((font_idx, logit, gid, e));
                     }
                     if sum_exp <= 0.0 { continue; }
-                    // sort by final prob descending to get ranks
-                    let mut ranked: Vec<(String, f32, usize, f32)> = exps.iter().map(|(fk, logit, gid, e)| {
-                        let prob = e / sum_exp;
-                        (fk.clone(), *logit, *gid, prob)
-                    }).collect();
-                    ranked.sort_by(|a, b| b.3.partial_cmp(&a.3).unwrap_or(std::cmp::Ordering::Equal));
+                    for e in &mut exps {
+                        e.3 /= sum_exp;
+                    }
+                    exps.sort_by(|a, b| b.3.partial_cmp(&a.3).unwrap_or(std::cmp::Ordering::Equal));
                     // find chosen and GT ranks/probs
-                    if let Some(ref cfk) = chosen_font_key {
-                        for (rank, (fk, _logit, _gid, prob)) in ranked.iter().enumerate() {
-                            if fk == cfk {
+                    if let Some(chosen_idx) = chosen_idx_opt {
+                        for (rank, (font_idx, _logit, _gid, prob)) in exps.iter().enumerate() {
+                            if *font_idx == chosen_idx {
                                 rp.chosen_ranks.insert(d.crop_index, rank + 1);
                                 rp.chosen_probs.insert(d.crop_index, *prob);
                                 break;
                             }
                         }
                     }
-                    if let Some(ref gfk) = gt_font_key {
-                        for (rank, (fk, _logit, _gid, prob)) in ranked.iter().enumerate() {
-                            if fk == gfk {
+                    if let Some(gt_idx) = gt_idx_opt {
+                        for (rank, (font_idx, _logit, _gid, prob)) in exps.iter().enumerate() {
+                            if *font_idx == gt_idx {
                                 rp.gt_ranks.insert(d.crop_index, rank + 1);
                                 rp.gt_probs.insert(d.crop_index, *prob);
                                 break;
@@ -1081,7 +1127,28 @@ pub fn match_lines(
             }).collect()
         };
 
-        LineMatch { font_result, text_color, font_scores, observations, font_scores_lig, observations_lig, seg_winner, diag_seg_dir, obs_rank_probs, alt_obs_rank_probs, tie_candidates: tie_candidates_audit, corrected_words, fast_path: false, fast_path_score: None, word_seg_summaries, ocr_corrections: ocr_correction_audit }
+        // Compute midpoint-derived font size for this winning font.
+        // This reuses the exact center-span scale from geometry scoring
+        // (obs_span/pred_span * upem) and is robust to sidebearings.
+        // Stored in LineMatch and later used as override for ZNCC verification
+        // and for report Size row, fixing L9 fox/jumps too-small.
+        let midpoint_em_px = if let Some(ref fm) = font_result {
+            let (win_segs_ref, win_wib_ref): (&[segment::WordSeg], &[crate::geometry_classifier::WordGeoMeasurement]) =
+                if seg_winner.as_deref() == Some("ligature") {
+                    if let (Some(lig_segs), Some(wib_lig)) = (line_crops.lig_word_segs.as_ref(), wib_lig_opt.as_ref()) {
+                        (lig_segs.as_slice(), wib_lig.as_slice())
+                    } else {
+                        (line_crops.word_segs.as_slice(), wib_plain.as_slice())
+                    }
+                } else {
+                    (line_crops.word_segs.as_slice(), wib_plain.as_slice())
+                };
+            crate::geometry_classifier::median_em_px_from_midpoints(&fm.font_key, win_segs_ref, win_wib_ref, geo_cache)
+        } else {
+            None
+        };
+
+        LineMatch { font_result, text_color, font_scores, observations, font_scores_lig, observations_lig, seg_winner, diag_seg_dir, obs_rank_probs, alt_obs_rank_probs, tie_candidates: tie_candidates_audit, corrected_words, fast_path: false, fast_path_score: None, midpoint_em_px, word_seg_summaries, ocr_corrections: ocr_correction_audit }
     }).collect();
 
     let fp_hits = fast_path_hits.load(Ordering::Relaxed);

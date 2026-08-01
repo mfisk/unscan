@@ -5,10 +5,11 @@
 
 use std::sync::Arc;
 use image::GrayImage;
+use rustc_hash::FxHashMap;
 use std::collections::{HashMap, HashSet};
 use std::sync::OnceLock;
 
-use crate::features::{contrast_normalize_char, is_supported, normalize_to_ink_bounds, NORM_H};
+use crate::features::{audit_all_chars_enabled, contrast_normalize_char, is_supported, normalize_to_ink_bounds, NORM_H};
 use crate::verify::WordPlacement;
 
 /// Seam carving scoring parameters, configurable via environment variables
@@ -467,16 +468,17 @@ fn segment_characters_inner(
         let mut heap: BinaryHeap<SeamEntry> = BinaryHeap::new();
         // Cache DP matrices by segment ID so we can trace paths
         // from the same matrices that computed candidate costs.
-        let mut dp_cache: std::collections::HashMap<u32, SeamDp> = std::collections::HashMap::new();
+        let mut dp_cache: FxHashMap<u32, SeamDp> = FxHashMap::default();
         // Diagonal bounds per segment: seam paths that bound each side.
         // Pixels at or beyond these paths are unusable in the DP.
         // left_path[r] = seam col; pixels with col <= left_path[r] are masked.
         // right_path[r] = seam col; pixels with col >= right_path[r] are masked.
+        // Perf: store as Arc to make clone cheap (atomic inc vs Vec copy O(h)).
         struct SegBounds {
-            left_path: Option<Vec<[u32; 2]>>,
-            right_path: Option<Vec<[u32; 2]>>,
+            left_path: Option<std::sync::Arc<Vec<[u32; 2]>>>,
+            right_path: Option<std::sync::Arc<Vec<[u32; 2]>>>,
         }
-        let mut seg_bounds: std::collections::HashMap<u32, SegBounds> = std::collections::HashMap::new();
+        let mut seg_bounds: FxHashMap<u32, SegBounds> = FxHashMap::default();
         let mut next_seg_id: u32 = 0;
 
         // Build initial segments from VP splits and seed the heap.
@@ -542,7 +544,7 @@ fn segment_characters_inner(
                         let parent_bounds = seg_bounds.get(&entry.seg_id);
                         let lp = parent_bounds.and_then(|b| b.left_path.clone());
                         let rp = parent_bounds.and_then(|b| b.right_path.clone());
-                        let (cands, dp) = candidate_seams(&energy, w_us, entry.seg_start, new_end, h, lp.as_deref(), rp.as_deref(), max_ink, &row_ink);
+                        let (cands, dp) = candidate_seams(&energy, w_us, entry.seg_start, new_end, h, lp.as_ref().map(|a| a.as_slice()), rp.as_ref().map(|a| a.as_slice()), max_ink, &row_ink);
                         for (col, cost) in &cands {
                             heap.push(SeamEntry { cost: *cost + segment_penalty(entry.seg_start, new_end, *col, *cost), col: *col, seg_start: entry.seg_start, seg_end: new_end, seg_id: sid });
                         }
@@ -560,7 +562,7 @@ fn segment_characters_inner(
                         let parent_bounds = seg_bounds.get(&entry.seg_id);
                         let lp = parent_bounds.and_then(|b| b.left_path.clone());
                         let rp = parent_bounds.and_then(|b| b.right_path.clone());
-                        let (cands, dp) = candidate_seams(&energy, w_us, new_start, entry.seg_end, h, lp.as_deref(), rp.as_deref(), max_ink, &row_ink);
+                        let (cands, dp) = candidate_seams(&energy, w_us, new_start, entry.seg_end, h, lp.as_ref().map(|a| a.as_slice()), rp.as_ref().map(|a| a.as_slice()), max_ink, &row_ink);
                         for (col, cost) in &cands {
                             heap.push(SeamEntry { cost: *cost + segment_penalty(new_start, entry.seg_end, *col, *cost), col: *col, seg_start: new_start, seg_end: entry.seg_end, seg_id: sid });
                         }
@@ -661,12 +663,14 @@ fn segment_characters_inner(
                 total: entry.cost,
             });
 
-            // Capture parent's diagonal bounds before removing.
+            // Capture parent's diagonal bounds before removing (Arc clone = cheap).
             let parent_lp = seg_bounds.get(&entry.seg_id).and_then(|b| b.left_path.clone());
             let parent_rp = seg_bounds.get(&entry.seg_id).and_then(|b| b.right_path.clone());
 
-            // Insert seam path into map (clone once, then move original into right child to save one clone)
-            seam_paths.insert(final_col, path.clone());
+            // Perf: wrap path in Arc once (moves Vec, no clone), then Arc clones for bounds.
+            // seam_paths map stores Vec for external API compat — clone once from Arc (1 Vec copy vs 2 before).
+            let arc_path = std::sync::Arc::new(path);
+            seam_paths.insert(final_col, (*arc_path).clone());
 
             // Mark old segment as dead — stale entries skipped on pop.
             let old_sid = entry.seg_id;
@@ -687,8 +691,8 @@ fn segment_characters_inner(
                 if child_left_end > child_left_start + 2 {
                     let sid = next_seg_id; next_seg_id += 1;
                     let lp = parent_lp.clone();
-                    let rp: Option<Vec<[u32; 2]>> = Some(path.clone());
-                    let (mut cands, dp) = candidate_seams(&energy, w_us, child_left_start, child_left_end, h, lp.as_deref(), rp.as_deref(), max_ink, &row_ink);
+                    let rp: Option<std::sync::Arc<Vec<[u32; 2]>>> = Some(std::sync::Arc::clone(&arc_path));
+                    let (mut cands, dp) = candidate_seams(&energy, w_us, child_left_start, child_left_end, h, lp.as_ref().map(|a| a.as_slice()), rp.as_ref().map(|a| a.as_slice()), max_ink, &row_ink);
                     for (col, cost) in &cands {
                         heap.push(SeamEntry { cost: *cost + segment_penalty(child_left_start, child_left_end, *col, *cost), col: *col, seg_start: child_left_start, seg_end: child_left_end, seg_id: sid });
                     }
@@ -703,9 +707,9 @@ fn segment_characters_inner(
             {
                 if child_right_end > child_right_start + 2 {
                     let sid = next_seg_id; next_seg_id += 1;
-                    let lp: Option<Vec<[u32; 2]>> = Some(path);
+                    let lp: Option<std::sync::Arc<Vec<[u32; 2]>>> = Some(arc_path);
                     let rp = parent_rp.clone();
-                    let (mut cands, dp) = candidate_seams(&energy, w_us, child_right_start, child_right_end, h, lp.as_deref(), rp.as_deref(), max_ink, &row_ink);
+                    let (mut cands, dp) = candidate_seams(&energy, w_us, child_right_start, child_right_end, h, lp.as_ref().map(|a| a.as_slice()), rp.as_ref().map(|a| a.as_slice()), max_ink, &row_ink);
                     for (col, cost) in &cands {
                         heap.push(SeamEntry { cost: *cost + segment_penalty(child_right_start, child_right_end, *col, *cost), col: *col, seg_start: child_right_start, seg_end: child_right_end, seg_id: sid });
                     }
@@ -1354,15 +1358,26 @@ pub fn segment_line(
     let mut words_with_ligatures: HashSet<usize> = HashSet::new();
 
     for (_word_idx, &(orig_idx, word)) in sorted.iter().enumerate() {
-        let chars_in_word: Vec<char> = word.text.chars().filter(|c| is_supported(*c)).collect();
-        if chars_in_word.is_empty() {
+        let audit_all = audit_all_chars_enabled();
+        let chars_in_word: Vec<char> = if audit_all {
+            word.text.chars().collect()
+        } else {
+            word.text.chars().filter(|c| is_supported(*c)).collect()
+        };
+        // Include 2-letter words, only exclude single-letter (and empty) unless audit-all requested
+        if !audit_all && chars_in_word.len() <= 1 {
             continue;
         }
 
-        let need_any = chars_in_word.iter().any(|c| {
-            char_counts.get(c).copied().unwrap_or(0) < 2
-        });
-        if !need_any {
+        let need_any = if audit_all {
+            true
+        } else {
+            chars_in_word.iter().any(|c| {
+                char_counts.get(c).copied().unwrap_or(0) < 2
+            })
+        };
+        // For 2-letter words, always keep them for geometry even if chars already seen
+        if !audit_all && chars_in_word.len() > 2 && !need_any {
             continue;
         }
 
@@ -1427,7 +1442,7 @@ pub fn segment_line(
 
         // Update char counts (for the word-skip optimisation)
         for &c in &all_chars {
-            if is_supported(c) {
+            if audit_all || is_supported(c) {
                 *char_counts.entry(c).or_insert(0) += 1;
             }
         }
@@ -1782,16 +1797,22 @@ pub fn char_crop_and_metrics(
             raw_canvas[dst_base..dst_base + len].copy_from_slice(&raw_crop[src_base..src_base + len]);
         }
     }
-    let scaled_w = (canvas_w as f32 * NORM_H as f32 / canvas_h as f32).ceil() as u32;
-    if scaled_w < 2 {
-        return None;
-    }
-    let normalized = image::imageops::resize(
-        &canvas,
-        scaled_w,
-        NORM_H,
-        image::imageops::FilterType::Lanczos3,
-    );
+    let normalized = if canvas_h == NORM_H {
+        // Identity: scaled_w == canvas_w when canvas_h == NORM_H
+        canvas
+    } else {
+        let scaled_w = (canvas_w as f32 * NORM_H as f32 / canvas_h as f32).ceil() as u32;
+        if scaled_w < 2 {
+            return None;
+        }
+        image::imageops::resize(
+            &canvas,
+            scaled_w,
+            NORM_H,
+            image::imageops::FilterType::Lanczos3,
+        )
+    };
+
 
     Some((normalized, x_min_abs, x_max_abs, y_min_abs, y_max_abs, cx, cy))
 }

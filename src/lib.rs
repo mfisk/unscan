@@ -30,6 +30,7 @@ pub mod hog;
 pub mod atomic_file;
 pub mod geo_cache;
 pub mod geometry_classifier;
+pub mod geometry_scale;
 pub mod ground_truth;
 pub mod vintage_cache;
 pub mod font_history;

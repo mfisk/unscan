@@ -146,8 +146,7 @@ pub struct PerCharError {
     pub v_ll: f64,
 }
 
-const SIGMA_CENTER_PX: f64 = 0.284;
-const SIGMA_PITCH_PX: f64 = 0.435;
+use crate::params::{quant_half_width_px, quantized_ll, SIGMA_CENTER_PX, SIGMA_PITCH_PX};
 
 pub fn batch_per_char_errors(
     obs_cx: &[f64],
@@ -164,14 +163,14 @@ pub fn batch_per_char_errors(
     let mut out = Vec::with_capacity(obs_cx.len());
     for i in 0..obs_cx.len() {
         let v_err = (obs_cy[i] - obs_word_cy) - (pred_cy[i] - pred_word_cy);
-        let v_ll = -v_err * v_err / (2.0 * SIGMA_CENTER_PX * SIGMA_CENTER_PX);
+        let v_ll = quantized_ll(v_err, SIGMA_CENTER_PX, quant_half_width_px());
         let (h_err, h_ll) = if i == 0 {
             (None, 0.0)
         } else {
             let obs_pitch = obs_cx[i] - obs_cx[i-1];
             let pred_pitch = pred_cx[i] - pred_cx[i-1];
             let he = obs_pitch - pred_pitch;
-            let hl = -he * he / (2.0 * SIGMA_PITCH_PX * SIGMA_PITCH_PX);
+            let hl = quantized_ll(he, SIGMA_PITCH_PX, quant_half_width_px());
             (Some(he), hl)
         };
         out.push(PerCharError { h_err, v_err, h_ll, v_ll });

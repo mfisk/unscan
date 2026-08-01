@@ -1,6 +1,19 @@
 //! Font match result type and font identification.
+//!
+//! Rule-out semantics: we effectively skip any font that does not contain a
+//! character present in the string. If `per_char_geo_cached` /
+//! `predict_glyph_positions_and_extents` returns `None` because the font lacks a
+//! cmap entry for any required character, that character's geometry log-likelihood
+//! is `-infinity` (infinitely bad). Therefore the whole-font log-likelihood is
+//! `-infinity`. The font is inserted into `cannot_render: HashSet<String>` and
+//! pruned as `f32::NEG_INFINITY`; `exp(-inf)=0` gives softmax probability 0, so
+//! the font contributes 0 probability and is excluded from ranking. Empty `Vec`
+//! is not an infinite penalty: it denotes ligature mismatch (no words had usable
+//! geo, e.g. “ff” → single glyph) and returns `Some(empty)` as valid, falling
+//! back to SSIM / n-gram only. Abort `None` is a valid short-circuit for an
+//! infinitely bad score because a missing glyph makes rendering impossible.
 
-use std::collections::HashSet;
+use rustc_hash::{FxHashMap, FxHashSet};
 use std::path::PathBuf;
 use image::GrayImage;
 use crate::features::{CropFeatures, compute_features};
@@ -8,7 +21,21 @@ use crate::classifier::{self, ObsStats};
 
 const GEO_WEIGHT: f32 = 1.0;
 // Aggregation mode: false = squared gap (current), true = simple sum (generative)
-const USE_SUM_AGG: bool = false;
+const USE_SUM_AGG: bool = true;
+
+/// Midpoint pruning: prune fonts where min_{chars}(h_ll+v_ll) < threshold.
+/// Threshold = BASE * thoroughness, thr=1 => BASE. Base was -12.0 (worst correct
+/// letter -10.1537 on old BAP, SourceSerif4-400 'T' p5:23). Sweep 2026-07-31 on
+/// font-timeline-specimen (505 entries, 494 GT, baseline 352 hits 71.3% zncc 0.8988):
+///   thr 0.9 (-10.8) 352 hits pruned 0.723
+///   thr 0.8 (-9.6)  352 hits pruned 0.746
+///   thr 0.7 (-8.4)  352 hits pruned 0.768
+///   thr 0.6 (-7.2)  352 hits pruned 0.788  <- tightest with no accuracy loss
+///   thr 0.5 (-6.0)  351 hits (-1) pruned 0.812
+/// So optimal default is -7.2: minimizes glyph measurement (keeps ~21% candidates
+/// vs ~30% at -12) with zero hit loss. Clamped thoroughness >=0.1.
+/// MIN_KEEP=10 ensures best_lps stability by keeping at least 10 best pruned fonts.
+const MIDPOINT_PRUNE_BASE: f32 = -7.2;
 
 // ---------------------------------------------------------------------------
 // Types
@@ -116,20 +143,20 @@ pub struct FontIdResult {
     pub path_score: f32,
 }
 
-pub fn identify_fonts(
-    windows: &[ScoringWindow],
+pub fn identify_fonts<'a>(
+    windows: &'a [ScoringWindow<'a>],
     classifier: &dyn crate::classifier::Classifier,
-    glyph_map: &crate::glyph_map::NgramGlyphMap,
-    _thoroughness: f32,
-    _audit: bool,
-    ensure_font_keys: &[&str],
+    glyph_map: &'a crate::glyph_map::NgramGlyphMap,
+    thoroughness: f32,
+    audit: bool,
+    ensure_font_keys: &'a [&'a str],
     min_ngram_prob: f32,
-    word_segs: &[crate::segment::WordSeg],
-    wib: &[crate::geometry_classifier::WordGeoMeasurement],
-    font_registry: &crate::font_scan::FontRegistry,
-    font_cache: &crate::font_cache::FontCache,
-    geo_cache: &crate::geo_cache::GeometryCache,
-    position_map: &[(usize, usize)],
+    word_segs: &'a [crate::segment::WordSeg],
+    wib: &'a [crate::geometry_classifier::WordGeoMeasurement],
+    font_registry: &'a crate::font_scan::FontRegistry,
+    font_cache: &'a crate::font_cache::FontCache,
+    geo_cache: &'a crate::geo_cache::GeometryCache,
+    position_map: &'a [(usize, usize)],
 ) -> FontIdResult {
     if windows.is_empty() {
         return FontIdResult { scores: Vec::new(), observations: Vec::new(), path_score: f32::MIN };
@@ -167,7 +194,7 @@ pub fn identify_fonts(
         .min(n_windows);
 
     // ── Stage 1: per-window classification → candidate set ─────────
-    let mut candidate_set: HashSet<String> = HashSet::new();
+    let mut candidate_set: FxHashSet<&'a str> = FxHashSet::default();
     let mut observations: Vec<ObservationDetail> = Vec::with_capacity(n_windows);
     let mut ood_weights: Vec<f32> = Vec::with_capacity(n_windows);
 
@@ -180,10 +207,10 @@ pub fn identify_fonts(
             continue;
         }
 
-        // Expand glyph_ids to font_keys
+        // Expand glyph_ids to font_keys – borrow directly from glyph_map (lifetime 'a)
         for &(glyph_id, _prob) in &picks {
             for fk in glyph_map.fonts_for_glyph(&seq, glyph_id) {
-                candidate_set.insert(fk.clone());
+                candidate_set.insert(fk.as_str());
             }
         }
 
@@ -215,14 +242,14 @@ pub fn identify_fonts(
     }
 
     // Ensure requested font_keys are always scored (e.g. ground-truth font)
-    for fk in ensure_font_keys {
-        candidate_set.insert(fk.to_string());
+    for &fk in ensure_font_keys {
+        candidate_set.insert(fk);
     }
 
     // Apply font allowlist (fontkey format, exact match) - filters at matching time
     // This keeps main cache untouched when using default cache dir.
     if let Some(allow) = crate::cache::font_allowlist() {
-        candidate_set.retain(|fk| allow.contains(fk));
+        candidate_set.retain(|fk| allow.contains(*fk));
     }
 
     if candidate_set.is_empty() {
@@ -230,30 +257,68 @@ pub fn identify_fonts(
     }
 
     // ── Per-char cache: compute logits/probs once, not per-candidate
-    let mut window_logit_maps: Vec<std::collections::HashMap<usize, f32>> = Vec::with_capacity(crop_data.len());
-    let mut window_prob_maps: Vec<std::collections::HashMap<usize, f32>> = Vec::with_capacity(crop_data.len());
+    // Perf slice 3b/4: dense Vec<Option<f32>> indexed by glyph_id, preserving Option semantics.
+    // Original HashMap<usize,f32> used get(&gid)? -> None if missing -> font filtered via len check.
+    // Dense Vec must preserve None for missing, not NEG_INFINITY, to keep Stage 2a threshold
+    // and Stage 2b scoring identical. Size by glyph_count, but grow if gid >= len (sparse ids).
+    // Slice 4: derive probs from logits to avoid second distance+softmax pass (2× sq_euclid).
+    // Previously called raw_logits + probabilities (each recomputed distances). Now single pass:
+    // logits = -d²/2σ², probs = softmax(logits) = exp(logit-max)/sum. Matches softmax_probs
+    // exactly (max_logit = -min_d/2σ²) and handles uniform fallback when sum<1e-30.
+    let mut window_logit_maps: Vec<Vec<Option<f32>>> = Vec::with_capacity(crop_data.len());
+    let mut window_prob_maps: Vec<Vec<Option<f32>>> = Vec::with_capacity(crop_data.len());
     for wd in &crop_data {
         let seq = [wd.ch];
         let logits = classifier.raw_logits(&seq, &wd.feat);
-        let probs = classifier.probabilities(&seq, &wd.feat);
-        window_logit_maps.push(logits.into_iter().collect());
-        window_prob_maps.push(probs.into_iter().collect());
+        let count = classifier.glyph_count(&seq).max(1);
+        let max_gid = logits.iter().map(|(gid, _)| *gid).max().unwrap_or(0);
+        let vec_len = count.max(max_gid + 1);
+        let mut logit_vec: Vec<Option<f32>> = vec![None; vec_len];
+        let mut prob_vec: Vec<Option<f32>> = vec![None; vec_len];
+        if logits.is_empty() {
+            window_logit_maps.push(logit_vec);
+            window_prob_maps.push(prob_vec);
+            continue;
+        }
+        // max logit = -min_d/2σ², used for numerical stability (same as softmax_probs)
+        let max_logit = logits.iter().map(|(_, l)| *l).fold(f32::NEG_INFINITY, f32::max);
+        let mut sum_exp = 0.0f32;
+        let mut exps: Vec<f32> = Vec::with_capacity(logits.len());
+        for (_, logit) in &logits {
+            let e = (*logit - max_logit).exp();
+            sum_exp += e;
+            exps.push(e);
+        }
+        let uniform = sum_exp < 1e-30;
+        let uniform_p = if uniform { 1.0 / exps.len() as f32 } else { 0.0 };
+        for (i, (gid, logit)) in logits.into_iter().enumerate() {
+            if gid >= logit_vec.len() {
+                let new_len = gid + 1;
+                logit_vec.resize(new_len, None);
+                prob_vec.resize(new_len, None);
+            }
+            logit_vec[gid] = Some(logit);
+            let p = if uniform { uniform_p } else { exps[i] / sum_exp };
+            prob_vec[gid] = Some(p);
+        }
+        window_logit_maps.push(logit_vec);
+        window_prob_maps.push(prob_vec);
     }
 
     // ── Stage 2a: filter chars — keep only chars where at least one
     // candidate font scores above (min_char_prob × uniform).
-    let candidate_vec: Vec<String> = candidate_set.into_iter().collect();
+    let candidate_vec: Vec<&'a str> = candidate_set.into_iter().collect();
     let scoring_window_indices: Vec<usize> = (0..crop_data.len())
         .filter(|&i| {
             let wd = &crop_data[i];
             let seq = [wd.ch];
             let n_glyphs = classifier.glyph_count(&seq).max(1) as f32;
             let threshold = min_ngram_prob / n_glyphs;
-            let prob_map = &window_prob_maps[i];
-            candidate_vec.iter().any(|font_key| {
+            let prob_vec = &window_prob_maps[i];
+            candidate_vec.iter().any(|&font_key| {
                 glyph_map.glyph_id_for_font(&seq, font_key)
-                    .and_then(|gid| prob_map.get(&gid))
-                    .map_or(false, |p| *p >= threshold)
+                    .and_then(|gid| prob_vec.get(gid).copied().flatten())
+                    .map_or(false, |p| p >= threshold)
             })
         })
         .collect();
@@ -262,35 +327,127 @@ pub fn identify_fonts(
     let n_scoring = scoring_window_indices.len();
 
     // ── Geo precompute: per-font per-char geometry log-likelihoods ──
-    let mut geo_per_font: std::collections::HashMap<String, std::collections::HashMap<(usize, usize), f32>> = std::collections::HashMap::new();
+    let mut geo_per_font: FxHashMap<&'a str, FxHashMap<(usize, usize), f32>> = FxHashMap::default();
+    let mut cannot_render: FxHashSet<&'a str> = FxHashSet::default();
     if !word_segs.is_empty() && !wib.is_empty() {
-        for font_key in &candidate_vec {
+        for &font_key in &candidate_vec {
             if let Some(geos) = crate::geometry_classifier::per_char_geo_for_font(
                 font_key, word_segs, wib, font_cache, geo_cache, font_registry
             ) {
-                let mut map = std::collections::HashMap::new();
+                let mut map = FxHashMap::default();
                 for g in geos {
                     let ll = (g.h_ll + g.v_ll) as f32;
                     map.insert((g.seg_idx, g.orig_idx), ll);
                 }
-                geo_per_font.insert(font_key.clone(), map);
+                geo_per_font.insert(font_key, map);
+            } else {
+                // Rule-out: per_char_geo returned None means the font lacks a cmap
+                // entry for a required character, so it cannot render that char.
+                // That char's geometry log-likelihood would be -infinity
+                // (infinitely bad), making the whole-font score -infinity.
+                // We short-circuit here — valid abort for an infinitely bad score —
+                // and mark the font as cannot_render so it gets pruned as -inf.
+                cannot_render.insert(font_key);
             }
         }
     }
 
+    // ── Midpoint pruning: prune fonts with very negative h_ll+v_ll ─────────
+    // Threshold = BASE * thoroughness, BASE=-7.2 optimal per 2026-07-31 sweep
+    // (thr=1 => -7.2, thr=2 => -14.4 looser, thr=0.5 => -3.6 tighter). Previous
+    // worst correct -10.15 on old BAP led to BASE=-12, but sweep on current
+    // 505-entry BAP shows -7.2 maintains 352/494 hits (71.3%) while pruning
+    // ~78.8% vs ~72% at -10.8, minimizing glyph measurement with no accuracy loss.
+    // We use min_ll (worst letter) to decide; keep ensure keys and fonts with no geo data.
+    // To keep best_lps stable across prune levels, we also keep at least 10 fonts with
+    // highest min_ll (least negative) so per-position best doesn't shift dramatically.
+    let prune_threshold = MIDPOINT_PRUNE_BASE * thoroughness.max(0.1);
+    let total_candidates = candidate_vec.len();
+    let mut kept_candidates: Vec<&'a str> = Vec::with_capacity(total_candidates);
+    let mut pruned_with_ll: Vec<(&'a str, f32)> = Vec::new();
+    let mut pruned_count: usize = 0;
+    for &fk in &candidate_vec {
+        if ensure_font_keys.contains(&fk) {
+            kept_candidates.push(fk);
+            continue;
+        }
+        if cannot_render.contains(fk) {
+            // Rule-out short-circuit: font cannot render a required char → its
+            // per-char geometry ll is -infinity, so its total score is
+            // -infinity (infinitely bad). We prune it here as NEG_INFINITY;
+            // aborting instead of scoring the rest is valid because an
+            // infinitely bad component dominates the sum.
+            pruned_count += 1;
+            pruned_with_ll.push((fk, f32::NEG_INFINITY));
+            continue;
+        }
+        if let Some(gmap) = geo_per_font.get(fk) {
+            if gmap.is_empty() {
+                kept_candidates.push(fk);
+                continue;
+            }
+            // min_ll = worst (most negative) midpoint log-prob for this font on this line
+            let min_ll = gmap.values().cloned().fold(f32::INFINITY, f32::min);
+            if min_ll < prune_threshold {
+                pruned_count += 1;
+                pruned_with_ll.push((fk, min_ll));
+                continue;
+            }
+        }
+        // No geo data -> cannot evaluate, keep for safety
+        kept_candidates.push(fk);
+    }
+    // Keep at least MIN_KEEP best pruned fonts by min_ll to stabilize per-position best
+    const MIN_KEEP: usize = 10;
+    if kept_candidates.len() < MIN_KEEP && !pruned_with_ll.is_empty() {
+        pruned_with_ll.sort_unstable_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal).then_with(|| a.0.cmp(b.0)));
+        let need = MIN_KEEP.saturating_sub(kept_candidates.len());
+        for &(fk, _ll) in pruned_with_ll.iter().take(need) {
+            kept_candidates.push(fk);
+            pruned_count = pruned_count.saturating_sub(1);
+        }
+    }
+    // Avoid empty candidate set: keep at least the best by max geo (least negative min_ll)
+    let candidate_vec: Vec<&'a str> = if kept_candidates.is_empty() && !candidate_vec.is_empty() {
+        let mut best: Option<(&'a str, f32)> = None;
+        for &fk in &candidate_vec {
+            let best_ll_for_font = geo_per_font
+                .get(fk)
+                .map(|m| m.values().cloned().fold(f32::NEG_INFINITY, f32::max))
+                .unwrap_or(f32::NEG_INFINITY);
+            if best.is_none() || best_ll_for_font > best.as_ref().unwrap().1 {
+                best = Some((fk, best_ll_for_font));
+            }
+        }
+        if let Some((bfk, _)) = best {
+            pruned_count = total_candidates.saturating_sub(1);
+            vec![bfk]
+        } else {
+            kept_candidates
+        }
+    } else {
+        kept_candidates
+    };
+    if pruned_count > 0 && audit {
+        eprintln!(
+            "midpoint prune: pruned {}/{} fonts at threshold {:.2} (base {:.1} * thoroughness {:.2})",
+            pruned_count, total_candidates, prune_threshold, MIDPOINT_PRUNE_BASE, thoroughness
+        );
+    }
+
     // First pass: collect log-probs for all candidate fonts
-    let font_lps: Vec<(String, Vec<(f32, f32)>)> = candidate_vec.into_iter()
+    let font_lps: Vec<(&'a str, Vec<(f32, f32)>)> = candidate_vec.into_iter()
         .filter_map(|font_key| {
             let log_probs: Vec<(f32, f32)> = scoring_window_indices.iter()
                 .filter_map(|&i| {
                     let wd = &crop_data[i];
                     let seq = [wd.ch];
-                    let glyph_id = glyph_map.glyph_id_for_font(&seq, &font_key)?;
-                    // Use raw logit -d²/(2σ²)
-                    let logit = *window_logit_maps[i].get(&glyph_id)?;
+                    let glyph_id = glyph_map.glyph_id_for_font(&seq, font_key)?;
+                    // Dense Vec<Option<f32>> → preserve None as missing, same as HashMap get(&gid)? 
+                    let logit = window_logit_maps[i].get(glyph_id).copied().flatten()?;
                     let mut lp = logit;
                     // Geo scoring: per character, scaled by GEO_WEIGHT
-                    if let Some(geo_map) = geo_per_font.get(&font_key) {
+                    if let Some(geo_map) = geo_per_font.get(font_key) {
                         if let Some(&(seg_idx, char_pos)) = position_map.get(wd.window_idx) {
                             if let Some(&ll) = geo_map.get(&(seg_idx, char_pos)) {
                                 lp += GEO_WEIGHT * ll;
@@ -317,8 +474,10 @@ pub fn identify_fonts(
     }
 
     // Second pass: score using squared deviations from per-observation best
+    // Perf: sort borrowed &str keys to avoid moving/cloning String during sort,
+    // then materialize owned Strings after sort (preserves output, avoids String moves).
     let mut best_path_score = f32::MIN;
-    let mut scores: Vec<(String, f32)> = font_lps.into_iter()
+    let mut borrowed_scores: Vec<(&'a str, f32)> = font_lps.into_iter()
         .filter_map(|(font_key, log_probs)| {
             let score = aggregate_font_score(&log_probs, &best_lps);
             if score.is_finite() {
@@ -336,11 +495,16 @@ pub fn identify_fonts(
         })
         .collect();
 
-    // Sort descending (higher = better = closer match).
-    scores.sort_by(|a, b| {
+    // Sort descending (higher = better = closer match). Deterministic tie-break by name.
+    borrowed_scores.sort_unstable_by(|a, b| {
         b.1.partial_cmp(&a.1)
             .unwrap_or(std::cmp::Ordering::Equal)
+            .then_with(|| a.0.cmp(b.0))
     });
+
+    let scores: Vec<(String, f32)> = borrowed_scores.into_iter()
+        .map(|(k, s)| (k.to_owned(), s))
+        .collect();
 
     FontIdResult { scores, observations, path_score: best_path_score }
 }

@@ -809,12 +809,27 @@ fn build_miss_block(
     let (gt_render_uri, gt_diff_uri, gt_sim) =
         render_correct_font_comparison(entry, correct_fe, font_data_cache, diag_dir.as_deref());
     // Compute font sizes for comparison
+    // GT size is ground-truth from PDF.
+    // Unprint size must be midpoint-derived (obs_span/pred_span * upem) per user intent,
+    // not width-matched. entry.midpoint_em_px is the median midpoint scale already computed
+    // in geometry_classifier::median_em_px_from_midpoints and used for ZNCC rendering.
     let gt_font_size_pt = ce.gt_font_size_pt;
+    let scale = 72.0 / dpi as f32;
+    let midpoint_pt = entry.midpoint_em_px.map(|em| em * scale);
     let inferred_size = chosen_fe.and_then(|fe| {
         let data = font_data_cache.load(&fe.path)?;
         compute_inferred_font_size(data, &entry.word_bboxes, &fe.variant_tag, fe.variations.as_deref(), dpi)
     });
-    let unprint_font_size_pt = inferred_size.as_ref().map(|s| s.median_pt);
+    // Prefer midpoint for the main Size value; fall back to width-matched only if midpoint missing
+    let unprint_font_size_pt = midpoint_pt.or_else(|| inferred_size.as_ref().map(|s| s.median_pt));
+    // Per-word breakdown is width-matched only. When we have a midpoint median, showing width-matched
+    // per-word values would make the pct column misleading (median vs width-matched word), so hide it
+    // in the midpoint case. Fallback case (no midpoint) keeps the old width-matched breakdown.
+    let per_word_for_block = if midpoint_pt.is_some() {
+        None
+    } else {
+        inferred_size.as_ref().map(|s| s.per_word.as_slice())
+    };
 
     let sim_compare_html = if let Some(ref dd) = diag_dir {
         build_similarity_block(
@@ -822,7 +837,7 @@ fn build_miss_block(
             gt_render_uri.as_deref(), gt_diff_uri.as_deref(),
             gt_sim,
             gt_font_size_pt, unprint_font_size_pt,
-            inferred_size.as_ref().map(|s| s.per_word.as_slice()),
+            per_word_for_block,
         )
     } else {
         String::new()
@@ -997,6 +1012,50 @@ fn build_miss_block(
         String::new()
     };
 
+    // Font candidate scores — top N with GT and chosen markers, legible tie-break context
+    let font_scores_html = {
+        if entry.font_candidates.is_empty() {
+            String::new()
+        } else {
+            let mut rows = String::new();
+            let gt_key_str = gt_key.as_deref().unwrap_or("");
+            for (i, fc) in entry.font_candidates.iter().take(10).enumerate() {
+                let rank = i + 1;
+                let is_chosen = rank == 1;
+                let is_gt = !gt_key_str.is_empty() && fc.font_key == gt_key_str;
+                let marker = if is_chosen && is_gt {
+                    " ✓ GT"
+                } else if is_chosen {
+                    " ✓"
+                } else if is_gt {
+                    " GT"
+                } else {
+                    ""
+                };
+                let cls = if is_chosen { "tie-winner" } else if is_gt { "correct" } else { "" };
+                let score_str = fc.score.map(|s| format!("{s:.6}")).unwrap_or_else(|| "—".into());
+                rows.push_str(&format!(
+                    "<tr><td>{rank}</td><td class=\"{cls}\">{}<span style=\"font-size:10px;color:#888;\">{}</span></td><td class=\"mono\">{}</td></tr>",
+                    short_key(&fc.font_key), marker, score_str
+                ));
+            }
+            // If GT rank >10, show it as extra row
+            if let (Some(gr), Some(gs)) = (gt_rank, gt_score) {
+                if gr > 10 {
+                    let gk = gt_key.as_deref().unwrap_or("?");
+                    rows.push_str(&format!(
+                        "<tr><td>{gr}</td><td class=\"correct\">{}<span style=\"font-size:10px;color:#888;\"> GT</span></td><td class=\"mono\">{:.6}</td></tr>",
+                        short_key(gk), gs
+                    ));
+                }
+            }
+            format!(
+                "<div class=\"font-scores-block\"><b>Font candidates (top 10, score = higher is better, negative = penalty)</b>\
+                 <table class=\"obs-table\" style=\"margin:0.4em 0;\"><thead><tr><th>Rank</th><th>Font</th><th>Score</th></tr></thead><tbody>{rows}</tbody></table></div>"
+            )
+        }
+    };
+
     // OCR override table — separate from font-matching obs table.
     // OCR corrections table — from audit ocr_corrections data.
     let ocr_override_html = {
@@ -1035,10 +1094,11 @@ fn build_miss_block(
          {}\
          {}\
          {}\
+         {}\
          </div>",
         entry.page, entry.line_index, miss_kind_label, sim_html,
         text_preview,
-        seg_path_html, lig_compare_html, scan_line_html, sim_compare_html, tie_break_html, obs_table_html,
+        seg_path_html, font_scores_html, lig_compare_html, scan_line_html, sim_compare_html, tie_break_html, obs_table_html,
         obs_table_lig_html, ocr_override_html,
     );
     (html, entry.similarity_score, gt_sim)
@@ -1452,6 +1512,9 @@ fn render_correct_font_comparison(
 
     // Same pipeline as the chosen font — render, ZNCC, ink-crop for display
     // For GT comparison renders, allow ligatures so "fi" can shape correctly
+    // Fix: use midpoint_em_px when available so GT==Chosen doesn't get different ZNCC
+    // due to width-matched vs midpoint sizing. Previously GT always used None (width-matched)
+    // while chosen used midpoint, causing L9 PTSerif to show different renders even when equal.
     let vr = crate::verify::verify_text_region(
         &scan_gray, font_data, &entry.text, &words,
         entry.bbox.x, entry.bbox.y,
@@ -1459,6 +1522,7 @@ fn render_correct_font_comparison(
         &fe.variant_tag, fe.variations.as_deref(),
         true,
         None, None,
+        entry.midpoint_em_px,
     );
 
     let render_uri = vr.render_ink.as_ref().map(|r| img_to_b64_uri(r));
@@ -2380,11 +2444,67 @@ pub fn generate_report(
         let major_pct = major_correct as f64 / compared as f64 * 100.0;
         let minor_correct = hits.len(); // hits = exact match
         let minor_pct = minor_correct as f64 / compared as f64 * 100.0;
+        let major_ignore = compared - major_misses.len();
+        let major_ignore_pct = major_ignore as f64 / compared as f64 * 100.0;
+        let exact_correct = hits.len() + similarity_failures.len();
+        let exact_pct = exact_correct as f64 / compared as f64 * 100.0;
         format!(
-            "Font accuracy: <b>{major_correct}/{compared} ({major_pct:.0}%)</b> major correct ·              <b>{minor_correct}/{compared} ({minor_pct:.0}%)</b> exact match"
+            "Font accuracy: <b>{major_correct}/{compared} ({major_pct:.0}%)</b> major correct · <b>{minor_correct}/{compared} ({minor_pct:.0}%)</b> exact match<br>Ignoring similarity threshold (<0.9 ZNCC): <b>{major_ignore}/{compared} ({major_ignore_pct:.0}%)</b> not major miss · <b>{exact_correct}/{compared} ({exact_pct:.0}%)</b> exact PS name"
         )
     } else {
         String::from("Font accuracy: no GT data")
+    };
+
+    // ── Independent attribute stats (each line can have multiple) ──────
+    // 4 independent booleans per GT line:
+    //   ocr_miss, zncc_miss, major_miss, major_right_but_not_exact (MinorMiss)
+    let (ocr_miss_cnt, zncc_miss_cnt, major_miss_ind_cnt, _major_right_not_exact_cnt) = {
+        let mut ocr = 0usize;
+        let mut zncc = 0usize;
+        let mut major = 0usize;
+        let mut mrne = 0usize;
+        for ce in &classified {
+            if ce.actual_font.is_none() {
+                continue; // only GT lines
+            }
+            // ocr miss: ocr_correct == false (enriched in enrich_audit_entries)
+            if ce.entry.ocr_correct == Some(false) {
+                ocr += 1;
+            }
+            // zncc miss: similarity_pass == false regardless of ps_match
+            // This is the independent ZNCC attribute, not the mutually-exclusive SimilarityFailure.
+            if ce.entry.similarity_pass == Some(false) {
+                zncc += 1;
+            }
+            match ce.kind {
+                MissKind::MajorMiss => major += 1,
+                MissKind::MinorMiss => mrne += 1,
+                _ => {}
+            }
+        }
+        (ocr, zncc, major, mrne)
+    };
+    let independent_summary = if compared > 0 {
+        // Pass / hit counts only — misses are redundant (pass = compared - miss)
+        let ocr_ok = compared.saturating_sub(ocr_miss_cnt);
+        let ocr_ok_pct = ocr_ok as f64 / compared as f64 * 100.0;
+        let zncc_ok = compared.saturating_sub(zncc_miss_cnt);
+        let zncc_ok_pct = zncc_ok as f64 / compared as f64 * 100.0;
+        let not_major = compared.saturating_sub(major_miss_ind_cnt);
+        let not_major_pct = not_major as f64 / compared as f64 * 100.0;
+        let exact = hits.len() + similarity_failures.len();
+        let exact_pct = exact as f64 / compared as f64 * 100.0;
+        format!(
+            "<h3 style=\"margin:1em 0 0.3em;\">Independent attribute stats — passes only (each line can have multiple)</h3>\
+             <ul style=\"margin:0 0 0.5em 1.2em; line-height:1.6;\">\
+               <li>OCR correct: <b>{ocr_ok}/{compared} ({ocr_ok_pct:.1}%)</b></li>\
+               <li>ZNCC pass (≥0.9): <b>{zncc_ok}/{compared} ({zncc_ok_pct:.1}%)</b></li>\
+               <li>Major correct (not major miss): <b>{not_major}/{compared} ({not_major_pct:.1}%)</b></li>\
+               <li>Exact PS name match: <b>{exact}/{compared} ({exact_pct:.1}%)</b></li>\
+             </ul>",
+        )
+    } else {
+        String::from("<div>Independent stats: no GT data</div>")
     };
 
     // ── Summary line 3: OCR ──────────────────────────────────────────
@@ -2489,6 +2609,7 @@ pub fn generate_report(
          <h2>{report_title}</h2>\n\
          <div class=\"summary\">{sim_summary}</div>\n\
          <div class=\"summary\">{font_summary}</div>\n\
+         <div class=\"summary\">{independent_summary}</div>\n\
          <div class=\"summary\">{ocr_summary}</div>\n\
          <div class=\"summary\">{meta_str}</div>\n\
          <div class=\"score-legend\">\n\

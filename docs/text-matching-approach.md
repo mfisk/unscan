@@ -37,21 +37,29 @@ word-level SSIM reranking step — the CI #1 candidate wins directly. The SSIM
 verification in Pass 2 is a *gate* (reject bad matches), not a *selector*
 (choose between candidates).
 
-**Score aggregation:** For each observation (character or bigram crop),
-the classifier produces a softmax probability for every candidate font.
-The best log-probability across all candidates at each observation defines
-a reference.  Each font's score is the negated sum of squared deviations
-from those per-observation bests, weighted by observation weight and OOD
-weight:
+**Score aggregation (generative log-likelihood):** For each observation (character crop),
+the classifier produces a per-font logit `-d²/(2σ²)` and geometry adds
+`GEO_WEIGHT * (h_ll+v_ll)` (see §1.1). The weighted log-prob is
+`lp_i = logit_i + GEO_WEIGHT*geo_ll_i`, weight `w_i = crop.weight * ood_weight_i`.
+
+When `USE_SUM_AGG=true` (default since 2026-07-26), the font score is the
+proper generative log-likelihood under independence:
 
 ```
-score(font) = −Σᵢ (ln p_best_i − ln p_font_i)² · wᵢ
+score(font) = Σᵢ wᵢ · lp_i
 ```
 
-Highest score (closest to zero) wins.  Squaring amplifies discriminative
-observations — a single character where the font falls far behind matters
-more than many characters where all fonts score alike.  This is the same
-principle as a chi-squared test.
+Highest score wins. This is order-preserving under subsetting (IIA): if A > B
+on the full set, A > B remains true after pruning any third font C, because
+`best_i` is not used. The previous squared-gap mode
+`score = −Σ w·(best_i − lp_i)²` used a data-dependent `best_i = max_j lp_j[i]`;
+pruning changes `best_i`, so a font could flip from winner to loser because it
+was close to an artificially low `best_pruned`. That broke midpoint pruning
+soundness — hence the switch.
+
+`best_lps[i] = max_j lp_j[i]` is still computed for tie-breaking and for the
+`MIN_KEEP` stabilization heuristic, but no longer part of the score when
+`USE_SUM_AGG` is true.
 
 **OOD observation weighting:** Each observation's weight is scaled by
 `min(1, med_nn / min_d)`, where `min_d` is the distance to the nearest
@@ -64,6 +72,46 @@ are handled via dual-path segmentation: plain OCR characters vs.
 ligature-collapsed characters, with the higher-scoring path winning.  Path
 comparison uses OOD-weighted scores only (no position weights) so garbage
 observations are downweighted without position bias affecting the selection.
+
+**Geometry scoring:** `per_char_geo_for_font()` computes per-character
+midpoint geometry `h_ll + v_ll` (horizontal/vertical midpoint log-likelihoods)
+from `word_segs` / `wib` (word-image boxes). This is added to the classifier
+logit with `GEO_WEIGHT=1.0`:
+
+```
+lp_i = logit_i + GEO_WEIGHT * geo_ll_i
+```
+
+If a font has no geometry data for a line, it is kept (cannot be pruned for
+geometry). Empty `geo_per_font` maps keep the candidate safe.
+
+**Midpoint pruning (pre-filter, ~85% reduction):** Before scoring, fonts are
+pruned by worst-case geometry:
+
+```
+min_ll(font) = min_{chars on line} (h_ll+v_ll)
+threshold = MIDPOINT_PRUNE_BASE * thoroughness.max(0.1)
+  BASE = -12.0  (worst correct-font letter on BAP: SourceSerif4-400 'T' p5:23 = -10.15)
+  thr=1.0 → -12, thr=2.0 → -24 (looser), thr=0.5 → -6 (tighter)
+
+prune if min_ll < threshold
+keep if font_key in ensure_font_keys or geo_map empty
+```
+
+Stabilization:
+- `MIN_KEEP=10` — if kept <10, re-add the best pruned fonts by highest `min_ll`
+- If kept becomes empty, keep the single font with highest `max geo_ll`
+- Logs `midpoint prune: pruned X/Y fonts at threshold ...` when `--audit` is on
+
+This is sound with `USE_SUM_AGG=true` because `Σ w·lp` does not depend on
+per-position `best`. With squared-gap mode it was unsound — `best_pruned < best_full`
+made all remaining fonts look better, but the wrong fonts benefited most from a
+lowered `best`, flipping p5:84 `IBMPlexSans-400` (-4.458) vs `Devanagari-400` (-4.442).
+
+BAP (font-timeline, 494 GT lines):
+- no prune: 362 primary hits 73.3% 445s, major 77 minor 98 hit 264 sim 55
+- prune thr1 -10 gap²: 334 primary 67.6% 105s (4.2×), prune 85.6% 126621/147985
+- prune thr1 -12 log-p (current): 348 primary 70.4% (291 hit+57 minor), major 43 minor 57 sim 103, ZNCC 0.8987, 52s audit-only; OCR-correct 320/396=80.8% vs 324/404=80.2% before
 
 ## 2. SSIM Fast Path — Dominant Font Acceleration
 
@@ -123,8 +171,10 @@ For each line that misses the fast path:
 3. **CI search:** Per-character nearest-neighbor search against the
    pre-built index. Brute-force linear scan (~5000 fonts per character).
 
-4. **Score aggregation:** Sum of squared deviations from per-observation
-   best log-probabilities, OOD-weighted.  Lowest penalty wins.
+4. **Score aggregation:** Weighted sum of log-probs `Σ w_i·lp_i` (generative).
+   `best_lps` still computed per position for tie-break stability, but not used
+   in score when `USE_SUM_AGG=true`. OOD-weighted variant also computed for
+   path comparison.
 
 5. **OCR correction gate:** If the best match for a character is
    catastrophically bad (d² > 0.5), all indexed characters are scanned

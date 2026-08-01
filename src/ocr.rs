@@ -180,6 +180,7 @@ pub fn extract_text_regions_from_gray(
     Ok((regions, char_boxes))
 }
 
+#[allow(dead_code)]
 pub fn extract_text_regions(
     page_img: &DynamicImage,
     dpi: u32,
@@ -555,61 +556,149 @@ pub fn trim_words_to_ink(
             // Use middle 80% of height to avoid ascenders/descenders from
             // adjacent lines that vertically overlap (Georgia p3 L54) while
             // keeping baseline punctuation like '.' which sits low (y 49-53 for h=59).
-            let (y_top, y_bot) = if wh >= 10 {
-                let margin = wh * 10 / 100; // 10% top and bottom -> 80% middle
+            // For left/right edge detection we also scan the full height within
+            // a small 5px window to capture own descenders/ascenders (e.g. italic 'f'
+            // in "fox" whose leftmost hook sits at y=bottom-1, outside the 80% band).
+            // This fixes the brown/fox gap: without the full-height check, trim
+            // thinks fox starts at 667 (ink at y=1155) and misses columns 664-666
+            // whose ink is only at y=1157-1159, leaving a 12px gap instead of the
+            // true 9px gap (brown end 654, fox start 664).
+            let (y_top_mid, y_bot_mid) = if wh >= 10 {
+                let margin = wh * 10 / 100;
                 (wy + margin, wy + wh - margin)
             } else {
                 (wy, wy + wh)
             };
+            let y_top_full = wy;
+            let y_bot_full = wy + wh;
 
-            // Find leftmost ink column
-            let mut left_ink = None;
-            for col in wx..wx+ww {
-                let has_ink = (y_top..y_bot).any(|row| {
-                    gray.as_raw()[(row.min(page_h-1)) as usize * gray.width() as usize + (col.min(page_w-1)) as usize] < ink_threshold
+            // Middle 80% scan
+            let mut left_mid: Option<u32> = None;
+            for col in wx..wx + ww {
+                let has = (y_top_mid..y_bot_mid).any(|row| {
+                    gray.as_raw()[(row.min(page_h - 1)) as usize * page_w as usize
+                        + (col.min(page_w - 1)) as usize]
+                        < ink_threshold
                 });
-                if has_ink {
-                    left_ink = Some(col);
+                if has {
+                    left_mid = Some(col);
                     break;
                 }
             }
-            // Find rightmost ink column (inclusive)
-            let mut right_ink = None;
-            for col in (wx..wx+ww).rev() {
-                let has_ink = (y_top..y_bot).any(|row| {
-                    gray.as_raw()[(row.min(page_h-1)) as usize * gray.width() as usize + (col.min(page_w-1)) as usize] < ink_threshold
+            let mut right_mid: Option<u32> = None;
+            for col in (wx..wx + ww).rev() {
+                let has = (y_top_mid..y_bot_mid).any(|row| {
+                    gray.as_raw()[(row.min(page_h - 1)) as usize * page_w as usize
+                        + (col.min(page_w - 1)) as usize]
+                        < ink_threshold
                 });
-                if has_ink {
-                    right_ink = Some(col);
+                if has {
+                    right_mid = Some(col);
                     break;
                 }
             }
 
-            if let (Some(li), Some(ri)) = (left_ink, right_ink) {
-                // ri is inclusive, so new width = ri - li + 1
-                if ri >= li {
-                    let new_x = li;
-                    let new_w = ri - li + 1;
-                    // Only shrink, never expand (expand already did)
-                    // Allow up to 2px expansion for anti-aliasing edge?
-                    // For now, shrink only if it reduces width.
-                    if new_x >= wx && new_w <= ww {
-                        // Ensure we don't shift too far (keep within original)
-                        word.x = new_x;
-                        word.width = new_w;
-                    } else if new_x > wx {
-                        // Left trim even if width slightly larger due to off-by-1
-                        let shift = new_x - wx;
-                        if shift < ww {
-                            word.x = new_x;
-                            word.width = ww - shift;
-                            if new_w < word.width {
-                                word.width = new_w;
-                            }
-                        }
-                    } else if new_w < ww {
-                        word.width = new_w;
+            // Full-height scan limited to original bbox + 5px each side
+            // to catch descender tips that sit outside the middle band.
+            let scan_left = wx.saturating_sub(5);
+            let scan_right = (wx + ww + 5).min(page_w);
+            let mut left_full: Option<u32> = None;
+            for col in scan_left..scan_right {
+                let has = (y_top_full..y_bot_full).any(|row| {
+                    gray.as_raw()[(row.min(page_h - 1)) as usize * page_w as usize
+                        + (col.min(page_w - 1)) as usize]
+                        < ink_threshold
+                });
+                if has {
+                    left_full = Some(col);
+                    break;
+                }
+            }
+            let mut right_full: Option<u32> = None;
+            for col in (scan_left..scan_right).rev() {
+                let has = (y_top_full..y_bot_full).any(|row| {
+                    gray.as_raw()[(row.min(page_h - 1)) as usize * page_w as usize
+                        + (col.min(page_w - 1)) as usize]
+                        < ink_threshold
+                });
+                if has {
+                    right_full = Some(col);
+                    break;
+                }
+            }
+
+            // Merge: prefer middle result, but allow up to 5px expansion outward
+            // from middle using full-height result when it is close.
+            // This preserves the adjacent-line avoidance of the middle scan
+            // while recovering own descenders (fox 'f' at 664-666).
+            let mut li = left_mid.or(left_full).unwrap_or(wx);
+            let mut ri = right_mid.or(right_full).unwrap_or(wx + ww - 1);
+            if let (Some(lm), Some(lf)) = (left_mid, left_full) {
+                if lf < lm && lm - lf <= 5 {
+                    li = lf;
+                }
+            } else if left_mid.is_none() {
+                if let Some(lf) = left_full {
+                    // If middle found nothing, use full if within 5px of original left
+                    if lf <= wx + 5 {
+                        li = lf;
                     }
+                }
+            }
+            // If left_full is left of original wx by <=5px (true ink just outside OCR box),
+            // allow small expansion (fox: original 665, true 664)
+            if let Some(lf) = left_full {
+                if lf < li && li - lf <= 5 && lf + 5 >= wx {
+                    li = lf;
+                }
+                if lf < wx && wx - lf <= 5 {
+                    li = lf;
+                }
+            }
+            if let (Some(rm), Some(rf)) = (right_mid, right_full) {
+                if rf > rm && rf - rm <= 5 {
+                    ri = rf;
+                }
+            } else if right_mid.is_none() {
+                if let Some(rf) = right_full {
+                    if rf + 5 >= wx + ww {
+                        ri = rf;
+                    }
+                }
+            }
+            if let Some(rf) = right_full {
+                if rf > ri && rf - ri <= 5 {
+                    ri = rf;
+                }
+                if rf >= wx + ww && rf - (wx + ww - 1) <= 5 {
+                    ri = rf;
+                }
+            }
+
+            if ri >= li {
+                let new_x = li;
+                let new_w = ri - li + 1;
+                // Allow up to 5px expansion each side for descenders/ascenders;
+                // otherwise shrink to ink. This replaces the previous
+                // shrink-only policy that clipped italic 'f' and produced a 12px
+                // brown/fox gap instead of 9px.
+                let min_x = wx.saturating_sub(5);
+                let max_w = ww + 10; // 5 left + 5 right
+                if new_x >= min_x && new_x <= wx + ww && new_w >= 1 && new_w <= max_w {
+                    word.x = new_x;
+                    word.width = new_w;
+                } else if new_x > wx && new_x < wx + ww {
+                    let shift = new_x - wx;
+                    if shift < ww {
+                        word.x = new_x;
+                        let mut w = ww - shift;
+                        if new_w < w {
+                            w = new_w;
+                        }
+                        word.width = w;
+                    }
+                } else if new_w < ww {
+                    word.width = new_w;
                 }
             }
         }

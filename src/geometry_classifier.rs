@@ -10,6 +10,15 @@
 //! pitch is well-defined. Multi-char ligature words (e.g. "ff" plain where
 //! GSUB merges 2 chars -> 1 glyph) are skipped for geo and fall back to
 //! SSIM/n-gram only.
+//!
+//! Rule-out short-circuit: if `predict_glyph_positions_and_extents` returns
+//! `None` because the font lacks a cmap entry for a required character, the
+//! character cannot be rendered, so its geometry log-likelihood is `-infinity`
+//! (infinitely bad). Whole-font score is `-infinity`, so the font is ruled out
+//! immediately. We return `None` to signal abort; caller inserts into
+//! `cannot_render` and prunes as `NEG_INFINITY` with softmax prob 0. Empty
+//! `Vec` is not abort: it indicates ligature mismatch (0 usable words) and
+//! returns `Some(empty)` valid, keeping the font with SSIM-only scoring.
 
 use image::GrayImage;
 use std::collections::HashMap;
@@ -57,8 +66,7 @@ pub struct PerCharGeo {
 // When expressed in em units, sigma_em = sigma_px / em_px, so sigma_em is a
 // function of how many pixels per em we sampled at. In pixel space sigma_px is
 // constant, which is why we compute h_ll/v_ll directly in pixels.
-const SIGMA_CENTER_PX: f64 = 0.284;
-const SIGMA_PITCH_PX: f64 = 0.435;
+use unprint_geometry::params::{quant_half_width_px, quantized_ll, SIGMA_CENTER_PX, SIGMA_PITCH_PX};
 
 /// Measure ink bounds for each character in a word.
 ///
@@ -235,22 +243,40 @@ fn per_char_geo_cached(
         // Non-BMP / missing cmap entries will miss and fall back to shaped path.
         // Ligature codepoints (FB00-FB04) ARE in cache and score as single glyphs.
         // Plain "ff" (['f','f']) is 2 chars, stays 2 glyphs (liga disabled for plain).
-        let preds_fu_ext = geo_cache.predict_glyph_positions_and_extents(font_key, &ws.chars)?;
+        //
+        // Rule-out short-circuit: if the font lacks a cmap entry for a required
+        // character it cannot render that character at all. Its geometry
+        // log-likelihood for that char would be -infinity (infinitely bad score),
+        // so the whole-font score is -infinity regardless of other chars.
+        // Abort (return None) is therefore a valid early short-circuit for an
+        // infinitely bad score — we rule the font out immediately without
+        // scoring remaining chars.
+        let Some(preds_fu_ext) = geo_cache.predict_glyph_positions_and_extents(font_key, &ws.chars) else { return None; };
         if preds_fu_ext.len() != word_bounds.len() {
             // Ligature merge: e.g. "ff" plain shaped to 1 glyph but we have 2 bounds → skip geo for this word.
             // Single-glyph cases (1 char word, or lig path with FB00) will have len==1 and pass.
+            // This is segmentation mismatch, not missing glyph, so skip word not abort font.
             continue;
         }
-        let preds_fu: Vec<(f64,f64)> = preds_fu_ext.iter().map(|(cx,cy,_,_)| (*cx,*cy)).collect();
-
-        // Scale from font units → px: center-span (unbiased by construction)
-        // For n>=2: scale = (obs_cx_last - obs_cx_first) / (pred_cx_last - pred_cx_first)
-        // This makes sum_h = 0 per word by construction, so any remaining bias is a bug.
-        // Longer words get more precise scale (pixel quantization / width).
+        // Perf slice 3: avoid two intermediate Vec allocs (preds_fu, preds) per word per font.
+        // preds_fu_ext is Vec<(cx,cy,y_min,y_max)> in font units. Scale from font units → px
+        // is center-span (unbiased). We compute scale via shared helper
+        // `geometry_scale::center_span_scale` — single source of truth for midpoint scaling.
         let scale = if word_bounds.len() >= 2 {
-            let obs_span = (word_bounds.last().unwrap().cx - word_bounds.first().unwrap().cx).abs().max(0.5);
-            let pred_span = (preds_fu.last().unwrap().0 - preds_fu.first().unwrap().0).abs().max(0.5);
-            obs_span / pred_span
+            let obs_first = word_bounds.first().unwrap().cx;
+            let obs_last = word_bounds.last().unwrap().cx;
+            let pred_first = preds_fu_ext.first().unwrap().0;
+            let pred_last = preds_fu_ext.last().unwrap().0;
+            crate::geometry_scale::center_span_scale(obs_first, obs_last, pred_first, pred_last)
+                .unwrap_or_else(|| {
+                    // fallback to height ratio if span degenerate (should be rare)
+                    let obs_h = word_bounds.iter().map(|b| b.height).fold(0.0_f64, f64::max).max(1.0);
+                    let pred_h = geo_cache
+                        .predict_word_ink_extent(font_key, &ws.chars, &[], 0.0)
+                        .map(|(_, h)| h)
+                        .unwrap_or(1000.0);
+                    obs_h / pred_h.max(1.0)
+                })
         } else {
             // single char: fall back to height ratio (h_err is None anyway)
             let obs_h = word_bounds[0].height.max(1.0);
@@ -260,32 +286,38 @@ fn per_char_geo_cached(
                 .unwrap_or(1000.0);
             obs_h / pred_h.max(1.0)
         };
-        // y is flipped: font y up → image y down
-        let preds: Vec<(f64, f64)> = preds_fu.iter().map(|(x, y)| (x * scale, y * -scale)).collect();
 
-        // Word vertical center: use mean of character centers so sum_v = 0 by construction
-        // (matches t64 theory: obs_word_cy = mean(obs_cy), pred_word_cy = mean(pred_cy))
+        // Word vertical center: mean of centers so sum_v = 0 by construction
         let obs_word_cy = word_bounds.iter().map(|b| b.cy).sum::<f64>() / word_bounds.len() as f64;
-        let pred_word_cy = preds.iter().map(|(_, cy)| *cy).sum::<f64>() / preds.len() as f64;
+        // pred_word_cy = mean(pred_cy) where pred_cy = cy_fu * -scale
+        let pred_word_cy = {
+            let sum: f64 = preds_fu_ext.iter().map(|(_, cy, _, _)| cy * -scale).sum();
+            sum / preds_fu_ext.len() as f64
+        };
 
-        for (orig_idx, (bounds, (pred_cx, pred_cy))) in word_bounds.iter().zip(preds.iter()).enumerate() {
+        // Second pass: emit PerCharGeo without allocating preds Vec. Keep prev_pred_cx for pitch.
+        let mut prev_obs_cx: Option<f64> = None;
+        let mut prev_pred_cx: Option<f64> = None;
+        for (orig_idx, (bounds, (cx_fu, cy_fu, _, _))) in word_bounds.iter().zip(preds_fu_ext.iter()).enumerate() {
+            let pred_cx = cx_fu * scale;
+            let pred_cy = cy_fu * -scale;
             let obs_cx = bounds.cx;
             let obs_cy = bounds.cy;
 
             let obs_cy_rel = obs_cy - obs_word_cy;
             let pred_cy_rel = pred_cy - pred_word_cy;
             let v_err = obs_cy_rel - pred_cy_rel;
-            let v_ll = -v_err * v_err / (2.0 * SIGMA_CENTER_PX * SIGMA_CENTER_PX);
+            let v_ll = quantized_ll(v_err, SIGMA_CENTER_PX, quant_half_width_px());
 
             let (obs_pitch, pred_pitch, h_err, h_ll) = if orig_idx == 0 {
                 (None, None, None, 0.0)
             } else {
-                let prev = &word_bounds[orig_idx - 1];
-                let (prev_pred_cx, _) = &preds[orig_idx - 1];
-                let obs_pitch_val = obs_cx - prev.cx;
-                let pred_pitch_val = pred_cx - prev_pred_cx;
+                let prev_cx = prev_obs_cx.unwrap();
+                let ppcx = prev_pred_cx.unwrap();
+                let obs_pitch_val = obs_cx - prev_cx;
+                let pred_pitch_val = pred_cx - ppcx;
                 let h_err_val = obs_pitch_val - pred_pitch_val;
-                let h_ll_val = -h_err_val * h_err_val / (2.0 * SIGMA_PITCH_PX * SIGMA_PITCH_PX);
+                let h_ll_val = quantized_ll(h_err_val, SIGMA_PITCH_PX, quant_half_width_px());
                 (Some(obs_pitch_val), Some(pred_pitch_val), Some(h_err_val), h_ll_val)
             };
 
@@ -294,8 +326,8 @@ fn per_char_geo_cached(
                 orig_idx,
                 obs_cx,
                 obs_cy,
-                pred_cx: *pred_cx,
-                pred_cy: *pred_cy,
+                pred_cx,
+                pred_cy,
                 obs_word_cy,
                 pred_word_cy,
                 obs_pitch,
@@ -307,9 +339,13 @@ fn per_char_geo_cached(
                 v_err,
                 v_ll,
             });
+            prev_obs_cx = Some(obs_cx);
+            prev_pred_cx = Some(pred_cx);
         }
     }
-    if result.is_empty() { None } else { Some(result) }
+    // Return Some even if empty: empty = no words had usable geo (ligature mismatch), not missing glyph.
+    // None is reserved for infinite penalty (cannot render char).
+    Some(result)
 }
 
 /// Shaped path: use HarfBuzz shaping per word (slow, but handles GPOS offsets, ligatures, non-ASCII).
@@ -349,13 +385,17 @@ fn per_char_geo_shaped(
         // is the correct way to get the ligature glyph.
         let is_lig_word = ws.chars.iter().any(|c| crate::font_scan::is_ligature_char(*c));
         let allow_liga = is_lig_word;
-        let text: String = if is_lig_word {
-            ws.word_text.clone()
-        } else {
-            ws.chars.iter().collect()
-        };
-        let features = base_features.clone();
-        let sw = crate::layout::shape_word(&face, &features, &text, allow_liga)?;
+        // Perf: word_text already holds the original string for both lig and plain.
+        // Previous code cloned word_text for lig and collected chars for plain,
+        // both equivalent to &word_text. Avoid String alloc per word.
+        let text = &ws.word_text;
+        // base_features is immutable per font; no need to clone per word.
+        // Rule-out: shape_word returns None when HarfBuzz cannot shape because
+        // the font lacks a cmap entry — the char cannot be rendered. Its geometry
+        // ll would be -infinity (infinitely bad), so whole-font score is -infinity.
+        // The `?` here propagates None to the caller, which is a valid abort
+        // short-circuit: we rule the font out immediately as impossible.
+        let sw = crate::layout::shape_word(&face, &base_features, text, allow_liga)?;
         if sw.glyph_ids.len() != bounds_vec.len() {
             continue;
         }
@@ -380,11 +420,20 @@ fn per_char_geo_shaped(
             cursor_fu += sw.x_advances[i] as f64;
         }
 
-        // Center-span scaling (unbiased): scale from first..last center distance
+        // Center-span scaling (unbiased): single source of truth via geometry_scale
         let scale = if bounds_vec.len() >= 2 {
-            let obs_span = (bounds_vec.last().unwrap().cx - bounds_vec.first().unwrap().cx).abs().max(0.5);
-            let pred_span = (pred_positions.last().unwrap().0 - pred_positions.first().unwrap().0).abs().max(0.5);
-            obs_span / pred_span
+            let obs_first = bounds_vec.first().unwrap().cx;
+            let obs_last = bounds_vec.last().unwrap().cx;
+            let pred_first = pred_positions.first().unwrap().0;
+            let pred_last = pred_positions.last().unwrap().0;
+            crate::geometry_scale::center_span_scale(obs_first, obs_last, pred_first, pred_last)
+                .unwrap_or_else(|| {
+                    let obs_h = bounds_vec.iter().map(|b| b.height).fold(0.0_f64, f64::max).max(1.0);
+                    let glyph_id = unprint_fonts::ttf_parser::GlyphId(sw.glyph_ids[0] as u16);
+                    let bbox = ttfp.glyph_bounding_box(glyph_id).unwrap_or(unprint_fonts::ttf_parser::Rect { x_min: 0, y_min: -1000, x_max: 0, y_max: 0 });
+                    let pred_h = (bbox.y_max - bbox.y_min) as f64;
+                    obs_h / pred_h.max(1.0)
+                })
         } else {
             let obs_h = bounds_vec[0].height.max(1.0);
             // Use ink height from bbox for single char
@@ -409,7 +458,7 @@ fn per_char_geo_shaped(
             let obs_cy_rel = obs_cy - obs_word_cy;
             let pred_cy_rel = pred_cy - pred_word_cy;
             let v_err = obs_cy_rel - pred_cy_rel;
-            let v_ll = -v_err * v_err / (2.0 * SIGMA_CENTER_PX * SIGMA_CENTER_PX);
+            let v_ll = quantized_ll(v_err, SIGMA_CENTER_PX, quant_half_width_px());
 
             let (obs_pitch, pred_pitch, h_err, h_ll) = if orig_idx == 0 {
                 (None, None, None, 0.0)
@@ -419,7 +468,7 @@ fn per_char_geo_shaped(
                 let obs_pitch_val = obs_cx - prev.cx;
                 let pred_pitch_val = pred_cx - prev_pred_cx;
                 let h_err_val = obs_pitch_val - pred_pitch_val;
-                let h_ll_val = -h_err_val * h_err_val / (2.0 * SIGMA_PITCH_PX * SIGMA_PITCH_PX);
+                let h_ll_val = quantized_ll(h_err_val, SIGMA_PITCH_PX, quant_half_width_px());
                 (Some(obs_pitch_val), Some(pred_pitch_val), Some(h_err_val), h_ll_val)
             };
 
@@ -443,7 +492,8 @@ fn per_char_geo_shaped(
             });
         }
     }
-    if result.is_empty() { None } else { Some(result) }
+    // Empty = no usable words (ligature mismatch), not missing glyph → keep font, not infinite penalty.
+    Some(result)
 }
 
 /// Compute per-character geometry for a font.
@@ -459,4 +509,76 @@ pub fn per_char_geo_for_font(
         return Some(cached);
     }
     per_char_geo_shaped(font_key, word_segs, wib, font_cache, font_registry)
+}
+
+/// Median font size (em_px) derived from midpoint center-span scales.
+///
+/// This reuses the exact scale calculation that geometry scoring uses for
+/// midpoint log-likelihoods: for each word,
+///   obs_span  = last observed cx - first observed cx   (px, from segmentation)
+///   pred_span = last predicted cx - first predicted cx (font units, from GPOS-aware cache)
+///   scale     = obs_span / pred_span                    (px per font unit)
+///   em_px     = scale * upem
+///
+/// The median across words is robust and does NOT use advance-width matching,
+/// so it is not distorted by sidebearings, punctuation, or numeric fragments.
+/// This is the "midpoint scale" the user asked to leverage for font-size.
+///
+/// We filter to alphabetic anchors (at least one alphabetic char) so pure
+/// numbers like "1,234,567,890" don't participate, matching the sizing-anchor
+/// heuristic but now via geometry rather than width.
+pub fn median_em_px_from_midpoints(
+    font_key: &str,
+    segs: &[crate::segment::WordSeg],
+    wib: &[WordGeoMeasurement],
+    geo_cache: &crate::geo_cache::GeometryCache,
+) -> Option<f32> {
+    let upem = geo_cache.units_per_em(font_key)? as f64;
+    if upem <= 0.0 {
+        return None;
+    }
+    // Reuse the shared word-scales path — single loop, cheaper predict (cx only),
+    // no y-extents, no duplicate math. This removes the previous duplicate
+    // `predict_glyph_positions_and_extents` call that geometry scoring had already done.
+    let scales = word_scales_for_font(font_key, segs, wib, geo_cache);
+    em_from_word_scales(&scales, upem)
+}
+
+/// Compute per-word center-span scales for a font without re-shaping twice.
+/// This is the shared path that both geometry scoring and sizing can use,
+/// removing the previous redundant `predict_glyph_positions_and_extents` call
+/// in sizing that geometry had already done.
+///
+/// Returns scales in same order as `segs`/`wib` (only for valid anchors).
+pub fn word_scales_for_font(
+    font_key: &str,
+    segs: &[crate::segment::WordSeg],
+    wib: &[WordGeoMeasurement],
+    geo_cache: &crate::geo_cache::GeometryCache,
+) -> Vec<f64> {
+    let mut scales = Vec::with_capacity(segs.len());
+    if segs.len() != wib.len() {
+        return scales;
+    }
+    for (seg, meas) in segs.iter().zip(wib.iter()) {
+        if meas.chars.len() != seg.chars.len() || meas.chars.len() < 2 {
+            continue;
+        }
+        if !crate::geometry_scale::is_sizing_anchor(&seg.chars) {
+            continue;
+        }
+        let obs_first = meas.chars.first().unwrap().cx;
+        let obs_last = meas.chars.last().unwrap().cx;
+        let Some(pred) = geo_cache.predict_glyph_positions(font_key, &seg.chars) else { continue };
+        if pred.len() < 2 { continue; }
+        let Some(s) = crate::geometry_scale::center_span_scale(obs_first, obs_last, pred[0].0, pred[pred.len()-1].0) else { continue };
+        scales.push(s);
+    }
+    scales
+}
+
+pub fn em_from_word_scales(scales: &[f64], upem: f64) -> Option<f32> {
+    if scales.is_empty() || upem <= 0.0 { return None; }
+    let mut ems: Vec<f32> = scales.iter().map(|&s| crate::geometry_scale::em_from_scale(s, upem)).collect();
+    crate::geometry_scale::median_f32(&mut ems)
 }

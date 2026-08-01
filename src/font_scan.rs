@@ -66,6 +66,11 @@ pub struct FontEntry {
     pub oldstyle_figures: bool,
     /// OT feature tag this variant represents (empty string for default entry).
     pub variant_tag: String,
+    /// Cached font_key = postscript_name (+ "|" + variant_tag if non-empty).
+    /// Stored to avoid repeated String alloc in hot loops (2532 fonts × 500 chars).
+    /// Not serialized; recomputed on load.
+    #[allow(dead_code)]
+    pub font_key_cache: String,
     /// For variant entries: maps characters to their feature-specific glyph IDs.
     /// Only characters whose glyph ID differs from default are included.
     /// None for the default entry (use normal cmap lookup).
@@ -88,6 +93,37 @@ pub struct FontEntry {
 }
 
 impl FontEntry {
+    #[inline]
+    pub fn compute_font_key(postscript_name: &str, variant_tag: &str) -> String {
+        if variant_tag.is_empty() {
+            postscript_name.to_owned()
+        } else {
+            format!("{}|{}", postscript_name, variant_tag)
+        }
+    }
+
+    #[inline]
+    pub fn compute_font_key_full(
+        postscript_name: &str,
+        variant_tag: &str,
+        vintage_era: Option<&str>,
+        has_var_default: bool,
+    ) -> String {
+        let mut k = if variant_tag.is_empty() {
+            postscript_name.to_owned()
+        } else {
+            format!("{}|{}", postscript_name, variant_tag)
+        };
+        if let Some(era) = vintage_era {
+            k.push_str("|vintage=");
+            k.push_str(era);
+        }
+        if has_var_default {
+            k.push_str("|var");
+        }
+        k
+    }
+
     /// Unique key for this font entry in the font registry.
     /// Uses the canonical PostScript name (from `make_weight_explicit`) so
     /// duplicate font files with different paths but the same identity
@@ -95,33 +131,27 @@ impl FontEntry {
     /// Vintage era and variable vs static are now part of the key so that
     /// `liberationsans-word6-<hash>.ttf` copying PS name does not collide
     /// with base, and static Inter-Regular vs variable Inter wght400 are distinct.
+    /// Returns clone of cached key to preserve API but avoid recompute (perf slice 8).
+    #[inline]
     pub fn font_key(&self) -> String {
-        let mut k = self.postscript_name.clone();
-        if !self.variant_tag.is_empty() {
-            k.push('|');
-            k.push_str(&self.variant_tag);
-        }
-        if let Some(ref era) = self.vintage_era {
-            k.push_str("|vintage=");
-            k.push_str(era);
-        }
-        // Explicitly encode variable source when variations are present but
-        // variant_tag might be empty (default instance of variable font).
-        // This keeps static vs variable at same weight distinct even before era tagging.
-        if self.variations.is_some() {
-            // variant_tag already contains wghtXXX for weight instances; for default
-            // variable instance (no wght tag) we still need distinction from static.
-            if self.variant_tag.is_empty() || !self.variant_tag.starts_with("wght") {
-                // If variant_tag is empty and we are a variable font default instance,
-                // append marker; if variant_tag is wght, it's already distinct, but we
-                // keep variations marker implicit. To avoid changing existing keys too
-                // much, only add when variant_tag does not start with wght.
-                if self.variant_tag.is_empty() {
-                    k.push_str("|var");
-                }
-            }
-        }
-        k
+        self.font_key_cache.clone()
+    }
+
+    /// Borrowed view of cached key — zero alloc, for hot loops.
+    #[inline]
+    pub fn font_key_ref(&self) -> &str {
+        &self.font_key_cache
+    }
+
+    /// Recompute cache after mutating vintage_era or variant fields (used for vintage generation).
+    pub fn recompute_font_key_cache(&mut self) {
+        let has_var_default = self.variations.is_some() && self.variant_tag.is_empty();
+        self.font_key_cache = Self::compute_font_key_full(
+            &self.postscript_name,
+            &self.variant_tag,
+            self.vintage_era.as_deref(),
+            has_var_default,
+        );
     }
 }
 
@@ -135,9 +165,9 @@ pub struct FontRegistry {
 impl FontRegistry {
     pub fn new(mut entries: Vec<FontEntry>) -> Self {
         // Sort by font_key for deterministic ordering and stable font_ids.
-        entries.sort_by(|a, b| a.font_key().cmp(&b.font_key()));
+        entries.sort_by(|a, b| a.font_key_ref().cmp(b.font_key_ref()));
         let by_key = entries.iter().enumerate()
-            .map(|(i, e)| (e.font_key(), i))
+            .map(|(i, e)| (e.font_key_ref().to_owned(), i))
             .collect();
         let catalog_hash = Self::compute_hash(&entries);
         Self { entries, by_key, catalog_hash }
@@ -149,7 +179,7 @@ impl FontRegistry {
         use std::hash::{Hash, Hasher};
         let mut hasher = std::collections::hash_map::DefaultHasher::new();
         for e in entries {
-            e.font_key().hash(&mut hasher);
+            e.font_key_ref().hash(&mut hasher);
         }
         hasher.finish()
     }
@@ -160,6 +190,11 @@ impl FontRegistry {
 
     pub fn by_key(&self, key: &str) -> Option<&FontEntry> {
         self.by_key.get(key).map(|&i| &self.entries[i])
+    }
+
+    #[inline]
+    pub fn index_of(&self, key: &str) -> Option<usize> {
+        self.by_key.get(key).copied()
     }
 
     pub fn entries(&self) -> &[FontEntry] {
@@ -561,14 +596,15 @@ fn read_scan_cache(path: &Path, quiet: bool) -> Option<Vec<FontEntry>> {
         entries.push(FontEntry {
             path: PathBuf::from(path_str),
             family_name,
-            postscript_name,
+            postscript_name: postscript_name.clone(),
             raw_postscript_name,
             is_bold,
             is_italic,
             class,
             data: Vec::new(),
             oldstyle_figures,
-            variant_tag,
+            variant_tag: variant_tag.clone(),
+            font_key_cache: FontEntry::compute_font_key(&postscript_name, &variant_tag),
             glyph_overrides,
             variations,
             typographic_family,
@@ -779,6 +815,7 @@ pub fn scan_fonts(dirs: &[PathBuf], quiet: bool) -> Vec<FontEntry> {
                         data: Vec::new(), // bytes not retained
                         oldstyle_figures: fe.oldstyle_figures,
                         variant_tag: tag.clone(),
+                        font_key_cache: format!("{}|{}|{}", fe.postscript_name, tag, tag),
                         glyph_overrides: Some(combined),
                         variations: None,
                         typographic_family: fe.typographic_family.clone(),
@@ -808,14 +845,15 @@ pub fn scan_fonts(dirs: &[PathBuf], quiet: bool) -> Vec<FontEntry> {
                     let mut var_fe = FontEntry {
                         path: fe.path.clone(),
                         family_name: format!("{} [{}]", fe.family_name, var_tag),
-                        postscript_name: var_ps,
+                        postscript_name: var_ps.clone(),
                         raw_postscript_name: fe.raw_postscript_name.clone(),
                         is_bold: wi.os2_weight >= 700,
                         is_italic: fe.is_italic,
                         class: fe.class,
                         data: Vec::new(),
                         oldstyle_figures: fe.oldstyle_figures,
-                        variant_tag: var_tag,
+                        variant_tag: var_tag.clone(),
+                        font_key_cache: FontEntry::compute_font_key(&var_ps, &var_tag),
                         glyph_overrides: None,
                         variations: Some(wi.axes.clone()),
                         typographic_family: fe.typographic_family.clone(),
@@ -849,6 +887,7 @@ pub fn scan_fonts(dirs: &[PathBuf], quiet: bool) -> Vec<FontEntry> {
                     data: Vec::new(),
                     oldstyle_figures: false,
                     variant_tag: String::new(),
+                    font_key_cache: String::new(),
                     glyph_overrides: None,
                     variations: None,
                     typographic_family: String::new(),
@@ -1614,6 +1653,7 @@ pub(crate) fn load_font_entry(path: &Path, aliases: &HashMap<String, Alias>) -> 
     // Try alias table first (exact match on lowercase stem)
     if let Some(alias) = aliases.get(&stem_lower) {
         let class = classify(alias.family);
+        let font_key_cache = postscript_name.clone();
         return Some(FontEntry {
             path: path.to_path_buf(),
             family_name: alias.family.to_string(),
@@ -1625,6 +1665,7 @@ pub(crate) fn load_font_entry(path: &Path, aliases: &HashMap<String, Alias>) -> 
             data,
             oldstyle_figures,
             variant_tag: String::new(),
+            font_key_cache,
             glyph_overrides: None,
             variations: None,
             typographic_family,
@@ -1639,6 +1680,7 @@ pub(crate) fn load_font_entry(path: &Path, aliases: &HashMap<String, Alias>) -> 
     let is_italic = lower.contains("italic") || lower.contains("oblique") || lower.contains("slant");
     let class = classify(&family_name);
 
+    let font_key_cache = postscript_name.clone();
     Some(FontEntry {
         path: path.to_path_buf(),
         family_name,
@@ -1650,6 +1692,7 @@ pub(crate) fn load_font_entry(path: &Path, aliases: &HashMap<String, Alias>) -> 
         data,
         oldstyle_figures,
         variant_tag: String::new(),
+        font_key_cache,
         glyph_overrides: None,
         variations: None,
         typographic_family,

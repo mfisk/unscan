@@ -35,6 +35,7 @@ mod ngram;
 mod atomic_file;
 mod geo_cache;
 mod geometry_classifier;
+mod geometry_scale;
 
 use crate::font_pipeline::ObsRankProbs;
 use crate::audit::{AuditEntry, AuditLog, BBox, GeometryEntry, PageSummary};
@@ -189,6 +190,8 @@ fn load_fonts(args: &cli::Args, _classifier: &mut dyn classifier::Classifier) ->
                 fe.family_name = format!("{} [{}]", fe.family_name, era.name());
             }
             fe.data = Vec::new(); // drop bytes, will be loaded via FontCache on demand
+            // Recompute cache to include |vintage=ERA|var so font_key is unique and sorted deterministically
+            fe.recompute_font_key_cache();
             vintage_entries.push(fe);
         }
     }
@@ -307,6 +310,7 @@ fn build_audit_entry(
         gt_text: None,
         ocr_text: None,
         ocr_correct: None,
+        midpoint_em_px: lm.midpoint_em_px,
         fast_path: lm.fast_path,
         word_segmentation: lm.word_seg_summaries.clone(),
         ocr_corrections: lm.ocr_corrections.clone(),
@@ -807,6 +811,7 @@ fn run(args: &cli::Args, classifier: &mut dyn classifier::Classifier) -> Result<
                             allow_liga,
                             lm.diag_seg_dir.as_deref(),
                             None,
+                            lm.midpoint_em_px,
                         );
                         // Verify alt segmentation path's top font for ZNCC comparison
                         if lm.seg_winner.is_some() && !lm.font_scores_lig.is_empty() {
@@ -830,6 +835,7 @@ fn run(args: &cli::Args, classifier: &mut dyn classifier::Classifier) -> Result<
                                             alt_fe.variations.as_deref(),
                                             allow_liga_alt,
                                             alt_audit_dir.as_deref(),
+                                            None,
                                             None,
                                         );
                                     }
