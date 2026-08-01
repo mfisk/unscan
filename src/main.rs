@@ -6,6 +6,7 @@ mod color;
 mod deskew;
 mod error;
 mod font_cache;
+mod font_history;
 mod font_match;
 mod font_scan;
 mod geometry;
@@ -27,6 +28,7 @@ pub(crate) mod verify;
 pub mod ground_truth;
 pub mod report;
 mod font_pipeline;
+mod vintage_cache;
 mod zncc_classifier;
 #[allow(dead_code)]
 mod ngram;
@@ -128,13 +130,77 @@ fn main() {
 /// Centroids are already baked into classifier .bin files from training,
 /// so no runtime render+embed step is needed.
 fn load_fonts(args: &cli::Args, _classifier: &mut dyn classifier::Classifier) -> Result<font_scan::FontRegistry, ScanTextError> {
+    // ── Vintage font cache generation (lightweight, BEFORE heavy scan) ──
+    // To avoid OOM on full rescan (685 files -> 2911 entries -> incremental 342k glyph renders),
+    // we generate vintage ONLY from msttcorefonts dir via uncached scan (53 files -> 30 deduped).
+    // This does NOT touch ~/.cache/unprint/font_scan.bin and stays <200MB RSS.
+    let vintage_eras = vintage_cache::DEFAULT_ERAS;
+    let vintage_paths = {
+        let mstt_dir = std::path::PathBuf::from("/usr/share/fonts/truetype/msttcorefonts");
+        let mstt_bases = if mstt_dir.exists() {
+            // scan_fonts_uncached is crate-private but same crate root — lightweight, no cache write
+            font_scan::scan_fonts_uncached(&[mstt_dir])
+        } else {
+            Vec::new()
+        };
+        vintage_cache::ensure_vintage_fonts(&mstt_bases, vintage_eras)
+    };
+
     let font_dirs = font_scan::default_font_dirs(&args.font_dir);
-    let entries = font_scan::scan_fonts(&font_dirs, args.quiet);
-    if entries.is_empty() {
+    let base_entries = font_scan::scan_fonts(&font_dirs, args.quiet);
+    if base_entries.is_empty() {
         return Err(ScanTextError::NoFonts);
     }
 
-    let registry = font_scan::FontRegistry::new(entries);
+    // Load vintage entries via uncached scan of the returned paths (avoids touching global font_scan.bin)
+    // We parse each vintage file to get a FontEntry, then tag it with era as variant so font_key is unique.
+    let alias_table = font_scan::build_alias_table();
+    let mut vintage_entries = Vec::with_capacity(vintage_paths.len());
+    for vp in &vintage_paths {
+        // Determine era from filename (format: {fam}-{era}-{hash}.ttf)
+        let fname = vp.file_name().and_then(|n| n.to_str()).unwrap_or("");
+        let mut found_era = None;
+        for &era in vintage_eras {
+            if fname.contains(era.name()) {
+                found_era = Some(era);
+                break;
+            }
+        }
+        // Fallback: try all eras if not in DEFAULT_ERAS (in case caller passes ALL_ERAS later)
+        if found_era.is_none() {
+            for &era in vintage_cache::ALL_ERAS {
+                if fname.contains(era.name()) {
+                    found_era = Some(era);
+                    break;
+                }
+            }
+        }
+        let era = found_era.unwrap_or(vintage_cache::Era::PostScript);
+
+        if let Some(mut fe) = font_scan::load_font_entry(vp, &alias_table) {
+            // New font_key logic: keep postscript_name as base, store era in vintage_era field.
+            // font_key = PSName | variant_tag | vintage=ERA — no need to mangle PS name.
+            let era_tag = era.name().to_string();
+            fe.vintage_era = Some(era_tag.clone());
+            // Keep variant_tag as-is (preserves wght for variable instances). If base had no variant,
+            // leave it empty — vintage distinction comes from vintage_era, not variant_tag.
+            // Family name tagged for human readability only; canonical matching uses substring.
+            if !fe.family_name.to_lowercase().contains(&era_tag) {
+                fe.family_name = format!("{} [{}]", fe.family_name, era.name());
+            }
+            fe.data = Vec::new(); // drop bytes, will be loaded via FontCache on demand
+            vintage_entries.push(fe);
+        }
+    }
+
+    if !vintage_entries.is_empty() {
+        eprintln!("[vintage] loaded {} vintage variants into registry ({} total with base)", vintage_entries.len(), base_entries.len() + vintage_entries.len());
+    }
+
+    let mut all_entries = base_entries;
+    all_entries.extend(vintage_entries);
+
+    let registry = font_scan::FontRegistry::new(all_entries);
 
     // Write catalog.bin so classifier loaders can validate against it.
     let catalog_path = classifier::default_catalog_path();

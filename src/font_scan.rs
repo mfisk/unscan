@@ -79,6 +79,12 @@ pub struct FontEntry {
     /// a variable-font weight instance share the same family+weight, the
     /// static one wins.  Not serialized in the font registry.
     pub typographic_family: String,
+    /// Vintage era this entry represents, e.g. "word6", "postscript", "variable".
+    /// None for base/system fonts. Used to distinguish vintage variants that
+    /// copy the base PostScript name but represent different era transforms.
+    /// Included in font_key to avoid colliding with base entry.
+    /// String (not Era) to avoid circular dep with vintage_cache crate.
+    pub vintage_era: Option<String>,
 }
 
 impl FontEntry {
@@ -86,12 +92,36 @@ impl FontEntry {
     /// Uses the canonical PostScript name (from `make_weight_explicit`) so
     /// duplicate font files with different paths but the same identity
     /// collapse to a single key.  Variant entries append `|tag`.
+    /// Vintage era and variable vs static are now part of the key so that
+    /// `liberationsans-word6-<hash>.ttf` copying PS name does not collide
+    /// with base, and static Inter-Regular vs variable Inter wght400 are distinct.
     pub fn font_key(&self) -> String {
-        if self.variant_tag.is_empty() {
-            self.postscript_name.clone()
-        } else {
-            format!("{}|{}", self.postscript_name, self.variant_tag)
+        let mut k = self.postscript_name.clone();
+        if !self.variant_tag.is_empty() {
+            k.push('|');
+            k.push_str(&self.variant_tag);
         }
+        if let Some(ref era) = self.vintage_era {
+            k.push_str("|vintage=");
+            k.push_str(era);
+        }
+        // Explicitly encode variable source when variations are present but
+        // variant_tag might be empty (default instance of variable font).
+        // This keeps static vs variable at same weight distinct even before era tagging.
+        if self.variations.is_some() {
+            // variant_tag already contains wghtXXX for weight instances; for default
+            // variable instance (no wght tag) we still need distinction from static.
+            if self.variant_tag.is_empty() || !self.variant_tag.starts_with("wght") {
+                // If variant_tag is empty and we are a variable font default instance,
+                // append marker; if variant_tag is wght, it's already distinct, but we
+                // keep variations marker implicit. To avoid changing existing keys too
+                // much, only add when variant_tag does not start with wght.
+                if self.variant_tag.is_empty() {
+                    k.push_str("|var");
+                }
+            }
+        }
+        k
     }
 }
 
@@ -279,7 +309,7 @@ pub fn default_font_dirs(extra: &[PathBuf]) -> Vec<PathBuf> {
 //     typographic_family_len: u32 le + [u8; typographic_family_len]
 
 const FSCN_MAGIC: &[u8; 4] = b"FSCN";
-const FSCN_VERSION: u32 = 2;
+const FSCN_VERSION: u32 = 3;
 
 pub(crate) fn scan_cache_path() -> PathBuf {
     crate::cache::paths::font_scan_bin()
@@ -429,6 +459,14 @@ fn write_scan_cache(path: &Path, entries: &[FontEntry]) -> std::io::Result<()> {
         }
 
         write_str(&mut w, &e.typographic_family)?;
+
+        // vintage_era (Option<String>) - v3+
+        match &e.vintage_era {
+            None => w.write_all(&0xFFFF_FFFFu32.to_le_bytes())?,
+            Some(s) => {
+                write_str(&mut w, s)?;
+            }
+        }
     }
 
     w.flush()?;
@@ -496,6 +534,30 @@ fn read_scan_cache(path: &Path, quiet: bool) -> Option<Vec<FontEntry>> {
 
         let typographic_family = read_str(&mut r)?;
 
+        // vintage_era: Option<String> - v3+, with backwards compat for v2
+        // In v2, there was no vintage_era field, so we attempt to peek.
+        // If version == 3, we read it as Option.
+        let vintage_era = if version >= 3 {
+            // Peek next u32: 0xFFFFFFFF => None, else it's length of string.
+            // Need to handle gracefully if buffer ends (old file truncated)
+            if r.len() < 4 {
+                None
+            } else {
+                // Save position to detect sentinel
+                let sentinel = u32::from_le_bytes([r[0], r[1], r[2], r[3]]);
+                if sentinel == 0xFFFF_FFFF {
+                    // consume sentinel
+                    r = &r[4..];
+                    None
+                } else {
+                    // it's a string length => read_str will consume len+bytes
+                    read_str(&mut r)
+                }
+            }
+        } else {
+            None
+        };
+
         entries.push(FontEntry {
             path: PathBuf::from(path_str),
             family_name,
@@ -510,20 +572,26 @@ fn read_scan_cache(path: &Path, quiet: bool) -> Option<Vec<FontEntry>> {
             glyph_overrides,
             variations,
             typographic_family,
+            vintage_era,
         });
     }
 
     Some(entries)
 }
 
-/// Dedup font entries: drop variable-font weight instances covered by static
-/// fonts, then dedup by font_key.
+/// Dedup font entries: keep both static and variable-font weight instances as
+/// distinct legacy vs modern variants (user requested), then dedup by enhanced font_key.
 fn dedup_fonts(mut fonts: Vec<FontEntry>, quiet: bool) -> Vec<FontEntry> {
-    // Prefer static fonts over variable-font weight instances
+    // Previously we dropped variable-font weight instances covered by static fonts.
+    // That loses the distinction between static Inter-Regular (legacy) and
+    // variable Inter wght400 (modern) which render differently (hinting, gvar).
+    // User request: keep both as separate entries expecting difference.
+    // So we now KEEP both and only log what would have been dropped.
+
     {
         use std::collections::HashSet;
         let static_keys: HashSet<(String, u16, bool)> = fonts.iter()
-            .filter(|f| f.variations.is_none() && !f.variant_tag.starts_with("wght"))
+            .filter(|f| f.variations.is_none() && !f.variant_tag.starts_with("wght") && f.vintage_era.is_none())
             .filter_map(|f| {
                 if f.typographic_family.is_empty() { return None; }
                 let ps = &f.postscript_name;
@@ -537,23 +605,24 @@ fn dedup_fonts(mut fonts: Vec<FontEntry>, quiet: bool) -> Vec<FontEntry> {
             })
             .collect();
 
-        let before = fonts.len();
-        fonts.retain(|f| {
-            if !f.variant_tag.starts_with("wght") {
-                return true;
+        let mut would_drop = 0usize;
+        for f in &fonts {
+            if f.variant_tag.starts_with("wght") {
+                let weight = f.variant_tag.strip_prefix("wght")
+                    .and_then(|s| s.parse::<u16>().ok())
+                    .unwrap_or(0);
+                if static_keys.contains(&(f.typographic_family.clone(), weight, f.is_italic)) {
+                    would_drop += 1;
+                }
             }
-            let weight = f.variant_tag.strip_prefix("wght")
-                .and_then(|s| s.parse::<u16>().ok())
-                .unwrap_or(0);
-            !static_keys.contains(&(f.typographic_family.clone(), weight, f.is_italic))
-        });
-        let removed = before - fonts.len();
-        if removed > 0 {
-            if !quiet { eprintln!("[scan] Dropped {} variable-font weight instances covered by static fonts", removed); }
         }
+        if would_drop > 0 {
+            eprintln!("[scan] Keeping {} variable-font weight instances that overlap static fonts (legacy vs modern, expected difference)", would_drop);
+        }
+        // Intentionally do NOT filter them out anymore.
     }
 
-    // Dedup by font_key
+    // Dedup by font_key (now includes vintage_era and |var marker, so static vs variable vs vintage distinct)
     {
         use std::collections::HashSet;
         let mut seen_keys: HashSet<String> = HashSet::new();
@@ -713,6 +782,7 @@ pub fn scan_fonts(dirs: &[PathBuf], quiet: bool) -> Vec<FontEntry> {
                         glyph_overrides: Some(combined),
                         variations: None,
                         typographic_family: fe.typographic_family.clone(),
+                        vintage_era: None,
                     };
                     fonts.push(var_entry);
                 }
@@ -749,6 +819,7 @@ pub fn scan_fonts(dirs: &[PathBuf], quiet: bool) -> Vec<FontEntry> {
                         glyph_overrides: None,
                         variations: Some(wi.axes.clone()),
                         typographic_family: fe.typographic_family.clone(),
+                        vintage_era: None,
                     };
                     // Add ligature overrides to weight-instance entry
                     if !ligatures.is_empty() {
@@ -781,6 +852,7 @@ pub fn scan_fonts(dirs: &[PathBuf], quiet: bool) -> Vec<FontEntry> {
                     glyph_overrides: None,
                     variations: None,
                     typographic_family: String::new(),
+                    vintage_era: None,
                 });
             }
         }
@@ -820,13 +892,13 @@ pub fn scan_fonts(dirs: &[PathBuf], quiet: bool) -> Vec<FontEntry> {
 // Alias table
 // ---------------------------------------------------------------------------
 
-struct Alias {
+pub(crate) struct Alias {
     family: &'static str,
     bold: bool,
     italic: bool,
 }
 
-fn build_alias_table() -> HashMap<String, Alias> {
+pub(crate) fn build_alias_table() -> HashMap<String, Alias> {
     let mut m = HashMap::new();
 
     macro_rules! a {
@@ -1519,7 +1591,7 @@ pub fn read_font_identity(path: &Path) -> Option<FontIdentity> {
     Some(FontIdentity { family, _weight: weight, italic })
 }
 
-fn load_font_entry(path: &Path, aliases: &HashMap<String, Alias>) -> Option<FontEntry> {
+pub(crate) fn load_font_entry(path: &Path, aliases: &HashMap<String, Alias>) -> Option<FontEntry> {
     let data = std::fs::read(path).ok()?;
 
     // Verify ab_glyph can parse it (reject corrupt files)
@@ -1556,6 +1628,7 @@ fn load_font_entry(path: &Path, aliases: &HashMap<String, Alias>) -> Option<Font
             glyph_overrides: None,
             variations: None,
             typographic_family,
+            vintage_era: None,
         });
     }
 
@@ -1580,5 +1653,36 @@ fn load_font_entry(path: &Path, aliases: &HashMap<String, Alias>) -> Option<Font
         glyph_overrides: None,
         variations: None,
         typographic_family,
+        vintage_era: None,
     })
+}
+
+/// Scan fonts in given dirs without touching the global scan cache.
+/// Used for vintage cache dir to avoid invalidating font_scan.bin.
+/// Walks dirs, calls load_font_entry for each .ttf/.otf, no dedup (caller may dedup).
+pub(crate) fn scan_fonts_uncached(dirs: &[PathBuf]) -> Vec<FontEntry> {
+    let aliases = build_alias_table();
+    let mut fonts = Vec::new();
+    for dir in dirs {
+        if !dir.exists() {
+            continue;
+        }
+        for entry in WalkDir::new(dir).follow_links(true).into_iter().filter_map(|e| e.ok()) {
+            let path = entry.path();
+            let ext = path.extension().and_then(|e| e.to_str()).unwrap_or("").to_lowercase();
+            if ext != "ttf" && ext != "otf" {
+                continue;
+            }
+            if let Some(fe) = load_font_entry(path, &aliases) {
+                // Drop bytes like main scan does for memory, but keep path
+                let mut fe_nodata = fe;
+                fe_nodata.data = Vec::new();
+                // Note: variant detection (OT features, weight instances) is skipped for vintage
+                // cache fonts to keep them as single entries. Base vintage fonts already have
+                // historical spacing baked in.
+                fonts.push(fe_nodata);
+            }
+        }
+    }
+    fonts
 }
