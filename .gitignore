@@ -64,3 +64,7 @@ workspace/
 # JSON - ignore all (per 2026-07-18 cleanup)
 *.json
 **/*.json
+
+# Vintage proprietary TTF cache - never commit (pixel-accurate msttcorefonts, non-redistributable)
+vintage-archive/
+docs/vintage-font-spacing.md
