@@ -1,6 +1,6 @@
 //! OCR crate — text reading, depends only on geometry.
 
-pub use unprint_geometry::{CharBox, TextRegion, TextLine, RawWordBBox, Rgb};
+pub use unprint_geometry::{TextRegion, TextLine, RawWordBBox, Rgb};
 
 use image::{DynamicImage, GrayImage};
 use thiserror::Error;
@@ -17,7 +17,7 @@ pub enum OcrError {
 /// Currently implemented via tesseract CLI (same as legacy).
 /// Hot loops (expand/fix/trim) are delegated to geometry batch APIs to keep this crate thin.
 pub fn detect_page_words(page_img: &DynamicImage, dpi: u32) -> Result<Vec<TextLine>, OcrError> {
-    let (mut regions, _char_boxes) = extract_text_regions(page_img, dpi)?;
+    let mut regions = extract_text_regions(page_img, dpi)?;
     let mut lines = assemble_lines(&regions);
     snapshot_raw_bboxes(&mut lines);
     // Legacy pipeline: merge disabled, split, drop
@@ -31,8 +31,8 @@ pub fn detect_page_words(page_img: &DynamicImage, dpi: u32) -> Result<Vec<TextLi
 
 // ---- Reimplemented minimal versions of legacy functions, pure (no font dep) ----
 
-pub fn extract_text_regions(page_img: &DynamicImage, dpi: u32) -> Result<(Vec<TextRegion>, Vec<CharBox>), OcrError> {
-    // Delegate to original implementation by shelling tesseract — copied from src/ocr.rs
+pub fn extract_text_regions(page_img: &DynamicImage, dpi: u32) -> Result<Vec<TextRegion>, OcrError> {
+    // Single-pass TSV only — HOCR char boxes removed 2026-08-02 (unused, cost 1 extra tesseract per page)
     let tmp = tempfile::Builder::new().suffix(".png").tempfile()?;
     let gray = page_img.to_luma8();
     image::DynamicImage::ImageLuma8(gray).save(tmp.path()).map_err(|e| OcrError::Ocr(format!("save temp: {e}")))?;
@@ -41,11 +41,7 @@ pub fn extract_text_regions(page_img: &DynamicImage, dpi: u32) -> Result<(Vec<Te
         .output().map_err(|e| OcrError::Ocr(format!("run tesseract: {e}")))?;
     if !output.status.success() { return Err(OcrError::Ocr(format!("tesseract failed: {}", String::from_utf8_lossy(&output.stderr)))); }
     let regions = parse_tsv(&String::from_utf8_lossy(&output.stdout), dpi)?;
-    let hocr_output = std::process::Command::new("tesseract")
-        .args([tmp.path().to_str().unwrap(), "stdout", "--dpi", &dpi.to_string(), "-l", "eng", "-c", "hocr_char_boxes=1", "hocr"])
-        .output().map_err(|e| OcrError::Ocr(format!("hocr: {e}")))?;
-    let char_boxes = if hocr_output.status.success() { parse_hocr(&String::from_utf8_lossy(&hocr_output.stdout)) } else { Vec::new() };
-    Ok((regions, char_boxes))
+    Ok(regions)
 }
 
 pub fn parse_tsv(tsv: &str, dpi: u32) -> Result<Vec<TextRegion>, OcrError> {
@@ -71,8 +67,6 @@ pub fn parse_tsv(tsv: &str, dpi: u32) -> Result<Vec<TextRegion>, OcrError> {
     }
     Ok(out)
 }
-
-pub fn parse_hocr(_hocr: &str) -> Vec<CharBox> { Vec::new() }
 
 pub fn assemble_lines(words: &[TextRegion]) -> Vec<TextLine> {
     use std::collections::BTreeMap;

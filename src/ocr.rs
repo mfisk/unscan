@@ -36,17 +36,6 @@ use unprint_fonts::ab_glyph::{Font, PxScale, ScaleFont, point};
 use image::{DynamicImage, GrayImage};
 use std::process::Command;
 
-/// A character-level bounding box from Tesseract HOCR output.
-#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
-pub struct CharBox {
-    pub ch: char,
-    pub x: u32,
-    pub y: u32,
-    pub width: u32,
-    pub height: u32,
-    pub confidence: f32,
-}
-
 /// A detected text region from OCR (word-level).
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub struct TextRegion {
@@ -118,7 +107,7 @@ pub fn snapshot_raw_bboxes(lines: &mut [TextLine]) {
 pub fn extract_text_regions_from_gray(
     gray: &image::GrayImage,
     dpi: u32,
-) -> Result<(Vec<TextRegion>, Vec<CharBox>), ScanTextError> {
+) -> Result<Vec<TextRegion>, ScanTextError> {
     let tmp = tempfile::Builder::new()
         .suffix(".png")
         .tempfile()
@@ -150,41 +139,14 @@ pub fn extract_text_regions_from_gray(
     }
 
     let regions = parse_tsv(&String::from_utf8_lossy(&output.stdout), dpi)?;
-
-    // Second pass: get character-level bounding boxes via HOCR
-    let hocr_output = Command::new("tesseract")
-        .args([
-            tmp.path().to_str().unwrap(),
-            "stdout",
-            "--dpi",
-            &dpi.to_string(),
-            "-l",
-            "eng",
-            "-c",
-            "hocr_char_boxes=1",
-            "hocr",
-        ])
-        .output()
-        .map_err(|e| {
-            ScanTextError::Ocr(format!(
-                "Failed to run tesseract hocr: {e}"
-            ))
-        })?;
-
-    let char_boxes = if hocr_output.status.success() {
-        parse_hocr(&String::from_utf8_lossy(&hocr_output.stdout))
-    } else {
-        Vec::new()
-    };
-
-    Ok((regions, char_boxes))
+    Ok(regions)
 }
 
 #[allow(dead_code)]
 pub fn extract_text_regions(
     page_img: &DynamicImage,
     dpi: u32,
-) -> Result<(Vec<TextRegion>, Vec<CharBox>), ScanTextError> {
+) -> Result<Vec<TextRegion>, ScanTextError> {
     // Fast path: if already Luma8, avoid to_luma8() clone
     if let Some(gray_ref) = page_img.as_luma8() {
         return extract_text_regions_from_gray(gray_ref, dpi);
@@ -1623,174 +1585,6 @@ fn parse_tsv(tsv: &str, dpi: u32) -> Result<Vec<TextRegion>, ScanTextError> {
         });
     }
     Ok(regions)
-}
-
-/// Parse Tesseract HOCR output into CharBox structs.
-///
-/// HOCR `ocrx_cinfo` spans provide per-character bboxes with confidence,
-/// structurally nested inside `ocrx_word` spans. Coordinates use top-left
-/// origin (matching image coordinates — no y-flip needed unlike makebox).
-///
-/// Format:
-/// ```html
-/// <span class='ocrx_cinfo' title='x_bboxes 132 88 158 121; x_conf 99.44'>T</span>
-/// ```
-fn parse_hocr(hocr: &str) -> Vec<CharBox> {
-    let mut boxes = Vec::new();
-
-    for line in hocr.lines() {
-        let line = line.trim();
-        if !line.contains("ocrx_cinfo") {
-            continue;
-        }
-
-        // Extract title attribute content: title='x_bboxes ... ; x_conf ...'
-        let title_start = match line.find("title='") {
-            Some(pos) => pos + 7,
-            None => continue,
-        };
-        let title_end = match line[title_start..].find('\'') {
-            Some(pos) => title_start + pos,
-            None => continue,
-        };
-        let title = &line[title_start..title_end];
-
-        // Parse x_bboxes: "x_bboxes x1 y1 x2 y2"
-        let bbox_start = match title.find("x_bboxes ") {
-            Some(pos) => pos + 9,
-            None => continue,
-        };
-        let bbox_end = title[bbox_start..].find(';')
-            .map(|p| bbox_start + p)
-            .unwrap_or(title.len());
-        let bbox_str = title[bbox_start..bbox_end].trim();
-        let coords: Vec<u32> = bbox_str.split_whitespace()
-            .filter_map(|s| s.parse().ok())
-            .collect();
-        if coords.len() < 4 {
-            continue;
-        }
-        let (x1, y1, x2, y2) = (coords[0], coords[1], coords[2], coords[3]);
-        if x2 <= x1 || y2 <= y1 {
-            continue;
-        }
-
-        // Parse x_conf: "x_conf 99.44"
-        let conf = if let Some(conf_start) = title.find("x_conf ") {
-            let val_start = conf_start + 7;
-            let val_str = title[val_start..].trim();
-            val_str.parse::<f32>().unwrap_or(0.0)
-        } else {
-            0.0
-        };
-
-        // Extract character text content: >T</span>
-        let ch = {
-            let content_start = match line.rfind("'>") {
-                Some(pos) => pos + 2,
-                None => continue,
-            };
-            let content_end = match line[content_start..].find("</span>") {
-                Some(pos) => content_start + pos,
-                None => continue,
-            };
-            let text = &line[content_start..content_end];
-            // Handle HTML entities
-            let text = text.replace("&amp;", "&")
-                .replace("&lt;", "<")
-                .replace("&gt;", ">")
-                .replace("&quot;", "\"")
-                .replace("&#39;", "'");
-            match text.chars().next() {
-                Some(c) => c,
-                None => continue,
-            }
-        };
-
-        boxes.push(CharBox {
-            ch,
-            x: x1,
-            y: y1,
-            width: x2 - x1,
-            height: y2 - y1,
-            confidence: conf,
-        });
-    }
-
-    // Resolve horizontal overlaps within each word.
-    // HOCR chars are nested in words — we track word boundaries by detecting
-    // ocrx_word lines, then resolve overlaps for each word's chars.
-    resolve_hocr_overlaps(&mut boxes, hocr);
-
-    boxes
-}
-
-/// Resolve horizontal overlaps between adjacent HOCR charboxes within each word.
-/// When two adjacent chars overlap, split at the midpoint of the overlap region.
-fn resolve_hocr_overlaps(boxes: &mut [CharBox], hocr: &str) {
-    // Count chars per word by scanning ocrx_word spans and their nested ocrx_cinfo spans.
-    let mut word_char_counts: Vec<usize> = Vec::new();
-    let mut in_word = false;
-    let mut count = 0usize;
-    for line in hocr.lines() {
-        let trimmed = line.trim();
-        if trimmed.contains("ocrx_word") && !trimmed.contains("ocrx_cinfo") {
-            // New word starting — save previous word's count if any
-            if in_word && count > 0 {
-                word_char_counts.push(count);
-            }
-            in_word = true;
-            count = 0;
-        } else if trimmed.contains("ocrx_cinfo") {
-            count += 1;
-        }
-    }
-    // Don't forget the last word
-    if in_word && count > 0 {
-        word_char_counts.push(count);
-    }
-
-    // Now walk through boxes in word-sized groups and resolve overlaps
-    let mut offset = 0usize;
-    for &wc in &word_char_counts {
-        if offset + wc > boxes.len() {
-            break;
-        }
-        let word_chars = &mut boxes[offset..offset + wc];
-
-        // Sort by x position within the word (should already be, but be safe)
-        word_chars.sort_by_key(|c| c.x);
-
-        // Resolve overlaps between adjacent chars.
-        // If one box is a superset of (or wider than) the other, the wider box
-        // becomes the complement of the narrower one. Otherwise fall back to
-        // trimming the wider side.
-        for i in 0..word_chars.len().saturating_sub(1) {
-            let a_left = word_chars[i].x;
-            let a_right = word_chars[i].x + word_chars[i].width;
-            let b_left = word_chars[i + 1].x;
-            let b_right = word_chars[i + 1].x + word_chars[i + 1].width;
-
-            if a_right <= b_left {
-                continue; // no overlap
-            }
-
-            let a_width = word_chars[i].width;
-            let b_width = word_chars[i + 1].width;
-
-            if a_width >= b_width {
-                // A is wider (or equal) — shrink A to the complement: A becomes [a_left, b_left)
-                word_chars[i].width = b_left.saturating_sub(a_left).max(1);
-            } else {
-                // B is wider — shrink B to the complement: B becomes [a_right, b_right)
-                let old_right = b_right;
-                word_chars[i + 1].x = a_right;
-                word_chars[i + 1].width = old_right.saturating_sub(a_right).max(1);
-            }
-        }
-
-        offset += wc;
-    }
 }
 
 /// Return the ink width of a glyph in pixels from outline bounds (no rasterization).

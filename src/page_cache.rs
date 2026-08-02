@@ -9,10 +9,10 @@
 //!
 //! Per page:
 //!   - `page-N.png`       — rasterized page image
-//!   - `page-N-ocr.json`  — OCR word regions + char boxes
+//!   - `page-N-ocr.json`  — OCR word regions
 //!   - `source-meta.json` — mtime + size for invalidation
 
-use crate::ocr::{CharBox, TextRegion};
+use crate::ocr::TextRegion;
 use image::{DynamicImage, GrayImage, Luma};
 use std::path::{Path, PathBuf};
 
@@ -20,7 +20,6 @@ use std::path::{Path, PathBuf};
 #[derive(serde::Serialize, serde::Deserialize)]
 struct CachedOcr {
     word_regions: Vec<TextRegion>,
-    char_boxes: Vec<CharBox>,
 }
 
 /// Source file metadata used for cache invalidation.
@@ -126,11 +125,11 @@ pub fn load_cached_image(dir: &Path, page_idx: usize) -> Option<DynamicImage> {
 }
 
 /// Try to load cached OCR results from disk.
-pub fn load_cached_ocr(dir: &Path, page_idx: usize) -> Option<(Vec<TextRegion>, Vec<CharBox>)> {
+pub fn load_cached_ocr(dir: &Path, page_idx: usize) -> Option<Vec<TextRegion>> {
     let json_path = dir.join(format!("page-{}-ocr.json", page_idx));
     let data = std::fs::read_to_string(&json_path).ok()?;
     let cached: CachedOcr = serde_json::from_str(&data).ok()?;
-    Some((cached.word_regions, cached.char_boxes))
+    Some(cached.word_regions)
 }
 
 /// Save a page image to the cache.
@@ -147,7 +146,6 @@ pub fn save_cached_ocr(
     dir: &Path,
     page_idx: usize,
     word_regions: &[TextRegion],
-    char_boxes: &[CharBox],
 ) {
     if std::fs::create_dir_all(dir).is_err() {
         return;
@@ -155,7 +153,6 @@ pub fn save_cached_ocr(
     let json_path = dir.join(format!("page-{}-ocr.json", page_idx));
     let cached = CachedOcr {
         word_regions: word_regions.to_vec(),
-        char_boxes: char_boxes.to_vec(),
     };
     if let Ok(data) = serde_json::to_string(&cached) {
         let _ = std::fs::write(&json_path, data);
@@ -548,14 +545,14 @@ pub fn prepare_page(
     };
 
     // OCR (with cache) — direct GrayImage path avoids DynamicImage clone + to_luma8 clone
-    let word_regions = if let Some((wr, _cb)) =
+    let word_regions = if let Some(wr) =
         cache_dir.and_then(|d| load_cached_ocr(d, page_idx))
     {
         wr
     } else {
-        let (wr, cb) = crate::ocr::extract_text_regions_from_gray(&deskewed_gray, dpi)?;
+        let wr = crate::ocr::extract_text_regions_from_gray(&deskewed_gray, dpi)?;
         if let Some(cdir) = cache_dir {
-            save_cached_ocr(cdir, page_idx, &wr, &cb);
+            save_cached_ocr(cdir, page_idx, &wr);
         }
         wr
     };

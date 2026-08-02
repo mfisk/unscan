@@ -2241,10 +2241,14 @@ pub fn generate_report(
     }
 
     // Collect OCR-wrong hits/minor misses (font matched, but OCR text wrong)
-    let ocr_misses: Vec<&ClassifiedEntry> = classified.iter()
-        .filter(|ce| matches!(ce.kind, MissKind::Hit)
+    // These are moved to the very end of the report.
+    let mut ocr_misses: Vec<&ClassifiedEntry> = classified.iter()
+        .filter(|ce| matches!(ce.kind, MissKind::Hit | MissKind::MinorMiss)
                      && ce.entry.ocr_correct == Some(false))
         .collect();
+    ocr_misses.sort_by(|a, b| {
+        a.entry.similarity_score.partial_cmp(&b.entry.similarity_score).unwrap_or(std::cmp::Ordering::Equal)
+    });
 
     let all_misses = major_misses.len() + minor_misses.len() + similarity_failures.len();
     let compared = hits.len() + all_misses + kept_raster.len();
@@ -2290,9 +2294,12 @@ pub fn generate_report(
         major_miss_blocks.push_str(&html);
     }
 
-    // Build minor miss blocks
+    // Build minor miss blocks — excluding OCR-miss entries (they move to the very end)
     let mut minor_miss_blocks = String::new();
     for ce in &minor_misses {
+        if ce.entry.ocr_correct == Some(false) {
+            continue;
+        }
         let (html, _chosen_zncc, _gt_zncc) = build_miss_block(
             ce, audit_root, font_catalog, glyph_map, &mut font_data_cache, dpi,
         );
@@ -2318,10 +2325,14 @@ pub fn generate_report(
     }
 
     // Build hits / no_ground_truth blocks when --report-all
+    // Hits exclude OCR misses — those go to the dedicated section at the very end
     let mut hits_blocks = String::new();
     let mut no_gt_blocks = String::new();
     if meta.report_all {
         for ce in &hits {
+            if ce.entry.ocr_correct == Some(false) {
+                continue;
+            }
             let (html, _chosen_zncc, _gt_zncc) = build_miss_block(
                 ce, audit_root, font_catalog, glyph_map, &mut font_data_cache, dpi,
             );

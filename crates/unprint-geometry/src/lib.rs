@@ -7,7 +7,7 @@ pub mod params;
 
 pub use params::{SIGMA_CENTER_PX, SIGMA_PITCH_PX, quant_half_width_px, quantized_ll, audit_all_chars_enabled};
 
-pub use text::{CharBox, TextRegion, TextLine, RawWordBBox};
+pub use text::{TextRegion, TextLine, RawWordBBox};
 pub use bbox::{Bbox, GlyphBBox, CharInkBounds, WordGeoMeasurement, center_span_scale, batch_center_span_scales, glyph_bboxes_batch_pure};
 pub use char_bounds::{measure_char_ink_bounds, measure_words_ink_bounds_batch, batch_per_char_errors, PerCharError, SeamPaths};
 pub use detect::{GeometryResult, DetectedLine, DetectedFill, detect_geometry, erase_bboxes, otsu_threshold, Rgb};

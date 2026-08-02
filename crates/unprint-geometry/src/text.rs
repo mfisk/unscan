@@ -1,16 +1,5 @@
 use serde::{Deserialize, Serialize};
 
-/// A character-level bounding box from Tesseract HOCR output.
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct CharBox {
-    pub ch: char,
-    pub x: u32,
-    pub y: u32,
-    pub width: u32,
-    pub height: u32,
-    pub confidence: f32,
-}
-
 /// A detected text region from OCR (word-level).
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct TextRegion {
