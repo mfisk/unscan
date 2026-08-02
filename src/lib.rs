@@ -1,40 +1,37 @@
-// Re-export core as unprint crate for backwards compat
-pub use unprint_core::*;
-pub use unprint_core::audit;
-pub use unprint_core::cache;
-pub use unprint_core::classifier;
-pub use unprint_core::cli;
-pub use unprint_core::color;
-pub use unprint_core::deskew;
-pub use unprint_core::error;
-pub use unprint_core::font_cache;
-pub use unprint_core::font_history;
-pub use unprint_core::font_match;
-pub use unprint_core::font_scan;
-pub use unprint_core::geometry;
-pub use unprint_core::features;
-pub use unprint_core::glyph_map;
-pub use unprint_core::hog;
-pub use unprint_core::char_render;
-pub use unprint_core::train;
-pub use unprint_core::layout;
-pub use unprint_core::compare;
-pub use unprint_core::seg_diag;
-pub use unprint_core::compare_rasters;
-pub use unprint_core::ocr;
-pub use unprint_core::page_cache;
-pub use unprint_core::pdf_out;
-pub use unprint_core::segment;
-pub use unprint_core::smooth;
-pub use unprint_core::verify;
-pub use unprint_core::ground_truth;
-pub use unprint_core::font_pipeline;
-pub use unprint_core::vintage_cache;
-pub use unprint_core::zncc_classifier;
-pub use unprint_core::ngram;
-pub use unprint_core::atomic_file;
-pub use unprint_core::geo_cache;
-pub use unprint_core::geometry_classifier;
-pub use unprint_core::geometry_scale;
-pub use unprint_core::per_char_cache;
-pub use unprint_core::MIN_VERIFY_SIMILARITY;
+// Library target for integration tests.
+// Includes modules needed by the test chain + their transitive deps.
+
+pub mod cache;
+pub mod error;
+pub mod color;
+pub mod geometry;
+pub mod ocr;
+pub mod verify;
+pub mod features;
+pub mod layout;
+pub mod segment;
+pub mod font_cache;
+pub mod font_scan;
+pub mod font_match;
+pub mod pdf_out;
+pub mod smooth;
+pub mod audit;
+pub mod classifier;
+pub mod seg_diag;
+pub mod compare_rasters;
+pub mod zncc_classifier;
+pub mod glyph_map;
+pub mod char_render;
+pub mod train;
+#[allow(dead_code)] // ngram training/LDA infrastructure — kept for future use
+pub mod ngram;
+pub mod hog;
+
+pub mod atomic_file;
+pub mod geo_cache;
+pub mod geometry_classifier;
+pub mod geometry_scale;
+pub mod ground_truth;
+pub mod vintage_cache;
+pub mod font_history;
+pub mod per_char_cache;
