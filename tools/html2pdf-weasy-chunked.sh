@@ -119,14 +119,21 @@ NUM_CHUNKS=$(ls -1 "$WORKDIR"/chunk-*.html 2>/dev/null | wc -l)
 echo "Generated $NUM_CHUNKS chunks"
 if [ "$NUM_CHUNKS" -eq 0 ]; then echo "No chunks generated" >&2; exit 1; fi
 
+BASE_URL="$(dirname "$ABS_INPUT")/"
+# Ensure file:// URL for weasyprint base
+case "$BASE_URL" in
+  file://*|http://*|https://*) ;;
+  *) BASE_URL="file://$BASE_URL" ;;
+esac
+
 set +e
 CHUNK_PDFS=()
 idx=0
 for html in "$WORKDIR"/chunk-*.html; do
   pdf="$WORKDIR/chunk-$(printf "%03d" $idx).pdf"
-  echo "Rendering chunk $idx: $(stat -c%s "$html" 2>/dev/null || echo ?) bytes -> $pdf"
-  # WeasyPrint with low memory settings
-  weasyprint "$html" "$pdf" 2> "$WORKDIR/weasy-$idx.log"
+  echo "Rendering chunk $idx: $(stat -c%s "$html" 2>/dev/null || echo ?) bytes -> $pdf (base $BASE_URL)"
+  # WeasyPrint with low memory settings, base-url so external images (new external-image code) resolve
+  weasyprint -u "$BASE_URL" "$html" "$pdf" 2> "$WORKDIR/weasy-$idx.log"
   RET=$?
   if [ $RET -ne 0 ] || [ ! -f "$pdf" ]; then
     echo "Chunk $idx failed RET=$RET, log tail:"

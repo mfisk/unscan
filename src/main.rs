@@ -1,42 +1,42 @@
-mod audit;
-mod cache;
-mod classifier;
-mod cli;
-mod color;
-mod deskew;
-mod error;
-mod font_cache;
-mod font_history;
-mod font_match;
-mod font_scan;
-mod geometry;
-pub mod features;
-pub mod glyph_map;
-pub mod hog;
-pub mod char_render;
-pub mod train;
-pub mod layout;
-mod compare;
-pub mod seg_diag;
-pub mod compare_rasters;
-mod ocr;
-mod page_cache;
-mod pdf_out;
-mod segment;
-mod smooth;
-pub(crate) mod verify;
-pub mod ground_truth;
-pub mod report;
-mod font_pipeline;
-mod vintage_cache;
-mod zncc_classifier;
+pub use unprint::audit;
+pub use unprint::cache;
+pub use unprint::classifier;
+pub use unprint::cli;
+pub use unprint::color;
+pub use unprint::deskew;
+pub use unprint::error;
+pub use unprint::font_cache;
+pub use unprint::font_history;
+pub use unprint::font_match;
+pub use unprint::font_scan;
+pub use unprint::geometry;
+pub use unprint::features;
+pub use unprint::glyph_map;
+pub use unprint::hog;
+pub use unprint::char_render;
+pub use unprint::train;
+pub use unprint::layout;
+pub use unprint::compare;
+pub use unprint::seg_diag;
+pub use unprint::compare_rasters;
+pub use unprint::ocr;
+pub use unprint::page_cache;
+pub use unprint::pdf_out;
+pub use unprint::segment;
+pub use unprint::smooth;
+pub use unprint::verify;
+pub use unprint::ground_truth;
+pub use unprint_report as report;
+pub use unprint::font_pipeline;
+pub use unprint::vintage_cache;
+pub use unprint::zncc_classifier;
 #[allow(dead_code)]
-mod ngram;
-mod atomic_file;
-mod geo_cache;
-mod geometry_classifier;
-mod geometry_scale;
-mod per_char_cache;
+pub use unprint::ngram;
+pub use unprint::atomic_file;
+pub use unprint::geo_cache;
+pub use unprint::geometry_classifier;
+pub use unprint::geometry_scale;
+pub use unprint::per_char_cache;
 
 use crate::font_pipeline::ObsRankProbs;
 use crate::audit::{AuditEntry, AuditLog, BBox, GeometryEntry, PageSummary};
@@ -1244,5 +1244,4 @@ fn run(args: &cli::Args, classifier: &mut dyn classifier::Classifier) -> Result<
 // ---------------------------------------------------------------------------
 // Raster fragment extraction (lossless)
 // ---------------------------------------------------------------------------
-
 

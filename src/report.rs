@@ -48,47 +48,135 @@ fn glyph_display_key(glyph_map: &NgramGlyphMap, seq: &[char], glyph_id: usize) -
         .unwrap_or_else(|| format!("glyph#{glyph_id}"))
 }
 
-// ── Image helpers ───────────────────────────────────────────────────────────
+// ── Image helpers — external file version ─────────────────────────────────
+// 2026-08-02: report now uses external PNG files instead of inline base64.
+// - Audit-owned files (under audit_root) are referenced by relative path
+//   e.g. "p0_L000_foo/ssim_scan.png"
+// - Generated images (rendered glyphs, verify renders) are written to
+//   audit_root.join("images") and referenced as "images/gen-XXXXX.png"
+// Thread-locals avoid changing 18 call sites.
+
+use std::cell::{Cell, RefCell};
+
+struct ImageWriter {
+    dir: PathBuf,
+    counter: Cell<usize>,
+}
+
+thread_local! {
+    static IMAGE_WRITER: RefCell<Option<ImageWriter>> = RefCell::new(None);
+    static AUDIT_ROOT_TL: RefCell<Option<PathBuf>> = RefCell::new(None);
+}
+
+fn rel_from_audit_root(audit_root: &Path, target: &Path) -> Option<String> {
+    if let Ok(rel) = target.strip_prefix(audit_root) {
+        return Some(rel.to_string_lossy().replace('\\', "/"));
+    }
+    // Canonicalize to handle symlinks / .. components
+    let canon_root = audit_root.canonicalize().ok();
+    let canon_target = target.canonicalize().ok();
+    if let (Some(cr), Some(ct)) = (canon_root, canon_target) {
+        if let Ok(rel) = ct.strip_prefix(cr) {
+            return Some(rel.to_string_lossy().replace('\\', "/"));
+        }
+    }
+    None
+}
 
 fn img_to_b64_uri(img: &GrayImage) -> String {
-    let mut buf = Vec::new();
-    let encoder = image::codecs::png::PngEncoder::new(&mut buf);
-    image::ImageEncoder::write_image(
-        encoder,
-        img.as_raw(),
-        img.width(),
-        img.height(),
-        image::ExtendedColorType::L8,
-    )
-    .ok();
-    let b64 = base64::engine::general_purpose::STANDARD.encode(&buf);
-    format!("data:image/png;base64,{b64}")
+    // Kept name for compatibility — now writes external file
+    IMAGE_WRITER.with(|wcell| {
+        let binding = wcell.borrow();
+        let writer = match binding.as_ref() {
+            Some(ww) => ww,
+            None => return String::new(),
+        };
+        let idx = writer.counter.get();
+        writer.counter.set(idx + 1);
+        let name = format!("gen-{idx:05}.png");
+        let dest = writer.dir.join(&name);
+        let mut buf = Vec::new();
+        if let Ok(()) = (|| -> Result<(), String> {
+            let encoder = image::codecs::png::PngEncoder::new(&mut buf);
+            image::ImageEncoder::write_image(
+                encoder,
+                img.as_raw(),
+                img.width(),
+                img.height(),
+                image::ExtendedColorType::L8,
+            )
+            .map_err(|e| e.to_string())?;
+            std::fs::write(&dest, &buf).map_err(|e| e.to_string())?;
+            Ok(())
+        })() {
+            let prefix = writer.dir.file_name().and_then(|n| n.to_str()).unwrap_or("images");
+            format!("{prefix}/{name}")
+        } else {
+            String::new()
+        }
+    })
 }
 
 fn rgb_img_to_b64_uri(img: &RgbImage) -> String {
-    let mut buf = Vec::new();
-    let encoder = image::codecs::png::PngEncoder::new(&mut buf);
-    image::ImageEncoder::write_image(
-        encoder,
-        img.as_raw(),
-        img.width(),
-        img.height(),
-        image::ExtendedColorType::Rgb8,
-    )
-    .ok();
-    let b64 = base64::engine::general_purpose::STANDARD.encode(&buf);
-    format!("data:image/png;base64,{b64}")
+    IMAGE_WRITER.with(|wcell| {
+        let binding = wcell.borrow();
+        let writer = match binding.as_ref() {
+            Some(ww) => ww,
+            None => return String::new(),
+        };
+        let idx = writer.counter.get();
+        writer.counter.set(idx + 1);
+        let name = format!("gen-{idx:05}.png");
+        let dest = writer.dir.join(&name);
+        let mut buf = Vec::new();
+        if let Ok(()) = (|| -> Result<(), String> {
+            let encoder = image::codecs::png::PngEncoder::new(&mut buf);
+            image::ImageEncoder::write_image(
+                encoder,
+                img.as_raw(),
+                img.width(),
+                img.height(),
+                image::ExtendedColorType::Rgb8,
+            )
+            .map_err(|e| e.to_string())?;
+            std::fs::write(&dest, &buf).map_err(|e| e.to_string())?;
+            Ok(())
+        })() {
+            let prefix = writer.dir.file_name().and_then(|n| n.to_str()).unwrap_or("images");
+            format!("{prefix}/{name}")
+        } else {
+            String::new()
+        }
+    })
 }
 
 fn file_to_b64_uri(path: &Path) -> Option<String> {
-    let data = std::fs::read(path).ok()?;
-    let b64 = base64::engine::general_purpose::STANDARD.encode(&data);
-    let ext = path.extension().and_then(|e| e.to_str()).unwrap_or("png");
-    let mime = match ext {
-        "jpg" | "jpeg" => "image/jpeg",
-        _ => "image/png",
-    };
-    Some(format!("data:{mime};base64,{b64}"))
+    if !path.is_file() {
+        return None;
+    }
+    // If path is under audit_root, reference it directly via relative path
+    if let Some(rel) = AUDIT_ROOT_TL.with(|a| {
+        a.borrow().as_ref().and_then(|root| rel_from_audit_root(root, path))
+    }) {
+        return Some(rel);
+    }
+    // Otherwise copy into images/ and reference there (externalized, not inlined)
+    IMAGE_WRITER.with(|wcell| {
+        let binding = wcell.borrow();
+        let writer = binding.as_ref()?;
+        let ext = path.extension().and_then(|e| e.to_str()).unwrap_or("png");
+        let idx = writer.counter.get();
+        writer.counter.set(idx + 1);
+        let name = format!("ext-{idx:05}.{ext}");
+        let dest = writer.dir.join(&name);
+        // Copy file; if copy fails try read/write
+        if std::fs::copy(path, &dest).is_err() {
+            let data = std::fs::read(path).ok()?;
+            std::fs::write(&dest, &data).ok()?;
+        }
+        let prefix = writer.dir.file_name().and_then(|n| n.to_str()).unwrap_or("images");
+        Some(format!("{prefix}/{name}"))
+    })
 }
 
 fn img_td(uri: Option<&str>) -> String {
@@ -2221,6 +2309,16 @@ pub fn generate_report(
     glyph_map: &NgramGlyphMap,
     meta: &ReportMeta,
 ) -> Result<(), String> {
+    // ── Initialize external-image writer ──────────────────────────────
+    let images_dir = audit_root.join("images");
+    // Clean previous run to avoid stale gen-*.png accumulation
+    let _ = std::fs::remove_dir_all(&images_dir);
+    std::fs::create_dir_all(&images_dir)
+        .map_err(|e| format!("Failed to create images dir {:?}: {e}", images_dir))?;
+    let writer = ImageWriter { dir: images_dir.clone(), counter: Cell::new(0) };
+    IMAGE_WRITER.with(|w| *w.borrow_mut() = Some(writer));
+    AUDIT_ROOT_TL.with(|a| *a.borrow_mut() = Some(audit_root.to_path_buf()));
+
     let classified = classify_entries(entries, gt, dpi, font_catalog, glyph_map);
 
     let mut hits: Vec<&ClassifiedEntry> = Vec::new();
@@ -2669,6 +2767,10 @@ pub fn generate_report(
     }
     std::fs::write(report_path, &html)
         .map_err(|e| format!("Failed to write report: {e}"))?;
+
+    // Clear thread-locals
+    IMAGE_WRITER.with(|w| *w.borrow_mut() = None);
+    AUDIT_ROOT_TL.with(|a| *a.borrow_mut() = None);
 
     Ok(())
 }

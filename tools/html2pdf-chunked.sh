@@ -155,25 +155,7 @@ for html in "$WORKDIR"/chunk-*.html; do
   ulimit -H -v unlimited 2>/dev/null || true
   ulimit -S -v unlimited 2>/dev/null || true
   # Use old headless, low-mem flags, 20s virtual budget per chunk
-  "$CHROME" --headless=old --disable-gpu --no-sandbox \
-    --disable-dev-shm-usage \
-    --disable-software-rasterizer \
-    --disable-extensions \
-    --disable-background-networking \
-    --disable-sync \
-    --metrics-recording-only \
-    --mute-audio \
-    --no-first-run \
-    --safebrowsing-disable-auto-update \
-    --disable-dev-tools \
-    --renderer-process-limit=1 \
-    --js-flags="--max-old-space-size=2048" \
-    --virtual-time-budget=20000 \
-    --user-data-dir="$USER_DATA_DIR" \
-    --print-to-pdf="$pdf" \
-    --print-to-pdf-no-header \
-    --run-all-compositor-stages-before-draw \
-    "file://$(realpath -m "$html")" 2> "$WORKDIR/chrome-$idx.log"
+  "$CHROME" --headless --disable-gpu --no-sandbox --disable-dev-shm-usage --print-to-pdf="$pdf" --print-to-pdf-no-header "file://$(realpath -m "$html")" 2> "$WORKDIR/chrome-$idx.log"
   RET=$?
   rm -rf "$USER_DATA_DIR" 2>/dev/null || true
   if [ $RET -ne 0 ] || [ ! -f "$pdf" ]; then
@@ -182,14 +164,7 @@ for html in "$WORKDIR"/chunk-*.html; do
     # retry once with more budget
     echo "Retrying chunk $idx with 30s budget..."
     mkdir -p "$USER_DATA_DIR"
-    "$CHROME" --headless=old --disable-gpu --no-sandbox \
-      --disable-dev-shm-usage \
-      --virtual-time-budget=30000 \
-      --user-data-dir="$USER_DATA_DIR" \
-      --print-to-pdf="$pdf" \
-      --print-to-pdf-no-header \
-      --run-all-compositor-stages-before-draw \
-      "file://$(realpath -m "$html")" 2> "$WORKDIR/chrome-${idx}-retry.log" || true
+    "$CHROME" --headless --disable-gpu --no-sandbox --disable-dev-shm-usage --print-to-pdf="$pdf" --print-to-pdf-no-header "file://$(realpath -m "$html")" 2> "$WORKDIR/chrome-${idx}-retry.log" || true
     rm -rf "$USER_DATA_DIR" 2>/dev/null || true
   fi
   if [ ! -f "$pdf" ]; then
