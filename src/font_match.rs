@@ -24,16 +24,10 @@ const GEO_WEIGHT: f32 = 1.0;
 const USE_SUM_AGG: bool = true;
 
 /// Midpoint pruning (geo-first): prune fonts where min_{chars}(h_ll+v_ll) < threshold.
-/// Threshold = BASE * thoroughness. Base -12.0 keeps worst correct
-/// letter -10.1537 (SourceSerif4-400 'T') with margin. Sweep showed -7.2
-/// prunes more but caused regression on Mayr-Duffner lig path where math
-/// fonts without ff ligature get empty geo (0 penalty) and beat GT.
-/// Restoring -12.0 + MIN_KEEP=10 stabilizes best_lps and avoids
-/// 2742/2743 catastrophic prune on plain path where -1381 sentinels hide
-/// behind weight 0.
+/// Threshold = BASE * thoroughness. Base -7.2 is the calibrated constant
+/// (see AGENTS.md). No MIN_KEEP — threshold alone decides.
 /// Clamped thoroughness >=0.1.
-const MIDPOINT_PRUNE_BASE: f32 = -12.0;
-const MIN_KEEP: usize = 10;
+const MIDPOINT_PRUNE_BASE: f32 = -7.2;
 
 // ---------------------------------------------------------------------------
 // Types
@@ -285,7 +279,6 @@ pub fn identify_fonts<'a>(
     let mut geo_per_font: FxHashMap<&'a str, FxHashMap<(usize, usize), f32>> = FxHashMap::default();
     let mut cannot_render: FxHashSet<&'a str> = FxHashSet::default();
     let mut kept_candidates: Vec<&'a str> = Vec::new();
-    let mut pruned_with_ll: Vec<(&'a str, f32)> = Vec::new();
     let mut pruned_count: usize = 0;
     let mut total_candidates: usize = 0;
 
@@ -342,32 +335,12 @@ pub fn identify_fonts<'a>(
                         map.insert((g.seg_idx, g.orig_idx), ll);
                     }
                     if !is_ensure && min_ll < prune_threshold {
-                        pruned_with_ll.push((fk, min_ll));
                         pruned_count += 1;
                         continue;
                     }
                     geo_per_font.insert(fk, map);
                     kept_candidates.push(fk);
                 }
-            }
-        }
-        // Keep at least MIN_KEEP best pruned fonts to stabilize per-position best_lps
-        if kept_candidates.len() < MIN_KEEP && !pruned_with_ll.is_empty() {
-            pruned_with_ll.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
-            let need = MIN_KEEP.saturating_sub(kept_candidates.len());
-            for (fk, ll) in pruned_with_ll.iter().take(need) {
-                // Recompute map for restored font (we already pruned it, need to rebuild)
-                if let Some(geos) = crate::geometry_classifier::per_char_geo_for_font(
-                    fk, word_segs, wib, font_cache, geo_cache, font_registry
-                ) {
-                    let mut map = FxHashMap::default();
-                    for g in geos {
-                        map.insert((g.seg_idx, g.orig_idx), (g.h_ll + g.v_ll) as f32);
-                    }
-                    geo_per_font.insert(fk, map);
-                }
-                kept_candidates.push(*fk);
-                pruned_count = pruned_count.saturating_sub(1);
             }
         }
         // Ensure keys that may not be in registry (variants)

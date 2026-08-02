@@ -29,7 +29,7 @@ impl FontHandle {
 
 pub fn hash_image(img: &GrayImage) -> u64 {
     use std::hash::{Hash, Hasher};
-    let mut hasher = std::collections::hash_map::DefaultHasher::new();
+    let mut hasher = rustc_hash::FxHasher::default();
     img.width().hash(&mut hasher);
     img.height().hash(&mut hasher);
     img.as_raw().hash(&mut hasher);

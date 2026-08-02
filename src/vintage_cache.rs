@@ -31,7 +31,6 @@
 //! on upgrade — intentional migration to readable names. Delete old `*.ttf` in vintage dir
 //! if you need to reclaim space.
 
-use std::collections::hash_map::DefaultHasher;
 use std::hash::{Hash, Hasher};
 use std::path::{Path, PathBuf};
 
@@ -668,8 +667,10 @@ fn sanitize_family(family: &str) -> String {
 /// different cache filenames for the same logical font, leading to 301 duplicate
 /// font_keys and geo-cache Wrote 2748 vs 3049. Now hashes logical identity
 /// (postscript_name + variant_tag) so same font maps to same cache file.
+/// Uses FxHasher for deterministic, stable hashing across runs (DefaultHasher is randomized).
 fn hash_base_era(base: &FontEntry, era: Era) -> u64 {
-    let mut hasher = DefaultHasher::new();
+    use std::hash::{Hash, Hasher};
+    let mut hasher = rustc_hash::FxHasher::default();
     base.postscript_name.hash(&mut hasher);
     base.variant_tag.hash(&mut hasher);
     // vintage_era on base should be None (base is not vintage), but include for completeness

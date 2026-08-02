@@ -177,4 +177,6 @@ pub mod paths {
     pub fn per_font_lda_dir() -> PathBuf { cache_dir().join("per-font-lda") }
     pub fn training_dir() -> PathBuf { cache_dir().join("training") }
     pub fn chars_dir() -> PathBuf { cache_dir().join("chars") }
+    pub fn means_dir() -> PathBuf { cache_dir().join("means") }
+    pub fn lda_dir() -> PathBuf { cache_dir().join("lda") }
 }

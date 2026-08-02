@@ -659,6 +659,7 @@ pub fn run_train(mut args: TrainArgs) {
     let font_dirs: Vec<PathBuf> = font_scan::default_font_dirs(&args.font_dir);
 
     let mut catalog = font_scan::scan_fonts(&font_dirs, false);
+
     let base_count = catalog.len();
 
     // Generate / reuse vintage fonts exactly like main::load_fonts
@@ -702,6 +703,7 @@ pub fn run_train(mut args: TrainArgs) {
     }
     catalog.extend(vintage_entries);
 
+
     // Sort by font_key for deterministic font_id assignment, matching
     // FontRegistry::new() ordering so runtime and training agree.
     catalog.sort_by(|a, b| a.font_key().cmp(&b.font_key()));
@@ -734,7 +736,7 @@ pub fn run_train(mut args: TrainArgs) {
     // Compute catalog hash for cache validation (same algorithm as FontRegistry).
     let catalog_hash = {
         use std::hash::{Hash, Hasher};
-        let mut hasher = std::collections::hash_map::DefaultHasher::new();
+        let mut hasher = rustc_hash::FxHasher::default();
         for fe in &catalog { fe.font_key().hash(&mut hasher); }
         hasher.finish()
     };

@@ -36,6 +36,7 @@ mod atomic_file;
 mod geo_cache;
 mod geometry_classifier;
 mod geometry_scale;
+mod per_char_cache;
 
 use crate::font_pipeline::ObsRankProbs;
 use crate::audit::{AuditEntry, AuditLog, BBox, GeometryEntry, PageSummary};
@@ -387,7 +388,7 @@ fn run(args: &cli::Args, classifier: &mut dyn classifier::Classifier) -> Result<
     let input_size = std::fs::metadata(input).map(|m| m.len()).unwrap_or(0);
 
     // ── 1. Scan fonts and populate classifier ──────────────────────
-    let font_registry = load_fonts(args, classifier)?;
+    let mut font_registry = load_fonts(args, classifier)?;
     if !args.quiet { eprintln!("[timing] load_fonts {:.2}s", run_start.elapsed().as_secs_f64()); }
     if font_registry.is_empty() {
         return Err(ScanTextError::NoFonts);
@@ -570,7 +571,7 @@ fn run(args: &cli::Args, classifier: &mut dyn classifier::Classifier) -> Result<
             // Update catalog hashes to new installed hash (union semantics: keep removed fonts' data, but hash reflects installed)
             let new_catalog_hash = {
                 use std::hash::{Hash, Hasher};
-                let mut hasher = std::collections::hash_map::DefaultHasher::new();
+                let mut hasher = rustc_hash::FxHasher::default();
                 let mut sorted_keys: Vec<&String> = installed_keys.iter().collect();
                 sorted_keys.sort();
                 for k in sorted_keys {
@@ -602,6 +603,21 @@ fn run(args: &cli::Args, classifier: &mut dyn classifier::Classifier) -> Result<
             };
             if let Err(e) = save_result {
                 eprintln!("warning: failed to persist updated classifier ({clf_name}): {e}");
+            }
+
+            // Patch catalog.bin hash to new installed hash so next run's fast path succeeds
+            // and we don't trigger an infinite retrain loop (registry hash == installed hash with FxHasher).
+            // Also update in-memory registry hash for current process consistency.
+            font_registry.set_catalog_hash(new_catalog_hash);
+            let catalog_path = classifier::default_catalog_path();
+            if let Err(e) = font_registry.write_fonts_bin(&catalog_path) {
+                eprintln!("warning: failed to rewrite catalog with new hash: {e}");
+                // Fallback: patch hash bytes in-place
+                if let Ok(mut f) = std::fs::OpenOptions::new().read(true).write(true).open(&catalog_path) {
+                    use std::io::{Seek, Write};
+                    let _ = f.seek(std::io::SeekFrom::Start(8));
+                    let _ = f.write_all(&new_catalog_hash.to_le_bytes());
+                }
             }
 
             if !args.quiet { eprintln!("[incremental] Indexed {fonts_indexed} new fonts, {new_glyphs_added} new glyph groups created"); }

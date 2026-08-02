@@ -307,7 +307,7 @@ fn read_u64(data: &[u8], pos: &mut usize) -> Result<u64, String> {
 /// Content hash for a rendered glyph image.
 pub fn hash_image(img: &image::GrayImage) -> u64 {
     use std::hash::{Hash, Hasher};
-    let mut hasher = std::collections::hash_map::DefaultHasher::new();
+    let mut hasher = rustc_hash::FxHasher::default();
     img.width().hash(&mut hasher);
     img.height().hash(&mut hasher);
     img.as_raw().hash(&mut hasher);

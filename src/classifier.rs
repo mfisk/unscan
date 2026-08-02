@@ -1931,6 +1931,42 @@ impl MahalanobisClassifier {
                 (fid, mean)
             }).collect();
 
+            // ── New per-char forward cache: means/{code:08x}.bin ──────────
+            // Populate means cache for lazy Unicode expansion. Format:
+            //   b"MEAN" | version | char_code | feat_dim | n_entries
+            //   per entry: font_key_len | font_key | file_hash | count | mean[feat_dim]
+            // Atomic write via tmp+rename. file_hash = mtime+size FNV (same as geo_cache).
+            if seq.len() == 1 {
+                let code = seq[0] as u32;
+                let mut mean_entries: Vec<crate::per_char_cache::MeanEntry> = Vec::new();
+                mean_entries.reserve(class_means.len() * 2);
+                for (&glyph_id, mean_f64) in &class_means {
+                    let count = font_indices.get(&glyph_id).map(|v| v.len() as u32).unwrap_or(1);
+                    // glyph_id is group index into glyph_map for this seq
+                    let font_keys = ctx.glyph_map.fonts_for_glyph(seq, glyph_id as usize);
+                    // mean as f32
+                    let mean_f32: Vec<f32> = mean_f64.iter().map(|&v| v as f32).collect();
+                    for fk in font_keys {
+                        if let Some(&font_idx) = ctx.font_id_map.get(fk) {
+                            if let Some(fe) = ctx.catalog.get(font_idx as usize) {
+                                let fhash = crate::per_char_cache::file_meta_hash(&fe.path);
+                                mean_entries.push(crate::per_char_cache::MeanEntry{
+                                    font_key: fk.clone(),
+                                    file_hash: fhash,
+                                    count,
+                                    mean: mean_f32.clone(),
+                                });
+                            }
+                        }
+                    }
+                }
+                if !mean_entries.is_empty() {
+                    if let Err(e) = crate::per_char_cache::write_means_atomic(code, FEAT_LEN, &mean_entries) {
+                        eprintln!("Warning: failed to write means cache for U+{:04X}: {e}", code);
+                    }
+                }
+            }
+
             // Within-class scatter Sw
             let mut sw = vec![0.0f64; FEAT_LEN * FEAT_LEN];
             for (&fid, indices) in &font_indices {
@@ -2287,6 +2323,36 @@ impl LdaClassifier {
                 (fid, mean)
             }).collect();
 
+            // ── New per-char forward cache: means/{code:08x}.bin ──────────
+            if seq.len() == 1 {
+                let code = seq[0] as u32;
+                let mut mean_entries: Vec<crate::per_char_cache::MeanEntry> = Vec::new();
+                mean_entries.reserve(class_means.len() * 2);
+                for (&glyph_id, mean_f64) in &class_means {
+                    let count = font_indices.get(&glyph_id).map(|v| v.len() as u32).unwrap_or(1);
+                    let font_keys = ctx.glyph_map.fonts_for_glyph(seq, glyph_id as usize);
+                    let mean_f32: Vec<f32> = mean_f64.iter().map(|&v| v as f32).collect();
+                    for fk in font_keys {
+                        if let Some(&font_idx) = ctx.font_id_map.get(fk) {
+                            if let Some(fe) = ctx.catalog.get(font_idx as usize) {
+                                let fhash = crate::per_char_cache::file_meta_hash(&fe.path);
+                                mean_entries.push(crate::per_char_cache::MeanEntry{
+                                    font_key: fk.clone(),
+                                    file_hash: fhash,
+                                    count,
+                                    mean: mean_f32.clone(),
+                                });
+                            }
+                        }
+                    }
+                }
+                if !mean_entries.is_empty() {
+                    if let Err(e) = crate::per_char_cache::write_means_atomic(code, FEAT_LEN, &mean_entries) {
+                        eprintln!("Warning: failed to write means cache for U+{:04X}: {e}", code);
+                    }
+                }
+            }
+
             // Within-class scatter Sw
             let mut sw = vec![0.0f64; FEAT_LEN * FEAT_LEN];
             for (&fid, indices) in &font_indices {
@@ -2567,6 +2633,30 @@ impl LdaClassifier {
         let file_size = std::fs::metadata(output).map(|m| m.len()).unwrap_or(0);
         eprintln!("  Weights: {} ({:.1} MB, {} fonts indexed)",
             output.display(), file_size as f64 / 1e6, ctx.catalog.len());
+
+        // ── New per-char forward cache: lda/{code:08x}.bin ────────────────
+        // Atomic write per char: b"LDPC" | version | char_code | feat_dim | out_dim | sigma | med_nn | catalog_hash | proj
+        // Enables lazy creation for unusual Unicode and fast per-char reload without monolithic file.
+        let mut per_char_written = 0usize;
+        for (seq, actual_dim, proj, sigma, _cm, d95) in &lda_chars {
+            if seq.len() != 1 { continue; }
+            let code = seq[0] as u32;
+            let entry = crate::per_char_cache::LdaPerChar{
+                char_code: code,
+                feat_dim: FEAT_LEN,
+                out_dim: *actual_dim,
+                sigma_sq: *sigma,
+                med_nn: *d95,
+                catalog_hash: ctx.catalog_hash,
+                projection: proj.clone(),
+            };
+            if let Err(e) = crate::per_char_cache::write_lda_atomic(&entry) {
+                eprintln!("Warning: failed to write lda cache for U+{:04X}: {e}", code);
+            } else {
+                per_char_written += 1;
+            }
+        }
+        eprintln!("  Per-char cache: {} lda files + {} means files (atomic)", per_char_written, per_char_written);
     }
 
 }

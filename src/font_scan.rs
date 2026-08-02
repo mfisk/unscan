@@ -191,7 +191,7 @@ impl FontRegistry {
     /// Changes when fonts are added, removed, or renamed.
     fn compute_hash(entries: &[FontEntry]) -> u64 {
         use std::hash::{Hash, Hasher};
-        let mut hasher = std::collections::hash_map::DefaultHasher::new();
+        let mut hasher = rustc_hash::FxHasher::default();
         for e in entries {
             e.font_key_ref().hash(&mut hasher);
         }
@@ -200,6 +200,10 @@ impl FontRegistry {
 
     pub fn catalog_hash(&self) -> u64 {
         self.catalog_hash
+    }
+
+    pub fn set_catalog_hash(&mut self, hash: u64) {
+        self.catalog_hash = hash;
     }
 
     pub fn by_key(&self, key: &str) -> Option<&FontEntry> {

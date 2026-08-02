@@ -34,3 +34,4 @@ pub mod geometry_scale;
 pub mod ground_truth;
 pub mod vintage_cache;
 pub mod font_history;
+pub mod per_char_cache;

@@ -12,3 +12,4 @@ ttf-parser = { version = "0.24", features = ["opentype-layout", "variable-fonts"
 image = { version = "0.25", default-features = false, features = ["png", "jpeg"] }
 thiserror = "2"
 bitflags = "2"
+rustc-hash = "2"
