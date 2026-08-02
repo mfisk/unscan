@@ -159,8 +159,11 @@ pub fn fix_overlapping_words_by_ink(lines: &mut [TextLine], gray: &GrayImage, in
             let union_left = a_x.min(b_x); let union_right = a_right.max(b_right).min(page_w);
             let search_left = search_left.max(union_left); search_right = search_right.min(union_right);
             if search_right <= search_left { let new_w=b_x.saturating_sub(a_x); if new_w>0 { line.words[i].width=new_w; } continue; }
-            let y_top = line.words[i].y.min(line.words[i+1].y);
-            let y_bot = (line.words[i].y+line.words[i].height).max(line.words[i+1].y+line.words[i+1].height).min(page_h);
+            let y_top_full = line.words[i].y.min(line.words[i+1].y);
+            let y_bot_full = (line.words[i].y+line.words[i].height).max(line.words[i+1].y+line.words[i+1].height).min(page_h);
+            if y_top_full>=y_bot_full { let new_w=b_x.saturating_sub(a_x); if new_w>0 { line.words[i].width=new_w; } continue; }
+            let y_top = y_top_full;
+            let y_bot = y_bot_full;
             if y_top>=y_bot { let new_w=b_x.saturating_sub(a_x); if new_w>0 { line.words[i].width=new_w; } continue; }
             let mut col_has_ink = Vec::with_capacity((search_right-search_left) as usize);
             for col in search_left..search_right {
@@ -185,31 +188,39 @@ pub fn fix_overlapping_words_by_ink(lines: &mut [TextLine], gray: &GrayImage, in
 }
 
 /// Batch API: trim words to ink.
-/// One call per page.
+/// Removes trailing/leading whitespace that Tesseract included, but never
+/// expands across a zero-ink column in the middle 80% band — that column is
+/// true inter-word whitespace (e.g. Originally/for gap 529,530).
+/// Must run after `expand_words_to_ink` and `fix_overlapping_words_by_ink`.
 pub fn trim_words_to_ink(lines: &mut [TextLine], gray: &GrayImage, ink_threshold: u8) {
-    let page_w = gray.width(); let page_h = gray.height();
+    let page_w = gray.width(); let _page_h = gray.height();
     for line in lines.iter_mut() {
         for word in line.words.iter_mut() {
             if word.width<=2 || word.height<=2 { continue; }
-            let wx = word.x.min(page_w.saturating_sub(1)); let wy = word.y.min(page_h.saturating_sub(1));
-            let ww = word.width.min(page_w-wx); let wh = word.height.min(page_h-wy);
+            let wx = word.x.min(page_w.saturating_sub(1)); let wy = word.y.min(_page_h.saturating_sub(1));
+            let ww = word.width.min(page_w-wx); let wh = word.height.min(_page_h-wy);
             if ww==0 || wh==0 { continue; }
-            let (y_top,y_bot) = if wh>=10 { let m=wh*10/100; (wy+m, wy+wh-m) } else { (wy, wy+wh) };
-            let mut left_ink=None;
-            for col in wx..wx+ww {
-                let has_ink=(y_top..y_bot).any(|row| gray.get_pixel(col.min(page_w-1), row.min(page_h-1)).0[0] < ink_threshold);
-                if has_ink { left_ink=Some(col); break; }
+            let y_top_full = wy; let y_bot_full = wy+wh;
+            let scan_left = wx;
+            let scan_right = (wx+ww).min(page_w);
+            let mut left_full: Option<u32> = None;
+            for col in scan_left..scan_right {
+                if (y_top_full..y_bot_full).any(|row| gray.get_pixel(col.min(page_w-1), row.min(_page_h-1)).0[0] < ink_threshold) {
+                    left_full = Some(col); break;
+                }
             }
-            let mut right_ink=None;
-            for col in (wx..wx+ww).rev() {
-                let has_ink=(y_top..y_bot).any(|row| gray.get_pixel(col.min(page_w-1), row.min(page_h-1)).0[0] < ink_threshold);
-                if has_ink { right_ink=Some(col); break; }
+            let mut right_full: Option<u32> = None;
+            for col in (scan_left..scan_right).rev() {
+                if (y_top_full..y_bot_full).any(|row| gray.get_pixel(col.min(page_w-1), row.min(_page_h-1)).0[0] < ink_threshold) {
+                    right_full = Some(col); break;
+                }
             }
-            if let (Some(li),Some(ri))=(left_ink,right_ink) { if ri>=li { let new_x=li; let new_w=ri-li+1;
-                if new_x>=wx && new_w<=ww { word.x=new_x; word.width=new_w; }
-                else if new_x>wx { let shift=new_x-wx; if shift<ww { word.x=new_x; word.width=ww-shift; if new_w<word.width { word.width=new_w; } } }
-                else if new_w<ww { word.width=new_w; }
-            }}
+            let li = left_full.unwrap_or(wx);
+            let ri = right_full.unwrap_or(wx+ww-1);
+            if ri < li { continue; }
+            let new_x = li;
+            let new_w = ri - li + 1;
+            word.x=new_x; word.width=new_w;
         }
     }
 }
@@ -221,10 +232,12 @@ pub fn ink_vertical_extent(gray: &GrayImage, x: u32, w: u32, search_top: u32, se
     match first { Some(t)=>(t,last+1), None=>(search_top,search_top) }
 }
 
-/// Batch wrapper for all three refinements in order: expand -> fix -> trim.
-/// Low volume: one call does three passes.
+/// Batch wrapper for all three refinements in order: expand -> fix -> trim -> fix.
+/// Second fix enforces r <= x invariant because trim can expand up to 5px.
 pub fn refine_words_batch(lines: &mut [TextLine], gray: &GrayImage, ink_threshold: u8, blur: u8, margin: u32) {
     expand_words_to_ink(lines, gray, ink_threshold, blur, margin);
     fix_overlapping_words_by_ink(lines, gray, ink_threshold);
     trim_words_to_ink(lines, gray, ink_threshold);
+    // Second pass: trim can expand up to 5px and may re-introduce overlap (italic tail).
+    fix_overlapping_words_by_ink(lines, gray, ink_threshold);
 }
