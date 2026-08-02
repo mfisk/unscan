@@ -13,69 +13,78 @@ use std::path::PathBuf;
 use std::process::Command;
 
 /// Expected seam splits for each test line, per word.
-/// Regenerated 2026-07-25 from fresh audit after 2-horiz DP (c±2) landed.
-/// HARDCODED_7 now has 10 lines; word_segmentation order is as emitted by
-/// Tesseract (scrambled for multi-word lines, noted below).
+/// Regenerated 2026-08-02 from fresh audit after HARDCODED expanded to 11 lines
+/// (added "Font: Originally for IBM Executive typewriters — 12 characters per inch").
+/// Captured from test-docs/t59-audit/audit.json after 2-horiz DP. Word_segmentation
+/// order is as emitted by Tesseract; first 10 lines share page for word-gap stats.
 const EXPECTED: &[(&str, &[&[u32]])] = &[
     // 0: LibreBodoni-400 lowercase
     ("abcdefghijklmnopqrstuvwxyz.", &[
-        &[19, 112, 166, 199, 395, 413, 427, 460],
+        &[17, 112, 165, 198, 395, 424, 438, 459],
     ]),
     // 1: LibreBodoni-400 uppercase
     ("ABCDEFGHIJKLMNOPQRSTUVWXYZ.", &[
-        &[25, 187, 216, 230, 275, 332, 360, 471, 518, 545, 570, 604, 633, 656],
+        &[24, 186, 216, 229, 276, 360, 545, 569, 604, 632, 656],
     ]),
     // 2: Georgia-400 uppercase
     ("ABCDEFGHIJKLMNOPQRSTUVWXYZ.", &[
-        &[26, 268, 290, 504, 531, 557, 592, 619, 642],
+        &[26, 268, 459, 530, 556, 592, 618, 642],
     ]),
-    // 3: OpenSans-400 lowercase — OCR splits into 3 words but single-letter "a"
-    //    excluded by segment_line filter chars_in_word.len() <= 1 (commit 7dca36a).
-    //    Remains: "bcdefghij", "klmnopgrstuvwxyz." -> 2 words
-    //    word_segmentation order is [klm..., bcd...] as emitted
+    // 3: OpenSans-400 lowercase — now 5 words due to word-gap stats shift from 11-line page
     ("abcdefghijklmnopqrstuvwxyz.", &[
-        &[241],
-        &[94, 146],
+        &[86, 134],
+        &[94],
+        &[],
+        &[4],
+        &[],
     ]),
     // 4: LibreBodoni-400Italic "dogs."
     ("dogs.", &[
-        &[22, 45, 67, 81],
+        &[22, 43, 65],
     ]),
     // 5: SourceSerif4-400It "Mayr-Duffner."
     ("Mayr-Duffner.", &[
-        &[39, 60, 96, 162, 187, 243],
+        &[19, 39, 60, 96, 162, 187, 243],
     ]),
     // 6: SourceSerif4-400It "Type"
     ("Type", &[
-        &[17, 39],
+        &[15, 39],
     ]),
-    // 7: LibreBaskerville-400 lowercase — the line with 188 (was 187)
+    // 7: LibreBaskerville-400 lowercase
     ("abcdefghijklmnopqrstuvwxyz.", &[
-        &[19, 126, 148, 188, 222, 375, 449, 471, 503, 526, 550],
+        &[19, 127, 149, 187, 375, 448, 503, 526],
     ]),
-    // 8: PTSerif-400Italic fox with numbers
-    //    Tesseract emits in scrambled order (debug profile):
-    //    ["1,234,567,890", "Italic:", "brown", "jumps", "over", "lazy", "The", "ick", "fox", "qu"]
-    //    (quick is split into qu + ick by seam/word bboxing)
+    // 8: PTSerif-400Italic fox with numbers — 9 words (quick no longer split)
     ("Italic: The quick brown fox jumps over 1,234,567,890 lazy", &[
-        &[52, 73, 97, 129, 167],
-        &[14],
+        &[51, 73, 96, 129, 236],
+        &[15],
+        &[],
+        &[38],
+        &[],
+        &[38],
+        &[50],
+        &[22],
+        &[15, 35],
+    ]),
+    // 9: SourceSerif4-400It "Font: Originally for IBM Executive typewriters — 12 characters per inch"
+    ("Font: Originally for IBM Executive typewriters — 12 characters per inch", &[
+        &[11, 32, 145, 177],
+        &[55],
+        &[75, 127, 159],
+        &[23, 46, 119, 150],
+        &[22, 80],
         &[],
         &[],
-        &[37],
-        &[31, 51],
-        &[21],
+        &[15],
         &[],
-        &[12],
         &[],
     ]),
-    // 9: Georgia-400 "Matthew Carter created Georgia in 1993."
-    //    emitted order: ["Matthew", "created", "Georgia", "Carter", "1993.", "in"]
+    // 10: Georgia-400 "Matthew Carter created Georgia in 1993."
     ("Matthew Carter created Georgia in 1993.", &[
-        &[73, 132],
-        &[76],
-        &[88, 109],
-        &[64],
+        &[57, 72, 87, 130],
+        &[75],
+        &[88],
+        &[63],
         &[],
         &[],
     ]),

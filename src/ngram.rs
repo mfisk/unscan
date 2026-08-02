@@ -78,13 +78,16 @@ pub fn build_ngram_glyph_map(
                 &font, seq, &gid_overrides, &params,
             ) {
                 let hash = crate::glyph_map::hash_image(&img);
-                // Write image cache
+                // Write image cache — always atomic; heals partial files from killed runs.
                 let path = crate::char_render::ngram_cache_path(seq, hash, &params);
-                if !path.exists() {
-                    if let Some(parent) = path.parent() {
-                        let _ = std::fs::create_dir_all(parent);
-                    }
-                    let _ = img.save(&path);
+                let tmp = crate::atomic_file::tmp_for(&path);
+                if let Some(parent) = tmp.parent() {
+                    let _ = std::fs::create_dir_all(parent);
+                }
+                if img.save(&tmp).is_ok() {
+                    let _ = std::fs::rename(&tmp, &path);
+                } else {
+                    let _ = std::fs::remove_file(&tmp);
                 }
                 hashes.push((seq.clone(), hash, fk.clone()));
             }

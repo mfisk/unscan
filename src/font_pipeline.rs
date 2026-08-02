@@ -166,7 +166,13 @@ fn save_obs_crops(
             let c = d.ch;
             let seq_label: String = if c.is_alphanumeric() { format!("{}", c) } else { format!("U{:04X}", c as u32) };
             let path = crop_dir.join(format!("crop_{:02}_{}.png", d.crop_index, seq_label));
-            let _ = img.save(&path);
+            // Diag output: best-effort atomic, don't block pipeline on failure.
+            let tmp = crate::atomic_file::tmp_for(&path);
+            if img.save(&tmp).is_ok() {
+                let _ = std::fs::rename(&tmp, &path);
+            } else {
+                let _ = std::fs::remove_file(&tmp);
+            }
         }
     }
 }
@@ -1019,11 +1025,22 @@ pub fn match_lines(
                             let fname: String = format!("U+{:04X}.png", d.ch as u32);
                             let seq = [d.ch];
                             let path = font_ref_dir.join(&fname);
-                            if path.exists() { continue; }
+                            if path.exists() {
+                                if let Ok(md) = std::fs::metadata(&path) {
+                                    if md.len() > 64 { continue; }
+                                }
+                                let _ = std::fs::remove_file(&path);
+                            }
                             let gid_overrides: Vec<Option<unprint_fonts::ab_glyph::GlyphId>> = vec![override_map.get(&d.ch).copied().map(|gid| unprint_fonts::ab_glyph::GlyphId(gid))];
                             let ref_img = char_render::render_ngram_fresh(&font, &seq, &gid_overrides, &char_render::RenderParams::default());
                             if let Some(img) = ref_img {
-                                let _ = img.save(&path);
+                                // Atomic to avoid partial ref image on SIGKILL.
+                                let tmp = crate::atomic_file::tmp_for(&path);
+                                if img.save(&tmp).is_ok() {
+                                    let _ = std::fs::rename(&tmp, &path);
+                                } else {
+                                    let _ = std::fs::remove_file(&tmp);
+                                }
                             }
                         }
                     }

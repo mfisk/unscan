@@ -117,7 +117,7 @@ impl NgramGlyphMap {
     /// font_key is added to that group. Otherwise a new group is created.
     /// Returns (glyph_id, is_new_group).
     pub fn register(&mut self, seq: &[char], font_key: &str, hash: u64) -> (usize, bool) {
-        // Fast path: already known via lookup with matching hash
+        // Fast path: already known via lookup with matching hash — no alloc.
         if let Some(map) = self.font_lookup.get(seq) {
             if let Some(&gid) = map.get(font_key) {
                 if let Some(groups) = self.groups.get(seq) {
@@ -127,12 +127,22 @@ impl NgramGlyphMap {
                 }
             }
         }
+        // Need owned key for insertion — allocate once here.
+        // Use &seq for lookups above to avoid alloc in hot path.
         let groups = self.groups.entry(seq.to_vec()).or_default();
         for (idx, group) in groups.iter_mut().enumerate() {
             if group.hash == hash {
                 if !group.font_keys.iter().any(|k| k == font_key) {
                     group.font_keys.push(font_key.to_string());
-                    self.font_lookup.entry(seq.to_vec()).or_default().insert(font_key.to_string(), idx);
+                    // font_lookup: try get_mut first to avoid second alloc when map exists
+                    if let Some(map) = self.font_lookup.get_mut(seq) {
+                        map.insert(font_key.to_string(), idx);
+                    } else {
+                        self.font_lookup
+                            .entry(seq.to_vec())
+                            .or_default()
+                            .insert(font_key.to_string(), idx);
+                    }
                     self.dirty = true;
                 }
                 return (idx, false);
@@ -143,7 +153,14 @@ impl NgramGlyphMap {
             hash,
             font_keys: vec![font_key.to_string()],
         });
-        self.font_lookup.entry(seq.to_vec()).or_default().insert(font_key.to_string(), new_id);
+        if let Some(map) = self.font_lookup.get_mut(seq) {
+            map.insert(font_key.to_string(), new_id);
+        } else {
+            self.font_lookup
+                .entry(seq.to_vec())
+                .or_default()
+                .insert(font_key.to_string(), new_id);
+        }
         self.dirty = true;
         (new_id, true)
     }

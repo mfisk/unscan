@@ -497,7 +497,14 @@ fn run(args: &cli::Args, classifier: &mut dyn classifier::Classifier) -> Result<
             }
             if updated_non_latin {
                 let _ = std::fs::create_dir_all(cache_path.parent().unwrap());
-                let _ = std::fs::write(&cache_path, serde_json::to_string(&known_non_latin).unwrap_or_default());
+                let tmp = crate::atomic_file::tmp_for(&cache_path);
+                if let Ok(s) = serde_json::to_string(&known_non_latin) {
+                    if std::fs::write(&tmp, s).is_ok() {
+                        let _ = std::fs::rename(&tmp, &cache_path);
+                    } else {
+                        let _ = std::fs::remove_file(&tmp);
+                    }
+                }
             }
             if skipped > 0 {
                 if !args.quiet { eprintln!("[incremental] Skipping {} non-Latin fonts (no supported_chars coverage)", skipped); }

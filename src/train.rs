@@ -619,12 +619,18 @@ pub fn subsample_eval(n: usize, max_eval: usize, seed: u64) -> Vec<usize> {
 
 
 pub fn run_train(mut args: TrainArgs) {
-    // Limit rayon thread pool to avoid holding too many fonts in memory at once.
-    // On memory-constrained machines (no swap), each thread holds one font's data.
-    let num_cpus = std::thread::available_parallelism()
-        .map(|n| n.get())
-        .unwrap_or(2);
-    let max_threads = num_cpus.min(4); // cap at 4 to limit memory pressure
+    // Respect wrapper env first, otherwise cap to avoid OOM on 7.8GB no-swap.
+    // Previous version always forced 4 threads, ignoring RAYON_NUM_THREADS=1,
+    // which caused VSZ bloat when each thread held font data + PNG encoders.
+    let max_threads = std::env::var("RAYON_NUM_THREADS")
+        .ok()
+        .and_then(|s| s.parse::<usize>().ok())
+        .unwrap_or_else(|| {
+            std::thread::available_parallelism()
+                .map(|n| n.get())
+                .unwrap_or(2)
+                .min(4)
+        });
     let _ = rayon::ThreadPoolBuilder::new()
         .num_threads(max_threads)
         .build_global();
@@ -763,7 +769,7 @@ pub fn run_train(mut args: TrainArgs) {
     eprintln!("  {} font families ({} with multiple variants)",
         n_families, multi_variant_families);
 
-    let chunk_size = 200;
+    let chunk_size = 30;
     let n_seqs = sequences.len();
 
     let _seq_to_idx: HashMap<Vec<char>, usize> = sequences.iter().enumerate()
@@ -819,8 +825,8 @@ pub fn run_train(mut args: TrainArgs) {
         };
         let gmap = Mutex::new(crate::glyph_map::NgramGlyphMap::new(catalog_hash));
 
-        catalog.par_iter().for_each(|fe| {
-            let fk = fe.font_key();
+        catalog.iter().for_each(|fe| {
+            let fk = fe.font_key_ref().to_owned();
             let mut local_hashes: Vec<(usize, u64)> = Vec::with_capacity(sequences.len());
             let mut need_render: Vec<usize> = Vec::new();
 
@@ -828,9 +834,18 @@ pub fn run_train(mut args: TrainArgs) {
                 if let Some(old) = old_gmap.as_ref() {
                     if let Some(hash) = old.hash_for_font(seq, &fk) {
                         let path = crate::char_render::ngram_cache_path(seq, hash, &prewarm_params);
+                        // Atomic-safe reuse check: exists + non-trivial size.
+                        // A SIGKILL during previous img.save could leave a 0-byte or truncated file.
+                        // Such files would still `exists()` but fail to decode; treat as miss.
                         if path.exists() {
-                            local_hashes.push((si, hash));
-                            continue;
+                            if let Ok(md) = std::fs::metadata(&path) {
+                                if md.len() > 64 {
+                                    local_hashes.push((si, hash));
+                                    continue;
+                                }
+                            }
+                            // Corrupt/partial file detected — delete so fresh render heals it.
+                            let _ = std::fs::remove_file(&path);
                         }
                     }
                 }
@@ -883,11 +898,15 @@ pub fn run_train(mut args: TrainArgs) {
                     ) {
                         let hash = crate::glyph_map::hash_image(&img);
                         let path = crate::char_render::ngram_cache_path(seq, hash, &prewarm_params);
-                        if !path.exists() {
-                            if let Some(parent) = path.parent() {
-                                let _ = std::fs::create_dir_all(parent);
-                            }
-                            let _ = img.save(&path);
+                        // Always atomic write to heal any prior partial file; rename is atomic.
+                        let tmp = crate::atomic_file::tmp_for(&path);
+                        if let Some(parent) = tmp.parent() {
+                            let _ = std::fs::create_dir_all(parent);
+                        }
+                        if img.save(&tmp).is_ok() {
+                            let _ = std::fs::rename(&tmp, &path);
+                        } else {
+                            let _ = std::fs::remove_file(&tmp);
                         }
                         local_hashes.push((si, hash));
                         rendered += 1;
@@ -1053,8 +1072,10 @@ pub fn run_train(mut args: TrainArgs) {
             let chunk_end = (chunk_start + chunk_size).min(catalog.len());
             let chunk = &catalog[chunk_start..chunk_end];
 
-            // Each font produces samples tagged with (ci, combo_index)
-            let chunk_results: Vec<Vec<(usize, usize, TrainingSample)>> = chunk.par_iter().map(|fe| {
+            // Sequential iter to bound memory: previous 200-font × 4-thread par_iter held
+            // 15MB chunk_results + 19MB writers + 4× font_data/canvases → >6GB VSZ.
+            // Now chunk_size=30, single thread, reused buffers.
+            let chunk_results: Vec<Vec<(usize, usize, TrainingSample)>> = chunk.iter().map(|fe| {
                 let font_data = match std::fs::read(&fe.path) {
                     Ok(d) => d,
                     Err(_) => {
@@ -1070,9 +1091,9 @@ pub fn run_train(mut args: TrainArgs) {
                     }
                 };
 
-                let fk = fe.font_key();
+                let fk = fe.font_key_ref().to_owned();
                 let overrides = fe.glyph_overrides.as_deref();
-                let mut samples = Vec::new();
+                let mut samples = Vec::with_capacity(sequences.len() * needed_combos.len());
 
                 for (si, seq) in sequences.iter().enumerate() {
                     // Look up this font's glyph_id for this sequence.

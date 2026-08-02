@@ -14,10 +14,29 @@
 //! Cache path: `chars/h{H}_s{S}/{aa}_{binarize}/{seq_dir}/{hash}.png`
 //! where `seq_dir` is `U+0061` for a single char or `U+0066_U+0069` for a bigram.
 
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 use unprint_fonts::ab_glyph::{Font, GlyphId, PxScale, ScaleFont, point};
 use image::{GrayImage, Luma};
+
+/// Atomic PNG save: write to `.tmp` sibling then rename, so a SIGKILL never leaves a partial file.
+/// Matches `atomic_file::tmp_for` pattern used for glyph_map and training features.
+pub(crate) fn atomic_save_png(img: &GrayImage, final_path: &Path) -> bool {
+    let tmp = crate::atomic_file::tmp_for(final_path);
+    if let Some(parent) = tmp.parent() {
+        let _ = std::fs::create_dir_all(parent);
+    }
+    if img.save(&tmp).is_err() {
+        let _ = std::fs::remove_file(&tmp);
+        return false;
+    }
+    // On Unix, rename is atomic. If it fails, clean up tmp and report failure.
+    if std::fs::rename(&tmp, final_path).is_err() {
+        let _ = std::fs::remove_file(&tmp);
+        return false;
+    }
+    true
+}
 
 use crate::features::{self as features, AaVariant, NORM_H};
 use crate::glyph_map;
@@ -93,7 +112,7 @@ pub fn load_cached_ngram(
 ) -> Option<GrayImage> {
     let path = ngram_cache_path(seq, img_hash, params);
     if path.exists() {
-        image::open(&path).ok().map(|d| d.to_luma8())
+        image::open(&path).ok().map(|d| d.into_luma8())
     } else {
         None
     }
@@ -120,7 +139,7 @@ pub fn render_ngram(
     glyph_map: &mut glyph_map::NgramGlyphMap,
     params: &RenderParams,
 ) -> Option<(u64, GrayImage)> {
-    let fk = fe.font_key();
+    let fk = fe.font_key_ref();
 
     // Cache read: check glyph_map for known hash, then image cache
     if let Some(hash) = glyph_map.hash_for_font(seq, &fk) {
@@ -143,14 +162,10 @@ pub fn render_ngram(
     // Update glyph_map
     glyph_map.register(seq, &fk, img_hash);
 
-    // Write image cache
+    // Write image cache — always atomic, and always overwrite on miss path
+    // to heal any previously partial/corrupt file (exists check alone would keep corrupt file).
     let path = ngram_cache_path(seq, img_hash, params);
-    if !path.exists() {
-        if let Some(parent) = path.parent() {
-            let _ = std::fs::create_dir_all(parent);
-        }
-        let _ = img.save(&path);
-    }
+    let _ = atomic_save_png(&img, &path);
 
     Some((img_hash, img))
 }
@@ -373,7 +388,8 @@ pub fn render_ref_chars(json_str: &str) {
         }
         if let Some(img) = render_ngram_fresh(&font, &[c], &[None], &RenderParams::default()) {
             let fname = format!("U+{:04X}.png", c as u32);
-            let _ = img.save(out.join(&fname));
+            let final_path = out.join(&fname);
+            let _ = atomic_save_png(&img, &final_path);
             rendered += 1;
         }
     }

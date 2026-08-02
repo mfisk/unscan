@@ -1944,8 +1944,8 @@ impl MahalanobisClassifier {
                     let count = font_indices.get(&glyph_id).map(|v| v.len() as u32).unwrap_or(1);
                     // glyph_id is group index into glyph_map for this seq
                     let font_keys = ctx.glyph_map.fonts_for_glyph(seq, glyph_id as usize);
-                    // mean as f32
-                    let mean_f32: Vec<f32> = mean_f64.iter().map(|&v| v as f32).collect();
+                    // mean as f32 — share Arc to avoid per-font Vec clone bloat (was Vec clone 200x per group).
+                    let mean_arc: std::sync::Arc<[f32]> = mean_f64.iter().map(|&v| v as f32).collect::<Vec<_>>().into();
                     for fk in font_keys {
                         if let Some(&font_idx) = ctx.font_id_map.get(fk) {
                             if let Some(fe) = ctx.catalog.get(font_idx as usize) {
@@ -1954,7 +1954,7 @@ impl MahalanobisClassifier {
                                     font_key: fk.clone(),
                                     file_hash: fhash,
                                     count,
-                                    mean: mean_f32.clone(),
+                                    mean: mean_arc.clone(),
                                 });
                             }
                         }
@@ -2331,7 +2331,7 @@ impl LdaClassifier {
                 for (&glyph_id, mean_f64) in &class_means {
                     let count = font_indices.get(&glyph_id).map(|v| v.len() as u32).unwrap_or(1);
                     let font_keys = ctx.glyph_map.fonts_for_glyph(seq, glyph_id as usize);
-                    let mean_f32: Vec<f32> = mean_f64.iter().map(|&v| v as f32).collect();
+                    let mean_arc: std::sync::Arc<[f32]> = mean_f64.iter().map(|&v| v as f32).collect::<Vec<_>>().into();
                     for fk in font_keys {
                         if let Some(&font_idx) = ctx.font_id_map.get(fk) {
                             if let Some(fe) = ctx.catalog.get(font_idx as usize) {
@@ -2340,7 +2340,7 @@ impl LdaClassifier {
                                     font_key: fk.clone(),
                                     file_hash: fhash,
                                     count,
-                                    mean: mean_f32.clone(),
+                                    mean: mean_arc.clone(),
                                 });
                             }
                         }

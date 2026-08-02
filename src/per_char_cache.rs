@@ -26,7 +26,7 @@ pub struct MeanEntry {
     pub font_key: String,
     pub file_hash: u64,
     pub count: u32,
-    pub mean: Vec<f32>,
+    pub mean: std::sync::Arc<[f32]>,
 }
 
 pub fn file_meta_hash(path: &Path) -> u64 {
@@ -75,7 +75,7 @@ pub fn write_means_atomic(code: u32, feat_dim: usize, entries: &[MeanEntry]) -> 
         buf.extend_from_slice(&e.file_hash.to_le_bytes());
         buf.extend_from_slice(&e.count.to_le_bytes());
         assert_eq!(e.mean.len(), feat_dim);
-        for &v in &e.mean { buf.extend_from_slice(&v.to_le_bytes()); }
+        for &v in e.mean.iter() { buf.extend_from_slice(&v.to_le_bytes()); }
     }
     write_all_atomic(&path, &buf)
 }
@@ -108,7 +108,7 @@ pub fn read_means(code: u32) -> io::Result<Option<(usize, Vec<MeanEntry>)>> {
             let v = f32::from_le_bytes(data[off..off+4].try_into().unwrap()); off+=4;
             mean.push(v);
         }
-        out.push(MeanEntry{ font_key: key, file_hash, count, mean });
+        out.push(MeanEntry{ font_key: key, file_hash, count, mean: mean.into() });
     }
     Ok(Some((feat_dim, out)))
 }

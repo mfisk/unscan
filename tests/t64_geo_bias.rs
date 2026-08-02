@@ -14,8 +14,8 @@
 //!   (crates/unprint-geometry/src/params.rs)
 //!
 //! Procedure:
-//!   - gen-line-test.py --hardcoded (same HARDCODED_10 as t59)
-//!   - run unprint with UNPRINT_AUDIT_ALL_CHARS=1 UNPRINT_FLAT_TOP=0.45,
+//!   - gen-line-test.py --hardcoded (same HARDCODED as t59)
+//!   - run unprint with UNPRINT_AUDIT_ALL_CHARS=1,
 //!     --test GT --audit (no UNPRINT_EXTRA_SEAMS — not debugging seams)
 //!   - collect gt_geo_h_err / gt_geo_v_err for ocr_correct==True only
 //!   - assert mean≈0 within 2σ, RMS≤2.0, sum_h per word==0 (center-span)
@@ -67,23 +67,24 @@ fn geo_bias_is_zero() {
 
     let bin = unscan_bin();
 
-    // All-chars GT path: env toggle, not --audit-all-lines flag. --audit-all-lines
-    // (aka --audit-all alias) is "audit all lines" for report; env is "audit all chars".
-    // audit_all_chars_enabled() now checks only UNPRINT_AUDIT_ALL_CHARS (old
-    // UNPRINT_AUDIT_ALL alias removed).
+    // All-chars GT + all-lines: env = audit all chars (punct, 2-letter words),
+    // CLI --audit-all-lines = audit all lines / hits in obs_votes + geo for t64.
+    // Both are required per 43aad2c: Histogram BAP needs
+    //   UNPRINT_AUDIT_ALL_CHARS=1 ... --audit-all-lines
     // Do NOT set UNPRINT_EXTRA_SEAMS — we are not debugging seam splits.
+    // Do NOT set UNPRINT_FLAT_TOP — use params.rs defaults (SIGMA_CENTER_PX=0.284 etc).
     let output = Command::new(&bin)
         .arg(&input)
         .args(["-o", "/dev/null"])
         .args(["--test", gt.to_str().unwrap()])
         .args(["--audit", audit_dir.to_str().unwrap()])
+        .args(["--audit-all-lines"])
         .env("RUST_LOG", "info")
         .env("RAYON_NUM_THREADS", "1")
         .env("MALLOC_ARENA_MAX", "1")
         .env("TMPDIR", "/home/hatch/workspace/tmp")
-        .env("UNPRINT_CACHE_DIR", "/home/hatch/.cache/unprint-small")
+        .env("UNPRINT_CACHE_DIR", "/home/hatch/.cache/unprint")
         .env("UNPRINT_AUDIT_ALL_CHARS", "1")
-        .env("UNPRINT_FLAT_TOP", "0.45")
         .env("UNPRINT_SKIP_OCR_CORRECTION", "true")
         .output()
         .expect("run unprint");

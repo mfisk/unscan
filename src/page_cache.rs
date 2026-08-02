@@ -59,7 +59,12 @@ fn save_source_meta(cache_dir: &Path, meta: &SourceMeta) {
     }
     let p = source_meta_path(cache_dir);
     if let Ok(s) = serde_json::to_string(meta) {
-        let _ = std::fs::write(p, s);
+        let tmp = crate::atomic_file::tmp_for(&p);
+        if std::fs::write(&tmp, s).is_ok() {
+            let _ = std::fs::rename(&tmp, &p);
+        } else {
+            let _ = std::fs::remove_file(&tmp);
+        }
     }
 }
 
@@ -138,7 +143,12 @@ pub fn save_cached_image(dir: &Path, page_idx: usize, img: &DynamicImage) {
         return;
     }
     let png_path = dir.join(format!("page-{}.png", page_idx));
-    let _ = img.save(&png_path);
+    let tmp = crate::atomic_file::tmp_for(&png_path);
+    if img.save(&tmp).is_ok() {
+        let _ = std::fs::rename(&tmp, &png_path);
+    } else {
+        let _ = std::fs::remove_file(&tmp);
+    }
 }
 
 /// Save OCR results to the cache.
@@ -155,7 +165,12 @@ pub fn save_cached_ocr(
         word_regions: word_regions.to_vec(),
     };
     if let Ok(data) = serde_json::to_string(&cached) {
-        let _ = std::fs::write(&json_path, data);
+        let tmp = crate::atomic_file::tmp_for(&json_path);
+        if std::fs::write(&tmp, data).is_ok() {
+            let _ = std::fs::rename(&tmp, &json_path);
+        } else {
+            let _ = std::fs::remove_file(&tmp);
+        }
     }
 }
 
