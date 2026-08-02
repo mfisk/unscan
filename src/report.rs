@@ -2240,16 +2240,16 @@ pub fn generate_report(
         }
     }
 
-    // Collect OCR-wrong hits/minor misses (font matched, but OCR text wrong)
-    // These are moved to the very end of the report.
+    // Collect ALL OCR-wrong entries (any miss kind) – these move to the very end.
+    // Previously only Hit|MinorMiss were moved, leaving 303 Major+82 ZNCC with OCR WRONG at front.
     let mut ocr_misses: Vec<&ClassifiedEntry> = classified.iter()
-        .filter(|ce| matches!(ce.kind, MissKind::Hit | MissKind::MinorMiss)
-                     && ce.entry.ocr_correct == Some(false))
+        .filter(|ce| ce.entry.ocr_correct == Some(false))
         .collect();
     ocr_misses.sort_by(|a, b| {
         a.entry.similarity_score.partial_cmp(&b.entry.similarity_score).unwrap_or(std::cmp::Ordering::Equal)
     });
 
+    // Accuracy stats should be computed on the full set BEFORE we filter for display.
     let all_misses = major_misses.len() + minor_misses.len() + similarity_failures.len();
     let compared = hits.len() + all_misses + kept_raster.len();
     // Primary metric: only major misses count against the score.
@@ -2264,60 +2264,73 @@ pub fn generate_report(
     // OCR accuracy split: break down font matching accuracy by OCR correctness
 
 
-    // Sort each miss category by increasing ZNCC (worst visual matches first)
-    major_misses.sort_by(|a, b| {
+    // Filtered views for display – OCR-wrong entries are excluded here and shown only in final section.
+    let major_misses_display: Vec<&ClassifiedEntry> = major_misses.iter().filter(|ce| ce.entry.ocr_correct != Some(false)).copied().collect();
+    let minor_misses_display: Vec<&ClassifiedEntry> = minor_misses.iter().filter(|ce| ce.entry.ocr_correct != Some(false)).copied().collect();
+    let similarity_failures_display: Vec<&ClassifiedEntry> = similarity_failures.iter().filter(|ce| ce.entry.ocr_correct != Some(false)).copied().collect();
+    let kept_raster_display: Vec<&ClassifiedEntry> = kept_raster.iter().filter(|ce| ce.entry.ocr_correct != Some(false)).copied().collect();
+    let hits_display: Vec<&ClassifiedEntry> = hits.iter().filter(|ce| ce.entry.ocr_correct != Some(false)).copied().collect();
+
+    // Sort each miss category by increasing ZNCC (worst visual matches first) – using filtered lists
+    let mut major_misses_sorted = major_misses_display.clone();
+    major_misses_sorted.sort_by(|a, b| {
         a.entry.similarity_score.partial_cmp(&b.entry.similarity_score).unwrap_or(std::cmp::Ordering::Equal)
     });
-    minor_misses.sort_by(|a, b| {
+    let mut minor_misses_sorted = minor_misses_display.clone();
+    minor_misses_sorted.sort_by(|a, b| {
         a.entry.similarity_score.partial_cmp(&b.entry.similarity_score).unwrap_or(std::cmp::Ordering::Equal)
     });
-    similarity_failures.sort_by(|a, b| {
+    let mut similarity_failures_sorted = similarity_failures_display.clone();
+    similarity_failures_sorted.sort_by(|a, b| {
         a.entry.similarity_score.partial_cmp(&b.entry.similarity_score).unwrap_or(std::cmp::Ordering::Equal)
     });
+    let mut kept_raster_sorted = kept_raster_display.clone();
+    kept_raster_sorted.sort_by(|a, b| {
+        a.entry.similarity_score.partial_cmp(&b.entry.similarity_score).unwrap_or(std::cmp::Ordering::Equal)
+    });
+    let mut hits_sorted = hits_display.clone();
+    let mut no_gt_sorted = no_ground_truth.clone();
     if meta.report_all {
-        hits.sort_by(|a, b| {
+        hits_sorted.sort_by(|a, b| {
             a.entry.similarity_score.partial_cmp(&b.entry.similarity_score).unwrap_or(std::cmp::Ordering::Equal)
         });
-        no_ground_truth.sort_by(|a, b| {
+        no_gt_sorted.sort_by(|a, b| {
             a.entry.similarity_score.partial_cmp(&b.entry.similarity_score).unwrap_or(std::cmp::Ordering::Equal)
         });
     }
 
     let mut font_data_cache = FontDataCache::new();
 
-    // Build major miss blocks
+    // Build major miss blocks (OCR-wrong already filtered out)
     let mut major_miss_blocks = String::new();
-    for ce in &major_misses {
+    for ce in &major_misses_sorted {
         let (html, _chosen_zncc, _gt_zncc) = build_miss_block(
             ce, audit_root, font_catalog, glyph_map, &mut font_data_cache, dpi,
         );
         major_miss_blocks.push_str(&html);
     }
 
-    // Build minor miss blocks — excluding OCR-miss entries (they move to the very end)
+    // Build minor miss blocks — OCR-miss already filtered
     let mut minor_miss_blocks = String::new();
-    for ce in &minor_misses {
-        if ce.entry.ocr_correct == Some(false) {
-            continue;
-        }
+    for ce in &minor_misses_sorted {
         let (html, _chosen_zncc, _gt_zncc) = build_miss_block(
             ce, audit_root, font_catalog, glyph_map, &mut font_data_cache, dpi,
         );
         minor_miss_blocks.push_str(&html);
     }
 
-    // Build similarity failure blocks
+    // Build similarity failure blocks (OCR-wrong filtered out)
     let mut sim_fail_blocks = String::new();
-    for ce in &similarity_failures {
+    for ce in &similarity_failures_sorted {
         let (html, _chosen_zncc, _gt_zncc) = build_miss_block(
             ce, audit_root, font_catalog, glyph_map, &mut font_data_cache, dpi,
         );
         sim_fail_blocks.push_str(&html);
     }
 
-    // Build kept-raster blocks
+    // Build kept-raster blocks (OCR-wrong filtered out)
     let mut raster_blocks = String::new();
-    for ce in &kept_raster {
+    for ce in &kept_raster_sorted {
         let (html, _chosen_zncc, _gt_zncc) = build_miss_block(
             ce, audit_root, font_catalog, glyph_map, &mut font_data_cache, dpi,
         );
@@ -2329,16 +2342,13 @@ pub fn generate_report(
     let mut hits_blocks = String::new();
     let mut no_gt_blocks = String::new();
     if meta.report_all {
-        for ce in &hits {
-            if ce.entry.ocr_correct == Some(false) {
-                continue;
-            }
+        for ce in &hits_sorted {
             let (html, _chosen_zncc, _gt_zncc) = build_miss_block(
                 ce, audit_root, font_catalog, glyph_map, &mut font_data_cache, dpi,
             );
             hits_blocks.push_str(&html);
         }
-        for ce in &no_ground_truth {
+        for ce in &no_gt_sorted {
             let (html, _chosen_zncc, _gt_zncc) = build_miss_block(
                 ce, audit_root, font_catalog, glyph_map, &mut font_data_cache, dpi,
             );
@@ -2346,16 +2356,20 @@ pub fn generate_report(
         }
     }
 
-    // Build OCR miss blocks (font matched, OCR text wrong)
+    // Build OCR miss blocks – now ALL entries where OCR is wrong (any font).
+    // Use full miss block so font info is preserved even for major misses.
     let mut ocr_miss_blocks = String::new();
     for ce in &ocr_misses {
-        ocr_miss_blocks.push_str(&build_ocr_miss_block(ce, audit_root));
+        let (html, _chosen_zncc, _gt_zncc) = build_miss_block(
+            ce, audit_root, font_catalog, glyph_map, &mut font_data_cache, dpi,
+        );
+        ocr_miss_blocks.push_str(&html);
     }
 
     let sim_fail_section = if !sim_fail_blocks.is_empty() {
         format!(
             "<h2 style=\"margin-top:2em; color:#c55;\">\
-             ZNCC Failures (correct font, ZNCC rejected)</h2>{sim_fail_blocks}"
+             ZNCC Failures (correct font, ZNCC rejected, OCR correct)</h2>{sim_fail_blocks}"
         )
     } else {
         String::new()
@@ -2364,8 +2378,8 @@ pub fn generate_report(
     let raster_section = if !raster_blocks.is_empty() {
         format!(
             "<h2 style=\"margin-top:2em; color:#888;\">\
-             Kept Raster ({} lines)</h2>{raster_blocks}",
-            kept_raster.len()
+             Kept Raster ({} lines, OCR correct)</h2>{raster_blocks}",
+            kept_raster_sorted.len()
         )
     } else {
         String::new()
@@ -2374,7 +2388,7 @@ pub fn generate_report(
     let ocr_miss_section = if !ocr_miss_blocks.is_empty() {
         format!(
             "<h2 style=\"margin-top:2em; color:#e90;\">\
-             OCR Text Mismatches ({} lines — font correct, text wrong)</h2>{ocr_miss_blocks}",
+             OCR Text Mismatches ({} lines — OCR wrong, any font)</h2>{ocr_miss_blocks}",
             ocr_misses.len()
         )
     } else {
@@ -2385,7 +2399,7 @@ pub fn generate_report(
         format!(
             "<h2 style=\"margin-top:2em; color:#2a7;\">\
              Hits ({} lines — all correct)</h2>{hits_blocks}",
-            hits.len()
+            hits_sorted.len()
         )
     } else {
         String::new()
@@ -2395,7 +2409,7 @@ pub fn generate_report(
         format!(
             "<h2 style=\"margin-top:2em; color:#888;\">\
              No Ground Truth ({} lines)</h2>{no_gt_blocks}",
-            no_ground_truth.len()
+            no_gt_sorted.len()
         )
     } else {
         String::new()
@@ -2645,8 +2659,8 @@ pub fn generate_report(
          {ocr_miss_section}\n\
          </body>\n\
          </html>",
-        n_major = major_misses.len(),
-        n_minor = minor_misses.len(),
+        n_major = major_misses_sorted.len(),
+        n_minor = minor_misses_sorted.len(),
     );
 
     if let Some(parent) = report_path.parent() {

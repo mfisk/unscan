@@ -13,26 +13,8 @@ ulimit -S -v unlimited 2>/dev/null || true
 ulimit -H -d unlimited 2>/dev/null || true
 ABS_INPUT="$(realpath -m "$INPUT" 2>/dev/null || echo "$INPUT")"
 if [[ "$ABS_INPUT" != file://* && "$ABS_INPUT" != http://* && "$ABS_INPUT" != https://* ]]; then INPUT_URL="file://$ABS_INPUT"; else INPUT_URL="$ABS_INPUT"; fi
-# Chrome-only, 30s virtual-time-budget version which reliably completes <1m for 75M HTML
-# Use old headless mode which succeeded for 58M PDF, not headless=new
-# Low-memory flags added to survive 7.8GB no-swap VM with 80M HTML (492 pages, many base64 PNGs)
-# Unlimited VSZ required — previous 6GB clamp killed chrome renderer (1.4TB VSZ ghost)
-"$CHROME" --headless --disable-gpu --no-sandbox \
-    --disable-dev-shm-usage \
-    --disable-software-rasterizer \
-    --disable-extensions \
-    --disable-background-networking \
-    --disable-sync \
-    --metrics-recording-only \
-    --mute-audio \
-    --no-first-run \
-    --safebrowsing-disable-auto-update \
-    --disable-dev-tools \
-    --js-flags="--max-old-space-size=3072" \
-    --virtual-time-budget=30000 \
-    --user-data-dir="$USER_DATA_DIR" \
-    --print-to-pdf="$OUTPUT" \
-    --print-to-pdf-no-header \
-    --run-all-compositor-stages-before-draw \
-    "$INPUT_URL"
+# Working minimal flag set – verified 58M 470p success 2026-08-02 11:16 EDT:
+# old headless, no virtual-time-budget, no run-all-compositor-stages-before-draw, no headless=new
+# Monitor: ~2.9GB RSS then finish, Skia/PDF m146, HeadlessChrome/146.0.0.0
+"$CHROME" --headless --disable-gpu --no-sandbox --disable-dev-shm-usage --print-to-pdf="$OUTPUT" --print-to-pdf-no-header "$INPUT_URL"
 RET=$?; rm -rf "$USER_DATA_DIR" 2>/dev/null || true; [ $RET -eq 0 ] || exit $RET; echo "$OUTPUT"
