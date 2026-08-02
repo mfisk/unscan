@@ -2034,6 +2034,47 @@ dependencies = [
 ]
 
 [[package]]
+name = "unprint-classify"
+version = "0.1.0"
+dependencies = [
+ "image",
+ "rayon",
+ "serde",
+ "unprint-fonts",
+ "unprint-geometry",
+]
+
+[[package]]
+name = "unprint-cli"
+version = "0.1.0"
+dependencies = [
+ "base64",
+ "clap",
+ "flate2",
+ "font-types 0.2.0",
+ "image",
+ "libm",
+ "lopdf",
+ "memmap2",
+ "pprof",
+ "rand 0.8.6",
+ "rayon",
+ "read-fonts 0.1.4",
+ "rustc-hash",
+ "serde",
+ "serde_json",
+ "subsetter",
+ "tempfile",
+ "thiserror 2.0.18",
+ "unprint",
+ "unprint-fonts",
+ "unprint-geometry",
+ "unprint-report",
+ "walkdir",
+ "write-fonts 0.3.6",
+]
+
+[[package]]
 name = "unprint-fonts"
 version = "0.1.0"
 dependencies = [
@@ -2054,6 +2095,30 @@ dependencies = [
  "image",
  "libm",
  "serde",
+]
+
+[[package]]
+name = "unprint-ocr"
+version = "0.1.0"
+dependencies = [
+ "image",
+ "serde",
+ "serde_json",
+ "tempfile",
+ "thiserror 2.0.18",
+ "unprint-geometry",
+]
+
+[[package]]
+name = "unprint-report"
+version = "0.1.0"
+dependencies = [
+ "base64",
+ "image",
+ "serde",
+ "serde_json",
+ "unprint",
+ "unprint-fonts",
 ]
 
 [[package]]

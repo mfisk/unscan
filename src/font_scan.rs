@@ -949,13 +949,13 @@ pub fn scan_fonts(dirs: &[PathBuf], quiet: bool) -> Vec<FontEntry> {
 // Alias table
 // ---------------------------------------------------------------------------
 
-pub(crate) struct Alias {
+pub struct Alias {
     family: &'static str,
     bold: bool,
     italic: bool,
 }
 
-pub(crate) fn build_alias_table() -> HashMap<String, Alias> {
+pub fn build_alias_table() -> HashMap<String, Alias> {
     let mut m = HashMap::new();
 
     macro_rules! a {
@@ -1648,7 +1648,7 @@ pub fn read_font_identity(path: &Path) -> Option<FontIdentity> {
     Some(FontIdentity { family, _weight: weight, italic })
 }
 
-pub(crate) fn load_font_entry(path: &Path, aliases: &HashMap<String, Alias>) -> Option<FontEntry> {
+pub fn load_font_entry(path: &Path, aliases: &HashMap<String, Alias>) -> Option<FontEntry> {
     let data = std::fs::read(path).ok()?;
 
     // Verify ab_glyph can parse it (reject corrupt files)
@@ -1721,7 +1721,7 @@ pub(crate) fn load_font_entry(path: &Path, aliases: &HashMap<String, Alias>) -> 
 /// Scan fonts in given dirs without touching the global scan cache.
 /// Used for vintage cache dir to avoid invalidating font_scan.bin.
 /// Walks dirs, calls load_font_entry for each .ttf/.otf, no dedup (caller may dedup).
-pub(crate) fn scan_fonts_uncached(dirs: &[PathBuf]) -> Vec<FontEntry> {
+pub fn scan_fonts_uncached(dirs: &[PathBuf]) -> Vec<FontEntry> {
     let aliases = build_alias_table();
     let mut fonts = Vec::new();
     for dir in dirs {

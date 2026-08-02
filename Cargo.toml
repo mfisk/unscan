@@ -1,5 +1,5 @@
 [workspace]
-members = ["crates/unprint-fonts"]
+members = ["crates/unprint-fonts", "crates/unprint-geometry", "crates/unprint-classify", "crates/unprint-ocr", "crates/unprint-report", "crates/unprint-cli"]
 resolver = "2"
 
 [package]
@@ -8,10 +8,7 @@ version = "0.2.0"
 edition = "2021"
 description = "Replace raster/scanned text with native vector text — zero information loss, maximum vectorization"
 license = "MIT"
-
-[[bin]]
-name = "unprint"
-path = "src/main.rs"
+autobins = false
 
 [[bin]]
 name = "gen_training_data"

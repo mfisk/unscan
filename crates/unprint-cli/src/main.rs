@@ -1,48 +1,48 @@
-mod audit;
-mod cache;
-mod classifier;
-mod cli;
-mod color;
-mod deskew;
-mod error;
-mod font_cache;
-mod font_history;
-mod font_match;
-mod font_scan;
-mod geometry;
-pub mod features;
-pub mod glyph_map;
-pub mod hog;
-pub mod char_render;
-pub mod train;
-pub mod layout;
-mod compare;
-pub mod seg_diag;
-pub mod compare_rasters;
-mod ocr;
-mod page_cache;
-mod pdf_out;
-mod segment;
-mod smooth;
-pub(crate) mod verify;
-pub mod ground_truth;
-mod font_pipeline;
-mod vintage_cache;
-mod zncc_classifier;
 #[allow(dead_code)]
-mod ngram;
-mod atomic_file;
-mod geo_cache;
-mod geometry_classifier;
-mod geometry_scale;
-mod per_char_cache;
 
 use unprint_report as report;
+use unprint::audit;
+use unprint::cache;
+use unprint::classifier;
+use unprint::cli;
+use unprint::color;
+use unprint::deskew;
+use unprint::error;
+use unprint::font_cache;
+use unprint::font_history;
+use unprint::font_match;
+use unprint::font_scan;
+use unprint::geometry;
+use unprint::features;
+use unprint::glyph_map;
+use unprint::hog;
+use unprint::char_render;
+use unprint::train;
+use unprint::layout;
+use unprint::compare;
+use unprint::seg_diag;
+use unprint::compare_rasters;
+use unprint::ocr;
+use unprint::page_cache;
+use unprint::pdf_out;
+use unprint::segment;
+use unprint::smooth;
+use unprint::verify;
+use unprint::ground_truth;
+use unprint::font_pipeline;
+use unprint::vintage_cache;
+use unprint::zncc_classifier;
+use unprint::ngram;
+use unprint::atomic_file;
+use unprint::geo_cache;
+use unprint::geometry_classifier;
+use unprint::geometry_scale;
+use unprint::per_char_cache;
 
-use crate::font_pipeline::ObsRankProbs;
-use crate::audit::{AuditEntry, AuditLog, BBox, GeometryEntry, PageSummary};
+use unprint::font_pipeline::ObsRankProbs;
+use unprint::audit::{AuditEntry, AuditLog, BBox, GeometryEntry, PageSummary};
 
-use crate::error::ScanTextError;
+use unprint::error::ScanTextError;
 use rayon::prelude::*;
 
 /// Minimum SSIM score for SSIM verification to consider a font match acceptable.
@@ -63,16 +63,16 @@ fn main() {
     }
 
     // Initialize cache directory and font allowlist from CLI/env
-    crate::cache::init_cache_dir(args.cache_dir.as_deref());
-    crate::cache::init_allowlist(args.font_allowlist.as_deref());
+    unprint::cache::init_cache_dir(args.cache_dir.as_deref());
+    unprint::cache::init_allowlist(args.font_allowlist.as_deref());
 
     // Warn if allowlist used with default cache (safe but slower than alt cache)
     if let Some(ref allowlist_str) = args.font_allowlist {
-        if crate::cache::is_default_cache_dir() {
+        if unprint::cache::is_default_cache_dir() {
             eprintln!("Note: --font-allowlist used with default cache dir; filtering at matching time only (main cache untouched). For faster iteration, use --cache-dir /tmp/unprint-6fonts with --font-allowlist.");
         } else {
             let count = allowlist_str.split(',').filter(|s| !s.trim().is_empty()).count();
-            eprintln!("Using alternate cache dir {:?} with font allowlist ({} entries)", crate::cache::cache_dir(), count);
+            eprintln!("Using alternate cache dir {:?} with font allowlist ({} entries)", unprint::cache::cache_dir(), count);
         }
     }
 
@@ -456,7 +456,7 @@ fn run(args: &cli::Args, classifier: &mut dyn classifier::Classifier) -> Result<
         // Cache known non-Latin keys to avoid re-reading 238 font files every run (was 3s).
         let t_nonlatin = std::time::Instant::now();
         {
-            let cache_path = crate::cache::cache_dir().join("non-latin-cache.json");
+            let cache_path = unprint::cache::cache_dir().join("non-latin-cache.json");
             let mut known_non_latin: std::collections::HashSet<String> = if let Ok(data) = std::fs::read_to_string(&cache_path) {
                 serde_json::from_str(&data).unwrap_or_default()
             } else {
@@ -642,7 +642,7 @@ fn run(args: &cli::Args, classifier: &mut dyn classifier::Classifier) -> Result<
 
     // ── 1c''. Geometry cache for GPOS kerning + ligature-aware positioning ──
     let t_geo = std::time::Instant::now();
-    let geo_cache = crate::geo_cache::GeometryCache::load_or_build(&font_registry, &font_cache, args.quiet);
+    let geo_cache = unprint::geo_cache::GeometryCache::load_or_build(&font_registry, &font_cache, args.quiet);
     if !args.quiet { eprintln!("[timing] geo_cache load_or_build {:.2}s (total {:.2}s)", t_geo.elapsed().as_secs_f64(), run_start.elapsed().as_secs_f64()); }
 
     // ── 2. Load input pages (with raster cache) ──────────────────────
@@ -1245,5 +1245,4 @@ fn run(args: &cli::Args, classifier: &mut dyn classifier::Classifier) -> Result<
 // ---------------------------------------------------------------------------
 // Raster fragment extraction (lossless)
 // ---------------------------------------------------------------------------
-
 

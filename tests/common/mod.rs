@@ -25,8 +25,27 @@ pub fn ensure_index() {
 // ── Binary & path helpers ────────────────────────────────────────────
 
 /// Locate the built `unscan` binary (release or debug).
+/// Supports new workspace layout where bin lives in `unprint-cli` crate.
 pub fn unscan_bin() -> PathBuf {
-    PathBuf::from(env!("CARGO_BIN_EXE_unprint"))
+    if let Some(p) = option_env!("CARGO_BIN_EXE_unprint") {
+        return PathBuf::from(p);
+    }
+    // fallback: workspace target layout after crate split (unprint-cli -> bin unprint)
+    let manifest = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
+    let candidates = [
+        manifest.join("../target/debug/unprint"),
+        manifest.join("../target/release/unprint"),
+        manifest.join("../../target/debug/unprint"),
+        PathBuf::from("/home/hatch/workspace/repos/unscan/target/debug/unprint"),
+        PathBuf::from("/home/hatch/workspace/repos/unscan/target/release/unprint"),
+    ];
+    for c in &candidates {
+        if c.exists() {
+            return c.clone();
+        }
+    }
+    // last resort - will error clearly if not built
+    manifest.join("../target/debug/unprint")
 }
 
 /// Path into the test-docs directory.

@@ -1006,17 +1006,20 @@ impl GroundTruth {
     /// Find the best-overlapping VectorSpan for a given audit bbox.
     fn lookup_span(&self, page: usize, bbox_px: &[f32; 4], dpi: u32) -> Option<&VectorSpan> {
         let scale = dpi as f32 / 72.0;
-        // Convert pixel bbox to PDF points.
+        // Convert pixel bbox to PDF points (display coords, top-left origin).
         let px0 = bbox_px[0] / scale;
         let py0 = bbox_px[1] / scale;
         let px1 = bbox_px[2] / scale;
         let py1 = bbox_px[3] / scale;
+        let px_cx = (px0 + px1) * 0.5;
 
         let spans = self.pages.get(&page)?;
 
         let mut best_span: Option<&VectorSpan> = None;
         let mut best_area: f32 = 0.0;
+        let mut best_dx: f32 = f32::MAX;
 
+        // Primary: max area overlap, tie-break by smallest x-center distance (2-col disambiguation)
         for span in spans {
             let [sx0, sy0, sx1, sy1] = span.bbox;
             let ox0 = sx0.max(px0);
@@ -1025,15 +1028,43 @@ impl GroundTruth {
             let oy1 = sy1.min(py1);
             if ox0 < ox1 && oy0 < oy1 {
                 let area = (ox1 - ox0) * (oy1 - oy0);
-                if area > best_area {
+                let sx_cx = (sx0 + sx1) * 0.5;
+                let dx = (sx_cx - px_cx).abs();
+                // epsilon for float tie
+                const EPS: f32 = 1e-3;
+                if area > best_area + EPS || ( (area - best_area).abs() <= EPS && dx < best_dx ) {
                     best_area = area;
+                    best_dx = dx;
                     best_span = Some(span);
                 }
             }
         }
 
-        best_span
+        if best_span.is_some() {
+            return best_span;
+        }
+
+        // Fallback: no area overlap (covers weak width estimates / vectorized entries).
+        // Find any span with y-overlap and pick smallest dx.
+        let mut fallback_span: Option<&VectorSpan> = None;
+        let mut fallback_dx: f32 = f32::MAX;
+        for span in spans {
+            let [sx0, sy0, sx1, sy1] = span.bbox;
+            let oy0 = sy0.max(py0);
+            let oy1 = sy1.min(py1);
+            if oy0 < oy1 {
+                let sx_cx = (sx0 + sx1) * 0.5;
+                let dx = (sx_cx - px_cx).abs();
+                if dx < fallback_dx {
+                    fallback_dx = dx;
+                    fallback_span = Some(span);
+                }
+            }
+        }
+
+        fallback_span
     }
+
 
     /// Look up the ground-truth font name and effective font size (in PDF
     /// points) for a given audit bbox (in pixels at the given DPI).

@@ -35,3 +35,9 @@ pub mod ground_truth;
 pub mod vintage_cache;
 pub mod font_history;
 pub mod per_char_cache;
+
+pub mod cli;
+pub mod deskew;
+pub mod compare;
+pub mod page_cache;
+pub mod font_pipeline;
