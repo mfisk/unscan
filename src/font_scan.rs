@@ -107,7 +107,7 @@ impl FontEntry {
         postscript_name: &str,
         variant_tag: &str,
         vintage_era: Option<&str>,
-        has_var_default: bool,
+        has_var: bool,
     ) -> String {
         let mut k = if variant_tag.is_empty() {
             postscript_name.to_owned()
@@ -118,7 +118,7 @@ impl FontEntry {
             k.push_str("|vintage=");
             k.push_str(era);
         }
-        if has_var_default {
+        if has_var {
             k.push_str("|var");
         }
         k
@@ -145,12 +145,12 @@ impl FontEntry {
 
     /// Recompute cache after mutating vintage_era or variant fields (used for vintage generation).
     pub fn recompute_font_key_cache(&mut self) {
-        let has_var_default = self.variations.is_some() && self.variant_tag.is_empty();
+        let has_var = self.variations.is_some();
         self.font_key_cache = Self::compute_font_key_full(
             &self.postscript_name,
             &self.variant_tag,
             self.vintage_era.as_deref(),
-            has_var_default,
+            has_var,
         );
     }
 }
@@ -362,7 +362,7 @@ pub fn default_font_dirs(extra: &[PathBuf]) -> Vec<PathBuf> {
 //     typographic_family_len: u32 le + [u8; typographic_family_len]
 
 const FSCN_MAGIC: &[u8; 4] = b"FSCN";
-const FSCN_VERSION: u32 = 3;
+const FSCN_VERSION: u32 = 4;
 
 pub(crate) fn scan_cache_path() -> PathBuf {
     crate::cache::paths::font_scan_bin()
@@ -857,6 +857,7 @@ pub fn scan_fonts(dirs: &[PathBuf], quiet: bool) -> Vec<FontEntry> {
                 // each named-instance weight so the font matcher indexes bold/light/
                 // etc. renderings from the same file.
                 let weight_instances = detect_weight_instances(path, fe.class);
+                let is_variable = !weight_instances.is_empty();
                 for wi in &weight_instances {
                     let var_ps = make_weight_explicit(&fe.raw_postscript_name, wi.os2_weight);
                     let var_tag = format!("wght{}", wi.os2_weight);
@@ -871,7 +872,15 @@ pub fn scan_fonts(dirs: &[PathBuf], quiet: bool) -> Vec<FontEntry> {
                         data: Vec::new(),
                         oldstyle_figures: fe.oldstyle_figures,
                         variant_tag: var_tag.clone(),
-                        font_key_cache: FontEntry::compute_font_key(&var_ps, &var_tag),
+                        // Include |var so static "SourceSerif4-400Italic" and
+                        // variable "SourceSerif4-400Italic|wght400|var" remain
+                        // distinct after normalization.
+                        font_key_cache: FontEntry::compute_font_key_full(
+                            &var_ps,
+                            &var_tag,
+                            None,
+                            true,
+                        ),
                         glyph_overrides: None,
                         variations: Some(wi.axes.clone()),
                         typographic_family: fe.typographic_family.clone(),
@@ -882,6 +891,21 @@ pub fn scan_fonts(dirs: &[PathBuf], quiet: bool) -> Vec<FontEntry> {
                         var_fe.glyph_overrides = Some(ligatures.clone());
                     }
                     fonts.push(var_fe);
+                }
+
+                // If this file is variable, mark the base entry as variable
+                // too (variations Some) so its key becomes "...|var" and does
+                // not collide with the static counterpart after normalization.
+                if is_variable {
+                    // Use the first instance's axes as representative; base
+                    // entry's variations presence is what matters for key.
+                    fe.variations = Some(weight_instances[0].axes.clone());
+                    fe.font_key_cache = FontEntry::compute_font_key_full(
+                        &fe.postscript_name,
+                        &fe.variant_tag,
+                        fe.vintage_era.as_deref(),
+                        true,
+                    );
                 }
 
                 fonts.push(fe);
@@ -1474,52 +1498,147 @@ pub fn make_weight_explicit(ps_name: &str, weight: u16) -> String {
 
     let weight_str = weight.to_string();
 
-    // Strip any trailing weight-word suffix before appending the numeric
-    // weight.  This ensures two copies of the same font with different PS
-    // naming conventions (e.g. "IBMPlexSerif-Regular" vs "IBMPlexSerif")
-    // collapse to the same canonical name ("IBMPlexSerif-400").
-    // The OS/2 weight class is the authority; the word suffix is just a label.
-    let stem = strip_weight_suffix(ps_name);
+    // Detect italic from original PS name — we canonicalize all italic forms
+    // to a single suffix "Italic".  Covers:
+    //   "Italic", "Oblique", Adobe "It" suffix ("SourceSerif4-It",
+    //   "SourceSerif4-BlackIt"), and the double "Italic-Italic" artifact
+    //   from variable fonts (raw PS "SourceSerif4Italic-Italic").
+    let lower_orig = ps_name.to_lowercase();
+    let is_italic = lower_orig.contains("italic")
+        || lower_orig.contains("oblique")
+        || ps_name.ends_with("It")
+        || lower_orig.ends_with("-it");
 
-    // Separate italic suffix — insert weight number before it.
-    if let Some(idx) = stem.to_lowercase().find("italic") {
-        let prefix = stem[..idx].trim_end_matches('-');
-        let italic_part = &stem[idx..];
-        format!("{}-{}{}", prefix, weight_str, italic_part)
-    } else if stem.ends_with("It") {
-        let prefix = stem[..stem.len()-2].trim_end_matches('-');
-        format!("{}-{}It", prefix, weight_str)
+    // Strip italic markers iteratively from the end, collapsing
+    // "Italic-Italic" → "" in two passes and "It" → "" in one.
+    let mut base = ps_name.to_string();
+    loop {
+        let l = base.to_lowercase();
+        let mut changed = false;
+        // Longest italic tokens first
+        const ITALIC_SUFFIXES: &[&str] = &[
+            "-italic-italic",
+            "_italic_italic",
+            "-italic",
+            "_italic",
+            "italic",
+            "-oblique",
+            "_oblique",
+            "oblique",
+        ];
+        for &sfx in ITALIC_SUFFIXES {
+            if l.ends_with(sfx) {
+                base.truncate(base.len() - sfx.len());
+                changed = true;
+                break;
+            }
+        }
+        if changed {
+            continue;
+        }
+        // Adobe shorthand: trailing "It" (capital I) e.g. "SourceSerif4-It",
+        // "SourceSerif4-BlackIt".  Also handle lowercase "-it".
+        if base.ends_with("It") && base.len() > 2 {
+            // Avoid stripping "Git" or other accidental words: only strip if
+            // the name contains italic or the suffix was preceded by '-' or a
+            // weight word.  Since we already know is_italic may be true from
+            // the original, stripping "It" when present is safe for our font
+            // set; no family ends with literal "It" outside of italic.
+            base.truncate(base.len() - 2);
+            changed = true;
+        } else if base.to_lowercase().ends_with("-it") && base.len() >= 3 {
+            // e.g. variable file normalized to lowercase "-it"
+            base.truncate(base.len() - 3);
+            changed = true;
+        }
+        if !changed {
+            break;
+        }
+    }
+    base = base.trim_end_matches(|c| c == '-' || c == '_' ).to_string();
+
+    // Strip weight-word suffixes (now that italic markers are gone) to obtain
+    // the family core.  Handles both "-Bold" and "Bold" (no hyphen) forms so
+    // "SourceSerif4BoldIt" → "SourceSerif4" after the italic strip above.
+    let core = strip_weight_suffix(&base);
+    let core = core.trim_end_matches(|c| c == '-' || c == '_' ).to_string();
+
+    if is_italic {
+        // Canonical form: "{Family}-{weight}Italic" — no duplicate "Italic".
+        // This collapses both static "SourceSerif4-It" and variable
+        // "SourceSerif4Italic-Italic" to "SourceSerif4-400Italic".
+        if core.is_empty() {
+            format!("{}Italic", weight_str)
+        } else {
+            format!("{}-{}Italic", core, weight_str)
+        }
+    } else if core.is_empty() {
+        weight_str
     } else {
-        format!("{}-{}", stem, weight_str)
+        format!("{}-{}", core, weight_str)
     }
 }
 
-/// Strip a trailing weight-word suffix (e.g. "-Regular", "-Bold") from a
-/// PostScript name, returning the family stem.  The suffix must appear after
-/// a hyphen; bare names without a hyphen are returned unchanged.
-fn strip_weight_suffix(ps_name: &str) -> &str {
-    const WEIGHT_SUFFIXES: &[&str] = &[
-        "-Regular",
-        "-Roman",
-        "-Bold",
-        "-Light",
-        "-Medium",
-        "-Thin",
-        "-ExtraLight",
-        "-UltraLight",
-        "-SemiBold",
-        "-DemiBold",
-        "-ExtraBold",
-        "-UltraBold",
-        "-Heavy",
-        "-Black",
+/// Strip trailing weight-word suffixes from a PostScript name.
+///
+/// Handles hyphenated, underscored, and bare suffixes (e.g. "-Bold",
+/// "_Bold", "Bold") case-insensitively, longest-first so "ExtraLight" is
+/// removed before "Light".  Loops until no more weight words remain so
+/// "SourceSerif4-Bold-Italic" after italic stripping still collapses.
+///
+/// Returns an owned String — the family stem.
+fn strip_weight_suffix(ps_name: &str) -> String {
+    // Longest-first to avoid "Light" eating "ExtraLight"
+    const WEIGHT_WORDS: &[&str] = &[
+        "ExtraLight",
+        "UltraLight",
+        "ExtraBlack",
+        "ExtraBold",
+        "UltraBold",
+        "SemiBold",
+        "DemiBold",
+        "Regular",
+        "Roman",
+        "Medium",
+        "Black",
+        "Heavy",
+        "Bold",
+        "Light",
+        "Thin",
     ];
-    for suffix in WEIGHT_SUFFIXES {
-        if ps_name.ends_with(suffix) {
-            return &ps_name[..ps_name.len() - suffix.len()];
+    let mut s = ps_name.to_string();
+    loop {
+        let lower = s.to_lowercase();
+        let mut stripped = false;
+        for &w in WEIGHT_WORDS {
+            let wl = w.to_lowercase();
+            let hyphen = format!("-{}", wl);
+            let uscore = format!("_{}", wl);
+            if lower.ends_with(&hyphen) {
+                s.truncate(s.len() - hyphen.len());
+                stripped = true;
+                break;
+            }
+            if lower.ends_with(&uscore) {
+                s.truncate(s.len() - uscore.len());
+                stripped = true;
+                break;
+            }
+            if lower.ends_with(&wl) && s.len() > w.len() {
+                // Bare suffix like "SourceSerif4Bold" — strip only if something
+                // remains that looks like a family (at least 2 chars).
+                // This is safe for our corpus; no family name itself is a
+                // weight word.
+                s.truncate(s.len() - wl.len());
+                stripped = true;
+                break;
+            }
+        }
+        if !stripped {
+            break;
         }
     }
-    ps_name
+    s
 }
 
 // ---------------------------------------------------------------------------
@@ -1691,11 +1810,23 @@ pub fn load_font_entry(path: &Path, aliases: &HashMap<String, Alias>) -> Option<
         });
     }
 
-    // Fallback: derive from filename
+    // Fallback: derive from filename + OS/2 metadata.
+    // Use OS/2 weight/italic as authority — filename "It" suffix (Adobe
+    // italic shorthand) previously missed because we only checked for
+    // "italic"/"oblique"/"slant".
     let family_name = stem.replace('-', " ").replace('_', " ");
     let lower = family_name.to_lowercase();
-    let is_bold = lower.contains("bold") || lower.contains("black") || lower.contains("heavy");
-    let is_italic = lower.contains("italic") || lower.contains("oblique") || lower.contains("slant");
+    let is_bold = os2_weight >= 700
+        || lower.contains("bold")
+        || lower.contains("black")
+        || lower.contains("heavy");
+    let is_italic = meta.italic
+        || lower.contains("italic")
+        || lower.contains("oblique")
+        || lower.contains("slant")
+        || lower.ends_with("-it")
+        || lower.ends_with(" it")
+        || stem_lower.ends_with("it");
     let class = classify(&family_name);
 
     let font_key_cache = postscript_name.clone();
