@@ -622,7 +622,15 @@ fn read_scan_cache(path: &Path, quiet: bool) -> Option<Vec<FontEntry>> {
             data: Vec::new(),
             oldstyle_figures,
             variant_tag: variant_tag.clone(),
-            font_key_cache: FontEntry::compute_font_key(&postscript_name, &variant_tag),
+            font_key_cache: {
+                let has_var = variations.is_some();
+                FontEntry::compute_font_key_full(
+                    &postscript_name,
+                    &variant_tag,
+                    vintage_era.as_deref(),
+                    has_var,
+                )
+            },
             glyph_overrides,
             variations,
             typographic_family,
