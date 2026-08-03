@@ -66,7 +66,7 @@ pub struct PerCharGeo {
 // When expressed in em units, sigma_em = sigma_px / em_px, so sigma_em is a
 // function of how many pixels per em we sampled at. In pixel space sigma_px is
 // constant, which is why we compute h_ll/v_ll directly in pixels.
-use unprint_geometry::params::{quant_half_width_px, quantized_ll, SIGMA_CENTER_PX, SIGMA_PITCH_PX};
+use unprint_geometry::params::{quant_half_width_center_px, quant_half_width_pitch_px, quant_half_width_px, quantized_ll, SIGMA_CENTER_PX, SIGMA_PITCH_PX};
 
 /// Measure ink bounds for each character in a word.
 ///
@@ -120,12 +120,27 @@ pub fn measure_char_ink_bounds(
                 x_max: x0_rect as u32,
                 y_min: 0,
                 y_max: h,
+                frac_left: x0_rect as f64,
+                frac_right: x0_rect as f64,
             });
             continue;
         }
 
         let left_seam = seam_paths.get(&b_left);
         let right_seam = seam_paths.get(&b_right);
+
+        // Expanded bounds to include winding seam excursions (prevents 1-px gap like col63=142)
+        let x0_exp = left_seam
+            .map(|sp| sp.iter().map(|p| p[1] as usize).min().unwrap_or(b_left as usize).min(b_left as usize))
+            .unwrap_or(b_left as usize)
+            .min(w as usize);
+        let x1_exp = right_seam
+            .map(|sp| sp.iter().map(|p| p[1] as usize).max().unwrap_or(b_right as usize).max(b_right as usize))
+            .unwrap_or(b_right as usize)
+            .saturating_add(1)
+            .min(w as usize);
+        let x0_rect = x0_exp;
+        let x1_rect = x1_exp;
 
         // Find ink bounds within this character's seam-masked x-range
         let mut x_min = x1_rect;
@@ -135,20 +150,67 @@ pub fn measure_char_ink_bounds(
         let mut has_ink = false;
 
         for y in 0..h as usize {
-            // Determine per-row left/right limits from seams (same as crop_ngram)
+            // Determine per-row left/right limits – handles horizontal moves (multiple seam cols in one row)
+            // Ownership: darkest adjacent pixel (s_min-1 vs s_max+1) decides which char gets the whole seam run
             let mut left_limit = x0_rect;
             let mut right_limit = x1_rect;
 
             if let Some(sp) = left_seam {
-                if let Some(seam_x) = sp.iter().filter(|p| p[0] as usize == y).map(|p| p[1] as usize).min() {
-                    // left seam: ink must be >= seam_x
-                    left_limit = seam_x.max(x0_rect).min(x1_rect);
+                let cols: Vec<usize> = sp
+                    .iter()
+                    .filter(|p| p[0] as usize == y)
+                    .map(|p| p[1] as usize)
+                    .collect();
+                if !cols.is_empty() {
+                    let s_min = *cols.iter().min().unwrap();
+                    let s_max = *cols.iter().max().unwrap();
+                    let s_min_c = s_min.min(w as usize - 1);
+                    let s_max_c = s_max.min(w as usize - 1);
+                    let left_adj = if s_min_c > 0 {
+                        raw_word[y * w_us + (s_min_c - 1)]
+                    } else {
+                        255
+                    };
+                    let right_adj = if s_max_c + 1 < w_us {
+                        raw_word[y * w_us + (s_max_c + 1)]
+                    } else {
+                        255
+                    };
+                    let assign_to_left = left_adj <= right_adj; // darkest adjacent left → seam belongs to left char
+                    left_limit = if assign_to_left {
+                        (s_max_c + 1).max(x0_rect).min(x1_rect)
+                    } else {
+                        s_min_c.max(x0_rect).min(x1_rect)
+                    };
                 }
             }
             if let Some(sp) = right_seam {
-                if let Some(seam_x) = sp.iter().filter(|p| p[0] as usize == y).map(|p| p[1] as usize).max() {
-                    // right seam: ink must be < seam_x (crop_ngram whites out >= seam_x)
-                    right_limit = seam_x.min(x1_rect).max(left_limit);
+                let cols: Vec<usize> = sp
+                    .iter()
+                    .filter(|p| p[0] as usize == y)
+                    .map(|p| p[1] as usize)
+                    .collect();
+                if !cols.is_empty() {
+                    let s_min = *cols.iter().min().unwrap();
+                    let s_max = *cols.iter().max().unwrap();
+                    let s_min_c = s_min.min(w as usize - 1);
+                    let s_max_c = s_max.min(w as usize - 1);
+                    let left_adj = if s_min_c > 0 {
+                        raw_word[y * w_us + (s_min_c - 1)]
+                    } else {
+                        255
+                    };
+                    let right_adj = if s_max_c + 1 < w_us {
+                        raw_word[y * w_us + (s_max_c + 1)]
+                    } else {
+                        255
+                    };
+                    let assign_to_left = left_adj <= right_adj; // seam belongs to current (left side) if left adjacent darker
+                    right_limit = if assign_to_left {
+                        (s_max_c + 1).min(x1_rect).max(left_limit)
+                    } else {
+                        s_min_c.min(x1_rect).max(left_limit)
+                    };
                 }
             }
             // For uniform fallback (no seams) left_limit==x0_rect, right_limit==x1_rect
@@ -180,6 +242,8 @@ pub fn measure_char_ink_bounds(
                 x_max: x1_rect as u32,
                 y_min: 0,
                 y_max: h,
+                frac_left: x0_rect as f64,
+                frac_right: x1_rect as f64,
             }
         } else {
             let cx = (x_min + x_max) as f64 / 2.0;
@@ -193,6 +257,8 @@ pub fn measure_char_ink_bounds(
                 x_max: x_max as u32,
                 y_min: y_min as u32,
                 y_max: y_max as u32,
+                frac_left: x_min as f64,
+                frac_right: x_max as f64 + 1.0,
             }
         };
         result.push(cb);
@@ -296,7 +362,7 @@ fn per_char_geo_cached_with_threshold(
             let obs_cy_rel = obs_cy - obs_word_cy;
             let pred_cy_rel = pred_cy - pred_word_cy;
             let v_err = obs_cy_rel - pred_cy_rel;
-            let v_ll = quantized_ll(v_err, SIGMA_CENTER_PX, quant_half_width_px());
+            let v_ll = quantized_ll(v_err, SIGMA_CENTER_PX, quant_half_width_center_px());
 
             let (obs_pitch, pred_pitch, h_err, h_ll) = if orig_idx == 0 {
                 (None, None, None, 0.0)
@@ -306,7 +372,7 @@ fn per_char_geo_cached_with_threshold(
                 let obs_pitch_val = obs_cx - prev_cx;
                 let pred_pitch_val = pred_cx - ppcx;
                 let h_err_val = obs_pitch_val - pred_pitch_val;
-                let h_ll_val = quantized_ll(h_err_val, SIGMA_PITCH_PX, quant_half_width_px());
+                let h_ll_val = quantized_ll(h_err_val, SIGMA_PITCH_PX, quant_half_width_pitch_px());
                 (Some(obs_pitch_val), Some(pred_pitch_val), Some(h_err_val), h_ll_val)
             };
 
@@ -465,7 +531,7 @@ fn per_char_geo_shaped_with_threshold(
             let obs_cy_rel = obs_cy - obs_word_cy;
             let pred_cy_rel = pred_cy - pred_word_cy;
             let v_err = obs_cy_rel - pred_cy_rel;
-            let v_ll = quantized_ll(v_err, SIGMA_CENTER_PX, quant_half_width_px());
+            let v_ll = quantized_ll(v_err, SIGMA_CENTER_PX, quant_half_width_center_px());
 
             let (obs_pitch, pred_pitch, h_err, h_ll) = if orig_idx == 0 {
                 (None, None, None, 0.0)
@@ -475,7 +541,7 @@ fn per_char_geo_shaped_with_threshold(
                 let obs_pitch_val = obs_cx - prev.cx;
                 let pred_pitch_val = pred_cx - prev_pred_cx;
                 let h_err_val = obs_pitch_val - pred_pitch_val;
-                let h_ll_val = quantized_ll(h_err_val, SIGMA_PITCH_PX, quant_half_width_px());
+                let h_ll_val = quantized_ll(h_err_val, SIGMA_PITCH_PX, quant_half_width_pitch_px());
                 (Some(obs_pitch_val), Some(pred_pitch_val), Some(h_err_val), h_ll_val)
             };
 

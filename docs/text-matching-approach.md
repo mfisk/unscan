@@ -82,10 +82,12 @@ logit with `GEO_WEIGHT=1.0`:
 lp_i = logit_i + GEO_WEIGHT * geo_ll_i
 ```
 
+Full spec → [midpoint-geometry.md](midpoint-geometry.md) – measurement (weighted centroid `m=255-p`, `p<250`), seam mask left-exclusive/right-inclusive, `v_err`/`h_err`, `quantized_ll` with `0.75σ` inflection, gamma-corrected coverage proposal.
+
 If a font has no geometry data for a line, it is kept (cannot be pruned for
 geometry). Empty `geo_per_font` maps keep the candidate safe.
 
-**Midpoint pruning (pre-filter, ~85% reduction):** Before scoring, fonts are
+**Midpoint pruning (pre-filter, ~85% reduction):** See [midpoint-geometry.md](midpoint-geometry.md) for full geometry matching math. Before scoring, fonts are
 pruned by worst-case geometry:
 
 ```

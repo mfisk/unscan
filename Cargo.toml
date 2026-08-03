@@ -2,6 +2,33 @@
 members = ["crates/unprint-fonts", "crates/unprint-geometry", "crates/unprint-classify", "crates/unprint-ocr", "crates/unprint-report", "crates/unprint-cli"]
 resolver = "2"
 
+[workspace.dependencies]
+ab_glyph = "0.2"
+base64 = "0.22.1"
+bitflags = "2"
+clap = { version = "4", features = ["derive", "env"] }
+flate2 = "1.1"
+font-types = "0.2"
+freetype-rs = "0.38"
+image = "0.25.8"
+libm = "0.2"
+lopdf = "0.34"
+memmap2 = "0.9"
+pprof = { version = "0.14", features = ["flamegraph"] }
+rand = { version = "0.8", features = ["small_rng"] }
+rayon = "1.10"
+read-fonts = { version = "0.1", features = ["std"] }
+rustc-hash = "2"
+rustybuzz = "0.18"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+subsetter = "0.2"
+tempfile = "3"
+thiserror = "2"
+ttf-parser = { version = "0.24", features = ["opentype-layout", "variable-fonts"] }
+walkdir = "2"
+write-fonts = "0.3"
+
 [package]
 name = "unprint"
 version = "0.2.0"
@@ -15,27 +42,31 @@ name = "gen_training_data"
 path = "src/bin/gen_training_data.rs"
 
 [dependencies]
-clap = { version = "4", features = ["derive", "env"] }
-image = "0.25"
+clap = { workspace = true }
+image = { workspace = true }
 unprint-fonts = { path = "crates/unprint-fonts" }
 unprint-geometry = { path = "crates/unprint-geometry" }
-lopdf = "0.34"
-walkdir = "2"
-rayon = "1.10"
-thiserror = "2"
-tempfile = "3"
-serde = { version = "1", features = ["derive", "rc"] }
-serde_json = "1"
-subsetter = "0.2"
-base64 = "0.22.1"
-libm = "0.2"
-rustc-hash = "2"
+lopdf = { workspace = true }
+walkdir = { workspace = true }
+rayon = { workspace = true }
+thiserror = { workspace = true }
+tempfile = { workspace = true }
+serde = { workspace = true, features = ["rc"] }
+serde_json = { workspace = true }
+subsetter = { workspace = true }
+base64 = { workspace = true }
+libm = { workspace = true }
+rustc-hash = { workspace = true }
+rand = { workspace = true }
+write-fonts = { workspace = true }
+read-fonts = { workspace = true }
+font-types = { workspace = true }
+flate2 = { workspace = true }
+memmap2 = { workspace = true }
+pprof = { workspace = true, optional = true }
 
-rand = { version = "0.8", features = ["small_rng"] }
-write-fonts = "0.3"
-read-fonts = { version = "0.1", features = ["std"] }
-font-types = "0.2"
-flate2 = "1.1"
+[features]
+profile = ["pprof"]
 
 # dev is left on cargo defaults (opt-level=0, debug=true, incremental) - fastest iteration with debuginfo
 # fastbuild is explicit fastest compile, no debuginfo, lowest RAM
@@ -53,17 +84,6 @@ lto = "thin"
 codegen-units = 2
 panic = "abort"
 strip = "debuginfo"
-
-[dependencies.memmap2]
-version = "0.9"
-
-[dependencies.pprof]
-version = "0.14"
-features = ["flamegraph"]
-optional = true
-
-[features]
-profile = ["pprof"]
 
 # portable = release build but without target-cpu=native — for distribution
 [profile.portable]

@@ -731,6 +731,8 @@ pub fn build_scoring_windows_with_geo<'a>(
                     x_max,
                     y_min,
                     y_max,
+                    frac_left: x_min as f64,
+                    frac_right: x_max as f64 + 1.0,
                 };
                 char_bounds.push(cb.clone());
 
@@ -762,6 +764,8 @@ pub fn build_scoring_windows_with_geo<'a>(
                     x_max: b_r,
                     y_min: 0,
                     y_max: seg.word_img.height(),
+                    frac_left: b_l as f64,
+                    frac_right: b_r as f64,
                 };
                 char_bounds.push(cb);
             }

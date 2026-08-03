@@ -1653,18 +1653,54 @@ pub fn crop_ngram(
         let stride = cw_us;
         for y in 0..ch_us {
             let base = y * stride;
-            // Clamped, ordered limits - mirrors measure_char_ink_bounds pre-1cfca57
+            // Per-row limits – handles 1-3 px horizontal moves, darkest-adjacent ownership
             let mut left_limit = x0;
             let mut right_limit = x1;
             if let Some(sp) = left_seam {
-                if let Some(seam_x) = sp.iter().filter(|p| p[0] == y as u32).map(|p| p[1]).min() {
-                    left_limit = seam_x.max(x0).min(x1);
+                let cols: Vec<u32> = sp.iter().filter(|p| p[0] == y as u32).map(|p| p[1]).collect();
+                if !cols.is_empty() {
+                    let s_min = *cols.iter().min().unwrap();
+                    let s_max = *cols.iter().max().unwrap();
+                    let left_adj = if s_min > 0 {
+                        word_img.get_pixel(s_min - 1, y as u32).0[0]
+                    } else {
+                        255
+                    };
+                    let right_adj = if s_max + 1 < ww {
+                        word_img.get_pixel(s_max + 1, y as u32).0[0]
+                    } else {
+                        255
+                    };
+                    let assign_to_left = left_adj <= right_adj;
+                    left_limit = if assign_to_left {
+                        (s_max + 1).max(x0).min(x1)
+                    } else {
+                        s_min.max(x0).min(x1)
+                    };
                 }
             }
             if let Some(sp) = right_seam {
-                if let Some(seam_x) = sp.iter().filter(|p| p[0] == y as u32).map(|p| p[1]).max() {
-                    let r = seam_x.max(x0).min(x1);
-                    right_limit = r.max(left_limit);
+                let cols: Vec<u32> = sp.iter().filter(|p| p[0] == y as u32).map(|p| p[1]).collect();
+                if !cols.is_empty() {
+                    let s_min = *cols.iter().min().unwrap();
+                    let s_max = *cols.iter().max().unwrap();
+                    let left_adj = if s_min > 0 {
+                        word_img.get_pixel(s_min - 1, y as u32).0[0]
+                    } else {
+                        255
+                    };
+                    let right_adj = if s_max + 1 < ww {
+                        word_img.get_pixel(s_max + 1, y as u32).0[0]
+                    } else {
+                        255
+                    };
+                    let assign_to_left = left_adj <= right_adj;
+                    let r = if assign_to_left {
+                        s_max + 1
+                    } else {
+                        s_min
+                    };
+                    right_limit = r.max(x0).min(x1).max(left_limit);
                 }
             }
             if left_limit >= x1 || right_limit <= x0 {
@@ -1736,21 +1772,51 @@ pub fn char_crop_and_metrics(
         let stride = cw_us;
         for y in 0..ch_us {
             let base = y * stride;
-            // Determine per-row clamped limits from seams (mirrors measure_char_ink_bounds)
+            // Per-row limits – handles 1-3 px horizontal moves, darkest-adjacent ownership (mirrors measure_char_ink_bounds)
             let mut left_limit = x0;
             let mut right_limit = x1;
 
             if let Some(sp) = left_seam {
-                if let Some(seam_x) = sp.iter().filter(|p| p[0] == y as u32).map(|p| p[1]).min() {
-                    // clamp seam to [x0, x1] and require ink >= seam
-                    left_limit = seam_x.max(x0).min(x1);
+                let cols: Vec<u32> = sp.iter().filter(|p| p[0] == y as u32).map(|p| p[1]).collect();
+                if !cols.is_empty() {
+                    let s_min = *cols.iter().min().unwrap();
+                    let s_max = *cols.iter().max().unwrap();
+                    let left_adj = if s_min > 0 {
+                        word_img.get_pixel(s_min - 1, y as u32).0[0]
+                    } else {
+                        255
+                    };
+                    let right_adj = if s_max + 1 < ww {
+                        word_img.get_pixel(s_max + 1, y as u32).0[0]
+                    } else {
+                        255
+                    };
+                    let assign_to_left = left_adj <= right_adj;
+                    left_limit = if assign_to_left {
+                        (s_max + 1).max(x0).min(x1)
+                    } else {
+                        s_min.max(x0).min(x1)
+                    };
                 }
             }
             if let Some(sp) = right_seam {
-                if let Some(seam_x) = sp.iter().filter(|p| p[0] == y as u32).map(|p| p[1]).max() {
-                    // clamp and ensure ordering: right >= left
-                    let r = seam_x.max(x0).min(x1);
-                    right_limit = r.max(left_limit);
+                let cols: Vec<u32> = sp.iter().filter(|p| p[0] == y as u32).map(|p| p[1]).collect();
+                if !cols.is_empty() {
+                    let s_min = *cols.iter().min().unwrap();
+                    let s_max = *cols.iter().max().unwrap();
+                    let left_adj = if s_min > 0 {
+                        word_img.get_pixel(s_min - 1, y as u32).0[0]
+                    } else {
+                        255
+                    };
+                    let right_adj = if s_max + 1 < ww {
+                        word_img.get_pixel(s_max + 1, y as u32).0[0]
+                    } else {
+                        255
+                    };
+                    let assign_to_left = left_adj <= right_adj;
+                    let r = if assign_to_left { s_max + 1 } else { s_min };
+                    right_limit = r.max(x0).min(x1).max(left_limit);
                 }
             }
             // right_limit is at least left_limit by construction

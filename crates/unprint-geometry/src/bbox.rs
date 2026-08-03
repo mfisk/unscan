@@ -31,6 +31,29 @@ pub struct CharInkBounds {
     pub x_max: u32,
     pub y_min: u32,
     pub y_max: u32,
+    /// Fractional left edge: x_min + (1 - c_left) where c_left = coverage(darkest in left column)
+    /// If fractional mode disabled, equals x_min as f64.
+    pub frac_left: f64,
+    /// Fractional right edge: x_max + c_right = (x_max+1) - (1 - c_right)
+    /// If fractional mode disabled, equals (x_max+1) as f64.
+    pub frac_right: f64,
+}
+
+impl Default for CharInkBounds {
+    fn default() -> Self {
+        Self {
+            cx: 0.0,
+            cy: 0.0,
+            width: 0.0,
+            height: 0.0,
+            x_min: 0,
+            x_max: 0,
+            y_min: 0,
+            y_max: 0,
+            frac_left: 0.0,
+            frac_right: 0.0,
+        }
+    }
 }
 
 /// Batch result: one entry per char in a word.

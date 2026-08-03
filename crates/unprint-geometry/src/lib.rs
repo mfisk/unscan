@@ -5,7 +5,7 @@ pub mod detect;
 pub mod word;
 pub mod params;
 
-pub use params::{SIGMA_CENTER_PX, SIGMA_PITCH_PX, quant_half_width_px, quantized_ll, audit_all_chars_enabled};
+pub use params::{quant_half_width_center_px, quant_half_width_pitch_px, quant_half_width_px, SIGMA_CENTER_PX, SIGMA_PITCH_PX, quantized_ll, audit_all_chars_enabled, FLAT_CENTER_THEORETICAL, FLAT_PITCH_THEORETICAL};
 
 pub use text::{TextRegion, TextLine, RawWordBBox};
 pub use bbox::{Bbox, GlyphBBox, CharInkBounds, WordGeoMeasurement, center_span_scale, batch_center_span_scales, glyph_bboxes_batch_pure};

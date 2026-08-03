@@ -7,6 +7,6 @@ description = "Font matching / classification — glyph bboxes, kerning table, s
 [dependencies]
 unprint-geometry = { path = "../unprint-geometry" }
 unprint-fonts = { path = "../unprint-fonts" }
-image = "0.25"
-serde = { version = "1", features = ["derive"] }
-rayon = "1.10"
+image = { workspace = true }
+serde = { workspace = true }
+rayon = { workspace = true }

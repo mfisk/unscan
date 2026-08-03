@@ -177,7 +177,7 @@ From the midpoint column:
 
 Result: a `Vec<[u32; 2]>` of length H — one `[row, col]` per row.
 
-### Diagonal Masking
+### Diagonal Masking and Seam Ownership
 
 When a seam splits a segment, child segments inherit the seam path as a
 diagonal boundary. In the child's DP, pixels on the wrong side of the
@@ -190,6 +190,54 @@ Each child inherits up to two boundaries via `SegBounds`:
   (plus any inherited left boundary from the parent).
 - The **right child** gets the accepted seam as its left boundary
   (plus any inherited right boundary from the parent).
+
+#### Horizontal Moves – 1 to 3 Pixels Per Row
+
+Since commit `542618e` the DP allows up to two horizontal steps per
+vertical move. A seam path entry is `Vec<[row,col]>` and a single row
+can contain 1, 2, or 3 columns when the seam moves horizontally:
+
+```
+(row, c) -> (row, c+1) -> (row, c+1)   // single horizontal + diagonal
+(row, c) -> (row, c+1) -> (row, c+2) -> (row+1, c+2) // double horizontal
+```
+
+`seam_viz.py` expands these pass-through pixels so the audit shows exactly
+what the DP cut. All per-row limits must consider the full run, not just
+`min` or `max`.
+
+#### Darkest-Adjacent Ownership
+
+The column(s) that the seam occupies in a given row contain ink that must
+belong to one side. The rule is:
+
+*For boundary `b` at row `y` with seam run `[s_min … s_max]` (1-3 px):*
+```
+left_adj  = image[y, s_min-1] (255 if out of bounds)
+right_adj = image[y, s_max+1] (255 if out of bounds)
+assign_to_left = left_adj <= right_adj   // darker = smaller value
+```
+
+If `assign_to_left` is true the whole run belongs to the character on the
+left; otherwise it belongs to the character on the right.
+
+For the current character `i` with `b_left` and `b_right`:
+- left boundary: if run assigned to left (previous char) → `left_limit = s_max+1`,
+  else `left_limit = s_min` (run belongs to current)
+- right boundary: if run assigned to left (current) → `right_limit = s_max+1`
+  (current keeps run), else `right_limit = s_min` (run goes to next char)
+
+This fixes the gap bug seen in `p1_L015 dogs.` where `seam['63'] = 64`
+for rows 0-15 and `col63=142` was excluded from both `g` (`42-63`) and `s`
+(`63-78`) because `g.right = min(64,63)=63` and `s.left = max(64,63)=64`.
+With expanded bounds `x0 = min(seam,b_left)`, `x1 = max(seam,b_right)+1`
+and darkest-adjacent ownership, `col63` is kept in whichever glyph has the
+darker stroke next to the seam, never dropped.
+
+The same logic is mirrored in three places to stay in lockstep:
+`src/geometry_classifier.rs::measure_char_ink_bounds`,
+`crates/unprint-geometry/src/char_bounds.rs::measure_char_ink_bounds`,
+and `src/segment.rs::crop_ngram` / `char_crop_and_metrics`.
 
 ### Greedy Loop
 
