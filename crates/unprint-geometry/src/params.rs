@@ -1,22 +1,27 @@
 //! Common tiny params that everything depends on.
-//! Centralizes flat-top quantized likelihood constants and env flags
-//! to avoid duplication across crates/unprint-core, src/, and
-//! unprint-geometry itself. No heavy deps.
 
 use std::sync::OnceLock;
 
 // First-principles expected error from uniform quantization:
-// Var[uniform -0.5..0.5] = 1/12  => sigma = 1/sqrt(12) ≈ 0.2887
-// Pitch variance doubles => 1/6 => 1/sqrt(6) ≈ 0.4082
-// Tuned values from sweep win over theory: 0.284 / 0.435 at default flat-top 0.45
-pub const SIGMA_CENTER_PX: f64 = 0.284;
-pub const SIGMA_PITCH_PX: f64 = 0.435;
+pub const SIGMA_CENTER_THEORETICAL: f64 = 0.28867513459481287;
+pub const SIGMA_PITCH_THEORETICAL: f64 = 0.40824829046386302;
+pub const SIGMA_CENTER_TUNED: f64 = 0.284;
+pub const SIGMA_PITCH_TUNED: f64 = 0.435;
+
+pub const SIGMA_CENTER_PX: f64 = SIGMA_CENTER_THEORETICAL;
+pub const SIGMA_PITCH_PX: f64 = SIGMA_PITCH_THEORETICAL;
+
+pub const FLAT_CENTER_THEORETICAL: f64 = SIGMA_CENTER_THEORETICAL;
+pub const FLAT_PITCH_THEORETICAL: f64 = SIGMA_PITCH_THEORETICAL;
+pub const FLAT_TOP_DEFAULT: f64 = 0.3375; // 0.45 * 0.75
+pub const FLAT_CENTER_DEFAULT: f64 = FLAT_TOP_DEFAULT;
+pub const FLAT_PITCH_DEFAULT: f64 = FLAT_TOP_DEFAULT;
 
 static FLAT_TOP_CACHE: OnceLock<f64> = OnceLock::new();
+static FLAT_TOP_PITCH_CACHE: OnceLock<f64> = OnceLock::new();
 
-/// Flat-top half-width in px. Env override `UNPRINT_FLAT_TOP` (compat: `QUANT_HALF_WIDTH_PX`|`FLAT_TOP`|`QUANT_HALF_WIDTH`), filtered 0<a<10, default 0.45.
 #[inline]
-pub fn quant_half_width_px() -> f64 {
+pub fn quant_half_width_center_px() -> f64 {
     *FLAT_TOP_CACHE.get_or_init(|| {
         std::env::var("UNPRINT_FLAT_TOP")
             .or_else(|_| std::env::var("QUANT_HALF_WIDTH_PX"))
@@ -25,60 +30,52 @@ pub fn quant_half_width_px() -> f64 {
             .ok()
             .and_then(|s| s.parse::<f64>().ok())
             .filter(|&v| v > 0.0 && v < 10.0)
-            .unwrap_or(0.45)
+            .unwrap_or(FLAT_CENTER_DEFAULT)
     })
 }
 
-/// Quantized likelihood: ln[ Φ((e+a)/σ) - Φ((e-a)/σ) ] - ln(2a)
-/// Φ via libm::erf. a = half-width, σ = per-axis sigma.
-///
-/// Stable for large |e|: for |e|>a the interval is one-sided, use erfc difference
-/// which retains precision up to ~1e-300. When erfc underflows, fall back to
-/// Gaussian pdf approximation: ln[ N(e;0,σ²) ] = -0.5*(e/σ)² - ln(σ√2π)
 #[inline]
-pub fn quantized_ll(e: f64, sigma: f64, half_width: f64) -> f64 {
+pub fn quant_half_width_pitch_px() -> f64 {
+    *FLAT_TOP_PITCH_CACHE.get_or_init(|| {
+        if let Ok(s) = std::env::var("UNPRINT_FLAT_TOP_PITCH") {
+            if let Ok(v) = s.parse::<f64>() {
+                if v > 0.0 && v < 10.0 {
+                    return v;
+                }
+            }
+        }
+        FLAT_PITCH_DEFAULT
+    })
+}
+
+#[inline]
+pub fn quant_half_width_px() -> f64 {
+    quant_half_width_center_px()
+}
+
+/// Conditional: inflection at 0.75*σ per dimension, inside 2σ (flat), outside 1σ (theoretical), continuous.
+///
+/// Center σ=0.2887 → thresh 0.2165, pitch σ=0.4082 → thresh 0.3062
+/// |e| < 0.75σ: -0.5*(e/2σ)²  → 0.2px center -0.06, pitch -0.03 (almost free)
+/// |e| ≥ 0.75σ: -0.5*(e/σ)² + 0.2109375 → continuous at -0.0703, 0.6px center -1.95, pitch -0.87
+#[inline]
+pub fn quantized_ll(e: f64, sigma: f64, _half_width: f64) -> f64 {
     let sigma = sigma.max(1e-12);
-    let a = half_width;
+    let thresh = 0.75 * sigma;
     let e_abs = e.abs();
-    // Two-sided case: interval straddles 0 (|e| <= a). Difference of CDFs includes ~0.5,
-    // erf is stable here.
-    if e_abs <= a {
-        let upper = (e + a) / sigma;
-        let lower = (e - a) / sigma;
-        const FRAC_1_SQRT_2: f64 = std::f64::consts::FRAC_1_SQRT_2;
-        let phi_upper = 0.5 * (1.0 + libm::erf(upper * FRAC_1_SQRT_2));
-        let phi_lower = 0.5 * (1.0 + libm::erf(lower * FRAC_1_SQRT_2));
-        let prob = (phi_upper - phi_lower).max(1e-300);
-        return prob.ln() - (2.0 * a).ln();
+    const K_INNER: f64 = 2.0;
+    if e_abs < thresh {
+        let si = K_INNER * sigma;
+        -0.5 * (e / si) * (e / si)
+    } else {
+        // constants: inner(thresh) = -0.5*(0.75/K)² = -0.0703125, outer_raw(thresh) = -0.28125, offset = 0.2109375
+        const OFFSET: f64 = 0.2109375;
+        -0.5 * (e / sigma) * (e / sigma) + OFFSET
     }
-    // One-sided: |e| > a, interval entirely positive (after folding via symmetry).
-    // prob = Φ((|e|+a)/σ) - Φ((|e|-a)/σ) = 0.5*erfc((|e|-a)/σ/√2) - 0.5*erfc((|e|+a)/σ/√2)
-    let lower_abs = (e_abs - a) / sigma;
-    let upper_abs = (e_abs + a) / sigma;
-    const FRAC_1_SQRT_2: f64 = std::f64::consts::FRAC_1_SQRT_2;
-    let z_lower = lower_abs * FRAC_1_SQRT_2;
-    let z_upper = upper_abs * FRAC_1_SQRT_2;
-    let erfc_lower = libm::erfc(z_lower);
-    let erfc_upper = libm::erfc(z_upper);
-    let mut prob = 0.5 * (erfc_lower - erfc_upper);
-    if prob <= 1e-300 || !prob.is_finite() || prob <= 0.0 {
-        // Asymptotic Gaussian pdf approximation for extreme tails.
-        // prob ≈ (2a) * N(e;0,σ²)  =>  prob/(2a) ≈ N(e)  =>  ll = ln N(e)
-        // ln N(e) = -0.5*(e/σ)² - ln(σ√2π)
-        let log_norm = -0.5 * (e_abs / sigma) * (e_abs / sigma) - (sigma * (2.0 * std::f64::consts::PI).sqrt()).ln();
-        return log_norm;
-    }
-    prob = prob.max(1e-300);
-    prob.ln() - (2.0 * a).ln()
 }
 
 static AUDIT_ALL_CHARS_CACHE: OnceLock<bool> = OnceLock::new();
 
-/// Env toggle for full-char audit logging. Set `UNPRINT_AUDIT_ALL_CHARS=1` to
-/// include all chars (not just supported) in segmentation and geo.
-/// Accepts 1|true|yes|on case-insensitive. Defaults off.
-/// Note: old `UNPRINT_AUDIT_ALL` alias removed to avoid collision with
-/// CLI `--audit-all` / `--audit-all-lines`; use `UNPRINT_AUDIT_ALL_CHARS`.
 #[inline]
 pub fn audit_all_chars_enabled() -> bool {
     *AUDIT_ALL_CHARS_CACHE.get_or_init(|| {
