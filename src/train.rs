@@ -789,9 +789,9 @@ pub fn run_train(mut args: TrainArgs) {
     eprintln!("Training cache: {}", feat_dir.display());
 
     // ── Pre-warm character render cache + build GlyphMap ──
-    // Merge the existing glyph map with the current catalog. A known hash plus
-    // an existing PNG is enough to carry the entry forward without rendering.
-    // Missing hashes or missing PNGs are rendered once and recorded in the new map.
+    // Incremental, stable-id build: start from the existing map so old gids
+    // 0..old_len-1 never shift. New hashes are appended, never inserted in
+    // the middle. This makes training cache reusable when fonts are added.
     let prewarm_params = crate::char_render::RenderParams::default();
     let glyph_map = {
         use std::sync::{
@@ -813,17 +813,22 @@ pub fn run_train(mut args: TrainArgs) {
         let old_gmap = match crate::glyph_map::NgramGlyphMap::load(&old_gmap_path) {
             Ok(g) => {
                 eprintln!(
-                    "  Loaded existing GlyphMap hints from {}",
+                    "  Loaded existing GlyphMap ({} seqs) for incremental build from {}",
+                    g.groups.len(),
                     old_gmap_path.display()
                 );
                 Some(g)
             }
             Err(e) => {
-                eprintln!("  No usable existing GlyphMap hints: {e}");
+                eprintln!("  No usable existing GlyphMap: {e} — building from scratch");
                 None
             }
         };
-        let gmap = Mutex::new(crate::glyph_map::NgramGlyphMap::new(catalog_hash));
+        // Preserve old groups for stable gids. New groups will be appended.
+        let initial_groups = old_gmap.as_ref()
+            .map(|g| g.groups.clone())
+            .unwrap_or_default();
+        let gmap = Mutex::new(crate::glyph_map::NgramGlyphMap::from_groups(initial_groups, catalog_hash));
 
         catalog.iter().for_each(|fe| {
             let fk = fe.font_key_ref().to_owned();
@@ -899,11 +904,27 @@ pub fn run_train(mut args: TrainArgs) {
                         let hash = crate::glyph_map::hash_image(&img);
                         let path = crate::char_render::ngram_cache_path(seq, hash, &prewarm_params);
                         // Always atomic write to heal any prior partial file; rename is atomic.
+                        // Explicit encoder needed — `.tmp` breaks `image::save` format detection.
                         let tmp = crate::atomic_file::tmp_for(&path);
                         if let Some(parent) = tmp.parent() {
                             let _ = std::fs::create_dir_all(parent);
                         }
-                        if img.save(&tmp).is_ok() {
+                        let ok = (|| -> std::io::Result<()> {
+                            use std::fs::File;
+                            use std::io::BufWriter;
+                            use image::codecs::png::PngEncoder;
+                            use image::ImageEncoder;
+                            let f = File::create(&tmp)?;
+                            let mut w = BufWriter::new(f);
+                            let enc = PngEncoder::new(&mut w);
+                            enc.write_image(img.as_raw(), img.width(), img.height(), image::ExtendedColorType::L8)
+                                .map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e))?;
+                            use std::io::Write;
+                            w.flush()?;
+                            Ok(())
+                        })()
+                        .is_ok();
+                        if ok {
                             let _ = std::fs::rename(&tmp, &path);
                         } else {
                             let _ = std::fs::remove_file(&tmp);
@@ -931,6 +952,18 @@ pub fn run_train(mut args: TrainArgs) {
 
         let mut gmap = gmap.into_inner().unwrap();
 
+        // Incremental stability: keep old order, only sort font_keys inside each
+        // group for determinism. Do NOT sort groups by hash — that would reinsert
+        // new hashes in the middle and shift old gids.
+        for (_seq, groups) in gmap.groups.iter_mut() {
+            for g in groups.iter_mut() {
+                g.font_keys.sort();
+                g.font_keys.dedup();
+            }
+        }
+        gmap.rebuild_lookup();
+        gmap.set_catalog_hash(catalog_hash);
+
         let total_glyphs: usize = gmap.groups.values().map(|g| g.len()).sum();
         let total_deduped: usize = gmap
             .groups
@@ -939,9 +972,15 @@ pub fn run_train(mut args: TrainArgs) {
             .filter(|g| g.font_keys.len() > 1)
             .map(|g| g.font_keys.len() - 1)
             .sum();
+        // Compute how many new glyphs were added vs old map
+        let new_glyphs = if let Some(old) = old_gmap.as_ref() {
+            let old_total: usize = old.groups.values().map(|g| g.len()).sum();
+            total_glyphs.saturating_sub(old_total)
+        } else { total_glyphs };
         eprintln!(
-            "  GlyphMap: {} unique glyphs across {} sequences ({} duplicate renders eliminated)",
+            "  GlyphMap: {} unique glyphs (+{} new) across {} sequences ({} duplicate renders eliminated)",
             total_glyphs,
+            new_glyphs,
             gmap.groups.len(),
             total_deduped
         );
@@ -960,87 +999,148 @@ pub fn run_train(mut args: TrainArgs) {
         gmap
     };
 
-    // ── Determine which (height, aa) combos need rendering ───────
-    // All possible combos (always render the full set so fast/normal share files)
+    // ── Incremental combo handling ──────────────────────────────────
+    // For stable incremental training, a glyph id is its index in the
+    // GlyphMap groups vec for that sequence. Old ids 0..old_len-1 never
+    // shift because we append new groups. Therefore feature files that
+    // store (gid:u32, features) remain valid when new groups are added —
+    // we only need to append new entries.
+    //
+    // Manifests previously stored `fonts=` which forced a full rebuild on
+    // any catalog change. New manifests store only `seqs=` and per-seq
+    // counts (glyph counts), so adding a font that doesn't introduce a new
+    // unique shape leaves the cache fully valid.
     let _all_heights: &[u32] = &args.heights;
     let all_aa: &[AaVariant] = AaVariant::all();
 
     /// Build a stable codepoint-based key for a character sequence.
-    /// E.g. ['A'] → "0041", ['h','e'] → "0068_0065".
     fn seq_key(seq: &[char]) -> String {
         seq.iter().map(|c| format!("{:04X}", *c as u32)).collect::<Vec<_>>().join("_")
     }
-
-    /// File path for a (sequence, height, aa) feature file.
     fn combo_path(feat_dir: &std::path::Path, seq: &[char], ht: u32, aa_name: &str) -> std::path::PathBuf {
         feat_dir.join(format!("{}_h{}_{}.bin", seq_key(seq), ht, aa_name))
     }
-
-    /// Manifest path for a (height, aa) combo.
     fn manifest_combo_path(feat_dir: &std::path::Path, ht: u32, aa_name: &str) -> std::path::PathBuf {
         feat_dir.join(format!("manifest_h{}_{}.txt", ht, aa_name))
     }
-
-    // A combo is cached if its manifest exists, matches the font count, all
-    // char files exist, and the manifest is not older than the font scan cache
-    // (font key changes invalidate glyph IDs stored in the feature files).
-    let scan_cache_mtime = std::fs::metadata(crate::font_scan::scan_cache_path())
-        .and_then(|m| m.modified())
-        .ok();
-    let combo_cached = |ht: u32, aa_idx: usize| -> Option<Vec<usize>> {
-        let aa_name = all_aa[aa_idx].name();
-        let mpath = manifest_combo_path(&feat_dir, ht, aa_name);
-        // Reject if manifest is older than font scan cache — glyph IDs may be stale
-        if let Some(scan_t) = scan_cache_mtime {
-            if let Ok(meta) = std::fs::metadata(&mpath) {
-                if let Ok(manifest_t) = meta.modified() {
-                    if manifest_t < scan_t {
-                        return None;
-                    }
+    fn parse_manifest_header(header: &str, n_seqs_expected: usize) -> Option<usize> {
+        let h = header.trim();
+        // New format: "seqs=106" or "v2 seqs=106"
+        if let Some(rest) = h.strip_prefix("seqs=") {
+            return rest.parse::<usize>().ok().filter(|&n| n==n_seqs_expected);
+        }
+        if h.starts_with("v2 ") {
+            if let Some(rest) = h.strip_prefix("v2 ") {
+                if let Some(s) = rest.strip_prefix("seqs=") {
+                    return s.parse::<usize>().ok().filter(|&n| n==n_seqs_expected);
                 }
             }
         }
+        // Old format: "fonts=2743 seqs=106" — accept if seqs matches, ignore fonts
+        if h.contains("seqs=") {
+            for part in h.split_whitespace() {
+                if let Some(s) = part.strip_prefix("seqs=") {
+                    if let Ok(n) = s.parse::<usize>() { if n==n_seqs_expected { return Some(n); } }
+                }
+            }
+        }
+        None
+    }
+    // Load manifest counts if it exists and header seqs matches.
+    // Returns None if missing or malformed. Does NOT check font count or mtime
+    // any more — old gids are stable, so mtime invalidation is unnecessary.
+    let load_manifest_counts = |ht: u32, aa_idx: usize| -> Option<Vec<usize>> {
+        let aa_name = all_aa[aa_idx].name();
+        let mpath = manifest_combo_path(&feat_dir, ht, aa_name);
         let content = std::fs::read_to_string(&mpath).ok()?;
         let mut lines = content.lines();
         let header = lines.next()?;
-        if header.trim() != format!("fonts={} seqs={}", catalog.len(), n_seqs) {
-            return None;
-        }
+        parse_manifest_header(header, n_seqs)?;
         let mut counts = Vec::with_capacity(n_seqs);
         for line in lines {
             counts.push(line.trim().parse::<usize>().ok()?);
         }
         if counts.len() != n_seqs { return None; }
-        // Verify all files exist
-        for si in 0..n_seqs {
-            if !combo_path(&feat_dir, &sequences[si], ht, aa_name).exists() { return None; }
-        }
         Some(counts)
+    };
+    // Check if all per-seq files exist for a combo (used for fully-cached fast path)
+    let all_files_exist = |ht: u32, aa_idx: usize, counts: &[usize]| -> bool {
+        let aa_name = all_aa[aa_idx].name();
+        for (si, &cnt) in counts.iter().enumerate() {
+            if cnt==0 { continue; }
+            if !combo_path(&feat_dir, &sequences[si], ht, aa_name).exists() { return false; }
+        }
+        true
     };
 
     // Check which combos the current mode needs
-    let mut needed_combos: Vec<(u32, usize)> = Vec::new(); // (height, aa_idx)
-    let mut cached_combos: Vec<(u32, usize, Vec<usize>)> = Vec::new(); // (height, aa_idx, counts)
+    // Incremental logic:
+    // - No manifest or missing files → full rebuild for that combo
+    // - Manifest present, file exists, current == cached → fully cached
+    // - Manifest present, file exists, current > cached → incremental append only for new gids
+    // - current < cached (should not happen append-only) → treat as full rebuild
+    struct IncrInfo { ht: u32, aa_idx: usize, old_counts: Vec<usize>, }
+    let mut full_needed: Vec<(u32, usize)> = Vec::new();
+    let mut cached_combos: Vec<(u32, usize, Vec<usize>)> = Vec::new();
+    let mut incr_combos: Vec<IncrInfo> = Vec::new();
+
+    // Current per-seq glyph counts for increment comparison, in sequences order
+    let current_counts_by_seq: Vec<usize> = sequences.iter()
+        .map(|seq| glyph_map.groups.get(seq).map(|gs| gs.len()).unwrap_or(0))
+        .collect();
 
     for &ht in &active_heights {
         for (aa_idx, _) in aa_variants.iter().enumerate() {
-            match combo_cached(ht, aa_idx) {
-                Some(counts) => cached_combos.push((ht, aa_idx, counts)),
-                None => needed_combos.push((ht, aa_idx)),
+            if let Some(old_counts) = load_manifest_counts(ht, aa_idx) {
+                if !all_files_exist(ht, aa_idx, &old_counts) {
+                    full_needed.push((ht, aa_idx));
+                    continue;
+                }
+                let mut is_cached = true;
+                let mut needs_incr = false;
+                for (i, (&cur, &old)) in current_counts_by_seq.iter().zip(old_counts.iter()).enumerate() {
+                    if cur < old {
+                        is_cached = false;
+                        needs_incr = false;
+                        break; // corruption / shrink → full rebuild
+                    } else if cur > old {
+                        is_cached = false;
+                        needs_incr = true;
+                    }
+                }
+                if is_cached {
+                    cached_combos.push((ht, aa_idx, old_counts));
+                } else if needs_incr {
+                    incr_combos.push(IncrInfo { ht, aa_idx, old_counts });
+                } else {
+                    full_needed.push((ht, aa_idx));
+                }
+            } else {
+                full_needed.push((ht, aa_idx));
             }
         }
     }
+    // Merge full_needed and incr handling below
+    let mut needed_combos = full_needed.clone(); // full rebuild combos use same render path initially
 
-    if needed_combos.is_empty() {
+    if needed_combos.is_empty() && incr_combos.is_empty() {
         let total_cached: usize = cached_combos.iter()
             .flat_map(|(_, _, c)| c.iter())
             .sum();
-        eprintln!("\nReusing {} cached combos ({} samples)",
+        eprintln!("\nReusing {} cached combos ({} samples) — glyph ids stable",
             cached_combos.len(), total_cached);
     } else {
-        eprintln!("\nRendering {} combos ({} cached)...",
-            needed_combos.len(), cached_combos.len());
+        if !needed_combos.is_empty() {
+            eprintln!("\nFull render needed for {} combos ({} fully cached, {} incremental pending)",
+                needed_combos.len(), cached_combos.len(), incr_combos.len());
+        }
+        if !incr_combos.is_empty() && needed_combos.is_empty() {
+            eprintln!("\nAll combos fully cached except {} incremental ({} fully cached)",
+                incr_combos.len(), cached_combos.len());
+        }
 
+        // ── Phase 1: full rebuild combos (truncating old files) ──
+        if !needed_combos.is_empty() {
         // Build a set of needed combos for the inner loop
         let _needed_set: std::collections::HashSet<(u32, usize)> = needed_combos.iter().copied().collect();
 
@@ -1205,12 +1305,12 @@ pub fn run_train(mut args: TrainArgs) {
             }
         }
 
-        // Write per-combo manifests
+        // Write per-combo manifests (new v2 format: seqs only, font count no longer invalidates)
         for (combo_idx, &(ht, aa_idx)) in needed_combos.iter().enumerate() {
             let aa_name = all_aa[aa_idx].name();
             let mpath = manifest_combo_path(&feat_dir, ht, aa_name);
             let tmp_mpath = crate::atomic_file::tmp_for(&mpath);
-            let mut manifest = format!("fonts={} seqs={}", catalog.len(), n_seqs);
+            let mut manifest = format!("seqs={}", n_seqs);
             for ci in 0..n_seqs {
                 manifest.push('\n');
                 manifest.push_str(&combo_counts[combo_idx][ci].to_string());
@@ -1221,15 +1321,90 @@ pub fn run_train(mut args: TrainArgs) {
 
         let rendered_samples: usize = combo_counts.iter().flat_map(|c| c.iter()).sum();
         let render_secs_inner = start.elapsed().as_secs_f64();
-        eprintln!("\nRendering complete: {} new samples in {:.1}s", rendered_samples, render_secs_inner);
+        eprintln!("\nFull rendering complete: {} new samples in {:.1}s", rendered_samples, render_secs_inner);
 
-        // Refresh cached_combos with freshly rendered ones
-        for &(ht, aa_idx) in &needed_combos {
-            if let Some(counts) = combo_cached(ht, aa_idx) {
-                cached_combos.push((ht, aa_idx, counts));
-            }
+        // Refresh cached_combos with freshly rendered ones (use in-memory counts, not re-read)
+        for (combo_idx, &(ht, aa_idx)) in needed_combos.iter().enumerate() {
+            cached_combos.push((ht, aa_idx, combo_counts[combo_idx].clone()));
         }
-    }
+        } // end full_needed
+
+        // ── Phase 2: incremental append combos ──
+        if !incr_combos.is_empty() {
+            eprintln!("\nIncremental append for {} combos (new glyphs only)...", incr_combos.len());
+            let incr_start = std::time::Instant::now();
+            let mut incr_total_new = 0usize;
+
+            for info in &incr_combos {
+                let aa_name = all_aa[info.aa_idx].name();
+                // For this combo, for each seq where cur > old, render only gids >= old
+                for (si, seq) in sequences.iter().enumerate() {
+                    let old_cnt = info.old_counts[si];
+                    let cur_cnt = current_counts_by_seq[si];
+                    if cur_cnt <= old_cnt { continue; }
+                    let fpath = combo_path(&feat_dir, seq, info.ht, aa_name);
+                    // Open existing file for append. File already has header.
+                    let mut file = std::fs::OpenOptions::new()
+                        .append(true)
+                        .open(&fpath)
+                        .unwrap_or_else(|e| panic!("open for append {:?}: {e}", fpath));
+                    let mut new_samples = 0usize;
+                    // Iterate over fonts to find those whose gid is in new range and are reps
+                    // To bound work, we iterate catalog but skip early if gid < old_cnt
+                    for fe in catalog.iter() {
+                        let fk = fe.font_key_ref();
+                        let gid = match glyph_map.glyph_id_for_font(seq, fk) {
+                            Some(id) => id,
+                            None => continue,
+                        };
+                        if gid < old_cnt { continue; } // old gid, already in file
+                        if gid >= cur_cnt { continue; } // should not happen
+                        let rep_font = &glyph_map.fonts_for_glyph(seq, gid)[0];
+                        if rep_font != fk { continue; }
+
+                        // Render this new glyph for this combo
+                        let font_data = match std::fs::read(&fe.path) { Ok(d)=>d, Err(_)=>continue };
+                        let font = match unprint_fonts::ab_glyph::FontRef::try_from_slice(&font_data) { Ok(f)=>f, Err(_)=>continue };
+                        let overrides = fe.glyph_overrides.as_deref();
+                        let gid_overrides: Vec<Option<unprint_fonts::ab_glyph::GlyphId>> = seq.iter().map(|c| {
+                            overrides.and_then(|ovs| ovs.iter().find(|(ch, _)| *ch == *c).map(|(_, g)| unprint_fonts::ab_glyph::GlyphId(*g)))
+                        }).collect();
+                        let mut params = args.render_params.clone();
+                        params.height = info.ht;
+                        params.aa = all_aa[info.aa_idx];
+                        let img = crate::char_render::render_ngram_fresh(&font, seq, &gid_overrides, &params);
+                        let img = match img { Some(i)=>i, None=>continue };
+                        let feats = match compute_features(&img, false) { Some(f)=>f, None=>continue };
+                        {
+                            use std::io::Write;
+                            let g32 = gid as u32;
+                            file.write_all(&g32.to_le_bytes()).expect("write gid");
+                            let arr = feats.as_slice();
+                            for &fv in &arr {
+                                file.write_all(&fv.to_le_bytes()).expect("write feat");
+                            }
+                        }
+                        new_samples += 1;
+                        incr_total_new += 1;
+                    }
+                    eprintln!("  h{} {} seq {} ({:?}): +{} new glyphs ({}→{})", info.ht, aa_name, si, seq, new_samples, old_cnt, cur_cnt);
+                }
+                // Update manifest for this combo to new counts
+                let mpath = manifest_combo_path(&feat_dir, info.ht, aa_name);
+                let tmp_mpath = crate::atomic_file::tmp_for(&mpath);
+                let mut manifest = format!("seqs={}", n_seqs);
+                for ci in 0..n_seqs {
+                    manifest.push('\n');
+                    manifest.push_str(&current_counts_by_seq[ci].to_string());
+                }
+                std::fs::write(&tmp_mpath, &manifest).expect("write incr manifest");
+                std::fs::rename(&tmp_mpath, &mpath).expect("atomic rename incr manifest");
+                // Push to cached_combos with updated counts
+                cached_combos.push((info.ht, info.aa_idx, current_counts_by_seq.clone()));
+            }
+            eprintln!("Incremental append done: +{} samples in {:.1}s", incr_total_new, incr_start.elapsed().as_secs_f64());
+        }
+    } // end outer if had work
 
     // ── Load aggregate char_counts from all active combos ────────
     let mut seq_counts = vec![0usize; n_seqs];

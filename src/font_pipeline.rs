@@ -159,6 +159,10 @@ fn save_obs_crops(
     observations: &[font_match::ObservationDetail],
     crops: &[GrayImage],
 ) {
+    use std::fs::File;
+    use std::io::BufWriter;
+    use image::codecs::png::PngEncoder;
+    use image::ImageEncoder;
     let crop_dir = diag_dir.join(subdir);
     let _ = std::fs::create_dir_all(&crop_dir);
     for d in observations {
@@ -167,8 +171,20 @@ fn save_obs_crops(
             let seq_label: String = if c.is_alphanumeric() { format!("{}", c) } else { format!("U{:04X}", c as u32) };
             let path = crop_dir.join(format!("crop_{:02}_{}.png", d.crop_index, seq_label));
             // Diag output: best-effort atomic, don't block pipeline on failure.
+            // Must use PngEncoder explicitly — `img.save(.tmp)` fails because extension is `.tmp`.
             let tmp = crate::atomic_file::tmp_for(&path);
-            if img.save(&tmp).is_ok() {
+            let ok = (|| -> std::io::Result<()> {
+                let f = File::create(&tmp)?;
+                let mut w = BufWriter::new(f);
+                let enc = PngEncoder::new(&mut w);
+                enc.write_image(img.as_raw(), img.width(), img.height(), image::ExtendedColorType::L8)
+                    .map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e))?;
+                use std::io::Write;
+                w.flush()?;
+                Ok(())
+            })()
+            .is_ok();
+            if ok {
                 let _ = std::fs::rename(&tmp, &path);
             } else {
                 let _ = std::fs::remove_file(&tmp);
@@ -1034,9 +1050,24 @@ pub fn match_lines(
                             let gid_overrides: Vec<Option<unprint_fonts::ab_glyph::GlyphId>> = vec![override_map.get(&d.ch).copied().map(|gid| unprint_fonts::ab_glyph::GlyphId(gid))];
                             let ref_img = char_render::render_ngram_fresh(&font, &seq, &gid_overrides, &char_render::RenderParams::default());
                             if let Some(img) = ref_img {
-                                // Atomic to avoid partial ref image on SIGKILL.
+                                // Atomic to avoid partial ref image on SIGKILL. Use explicit encoder (`.tmp` breaks `save`).
                                 let tmp = crate::atomic_file::tmp_for(&path);
-                                if img.save(&tmp).is_ok() {
+                                let ok = (|| -> std::io::Result<()> {
+                                    use std::fs::File;
+                                    use std::io::BufWriter;
+                                    use image::codecs::png::PngEncoder;
+                                    use image::ImageEncoder;
+                                    let f = File::create(&tmp)?;
+                                    let mut w = BufWriter::new(f);
+                                    let enc = PngEncoder::new(&mut w);
+                                    enc.write_image(img.as_raw(), img.width(), img.height(), image::ExtendedColorType::L8)
+                                        .map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e))?;
+                                    use std::io::Write;
+                                    w.flush()?;
+                                    Ok(())
+                                })()
+                                .is_ok();
+                                if ok {
                                     let _ = std::fs::rename(&tmp, &path);
                                 } else {
                                     let _ = std::fs::remove_file(&tmp);

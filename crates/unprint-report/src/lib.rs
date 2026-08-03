@@ -361,7 +361,9 @@ fn pick_interesting_observations<'a>(
     _n_normal: usize,
 ) -> Vec<(usize, &'a unprint::audit::ObservationVote)> {
     // Rank by the log-probability difference between chosen and ground-truth fonts.
-    // Largest absolute difference first — these observations drive the font decision.
+    // Positive delta = chosen beats GT on this char. For a miss we want to show
+    // the chars that most favored the (incorrect) chosen font, i.e. largest
+    // delta first, not |delta|. GT-better chars (negative delta) should sort last.
     let mut scored: Vec<(usize, &unprint::audit::ObservationVote, f32)> = chars.iter()
         .enumerate()
         .filter_map(|(i, c)| {
@@ -372,8 +374,8 @@ fn pick_interesting_observations<'a>(
             Some((i, c, delta))
         })
         .collect();
-    // Sort by |delta| descending — biggest disagreements first
-    scored.sort_by(|a, b| b.2.abs().partial_cmp(&a.2.abs()).unwrap_or(std::cmp::Ordering::Equal));
+    // Sort by delta descending — strongest evidence for chosen font first
+    scored.sort_by(|a, b| b.2.partial_cmp(&a.2).unwrap_or(std::cmp::Ordering::Equal));
 
     let mut result: Vec<(usize, &unprint::audit::ObservationVote)> = scored.iter()
         .take(n_show)

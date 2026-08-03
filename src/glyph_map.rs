@@ -15,6 +15,7 @@ use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 
 /// A group of font_keys that produce an identical rendered image.
+#[derive(Clone, Debug)]
 pub struct GlyphGroup {
     /// Content hash of the rendered image.
     pub hash: u64,
@@ -26,6 +27,13 @@ pub struct GlyphGroup {
 ///
 /// `glyph_id` is dense per sequence (0..n_unique_glyphs_for_that_seq).
 /// Every font_key appears in exactly one group per sequence.
+///
+/// For incremental training, glyph_id stability is critical: old ids must
+/// never shift when new fonts are added.  `from_groups` preserves existing
+/// order and `register` always appends new groups, never inserts in the
+/// middle.  Sorting by hash was removed 2026-08-02 because it broke this
+/// invariant.
+#[derive(Clone)]
 pub struct NgramGlyphMap {
     /// seq → Vec<GlyphGroup>, where group index = glyph_id
     pub groups: HashMap<Vec<char>, Vec<GlyphGroup>>,
@@ -40,6 +48,43 @@ pub struct NgramGlyphMap {
 impl NgramGlyphMap {
     pub fn new(catalog_hash: u64) -> Self {
         Self { groups: HashMap::new(), font_lookup: HashMap::new(), catalog_hash, dirty: false }
+    }
+
+    /// Build from existing groups, preserving order for incremental stability.
+    /// `groups` is typically cloned from a previous map; new hashes will be
+    /// appended after these, so old gids 0..old_len-1 never shift.
+    pub fn from_groups(groups: HashMap<Vec<char>, Vec<GlyphGroup>>, catalog_hash: u64) -> Self {
+        let mut font_lookup: HashMap<Vec<char>, HashMap<String, usize>> = HashMap::with_capacity(groups.len());
+        for (seq, entry_groups) in &groups {
+            let mut map = HashMap::with_capacity(entry_groups.iter().map(|g| g.font_keys.len()).sum());
+            for (gid, group) in entry_groups.iter().enumerate() {
+                for fk in &group.font_keys {
+                    map.insert(fk.clone(), gid);
+                }
+            }
+            font_lookup.insert(seq.clone(), map);
+        }
+        Self { groups, font_lookup, catalog_hash, dirty: false }
+    }
+
+    /// Rebuild the inverse index after external reordering of `groups`.
+    /// Used after deterministic sorting of groups by hash to ensure
+    /// `glyph_id_for_font` remains consistent with the new order.
+    /// For incremental mode, prefer `from_groups` + append-only `register`
+    /// instead of sorting, to keep old gids stable.
+    pub fn rebuild_lookup(&mut self) {
+        let mut new_lookup: HashMap<Vec<char>, HashMap<String, usize>> = HashMap::with_capacity(self.groups.len());
+        for (seq, entry_groups) in &self.groups {
+            let mut map = HashMap::with_capacity(entry_groups.iter().map(|g| g.font_keys.len()).sum());
+            for (gid, group) in entry_groups.iter().enumerate() {
+                for fk in &group.font_keys {
+                    map.insert(fk.clone(), gid);
+                }
+            }
+            new_lookup.insert(seq.clone(), map);
+        }
+        self.font_lookup = new_lookup;
+        self.dirty = true;
     }
 
     /// Look up which font_keys share a glyph_id for a given sequence.

@@ -144,7 +144,20 @@ pub fn save_cached_image(dir: &Path, page_idx: usize, img: &DynamicImage) {
     }
     let png_path = dir.join(format!("page-{}.png", page_idx));
     let tmp = crate::atomic_file::tmp_for(&png_path);
-    if img.save(&tmp).is_ok() {
+    // Explicit PNG format — `.tmp` extension breaks `img.save` inference.
+    let ok = (|| -> std::io::Result<()> {
+        use std::fs::File;
+        use std::io::BufWriter;
+        let f = File::create(&tmp)?;
+        let mut w = BufWriter::new(f);
+        img.write_to(&mut w, image::ImageFormat::Png)
+            .map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e))?;
+        use std::io::Write;
+        w.flush()?;
+        Ok(())
+    })()
+    .is_ok();
+    if ok {
         let _ = std::fs::rename(&tmp, &png_path);
     } else {
         let _ = std::fs::remove_file(&tmp);

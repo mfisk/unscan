@@ -21,12 +21,29 @@ use image::{GrayImage, Luma};
 
 /// Atomic PNG save: write to `.tmp` sibling then rename, so a SIGKILL never leaves a partial file.
 /// Matches `atomic_file::tmp_for` pattern used for glyph_map and training features.
+/// Uses explicit PngEncoder so the `.tmp` extension does not confuse `image::save`.
 pub(crate) fn atomic_save_png(img: &GrayImage, final_path: &Path) -> bool {
+    use std::fs::File;
+    use std::io::BufWriter;
+    use image::codecs::png::PngEncoder;
+    use image::ImageEncoder;
     let tmp = crate::atomic_file::tmp_for(final_path);
     if let Some(parent) = tmp.parent() {
         let _ = std::fs::create_dir_all(parent);
     }
-    if img.save(&tmp).is_err() {
+    let ok = (|| -> std::io::Result<()> {
+        let file = File::create(&tmp)?;
+        let mut w = BufWriter::new(file);
+        let enc = PngEncoder::new(&mut w);
+        enc.write_image(img.as_raw(), img.width(), img.height(), image::ExtendedColorType::L8)
+            .map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e))?;
+        // BufWriter flush on drop, but explicit flush for safety
+        use std::io::Write;
+        w.flush()?;
+        Ok(())
+    })()
+    .is_ok();
+    if !ok {
         let _ = std::fs::remove_file(&tmp);
         return false;
     }
