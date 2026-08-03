@@ -238,6 +238,4 @@ pub fn refine_words_batch(lines: &mut [TextLine], gray: &GrayImage, ink_threshol
     expand_words_to_ink(lines, gray, ink_threshold, blur, margin);
     fix_overlapping_words_by_ink(lines, gray, ink_threshold);
     trim_words_to_ink(lines, gray, ink_threshold);
-    // Second pass: trim can expand up to 5px and may re-introduce overlap (italic tail).
-    fix_overlapping_words_by_ink(lines, gray, ink_threshold);
 }

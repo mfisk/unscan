@@ -595,8 +595,6 @@ pub fn prepare_page(
     crate::ocr::expand_words_to_ink(&mut lines, &deskewed_gray, ink_thresh, blur_thresh, 20);
     crate::ocr::fix_overlapping_words_by_ink(&mut lines, &deskewed_gray, ink_thresh);
     crate::ocr::trim_words_to_ink(&mut lines, &deskewed_gray, ink_thresh);
-    // Second pass: trim can re-introduce overlap (italic tail) – enforce non-overlap again
-    crate::ocr::fix_overlapping_words_by_ink(&mut lines, &deskewed_gray, ink_thresh);
 
     Ok(PreparedPage { lines, gray: deskewed_gray, bg_color, ink_thresh })
 }
