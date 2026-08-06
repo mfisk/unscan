@@ -108,21 +108,101 @@ fn main() {
         std::process::exit(1);
     }
 
-    // ── Write flamegraph (cargo build --features profile) ────────
+    // ── Write pprof top-30 (cargo build --features profile) ────────
     #[cfg(feature = "profile")]
     {
         if let Ok(report) = pprof_guard.report().build() {
-            let ts = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_secs();
+            use std::collections::{HashMap, HashSet};
+            use std::io::Write as IoWrite;
+
+            let total: isize = report.data.values().sum();
+            let mut inclusive: HashMap<String, isize> = HashMap::new();
+            let mut exclusive: HashMap<String, isize> = HashMap::new();
+
+            for (frames, count) in report.data.iter() {
+                // inclusive: count if func appears anywhere in stack (dedup per sample)
+                let mut seen: HashSet<String> = HashSet::new();
+                for syms in frames.frames.iter() {
+                    for sym in syms.iter() {
+                        let n = sym.name();
+                        if seen.insert(n.clone()) {
+                            *inclusive.entry(n).or_insert(0) += *count;
+                        }
+                    }
+                }
+                // exclusive: leaf frame = frames[0] (innermost) per pprof impl
+                if let Some(leaf) = frames.frames.first() {
+                    for sym in leaf.iter() {
+                        let n = sym.name();
+                        *exclusive.entry(n).or_insert(0) += *count;
+                    }
+                }
+            }
+
+            let mut inc_vec: Vec<(String, isize)> = inclusive.into_iter().collect();
+            inc_vec.sort_by(|a, b| b.1.cmp(&a.1));
+            let mut exc_vec: Vec<(String, isize)> = exclusive.into_iter().collect();
+            exc_vec.sort_by(|a, b| b.1.cmp(&a.1));
+
+            let ts = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_secs();
             let pid = std::process::id();
-            let fg_path = std::path::Path::new("/tmp/lob-flamegraph.svg");
-            let fg_ts_path = format!("/tmp/unprint-flamegraph-{}-{}.svg", ts, pid);
-            if let Ok(file) = std::fs::File::create(fg_path) {
-                let _ = report.flamegraph(file);
+
+            let mut buf = Vec::new();
+            {
+                let mut w = &mut buf;
+                writeln!(w, "# pprof top-30 profile").unwrap();
+                writeln!(w, "# frequency: 997 Hz, total_samples: {}", total).unwrap();
+                writeln!(w, "# ts: {}, pid: {}", ts, pid).unwrap();
+                writeln!(w, "").unwrap();
+                writeln!(w, "Top 30 Inclusive (function appears anywhere in stack):").unwrap();
+                writeln!(w, "{:>7} {:>6}  {}", "count", "%", "function").unwrap();
+                for (i, (name, cnt)) in inc_vec.iter().take(30).enumerate() {
+                    let pct = if total > 0 { (*cnt as f64 / total as f64) * 100.0 } else { 0.0 };
+                    writeln!(w, "{:>7} {:5.1}%  {}", cnt, pct, name).unwrap();
+                    let _ = i;
+                }
+                writeln!(w, "").unwrap();
+                writeln!(w, "Top 30 Exclusive (leaf / self time):").unwrap();
+                writeln!(w, "{:>7} {:>6}  {}", "count", "%", "function").unwrap();
+                for (name, cnt) in exc_vec.iter().take(30) {
+                    let pct = if total > 0 { (*cnt as f64 / total as f64) * 100.0 } else { 0.0 };
+                    writeln!(w, "{:>7} {:5.1}%  {}", cnt, pct, name).unwrap();
+                }
+                if total == 0 {
+                    writeln!(w, "\n[warning] total_samples == 0 — profiler may not have collected data (too short run or blocklisted)").unwrap();
+                }
             }
-            if let Ok(file) = std::fs::File::create(&fg_ts_path) {
-                let _ = report.flamegraph(file);
+
+            let out_str = String::from_utf8_lossy(&buf).to_string();
+            let top_path = std::path::Path::new("/tmp/pprof-top.txt");
+            let ts_path = format!("/tmp/unprint-pprof-top-{}-{}.txt", ts, pid);
+            let _ = std::fs::write(top_path, &out_str);
+            let _ = std::fs::write(&ts_path, &out_str);
+
+            // flamegraph only on explicit request (per task: DO NOT generate unless requested)
+            let want_fg = std::env::var("UNPRINT_FLAMEGRAPH").map(|v| v == "1").unwrap_or(false);
+            if want_fg {
+                let fg_path = std::path::Path::new("/tmp/lob-flamegraph.svg");
+                let fg_ts_path = format!("/tmp/unprint-flamegraph-{}-{}.svg", ts, pid);
+                if let Ok(file) = std::fs::File::create(fg_path) {
+                    let _ = report.flamegraph(file);
+                }
+                if let Ok(file) = std::fs::File::create(&fg_ts_path) {
+                    let _ = report.flamegraph(file);
+                }
+                if !args.quiet {
+                    eprintln!("[profile] Wrote flamegraph to {} and {}", fg_path.display(), fg_ts_path);
+                }
             }
-            if !args.quiet { eprintln!("[profile] Wrote flamegraph to {} and {}", fg_path.display(), fg_ts_path); }
+
+            if !args.quiet {
+                eprintln!("[profile] Wrote pprof top to {} and {} (total_samples={})", top_path.display(), ts_path, total);
+            }
+        } else if !args.quiet {
+            eprintln!("[profile] Failed to build pprof report");
         }
     }
 }
