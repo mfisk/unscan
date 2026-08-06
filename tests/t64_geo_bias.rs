@@ -43,18 +43,30 @@ fn geo_bias_is_zero() {
         .expect("gen-line-test.py launch failed");
     assert!(gen_status.success(), "gen-line-test.py --hardcoded failed");
 
-    std::fs::copy(
-        repo.join("test-docs/line-test-gt.pdf"),
-        repo.join("test-docs/line-test-seams-gt.pdf"),
-    )
-    .expect("copy gt");
-    std::fs::copy(
-        repo.join("test-docs/line-test.pdf"),
-        repo.join("test-docs/line-test-seams.pdf"),
-    )
-    .expect("copy raster");
+    let gt_src = repo.join("test-docs/line-test-gt.pdf");
+    let gt_dst = repo.join("test-docs/line-test-seams-gt.pdf");
+    let raster_src = repo.join("test-docs/line-test.pdf");
+    let raster_dst = repo.join("test-docs/line-test-seams.pdf");
+    // Prev bug: *-seams.pdf were symlinks to line-test.pdf/gt -> std::fs::copy truncated source to 0 bytes (self-copy via symlink).
+    // Remove dest symlink/file first.
+    let _ = std::fs::remove_file(&gt_dst);
+    let _ = std::fs::remove_file(&raster_dst);
+    std::fs::copy(&gt_src, &gt_dst).expect("copy gt");
+    std::fs::copy(&raster_src, &raster_dst).expect("copy raster");
 
     let _ = std::fs::remove_dir_all("/tmp/unprint-page-cache/line-test-seams");
+    // TMPDIR is ~/workspace/tmp in pueue - test originally cleared wrong /tmp path
+    let _ = std::fs::remove_dir_all("/home/hatch/workspace/tmp/unprint-page-cache/line-test-seams");
+    // also clear any hashed variants
+    for entry in std::fs::read_dir("/home/hatch/workspace/tmp/unprint-page-cache").unwrap_or_else(|_| std::fs::read_dir("/tmp").unwrap()) {
+        // best-effort cleanup of stale line-test-seams caches that cause false hits
+        if let Ok(e) = entry {
+            let name = e.file_name().to_string_lossy().to_string();
+            if name.starts_with("line-test-seams") {
+                let _ = std::fs::remove_dir_all(e.path());
+            }
+        }
+    }
 
     let audit_dir = repo.join("test-docs/t64-audit");
     let _ = std::fs::remove_dir_all(&audit_dir);
