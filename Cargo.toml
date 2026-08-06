@@ -41,10 +41,6 @@ autobins = false
 name = "gen_training_data"
 path = "src/bin/gen_training_data.rs"
 
-[[bin]]
-name = "dump_gt"
-path = "src/bin/dump_gt.rs"
-
 [dependencies]
 clap = { workspace = true }
 image = { workspace = true }
