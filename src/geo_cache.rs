@@ -37,10 +37,11 @@ use std::collections::{BTreeMap, HashMap, HashSet};
 use std::path::{Path, PathBuf};
 
 const BGEO_MAGIC: &[u8; 4] = b"BGEO";
-// Bump to 15 to invalidate caches after correctly handling case/cpsp as conditional features.
-// v14 excluded case/cpsp entirely, which fixed non-caps gt_geo_v_err but lost correctness for all-caps.
-// v15 stores case/cpsp separately and applies them only in all-caps context.
-const BGEO_VERSION: u32 = 15;
+// Bump to 16 to store pre-grouped pair/single lookup groups for fast pair_adjustment_full.
+// v15 stored case/cpsp separately and applied them only in all-caps context.
+// v16 adds: pair_groups, case_pair_groups, single_groups, case_single_groups (BTree-free fast path)
+// plus sorted ClassDef Format2 ranges for binary search in class_get.
+const BGEO_VERSION: u32 = 16;
 
 // ---------- BE helpers for OT parsing ----------
 #[inline]
@@ -254,6 +255,29 @@ struct Format2Index {
     subtable_pos: u16,
 }
 
+// v16 pre-grouped lookup structures — zero-alloc fast path for pair/single adjustment
+#[derive(Debug)]
+struct PairEntryIndex {
+    pos: u16,
+    is_f2: bool,
+    idx: u16, // index into format1_tables or format2_tables
+}
+#[derive(Debug)]
+struct PairGroupIndex {
+    lookup_id: u16,
+    entries: Vec<PairEntryIndex>, // sorted by pos
+}
+#[derive(Debug)]
+struct SingleEntryIndex {
+    pos: u16,
+    idx: u16, // index into single_tables
+}
+#[derive(Debug)]
+struct SingleGroupIndex {
+    lookup_id: u16,
+    entries: Vec<SingleEntryIndex>, // sorted by pos
+}
+
 // Helper for lookup-aware pair resolution: reference to either Format1 or Format2 subtable within a lookup.
 enum PairSubtableRef<'a> {
     F1(&'a Format1Index),
@@ -274,6 +298,11 @@ struct FontMmapIndex {
     case_single_tables: Vec<SingleIndex>,
     case_format1_tables: Vec<Format1Index>,
     case_format2_tables: Vec<Format2Index>,
+    // v16: pre-grouped, sorted by lookup_id then pos — built once at cache write/load
+    pair_groups: Vec<PairGroupIndex>,
+    case_pair_groups: Vec<PairGroupIndex>,
+    single_groups: Vec<SingleGroupIndex>,
+    case_single_groups: Vec<SingleGroupIndex>,
 }
 
 // ---------- Backward compat parse structs for test_gpos ----------
@@ -349,13 +378,24 @@ impl GeometryCache {
                 le_u16_at(d, off) as usize
             }
             ClassDefIndex::Format2 { count, ranges_off } => {
-                for i in 0..*count {
-                    let off = *ranges_off + i*6;
+                // v16: ranges sorted by start (enforced in parse_class_def_with_raw),
+                // binary search for containing interval instead of linear scan.
+                let mut lo = 0usize;
+                let mut hi = *count;
+                while lo < hi {
+                    let mid = (lo + hi) / 2;
+                    let off = *ranges_off + mid*6;
                     if off+6 > d.len() { break; }
                     let s = le_u16_at(d, off);
                     let e = le_u16_at(d, off+2);
                     let c = le_u16_at(d, off+4);
-                    if gid >= s && gid <= e { return c as usize; }
+                    if gid < s {
+                        hi = mid;
+                    } else if gid > e {
+                        lo = mid + 1;
+                    } else {
+                        return c as usize;
+                    }
                 }
                 0
             }
@@ -380,126 +420,201 @@ impl GeometryCache {
     }
 
     // single adjustment sum across lookups, first matching subtable per lookup wins
-    // GPOS spec: within a lookup, subtables are tried in order; first that applies wins.
-    // Across lookups, adjustments are summed.
+    // v16: uses pre-grouped single_groups built at cache build time — zero alloc, no sort, no HashSet
     fn single_adjustment_full(&self, f: &FontMmapIndex, gid: u16) -> [i32;4] {
         let d = self.data();
         let mut acc = [0i32;4];
-        let mut seen_lookups: HashSet<u16> = HashSet::new();
-        // Ensure deterministic subtable order per lookup (parse order already is, but sort to be safe)
-        let mut tables: Vec<&SingleIndex> = f.single_tables.iter().collect();
-        tables.sort_by_key(|t| (t.lookup_id, t.subtable_pos));
-        for tbl in tables {
-            if seen_lookups.contains(&tbl.lookup_id) { continue; }
-            let idx_opt = if tbl.is_single {
-                if self.coverage_contains(tbl.coverage_off, tbl.coverage_len, gid).is_none() { continue; }
-                Some(0usize)
-            } else {
-                self.coverage_contains(tbl.coverage_off, tbl.coverage_len, gid)
-            };
-            let idx = match idx_opt { Some(i)=>i, None=>continue };
-            let vf = tbl.value_format;
-            let sz = tbl.stride;
-            let off = tbl.values_off + idx*sz*2;
-            if off + sz*2 > d.len() { continue; }
-            let mut p = off;
-            if vf & 0x0001 != 0 { acc[0] += le_i16_at(d,p) as i32; p+=2; }
-            if vf & 0x0002 != 0 { acc[1] += le_i16_at(d,p) as i32; p+=2; }
-            if vf & 0x0004 != 0 { acc[2] += le_i16_at(d,p) as i32; p+=2; }
-            if vf & 0x0008 != 0 { acc[3] += le_i16_at(d,p) as i32; }
-            seen_lookups.insert(tbl.lookup_id);
+        if f.single_groups.is_empty() {
+            // fallback for old caches (should not happen with v16, but keep correctness)
+            let mut seen_lookups: HashSet<u16> = HashSet::new();
+            let mut tables: Vec<&SingleIndex> = f.single_tables.iter().collect();
+            tables.sort_by_key(|t| (t.lookup_id, t.subtable_pos));
+            for tbl in tables {
+                if seen_lookups.contains(&tbl.lookup_id) { continue; }
+                let idx_opt = if tbl.is_single {
+                    if self.coverage_contains(tbl.coverage_off, tbl.coverage_len, gid).is_none() { continue; }
+                    Some(0usize)
+                } else {
+                    self.coverage_contains(tbl.coverage_off, tbl.coverage_len, gid)
+                };
+                let idx = match idx_opt { Some(i)=>i, None=>continue };
+                let vf = tbl.value_format;
+                let sz = tbl.stride;
+                let off = tbl.values_off + idx*sz*2;
+                if off + sz*2 > d.len() { continue; }
+                let mut p = off;
+                if vf & 0x0001 != 0 { acc[0] += le_i16_at(d,p) as i32; p+=2; }
+                if vf & 0x0002 != 0 { acc[1] += le_i16_at(d,p) as i32; p+=2; }
+                if vf & 0x0004 != 0 { acc[2] += le_i16_at(d,p) as i32; p+=2; }
+                if vf & 0x0008 != 0 { acc[3] += le_i16_at(d,p) as i32; }
+                seen_lookups.insert(tbl.lookup_id);
+            }
+            return acc;
+        }
+        for group in &f.single_groups {
+            for entry in &group.entries {
+                let tbl = &f.single_tables[entry.idx as usize];
+                let idx_opt = if tbl.is_single {
+                    if self.coverage_contains(tbl.coverage_off, tbl.coverage_len, gid).is_none() { continue; }
+                    Some(0usize)
+                } else {
+                    self.coverage_contains(tbl.coverage_off, tbl.coverage_len, gid)
+                };
+                let idx = match idx_opt { Some(i)=>i, None=>continue };
+                let vf = tbl.value_format;
+                let sz = tbl.stride;
+                let off = tbl.values_off + idx*sz*2;
+                if off + sz*2 > d.len() { continue; }
+                let mut p = off;
+                if vf & 0x0001 != 0 { acc[0] += le_i16_at(d,p) as i32; p+=2; }
+                if vf & 0x0002 != 0 { acc[1] += le_i16_at(d,p) as i32; p+=2; }
+                if vf & 0x0004 != 0 { acc[2] += le_i16_at(d,p) as i32; p+=2; }
+                if vf & 0x0008 != 0 { acc[3] += le_i16_at(d,p) as i32; }
+                break; // first matching subtable per lookup wins
+            }
         }
         acc
     }
 
     // pair adjustment for adjacent gids, returns (val1, val2) each [xPla,yPla,xAdv,yAdv] summed
-    // Correct GPOS semantics: for each lookup, try subtables in order (by subtable_pos);
-    // first subtable where coverage contains gid1 AND second glyph matches (for Format1) wins for that lookup.
-    // Sum across lookups. Format1 and Format2 subtables can coexist in same lookup, so we merge them by pos.
+    // v16: pre-grouped by lookup_id at cache build time — no BTreeMap, no sort, no alloc.
+    // Also: class_get Format2 now binary searches sorted ranges, and pair second-gid uses
+    // linear for tiny sets (<=8) else binary search — both benefit from cache-build sorting.
     fn pair_adjustment_full(&self, f: &FontMmapIndex, gid1: u16, gid2: u16) -> ([i32;4],[i32;4]) {
         let d = self.data();
         let mut v1_acc = [0i32;4];
         let mut v2_acc = [0i32;4];
 
-        // Group candidates by lookup_id
-        let mut by_lookup: BTreeMap<u16, Vec<(u16, PairSubtableRef<'_>)>> = BTreeMap::new();
-        for tbl in &f.format1_tables {
-            by_lookup.entry(tbl.lookup_id).or_default().push((tbl.subtable_pos, PairSubtableRef::F1(tbl)));
-        }
-        for tbl in &f.format2_tables {
-            by_lookup.entry(tbl.lookup_id).or_default().push((tbl.subtable_pos, PairSubtableRef::F2(tbl)));
-        }
-
-        for (_lookup_id, mut cands) in by_lookup {
-            cands.sort_by_key(|(pos, _)| *pos);
-            let mut matched = false;
-            for (_pos, cand) in cands {
-                match cand {
-                    PairSubtableRef::F1(tbl) => {
-                        let cov_idx = match self.coverage_contains(tbl.coverage_off, tbl.coverage_len, gid1) {
-                            Some(i)=>i, None=>continue,
-                        };
-                        let ps = &tbl.pair_sets[cov_idx];
-                        // binary search second gid
-                        let mut lo = 0usize;
-                        let mut hi = ps.pair_count;
-                        let mut found_off: Option<usize> = None;
-                        while lo < hi {
-                            let mid = (lo+hi)/2;
-                            let rec_size = 2 + tbl.sz1*2 + tbl.sz2*2;
-                            let off = ps.pairs_off + mid*rec_size;
-                            if off+2 > d.len() { break; }
-                            let sg = le_u16_at(d, off);
-                            if sg < gid2 { lo = mid+1; }
-                            else if sg > gid2 { hi = mid; }
-                            else { found_off = Some(off); break; }
+        if f.pair_groups.is_empty() {
+            // fallback old path for safety (old cache)
+            let mut by_lookup: BTreeMap<u16, Vec<(u16, PairSubtableRef<'_>)>> = BTreeMap::new();
+            for tbl in &f.format1_tables {
+                by_lookup.entry(tbl.lookup_id).or_default().push((tbl.subtable_pos, PairSubtableRef::F1(tbl)));
+            }
+            for tbl in &f.format2_tables {
+                by_lookup.entry(tbl.lookup_id).or_default().push((tbl.subtable_pos, PairSubtableRef::F2(tbl)));
+            }
+            for (_lookup_id, mut cands) in by_lookup {
+                cands.sort_by_key(|(pos, _)| *pos);
+                for (_pos, cand) in cands {
+                    match cand {
+                        PairSubtableRef::F1(tbl) => {
+                            let cov_idx = match self.coverage_contains(tbl.coverage_off, tbl.coverage_len, gid1) { Some(i)=>i, None=>continue };
+                            let ps = &tbl.pair_sets[cov_idx];
+                            let mut lo = 0usize; let mut hi = ps.pair_count; let mut found_off: Option<usize> = None;
+                            while lo < hi {
+                                let mid = (lo+hi)/2;
+                                let rec_size = 2 + tbl.sz1*2 + tbl.sz2*2;
+                                let off = ps.pairs_off + mid*rec_size;
+                                if off+2 > d.len() { break; }
+                                let sg = le_u16_at(d, off);
+                                if sg < gid2 { lo = mid+1; } else if sg > gid2 { hi = mid; } else { found_off = Some(off); break; }
+                            }
+                            let off = match found_off { Some(o)=>o, None=>continue };
+                            let mut p = off + 2;
+                            let vf1 = tbl.val_fmt1;
+                            if vf1 & 0x0001 != 0 { v1_acc[0] += le_i16_at(d,p) as i32; p+=2; }
+                            if vf1 & 0x0002 != 0 { v1_acc[1] += le_i16_at(d,p) as i32; p+=2; }
+                            if vf1 & 0x0004 != 0 { v1_acc[2] += le_i16_at(d,p) as i32; p+=2; }
+                            if vf1 & 0x0008 != 0 { v1_acc[3] += le_i16_at(d,p) as i32; p+=2; }
+                            let vf2 = tbl.val_fmt2;
+                            if vf2 & 0x0001 != 0 { v2_acc[0] += le_i16_at(d,p) as i32; p+=2; }
+                            if vf2 & 0x0002 != 0 { v2_acc[1] += le_i16_at(d,p) as i32; p+=2; }
+                            if vf2 & 0x0004 != 0 { v2_acc[2] += le_i16_at(d,p) as i32; p+=2; }
+                            if vf2 & 0x0008 != 0 { v2_acc[3] += le_i16_at(d,p) as i32; }
+                            break;
                         }
-                        let off = match found_off { Some(o)=>o, None=>continue };
-                        let mut p = off + 2;
-                        let vf1 = tbl.val_fmt1;
-                        if vf1 & 0x0001 != 0 { v1_acc[0] += le_i16_at(d,p) as i32; p+=2; }
-                        if vf1 & 0x0002 != 0 { v1_acc[1] += le_i16_at(d,p) as i32; p+=2; }
-                        if vf1 & 0x0004 != 0 { v1_acc[2] += le_i16_at(d,p) as i32; p+=2; }
-                        if vf1 & 0x0008 != 0 { v1_acc[3] += le_i16_at(d,p) as i32; p+=2; }
-                        let vf2 = tbl.val_fmt2;
-                        if vf2 & 0x0001 != 0 { v2_acc[0] += le_i16_at(d,p) as i32; p+=2; }
-                        if vf2 & 0x0002 != 0 { v2_acc[1] += le_i16_at(d,p) as i32; p+=2; }
-                        if vf2 & 0x0004 != 0 { v2_acc[2] += le_i16_at(d,p) as i32; p+=2; }
-                        if vf2 & 0x0008 != 0 { v2_acc[3] += le_i16_at(d,p) as i32; }
-                        matched = true;
-                        break;
-                    }
-                    PairSubtableRef::F2(tbl) => {
-                        let cov_opt = self.coverage_contains(tbl.coverage_off, tbl.coverage_len, gid1);
-                        if cov_opt.is_none() {
-                            continue;
+                        PairSubtableRef::F2(tbl) => {
+                            if self.coverage_contains(tbl.coverage_off, tbl.coverage_len, gid1).is_none() { continue; }
+                            let c1 = self.class_get(&tbl.class1_def, gid1);
+                            let c2 = self.class_get(&tbl.class2_def, gid2);
+                            if c1 >= tbl.class1_count || c2 >= tbl.class2_count { continue; }
+                            let idx = c1 * tbl.class2_count + c2;
+                            let rec_size = (tbl.sz1 + tbl.sz2)*2;
+                            let off = tbl.matrix_off + idx*rec_size;
+                            if off + rec_size > d.len() { continue; }
+                            let mut p = off;
+                            let vf1 = tbl.val_fmt1;
+                            if vf1 & 0x0001 != 0 { v1_acc[0] += le_i16_at(d,p) as i32; p+=2; }
+                            if vf1 & 0x0002 != 0 { v1_acc[1] += le_i16_at(d,p) as i32; p+=2; }
+                            if vf1 & 0x0004 != 0 { v1_acc[2] += le_i16_at(d,p) as i32; p+=2; }
+                            if vf1 & 0x0008 != 0 { v1_acc[3] += le_i16_at(d,p) as i32; p+=2; }
+                            let vf2 = tbl.val_fmt2;
+                            if vf2 & 0x0001 != 0 { v2_acc[0] += le_i16_at(d,p) as i32; p+=2; }
+                            if vf2 & 0x0002 != 0 { v2_acc[1] += le_i16_at(d,p) as i32; p+=2; }
+                            if vf2 & 0x0004 != 0 { v2_acc[2] += le_i16_at(d,p) as i32; p+=2; }
+                            if vf2 & 0x0008 != 0 { v2_acc[3] += le_i16_at(d,p) as i32; }
+                            break;
                         }
-                        let c1 = self.class_get(&tbl.class1_def, gid1);
-                        let c2 = self.class_get(&tbl.class2_def, gid2);
-                        if c1 >= tbl.class1_count || c2 >= tbl.class2_count {
-                            continue;
-                        }
-                        let idx = c1 * tbl.class2_count + c2;
-                        let rec_size = (tbl.sz1 + tbl.sz2)*2;
-                        let off = tbl.matrix_off + idx*rec_size;
-                        if off + rec_size > d.len() { continue; }
-                        let mut p = off;
-                        let vf1 = tbl.val_fmt1;
-                        if vf1 & 0x0001 != 0 { v1_acc[0] += le_i16_at(d,p) as i32; p+=2; }
-                        if vf1 & 0x0002 != 0 { v1_acc[1] += le_i16_at(d,p) as i32; p+=2; }
-                        if vf1 & 0x0004 != 0 { v1_acc[2] += le_i16_at(d,p) as i32; p+=2; }
-                        if vf1 & 0x0008 != 0 { v1_acc[3] += le_i16_at(d,p) as i32; p+=2; }
-                        let vf2 = tbl.val_fmt2;
-                        if vf2 & 0x0001 != 0 { v2_acc[0] += le_i16_at(d,p) as i32; p+=2; }
-                        if vf2 & 0x0002 != 0 { v2_acc[1] += le_i16_at(d,p) as i32; p+=2; }
-                        if vf2 & 0x0004 != 0 { v2_acc[2] += le_i16_at(d,p) as i32; p+=2; }
-                        if vf2 & 0x0008 != 0 { v2_acc[3] += le_i16_at(d,p) as i32; }
-                        matched = true;
-                        break;
                     }
                 }
             }
-            let _ = matched;
+            return (v1_acc, v2_acc);
+        }
+
+        for group in &f.pair_groups {
+            for entry in &group.entries {
+                if entry.is_f2 {
+                    let tbl = &f.format2_tables[entry.idx as usize];
+                    if self.coverage_contains(tbl.coverage_off, tbl.coverage_len, gid1).is_none() { continue; }
+                    let c1 = self.class_get(&tbl.class1_def, gid1);
+                    let c2 = self.class_get(&tbl.class2_def, gid2);
+                    if c1 >= tbl.class1_count || c2 >= tbl.class2_count { continue; }
+                    let idx = c1 * tbl.class2_count + c2;
+                    let rec_size = (tbl.sz1 + tbl.sz2)*2;
+                    let off = tbl.matrix_off + idx*rec_size;
+                    if off + rec_size > d.len() { continue; }
+                    let mut p = off;
+                    let vf1 = tbl.val_fmt1;
+                    if vf1 & 0x0001 != 0 { v1_acc[0] += le_i16_at(d,p) as i32; p+=2; }
+                    if vf1 & 0x0002 != 0 { v1_acc[1] += le_i16_at(d,p) as i32; p+=2; }
+                    if vf1 & 0x0004 != 0 { v1_acc[2] += le_i16_at(d,p) as i32; p+=2; }
+                    if vf1 & 0x0008 != 0 { v1_acc[3] += le_i16_at(d,p) as i32; p+=2; }
+                    let vf2 = tbl.val_fmt2;
+                    if vf2 & 0x0001 != 0 { v2_acc[0] += le_i16_at(d,p) as i32; p+=2; }
+                    if vf2 & 0x0002 != 0 { v2_acc[1] += le_i16_at(d,p) as i32; p+=2; }
+                    if vf2 & 0x0004 != 0 { v2_acc[2] += le_i16_at(d,p) as i32; p+=2; }
+                    if vf2 & 0x0008 != 0 { v2_acc[3] += le_i16_at(d,p) as i32; }
+                    break; // first match per lookup wins
+                } else {
+                    let tbl = &f.format1_tables[entry.idx as usize];
+                    let cov_idx = match self.coverage_contains(tbl.coverage_off, tbl.coverage_len, gid1) { Some(i)=>i, None=>continue };
+                    let ps = &tbl.pair_sets[cov_idx];
+                    let rec_size = 2 + tbl.sz1*2 + tbl.sz2*2;
+                    let mut found_off: Option<usize> = None;
+                    if ps.pair_count <= 8 {
+                        // linear scan is faster for tiny sets than binary search (fewer branches, better prefetch)
+                        for i in 0..ps.pair_count {
+                            let off = ps.pairs_off + i*rec_size;
+                            if off+2 > d.len() { break; }
+                            let sg = le_u16_at(d, off);
+                            if sg == gid2 { found_off = Some(off); break; }
+                        }
+                    } else {
+                        let mut lo = 0usize; let mut hi = ps.pair_count;
+                        while lo < hi {
+                            let mid = (lo+hi)/2;
+                            let off = ps.pairs_off + mid*rec_size;
+                            if off+2 > d.len() { break; }
+                            let sg = le_u16_at(d, off);
+                            if sg < gid2 { lo = mid+1; } else if sg > gid2 { hi = mid; } else { found_off = Some(off); break; }
+                        }
+                    }
+                    let off = match found_off { Some(o)=>o, None=>continue };
+                    let mut p = off + 2;
+                    let vf1 = tbl.val_fmt1;
+                    if vf1 & 0x0001 != 0 { v1_acc[0] += le_i16_at(d,p) as i32; p+=2; }
+                    if vf1 & 0x0002 != 0 { v1_acc[1] += le_i16_at(d,p) as i32; p+=2; }
+                    if vf1 & 0x0004 != 0 { v1_acc[2] += le_i16_at(d,p) as i32; p+=2; }
+                    if vf1 & 0x0008 != 0 { v1_acc[3] += le_i16_at(d,p) as i32; p+=2; }
+                    let vf2 = tbl.val_fmt2;
+                    if vf2 & 0x0001 != 0 { v2_acc[0] += le_i16_at(d,p) as i32; p+=2; }
+                    if vf2 & 0x0002 != 0 { v2_acc[1] += le_i16_at(d,p) as i32; p+=2; }
+                    if vf2 & 0x0004 != 0 { v2_acc[2] += le_i16_at(d,p) as i32; p+=2; }
+                    if vf2 & 0x0008 != 0 { v2_acc[3] += le_i16_at(d,p) as i32; }
+                    break;
+                }
+            }
         }
         (v1_acc, v2_acc)
     }
@@ -530,28 +645,53 @@ impl GeometryCache {
     fn case_single_adjustment_full(&self, f: &FontMmapIndex, gid: u16) -> [i32;4] {
         let d = self.data();
         let mut acc = [0i32;4];
-        let mut seen_lookups: HashSet<u16> = HashSet::new();
-        let mut tables: Vec<&SingleIndex> = f.case_single_tables.iter().collect();
-        tables.sort_by_key(|t| (t.lookup_id, t.subtable_pos));
-        for tbl in tables {
-            if seen_lookups.contains(&tbl.lookup_id) { continue; }
-            let idx_opt = if tbl.is_single {
-                if self.coverage_contains(tbl.coverage_off, tbl.coverage_len, gid).is_none() { continue; }
-                Some(0usize)
-            } else {
-                self.coverage_contains(tbl.coverage_off, tbl.coverage_len, gid)
-            };
-            let idx = match idx_opt { Some(i)=>i, None=>continue };
-            let vf = tbl.value_format;
-            let sz = tbl.stride;
-            let off = tbl.values_off + idx*sz*2;
-            if off + sz*2 > d.len() { continue; }
-            let mut p = off;
-            if vf & 0x0001 != 0 { acc[0] += le_i16_at(d,p) as i32; p+=2; }
-            if vf & 0x0002 != 0 { acc[1] += le_i16_at(d,p) as i32; p+=2; }
-            if vf & 0x0004 != 0 { acc[2] += le_i16_at(d,p) as i32; p+=2; }
-            if vf & 0x0008 != 0 { acc[3] += le_i16_at(d,p) as i32; }
-            seen_lookups.insert(tbl.lookup_id);
+        if f.case_single_groups.is_empty() {
+            let mut seen_lookups: HashSet<u16> = HashSet::new();
+            let mut tables: Vec<&SingleIndex> = f.case_single_tables.iter().collect();
+            tables.sort_by_key(|t| (t.lookup_id, t.subtable_pos));
+            for tbl in tables {
+                if seen_lookups.contains(&tbl.lookup_id) { continue; }
+                let idx_opt = if tbl.is_single {
+                    if self.coverage_contains(tbl.coverage_off, tbl.coverage_len, gid).is_none() { continue; }
+                    Some(0usize)
+                } else {
+                    self.coverage_contains(tbl.coverage_off, tbl.coverage_len, gid)
+                };
+                let idx = match idx_opt { Some(i)=>i, None=>continue };
+                let vf = tbl.value_format;
+                let sz = tbl.stride;
+                let off = tbl.values_off + idx*sz*2;
+                if off + sz*2 > d.len() { continue; }
+                let mut p = off;
+                if vf & 0x0001 != 0 { acc[0] += le_i16_at(d,p) as i32; p+=2; }
+                if vf & 0x0002 != 0 { acc[1] += le_i16_at(d,p) as i32; p+=2; }
+                if vf & 0x0004 != 0 { acc[2] += le_i16_at(d,p) as i32; p+=2; }
+                if vf & 0x0008 != 0 { acc[3] += le_i16_at(d,p) as i32; }
+                seen_lookups.insert(tbl.lookup_id);
+            }
+            return acc;
+        }
+        for group in &f.case_single_groups {
+            for entry in &group.entries {
+                let tbl = &f.case_single_tables[entry.idx as usize];
+                let idx_opt = if tbl.is_single {
+                    if self.coverage_contains(tbl.coverage_off, tbl.coverage_len, gid).is_none() { continue; }
+                    Some(0usize)
+                } else {
+                    self.coverage_contains(tbl.coverage_off, tbl.coverage_len, gid)
+                };
+                let idx = match idx_opt { Some(i)=>i, None=>continue };
+                let vf = tbl.value_format;
+                let sz = tbl.stride;
+                let off = tbl.values_off + idx*sz*2;
+                if off + sz*2 > d.len() { continue; }
+                let mut p = off;
+                if vf & 0x0001 != 0 { acc[0] += le_i16_at(d,p) as i32; p+=2; }
+                if vf & 0x0002 != 0 { acc[1] += le_i16_at(d,p) as i32; p+=2; }
+                if vf & 0x0004 != 0 { acc[2] += le_i16_at(d,p) as i32; p+=2; }
+                if vf & 0x0008 != 0 { acc[3] += le_i16_at(d,p) as i32; }
+                break;
+            }
         }
         acc
     }
@@ -560,71 +700,130 @@ impl GeometryCache {
         let d = self.data();
         let mut v1_acc = [0i32;4];
         let mut v2_acc = [0i32;4];
-        let mut by_lookup: BTreeMap<u16, Vec<(u16, PairSubtableRef<'_>)>> = BTreeMap::new();
-        for tbl in &f.case_format1_tables {
-            by_lookup.entry(tbl.lookup_id).or_default().push((tbl.subtable_pos, PairSubtableRef::F1(tbl)));
+        if f.case_pair_groups.is_empty() {
+            let mut by_lookup: BTreeMap<u16, Vec<(u16, PairSubtableRef<'_>)>> = BTreeMap::new();
+            for tbl in &f.case_format1_tables {
+                by_lookup.entry(tbl.lookup_id).or_default().push((tbl.subtable_pos, PairSubtableRef::F1(tbl)));
+            }
+            for tbl in &f.case_format2_tables {
+                by_lookup.entry(tbl.lookup_id).or_default().push((tbl.subtable_pos, PairSubtableRef::F2(tbl)));
+            }
+            for (_lookup_id, mut cands) in by_lookup {
+                cands.sort_by_key(|(pos, _)| *pos);
+                for (_pos, cand) in cands {
+                    match cand {
+                        PairSubtableRef::F1(tbl) => {
+                            let cov_idx = match self.coverage_contains(tbl.coverage_off, tbl.coverage_len, gid1) { Some(i)=>i, None=>continue };
+                            let ps = &tbl.pair_sets[cov_idx];
+                            let mut lo = 0usize; let mut hi = ps.pair_count; let mut found_off: Option<usize> = None;
+                            while lo < hi {
+                                let mid = (lo+hi)/2;
+                                let rec_size = 2 + tbl.sz1*2 + tbl.sz2*2;
+                                let off = ps.pairs_off + mid*rec_size;
+                                if off+2 > d.len() { break; }
+                                let sg = le_u16_at(d, off);
+                                if sg < gid2 { lo = mid+1; } else if sg > gid2 { hi = mid; } else { found_off = Some(off); break; }
+                            }
+                            let off = match found_off { Some(o)=>o, None=>continue };
+                            let mut p = off + 2;
+                            let vf1 = tbl.val_fmt1;
+                            if vf1 & 0x0001 != 0 { v1_acc[0] += le_i16_at(d,p) as i32; p+=2; }
+                            if vf1 & 0x0002 != 0 { v1_acc[1] += le_i16_at(d,p) as i32; p+=2; }
+                            if vf1 & 0x0004 != 0 { v1_acc[2] += le_i16_at(d,p) as i32; p+=2; }
+                            if vf1 & 0x0008 != 0 { v1_acc[3] += le_i16_at(d,p) as i32; p+=2; }
+                            let vf2 = tbl.val_fmt2;
+                            if vf2 & 0x0001 != 0 { v2_acc[0] += le_i16_at(d,p) as i32; p+=2; }
+                            if vf2 & 0x0002 != 0 { v2_acc[1] += le_i16_at(d,p) as i32; p+=2; }
+                            if vf2 & 0x0004 != 0 { v2_acc[2] += le_i16_at(d,p) as i32; p+=2; }
+                            if vf2 & 0x0008 != 0 { v2_acc[3] += le_i16_at(d,p) as i32; }
+                            break;
+                        }
+                        PairSubtableRef::F2(tbl) => {
+                            if self.coverage_contains(tbl.coverage_off, tbl.coverage_len, gid1).is_none() { continue; }
+                            let c1 = self.class_get(&tbl.class1_def, gid1);
+                            let c2 = self.class_get(&tbl.class2_def, gid2);
+                            if c1 >= tbl.class1_count || c2 >= tbl.class2_count { continue; }
+                            let idx = c1 * tbl.class2_count + c2;
+                            let rec_size = (tbl.sz1 + tbl.sz2)*2;
+                            let off = tbl.matrix_off + idx*rec_size;
+                            if off + rec_size > d.len() { continue; }
+                            let mut p = off;
+                            let vf1 = tbl.val_fmt1;
+                            if vf1 & 0x0001 != 0 { v1_acc[0] += le_i16_at(d,p) as i32; p+=2; }
+                            if vf1 & 0x0002 != 0 { v1_acc[1] += le_i16_at(d,p) as i32; p+=2; }
+                            if vf1 & 0x0004 != 0 { v1_acc[2] += le_i16_at(d,p) as i32; p+=2; }
+                            if vf1 & 0x0008 != 0 { v1_acc[3] += le_i16_at(d,p) as i32; p+=2; }
+                            let vf2 = tbl.val_fmt2;
+                            if vf2 & 0x0001 != 0 { v2_acc[0] += le_i16_at(d,p) as i32; p+=2; }
+                            if vf2 & 0x0002 != 0 { v2_acc[1] += le_i16_at(d,p) as i32; p+=2; }
+                            if vf2 & 0x0004 != 0 { v2_acc[2] += le_i16_at(d,p) as i32; p+=2; }
+                            if vf2 & 0x0008 != 0 { v2_acc[3] += le_i16_at(d,p) as i32; }
+                            break;
+                        }
+                    }
+                }
+            }
+            return (v1_acc, v2_acc);
         }
-        for tbl in &f.case_format2_tables {
-            by_lookup.entry(tbl.lookup_id).or_default().push((tbl.subtable_pos, PairSubtableRef::F2(tbl)));
-        }
-        for (_lookup_id, mut cands) in by_lookup {
-            cands.sort_by_key(|(pos, _)| *pos);
-            for (_pos, cand) in cands {
-                match cand {
-                    PairSubtableRef::F1(tbl) => {
-                        let cov_idx = match self.coverage_contains(tbl.coverage_off, tbl.coverage_len, gid1) {
-                            Some(i)=>i, None=>continue,
-                        };
-                        let ps = &tbl.pair_sets[cov_idx];
-                        let mut lo = 0usize;
-                        let mut hi = ps.pair_count;
-                        let mut found_off: Option<usize> = None;
+        for group in &f.case_pair_groups {
+            for entry in &group.entries {
+                if entry.is_f2 {
+                    let tbl = &f.case_format2_tables[entry.idx as usize];
+                    if self.coverage_contains(tbl.coverage_off, tbl.coverage_len, gid1).is_none() { continue; }
+                    let c1 = self.class_get(&tbl.class1_def, gid1);
+                    let c2 = self.class_get(&tbl.class2_def, gid2);
+                    if c1 >= tbl.class1_count || c2 >= tbl.class2_count { continue; }
+                    let idx = c1 * tbl.class2_count + c2;
+                    let rec_size = (tbl.sz1 + tbl.sz2)*2;
+                    let off = tbl.matrix_off + idx*rec_size;
+                    if off + rec_size > d.len() { continue; }
+                    let mut p = off;
+                    let vf1 = tbl.val_fmt1;
+                    if vf1 & 0x0001 != 0 { v1_acc[0] += le_i16_at(d,p) as i32; p+=2; }
+                    if vf1 & 0x0002 != 0 { v1_acc[1] += le_i16_at(d,p) as i32; p+=2; }
+                    if vf1 & 0x0004 != 0 { v1_acc[2] += le_i16_at(d,p) as i32; p+=2; }
+                    if vf1 & 0x0008 != 0 { v1_acc[3] += le_i16_at(d,p) as i32; p+=2; }
+                    let vf2 = tbl.val_fmt2;
+                    if vf2 & 0x0001 != 0 { v2_acc[0] += le_i16_at(d,p) as i32; p+=2; }
+                    if vf2 & 0x0002 != 0 { v2_acc[1] += le_i16_at(d,p) as i32; p+=2; }
+                    if vf2 & 0x0004 != 0 { v2_acc[2] += le_i16_at(d,p) as i32; p+=2; }
+                    if vf2 & 0x0008 != 0 { v2_acc[3] += le_i16_at(d,p) as i32; }
+                    break;
+                } else {
+                    let tbl = &f.case_format1_tables[entry.idx as usize];
+                    let cov_idx = match self.coverage_contains(tbl.coverage_off, tbl.coverage_len, gid1) { Some(i)=>i, None=>continue };
+                    let ps = &tbl.pair_sets[cov_idx];
+                    let rec_size = 2 + tbl.sz1*2 + tbl.sz2*2;
+                    let mut found_off: Option<usize> = None;
+                    if ps.pair_count <= 8 {
+                        for i in 0..ps.pair_count {
+                            let off = ps.pairs_off + i*rec_size;
+                            if off+2 > d.len() { break; }
+                            if le_u16_at(d, off) == gid2 { found_off = Some(off); break; }
+                        }
+                    } else {
+                        let mut lo = 0usize; let mut hi = ps.pair_count;
                         while lo < hi {
                             let mid = (lo+hi)/2;
-                            let rec_size = 2 + tbl.sz1*2 + tbl.sz2*2;
                             let off = ps.pairs_off + mid*rec_size;
                             if off+2 > d.len() { break; }
                             let sg = le_u16_at(d, off);
-                            if sg < gid2 { lo = mid+1; }
-                            else if sg > gid2 { hi = mid; }
-                            else { found_off = Some(off); break; }
+                            if sg < gid2 { lo = mid+1; } else if sg > gid2 { hi = mid; } else { found_off = Some(off); break; }
                         }
-                        let off = match found_off { Some(o)=>o, None=>continue };
-                        let mut p = off + 2;
-                        let vf1 = tbl.val_fmt1;
-                        if vf1 & 0x0001 != 0 { v1_acc[0] += le_i16_at(d,p) as i32; p+=2; }
-                        if vf1 & 0x0002 != 0 { v1_acc[1] += le_i16_at(d,p) as i32; p+=2; }
-                        if vf1 & 0x0004 != 0 { v1_acc[2] += le_i16_at(d,p) as i32; p+=2; }
-                        if vf1 & 0x0008 != 0 { v1_acc[3] += le_i16_at(d,p) as i32; p+=2; }
-                        let vf2 = tbl.val_fmt2;
-                        if vf2 & 0x0001 != 0 { v2_acc[0] += le_i16_at(d,p) as i32; p+=2; }
-                        if vf2 & 0x0002 != 0 { v2_acc[1] += le_i16_at(d,p) as i32; p+=2; }
-                        if vf2 & 0x0004 != 0 { v2_acc[2] += le_i16_at(d,p) as i32; p+=2; }
-                        if vf2 & 0x0008 != 0 { v2_acc[3] += le_i16_at(d,p) as i32; }
-                        break;
                     }
-                    PairSubtableRef::F2(tbl) => {
-                        if self.coverage_contains(tbl.coverage_off, tbl.coverage_len, gid1).is_none() { continue; }
-                        let c1 = self.class_get(&tbl.class1_def, gid1);
-                        let c2 = self.class_get(&tbl.class2_def, gid2);
-                        if c1 >= tbl.class1_count || c2 >= tbl.class2_count { continue; }
-                        let idx = c1 * tbl.class2_count + c2;
-                        let rec_size = (tbl.sz1 + tbl.sz2)*2;
-                        let off = tbl.matrix_off + idx*rec_size;
-                        if off + rec_size > d.len() { continue; }
-                        let mut p = off;
-                        let vf1 = tbl.val_fmt1;
-                        if vf1 & 0x0001 != 0 { v1_acc[0] += le_i16_at(d,p) as i32; p+=2; }
-                        if vf1 & 0x0002 != 0 { v1_acc[1] += le_i16_at(d,p) as i32; p+=2; }
-                        if vf1 & 0x0004 != 0 { v1_acc[2] += le_i16_at(d,p) as i32; p+=2; }
-                        if vf1 & 0x0008 != 0 { v1_acc[3] += le_i16_at(d,p) as i32; p+=2; }
-                        let vf2 = tbl.val_fmt2;
-                        if vf2 & 0x0001 != 0 { v2_acc[0] += le_i16_at(d,p) as i32; p+=2; }
-                        if vf2 & 0x0002 != 0 { v2_acc[1] += le_i16_at(d,p) as i32; p+=2; }
-                        if vf2 & 0x0004 != 0 { v2_acc[2] += le_i16_at(d,p) as i32; p+=2; }
-                        if vf2 & 0x0008 != 0 { v2_acc[3] += le_i16_at(d,p) as i32; }
-                        break;
-                    }
+                    let off = match found_off { Some(o)=>o, None=>continue };
+                    let mut p = off + 2;
+                    let vf1 = tbl.val_fmt1;
+                    if vf1 & 0x0001 != 0 { v1_acc[0] += le_i16_at(d,p) as i32; p+=2; }
+                    if vf1 & 0x0002 != 0 { v1_acc[1] += le_i16_at(d,p) as i32; p+=2; }
+                    if vf1 & 0x0004 != 0 { v1_acc[2] += le_i16_at(d,p) as i32; p+=2; }
+                    if vf1 & 0x0008 != 0 { v1_acc[3] += le_i16_at(d,p) as i32; p+=2; }
+                    let vf2 = tbl.val_fmt2;
+                    if vf2 & 0x0001 != 0 { v2_acc[0] += le_i16_at(d,p) as i32; p+=2; }
+                    if vf2 & 0x0002 != 0 { v2_acc[1] += le_i16_at(d,p) as i32; p+=2; }
+                    if vf2 & 0x0004 != 0 { v2_acc[2] += le_i16_at(d,p) as i32; p+=2; }
+                    if vf2 & 0x0008 != 0 { v2_acc[3] += le_i16_at(d,p) as i32; }
+                    break;
                 }
             }
         }
@@ -1633,6 +1832,80 @@ impl GeometryCache {
                     pack_vals_4(&mut w, v2, tbl.val_fmt2)?;
                 }
             }
+            // ── v16: pre-grouped lookup indexes for fast path (zero BTreeMap at runtime) ──
+            // Helper: build pair groups from owned tables
+            fn build_pair_groups(f1: &[Format1TableOwned], f2: &[Format2TableOwned]) -> Vec<(u16, Vec<(u16,u8,u16)>)> {
+                // Returns Vec<(lookup_id, entries)> where entry = (pos, kind 0=F1/1=F2, idx)
+                let mut map: BTreeMap<u16, Vec<(u16,u8,u16)>> = BTreeMap::new();
+                for (i, tbl) in f1.iter().enumerate() {
+                    map.entry(tbl.lookup_id).or_default().push((tbl.subtable_pos, 0u8, i as u16));
+                }
+                for (i, tbl) in f2.iter().enumerate() {
+                    map.entry(tbl.lookup_id).or_default().push((tbl.subtable_pos, 1u8, i as u16));
+                }
+                let mut out = Vec::with_capacity(map.len());
+                for (lid, mut entries) in map {
+                    entries.sort_by_key(|(pos,_,_)| *pos);
+                    out.push((lid, entries));
+                }
+                out
+            }
+            fn build_single_groups(singles: &[SingleTableOwned]) -> Vec<(u16, Vec<(u16,u16)>)> {
+                let mut map: BTreeMap<u16, Vec<(u16,u16)>> = BTreeMap::new();
+                for (i, tbl) in singles.iter().enumerate() {
+                    map.entry(tbl.lookup_id).or_default().push((tbl.subtable_pos, i as u16));
+                }
+                let mut out = Vec::with_capacity(map.len());
+                for (lid, mut entries) in map {
+                    entries.sort_by_key(|(pos,_)| *pos);
+                    out.push((lid, entries));
+                }
+                out
+            }
+            // pair groups
+            let pg = build_pair_groups(&of.format1_tables, &of.format2_tables);
+            w.write_all(&(pg.len() as u16).to_le_bytes())?;
+            for (lookup_id, entries) in &pg {
+                w.write_all(&lookup_id.to_le_bytes())?;
+                w.write_all(&(entries.len() as u16).to_le_bytes())?;
+                for (pos, kind, idx) in entries {
+                    w.write_all(&pos.to_le_bytes())?;
+                    w.write_all(&[*kind, 0u8])?; // kind + pad
+                    w.write_all(&idx.to_le_bytes())?;
+                }
+            }
+            let cpg = build_pair_groups(&of.case_format1_tables, &of.case_format2_tables);
+            w.write_all(&(cpg.len() as u16).to_le_bytes())?;
+            for (lookup_id, entries) in &cpg {
+                w.write_all(&lookup_id.to_le_bytes())?;
+                w.write_all(&(entries.len() as u16).to_le_bytes())?;
+                for (pos, kind, idx) in entries {
+                    w.write_all(&pos.to_le_bytes())?;
+                    w.write_all(&[*kind, 0u8])?;
+                    w.write_all(&idx.to_le_bytes())?;
+                }
+            }
+            // single groups
+            let sg = build_single_groups(&of.single_tables);
+            w.write_all(&(sg.len() as u16).to_le_bytes())?;
+            for (lookup_id, entries) in &sg {
+                w.write_all(&lookup_id.to_le_bytes())?;
+                w.write_all(&(entries.len() as u16).to_le_bytes())?;
+                for (pos, idx) in entries {
+                    w.write_all(&pos.to_le_bytes())?;
+                    w.write_all(&idx.to_le_bytes())?;
+                }
+            }
+            let csg = build_single_groups(&of.case_single_tables);
+            w.write_all(&(csg.len() as u16).to_le_bytes())?;
+            for (lookup_id, entries) in &csg {
+                w.write_all(&lookup_id.to_le_bytes())?;
+                w.write_all(&(entries.len() as u16).to_le_bytes())?;
+                for (pos, idx) in entries {
+                    w.write_all(&pos.to_le_bytes())?;
+                    w.write_all(&idx.to_le_bytes())?;
+                }
+            }
         }
         w.flush()?; drop(w); std::fs::rename(&tmp, path)?; Ok(())
     }
@@ -1903,7 +2176,77 @@ impl GeometryCache {
                 case_f2_tables.push(Format2Index { coverage_off: cov_off, coverage_len: cov_len, class1_count: c1c, class2_count: c2c, val_fmt1: vf1u, val_fmt2: vf2u, sz1, sz2, class1_def: cd1, class2_def: cd2, matrix_off, lookup_id, subtable_pos });
             }
 
-            fonts.insert(font_key, FontMmapIndex { file_hash, upem, num_glyphs, glyphs_off, cmap_off, cmap_len, single_tables, format1_tables: f1_tables, format2_tables: f2_tables, case_single_tables, case_format1_tables: case_f1_tables, case_format2_tables: case_f2_tables });
+            // ── v16: pre-grouped lookup groups ──
+            // pair groups
+            if pos+2 > data.len() { return Err("trunc v16 pair_groups count".into()); }
+            let n_pg = u16::from_le_bytes(data[pos..pos+2].try_into().unwrap()) as usize; pos+=2;
+            let mut pair_groups = Vec::with_capacity(n_pg);
+            for _ in 0..n_pg {
+                if pos+4 > data.len() { return Err("trunc pair_group hdr".into()); }
+                let lookup_id = u16::from_le_bytes(data[pos..pos+2].try_into().unwrap()); pos+=2;
+                let n_entries = u16::from_le_bytes(data[pos..pos+2].try_into().unwrap()) as usize; pos+=2;
+                let mut entries = Vec::with_capacity(n_entries);
+                for _ in 0..n_entries {
+                    if pos+6 > data.len() { return Err("trunc pair_entry".into()); }
+                    let p = u16::from_le_bytes(data[pos..pos+2].try_into().unwrap()); pos+=2;
+                    let kind = data[pos]; pos+=1; let _pad = data[pos]; pos+=1;
+                    let idx = u16::from_le_bytes(data[pos..pos+2].try_into().unwrap()); pos+=2;
+                    entries.push(PairEntryIndex { pos: p, is_f2: kind==1, idx });
+                }
+                pair_groups.push(PairGroupIndex { lookup_id, entries });
+            }
+            if pos+2 > data.len() { return Err("trunc v16 case_pair_groups count".into()); }
+            let n_cpg = u16::from_le_bytes(data[pos..pos+2].try_into().unwrap()) as usize; pos+=2;
+            let mut case_pair_groups = Vec::with_capacity(n_cpg);
+            for _ in 0..n_cpg {
+                if pos+4 > data.len() { return Err("trunc case_pair_group hdr".into()); }
+                let lookup_id = u16::from_le_bytes(data[pos..pos+2].try_into().unwrap()); pos+=2;
+                let n_entries = u16::from_le_bytes(data[pos..pos+2].try_into().unwrap()) as usize; pos+=2;
+                let mut entries = Vec::with_capacity(n_entries);
+                for _ in 0..n_entries {
+                    if pos+6 > data.len() { return Err("trunc case_pair_entry".into()); }
+                    let p = u16::from_le_bytes(data[pos..pos+2].try_into().unwrap()); pos+=2;
+                    let kind = data[pos]; pos+=1; let _pad = data[pos]; pos+=1;
+                    let idx = u16::from_le_bytes(data[pos..pos+2].try_into().unwrap()); pos+=2;
+                    entries.push(PairEntryIndex { pos: p, is_f2: kind==1, idx });
+                }
+                case_pair_groups.push(PairGroupIndex { lookup_id, entries });
+            }
+            // single groups
+            if pos+2 > data.len() { return Err("trunc v16 single_groups count".into()); }
+            let n_sg = u16::from_le_bytes(data[pos..pos+2].try_into().unwrap()) as usize; pos+=2;
+            let mut single_groups = Vec::with_capacity(n_sg);
+            for _ in 0..n_sg {
+                if pos+4 > data.len() { return Err("trunc single_group hdr".into()); }
+                let lookup_id = u16::from_le_bytes(data[pos..pos+2].try_into().unwrap()); pos+=2;
+                let n_entries = u16::from_le_bytes(data[pos..pos+2].try_into().unwrap()) as usize; pos+=2;
+                let mut entries = Vec::with_capacity(n_entries);
+                for _ in 0..n_entries {
+                    if pos+4 > data.len() { return Err("trunc single_entry".into()); }
+                    let p = u16::from_le_bytes(data[pos..pos+2].try_into().unwrap()); pos+=2;
+                    let idx = u16::from_le_bytes(data[pos..pos+2].try_into().unwrap()); pos+=2;
+                    entries.push(SingleEntryIndex { pos: p, idx });
+                }
+                single_groups.push(SingleGroupIndex { lookup_id, entries });
+            }
+            if pos+2 > data.len() { return Err("trunc v16 case_single_groups count".into()); }
+            let n_csg = u16::from_le_bytes(data[pos..pos+2].try_into().unwrap()) as usize; pos+=2;
+            let mut case_single_groups = Vec::with_capacity(n_csg);
+            for _ in 0..n_csg {
+                if pos+4 > data.len() { return Err("trunc case_single_group hdr".into()); }
+                let lookup_id = u16::from_le_bytes(data[pos..pos+2].try_into().unwrap()); pos+=2;
+                let n_entries = u16::from_le_bytes(data[pos..pos+2].try_into().unwrap()) as usize; pos+=2;
+                let mut entries = Vec::with_capacity(n_entries);
+                for _ in 0..n_entries {
+                    if pos+4 > data.len() { return Err("trunc case_single_entry".into()); }
+                    let p = u16::from_le_bytes(data[pos..pos+2].try_into().unwrap()); pos+=2;
+                    let idx = u16::from_le_bytes(data[pos..pos+2].try_into().unwrap()); pos+=2;
+                    entries.push(SingleEntryIndex { pos: p, idx });
+                }
+                case_single_groups.push(SingleGroupIndex { lookup_id, entries });
+            }
+
+            fonts.insert(font_key, FontMmapIndex { file_hash, upem, num_glyphs, glyphs_off, cmap_off, cmap_len, single_tables, format1_tables: f1_tables, format2_tables: f2_tables, case_single_tables, case_format1_tables: case_f1_tables, case_format2_tables: case_f2_tables, pair_groups, case_pair_groups, single_groups, case_single_groups });
         }
         Ok((Self { mmap, fonts, _cache_path: path.to_path_buf() }, catalog_hash))
     }
@@ -2231,6 +2574,8 @@ impl GeometryCache {
                 let cls = be_u16(data, base+4)?;
                 ranges.push((start,end,cls));
             }
+            // v16: sort by start for binary search in class_get — OT spec says sorted but enforce
+            ranges.sort_by_key(|(s,_,_)| *s);
             Some((4+range_count*6, ClassDefParse::Format2 { ranges }))
         } else { None }
     }

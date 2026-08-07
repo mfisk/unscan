@@ -1614,6 +1614,10 @@ fn strip_weight_suffix(ps_name: &str) -> String {
         "Light",
         "Thin",
     ];
+    // Numeric weights must be stripped when they appear as "-400" / "_400"
+    // so that "SourceSerif4-400It" → "SourceSerif4" (not "SourceSerif4-400")
+    // and we don't produce "SourceSerif4-400-400Italic".
+    const NUMERIC_WEIGHTS: &[&str] = &["100","200","300","400","500","600","700","800","900"];
     let mut s = ps_name.to_string();
     loop {
         let lower = s.to_lowercase();
@@ -1638,6 +1642,25 @@ fn strip_weight_suffix(ps_name: &str) -> String {
                 // This is safe for our corpus; no family name itself is a
                 // weight word.
                 s.truncate(s.len() - wl.len());
+                stripped = true;
+                break;
+            }
+        }
+        if stripped {
+            continue;
+        }
+        // Numeric weight stripping — only hyphen/underscore forms to avoid
+        // stripping the "4" in "SourceSerif4".
+        for &nw in NUMERIC_WEIGHTS {
+            let hyphen = format!("-{}", nw);
+            let uscore = format!("_{}", nw);
+            if lower.ends_with(&hyphen) {
+                s.truncate(s.len() - hyphen.len());
+                stripped = true;
+                break;
+            }
+            if lower.ends_with(&uscore) {
+                s.truncate(s.len() - uscore.len());
                 stripped = true;
                 break;
             }

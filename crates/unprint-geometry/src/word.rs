@@ -187,42 +187,45 @@ pub fn fix_overlapping_words_by_ink(lines: &mut [TextLine], gray: &GrayImage, in
     }
 }
 
-/// Batch API: trim words to ink.
-/// Removes trailing/leading whitespace that Tesseract included, but never
-/// expands across a zero-ink column in the middle 80% band — that column is
-/// true inter-word whitespace (e.g. Originally/for gap 529,530).
-/// Must run after `expand_words_to_ink` and `fix_overlapping_words_by_ink`.
-pub fn trim_words_to_ink(lines: &mut [TextLine], gray: &GrayImage, ink_threshold: u8) {
-    let page_w = gray.width(); let _page_h = gray.height();
-    for line in lines.iter_mut() {
-        for word in line.words.iter_mut() {
-            if word.width<=2 || word.height<=2 { continue; }
-            let wx = word.x.min(page_w.saturating_sub(1)); let wy = word.y.min(_page_h.saturating_sub(1));
-            let ww = word.width.min(page_w-wx); let wh = word.height.min(_page_h-wy);
-            if ww==0 || wh==0 { continue; }
-            let y_top_full = wy; let y_bot_full = wy+wh;
-            let scan_left = wx;
-            let scan_right = (wx+ww).min(page_w);
-            let mut left_full: Option<u32> = None;
-            for col in scan_left..scan_right {
-                if (y_top_full..y_bot_full).any(|row| gray.get_pixel(col.min(page_w-1), row.min(_page_h-1)).0[0] < ink_threshold) {
-                    left_full = Some(col); break;
-                }
+/// Scan grayscale for horizontal ink extent.
+/// Returns (left, right_exclusive) of ink < threshold within y..y+h and search_left..search_right.
+/// Returns (search_left, search_left) if no ink found.
+pub fn ink_horizontal_extent(
+    gray: &GrayImage,
+    y: u32,
+    h: u32,
+    search_left: u32,
+    search_right: u32,
+    threshold: u8,
+) -> (u32, u32) {
+    let page_w = gray.width();
+    let page_h = gray.height();
+    let y0 = y.min(page_h.saturating_sub(1));
+    let y1 = (y + h).min(page_h);
+    let sl = search_left.min(page_w);
+    let sr = search_right.min(page_w);
+    if sl >= sr || y0 >= y1 { return (sl, sl); }
+    let mut first: Option<u32> = None;
+    for col in sl..sr {
+        for row in y0..y1 {
+            if gray.get_pixel(col, row).0[0] < threshold {
+                first = Some(col);
+                break;
             }
-            let mut right_full: Option<u32> = None;
-            for col in (scan_left..scan_right).rev() {
-                if (y_top_full..y_bot_full).any(|row| gray.get_pixel(col.min(page_w-1), row.min(_page_h-1)).0[0] < ink_threshold) {
-                    right_full = Some(col); break;
-                }
+        }
+        if first.is_some() { break; }
+    }
+    let Some(f) = first else { return (sl, sl); };
+    let mut last_ex = f + 1;
+    for col in (sl..sr).rev() {
+        for row in y0..y1 {
+            if gray.get_pixel(col, row).0[0] < threshold {
+                last_ex = col + 1;
+                return (f, last_ex);
             }
-            let li = left_full.unwrap_or(wx);
-            let ri = right_full.unwrap_or(wx+ww-1);
-            if ri < li { continue; }
-            let new_x = li;
-            let new_w = ri - li + 1;
-            word.x=new_x; word.width=new_w;
         }
     }
+    (f, last_ex)
 }
 
 /// Scan grayscale for vertical ink extent - batch helper.
@@ -230,6 +233,32 @@ pub fn ink_vertical_extent(gray: &GrayImage, x: u32, w: u32, search_top: u32, se
     let mut first: Option<u32>=None; let mut last=search_top;
     for row in search_top..search_bot { for col in x..x+w { if gray.get_pixel(col,row).0[0] < threshold { if first.is_none(){first=Some(row);} last=row; break; } } }
     match first { Some(t)=>(t,last+1), None=>(search_top,search_top) }
+}
+
+/// Batch API: trim words to ink.
+/// Removes trailing/leading whitespace that Tesseract included, but never
+/// expands across a zero-ink column in the middle 80% band — that column is
+/// true inter-word whitespace (e.g. Originally/for gap 529,530).
+/// Must run after `expand_words_to_ink` and `fix_overlapping_words_by_ink`.
+pub fn trim_words_to_ink(lines: &mut [TextLine], gray: &GrayImage, ink_threshold: u8) {
+    let page_w = gray.width();
+    let page_h = gray.height();
+    for line in lines.iter_mut() {
+        for word in line.words.iter_mut() {
+            if word.width <= 2 || word.height <= 2 { continue; }
+            let wx = word.x.min(page_w.saturating_sub(1));
+            let wy = word.y.min(page_h.saturating_sub(1));
+            let ww = word.width.min(page_w - wx);
+            let wh = word.height.min(page_h - wy);
+            if ww == 0 || wh == 0 { continue; }
+            let scan_left = wx;
+            let scan_right = (wx + ww).min(page_w);
+            let (nl, nr_ex) = ink_horizontal_extent(gray, wy, wh, scan_left, scan_right, ink_threshold);
+            if nr_ex <= nl { continue; } // no ink -> keep original
+            word.x = nl;
+            word.width = nr_ex - nl;
+        }
+    }
 }
 
 /// Batch wrapper for all three refinements in order: expand -> fix -> trim -> fix.

@@ -594,7 +594,7 @@ pub fn prepare_page(
     let blur_thresh = bg_color.0.saturating_sub(15);
     crate::ocr::expand_words_to_ink(&mut lines, &deskewed_gray, ink_thresh, blur_thresh, 20);
     crate::ocr::fix_overlapping_words_by_ink(&mut lines, &deskewed_gray, ink_thresh);
-    crate::ocr::trim_words_to_ink(&mut lines, &deskewed_gray, ink_thresh);
+    crate::ocr::trim_words_to_ink(&mut lines, &deskewed_gray, crate::ocr::INK_THRESHOLD);
 
     Ok(PreparedPage { lines, gray: deskewed_gray, bg_color, ink_thresh })
 }

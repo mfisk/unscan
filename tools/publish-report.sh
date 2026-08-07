@@ -34,6 +34,53 @@ for p in "${SRC}"/p[0-9]*; do
 done
 shopt -u nullglob
 
+# sanitize font_refs names containing brackets/commas which break sandbox URL serving
+# (base64=0 reports use external files; brackets previously worked only with base64 inline)
+if [ -d "${OUTDIR}/font_refs" ]; then
+  python3 - "$OUTDIR" << 'PY'
+import os, sys, pathlib
+outdir = pathlib.Path(sys.argv[1])
+fr = outdir / "font_refs"
+mapping = {}
+def sanitize(name):
+    # replace unsafe URL chars: [] , + ? # etc -> _
+    s = name
+    for ch in "[](),+":
+        s = s.replace(ch, "_")
+    # collapse __+
+    import re
+    s = re.sub(r"_+", "_", s)
+    return s
+
+for child in list(fr.iterdir()):
+    if not child.is_dir():
+        continue
+    orig = child.name
+    safe = sanitize(orig)
+    if safe != orig:
+        # avoid collision
+        target = fr / safe
+        i = 1
+        base = safe
+        while target.exists():
+            target = fr / f"{base}_{i}"
+            i += 1
+        child.rename(target)
+        mapping[orig] = target.name
+    else:
+        mapping[orig] = orig
+
+# rewrite index.html references
+idx = outdir / "index.html"
+txt = idx.read_text(encoding="utf-8", errors="ignore")
+for orig, safe in mapping.items():
+    if orig != safe:
+        txt = txt.replace(f'font_refs/{orig}/', f'font_refs/{safe}/')
+idx.write_text(txt, encoding="utf-8")
+print(f"sanitized {len([k for k,v in mapping.items() if k!=v])} font_ref dirs", file=sys.stderr)
+PY
+fi
+
 # enforce 0 base64
 BASE64_COUNT=$(grep -c "base64" "${OUTDIR}/index.html" || true)
 if [ "$BASE64_COUNT" -ne 0 ]; then

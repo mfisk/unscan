@@ -2,6 +2,13 @@
 
 use std::sync::OnceLock;
 
+// Canonical ink threshold: `< INK_THRESHOLD` is ink, `>= INK_THRESHOLD` is paper/whitespace.
+// Single source of truth for both scan-side trimming (`trim_words_to_ink`,
+// `ink_horizontal_extent`, `ink_vertical_extent`) and render-side cropping
+// (`verify.rs`). Must be 255 to keep 1px AA fringe (212,230) as ink and avoid
+// the 1px left-shift ZNCC failure seen in p2:L84 (diff blue-left/red-right).
+pub const INK_THRESHOLD: u8 = 255;
+
 // First-principles expected error from uniform quantization:
 pub const SIGMA_CENTER_THEORETICAL: f64 = 0.28867513459481287;
 pub const SIGMA_PITCH_THEORETICAL: f64 = 0.40824829046386302;

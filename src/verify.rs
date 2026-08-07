@@ -142,12 +142,18 @@ pub fn verify_text_region(
         scan_crop, &full_render, 12, bail_below,
     );
 
-    // Ink-crop render for display
-    let ink_threshold = 240u8;
+    // Ink-crop render for display - same threshold as scan box trim (single source of truth)
+    let ink_threshold = crate::ocr::INK_THRESHOLD;
     let (rw, rh) = full_render.dimensions();
+    // same functions as scan trim: `< threshold` is ink.
+    // scan uses trim_words_to_ink -> ink_horizontal_extent; we use identical pair for render.
     let (r_top, r_bot) = crate::ocr::ink_vertical_extent(&full_render, 0, rw, 0, rh, ink_threshold);
+    let (r_left, r_right) = crate::ocr::ink_horizontal_extent(&full_render, 0, rh, 0, rw, ink_threshold);
     let ink_h = r_bot.saturating_sub(r_top);
-    let render_ink = if ink_h >= 3 {
+    let ink_w = r_right.saturating_sub(r_left);
+    let render_ink = if ink_h >= 3 && ink_w >= 3 {
+        image::imageops::crop_imm(&full_render, r_left, r_top, ink_w, ink_h).to_image()
+    } else if ink_h >= 3 {
         image::imageops::crop_imm(&full_render, 0, r_top, rw, ink_h).to_image()
     } else {
         full_render

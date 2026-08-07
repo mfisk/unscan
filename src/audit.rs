@@ -89,6 +89,9 @@ pub struct AuditEntry {
     /// to avoid the bug where chosen==GT but ZNCC differs because GT used width-matched.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub midpoint_em_px: Option<f32>,
+    /// GT font's own midpoint em_px computed from GT's predicted span.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub gt_midpoint_em_px: Option<f32>,
     /// Whether this line was matched via the dominant-font fast path
     /// (skipping full classification).
     #[serde(skip_serializing_if = "std::ops::Not::not")]

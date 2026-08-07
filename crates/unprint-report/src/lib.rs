@@ -673,10 +673,22 @@ fn find_correct_ci_candidate(
 ) -> (Option<String>, Option<f32>, Option<usize>) {
     let gt_ps = ground_truth::strip_subset_prefix_str(actual_font);
 
-    // Match CI candidate's PostScript name against GT font.
-    // After GT canonicalization, both names are canonical — exact equality.
-    // Variant entries carry "PSName|tag" so they won't match base "PSName".
-    for (i, c) in entry.font_candidates.iter().enumerate() {
+    // font_candidates is always the winning path (font_pipeline.rs: winner → font_scores),
+    // font_candidates_lig is the losing path. Prioritize winner, fall back to loser
+    // so GT always shows a rank when it was scored in either path (fixes p4:L23
+    // where Caladea-400 is rank 1 in plain (loser) when ligature wins, and
+    // would otherwise show "not scored").
+    let primary = &entry.font_candidates;
+    let secondary = &entry.font_candidates_lig;
+
+    for (i, c) in primary.iter().enumerate() {
+        if let Some(fe) = find_font_by_key(font_catalog, &c.font_key) {
+            if fe.postscript_name == gt_ps {
+                return (Some(c.font_key.clone()), c.score, Some(i + 1));
+            }
+        }
+    }
+    for (i, c) in secondary.iter().enumerate() {
         if let Some(fe) = find_font_by_key(font_catalog, &c.font_key) {
             if fe.postscript_name == gt_ps {
                 return (Some(c.font_key.clone()), c.score, Some(i + 1));
@@ -888,10 +900,11 @@ fn build_miss_block(
         .font_matched
         .as_deref()
         .and_then(|m| {
-            entry
-                .font_candidates
+            // font_candidates is always the winner; font_candidates_lig is loser.
+            entry.font_candidates
                 .first()
                 .and_then(|c| find_font_by_key(font_catalog, &c.font_key))
+                .or_else(|| entry.font_candidates_lig.first().and_then(|c| find_font_by_key(font_catalog, &c.font_key)))
                 .or_else(|| find_font_in_catalog(font_catalog, m))
         });
 
@@ -1605,9 +1618,10 @@ fn render_correct_font_comparison(
 
     // Same pipeline as the chosen font — render, ZNCC, ink-crop for display
     // For GT comparison renders, allow ligatures so "fi" can shape correctly
-    // Fix: use midpoint_em_px when available so GT==Chosen doesn't get different ZNCC
-    // due to width-matched vs midpoint sizing. Previously GT always used None (width-matched)
-    // while chosen used midpoint, causing L9 PTSerif to show different renders even when equal.
+    // Fix: use GT's own midpoint_em_px computed from GT's predicted span, not winner's.
+    // Previously GT used winner's midpoint, causing 1.6% width error for p1:L7
+    // where GT 400Italic (5230) is wider than winner 300Italic (5148/5118).
+    let gt_em = entry.gt_midpoint_em_px.or(entry.midpoint_em_px);
     let vr = unprint::verify::verify_text_region(
         &scan_gray, font_data, &entry.text, &words,
         entry.bbox.x, entry.bbox.y,
@@ -1615,7 +1629,7 @@ fn render_correct_font_comparison(
         &fe.variant_tag, fe.variations.as_deref(),
         true,
         None, None,
-        entry.midpoint_em_px,
+        gt_em,
     );
 
     let render_uri = vr.render_ink.as_ref().map(|r| img_to_b64_uri(r));
@@ -1920,6 +1934,30 @@ fn build_observation_table(
     _glyph_map: &NgramGlyphMap,
     crop_dir_name: &str,
 ) -> String {
+    // Build fallback geo map from the alternate path (loser when winner is shown).
+    // When winner is ligature (contains ﬃ) and GT font lacks ligature support,
+    // its per_char_geo is None on winner path (pruned), so gt_geo_* are None.
+    // The plain (alt) path does have geo for the same characters (O, c, etc.),
+    // so we use it as fallback for display.
+    use std::collections::HashMap as FbMap;
+    let alt_obs_ref: &[unprint::audit::ObservationVote] = if crop_dir_name == "crops_alt" {
+        &entry.obs_votes
+    } else {
+        &entry.obs_votes_lig
+    };
+    // Map seq string -> (h_ll, v_ll, h_err, v_err, glyph_score, rank, prob)
+    let mut gt_fallback: FbMap<String, (Option<f32>, Option<f32>, Option<f32>, Option<f32>, Option<f32>, Option<usize>, Option<f32>)> = FbMap::new();
+    for ov in alt_obs_ref {
+        if ov.gt_geo_h_ll.is_some() || ov.gt_font_rank.is_some() {
+            let key: String = ov.seq.iter().collect();
+            // Keep first occurrence (plain path may have duplicates; first is fine)
+            gt_fallback.entry(key).or_insert((
+                ov.gt_geo_h_ll, ov.gt_geo_v_ll, ov.gt_geo_h_err, ov.gt_geo_v_err,
+                ov.gt_glyph_score, ov.gt_font_rank, ov.gt_font_prob,
+            ));
+        }
+    }
+
     let mut rows = String::new();
 
     for &(_idx, cv) in obs_to_show {
@@ -2014,10 +2052,30 @@ fn build_observation_table(
             cv.chosen_geo_h_ll, cv.chosen_geo_v_ll,
             cv.chosen_geo_h_err, cv.chosen_geo_v_err
         );
+        // Use fallback geo from alt path when winner path pruned GT (e.g., ligature
+        // path where GT lacks ﬃ support → per_char_geo returns None → gt_geo None).
+        let (gt_h, gt_v, gt_h_err, gt_v_err, gt_glyph, gt_rank_f, gt_prob_f) = if cv.gt_geo_h_ll.is_none() || cv.gt_font_rank.is_none() {
+            let seq_key: String = cv.seq.iter().collect();
+            if let Some((fh, fv, fhe, fve, fg, fr, fp)) = gt_fallback.get(&seq_key) {
+                (
+                    cv.gt_geo_h_ll.or(*fh),
+                    cv.gt_geo_v_ll.or(*fv),
+                    cv.gt_geo_h_err.or(*fhe),
+                    cv.gt_geo_v_err.or(*fve),
+                    cv.gt_glyph_score.or(*fg),
+                    cv.gt_font_rank.or(*fr),
+                    cv.gt_font_prob.or(*fp),
+                )
+            } else {
+                (cv.gt_geo_h_ll, cv.gt_geo_v_ll, cv.gt_geo_h_err, cv.gt_geo_v_err, cv.gt_glyph_score, cv.gt_font_rank, cv.gt_font_prob)
+            }
+        } else {
+            (cv.gt_geo_h_ll, cv.gt_geo_v_ll, cv.gt_geo_h_err, cv.gt_geo_v_err, cv.gt_glyph_score, cv.gt_font_rank, cv.gt_font_prob)
+        };
         let correct_detail = format_char_detail(
-            cv.gt_font_rank, cv.gt_font_prob, cv.gt_glyph_score,
-            cv.gt_geo_h_ll, cv.gt_geo_v_ll,
-            cv.gt_geo_h_err, cv.gt_geo_v_err
+            gt_rank_f, gt_prob_f, gt_glyph,
+            gt_h, gt_v,
+            gt_h_err, gt_v_err
         );
 
         let chosen_score_label = if !chosen_detail.is_empty() {

@@ -86,6 +86,9 @@ pub struct LineMatch {
     /// This reuses the exact scale calculation from geometry scoring for font-size,
     /// fixing L9 fox/jumps too-small issue where width-matched median was dragged down.
     pub midpoint_em_px: Option<f32>,
+    /// GT font's own midpoint em_px computed from GT's predicted span, not winner's.
+    /// Fixes p1:L7 1.6% scale error where GT rendered at winner size.
+    pub gt_midpoint_em_px: Option<f32>,
     /// Per-word segmentation summaries for audit integration.
     pub word_seg_summaries: Vec<crate::audit::WordSegSummary>,
     /// PFLDA OCR corrections with decision data.
@@ -216,6 +219,56 @@ pub fn match_lines(
         .and_then(|fm| font_cache.load(&fm.font_path).ok());
     let fast_path_hits = AtomicU64::new(0);
 
+    // ── Serialized diag-dir stale cleanup (before parallel work) ──
+    // Previously this was inside the par_iter with `let _ = remove_dir_all`,
+    // which could race and would silently ignore errors, and also deleted
+    // the dir that Pass1b had just recreated when old and new slugs are
+    // identical (line.text unchanged after word-split). We now clean once,
+    // serially, before any workers start.
+    if let Some(diag_root) = args.diag_seg_dir() {
+        let mut prefixes: Vec<String> = Vec::new();
+        for (li, _line) in lines.iter().enumerate() {
+            if audit_line_filter.as_ref().map_or(true, |f| f.contains(&li)) {
+                let line_num = li + 1;
+                prefixes.push(format!("p{}_L{:03}_", page_num, line_num));
+            }
+        }
+        if !prefixes.is_empty() {
+            match std::fs::read_dir(&diag_root) {
+                Ok(rd) => {
+                    for entry in rd.flatten() {
+                        if let Ok(ft) = entry.file_type() {
+                            if ft.is_dir() {
+                                let name = entry.file_name();
+                                let name_str = name.to_string_lossy();
+                                for pref in &prefixes {
+                                    if name_str.starts_with(pref) {
+                                        let path = entry.path();
+                                        if let Err(e) = std::fs::remove_dir_all(&path) {
+                                            eprintln!(
+                                                "[diag-clean] failed to remove stale {}: {}",
+                                                path.display(),
+                                                e
+                                            );
+                                        }
+                                        break;
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+                Err(e) => {
+                    eprintln!(
+                        "[diag-clean] failed to read diag root {}: {}",
+                        diag_root.display(),
+                        e
+                    );
+                }
+            }
+        }
+    }
+
     // Profiling accumulators (microseconds, atomic for par_iter)
     let line_matches: Vec<LineMatch> = lines.par_iter().enumerate().map(|(li, line)| {
         let line_num = li + 1; // 1-indexed for output
@@ -279,6 +332,7 @@ pub fn match_lines(
                     fast_path: true,
                     fast_path_score: Some(vr.score),
                     midpoint_em_px: None,
+                    gt_midpoint_em_px: None,
                     word_seg_summaries: Vec::new(),
                     ocr_corrections: Vec::new(),
                 };
@@ -310,29 +364,20 @@ pub fn match_lines(
         let font_scores_lig: Vec<(String, Option<f32>)>;
         let observations_lig: Vec<font_match::ObservationDetail>;
         let seg_winner: Option<String>;
-        let diag_seg_dir: Option<PathBuf> = args.diag_seg_dir()
+        let diag_seg_dir: Option<PathBuf> = args
+            .diag_seg_dir()
             .filter(|_| audit_line_filter.map_or(true, |f| f.contains(&li)))
             .map(|d| {
-            let line_slug: String = line.text.chars().take(30)
-                .map(|c| if c.is_alphanumeric() { c } else { '_' })
-                .collect();
-            let prefix = format!("p{}_L{:03}_", page_num, line_num);
-            // Remove stale diag dirs from prior runs with different word splits
-            if let Ok(rd) = std::fs::read_dir(&d) {
-                for entry in rd.flatten() {
-                    let name = entry.file_name();
-                    let name_str = name.to_string_lossy();
-                    if name_str.starts_with(&prefix)
-                        && entry.file_type().map(|t| t.is_dir()).unwrap_or(false)
-                    {
-                        let _ = std::fs::remove_dir_all(entry.path());
-                    }
-                }
-            }
-            let p = d.join(format!("p{}_L{:03}_{}", page_num, line_num, line_slug));
-            let _ = std::fs::create_dir_all(&p);
-            p
-        });
+                let line_slug: String = line
+                    .text
+                    .chars()
+                    .take(30)
+                    .map(|c| if c.is_alphanumeric() { c } else { '_' })
+                    .collect();
+                let p = d.join(format!("p{}_L{:03}_{}", page_num, line_num, line_slug));
+                let _ = std::fs::create_dir_all(&p);
+                p
+            });
         // Segment line (lazy crop data) (before font matching block so they're available after)
         let word_placements: Vec<crate::verify::WordPlacement> = line.words.iter()
             .map(|w| crate::verify::WordPlacement {
@@ -1091,11 +1136,55 @@ pub fn match_lines(
                 &crop_store_lig
             };
             let alt_font_key: Option<String> = font_scores_lig.first().map(|(k, _)| k.clone());
-            compute_obs_rank_probs(
+            let mut alt_rp = compute_obs_rank_probs(
                 &observations_lig, losing_crops,
                 alt_font_key.as_deref(), gt_font_key.as_deref(),
                 classifier, glyph_map,
-            )
+            );
+            // ── Fill geo for alt (loser) path as well, so fallback map in report has data ──
+            // This mirrors the winner-path fill_one above but uses losing segs/wib/pos.
+            let (lose_segs, lose_wib, lose_pos_map): (&[segment::WordSeg], &[crate::geometry_classifier::WordGeoMeasurement], &[(usize, usize)]) = if seg_winner.as_deref() == Some("ligature") {
+                // winner = lig, loser = plain
+                (line_crops.word_segs.as_slice(), wib_plain.as_slice(), plain_pos_map.as_slice())
+            } else {
+                // winner = plain, loser = lig
+                if let (Some(lig_segs), Some(wib_lig)) = (line_crops.lig_word_segs.as_ref(), wib_lig_opt.as_ref()) {
+                    (lig_segs.as_slice(), wib_lig.as_slice(), lig_pos_map.as_slice())
+                } else {
+                    (line_crops.word_segs.as_slice(), wib_plain.as_slice(), plain_pos_map.as_slice())
+                }
+            };
+            let fill_alt = |font_key: &str,
+                                h_ll_map: &mut std::collections::HashMap<usize, f32>,
+                                v_ll_map: &mut std::collections::HashMap<usize, f32>,
+                                h_err_map: &mut std::collections::HashMap<usize, f32>,
+                                v_err_map: &mut std::collections::HashMap<usize, f32>| {
+                if let Some(geos) = crate::geometry_classifier::per_char_geo_for_font(
+                    font_key, lose_segs, lose_wib, font_cache, geo_cache, font_registry,
+                ) {
+                    let mut lookup: std::collections::HashMap<(usize, usize), &crate::geometry_classifier::PerCharGeo> = std::collections::HashMap::with_capacity(geos.len());
+                    for g in &geos {
+                        lookup.insert((g.seg_idx, g.orig_idx), g);
+                    }
+                    for d in observations_lig.iter() {
+                        if let Some(&(seg_idx, char_pos)) = lose_pos_map.get(d.crop_index) {
+                            if let Some(pg) = lookup.get(&(seg_idx, char_pos)) {
+                                h_ll_map.insert(d.crop_index, pg.h_ll as f32);
+                                v_ll_map.insert(d.crop_index, pg.v_ll as f32);
+                                h_err_map.insert(d.crop_index, pg.h_err.unwrap_or(0.0) as f32);
+                                v_err_map.insert(d.crop_index, pg.v_err as f32);
+                            }
+                        }
+                    }
+                }
+            };
+            if let Some(ref afk) = alt_font_key {
+                fill_alt(afk, &mut alt_rp.chosen_geo_h_ll, &mut alt_rp.chosen_geo_v_ll, &mut alt_rp.chosen_geo_h_err, &mut alt_rp.chosen_geo_v_err);
+            }
+            if let Some(ref gfk) = gt_font_key {
+                fill_alt(gfk, &mut alt_rp.gt_geo_h_ll, &mut alt_rp.gt_geo_v_ll, &mut alt_rp.gt_geo_h_err, &mut alt_rp.gt_geo_v_err);
+            }
+            alt_rp
         } else {
             ObsRankProbs::default()
         };
@@ -1180,7 +1269,7 @@ pub fn match_lines(
         // (obs_span/pred_span * upem) and is robust to sidebearings.
         // Stored in LineMatch and later used as override for ZNCC verification
         // and for report Size row, fixing L9 fox/jumps too-small.
-        let midpoint_em_px = if let Some(ref fm) = font_result {
+        let (midpoint_em_px, gt_midpoint_em_px) = {
             let (win_segs_ref, win_wib_ref): (&[segment::WordSeg], &[crate::geometry_classifier::WordGeoMeasurement]) =
                 if seg_winner.as_deref() == Some("ligature") {
                     if let (Some(lig_segs), Some(wib_lig)) = (line_crops.lig_word_segs.as_ref(), wib_lig_opt.as_ref()) {
@@ -1191,12 +1280,20 @@ pub fn match_lines(
                 } else {
                     (line_crops.word_segs.as_slice(), wib_plain.as_slice())
                 };
-            crate::geometry_classifier::median_em_px_from_midpoints(&fm.font_key, win_segs_ref, win_wib_ref, geo_cache)
-        } else {
-            None
+            let mp = if let Some(ref fm) = font_result {
+                crate::geometry_classifier::median_em_px_from_midpoints(&fm.font_key, win_segs_ref, win_wib_ref, geo_cache)
+            } else {
+                None
+            };
+            let gt_mp = if let Some(ref gfk) = gt_font_key {
+                crate::geometry_classifier::median_em_px_from_midpoints(gfk, win_segs_ref, win_wib_ref, geo_cache)
+            } else {
+                None
+            };
+            (mp, gt_mp)
         };
 
-        LineMatch { font_result, text_color, font_scores, observations, font_scores_lig, observations_lig, seg_winner, diag_seg_dir, obs_rank_probs, alt_obs_rank_probs, tie_candidates: tie_candidates_audit, corrected_words, fast_path: false, fast_path_score: None, midpoint_em_px, word_seg_summaries, ocr_corrections: ocr_correction_audit }
+        LineMatch { font_result, text_color, font_scores, observations, font_scores_lig, observations_lig, seg_winner, diag_seg_dir, obs_rank_probs, alt_obs_rank_probs, tie_candidates: tie_candidates_audit, corrected_words, fast_path: false, fast_path_score: None, midpoint_em_px, gt_midpoint_em_px, word_seg_summaries, ocr_corrections: ocr_correction_audit }
     }).collect();
 
     let fp_hits = fast_path_hits.load(Ordering::Relaxed);

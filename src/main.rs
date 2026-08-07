@@ -408,6 +408,7 @@ fn build_audit_entry(
         ocr_text: None,
         ocr_correct: None,
         midpoint_em_px: lm.midpoint_em_px,
+        gt_midpoint_em_px: lm.gt_midpoint_em_px,
         fast_path: lm.fast_path,
         word_segmentation: lm.word_seg_summaries.clone(),
         ocr_corrections: lm.ocr_corrections.clone(),
@@ -874,11 +875,23 @@ fn run(args: &cli::Args, classifier: &mut dyn classifier::Classifier) -> Result<
                 rtd.as_ref(),
             );
             for li in split_indices {
+                // new_matches[li] is the fresh Pass 1b result, line_matches[li] is the stale Pass 1 result.
+                // If their diag dirs are the same path (slug derived from line.text, which
+                // doesn't change after word-split), we must NOT delete it, otherwise we delete
+                // the dir we just recreated.
+                let new_dir = new_matches[li].diag_seg_dir.clone();
                 std::mem::swap(&mut line_matches[li], &mut new_matches[li]);
-                // After swap, new_matches[li] holds pass 1's stale LineMatch.
-                // Remove its diag dir so the report finds pass 2's dir.
                 if let Some(old_dir) = new_matches[li].diag_seg_dir.as_ref() {
-                    let _ = std::fs::remove_dir_all(old_dir);
+                    if Some(old_dir) != new_dir.as_ref() {
+                        if let Err(e) = std::fs::remove_dir_all(old_dir) {
+                            eprintln!(
+                                "[diag-clean] failed to remove stale {}: {}",
+                                old_dir.display(),
+                                e
+                            );
+                        }
+                    }
+                    // else: same path as new_dir — keep it
                 }
             }
         }

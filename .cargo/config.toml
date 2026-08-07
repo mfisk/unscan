@@ -1,6 +1,8 @@
 [build]
 jobs = 1
 pipelining = true
+rustc-wrapper = "sccache"
+incremental = false
 
 # default for x86_64 = x86-64-v3 + mold — safe for distribution, no AVX512 SIGILL
 # use `cargo build --config target.x86_64-unknown-linux-gnu.rustflags='["-C","target-cpu=native"]'` for native speed
@@ -26,6 +28,30 @@ lto = false
 codegen-units = 64
 incremental = true
 split-debuginfo = "off"
+
+[profile.bap]
+inherits = "release"
+# balanced for total time: release build is 11-17m + 4m audit = 15-21m
+# fastbuild is 20s + 9-11m audit = 9-11m but slower unprint offset
+# bap = opt2 + lto off + codegen16 = ~2-3m build + ~4.5-5.5m audit = ~7-8m total
+opt-level = 2
+lto = false
+codegen-units = 16
+debug = 0
+incremental = false
+strip = "debuginfo"
+panic = "abort"
+
+[profile.bap-opt1]
+inherits = "release"
+# even faster build, slightly slower audit: try if total < bap
+opt-level = 1
+lto = false
+codegen-units = 32
+debug = 0
+incremental = false
+strip = "debuginfo"
+panic = "abort"
 
 [profile.portable]
 inherits = "release"
