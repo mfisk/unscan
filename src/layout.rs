@@ -156,9 +156,30 @@ pub fn baseline_aligned_baseline_pt<F: Font>(
 // Shared rustybuzz shaping
 // ---------------------------------------------------------------------------
 
-/// Build OT feature list from a variant tag (e.g. "smcp", "onum").
+/// Build OT feature list from a variant tag (e.g. "smcp", "onum", "allcaps").
 pub fn ot_features(variant_tag: &str) -> Vec<unprint_fonts::rustybuzz::Feature> {
-    if !variant_tag.is_empty() && variant_tag.len() <= 4 {
+    if variant_tag.is_empty() {
+        return vec![];
+    }
+    // Combined allcaps variant: enables both Capital Spacing and Case-Sensitive Forms.
+    // These are orthogonal and additive per OT spec, typically both on for All Caps.
+    if variant_tag == "allcaps" || variant_tag == "caps" {
+        let cpsp = unprint_fonts::ttf_parser::Tag::from_bytes(b"cpsp");
+        let case = unprint_fonts::ttf_parser::Tag::from_bytes(b"case");
+        return vec![
+            unprint_fonts::rustybuzz::Feature::new(cpsp, 1, ..),
+            unprint_fonts::rustybuzz::Feature::new(case, 1, ..),
+        ];
+    }
+    if variant_tag == "cpsp" {
+        let tag = unprint_fonts::ttf_parser::Tag::from_bytes(b"cpsp");
+        return vec![unprint_fonts::rustybuzz::Feature::new(tag, 1, ..)];
+    }
+    if variant_tag == "case" {
+        let tag = unprint_fonts::ttf_parser::Tag::from_bytes(b"case");
+        return vec![unprint_fonts::rustybuzz::Feature::new(tag, 1, ..)];
+    }
+    if variant_tag.len() <= 4 {
         let mut tag_bytes = [b' '; 4];
         for (i, b) in variant_tag.as_bytes().iter().enumerate().take(4) {
             tag_bytes[i] = *b;

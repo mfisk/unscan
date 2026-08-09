@@ -8,7 +8,6 @@ use std::io::{BufReader, BufWriter, Read, Write};
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicUsize, Ordering};
 
-use rayon::prelude::*;
 use rand::prelude::*;
 use rand::rngs::SmallRng;
 
@@ -1098,7 +1097,7 @@ pub fn run_train(mut args: TrainArgs) {
                 }
                 let mut is_cached = true;
                 let mut needs_incr = false;
-                for (i, (&cur, &old)) in current_counts_by_seq.iter().zip(old_counts.iter()).enumerate() {
+                for (_i, (&cur, &old)) in current_counts_by_seq.iter().zip(old_counts.iter()).enumerate() {
                     if cur < old {
                         is_cached = false;
                         needs_incr = false;
@@ -1121,7 +1120,7 @@ pub fn run_train(mut args: TrainArgs) {
         }
     }
     // Merge full_needed and incr handling below
-    let mut needed_combos = full_needed.clone(); // full rebuild combos use same render path initially
+    let needed_combos = full_needed.clone(); // full rebuild combos use same render path initially
 
     if needed_combos.is_empty() && incr_combos.is_empty() {
         let total_cached: usize = cached_combos.iter()
@@ -1819,7 +1818,7 @@ impl RuntimeTrainingData {
     /// Returns None if the feature cache doesn't exist.
     pub fn from_registry(
         font_registry: &crate::font_scan::FontRegistry,
-        glyph_map: &crate::glyph_map::NgramGlyphMap,
+        _glyph_map: &crate::glyph_map::NgramGlyphMap,
         render_params: &crate::char_render::RenderParams,
     ) -> Option<Self> {
         let sequences: Vec<Vec<char>> = crate::features::supported_chars().iter().map(|&c| vec![c]).collect();

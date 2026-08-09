@@ -642,6 +642,23 @@ impl GeometryCache {
         has_upper
     }
 
+    #[inline]
+    fn is_allcaps_variant(font_key: &str) -> bool {
+        // Enable variant: font_key contains |allcaps, |cpsp, |case, |caps, etc.
+        // Default (no variant) = no case/cpsp — matches WeasyPrint/CSS default (off).
+        // With |allcaps we apply both case + cpsp when all-caps context holds.
+        // Individual |cpsp / |case still work as before, orthogonal.
+        let lk = font_key.to_ascii_lowercase();
+        lk.contains("|allcaps")
+            || lk.contains("[allcaps")
+            || lk.contains("|cpsp")
+            || lk.contains("[cpsp")
+            || lk.contains("|case")
+            || lk.contains("[case")
+            || lk.contains("|caps")
+            || lk.contains("[caps")
+    }
+
     fn case_single_adjustment_full(&self, f: &FontMmapIndex, gid: u16) -> [i32;4] {
         let d = self.data();
         let mut acc = [0i32;4];
@@ -866,7 +883,9 @@ impl GeometryCache {
             }
         }
         // ── case/cpsp conditional ──
-        let apply_case = Self::is_all_caps_context(chars);
+        // Default = no case/cpsp (matches WeasyPrint/CSS default). Enable only when
+        // font variant explicitly asks for caps handling: |cpsp, |case, |caps.
+        let apply_case = Self::is_all_caps_context(chars) && Self::is_allcaps_variant(font_key);
         let mut case_singles: Vec<[i32;4]> = vec![[0;4]; n];
         let mut case_pair_firsts: Vec<[i32;4]> = vec![[0;4]; n];
         let mut case_pair_seconds: Vec<[i32;4]> = vec![[0;4]; n];
@@ -927,7 +946,7 @@ impl GeometryCache {
                 pair_seconds[i+1] = v2;
             }
         }
-        let apply_case = Self::is_all_caps_context(chars);
+        let apply_case = Self::is_all_caps_context(chars) && Self::is_allcaps_variant(font_key);
         let mut case_singles: Vec<[i32;4]> = vec![[0;4]; n];
         let mut case_pair_firsts: Vec<[i32;4]> = vec![[0;4]; n];
         let mut case_pair_seconds: Vec<[i32;4]> = vec![[0;4]; n];
@@ -965,73 +984,6 @@ impl GeometryCache {
         }
         Some(out)
     }
-
-    pub fn predict_word_ink_extent(&self, font_key: &str, chars: &[char], _font_data: &[u8], _em_px: f64) -> Option<(f64,f64)> {
-        let f = self.fonts.get(font_key)?;
-        let mut gids: Vec<Option<u16>> = Vec::with_capacity(chars.len());
-        for &c in chars { gids.push(self.cmap_gid(f, c)); }
-        for g in &gids { if g.is_none() { return None; } }
-        let n = gids.len();
-        if n==0 { return Some((1.0,1.0)); }
-
-        let mut singles: Vec<[i32;4]> = Vec::with_capacity(n);
-        for i in 0..n { singles.push(self.single_adjustment_full(f, gids[i].unwrap())); }
-        let mut pair_firsts: Vec<[i32;4]> = vec![[0;4]; n];
-        let mut pair_seconds: Vec<[i32;4]> = vec![[0;4]; n];
-        for i in 0..n.saturating_sub(1) {
-            let (v1,v2)=self.pair_adjustment_full(f, gids[i].unwrap(), gids[i+1].unwrap());
-            pair_firsts[i]=v1;
-            pair_seconds[i+1]=v2;
-        }
-        let apply_case = Self::is_all_caps_context(chars);
-        let mut case_singles: Vec<[i32;4]> = vec![[0;4]; n];
-        let mut case_pair_firsts: Vec<[i32;4]> = vec![[0;4]; n];
-        let mut case_pair_seconds: Vec<[i32;4]> = vec![[0;4]; n];
-        if apply_case {
-            for i in 0..n { case_singles[i]=self.case_single_adjustment_full(f, gids[i].unwrap()); }
-            for i in 0..n.saturating_sub(1) {
-                let (v1,v2)=self.case_pair_adjustment_full(f, gids[i].unwrap(), gids[i+1].unwrap());
-                case_pair_firsts[i]=v1; case_pair_seconds[i+1]=v2;
-            }
-        }
-
-        let mut total_adv = 0.0f64;
-        let mut min_y = f64::INFINITY;
-        let mut max_y = f64::NEG_INFINITY;
-        for i in 0..n {
-            let gid = gids[i].unwrap() as usize;
-            let (adv, _x0, _x1, y0, y1) = self.glyph_metrics(f, gid)?;
-            let s = singles[i];
-            let pf = pair_firsts[i];
-            let ps = pair_seconds[i];
-            let cs = case_singles[i];
-            let cpf = case_pair_firsts[i];
-            let cps = case_pair_seconds[i];
-            let y_pla = (s[1] + pf[1] + ps[1] + cs[1] + cpf[1] + cps[1]) as f64;
-            let x_adv_adj = (s[2] + pf[2] + ps[2] + cs[2] + cpf[2] + cps[2]) as f64;
-            total_adv += adv + x_adv_adj;
-            let y0a = y0 + y_pla;
-            let y1a = y1 + y_pla;
-            min_y = min_y.min(y0a.min(y1a));
-            max_y = max_y.max(y0a.max(y1a));
-        }
-        if !min_y.is_finite() { min_y=0.0; max_y=1.0; }
-        Some((total_adv.max(1.0), (max_y-min_y).max(1.0)))
-    }
-
-    pub fn predict_word_ink_width_sum(&self, font_key: &str, chars: &[char]) -> Option<f64> {
-        let f = self.fonts.get(font_key)?;
-        let mut total_ink_w = 0.0f64;
-        for &c in chars {
-            let gid = self.cmap_gid(f, c)? as usize;
-            let (_adv, x0, x1, _y0, _y1) = self.glyph_metrics(f, gid)?;
-            total_ink_w += (x1 - x0) as f64;
-        }
-        Some(total_ink_w.max(1.0))
-    }
-
-    pub fn predict_glyph_x(&self, _seg_idx: usize, _orig_idx: usize) -> Option<f64> { None }
-    pub fn predict_glyph_y(&self, _seg_idx: usize, _orig_idx: usize) -> Option<f64> { None }
 
     // reconstruct OwnedFont from mmap index for incremental reuse
     fn mmap_index_to_owned(&self, findex: &FontMmapIndex) -> OwnedFont {

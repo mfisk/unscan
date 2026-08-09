@@ -1,5 +1,19 @@
 #!/usr/bin/env bash
 set -euo pipefail
+# publish-report.sh — copies audit report + external images for sandbox:// serving
+#
+# Constraints:
+# - base64 must be 0 (report uses external font_refs/images, not inline)
+# - bracket chars [](),+ in font_ref names break sandbox URL serving → sanitize to _
+# - Space (Hatch Spaces / static hosting) enforces 500-file limit per publish
+#   — font_refs alone is ~20k files (20895 in 2026-08-08 inkfix), pdirs ~525, images ~1.3k
+#   → Space cannot host BAP reports directly. Use workspace/your_files (sandbox://)
+#   which has no such limit. If you must use Space, tar or prune font_refs.
+#   p2:L84 is the tightest case: 1px AA fringe 212/230 must count as ink (threshold 255)
+#   or ZNCC sees blue-left/red-right shift. See crates/unprint-geometry/src/params.rs:10.
+# - assets/ prefix: newer report templates reference assets/images/* and assets/font_refs/*
+#   — we copy both bare and assets/ layouts for compatibility. If SRC has assets/,
+#   copy it whole; if OUT references assets/ but SRC doesn't, symlink/copy will be handled.
 SRC="${1:-test-docs/audit}"
 PREFIX="${2:-report}"
 TS="$(date +%Y%m%d-%H%M%S)"
@@ -17,12 +31,29 @@ else
   echo "publish-report: no report.html in $SRC" >&2; exit 2
 fi
 
-# copy assets
-for d in images font_refs; do
+# copy assets (bare + assets/ layout)
+for d in images font_refs assets; do
   if [ -d "${SRC}/${d}" ]; then
     cp -a "${SRC}/${d}" "${OUTDIR}/"
   fi
 done
+# Also handle report that references assets/images but SRC has bare images/
+# — ensure both layouts exist in OUTDIR for missing_refs=0
+if [ -d "${OUTDIR}/images" ] && [ ! -d "${OUTDIR}/assets" ]; then
+  mkdir -p "${OUTDIR}/assets"
+  ln -sfn ../images "${OUTDIR}/assets/images" 2>/dev/null || cp -a "${OUTDIR}/images" "${OUTDIR}/assets/images"
+fi
+if [ -d "${OUTDIR}/font_refs" ] && [ ! -e "${OUTDIR}/assets/font_refs" ]; then
+  mkdir -p "${OUTDIR}/assets"
+  ln -sfn ../font_refs "${OUTDIR}/assets/font_refs" 2>/dev/null || cp -a "${OUTDIR}/font_refs" "${OUTDIR}/assets/font_refs"
+fi
+# If SRC has assets/ but no bare dirs, create bare symlinks for old templates
+if [ -d "${OUTDIR}/assets/images" ] && [ ! -d "${OUTDIR}/images" ]; then
+  ln -sfn assets/images "${OUTDIR}/images" 2>/dev/null || cp -a "${OUTDIR}/assets/images" "${OUTDIR}/images"
+fi
+if [ -d "${OUTDIR}/assets/font_refs" ] && [ ! -d "${OUTDIR}/font_refs" ]; then
+  ln -sfn assets/font_refs "${OUTDIR}/font_refs" 2>/dev/null || cp -a "${OUTDIR}/assets/font_refs" "${OUTDIR}/font_refs"
+fi
 
 # copy p dirs (p0_*, p1_*, p[0-9]_L* etc)
 shopt -s nullglob

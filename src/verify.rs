@@ -311,7 +311,7 @@ fn render_via_freetype(
     // aren't clipped.  After rendering, we trim back to the scan width.
     let render_pad: u32 = 20;
     let render_w = (canvas_w + render_pad) * render_scale;
-    let final_w = canvas_w * render_scale;  // target width after trim
+    let _final_w = canvas_w * render_scale;  // target width after trim
     let render_em = line_em_px * render_scale as f32;
 
     // The caller's canvas_h is the OCR-expanded bbox — sized to the scan's
@@ -427,59 +427,28 @@ fn render_via_freetype(
     }
     } // end raw blit scope, release canvas_raw borrow
 
-    // Measure rendered ink extent and correct for advance-vs-ink mismatch.
-    // width_matched_em_px matches advance width to target, but the OCR bbox
-    // is ink extent (excluding sidebearings). Resize to match.
-    // Raw-buffer ink scan: avoids get_pixel in hot any() loop.
-    let (rend_ink_left, rend_ink_right) = {
-        let raw = canvas.as_raw();
-        let w = canvas.width() as usize;
-        let h = canvas.height() as usize;
-        let mut left = w as u32;
-        for x in 0..w {
-            let mut found = false;
-            for y in 0..h {
-                if raw[y * w + x] < 240 {
-                    found = true;
-                    break;
-                }
-            }
-            if found {
-                left = x as u32;
-                break;
-            }
-        }
-        let mut right = 0u32;
-        for x in (0..w).rev() {
-            let mut found = false;
-            for y in 0..h {
-                if raw[y * w + x] < 240 {
-                    found = true;
-                    break;
-                }
-            }
-            if found {
-                right = x as u32 + 1;
-                break;
-            }
-        }
-        (left, right)
-    };
-    let target_ink_w = words.iter().map(|w| w.x_off as u32 + w.width).max().unwrap_or(canvas_w);
-    // Scale canvas horizontally so rendered ink extent matches scan ink extent (the OCR bbox).
-    // Only apply if there's a meaningful difference (>1px) and rendered ink is non-empty.
-    let rendered_ink_w = rend_ink_right.saturating_sub(rend_ink_left);
-    let target_ink_w_rs = target_ink_w * render_scale;
-    if rendered_ink_w > 0 && rendered_ink_w.abs_diff(target_ink_w_rs) > render_scale {
-        let scale_x = target_ink_w_rs as f64 / rendered_ink_w as f64;
-        let new_w = (canvas.width() as f64 * scale_x).round() as u32;
-        canvas = image::imageops::resize(&canvas, new_w, canvas.height(), image::imageops::FilterType::Lanczos3);
+    // Trim to ink using shared canonical threshold — do NOT scale to fill w+20.
+    // The +20 padding is safety margin for rasterization only. The correct scale
+    // comes from override_em_px (midpoint-derived) or width_matched_em_px,
+    // not from forcing ink to fill the padded width. We keep whatever ink exists
+    // and crop to its bounds, preserving overhang that landed in padding.
+    let ink_thresh = crate::ocr::INK_THRESHOLD;
+    let (rend_ink_left, rend_ink_right) =
+        crate::ocr::ink_horizontal_extent(&canvas, 0, canvas.height(), 0, canvas.width(), ink_thresh);
+    let (rend_ink_top, rend_ink_bottom) =
+        crate::ocr::ink_vertical_extent(&canvas, 0, canvas.width(), 0, canvas.height(), ink_thresh);
+    let ink_w = rend_ink_right.saturating_sub(rend_ink_left);
+    let ink_h = rend_ink_bottom.saturating_sub(rend_ink_top);
+    if ink_w >= 3 && ink_h >= 3 {
+        canvas = image::imageops::crop_imm(&canvas, rend_ink_left, rend_ink_top, ink_w, ink_h).to_image();
+    } else {
+        // Fallback: if ink measurement failed, keep at least the scan width
+        // but don't force fill — preserve white padding on right if no ink there.
+        let keep_w = rend_ink_right.max(canvas_w).min(canvas.width());
+        let keep_h = rend_ink_bottom.max(canvas.height()).min(canvas.height());
+        let kh = if keep_h < 3 { canvas.height() } else { keep_h };
+        canvas = image::imageops::crop_imm(&canvas, 0, 0, keep_w, kh).to_image();
     }
-
-    // Trim render padding: crop (not resize!) back to the scan bbox width.
-    // The extra padding was only to avoid clipping during glyph rasterisation.
-    let trim_w = final_w.min(canvas.width());
-    canvas = image::imageops::crop_imm(&canvas, 0, 0, trim_w, canvas.height()).to_image();
 
     // Downsample from render resolution to 1x (keep expanded height if canvas was grown)
     if render_scale > 1 {

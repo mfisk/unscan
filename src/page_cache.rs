@@ -13,7 +13,7 @@
 //!   - `source-meta.json` — mtime + size for invalidation
 
 use crate::ocr::TextRegion;
-use image::{DynamicImage, GrayImage, Luma};
+use image::{DynamicImage, GrayImage};
 use std::path::{Path, PathBuf};
 
 /// Cached OCR results for a single page.

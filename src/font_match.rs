@@ -280,7 +280,7 @@ pub fn identify_fonts<'a>(
     let mut cannot_render: FxHashSet<&'a str> = FxHashSet::default();
     let mut kept_candidates: Vec<&'a str> = Vec::new();
     let mut pruned_count: usize = 0;
-    let mut total_candidates: usize = 0;
+    let total_candidates: usize;
 
     let mut ensure_set: FxHashSet<&'a str> = FxHashSet::default();
     for &fk in ensure_font_keys {

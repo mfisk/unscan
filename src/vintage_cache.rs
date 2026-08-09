@@ -31,7 +31,7 @@
 //! on upgrade — intentional migration to readable names. Delete old `*.ttf` in vintage dir
 //! if you need to reclaim space.
 
-use std::hash::{Hash, Hasher};
+use std::hash::Hash;
 use std::path::{Path, PathBuf};
 
 use read_fonts::types::Tag;

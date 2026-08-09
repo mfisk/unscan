@@ -66,7 +66,7 @@ pub struct PerCharGeo {
 // When expressed in em units, sigma_em = sigma_px / em_px, so sigma_em is a
 // function of how many pixels per em we sampled at. In pixel space sigma_px is
 // constant, which is why we compute h_ll/v_ll directly in pixels.
-use unprint_geometry::params::{quant_half_width_center_px, quant_half_width_pitch_px, quant_half_width_px, quantized_ll, SIGMA_CENTER_PX, SIGMA_PITCH_PX};
+use unprint_geometry::params::{quant_half_width_center_px, quant_half_width_pitch_px, quantized_ll, SIGMA_CENTER_PX, SIGMA_PITCH_PX};
 
 /// Measure ink bounds for each character in a word.
 ///
@@ -326,19 +326,14 @@ fn per_char_geo_cached_with_threshold(
                 .unwrap_or_else(|| {
                     // fallback to height ratio if span degenerate (should be rare)
                     let obs_h = word_bounds.iter().map(|b| b.height).fold(0.0_f64, f64::max).max(1.0);
-                    let pred_h = geo_cache
-                        .predict_word_ink_extent(font_key, &ws.chars, &[], 0.0)
-                        .map(|(_, h)| h)
-                        .unwrap_or(1000.0);
+                    let pred_h = preds_fu_ext.iter().map(|(_,_,y_min,y_max)| (y_max - y_min).abs()).fold(0.0_f64, f64::max).max(1.0);
                     obs_h / pred_h.max(1.0)
                 })
         } else {
             // single char: fall back to height ratio (h_err is None anyway)
             let obs_h = word_bounds[0].height.max(1.0);
-            let pred_h = geo_cache
-                .predict_word_ink_extent(font_key, &ws.chars, &[], 0.0)
-                .map(|(_, h)| h)
-                .unwrap_or(1000.0);
+            let (_,_, y_min, y_max) = preds_fu_ext[0];
+            let pred_h = (y_max - y_min).abs().max(1.0);
             obs_h / pred_h.max(1.0)
         };
 
@@ -636,12 +631,10 @@ pub fn median_em_px_from_midpoints(
     if upem <= 0.0 {
         return None;
     }
-    // Reuse the shared word-scales path — single loop, cheaper predict (cx only),
-    // no y-extents, no duplicate math. This removes the previous duplicate
-    // `predict_glyph_positions_and_extents` call that geometry scoring had already done.
     let scales = word_scales_for_font(font_key, segs, wib, geo_cache);
     em_from_word_scales(&scales, upem)
 }
+
 
 /// Compute per-word center-span scales for a font without re-shaping twice.
 /// This is the shared path that both geometry scoring and sizing can use,
@@ -675,6 +668,7 @@ pub fn word_scales_for_font(
     }
     scales
 }
+
 
 pub fn em_from_word_scales(scales: &[f64], upem: f64) -> Option<f32> {
     if scales.is_empty() || upem <= 0.0 { return None; }

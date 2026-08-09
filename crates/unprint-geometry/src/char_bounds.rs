@@ -72,13 +72,6 @@ fn coverage_lut() -> &'static [f64; 256] {
     })
 }
 
-#[inline]
-fn coverage(p: u8, _gamma: f64) -> f64 {
-    // gamma ignored - LUT already built from env gamma; fast path for fractional edge calls
-    // that pass gamma param. For per-pixel loops we use LUT directly.
-    coverage_lut()[p as usize]
-}
-
 /// Measure ink bounds for each character in a word.
 ///
 /// Batch API: takes whole word image + char slice + boundaries + seam paths,

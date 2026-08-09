@@ -206,8 +206,10 @@ pub fn ssim_windowed(a: &GrayImage, b: &GrayImage, b_dy: i32, bail_below: Option
     let c1: f64 = (0.01 * 255.0_f64).powi(2);
     let c2: f64 = (0.03 * 255.0_f64).powi(2);
 
-    // Ink threshold: a pixel is "ink" if its value < 240
-    const INK_THRESHOLD: u8 = 240;
+    // Canonical ink threshold — must match crates/unprint-geometry/src/params.rs:10 = 255.
+    // 240 is wrong (drops 1px AA fringe 212/230, causes p2:L84 1px left-shift ZNCC failure).
+    // Use 255 to keep AA fringe as ink.
+    const INK_THRESHOLD: u8 = 255;
     // Minimum number of ink pixels in a window to count it
     const MIN_INK_PIXELS: u32 = 3;
 
@@ -597,7 +599,8 @@ pub fn zncc_windowed(a: &GrayImage, b: &GrayImage, b_dy: i32, bail_below: Option
     }
 
     let kernel = gaussian_kernel_11x11();
-    const INK_THRESHOLD: u8 = 240;
+    // Canonical 255 — see params.rs:10. 240 drops AA fringe and breaks p2:L84 ZNCC.
+    const INK_THRESHOLD: u8 = 255;
     const MIN_INK_PIXELS: u32 = 3;
 
     let half = 5i32;

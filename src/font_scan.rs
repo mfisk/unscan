@@ -849,6 +849,39 @@ pub fn scan_fonts(dirs: &[PathBuf], quiet: bool) -> Vec<FontEntry> {
                     };
                     fonts.push(var_entry);
                 }
+                // ── allcaps enable variant (case + cpsp) ──
+                // Default is no case/cpsp (matches WeasyPrint/CSS). The |allcaps
+                // variant opts in to both, orthogonal and additive per OT spec.
+                // Only emit when the font actually defines either table —
+                // don't add a no-op variant when neither exists.
+                if font_has_caps_tables(&fe.data) {
+                    let tag = "allcaps".to_string();
+                    // Avoid duplicate if detect_ot_variants ever started returning it
+                    if !variants.iter().any(|(t, _)| t == &tag) {
+                        let mut combined_lig = Vec::new();
+                        for &(lig_c, gid) in &ligatures {
+                            combined_lig.push((lig_c, gid));
+                        }
+                        let allcaps_entry = FontEntry {
+                            path: fe.path.clone(),
+                            family_name: format!("{} [{}]", fe.family_name, tag),
+                            postscript_name: format!("{}|{}", fe.postscript_name, tag),
+                            raw_postscript_name: fe.raw_postscript_name.clone(),
+                            is_bold: fe.is_bold,
+                            is_italic: fe.is_italic,
+                            class: fe.class,
+                            data: Vec::new(),
+                            oldstyle_figures: fe.oldstyle_figures,
+                            variant_tag: tag.clone(),
+                            font_key_cache: format!("{}|{}|{}", fe.postscript_name, tag, tag),
+                            glyph_overrides: if combined_lig.is_empty() { None } else { Some(combined_lig) },
+                            variations: None,
+                            typographic_family: fe.typographic_family.clone(),
+                            vintage_era: None,
+                        };
+                        fonts.push(allcaps_entry);
+                    }
+                }
                 // Drop font bytes — metadata + path is all we keep.
                 // Index build and matching load from path on demand.
                 let mut fe = fe;
@@ -1426,6 +1459,35 @@ fn detect_ot_variants(data: &[u8]) -> Vec<(String, Vec<(char, u16)>)> {
     }
 
     variants
+}
+
+/// Returns true if the font's GPOS or GSUB contains a 'case' or 'cpsp' Feature.
+/// We must not emit |allcaps when neither table exists (pure no-op variant).
+fn font_has_caps_tables(data: &[u8]) -> bool {
+    let face = match unprint_fonts::ttf_parser::Face::parse(data, 0) {
+        Ok(f) => f,
+        Err(_) => return false,
+    };
+    // Check both GPOS and GSUB for feature tags
+    for table_tag in [b"GPOS", b"GSUB"] {
+        let tag = unprint_fonts::ttf_parser::Tag::from_bytes(table_tag);
+        let Some(tbl) = face.raw_face().table(tag) else { continue };
+        if tbl.len() < 10 { continue; }
+        // Table header: version (4), scriptListOffset (2), featureListOffset (2), lookupListOffset (2)
+        // Offsets are relative to start of table
+        let feature_list_off = u16::from_be_bytes([tbl[6], tbl[7]]) as usize;
+        if feature_list_off + 2 > tbl.len() { continue; }
+        let feature_count = u16::from_be_bytes([tbl[feature_list_off], tbl[feature_list_off+1]]) as usize;
+        for i in 0..feature_count {
+            let rec_off = feature_list_off + 2 + i*6;
+            if rec_off + 6 > tbl.len() { break; }
+            let t = &tbl[rec_off..rec_off+4];
+            if t == b"case" || t == b"cpsp" {
+                return true;
+            }
+        }
+    }
+    false
 }
 
 /// Ligature probe sequences: (input_chars, unicode_ligature_char).

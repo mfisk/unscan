@@ -24,6 +24,7 @@ pub fn center_span_scale(obs_first: f64, obs_last: f64, pred_first: f64, pred_la
     }
 }
 
+
 /// Convert scale (px per font unit) to em_px using upem.
 #[inline]
 pub fn em_from_scale(scale: f64, upem: f64) -> f32 {
@@ -51,3 +52,4 @@ pub fn is_sizing_anchor(chars: &[char]) -> bool {
     }
     chars.iter().any(|c| c.is_alphabetic())
 }
+
