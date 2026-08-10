@@ -22,7 +22,9 @@ pub struct WordSegSummary {
     pub mismatch: bool,
     pub ws_splits: Vec<u32>,
     pub seam_splits: Vec<u32>,
+    #[serde(skip_serializing)]
     pub seam_paths: Arc<HashMap<u32, Vec<[u32; 2]>>>,
+    #[serde(skip_serializing)]
     pub seam_costs: Arc<HashMap<u32, crate::segment::SeamCost>>,
 }
 
