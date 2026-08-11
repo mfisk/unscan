@@ -1289,6 +1289,7 @@ pub struct SeamCost {
 
 /// Segmentation summary for a single word — returned from segmentation
 /// for audit integration. Does not include large debug arrays
+#[derive(Debug, Clone)]
 pub struct SegSummary {
     pub image_w: u32,
     pub image_h: u32,
@@ -1558,6 +1559,36 @@ fn collapse_ligature_chars(chars: &[char]) -> Vec<char> {
     while i < chars.len() {
         let mut matched = false;
         for &(seq, lig_char) in LIGATURE_SEQUENCES {
+            if i + seq.len() <= chars.len() && chars[i..i + seq.len()] == *seq {
+                out.push(lig_char);
+                i += seq.len();
+                matched = true;
+                break;
+            }
+        }
+        if !matched {
+            out.push(chars[i]);
+            i += 1;
+        }
+    }
+    out
+}
+
+/// Per-font ligature collapse: only collapse a sequence if the resulting
+/// ligature unicode char is in `allowed` (font's supported lig set).
+/// Greedy longest-first, same as `collapse_ligature_chars`.  Empty allowed → identity.
+pub fn collapse_ligature_chars_for_allowed(chars: &[char], allowed: &HashSet<char>) -> Vec<char> {
+    if allowed.is_empty() {
+        return chars.to_vec();
+    }
+    let mut out = Vec::with_capacity(chars.len());
+    let mut i = 0;
+    while i < chars.len() {
+        let mut matched = false;
+        for &(seq, lig_char) in LIGATURE_SEQUENCES {
+            if !allowed.contains(&lig_char) {
+                continue;
+            }
             if i + seq.len() <= chars.len() && chars[i..i + seq.len()] == *seq {
                 out.push(lig_char);
                 i += seq.len();

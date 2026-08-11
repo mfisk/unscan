@@ -372,6 +372,7 @@ fn build_audit_entry(
         gt_midpoint_em_px: lm.gt_midpoint_em_px,
         fast_path: lm.fast_path,
         word_segmentation: lm.word_seg_summaries.clone(),
+        gt_word_segmentation: lm.gt_word_seg_summaries.clone(),
         ocr_corrections: lm.ocr_corrections.clone(),
     }
 }

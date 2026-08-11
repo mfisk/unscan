@@ -101,6 +101,9 @@ pub struct AuditEntry {
     /// Per-word segmentation summaries for this line.
     #[serde(skip_serializing_if = "Vec::is_empty")]
     pub word_segmentation: Vec<WordSegSummary>,
+    /// GT font per-word segmentation summaries – always included when GT scored.
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub gt_word_segmentation: Vec<WordSegSummary>,
     /// PFLDA OCR corrections with decision data.
     #[serde(skip_serializing_if = "Vec::is_empty")]
     pub ocr_corrections: Vec<OcrCorrection>,

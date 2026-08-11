@@ -153,6 +153,265 @@ impl FontEntry {
             has_var,
         );
     }
+
+    /// Set of ligature unicode codepoints (FB00–FB04) that this font
+    /// truly collapses as one contiguous ink blob.
+    ///
+    /// Historically this was called `allowed_lig_set` and was derived only from
+    /// `glyph_overrides` + cmap + GSUB shaping.  That led to fonts that claim a
+    /// ligature via GSUB but render it as two separate inks (e.g., separate f
+    /// and i with a 100% vertical white gutter) still being treated as collapsed.
+    /// Those should be scored as separate characters.
+    ///
+    /// New name is `collapsed_lig_set`.  It filters the supported set by
+    /// checking actual glyph ink for a clear vertical whitespace (no white
+    /// padding, 100% top-to-bottom).  Two-char ligs (ff, fi, fl) need ≥1 such
+    /// interior gutter to be excluded; three-char ligs (ffi, ffl) need ≥2.
+    /// Only FB00–FB04 are considered; quote ligature probes are excluded.
+    pub fn collapsed_lig_set(&self) -> std::collections::HashSet<char> {
+        let mut set = std::collections::HashSet::new();
+        // Fast path: anything already known from glyph_overrides.
+        if let Some(ref ov) = self.glyph_overrides {
+            for (ch, _gid) in ov {
+                match *ch {
+                    '\u{FB00}' | '\u{FB01}' | '\u{FB02}' | '\u{FB03}' | '\u{FB04}' => {
+                        set.insert(*ch);
+                    }
+                    _ => {}
+                }
+            }
+        }
+
+        // Probe the actual font file for cmap and GSUB liga support if not full.
+        // This handles stale caches and fonts where GSUB produced a ligature but
+        // cmap does not contain FBxx.  We gather the full supported set first,
+        // then filter by ink contiguity below so even the fast-path 5-entry case
+        // gets filtered.
+        let mut data_cache: Option<Vec<u8>> = None;
+        if set.len() < 5 {
+            if let Ok(data) = std::fs::read(&self.path) {
+                if let Ok(font) = unprint_fonts::ab_glyph::FontRef::try_from_slice(&data) {
+                    for &lig in &['\u{FB00}', '\u{FB01}', '\u{FB02}', '\u{FB03}', '\u{FB04}'] {
+                        if set.contains(&lig) {
+                            continue;
+                        }
+                        if font.glyph_id(lig).0 != 0 {
+                            set.insert(lig);
+                        }
+                    }
+                }
+                if let Some(face) = unprint_fonts::rustybuzz::Face::from_slice(&data, 0) {
+                    let liga_tag = unprint_fonts::ttf_parser::Tag::from_bytes(b"liga");
+                    let dlig_tag = unprint_fonts::ttf_parser::Tag::from_bytes(b"dlig");
+                    let features = [
+                        unprint_fonts::rustybuzz::Feature::new(liga_tag, 1, ..),
+                        unprint_fonts::rustybuzz::Feature::new(dlig_tag, 1, ..),
+                    ];
+                    for &(probe, lig_char) in LIGATURE_PROBES {
+                        match lig_char {
+                            '\u{FB00}' | '\u{FB01}' | '\u{FB02}' | '\u{FB03}' | '\u{FB04}' => {},
+                            _ => continue,
+                        }
+                        if set.contains(&lig_char) {
+                            continue;
+                        }
+                        if probe.chars().count() <= 1 {
+                            continue;
+                        }
+                        let mut buf = unprint_fonts::rustybuzz::UnicodeBuffer::new();
+                        buf.push_str(probe);
+                        let out = unprint_fonts::rustybuzz::shape(&face, &features, buf);
+                        if out.glyph_infos().len() == 1 && out.glyph_infos()[0].glyph_id != 0 {
+                            set.insert(lig_char);
+                        }
+                    }
+                }
+                data_cache = Some(data);
+            }
+        } else {
+            // Even when we had 5 entries from overrides, we still need file data
+            // for ink-contiguity filtering below.
+            if let Ok(data) = std::fs::read(&self.path) {
+                data_cache = Some(data);
+            }
+        }
+
+        // --- collapsed filtering: exclude ligs that are really two/three inks ---
+        if let Some(ref data) = data_cache {
+            let mut to_remove = Vec::new();
+            for &lig in &set.clone().into_iter().collect::<Vec<_>>() {
+                let required_gaps = match lig {
+                    '\u{FB00}' | '\u{FB01}' | '\u{FB02}' => 1usize, // ff, fi, fl -> 2 chars
+                    '\u{FB03}' | '\u{FB04}' => 2usize,               // ffi, ffl -> 3 chars
+                    _ => continue,
+                };
+                let gaps = Self::count_vertical_gaps_for_lig(data, lig);
+                if gaps >= required_gaps {
+                    to_remove.push(lig);
+                }
+            }
+            for lig in to_remove {
+                set.remove(&lig);
+            }
+        }
+
+        set
+    }
+
+    /// Back-compat shim: old name kept for any missed call sites.
+    #[allow(dead_code)]
+    pub fn allowed_lig_set(&self) -> std::collections::HashSet<char> {
+        self.collapsed_lig_set()
+    }
+
+    /// Count interior 100% top-to-bottom white vertical gutters inside the glyph
+    /// for `lig_char`. No white padding around glyph — tight ink bounds only.
+    /// Returns number of whitespace regions separating ink (0,1,2...).
+    fn count_vertical_gaps_for_lig(data: &[u8], lig_char: char) -> usize {
+        // High-res 200px no-hint (ab_glyph has no hinting) gives outline truth.
+        // We also produce a low-res ~40px sample for parity with spec, but decision
+        // uses high-res strict gap (100% height). Low-res is used only as sanity
+        // that gap persists across scale; if it merges due to AA we still honour high-res.
+        let high = Self::vertical_gaps_at_scale(data, lig_char, 200.0, 20.0 / 255.0);
+        if high == 0 {
+            return 0;
+        }
+        // Low-res 40px hinted attempt via same ab_glyph (unhinted) – if font lacks
+        // outline at that size due to rasterizer limits, ignore.  We return high
+        // as final count because clear outline whitespace is the definition.
+        let _low = Self::vertical_gaps_at_scale(data, lig_char, 40.0, 20.0 / 255.0);
+        high
+    }
+
+    fn vertical_gaps_at_scale(data: &[u8], lig_char: char, px: f32, cov_thresh: f32) -> usize {
+        let font = match unprint_fonts::ab_glyph::FontRef::try_from_slice(data) {
+            Ok(f) => f,
+            Err(_) => return 0,
+        };
+        let scale = unprint_fonts::ab_glyph::PxScale::from(px);
+        let sf = font.as_scaled(scale);
+        let gid = font.glyph_id(lig_char);
+        if gid.0 == 0 {
+            return 0;
+        }
+        let glyph = gid.with_scale_and_position(scale, unprint_fonts::ab_glyph::point(0.0, sf.ascent()));
+        let outlined = match font.outline_glyph(glyph) {
+            Some(o) => o,
+            None => return 0,
+        };
+        let bounds = outlined.px_bounds();
+        let w_f = bounds.max.x - bounds.min.x;
+        let h_f = bounds.max.y - bounds.min.y;
+        if w_f < 1.0 || h_f < 1.0 {
+            return 0;
+        }
+        let w = w_f.ceil() as usize;
+        let h = h_f.ceil() as usize;
+        if w < 2 || h < 2 || w > 4096 || h > 4096 {
+            return 0;
+        }
+        // Tight bitmap, no padding.
+        let mut ink = vec![false; w * h];
+        outlined.draw(|gx, gy, cov| {
+            if cov <= cov_thresh {
+                return;
+            }
+            if (gx as usize) < w && (gy as usize) < h {
+                ink[gy as usize * w + gx as usize] = true;
+            } else if (gx as usize) < w && (gy as usize) >= h {
+                // clamped by ceil differences – ignore out-of-range draws
+            }
+        });
+
+        // Scan columns for full-height emptiness (100% top-to-bottom).
+        let mut gap_cols = Vec::new();
+        for x in 0..w {
+            let mut any_ink = false;
+            for y in 0..h {
+                if ink[y * w + x] {
+                    any_ink = true;
+                    break;
+                }
+            }
+            if !any_ink {
+                gap_cols.push(x);
+            }
+        }
+        if gap_cols.is_empty() {
+            return 0;
+        }
+
+        // Group consecutive empty columns into single whitespace regions.
+        let mut gaps: Vec<(usize, usize)> = Vec::new(); // (start,end inclusive)
+        let mut start = gap_cols[0];
+        let mut prev = gap_cols[0];
+        for &cx in gap_cols.iter().skip(1) {
+            if cx == prev + 1 {
+                prev = cx;
+            } else {
+                gaps.push((start, prev));
+                start = cx;
+                prev = cx;
+            }
+        }
+        gaps.push((start, prev));
+
+        // Filter: interior only, not touching outer edge (since bounds are tight,
+        // any edge empty column is artifact of ceil). Also require ≥3px ink on
+        // both sides at 200px to avoid dot-on-i isolated pixel being counted.
+        let mut valid = 0usize;
+        for (gs, ge) in gaps {
+            if gs == 0 || ge + 1 >= w {
+                continue; // touching edge – ignore
+            }
+            // left side ink mass ≥3px columns with any ink
+            let mut left_mass = 0usize;
+            for lx in 0..gs {
+                let mut col_has = false;
+                for ly in 0..h {
+                    if ink[ly * w + lx] {
+                        col_has = true;
+                        break;
+                    }
+                }
+                if col_has {
+                    left_mass += 1;
+                }
+                if left_mass >= 3 {
+                    break;
+                }
+            }
+            if left_mass < 1 {
+                continue;
+            }
+            let mut right_mass = 0usize;
+            for rx in (ge + 1)..w {
+                let mut col_has = false;
+                for ry in 0..h {
+                    if ink[ry * w + rx] {
+                        col_has = true;
+                        break;
+                    }
+                }
+                if col_has {
+                    right_mass += 1;
+                }
+                if right_mass >= 3 {
+                    break;
+                }
+            }
+            if right_mass < 1 {
+                continue;
+            }
+            // At high-res we require strict 3px sides per spec; at low-res
+            // the same helper runs with px=40 where 3px still meaningful.
+            if px >= 100.0 && (left_mass < 3 || right_mass < 3) {
+                continue;
+            }
+            valid += 1;
+        }
+        valid
+    }
 }
 
 /// Indexed collection of discovered fonts, keyed by `font_key()`.
@@ -362,7 +621,7 @@ pub fn default_font_dirs(extra: &[PathBuf]) -> Vec<PathBuf> {
 //     typographic_family_len: u32 le + [u8; typographic_family_len]
 
 const FSCN_MAGIC: &[u8; 4] = b"FSCN";
-const FSCN_VERSION: u32 = 4;
+const FSCN_VERSION: u32 = 6;
 
 pub(crate) fn scan_cache_path() -> PathBuf {
     crate::cache::paths::font_scan_bin()

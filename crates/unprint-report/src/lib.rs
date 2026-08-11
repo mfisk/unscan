@@ -796,13 +796,6 @@ fn build_miss_block(
         String::new()
     };
 
-    // Scan line image with word bbox + segmentation overlays
-    let scan_line_html = if let Some(ref dd) = diag_dir {
-        build_scan_line_with_overlays(dd, entry)
-    } else {
-        String::new()
-    };
-
     // Similarity (ZNCC) info
     let sim_html = match (entry.similarity_score, entry.similarity_pass) {
         (Some(score), Some(pass)) => {
@@ -1021,6 +1014,17 @@ fn build_miss_block(
         }
     };
 
+    // GT vs winner seam viz – two separate viz, no crop grid per user request
+    // Chosen and GT both use canonical seam viz code (build_scan_line_with_overlays_inner)
+    let gt_seg_summary_html = build_gt_segmentation_summary(entry);
+
+    let chosen_scan_line_html = if let Some(ref dd) = diag_dir {
+        build_scan_line_with_overlays(dd, entry)
+    } else { String::new() };
+    let gt_scan_line_html = if let Some(ref dd) = diag_dir {
+        build_gt_scan_line_with_overlays(dd, entry)
+    } else { String::new() };
+
     let html = format!(
         "<div class=\"miss\">\
          <h3>p{}:L{}{}{}  </h3>\
@@ -1034,13 +1038,24 @@ fn build_miss_block(
          {}\
          {}\
          {}\
+         {}\
+         {}\
          </div>",
         entry.page, entry.line_index, miss_kind_label, sim_html,
         text_preview,
-        seg_path_html, font_scores_html, lig_compare_html, scan_line_html, sim_compare_html, tie_break_html, obs_table_html,
+        seg_path_html, font_scores_html, lig_compare_html, chosen_scan_line_html, gt_scan_line_html, gt_seg_summary_html, sim_compare_html, tie_break_html, obs_table_html,
         obs_table_lig_html, ocr_override_html,
     );
     (html, entry.similarity_score, gt_sim)
+}
+
+fn build_gt_segmentation_summary(entry: &AuditEntry) -> String {
+    if entry.gt_word_segmentation.is_empty() { return String::new(); }
+    let mut parts: Vec<String> = Vec::new();
+    for ws in &entry.gt_word_segmentation {
+        parts.push(format!("“{}” {}/{} ws{:?} seam{:?}", ws.word_text, ws.n_segments_produced, ws.n_chars_expected, ws.ws_splits, ws.seam_splits));
+    }
+    format!("<div class='scan-line-label'>GT Segmentation: {}</div>", parts.join(" | "))
 }
 
 /// Build ligature vs plain segmentation visual comparison.
@@ -1156,15 +1171,14 @@ fn build_lig_comparison_block(diag_dir: &Path, entry: &AuditEntry) -> String {
     )
 }
 
-/// Build scan line image with word bbox and segmentation path overlays.
-/// Replicates the Python report `render_scan_line_with_word_boxes()`:
-///   - scan_line.png as the background (colour crop of the word-union region)
-///   - Raw Tesseract word bboxes: dotted orange outlines
-///   - Final post-processed word bboxes: dashed cyan outlines
-///   - VP splits: blue vertical lines with column labels
-///   - Seam paths: magenta diagonal paths with column labels
-///   - Pixel-scale ruler at top of each final word box
-fn build_scan_line_with_overlays(diag_dir: &Path, entry: &AuditEntry) -> String {
+fn build_scan_line_with_overlays_inner(
+    diag_dir: &Path,
+    entry: &AuditEntry,
+    segs: &[unprint::audit::WordSegSummary],
+    header_label: &str,
+) -> String {
+    // This is the canonical seam viz code – reused for both chosen and GT.
+    // No substitute logic – same VP vs seam overlay drawing as before.
     // Prefer scan_line.png (full-colour); fall back to ssim_scan.png (grayscale)
     let scan_path = diag_dir.join("scan_line.png");
     let origin_path = diag_dir.join("scan_line_origin.json");
@@ -1173,7 +1187,6 @@ fn build_scan_line_with_overlays(diag_dir: &Path, entry: &AuditEntry) -> String 
             Some(u) => u,
             None => return String::new(),
         };
-        // Read crop origin
         let (ox, oy) = if let Ok(data) = std::fs::read_to_string(&origin_path) {
             let v: serde_json::Value = serde_json::from_str(&data).unwrap_or_default();
             (
@@ -1185,7 +1198,6 @@ fn build_scan_line_with_overlays(diag_dir: &Path, entry: &AuditEntry) -> String 
         };
         (uri, ox, oy)
     } else {
-        // Fall back to ssim_scan.png (legacy file name for similarity scan)
         let scan_fallback_path = diag_dir.join("ssim_scan.png");
         if !scan_fallback_path.exists() {
             return String::new();
@@ -1196,7 +1208,6 @@ fn build_scan_line_with_overlays(diag_dir: &Path, entry: &AuditEntry) -> String 
         }
     };
 
-    // Get image dimensions for the container
     let (img_w, img_h) = if scan_path.exists() {
         image::image_dimensions(&scan_path)
             .unwrap_or((entry.bbox.width, entry.bbox.height))
@@ -1206,7 +1217,7 @@ fn build_scan_line_with_overlays(diag_dir: &Path, entry: &AuditEntry) -> String 
             .unwrap_or((entry.bbox.width, entry.bbox.height))
     };
 
-    let scale = 1u32; // 1× native resolution
+    let scale = 1u32;
     let margin_top = 18 * scale;
     let margin_bot = 14 * scale;
     let canvas_w = img_w * scale;
@@ -1214,7 +1225,6 @@ fn build_scan_line_with_overlays(diag_dir: &Path, entry: &AuditEntry) -> String 
 
     let mut overlays = String::new();
 
-    // Raw Tesseract boxes — dotted orange
     for wb in &entry.word_bboxes_raw {
         let bx = (wb.x.saturating_sub(crop_x)) * scale;
         let by = (wb.y.saturating_sub(crop_y)) * scale + margin_top;
@@ -1226,7 +1236,6 @@ fn build_scan_line_with_overlays(diag_dir: &Path, entry: &AuditEntry) -> String 
         ));
     }
 
-    // Final post-processed boxes — dashed cyan
     for wb in &entry.word_bboxes {
         let bx = (wb.x.saturating_sub(crop_x)) * scale;
         let by = (wb.y.saturating_sub(crop_y)) * scale + margin_top;
@@ -1236,14 +1245,11 @@ fn build_scan_line_with_overlays(diag_dir: &Path, entry: &AuditEntry) -> String 
             "<rect x=\"{bx}\" y=\"{by}\" width=\"{bw}\" height=\"{bh}\" \
              fill=\"none\" stroke=\"rgba(0,200,220,0.85)\" stroke-width=\"1\" stroke-dasharray=\"4,2\"/>"
         ));
-
-        // Pixel-scale ruler at top of each final word box
         let wb_px_w = wb.width;
         let mut col = 0u32;
         while col <= wb_px_w {
             let sx = bx + col * scale + scale / 2;
             if col % 10 == 0 {
-                // Major tick + label
                 overlays.push_str(&format!(
                     "<line x1=\"{sx}\" y1=\"{}\" x2=\"{sx}\" y2=\"{}\" \
                      stroke=\"rgba(140,140,140,0.7)\" stroke-width=\"1\"/>\
@@ -1252,7 +1258,6 @@ fn build_scan_line_with_overlays(diag_dir: &Path, entry: &AuditEntry) -> String 
                     by.saturating_sub(6), by, by.saturating_sub(9), by.saturating_sub(9)
                 ));
             } else {
-                // Minor tick
                 overlays.push_str(&format!(
                     "<line x1=\"{sx}\" y1=\"{}\" x2=\"{sx}\" y2=\"{}\" \
                      stroke=\"rgba(180,180,180,0.6)\" stroke-width=\"1\"/>",
@@ -1263,8 +1268,7 @@ fn build_scan_line_with_overlays(diag_dir: &Path, entry: &AuditEntry) -> String 
         }
     }
 
-    // Segmentation paths from audit entry word_segmentation
-    for ws in &entry.word_segmentation {
+    for ws in segs {
         if ws.image_w == 0 || ws.image_h == 0 {
             continue;
         }
@@ -1282,7 +1286,6 @@ fn build_scan_line_with_overlays(diag_dir: &Path, entry: &AuditEntry) -> String 
 
         let label_y = wy + wb_h + 2;
 
-        // Whitespace splits — blue vertical lines
         for &col in &ws.ws_splits {
             let cx = wx + (col as f64 * sx_f) as u32;
             overlays.push_str(&format!(
@@ -1294,8 +1297,6 @@ fn build_scan_line_with_overlays(diag_dir: &Path, entry: &AuditEntry) -> String 
             ));
         }
 
-        // Seam paths — magenta diagonal paths (one x per row)
-        // seam_paths now includes candidate (unused) paths too; only draw accepted ones.
         let seam_split_set: std::collections::HashSet<u32> = ws.seam_splits.iter().copied().collect();
         for (col_key, path) in ws.seam_paths.iter() {
             if !seam_split_set.contains(col_key) { continue; }
@@ -1309,7 +1310,6 @@ fn build_scan_line_with_overlays(diag_dir: &Path, entry: &AuditEntry) -> String 
                      fill=\"rgba(255,0,200,0.8)\"/>",
                 ));
             }
-            // Column label
             let cx = wx + (*col_key as f64 * sx_f) as u32;
             overlays.push_str(&format!(
                 "<text x=\"{}\" y=\"{label_y}\" font-size=\"7\" \
@@ -1318,7 +1318,6 @@ fn build_scan_line_with_overlays(diag_dir: &Path, entry: &AuditEntry) -> String 
             ));
         }
 
-        // Seam splits without paths — magenta vertical lines
         let seam_path_keys: std::collections::HashSet<u32> = ws.seam_paths.keys().copied().collect();
         for &col in &ws.seam_splits {
             if !seam_path_keys.contains(&col) {
@@ -1334,13 +1333,12 @@ fn build_scan_line_with_overlays(diag_dir: &Path, entry: &AuditEntry) -> String 
         }
     }
 
-    // Build the segmentation stats line
-    let seg_stats = build_seg_stats(diag_dir, entry);
+    let seg_stats = build_seg_stats_for_segs(diag_dir, entry, segs, header_label);
 
     format!(
         "<div class=\"scan-line-block\">\
-         <div class=\"scan-line-label\">\
-         Scan line: <span style=\"color:#ffa000\">···</span> raw box · \
+         <div class='scan-line-label'>\
+         {}: <span style=\"color:#ffa000\">···</span> raw box · \
          <span style=\"color:#00c8dc\">- -</span> final box · \
          <span style=\"color:#2864dc\">│</span> v-whitespace · \
          <span style=\"color:#ff00c8\">╲</span> seam</div>\
@@ -1351,30 +1349,47 @@ fn build_scan_line_with_overlays(diag_dir: &Path, entry: &AuditEntry) -> String 
          </svg></div>\
          {seg_stats}\
          </div>",
+        header_label,
         cw = img_w * scale,
         ch = img_h * scale,
     )
 }
 
-fn build_seg_stats(_diag_dir: &Path, entry: &AuditEntry) -> String {
-    if entry.word_segmentation.is_empty() {
+/// Build scan line image with word bbox and segmentation path overlays.
+/// Replicates the Python report `render_scan_line_with_word_boxes()`:
+///   - scan_line.png as the background (colour crop of the word-union region)
+///   - Raw Tesseract word bboxes: dotted orange outlines
+///   - Final post-processed word bboxes: dashed cyan outlines
+///   - VP splits: blue vertical lines with column labels
+///   - Seam paths: magenta diagonal paths with column labels
+///   - Pixel-scale ruler at top of each final word box
+/// Canonical seam viz code – reused without substitution.
+fn build_scan_line_with_overlays(diag_dir: &Path, entry: &AuditEntry) -> String {
+    // Chosen segmentation – uses canonical seam viz code via inner
+    build_scan_line_with_overlays_inner(diag_dir, entry, &entry.word_segmentation, "Chosen segmentation")
+}
+
+fn build_gt_scan_line_with_overlays(diag_dir: &Path, entry: &AuditEntry) -> String {
+    if entry.gt_word_segmentation.is_empty() {
         return String::new();
     }
+    build_scan_line_with_overlays_inner(diag_dir, entry, &entry.gt_word_segmentation, "GT segmentation")
+}
 
-    // Build word text → x position map for left-to-right ordering
-    let word_x_map: HashMap<&str, u32> = entry
+fn build_seg_stats_for_segs(_diag_dir: &Path, entry: &AuditEntry, segs: &[unprint::audit::WordSegSummary], header: &str) -> String {
+    if segs.is_empty() {
+        return String::new();
+    }
+    let word_x_map: std::collections::HashMap<&str, u32> = entry
         .word_bboxes
         .iter()
         .map(|wb| (wb.text.as_str(), wb.x))
         .collect();
-
     let mut seg_parts: Vec<(u32, String)> = Vec::new();
-
-    for ws in &entry.word_segmentation {
+    for ws in segs {
         let wtext = &ws.word_text;
         let n_exp = ws.n_chars_expected.to_string();
         let n_got = ws.n_segments_produced.to_string();
-
         let word_x = word_x_map.get(wtext.as_str()).copied().unwrap_or(999999u32);
         let mut info = format!("&quot;{wtext}&quot; {n_got}/{n_exp}");
         if ws.mismatch {
@@ -1383,29 +1398,22 @@ fn build_seg_stats(_diag_dir: &Path, entry: &AuditEntry) -> String {
         let mut tags = Vec::new();
         let nvp = ws.ws_splits.len();
         let nseam = ws.seam_splits.len();
-        if nvp > 0 {
-            tags.push(format!("{nvp} vert"));
-        }
-        if nseam > 0 {
-            tags.push(format!("{nseam} seam"));
-        }
+        if nvp > 0 { tags.push(format!("{nvp} vert")); }
+        if nseam > 0 { tags.push(format!("{nseam} seam")); }
         if !tags.is_empty() {
             info.push_str(&format!(" ({})", tags.join(", ")));
         }
         seg_parts.push((word_x, info));
     }
-
-    if seg_parts.is_empty() {
-        return String::new();
-    }
+    if seg_parts.is_empty() { return String::new(); }
     seg_parts.sort_by_key(|t| t.0);
-    let stats = seg_parts
-        .iter()
-        .map(|(_, info)| info.as_str())
-        .collect::<Vec<_>>()
-        .join(" | ");
-    format!("<div class=\"scan-line-label\">Segmentation: {stats}</div>")
+    let stats = seg_parts.iter().map(|(_, info)| info.as_str()).collect::<Vec<_>>().join(" | ");
+    format!("<div class='scan-line-label'>{}: {}</div>", header, stats)
 }
+
+
+
+
 
 /// Render the correct (ground-truth) font for a miss entry and produce
 /// base64 URIs for the render image and its diff against the scan crop.
