@@ -189,7 +189,7 @@ fn img_td(uri: Option<&str>) -> String {
 }
 
 /// Ink bounding-box midpoint (cx, cy) for a grayscale image.
-/// Ink = pixel < 200 (same threshold as geometry_classifier).
+/// Ink = pixel < INK_THRESH (same threshold as geometry_classifier, 255).
 /// Returns None for blank images.
 fn ink_midpoint(img: &GrayImage) -> Option<(f32, f32)> {
     let (w, h) = img.dimensions();
@@ -203,7 +203,7 @@ fn ink_midpoint(img: &GrayImage) -> Option<(f32, f32)> {
     for y in 0..h_us {
         let row = y * w_us;
         for x in 0..w_us {
-            if raw[row + x] < 200 {
+            if raw[row + x] < unprint::INK_THRESH {
                 if (x as i32) < x_min { x_min = x as i32; }
                 if x as i32 > x_max { x_max = x as i32; }
                 if (y as i32) < y_min { y_min = y as i32; }
@@ -699,6 +699,24 @@ fn find_correct_ci_candidate(
 
 // ── HTML block generation ───────────────────────────────────────────────────
 
+/// True if two WordSegSummary slices describe the same k segmentation
+/// (same word order, same expected/produced counts, same ws and seam splits).
+fn segs_same(a: &[unprint::audit::WordSegSummary], b: &[unprint::audit::WordSegSummary]) -> bool {
+    if a.len() != b.len() {
+        return false;
+    }
+    for (x, y) in a.iter().zip(b) {
+        if x.n_chars_expected != y.n_chars_expected
+            || x.n_segments_produced != y.n_segments_produced
+            || x.ws_splits != y.ws_splits
+            || x.seam_splits != y.seam_splits
+        {
+            return false;
+        }
+    }
+    true
+}
+
 /// Returns (html_block, chosen_zncc, gt_zncc).
 fn build_miss_block(
     ce: &ClassifiedEntry,
@@ -1016,14 +1034,39 @@ fn build_miss_block(
 
     // GT vs winner seam viz – two separate viz, no crop grid per user request
     // Chosen and GT both use canonical seam viz code (build_scan_line_with_overlays_inner)
-    let gt_seg_summary_html = build_gt_segmentation_summary(entry);
+    // If both GT and chosen use same k for segmentation, only show it once.
+    let same_k = !entry.word_segmentation.is_empty()
+        && !entry.gt_word_segmentation.is_empty()
+        && segs_same(&entry.word_segmentation, &entry.gt_word_segmentation);
 
-    let chosen_scan_line_html = if let Some(ref dd) = diag_dir {
-        build_scan_line_with_overlays(dd, entry)
-    } else { String::new() };
-    let gt_scan_line_html = if let Some(ref dd) = diag_dir {
-        build_gt_scan_line_with_overlays(dd, entry)
-    } else { String::new() };
+    let (gt_seg_summary_html, chosen_scan_line_html, gt_scan_line_html) = if same_k {
+        // Same k: build only one viz using canonical inner, label as shared.
+        let chosen_html = if let Some(ref dd) = diag_dir {
+            build_scan_line_with_overlays_inner(
+                dd,
+                entry,
+                &entry.word_segmentation,
+                "Same k (GT and chosen) – Segmentation",
+            )
+        } else {
+            String::new()
+        };
+        // No separate GT summary or viz when k identical
+        (String::new(), chosen_html, String::new())
+    } else {
+        let gt_summary = build_gt_segmentation_summary(entry);
+        let chosen = if let Some(ref dd) = diag_dir {
+            build_scan_line_with_overlays(dd, entry)
+        } else {
+            String::new()
+        };
+        let gt = if let Some(ref dd) = diag_dir {
+            build_gt_scan_line_with_overlays(dd, entry)
+        } else {
+            String::new()
+        };
+        (gt_summary, chosen, gt)
+    };
 
     let html = format!(
         "<div class=\"miss\">\
