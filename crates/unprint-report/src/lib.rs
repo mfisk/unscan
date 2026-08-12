@@ -267,8 +267,10 @@ fn format_char_detail(
     v_ll: Option<f32>,
     h_err: Option<f32>,
     v_err: Option<f32>,
+    opp_glyph: Option<f32>,
+    opp_h: Option<f32>,
+    opp_v: Option<f32>,
 ) -> String {
-    // Requested: "rank 1, p=#×u<br>glyph: #<br>midpoint x,y (delta x,ypx)"
     let mut out = String::new();
     if let Some(r) = rank {
         out.push_str(&format!("<span class='font-mini'>rank {r}</span>"));
@@ -277,34 +279,54 @@ fn format_char_detail(
         if !out.is_empty() { out.push_str(", "); }
         out.push_str(&format!("<span class='num'>p={pu:.1}×u</span>"));
     }
-    if out.is_empty() && glyph_score.is_none() && h_ll.is_none() && v_ll.is_none() && h_err.is_none() && v_err.is_none() {
+    let empty_main = out.is_empty() && glyph_score.is_none() && h_ll.is_none() && v_ll.is_none() && h_err.is_none() && v_err.is_none();
+    if empty_main {
         return String::new();
     }
-    // line break between total score and glyph score
     if !out.is_empty() { out.push_str("<br>"); }
-    // glyph: raw logit -d²/(2σ²) — not ln(joint prob)
     if let Some(gs) = glyph_score {
-        out.push_str(&format!("<span class='logprob'>glyph: {gs:.2}</span>"));
+        let cls = match opp_glyph {
+            Some(og) if gs > og + 1e-6 => " dim-win",
+            Some(og) if gs < og - 1e-6 => " dim-lose",
+            _ => "",
+        };
+        out.push_str(&format!("<span class='logprob{cls}'>glyph: {gs:.2}</span>"));
     } else if let Some(pu) = prob_x_u {
-        // fallback: if glyph_score missing (old audit), show ln(joint) as approximation
         if pu > 0.0 {
             out.push_str(&format!("<span class='logprob'>glyph: {:.2}</span>", pu.ln()));
         }
     }
-    // midpoint scores + deltas
     let has_mid = h_ll.is_some() || v_ll.is_some();
     let has_delta = h_err.is_some() || v_err.is_some();
     if has_mid || has_delta {
-        // line break between glyph score and midpoint scores
         if glyph_score.is_some() || prob_x_u.is_some() { out.push_str("<br>"); }
         out.push_str("<span class='geo'>midpoint ");
-        if let Some(h) = h_ll { out.push_str(&format!("h {h:.2}")); }
+        if let Some(h) = h_ll {
+            let cls = match opp_h {
+                Some(oh) if h > oh + 1e-6 => "dim-win",
+                Some(oh) if h < oh - 1e-6 => "dim-lose",
+                _ => "",
+            };
+            if cls.is_empty() {
+                out.push_str(&format!("h {h:.2}"));
+            } else {
+                out.push_str(&format!("<span class='{cls}'>h {h:.2}</span>"));
+            }
+        }
         if let Some(v) = v_ll {
             if h_ll.is_some() { out.push(' '); }
-            out.push_str(&format!("v {v:.2}"));
+            let cls = match opp_v {
+                Some(ov) if v > ov + 1e-6 => "dim-win",
+                Some(ov) if v < ov - 1e-6 => "dim-lose",
+                _ => "",
+            };
+            if cls.is_empty() {
+                out.push_str(&format!("v {v:.2}"));
+            } else {
+                out.push_str(&format!("<span class='{cls}'>v {v:.2}</span>"));
+            }
         }
         if !has_mid && has_delta {
-            // no h_ll/v_ll, just deltas
             out.push_str("—");
         }
         if has_delta {
@@ -1931,13 +1953,6 @@ fn build_observation_table(
             _ => ("", ""),
         };
 
-        let chosen_detail = format_char_detail(
-            cv.chosen_rank, cv.chosen_prob, cv.chosen_glyph_score,
-            cv.chosen_geo_h_ll, cv.chosen_geo_v_ll,
-            cv.chosen_geo_h_err, cv.chosen_geo_v_err
-        );
-        // Use fallback geo from alt path when winner path pruned GT (e.g., ligature
-        // path where GT lacks ﬃ support → per_char_geo returns None → gt_geo None).
         let (gt_h, gt_v, gt_h_err, gt_v_err, gt_glyph, gt_rank_f, gt_prob_f) = if cv.gt_geo_h_ll.is_none() || cv.gt_font_rank.is_none() {
             let seq_key: String = cv.seq.iter().collect();
             if let Some((fh, fv, fhe, fve, fg, fr, fp)) = gt_fallback.get(&seq_key) {
@@ -1956,10 +1971,18 @@ fn build_observation_table(
         } else {
             (cv.gt_geo_h_ll, cv.gt_geo_v_ll, cv.gt_geo_h_err, cv.gt_geo_v_err, cv.gt_glyph_score, cv.gt_font_rank, cv.gt_font_prob)
         };
+        // For GT debugging: pass each side's opponent for per-dimension coloring
+        let chosen_detail = format_char_detail(
+            cv.chosen_rank, cv.chosen_prob, cv.chosen_glyph_score,
+            cv.chosen_geo_h_ll, cv.chosen_geo_v_ll,
+            cv.chosen_geo_h_err, cv.chosen_geo_v_err,
+            gt_glyph, gt_h, gt_v
+        );
         let correct_detail = format_char_detail(
             gt_rank_f, gt_prob_f, gt_glyph,
             gt_h, gt_v,
-            gt_h_err, gt_v_err
+            gt_h_err, gt_v_err,
+            cv.chosen_glyph_score, cv.chosen_geo_h_ll, cv.chosen_geo_v_ll
         );
 
         let chosen_score_label = if !chosen_detail.is_empty() {
@@ -2107,6 +2130,11 @@ img.ci {
 .geo { font-family: monospace; font-size: 9px; color: #d07a00; white-space: nowrap; display: inline; }
 .prob-win { background: #e8f5e9; border-left: 3px solid #4caf50; padding-left: 4px; }
 .prob-lose { background: #ffebee; border-left: 3px solid #ef5350; padding-left: 4px; }
+.dim-win { color: #2e7d32; font-weight: 700; }
+.dim-lose { color: #c62828; }
+.prob-win .dim-win, .prob-lose .dim-lose { font-weight: 800; }
+.img-td.prob-win { outline: 2px solid #4caf50; outline-offset: -1px; }
+.img-td.prob-lose { outline: 1px solid #ef9a9a; }
 .per-word-sizes { font-family: monospace; font-size: 11px; line-height: 1.8; }
 .word-size-cell { display: inline-block; padding: 1px 5px; margin: 1px 3px; border-radius: 3px; background: #f5f5f5; border: 1px solid #ddd; }
 .word-size-cell.bad { background: #ffebee; border-color: #ef9a9a; }
