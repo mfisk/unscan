@@ -1,3 +1,5 @@
+pub const INK_THRESH: u8 = 255;
+
 // Library target for integration tests.
 // Includes modules needed by the test chain + their transitive deps.
 

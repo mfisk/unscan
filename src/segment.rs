@@ -165,7 +165,7 @@ fn segment_characters_inner(
     //   Pass 1 — Whitespace: split at midpoint of zero-ink column runs
     //   Pass 2 — Seam carving: cheapest vertical path for remaining splits
 
-    let threshold = 200u8;
+    let threshold = crate::INK_THRESH;
 
     // Compute total ink per column (count of pixels above ink threshold). Raw buffer.
     let w_us = w as usize;
@@ -619,12 +619,12 @@ fn segment_characters_inner(
                 let lb = lb_by_row[row] as usize;
                 let rb = rb_by_row[row] as usize;
                 for c in lb..seam_col.min(w_us_seam) {
-                    if raw_seam[base + c] < 200 {
+                    if raw_seam[base + c] < crate::INK_THRESH {
                         seam_ink_left += 1;
                     }
                 }
                 for c in (seam_col + 1)..rb.min(w_us_seam) {
-                    if raw_seam[base + c] < 200 {
+                    if raw_seam[base + c] < crate::INK_THRESH {
                         seam_ink_right += 1;
                     }
                 }

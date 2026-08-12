@@ -19,8 +19,7 @@ use crate::segment::{WordSeg, SegSummary, collapse_ligature_chars_for_allowed, s
 use crate::geometry_classifier::{CharInkBounds, WordGeoMeasurement};
 
 const GEO_WEIGHT: f32 = 1.0;
-const USE_SUM_AGG: bool = true;
-const MIDPOINT_PRUNE_BASE: f32 = -7.2;
+const MIDPOINT_PRUNE_BASE: f32 = -2.0; // tighter still - avg logit typical -1 to -1.5, -3 was still loose
 
 #[derive(Debug, Clone)]
 pub struct FontMatchResult {
@@ -32,19 +31,6 @@ pub struct FontMatchResult {
     pub variations: crate::font_scan::Variations,
     pub score: f32,
     pub best_dy: i32,
-}
-
-pub fn aggregate_font_score(log_probs: &[(f32, f32)], best_lps: &[f32]) -> f32 {
-    if USE_SUM_AGG {
-        return log_probs.iter().map(|&(lp, w)| lp * w).sum();
-    }
-    debug_assert_eq!(log_probs.len(), best_lps.len());
-    let penalty: f32 = log_probs.iter().enumerate()
-        .map(|(i, &(lp, w))| {
-            let gap = best_lps[i] - lp;
-            gap * gap * w
-        }).sum();
-    -penalty
 }
 
 pub struct ScoringWindow<'a> {
@@ -424,8 +410,8 @@ pub fn identify_fonts(
             if prob < thresh { continue; }
             let combined_geo = t.geo_h_ll + t.geo_v_ll;
             let lp = logit + GEO_WEIGHT * combined_geo;
-            log_probs.push((lp, t.weight * t.ood));
-            ood_probs.push((lp, t.ood));
+            log_probs.push((lp, t.weight));
+            ood_probs.push((lp, t.weight));
             obs_for_this.push(ObservationDetail {
                 ch: t.ch,
                 weight: t.weight,

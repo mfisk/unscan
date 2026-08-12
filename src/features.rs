@@ -462,7 +462,7 @@ fn detect_serif(img: &GrayImage) -> f32 {
 
     let w_us = w as usize;
     let h_us = h as usize;
-    let threshold = 200u8;
+    let threshold = crate::INK_THRESH;
     let raw = img.as_raw();
     let mut row_ink = vec![0u32; h_us];
     let mut min_y = h;
@@ -545,7 +545,7 @@ pub fn compute_features(img: &GrayImage, pre_normalized: bool) -> Option<CropFea
         return None;
     }
 
-    let threshold = 200u8;
+    let threshold = crate::INK_THRESH;
     let mut min_x = w;
     let mut max_x = 0u32;
     let mut min_y = h;
@@ -1415,7 +1415,7 @@ fn collect_ink_runs(img: &GrayImage) -> Vec<u32> {
     let (w, h) = img.dimensions();
     let w_us = w as usize;
     let h_us = h as usize;
-    let threshold = 200u8;
+    let threshold = crate::INK_THRESH;
     let raw = img.as_raw();
     let mut all_runs: Vec<u32> = Vec::new();
 

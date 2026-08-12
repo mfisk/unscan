@@ -220,7 +220,7 @@ pub fn measure_char_ink_bounds(
                     let base = y * w_us;
                     raw_word[base + x]
                 };
-                if pixel < 200 {
+                if pixel < crate::INK_THRESH {
                     has_ink = true;
                     if x < x_min { x_min = x; }
                     if x > x_max { x_max = x; }

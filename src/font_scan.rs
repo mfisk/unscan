@@ -18,9 +18,19 @@
 //! that produce at least one different glyph ID are emitted as variants.
 
 use unprint_fonts::ab_glyph::{Font, FontRef, PxScale, ScaleFont};
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
+use std::sync::{Mutex, OnceLock};
 use walkdir::WalkDir;
+
+/// Cache of vertical-gap counts per (font path, ligature char) — avoids
+/// re-rasterizing the same FB00-FB04 glyph for every candidate per line.
+/// 52% of CPU was here in nightly pprof.
+static GAP_CACHE: OnceLock<Mutex<HashMap<(PathBuf, char), usize>>> = OnceLock::new();
+
+fn gap_cache() -> &'static Mutex<HashMap<(PathBuf, char), usize>> {
+    GAP_CACHE.get_or_init(|| Mutex::new(HashMap::new()))
+}
 
 // ---------------------------------------------------------------------------
 // Types
@@ -168,8 +178,8 @@ impl FontEntry {
     /// padding, 100% top-to-bottom).  Two-char ligs (ff, fi, fl) need ≥1 such
     /// interior gutter to be excluded; three-char ligs (ffi, ffl) need ≥2.
     /// Only FB00–FB04 are considered; quote ligature probes are excluded.
-    pub fn collapsed_lig_set(&self) -> std::collections::HashSet<char> {
-        let mut set = std::collections::HashSet::new();
+    pub fn collapsed_lig_set(&self) -> HashSet<char> {
+        let mut set = HashSet::new();
         // Fast path: anything already known from glyph_overrides.
         if let Some(ref ov) = self.glyph_overrides {
             for (ch, _gid) in ov {
@@ -190,7 +200,7 @@ impl FontEntry {
         let mut data_cache: Option<Vec<u8>> = None;
         if set.len() < 5 {
             if let Ok(data) = std::fs::read(&self.path) {
-                if let Ok(font) = unprint_fonts::ab_glyph::FontRef::try_from_slice(&data) {
+                if let Ok(font) = FontRef::try_from_slice(&data) {
                     for &lig in &['\u{FB00}', '\u{FB01}', '\u{FB02}', '\u{FB03}', '\u{FB04}'] {
                         if set.contains(&lig) {
                             continue;
@@ -237,15 +247,31 @@ impl FontEntry {
         }
 
         // --- collapsed filtering: exclude ligs that are really two/three inks ---
+        // Use per-(path,lig) gap cache so per-line per-font work collapses to
+        // one rasterization per font in the entire run.
         if let Some(ref data) = data_cache {
             let mut to_remove = Vec::new();
+            // Load cache once for this call to avoid locking per lig.
+            let path_key = self.path.clone();
             for &lig in &set.clone().into_iter().collect::<Vec<_>>() {
                 let required_gaps = match lig {
-                    '\u{FB00}' | '\u{FB01}' | '\u{FB02}' => 1usize, // ff, fi, fl -> 2 chars
-                    '\u{FB03}' | '\u{FB04}' => 2usize,               // ffi, ffl -> 3 chars
+                    '\u{FB00}' | '\u{FB01}' | '\u{FB02}' => 1usize,
+                    '\u{FB03}' | '\u{FB04}' => 2usize,
                     _ => continue,
                 };
-                let gaps = Self::count_vertical_gaps_for_lig(data, lig);
+                // Fast cache lookup
+                let cached = {
+                    let guard = gap_cache().lock().unwrap();
+                    guard.get(&(path_key.clone(), lig)).copied()
+                };
+                let gaps = if let Some(g) = cached {
+                    g
+                } else {
+                    let g = Self::count_vertical_gaps_for_lig(data, lig);
+                    let mut guard = gap_cache().lock().unwrap();
+                    guard.insert((path_key.clone(), lig), g);
+                    g
+                };
                 if gaps >= required_gaps {
                     to_remove.push(lig);
                 }
@@ -268,27 +294,17 @@ impl FontEntry {
     /// for `lig_char`. No white padding around glyph — tight ink bounds only.
     /// Returns number of whitespace regions separating ink (0,1,2...).
     fn count_vertical_gaps_for_lig(data: &[u8], lig_char: char) -> usize {
-        // High-res 200px no-hint (ab_glyph has no hinting) gives outline truth.
-        // We also produce a low-res ~40px sample for parity with spec, but decision
-        // uses high-res strict gap (100% height). Low-res is used only as sanity
-        // that gap persists across scale; if it merges due to AA we still honour high-res.
-        let high = Self::vertical_gaps_at_scale(data, lig_char, 200.0, 20.0 / 255.0);
-        if high == 0 {
-            return 0;
-        }
-        // Low-res 40px hinted attempt via same ab_glyph (unhinted) – if font lacks
-        // outline at that size due to rasterizer limits, ignore.  We return high
-        // as final count because clear outline whitespace is the definition.
-        let _low = Self::vertical_gaps_at_scale(data, lig_char, 40.0, 20.0 / 255.0);
-        high
+        // High-res 200px no-hint gives outline truth. Low-res 40px was previously
+        // computed but discarded — skip it to halve CPU.
+        Self::vertical_gaps_at_scale(data, lig_char, 200.0, 20.0 / 255.0)
     }
 
     fn vertical_gaps_at_scale(data: &[u8], lig_char: char, px: f32, cov_thresh: f32) -> usize {
-        let font = match unprint_fonts::ab_glyph::FontRef::try_from_slice(data) {
+        let font = match FontRef::try_from_slice(data) {
             Ok(f) => f,
             Err(_) => return 0,
         };
-        let scale = unprint_fonts::ab_glyph::PxScale::from(px);
+        let scale = PxScale::from(px);
         let sf = font.as_scaled(scale);
         let gid = font.glyph_id(lig_char);
         if gid.0 == 0 {
@@ -310,30 +326,34 @@ impl FontEntry {
         if w < 2 || h < 2 || w > 4096 || h > 4096 {
             return 0;
         }
-        // Tight bitmap, no padding.
+        // Tight bitmap, no padding — single allocation.
         let mut ink = vec![false; w * h];
         outlined.draw(|gx, gy, cov| {
             if cov <= cov_thresh {
                 return;
             }
-            if (gx as usize) < w && (gy as usize) < h {
-                ink[gy as usize * w + gx as usize] = true;
-            } else if (gx as usize) < w && (gy as usize) >= h {
-                // clamped by ceil differences – ignore out-of-range draws
+            let x = gx as usize;
+            let y = gy as usize;
+            if x < w && y < h {
+                ink[y * w + x] = true;
             }
         });
 
-        // Scan columns for full-height emptiness (100% top-to-bottom).
-        let mut gap_cols = Vec::new();
-        for x in 0..w {
-            let mut any_ink = false;
-            for y in 0..h {
-                if ink[y * w + x] {
-                    any_ink = true;
-                    break;
+        // One pass: column ink presence
+        let mut col_has = vec![false; w];
+        for y in 0..h {
+            let row = y * w;
+            for x in 0..w {
+                if ink[row + x] {
+                    col_has[x] = true;
                 }
             }
-            if !any_ink {
+        }
+
+        // Gap columns = columns with no ink at all
+        let mut gap_cols = Vec::new();
+        for x in 0..w {
+            if !col_has[x] {
                 gap_cols.push(x);
             }
         }
@@ -341,8 +361,8 @@ impl FontEntry {
             return 0;
         }
 
-        // Group consecutive empty columns into single whitespace regions.
-        let mut gaps: Vec<(usize, usize)> = Vec::new(); // (start,end inclusive)
+        // Group consecutive empty columns
+        let mut gaps: Vec<(usize, usize)> = Vec::new();
         let mut start = gap_cols[0];
         let mut prev = gap_cols[0];
         for &cx in gap_cols.iter().skip(1) {
@@ -356,55 +376,25 @@ impl FontEntry {
         }
         gaps.push((start, prev));
 
-        // Filter: interior only, not touching outer edge (since bounds are tight,
-        // any edge empty column is artifact of ceil). Also require ≥3px ink on
-        // both sides at 200px to avoid dot-on-i isolated pixel being counted.
+        // Prefix sums of col_has for O(1) left/right mass
+        let mut prefix = vec![0usize; w + 1];
+        for i in 0..w {
+            prefix[i + 1] = prefix[i] + (col_has[i] as usize);
+        }
+
         let mut valid = 0usize;
         for (gs, ge) in gaps {
             if gs == 0 || ge + 1 >= w {
-                continue; // touching edge – ignore
+                continue; // edge artifact from ceil
             }
-            // left side ink mass ≥3px columns with any ink
-            let mut left_mass = 0usize;
-            for lx in 0..gs {
-                let mut col_has = false;
-                for ly in 0..h {
-                    if ink[ly * w + lx] {
-                        col_has = true;
-                        break;
-                    }
-                }
-                if col_has {
-                    left_mass += 1;
-                }
-                if left_mass >= 3 {
-                    break;
-                }
-            }
+            let left_mass = prefix[gs]; // columns with ink in [0, gs)
             if left_mass < 1 {
                 continue;
             }
-            let mut right_mass = 0usize;
-            for rx in (ge + 1)..w {
-                let mut col_has = false;
-                for ry in 0..h {
-                    if ink[ry * w + rx] {
-                        col_has = true;
-                        break;
-                    }
-                }
-                if col_has {
-                    right_mass += 1;
-                }
-                if right_mass >= 3 {
-                    break;
-                }
-            }
+            let right_mass = prefix[w] - prefix[ge + 1]; // [ge+1, w)
             if right_mass < 1 {
                 continue;
             }
-            // At high-res we require strict 3px sides per spec; at low-res
-            // the same helper runs with px=40 where 3px still meaningful.
             if px >= 100.0 && (left_mass < 3 || right_mass < 3) {
                 continue;
             }
