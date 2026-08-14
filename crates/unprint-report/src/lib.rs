@@ -270,6 +270,7 @@ fn format_char_detail(
     opp_glyph: Option<f32>,
     opp_h: Option<f32>,
     opp_v: Option<f32>,
+    weight: Option<f32>,
 ) -> String {
     let mut out = String::new();
     if let Some(r) = rank {
@@ -291,6 +292,9 @@ fn format_char_detail(
             _ => "",
         };
         out.push_str(&format!("<span class='logprob{cls}'>glyph: {gs:.2}</span>"));
+        if let Some(w) = weight {
+            out.push_str(&format!("<span class='num'> ×{w:.2} → {:.2}</span>", gs * w));
+        }
     } else if let Some(pu) = prob_x_u {
         if pu > 0.0 {
             out.push_str(&format!("<span class='logprob'>glyph: {:.2}</span>", pu.ln()));
@@ -1976,13 +1980,13 @@ fn build_observation_table(
             cv.chosen_rank, cv.chosen_prob, cv.chosen_glyph_score,
             cv.chosen_geo_h_ll, cv.chosen_geo_v_ll,
             cv.chosen_geo_h_err, cv.chosen_geo_v_err,
-            gt_glyph, gt_h, gt_v
+            gt_glyph, gt_h, gt_v, Some(cv.weight)
         );
         let correct_detail = format_char_detail(
             gt_rank_f, gt_prob_f, gt_glyph,
             gt_h, gt_v,
             gt_h_err, gt_v_err,
-            cv.chosen_glyph_score, cv.chosen_geo_h_ll, cv.chosen_geo_v_ll
+            cv.chosen_glyph_score, cv.chosen_geo_h_ll, cv.chosen_geo_v_ll, Some(cv.weight)
         );
 
         let chosen_score_label = if !chosen_detail.is_empty() {
