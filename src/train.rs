@@ -1024,6 +1024,13 @@ pub fn run_train(mut args: TrainArgs) {
     }
     fn parse_manifest_header(header: &str, n_seqs_expected: usize) -> Option<usize> {
         let h = header.trim();
+        // Manifests are tagged with the ink threshold their features were
+        // extracted at; a threshold change invalidates the cache and forces
+        // feature regeneration so training and scoring never mix thresholds.
+        let th_tag = format!("th={}", crate::INK_THRESH);
+        if !h.split_whitespace().any(|t| t == th_tag) {
+            return None;
+        }
         // New format: "seqs=106" or "v2 seqs=106"
         if let Some(rest) = h.strip_prefix("seqs=") {
             return rest.parse::<usize>().ok().filter(|&n| n==n_seqs_expected);
@@ -1309,7 +1316,7 @@ pub fn run_train(mut args: TrainArgs) {
             let aa_name = all_aa[aa_idx].name();
             let mpath = manifest_combo_path(&feat_dir, ht, aa_name);
             let tmp_mpath = crate::atomic_file::tmp_for(&mpath);
-            let mut manifest = format!("seqs={}", n_seqs);
+            let mut manifest = format!("th={} seqs={}", crate::INK_THRESH, n_seqs);
             for ci in 0..n_seqs {
                 manifest.push('\n');
                 manifest.push_str(&combo_counts[combo_idx][ci].to_string());
@@ -1391,7 +1398,7 @@ pub fn run_train(mut args: TrainArgs) {
                 // Update manifest for this combo to new counts
                 let mpath = manifest_combo_path(&feat_dir, info.ht, aa_name);
                 let tmp_mpath = crate::atomic_file::tmp_for(&mpath);
-                let mut manifest = format!("seqs={}", n_seqs);
+                let mut manifest = format!("th={} seqs={}", crate::INK_THRESH, n_seqs);
                 for ci in 0..n_seqs {
                     manifest.push('\n');
                     manifest.push_str(&current_counts_by_seq[ci].to_string());

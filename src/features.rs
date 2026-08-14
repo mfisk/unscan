@@ -1508,7 +1508,9 @@ pub fn normalize_to_ink_bounds(img: &GrayImage, target_h: u32) -> Option<GrayIma
     if w == 0 || h == 0 {
         return None;
     }
-    const THRESH: u8 = 200;
+    // Single canonical threshold, same as feature extraction (compute_features)
+    // and the scoring path — training and scoring trim consistently.
+    const THRESH: u8 = crate::INK_THRESH;
     let w_us = w as usize;
     let h_us = h as usize;
     let raw = img.as_raw();

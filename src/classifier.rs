@@ -3321,6 +3321,21 @@ fn training_features_stale() -> bool {
         let name = entry.file_name();
         let name_str = name.to_string_lossy();
         if !name_str.starts_with("manifest_") { continue; }
+        // Content check: the manifest header carries the ink threshold its
+        // features were extracted at; a threshold change forces regeneration.
+        let th_tag = format!("th={}", crate::INK_THRESH);
+        if let Ok(content) = std::fs::read_to_string(entry.path()) {
+            let header_ok = content
+                .lines()
+                .next()
+                .map(|h| h.split_whitespace().any(|t| t == th_tag))
+                .unwrap_or(false);
+            if !header_ok {
+                return true;
+            }
+        } else {
+            return true;
+        }
         if let Ok(meta) = entry.metadata() {
             if let Ok(mtime) = meta.modified() {
                 if mtime < scan_mtime {
