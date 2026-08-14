@@ -198,6 +198,7 @@ pub fn identify_fonts(
         struct Temp {
             ch: char,
             weight: f32,
+            area_px: f32,
             ood: f32,
             best_prob: f32,
             nearest: Vec<(usize,f32)>,
@@ -245,6 +246,7 @@ pub fn identify_fonts(
                 temps_collect.push(Temp {
                     ch: c,
                     weight: 1.0,
+                    area_px: 0.0,
                     ood: 1.0,
                     best_prob: 0.0,
                     nearest: Vec::new(),
@@ -325,6 +327,7 @@ pub fn identify_fonts(
                 let crop_opt = &wb.char_crops[pos];
                 if crop_opt.is_none() { continue; }
                 let (ref norm, _x_min,_x_max,_y_min,_y_max,_cx,_cy) = crop_opt.as_ref().unwrap();
+                let area_px = ((_x_max - _x_min + 1) * (_y_max - _y_min + 1)) as f32;
                 // Feature
                 let feat = match compute_features(norm, false) {
                     Some(f) => f,
@@ -338,6 +341,7 @@ pub fn identify_fonts(
                 let mut t = Temp {
                     ch: c,
                     weight: 1.0,
+                    area_px,
                     ood: 1.0,
                     best_prob: 0.0,
                     nearest: Vec::new(),
@@ -388,6 +392,16 @@ pub fn identify_fonts(
         }
 
         let n_windows = scoring_temps.len();
+
+        // Median ink-bbox pixel area across this line's scored crops; small
+        // punctuation upscaled to the canonical cell gets downweighted by
+        // area/median so its (noisy) glyph evidence counts less.
+        let mut areas: Vec<f32> = scoring_temps.iter().map(|t| t.area_px).collect();
+        areas.sort_by(|a,b| a.partial_cmp(b).unwrap());
+        let median_area = if areas.is_empty() { 1.0 } else { areas[areas.len()/2].max(1.0) };
+        for t in scoring_temps.iter_mut() {
+            t.weight = t.area_px / median_area;
+        }
         let min_coverage = ((n_windows as f32 * 0.4).ceil() as usize).max(3).min(n_windows.max(1));
 
         let mut log_probs: Vec<(f32,f32)> = Vec::with_capacity(n_windows);
@@ -409,9 +423,9 @@ pub fn identify_fonts(
             let thresh = min_ngram_prob / n_glyphs;
             if prob < thresh { continue; }
             let combined_geo = t.geo_h_ll + t.geo_v_ll;
-            let lp = logit + GEO_WEIGHT * combined_geo;
-            log_probs.push((lp, t.weight));
-            ood_probs.push((lp, t.weight));
+            let lp = logit * t.weight + GEO_WEIGHT * combined_geo;
+            log_probs.push((lp, 1.0));
+            ood_probs.push((lp, 1.0));
             obs_for_this.push(ObservationDetail {
                 ch: t.ch,
                 weight: t.weight,
