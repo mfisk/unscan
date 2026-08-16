@@ -310,7 +310,7 @@ struct FontMmapIndex {
     case_pair_groups: Vec<PairGroupIndex>,
     single_groups: Vec<SingleGroupIndex>,
     case_single_groups: Vec<SingleGroupIndex>,
-    pair_first_present: Vec<u8>, // size=num_glyphs, 1 if gid has any pair kern
+    pair_first_present_off: usize, // v17: offset in mmap of num_glyphs bytes, 1 if gid has any pair kern (0 = missing / v16 compat)
 }
 
 // ---------- Backward compat parse structs for test_gpos ----------
@@ -494,9 +494,21 @@ impl GeometryCache {
         if let Some(hit) = PAIR_CACHE.with(|c| c.borrow().get(&cache_key).copied()) {
             return hit;
         }
-        if !f.pair_first_present.is_empty() {
+        // v17 zero-copy: pair_first_present is an offset into mmap, no Vec copy
+        if f.pair_first_present_off != 0 {
+            let d = self.data();
             let g1 = gid1 as usize;
-            if g1 >= f.pair_first_present.len() || f.pair_first_present[g1]==0 {
+            if g1 >= f.num_glyphs {
+                let res = ([0i32;4],[0i32;4]);
+                PAIR_CACHE.with(|c| {
+                    let mut m = c.borrow_mut();
+                    if m.len() >= 16384 { m.clear(); }
+                    m.insert(cache_key, res);
+                });
+                return res;
+            }
+            let off = f.pair_first_present_off + g1;
+            if off < d.len() && d[off]==0 {
                 let res = ([0i32;4],[0i32;4]);
                 PAIR_CACHE.with(|c| {
                     let mut m = c.borrow_mut();
@@ -2254,36 +2266,20 @@ impl GeometryCache {
             }
 
             // v17: pair_first_present blob — stored directly after case_single_groups
-            let pair_first_present = if version >= 17 {
+            // zero-copy: keep its offset in mmap, no Vec copy (true mmap)
+            let pair_first_present_off = if version >= 17 {
                 if pos + num_glyphs > data.len() {
                     return Err(format!("trunc v17 pair_first_present {} + {} > {}", pos, num_glyphs, data.len()));
                 }
-                let v = data[pos..pos+num_glyphs].to_vec();
+                let off = pos;
                 pos += num_glyphs;
-                v
+                off
             } else {
-                // v16 compat: recompute from Format1/Format2 coverage (old caches)
-                let mut pfp = vec![0u8; num_glyphs];
-                for tbl in &f1_tables {
-                    for i in 0..tbl.coverage_len {
-                        let off = tbl.coverage_off + i*2;
-                        if off+2>data.len() {continue}
-                        let gid=le_u16_at(data,off) as usize;
-                        if gid < pfp.len() { pfp[gid]=1 }
-                    }
-                }
-                for tbl in &f2_tables {
-                    for i in 0..tbl.coverage_len {
-                        let off = tbl.coverage_off + i*2;
-                        if off+2>data.len() {continue}
-                        let gid=le_u16_at(data,off) as usize;
-                        if gid < pfp.len() { pfp[gid]=1 }
-                    }
-                }
-                pfp
+                // v16 compat: old cache had no blob — point to 0 (no fast path), will be rebuilt next write
+                0usize
             };
 
-            fonts.insert(font_key, FontMmapIndex { file_hash, upem, num_glyphs, glyphs_off, cmap_off, cmap_len, single_tables, format1_tables: f1_tables, format2_tables: f2_tables, case_single_tables, case_format1_tables: case_f1_tables, case_format2_tables: case_f2_tables, pair_groups, case_pair_groups, single_groups, case_single_groups, pair_first_present });
+            fonts.insert(font_key, FontMmapIndex { file_hash, upem, num_glyphs, glyphs_off, cmap_off, cmap_len, single_tables, format1_tables: f1_tables, format2_tables: f2_tables, case_single_tables, case_format1_tables: case_f1_tables, case_format2_tables: case_f2_tables, pair_groups, case_pair_groups, single_groups, case_single_groups, pair_first_present_off });
         }
         Ok((Self { mmap, fonts, _cache_path: path.to_path_buf() }, catalog_hash))
     }
