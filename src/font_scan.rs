@@ -19,7 +19,7 @@
 
 use unprint_fonts::ab_glyph::{Font, FontRef, PxScale, ScaleFont};
 use std::cell::RefCell;
-use std::collections::{HashMap, HashSet};
+use std::collections::HashMap;
 use std::collections::hash_map::DefaultHasher;
 use std::hash::{Hash, Hasher};
 use std::path::{Path, PathBuf};
@@ -35,12 +35,36 @@ fn gap_cache() -> &'static Mutex<HashMap<(PathBuf, char), usize>> {
     GAP_CACHE.get_or_init(|| Mutex::new(HashMap::new()))
 }
 
+/// Compact bitmask for FB00-FB04 ligatures: bit0=FF,1=FI,2=FL,3=FFI,4=FFL.
+/// Replaces HashSet<char> to avoid allocation in hot path.
+pub type LigMask = u8;
+const FB_LIGS: [char;5] = ['\u{FB00}','\u{FB01}','\u{FB02}','\u{FB03}','\u{FB04}'];
+
+#[inline]
+fn lig_bit(c: char) -> Option<u8> {
+    match c {
+        '\u{FB00}' => Some(0),
+        '\u{FB01}' => Some(1),
+        '\u{FB02}' => Some(2),
+        '\u{FB03}' => Some(3),
+        '\u{FB04}' => Some(4),
+        _ => None,
+    }
+}
+#[inline]
+#[allow(dead_code)]
+fn lig_contains(mask: LigMask, c: char) -> bool {
+    if let Some(b) = lig_bit(c) {
+        (mask & (1u8 << b)) != 0
+    } else { false }
+}
+
 /// Cache of final collapsed lig sets per font path — eliminates 33.9%
 /// inclusive hot path (font_match.rs:138, font_pipeline.rs:381) which
 /// otherwise did fs::read + cmap + 5× shape per candidate per line.
-static LIG_SET_CACHE: OnceLock<Mutex<HashMap<PathBuf, HashSet<char>>>> = OnceLock::new();
+static LIG_SET_CACHE: OnceLock<Mutex<HashMap<PathBuf, LigMask>>> = OnceLock::new();
 
-fn lig_set_cache() -> &'static Mutex<HashMap<PathBuf, HashSet<char>>> {
+fn lig_set_cache() -> &'static Mutex<HashMap<PathBuf, LigMask>> {
     LIG_SET_CACHE.get_or_init(|| Mutex::new(HashMap::new()))
 }
 
@@ -264,40 +288,37 @@ impl FontEntry {
     /// padding, 100% top-to-bottom).  Two-char ligs (ff, fi, fl) need ≥1 such
     /// interior gutter to be excluded; three-char ligs (ffi, ffl) need ≥2.
     /// Only FB00–FB04 are considered; quote ligature probes are excluded.
-    pub fn collapsed_lig_set(&self) -> HashSet<char> {
+    pub fn collapsed_lig_set(&self) -> LigMask {
         // Global memo — eliminates 33.9% inclusive hot path after first line.
         // Final filtered set is cached, so no FS read / shaping on hits.
         {
             let guard = lig_set_cache().lock().unwrap();
             if let Some(cached) = guard.get(&self.path) {
-                return cached.clone();
+                return *cached;
             }
         }
 
-        let mut set = HashSet::new();
+        let mut mask: LigMask = 0;
         // Fast path: anything already known from glyph_overrides.
         if let Some(ref ov) = self.glyph_overrides {
             for (ch, _gid) in ov {
-                match *ch {
-                    '\u{FB00}' | '\u{FB01}' | '\u{FB02}' | '\u{FB03}' | '\u{FB04}' => {
-                        set.insert(*ch);
-                    }
-                    _ => {}
+                if let Some(b) = lig_bit(*ch) {
+                    mask |= 1u8 << b;
                 }
             }
         }
 
         // Probe the actual font file for cmap and GSUB liga support if not full.
         let mut data_cache: Option<Vec<u8>> = None;
-        if set.len() < 5 {
+        let current_count = mask.count_ones() as usize;
+        if current_count < 5 {
             if let Ok(data) = std::fs::read(&self.path) {
                 if let Ok(font) = FontRef::try_from_slice(&data) {
-                    for &lig in &['\u{FB00}', '\u{FB01}', '\u{FB02}', '\u{FB03}', '\u{FB04}'] {
-                        if set.contains(&lig) {
-                            continue;
-                        }
+                    for &lig in &FB_LIGS {
+                        let b = lig_bit(lig).unwrap();
+                        if (mask & (1u8<<b)) != 0 { continue; }
                         if font.glyph_id(lig).0 != 0 {
-                            set.insert(lig);
+                            mask |= 1u8<<b;
                         }
                     }
                 }
@@ -310,18 +331,11 @@ impl FontEntry {
                     ];
                     let data_ptr = data.as_ptr() as usize;
                     for &(probe, lig_char) in LIGATURE_PROBES {
-                        match lig_char {
-                            '\u{FB00}' | '\u{FB01}' | '\u{FB02}' | '\u{FB03}' | '\u{FB04}' => {},
-                            _ => continue,
-                        }
-                        if set.contains(&lig_char) {
-                            continue;
-                        }
-                        if probe.chars().count() <= 1 {
-                            continue;
-                        }
+                        let Some(b) = lig_bit(lig_char) else { continue };
+                        if (mask & (1u8<<b)) != 0 { continue; }
+                        if probe.chars().count() <= 1 { continue; }
                         if shape_probes_collapsed(&face, data_ptr, &features, probe) {
-                            set.insert(lig_char);
+                            mask |= 1u8<<b;
                         }
                     }
                 }
@@ -335,11 +349,10 @@ impl FontEntry {
 
         // --- collapsed filtering: exclude ligs that are really two/three inks ---
         if let Some(ref data) = data_cache {
-            let mut to_remove = Vec::new();
             let path_key = self.path.clone();
-            // Clone set to iter because we mutate to_remove later; avoid holding
-            // LIG_SET_CACHE lock while holding GAP_CACHE — deadlock avoidance per spec.
-            for &lig in &set.clone().into_iter().collect::<Vec<_>>() {
+            for &lig in &FB_LIGS {
+                let b = lig_bit(lig).unwrap();
+                if (mask & (1u8<<b)) == 0 { continue; }
                 let required_gaps = match lig {
                     '\u{FB00}' | '\u{FB01}' | '\u{FB02}' => 1usize,
                     '\u{FB03}' | '\u{FB04}' => 2usize,
@@ -358,25 +371,22 @@ impl FontEntry {
                     g
                 };
                 if gaps >= required_gaps {
-                    to_remove.push(lig);
+                    mask &= !(1u8<<b);
                 }
-            }
-            for lig in to_remove {
-                set.remove(&lig);
             }
         }
 
         // Insert final filtered set into global cache.
         {
             let mut guard = lig_set_cache().lock().unwrap();
-            guard.insert(self.path.clone(), set.clone());
+            guard.insert(self.path.clone(), mask);
         }
-        set
+        mask
     }
 
     /// Back-compat shim: old name kept for any missed call sites.
     #[allow(dead_code)]
-    pub fn allowed_lig_set(&self) -> std::collections::HashSet<char> {
+    pub fn allowed_lig_set(&self) -> LigMask {
         self.collapsed_lig_set()
     }
 

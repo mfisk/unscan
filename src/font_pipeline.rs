@@ -381,7 +381,7 @@ pub fn match_lines(
             let allowed = fe.collapsed_lig_set();
             let mut segs: Vec<crate::segment::WordSeg> = Vec::with_capacity(infos.len());
             for wi in infos {
-                let collapsed = crate::segment::collapse_ligature_chars_for_allowed(&wi.orig_chars, &allowed);
+                let collapsed = crate::segment::collapse_ligature_chars_for_allowed(&wi.orig_chars, allowed);
                 let k = collapsed.len();
                 if k == 0 { continue; }
                 let (bounds, seams, summary) = crate::segment::segment_characters(&wi.img, k);

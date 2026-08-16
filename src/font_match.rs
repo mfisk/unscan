@@ -8,12 +8,11 @@
 //! `WordSegs` cache is per-k (fresh map for each line/word), `WordSeg` is
 //! per-font view on top of per-k cuts.
 
-use rustc_hash::{FxHashMap, FxHashSet};
+use rustc_hash::FxHashSet;
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::collections::HashMap;
 use image::GrayImage;
-use crate::features::compute_features;
 use crate::classifier::{self, ObsStats};
 use crate::segment::{WordSeg, SegSummary, collapse_ligature_chars_for_allowed, segment_characters, char_crop_and_metrics};
 use crate::geometry_classifier::{CharInkBounds, WordGeoMeasurement};
@@ -94,6 +93,8 @@ struct SegCacheEntry {
     summary: SegSummary,
     // per-char crop+metrics for this k, length = k – Arc to make per-font clone cheap
     char_crops: Vec<Option<(Arc<GrayImage>, u32, u32, u32, u32, f64, f64)>>,
+    // font-independent precomputed features for each char crop – hoisted out of per-font loop
+    pre_features: Vec<Option<crate::features::CropFeatures>>,
 }
 
 pub fn identify_fonts(
@@ -145,6 +146,7 @@ pub fn identify_fonts(
             seams: Arc<HashMap<u32, Vec<[u32;2]>>>,
             summary: SegSummary,
             char_crops: Vec<Option<(Arc<GrayImage>, u32,u32,u32,u32,f64,f64)>>, // Arc makes per-font clone cheap
+            pre_features: Vec<Option<crate::features::CropFeatures>>,
             crop_h: u32,
             word_img: Arc<GrayImage>,
             word_text: String,
@@ -154,7 +156,7 @@ pub fn identify_fonts(
 
         let mut feasible = true;
         for (wi_idx, wi) in word_infos.iter().enumerate() {
-            let collapsed = collapse_ligature_chars_for_allowed(&wi.orig_chars, &allowed);
+            let collapsed = collapse_ligature_chars_for_allowed(&wi.orig_chars, allowed);
             let k = collapsed.len();
             if k == 0 { continue; }
             // get or create cache entry for this word k
@@ -168,7 +170,16 @@ pub fn identify_fonts(
                     let cc_arc = cc.map(|(img, x1,x2,y1,y2,cx,cy)| (Arc::new(img), x1,x2,y1,y2,cx,cy));
                     char_crops.push(cc_arc);
                 }
-                cache.insert(k, SegCacheEntry { bounds: b, seams: s, summary: sum, char_crops });
+                // Hoist: precompute font-independent features once per (word,k)
+                let mut pre_features: Vec<Option<crate::features::CropFeatures>> = Vec::with_capacity(k);
+                for cc in &char_crops {
+                    if let Some((ref norm, _,_,_,_,_,_)) = cc {
+                        pre_features.push(crate::features::compute_features(norm, false));
+                    } else {
+                        pre_features.push(None);
+                    }
+                }
+                cache.insert(k, SegCacheEntry { bounds: b, seams: s, summary: sum, char_crops, pre_features });
             }
             let ent = cache.get(&k).unwrap();
             // Clone needed data for WordBuild (bounds clone cheap, seams Arc clone cheap)
@@ -178,6 +189,7 @@ pub fn identify_fonts(
                 seams: Arc::new(ent.seams.clone()),
                 summary: ent.summary.clone(),
                 char_crops: ent.char_crops.clone(),
+                pre_features: ent.pre_features.clone(),
                 crop_h: wi.img.height(),
                 word_img: wi.img.clone(),
                 word_text: wi.text.clone(),
@@ -284,30 +296,35 @@ pub fn identify_fonts(
         }
 
         // Geometry LLs – keep h/v separate for per-char table
+        // v18b: drop FxHashMap per-font allocations (8%+5% overhead) – use dense Vec grid
         let geo_opt = crate::geometry_classifier::per_char_geo_for_font(
             fk, &word_segs, &wib, font_cache, geo_cache, font_registry
         );
-        // maps: (seg_idx, pos) -> ll / err
-        let mut geo_h_map: FxHashMap<(usize,usize), f32> = FxHashMap::default();
-        let mut geo_v_map: FxHashMap<(usize,usize), f32> = FxHashMap::default();
-        let mut geo_h_err_map: FxHashMap<(usize,usize), f32> = FxHashMap::default();
-        let mut geo_v_err_map: FxHashMap<(usize,usize), f32> = FxHashMap::default();
-        match geo_opt {
+        // dense grid: geo_grid[seg_idx][orig_idx] = Some((h_ll,v_ll,h_err,v_err)) or None for missing
+        let mut geo_grid: Vec<Vec<Option<(f32,f32,f32,f32)>>> = builds.iter().map(|wb| vec![None; wb.collapsed.len()]).collect();
+        match &geo_opt {
             None => {
                 if !is_ensure { pruned_count+=1; continue; }
             }
-            Some(ref geos) if geos.is_empty() => {},
+            Some(geos) if geos.is_empty() => {},
             Some(geos) => {
                 let mut min_ll = f32::INFINITY;
-                for g in &geos {
+                for g in geos {
                     let ll = (g.h_ll + g.v_ll) as f32;
                     if ll < min_ll { min_ll = ll; }
-                    geo_h_map.insert((g.seg_idx, g.orig_idx), g.h_ll as f32);
-                    geo_v_map.insert((g.seg_idx, g.orig_idx), g.v_ll as f32);
-                    geo_h_err_map.insert((g.seg_idx, g.orig_idx), g.h_err.unwrap_or(0.0) as f32);
-                    geo_v_err_map.insert((g.seg_idx, g.orig_idx), g.v_err as f32);
                 }
                 if !is_ensure && min_ll < prune_threshold { pruned_count+=1; continue; }
+                // fill grid after prune check – same geos reused
+                for g in geos {
+                    if g.seg_idx < geo_grid.len() && g.orig_idx < geo_grid[g.seg_idx].len() {
+                        geo_grid[g.seg_idx][g.orig_idx] = Some((
+                            g.h_ll as f32,
+                            g.v_ll as f32,
+                            g.h_err.unwrap_or(0.0) as f32,
+                            g.v_err as f32,
+                        ));
+                    }
+                }
             }
         };
 
@@ -326,18 +343,28 @@ pub fn identify_fonts(
                 if pos >= wb.char_crops.len() { continue; }
                 let crop_opt = &wb.char_crops[pos];
                 if crop_opt.is_none() { continue; }
-                let (ref norm, _x_min,_x_max,_y_min,_y_max,_cx,_cy) = crop_opt.as_ref().unwrap();
+                // area from bbox (font-independent, cheap)
+                let (_ref_norm, _x_min,_x_max,_y_min,_y_max,_cx,_cy) = crop_opt.as_ref().unwrap();
                 let area_px = ((_x_max - _x_min + 1) * (_y_max - _y_min + 1)) as f32;
-                // Feature
-                let feat = match compute_features(norm, false) {
-                    Some(f) => f,
-                    None => { continue; }
+                // Hoisted: reuse precomputed features (font-independent) – avoids 2743× recompute
+                let feat = match &wb.pre_features[pos] {
+                    Some(f) => f.clone(),
+                    None => {
+                        // fallback recompute if not cached (should be rare)
+                        if let Some((ref norm, _,_,_,_,_,_)) = wb.char_crops[pos] {
+                            match crate::features::compute_features(norm, false) {
+                                Some(f) => f,
+                                None => continue,
+                            }
+                        } else { continue }
+                    }
                 };
-                // Temp placeholder – classify below; pull geo from per-font maps
-                let h_ll = geo_h_map.get(&(seg_idx, pos)).copied().unwrap_or(0.0);
-                let v_ll = geo_v_map.get(&(seg_idx, pos)).copied().unwrap_or(0.0);
-                let h_err = geo_h_err_map.get(&(seg_idx, pos)).copied().unwrap_or(0.0);
-                let v_err = geo_v_err_map.get(&(seg_idx, pos)).copied().unwrap_or(0.0);
+                // Temp placeholder – classify below; pull geo from per-font dense grid (no hash)
+                let (h_ll, v_ll, h_err, v_err) = if seg_idx < geo_grid.len() && pos < geo_grid[seg_idx].len() {
+                    geo_grid[seg_idx][pos].unwrap_or((0.0,0.0,0.0,0.0))
+                } else {
+                    (0.0,0.0,0.0,0.0)
+                };
                 let mut t = Temp {
                     ch: c,
                     weight: 1.0,

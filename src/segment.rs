@@ -1298,8 +1298,24 @@ fn candidate_seams_child(
     const BOUND_STACK_MAX: usize = 1024;
     let mut left_stack = [0u32; BOUND_STACK_MAX];
     let mut right_stack = [u32::MAX; BOUND_STACK_MAX];
-    let mut left_heap: Option<Vec<u32>> = None;
-    let mut right_heap: Option<Vec<u32>> = None;
+    let left_heap: Option<Vec<u32>> = if left_path.is_some() && h_us > BOUND_STACK_MAX {
+        let lp = left_path.unwrap();
+        let mut b = vec![0u32; h_us];
+        for e in lp {
+            let r = e[0] as usize;
+            if r < b.len() && e[1] > b[r] { b[r] = e[1]; }
+        }
+        Some(b)
+    } else { None };
+    let right_heap: Option<Vec<u32>> = if right_path.is_some() && h_us > BOUND_STACK_MAX {
+        let rp = right_path.unwrap();
+        let mut b = vec![u32::MAX; h_us];
+        for e in rp {
+            let r = e[0] as usize;
+            if r < b.len() && e[1] < b[r] { b[r] = e[1]; }
+        }
+        Some(b)
+    } else { None };
 
     let left_bound: Option<&[u32]> = if let Some(lp) = left_path {
         if h_us <= BOUND_STACK_MAX {
@@ -1311,12 +1327,6 @@ fn candidate_seams_child(
             }
             Some(&left_stack[..h_us])
         } else {
-            let mut b = vec![0u32; h_us];
-            for e in lp {
-                let r = e[0] as usize;
-                if r < b.len() && e[1] > b[r] { b[r] = e[1]; }
-            }
-            left_heap = Some(b);
             Some(left_heap.as_ref().unwrap().as_slice())
         }
     } else { None };
@@ -1330,12 +1340,6 @@ fn candidate_seams_child(
             }
             Some(&right_stack[..h_us])
         } else {
-            let mut b = vec![u32::MAX; h_us];
-            for e in rp {
-                let r = e[0] as usize;
-                if r < b.len() && e[1] < b[r] { b[r] = e[1]; }
-            }
-            right_heap = Some(b);
             Some(right_heap.as_ref().unwrap().as_slice())
         }
     } else { None };
@@ -1736,7 +1740,7 @@ fn candidate_seams_child(
     }
 
     // ---- Generate candidates same as candidate_seams final ----
-    let mid_r = (h as usize / 2) ;
+    let mid_r = h as usize / 2;
     let mid_off = mid_r * seg_w;
     let mut dp_candidates: Vec<(u32, f32)> = Vec::with_capacity(seg_w.saturating_sub(2));
     for c in 1..seg_w - 1 {
@@ -2077,8 +2081,9 @@ fn collapse_ligature_chars(chars: &[char]) -> Vec<char> {
 /// Per-font ligature collapse: only collapse a sequence if the resulting
 /// ligature unicode char is in `allowed` (font's supported lig set).
 /// Greedy longest-first, same as `collapse_ligature_chars`.  Empty allowed → identity.
-pub fn collapse_ligature_chars_for_allowed(chars: &[char], allowed: &HashSet<char>) -> Vec<char> {
-    if allowed.is_empty() {
+/// `allowed` is a bitmask: bit0=FB00,1=FB01,2=FB02,3=FB03,4=FB04.
+pub fn collapse_ligature_chars_for_allowed(chars: &[char], allowed: u8) -> Vec<char> {
+    if allowed == 0 {
         return chars.to_vec();
     }
     let mut out = Vec::with_capacity(chars.len());
@@ -2086,9 +2091,10 @@ pub fn collapse_ligature_chars_for_allowed(chars: &[char], allowed: &HashSet<cha
     while i < chars.len() {
         let mut matched = false;
         for &(seq, lig_char) in LIGATURE_SEQUENCES {
-            if !allowed.contains(&lig_char) {
-                continue;
-            }
+            let bit = match lig_char {
+                '\u{FB00}' => 0, '\u{FB01}' => 1, '\u{FB02}' => 2, '\u{FB03}' => 3, '\u{FB04}' => 4, _ => continue,
+            };
+            if (allowed & (1u8 << bit)) == 0 { continue; }
             if i + seq.len() <= chars.len() && chars[i..i + seq.len()] == *seq {
                 out.push(lig_char);
                 i += seq.len();

@@ -34,12 +34,12 @@
 //!     }
 
 use std::collections::{BTreeMap, HashMap, HashSet};
-use std::cell::RefCell;
 use std::path::{Path, PathBuf};
+use std::cell::RefCell;
 use rustc_hash::FxHashMap;
 
 thread_local! {
-    static PAIR_CACHE: RefCell<FxHashMap<(usize,u32), ([i32;4],[i32;4])>> = RefCell::new(FxHashMap::default());
+    static PRED_CACHE: RefCell<FxHashMap<(String, String), Vec<(f64,f64,f64,f64)>>> = RefCell::new(FxHashMap::default());
 }
 
 const BGEO_MAGIC: &[u8; 4] = b"BGEO";
@@ -48,7 +48,7 @@ const BGEO_MAGIC: &[u8; 4] = b"BGEO";
 // v16 adds: pair_groups, case_pair_groups, single_groups, case_single_groups (BTree-free fast path)
 // plus sorted ClassDef Format2 ranges for binary search in class_get.
 // v17 adds: pair_first_present blob per font (num_glyphs bytes) built from Format1/Format2 coverage at cache build time.
-const BGEO_VERSION: u32 = 17;
+const BGEO_VERSION: u32 = 18;
 
 // ---------- BE helpers for OT parsing ----------
 #[inline]
@@ -237,6 +237,7 @@ struct Format1Index {
     pair_sets: Vec<PairSetIndex>,
     lookup_id: u16,
     subtable_pos: u16,
+    coverage_map_off: usize,
 }
 
 #[derive(Debug)]
@@ -260,6 +261,9 @@ struct Format2Index {
     matrix_off: usize,
     lookup_id: u16,
     subtable_pos: u16,
+    coverage_map_off: usize,
+    class1_map_off: usize,
+    class2_map_off: usize,
 }
 
 // v16 pre-grouped lookup structures — zero-alloc fast path for pair/single adjustment
@@ -310,7 +314,7 @@ struct FontMmapIndex {
     case_pair_groups: Vec<PairGroupIndex>,
     single_groups: Vec<SingleGroupIndex>,
     case_single_groups: Vec<SingleGroupIndex>,
-    pair_first_present_off: usize, // v17: offset in mmap of num_glyphs bytes, 1 if gid has any pair kern (0 = missing / v16 compat)
+    pair_first_present_off: usize, // v18: offset in mmap of num_glyphs bytes, 1 if gid has any pair kern (always present)
 }
 
 // ---------- Backward compat parse structs for test_gpos ----------
@@ -427,6 +431,26 @@ impl GeometryCache {
         None
     }
 
+    #[inline]
+    fn coverage_index_fast(&self, map_off: usize, gid: u16) -> Option<usize> {
+        if map_off == 0 { return None; }
+        let d = self.data();
+        let off = map_off + gid as usize * 2;
+        if off + 2 > d.len() { return None; }
+        let v = le_u16_at(d, off);
+        if v == 0xFFFF { None } else { Some(v as usize) }
+    }
+
+    #[inline]
+    fn class_get_fast(&self, map_off: usize, gid: u16) -> Option<usize> {
+        if map_off == 0 { return None; }
+        let d = self.data();
+        let off = map_off + gid as usize * 2;
+        if off + 2 > d.len() { return None; }
+        Some(le_u16_at(d, off) as usize)
+    }
+
+
     // single adjustment sum across lookups, first matching subtable per lookup wins
     // v16: uses pre-grouped single_groups built at cache build time — zero alloc, no sort, no HashSet
     fn single_adjustment_full(&self, f: &FontMmapIndex, gid: u16) -> [i32;4] {
@@ -489,33 +513,16 @@ impl GeometryCache {
     // Also: class_get Format2 now binary searches sorted ranges, and pair second-gid uses
     // linear for tiny sets (<=8) else binary search — both benefit from cache-build sorting.
     fn pair_adjustment_full(&self, f: &FontMmapIndex, gid1: u16, gid2: u16) -> ([i32;4],[i32;4]) {
-        // thread-local memoization — pure for given mmap font data
-        let cache_key = (f as *const FontMmapIndex as usize, ((gid1 as u32) << 16) | (gid2 as u32));
-        if let Some(hit) = PAIR_CACHE.with(|c| c.borrow().get(&cache_key).copied()) {
-            return hit;
-        }
-        // v17 zero-copy: pair_first_present is an offset into mmap, no Vec copy
+        // v18: O(1) coverage and class maps, no PAIR_CACHE
         if f.pair_first_present_off != 0 {
             let d = self.data();
             let g1 = gid1 as usize;
             if g1 >= f.num_glyphs {
-                let res = ([0i32;4],[0i32;4]);
-                PAIR_CACHE.with(|c| {
-                    let mut m = c.borrow_mut();
-                    if m.len() >= 16384 { m.clear(); }
-                    m.insert(cache_key, res);
-                });
-                return res;
+                return ([0i32;4],[0i32;4]);
             }
             let off = f.pair_first_present_off + g1;
             if off < d.len() && d[off]==0 {
-                let res = ([0i32;4],[0i32;4]);
-                PAIR_CACHE.with(|c| {
-                    let mut m = c.borrow_mut();
-                    if m.len() >= 16384 { m.clear(); }
-                    m.insert(cache_key, res);
-                });
-                return res;
+                return ([0i32;4],[0i32;4]);
             }
         }
         let d = self.data();
@@ -536,7 +543,11 @@ impl GeometryCache {
                 for (_pos, cand) in cands {
                     match cand {
                         PairSubtableRef::F1(tbl) => {
-                            let cov_idx = match self.coverage_contains(tbl.coverage_off, tbl.coverage_len, gid1) { Some(i)=>i, None=>continue };
+                            let cov_idx = if tbl.coverage_map_off != 0 {
+                        match self.coverage_index_fast(tbl.coverage_map_off, gid1) { Some(i)=>i, None=>continue }
+                    } else {
+                        match self.coverage_contains(tbl.coverage_off, tbl.coverage_len, gid1) { Some(i)=>i, None=>continue }
+                    };
                             let ps = &tbl.pair_sets[cov_idx];
                             let mut lo = 0usize; let mut hi = ps.pair_count; let mut found_off: Option<usize> = None;
                             while lo < hi {
@@ -562,9 +573,11 @@ impl GeometryCache {
                             break;
                         }
                         PairSubtableRef::F2(tbl) => {
-                            if self.coverage_contains(tbl.coverage_off, tbl.coverage_len, gid1).is_none() { continue; }
-                            let c1 = self.class_get(&tbl.class1_def, gid1);
-                            let c2 = self.class_get(&tbl.class2_def, gid2);
+                            if tbl.coverage_map_off != 0 {
+                                if self.coverage_index_fast(tbl.coverage_map_off, gid1).is_none() { continue; }
+                            } else if self.coverage_contains(tbl.coverage_off, tbl.coverage_len, gid1).is_none() { continue; }
+                            let c1 = if tbl.class1_map_off != 0 { self.class_get_fast(tbl.class1_map_off, gid1).unwrap_or(0) } else { self.class_get(&tbl.class1_def, gid1) };
+                            let c2 = if tbl.class2_map_off != 0 { self.class_get_fast(tbl.class2_map_off, gid2).unwrap_or(0) } else { self.class_get(&tbl.class2_def, gid2) };
                             if c1 >= tbl.class1_count || c2 >= tbl.class2_count { continue; }
                             let idx = c1 * tbl.class2_count + c2;
                             let rec_size = (tbl.sz1 + tbl.sz2)*2;
@@ -587,11 +600,6 @@ impl GeometryCache {
                 }
             }
             let res = (v1_acc, v2_acc);
-            PAIR_CACHE.with(|c| {
-                let mut m = c.borrow_mut();
-                if m.len() >= 16384 { m.clear(); }
-                m.insert(cache_key, res);
-            });
             return res;
         }
 
@@ -599,9 +607,11 @@ impl GeometryCache {
             for entry in &group.entries {
                 if entry.is_f2 {
                     let tbl = &f.format2_tables[entry.idx as usize];
-                    if self.coverage_contains(tbl.coverage_off, tbl.coverage_len, gid1).is_none() { continue; }
-                    let c1 = self.class_get(&tbl.class1_def, gid1);
-                    let c2 = self.class_get(&tbl.class2_def, gid2);
+                    if tbl.coverage_map_off != 0 {
+                        if self.coverage_index_fast(tbl.coverage_map_off, gid1).is_none() { continue; }
+                    } else if self.coverage_contains(tbl.coverage_off, tbl.coverage_len, gid1).is_none() { continue; }
+                    let c1 = if tbl.class1_map_off != 0 { self.class_get_fast(tbl.class1_map_off, gid1).unwrap_or(0) } else { self.class_get(&tbl.class1_def, gid1) };
+                    let c2 = if tbl.class2_map_off != 0 { self.class_get_fast(tbl.class2_map_off, gid2).unwrap_or(0) } else { self.class_get(&tbl.class2_def, gid2) };
                     if c1 >= tbl.class1_count || c2 >= tbl.class2_count { continue; }
                     let idx = c1 * tbl.class2_count + c2;
                     let rec_size = (tbl.sz1 + tbl.sz2)*2;
@@ -621,7 +631,11 @@ impl GeometryCache {
                     break; // first match per lookup wins
                 } else {
                     let tbl = &f.format1_tables[entry.idx as usize];
-                    let cov_idx = match self.coverage_contains(tbl.coverage_off, tbl.coverage_len, gid1) { Some(i)=>i, None=>continue };
+                    let cov_idx = if tbl.coverage_map_off != 0 {
+                        match self.coverage_index_fast(tbl.coverage_map_off, gid1) { Some(i)=>i, None=>continue }
+                    } else {
+                        match self.coverage_contains(tbl.coverage_off, tbl.coverage_len, gid1) { Some(i)=>i, None=>continue }
+                    };
                     let ps = &tbl.pair_sets[cov_idx];
                     let rec_size = 2 + tbl.sz1*2 + tbl.sz2*2;
                     let mut found_off: Option<usize> = None;
@@ -660,11 +674,6 @@ impl GeometryCache {
             }
         }
         let res = (v1_acc, v2_acc);
-        PAIR_CACHE.with(|c| {
-            let mut m = c.borrow_mut();
-            if m.len() >= 16384 { m.clear(); }
-            m.insert(cache_key, res);
-        });
         res
     }
 
@@ -779,7 +788,11 @@ impl GeometryCache {
                 for (_pos, cand) in cands {
                     match cand {
                         PairSubtableRef::F1(tbl) => {
-                            let cov_idx = match self.coverage_contains(tbl.coverage_off, tbl.coverage_len, gid1) { Some(i)=>i, None=>continue };
+                            let cov_idx = if tbl.coverage_map_off != 0 {
+                        match self.coverage_index_fast(tbl.coverage_map_off, gid1) { Some(i)=>i, None=>continue }
+                    } else {
+                        match self.coverage_contains(tbl.coverage_off, tbl.coverage_len, gid1) { Some(i)=>i, None=>continue }
+                    };
                             let ps = &tbl.pair_sets[cov_idx];
                             let mut lo = 0usize; let mut hi = ps.pair_count; let mut found_off: Option<usize> = None;
                             while lo < hi {
@@ -805,9 +818,11 @@ impl GeometryCache {
                             break;
                         }
                         PairSubtableRef::F2(tbl) => {
-                            if self.coverage_contains(tbl.coverage_off, tbl.coverage_len, gid1).is_none() { continue; }
-                            let c1 = self.class_get(&tbl.class1_def, gid1);
-                            let c2 = self.class_get(&tbl.class2_def, gid2);
+                            if tbl.coverage_map_off != 0 {
+                                if self.coverage_index_fast(tbl.coverage_map_off, gid1).is_none() { continue; }
+                            } else if self.coverage_contains(tbl.coverage_off, tbl.coverage_len, gid1).is_none() { continue; }
+                            let c1 = if tbl.class1_map_off != 0 { self.class_get_fast(tbl.class1_map_off, gid1).unwrap_or(0) } else { self.class_get(&tbl.class1_def, gid1) };
+                            let c2 = if tbl.class2_map_off != 0 { self.class_get_fast(tbl.class2_map_off, gid2).unwrap_or(0) } else { self.class_get(&tbl.class2_def, gid2) };
                             if c1 >= tbl.class1_count || c2 >= tbl.class2_count { continue; }
                             let idx = c1 * tbl.class2_count + c2;
                             let rec_size = (tbl.sz1 + tbl.sz2)*2;
@@ -835,9 +850,11 @@ impl GeometryCache {
             for entry in &group.entries {
                 if entry.is_f2 {
                     let tbl = &f.case_format2_tables[entry.idx as usize];
-                    if self.coverage_contains(tbl.coverage_off, tbl.coverage_len, gid1).is_none() { continue; }
-                    let c1 = self.class_get(&tbl.class1_def, gid1);
-                    let c2 = self.class_get(&tbl.class2_def, gid2);
+                    if tbl.coverage_map_off != 0 {
+                        if self.coverage_index_fast(tbl.coverage_map_off, gid1).is_none() { continue; }
+                    } else if self.coverage_contains(tbl.coverage_off, tbl.coverage_len, gid1).is_none() { continue; }
+                    let c1 = if tbl.class1_map_off != 0 { self.class_get_fast(tbl.class1_map_off, gid1).unwrap_or(0) } else { self.class_get(&tbl.class1_def, gid1) };
+                    let c2 = if tbl.class2_map_off != 0 { self.class_get_fast(tbl.class2_map_off, gid2).unwrap_or(0) } else { self.class_get(&tbl.class2_def, gid2) };
                     if c1 >= tbl.class1_count || c2 >= tbl.class2_count { continue; }
                     let idx = c1 * tbl.class2_count + c2;
                     let rec_size = (tbl.sz1 + tbl.sz2)*2;
@@ -857,7 +874,11 @@ impl GeometryCache {
                     break;
                 } else {
                     let tbl = &f.case_format1_tables[entry.idx as usize];
-                    let cov_idx = match self.coverage_contains(tbl.coverage_off, tbl.coverage_len, gid1) { Some(i)=>i, None=>continue };
+                    let cov_idx = if tbl.coverage_map_off != 0 {
+                        match self.coverage_index_fast(tbl.coverage_map_off, gid1) { Some(i)=>i, None=>continue }
+                    } else {
+                        match self.coverage_contains(tbl.coverage_off, tbl.coverage_len, gid1) { Some(i)=>i, None=>continue }
+                    };
                     let ps = &tbl.pair_sets[cov_idx];
                     let rec_size = 2 + tbl.sz1*2 + tbl.sz2*2;
                     let mut found_off: Option<usize> = None;
@@ -905,82 +926,34 @@ impl GeometryCache {
     }
 
     pub fn predict_glyph_positions(&self, font_key: &str, chars: &[char]) -> Option<Vec<(f64,f64)>> {
-        let f = self.fonts.get(font_key)?;
-        let mut gids: Vec<Option<u16>> = Vec::with_capacity(chars.len());
-        for &c in chars { gids.push(self.cmap_gid(f, c)); }
-        // early exit if any missing
-        for g in &gids { if g.is_none() { return None; } }
-        let n = gids.len();
-        if n==0 { return Some(Vec::new()); }
-
-        // precompute singles (default only)
-        let mut singles: Vec<[i32;4]> = Vec::with_capacity(n);
-        for i in 0..n {
-            let gid = gids[i].unwrap();
-            singles.push(self.single_adjustment_full(f, gid));
-        }
-        // precompute pair adjs (default)
-        let mut pair_firsts: Vec<[i32;4]> = vec![[0;4]; n];
-        let mut pair_seconds: Vec<[i32;4]> = vec![[0;4]; n];
-        if n>1 {
-            for i in 0..n-1 {
-                let g1 = gids[i].unwrap();
-                let g2 = gids[i+1].unwrap();
-                let (v1,v2) = self.pair_adjustment_full(f, g1, g2);
-                pair_firsts[i] = v1;
-                pair_seconds[i+1] = v2;
-            }
-        }
-        // ── case/cpsp conditional ──
-        // Default = no case/cpsp (matches WeasyPrint/CSS default). Enable only when
-        // font variant explicitly asks for caps handling: |cpsp, |case, |caps.
-        let apply_case = Self::is_all_caps_context(chars) && Self::is_allcaps_variant(font_key);
-        let mut case_singles: Vec<[i32;4]> = vec![[0;4]; n];
-        let mut case_pair_firsts: Vec<[i32;4]> = vec![[0;4]; n];
-        let mut case_pair_seconds: Vec<[i32;4]> = vec![[0;4]; n];
-        if apply_case {
-            for i in 0..n {
-                case_singles[i] = self.case_single_adjustment_full(f, gids[i].unwrap());
-            }
-            if n>1 {
-                for i in 0..n-1 {
-                    let (v1,v2) = self.case_pair_adjustment_full(f, gids[i].unwrap(), gids[i+1].unwrap());
-                    case_pair_firsts[i] = v1;
-                    case_pair_seconds[i+1] = v2;
-                }
-            }
-        }
-
-        let mut out = Vec::with_capacity(n);
-        let mut cursor = 0.0f64;
-        for i in 0..n {
-            let gid = gids[i].unwrap() as usize;
-            let (adv, x0, x1, y0, y1) = self.glyph_metrics(f, gid)?;
-            let s = singles[i];
-            let pf = pair_firsts[i];
-            let ps = pair_seconds[i];
-            let cs = case_singles[i];
-            let cpf = case_pair_firsts[i];
-            let cps = case_pair_seconds[i];
-            let x_pla = (s[0] + pf[0] + ps[0] + cs[0] + cpf[0] + cps[0]) as f64;
-            let y_pla = (s[1] + pf[1] + ps[1] + cs[1] + cpf[1] + cps[1]) as f64;
-            let x_adv_adj = (s[2] + pf[2] + ps[2] + cs[2] + cpf[2] + cps[2]) as f64;
-            let total_adv = adv + x_adv_adj;
-            let cx = cursor + x_pla + (x0 + x1)*0.5;
-            let cy = y_pla + (y0 + y1)*0.5;
-            out.push((cx,cy));
-            cursor += total_adv;
-        }
-        Some(out)
+        // De-duplicate: single core is predict_glyph_positions_and_extents with a thread-local memo.
+        // This removes the second copy of singles/pairs precompute that previously lived here.
+        self.predict_glyph_positions_and_extents(font_key, chars)
+            .map(|v| v.into_iter().map(|(x,y,_,_)| (x,y)).collect())
     }
 
     pub fn predict_glyph_positions_and_extents(&self, font_key: &str, chars: &[char]) -> Option<Vec<(f64,f64,f64,f64)>> {
+        // thread-local memo: many lines re-evaluate same word for same font via
+        // per_char_geo and word_scales. Cache num_glyphs-length keys keeps second call O(1).
+        let key_str: String = chars.iter().collect();
+        let cache_key = (font_key.to_owned(), key_str.clone());
+        if let Some(hit) = PRED_CACHE.with(|c| c.borrow().get(&cache_key).cloned()) {
+            return Some(hit);
+        }
         let f = self.fonts.get(font_key)?;
         let mut gids: Vec<Option<u16>> = Vec::with_capacity(chars.len());
         for &c in chars { gids.push(self.cmap_gid(f, c)); }
         for g in &gids { if g.is_none() { return None; } }
         let n = gids.len();
-        if n==0 { return Some(Vec::new()); }
+        if n==0 {
+            let empty: Vec<(f64,f64,f64,f64)> = Vec::new();
+            PRED_CACHE.with(|c| {
+                let mut m = c.borrow_mut();
+                if m.len() > 2048 { m.clear(); }
+                m.insert(cache_key, empty.clone());
+            });
+            return Some(empty);
+        }
 
         let mut singles: Vec<[i32;4]> = Vec::with_capacity(n);
         for i in 0..n {
@@ -1031,6 +1004,11 @@ impl GeometryCache {
             out.push((cx,cy,y_min_a,y_max_a));
             cursor += total_adv;
         }
+        PRED_CACHE.with(|c| {
+            let mut m = c.borrow_mut();
+            if m.len() > 2048 { m.clear(); }
+            m.insert(cache_key, out.clone());
+        });
         Some(out)
     }
 
@@ -1924,6 +1902,131 @@ impl GeometryCache {
                 }
                 w.write_all(&pfp)?;
             }
+            // v18: O(1) coverage and class maps — num_glyphs *2 LE per table, 0xFFFF sentinel for missing coverage
+            {
+                let ng = of.num_glyphs;
+                // F1 coverage map
+                for tbl in &of.format1_tables {
+                    let mut map = vec![0xFFFFu16; ng];
+                    for (i, &gid) in tbl.coverage.iter().enumerate() {
+                        let g = gid as usize;
+                        if g < ng { map[g] = i as u16; }
+                    }
+                    for v in map { w.write_all(&v.to_le_bytes())?; }
+                }
+                // F2: coverage + class1 + class2
+                for tbl in &of.format2_tables {
+                    let mut cov_map = vec![0xFFFFu16; ng];
+                    for (i, &gid) in tbl.coverage.iter().enumerate() {
+                        let g = gid as usize;
+                        if g < ng { cov_map[g] = i as u16; }
+                    }
+                    for v in cov_map { w.write_all(&v.to_le_bytes())?; }
+                    // class1 map
+                    let mut c1map = vec![0u16; ng];
+                    for g in 0..ng {
+                        let gid = g as u16;
+                        let cls = match &tbl.class_def1 {
+                            ClassDefOwned::Format1 { start, classes } => {
+                                if gid < *start { 0 } else {
+                                    let idx = (gid - *start) as usize;
+                                    if idx < classes.len() { classes[idx] } else { 0 }
+                                }
+                            }
+                            ClassDefOwned::Format2 { ranges } => {
+                                let mut c = 0u16;
+                                for (s,e,cl) in ranges {
+                                    if gid >= *s && gid <= *e { c = *cl; break; }
+                                }
+                                c
+                            }
+                        };
+                        c1map[g] = cls;
+                    }
+                    for v in c1map { w.write_all(&v.to_le_bytes())?; }
+                    let mut c2map = vec![0u16; ng];
+                    for g in 0..ng {
+                        let gid = g as u16;
+                        let cls = match &tbl.class_def2 {
+                            ClassDefOwned::Format1 { start, classes } => {
+                                if gid < *start { 0 } else {
+                                    let idx = (gid - *start) as usize;
+                                    if idx < classes.len() { classes[idx] } else { 0 }
+                                }
+                            }
+                            ClassDefOwned::Format2 { ranges } => {
+                                let mut c = 0u16;
+                                for (s,e,cl) in ranges {
+                                    if gid >= *s && gid <= *e { c = *cl; break; }
+                                }
+                                c
+                            }
+                        };
+                        c2map[g] = cls;
+                    }
+                    for v in c2map { w.write_all(&v.to_le_bytes())?; }
+                }
+                // case F1
+                for tbl in &of.case_format1_tables {
+                    let mut map = vec![0xFFFFu16; ng];
+                    for (i, &gid) in tbl.coverage.iter().enumerate() {
+                        let g = gid as usize;
+                        if g < ng { map[g] = i as u16; }
+                    }
+                    for v in map { w.write_all(&v.to_le_bytes())?; }
+                }
+                // case F2
+                for tbl in &of.case_format2_tables {
+                    let mut cov_map = vec![0xFFFFu16; ng];
+                    for (i, &gid) in tbl.coverage.iter().enumerate() {
+                        let g = gid as usize;
+                        if g < ng { cov_map[g] = i as u16; }
+                    }
+                    for v in cov_map { w.write_all(&v.to_le_bytes())?; }
+                    let mut c1map = vec![0u16; ng];
+                    for g in 0..ng {
+                        let gid = g as u16;
+                        let cls = match &tbl.class_def1 {
+                            ClassDefOwned::Format1 { start, classes } => {
+                                if gid < *start { 0 } else {
+                                    let idx = (gid - *start) as usize;
+                                    if idx < classes.len() { classes[idx] } else { 0 }
+                                }
+                            }
+                            ClassDefOwned::Format2 { ranges } => {
+                                let mut c = 0u16;
+                                for (s,e,cl) in ranges {
+                                    if gid >= *s && gid <= *e { c = *cl; break; }
+                                }
+                                c
+                            }
+                        };
+                        c1map[g] = cls;
+                    }
+                    for v in c1map { w.write_all(&v.to_le_bytes())?; }
+                    let mut c2map = vec![0u16; ng];
+                    for g in 0..ng {
+                        let gid = g as u16;
+                        let cls = match &tbl.class_def2 {
+                            ClassDefOwned::Format1 { start, classes } => {
+                                if gid < *start { 0 } else {
+                                    let idx = (gid - *start) as usize;
+                                    if idx < classes.len() { classes[idx] } else { 0 }
+                                }
+                            }
+                            ClassDefOwned::Format2 { ranges } => {
+                                let mut c = 0u16;
+                                for (s,e,cl) in ranges {
+                                    if gid >= *s && gid <= *e { c = *cl; break; }
+                                }
+                                c
+                            }
+                        };
+                        c2map[g] = cls;
+                    }
+                    for v in c2map { w.write_all(&v.to_le_bytes())?; }
+                }
+            }
         }
         w.flush()?; drop(w); std::fs::rename(&tmp, path)?; Ok(())
     }
@@ -1935,8 +2038,7 @@ impl GeometryCache {
         if data.len() < 20 { return Err("BGEO too small".into()); }
         if &data[0..4] != BGEO_MAGIC { return Err(format!("bad magic {:?}", &data[0..4])); }
         let version = u32::from_le_bytes(data[4..8].try_into().unwrap());
-        // Support v16 compat (recompute pfp) + v17 (stored pfp): accept both in transition.
-        if version != 16 && version != BGEO_VERSION { return Err(format!("BGEO version {version}, need v{BGEO_VERSION} (or v16 compat)")); }
+        if version != BGEO_VERSION { return Err(format!("BGEO version {version}, need v{BGEO_VERSION}")); }
         let catalog_hash = u64::from_le_bytes(data[8..16].try_into().unwrap());
         let n_fonts = u32::from_le_bytes(data[16..20].try_into().unwrap()) as usize;
         let mut pos = 20usize;
@@ -2012,7 +2114,7 @@ impl GeometryCache {
                     pos+=bytes;
                     pair_sets.push(PairSetIndex { pairs_off, pair_count: pc });
                 }
-                f1_tables.push(Format1Index { coverage_off: cov_off, coverage_len: cov_len, val_fmt1: vf1, val_fmt2: vf2, sz1, sz2, pair_sets, lookup_id, subtable_pos });
+                f1_tables.push(Format1Index { coverage_off: cov_off, coverage_len: cov_len, val_fmt1: vf1, val_fmt2: vf2, sz1, sz2, pair_sets, lookup_id, subtable_pos, coverage_map_off: 0 });
             }
 
             let mut f2_tables = Vec::with_capacity(n_f2);
@@ -2075,7 +2177,7 @@ impl GeometryCache {
                 let matrix_bytes = c1c*c2c*(sz1+sz2)*2;
                 if pos+matrix_bytes > data.len() { return Err("trunc f2 matrix".into()); }
                 pos+=matrix_bytes;
-                f2_tables.push(Format2Index { coverage_off: cov_off, coverage_len: cov_len, class1_count: c1c, class2_count: c2c, val_fmt1: vf1u, val_fmt2: vf2u, sz1, sz2, class1_def: cd1, class2_def: cd2, matrix_off, lookup_id, subtable_pos });
+                f2_tables.push(Format2Index { coverage_off: cov_off, coverage_len: cov_len, class1_count: c1c, class2_count: c2c, val_fmt1: vf1u, val_fmt2: vf2u, sz1, sz2, class1_def: cd1, class2_def: cd2, matrix_off, lookup_id, subtable_pos, coverage_map_off: 0, class1_map_off: 0, class2_map_off: 0 });
             }
 
             // ── v15 case/cpsp tables ──
@@ -2132,7 +2234,7 @@ impl GeometryCache {
                     pos+=bytes;
                     pair_sets.push(PairSetIndex { pairs_off, pair_count: pc });
                 }
-                case_f1_tables.push(Format1Index { coverage_off: cov_off, coverage_len: cov_len, val_fmt1: vf1, val_fmt2: vf2, sz1, sz2, pair_sets, lookup_id, subtable_pos });
+                case_f1_tables.push(Format1Index { coverage_off: cov_off, coverage_len: cov_len, val_fmt1: vf1, val_fmt2: vf2, sz1, sz2, pair_sets, lookup_id, subtable_pos, coverage_map_off: 0 });
             }
             let mut case_f2_tables = Vec::with_capacity(n_case_f2);
             for _ in 0..n_case_f2 {
@@ -2192,7 +2294,7 @@ impl GeometryCache {
                 let matrix_bytes = c1c*c2c*(sz1+sz2)*2;
                 if pos+matrix_bytes > data.len() { return Err("trunc case f2 matrix".into()); }
                 pos+=matrix_bytes;
-                case_f2_tables.push(Format2Index { coverage_off: cov_off, coverage_len: cov_len, class1_count: c1c, class2_count: c2c, val_fmt1: vf1u, val_fmt2: vf2u, sz1, sz2, class1_def: cd1, class2_def: cd2, matrix_off, lookup_id, subtable_pos });
+                case_f2_tables.push(Format2Index { coverage_off: cov_off, coverage_len: cov_len, class1_count: c1c, class2_count: c2c, val_fmt1: vf1u, val_fmt2: vf2u, sz1, sz2, class1_def: cd1, class2_def: cd2, matrix_off, lookup_id, subtable_pos, coverage_map_off: 0, class1_map_off: 0, class2_map_off: 0 });
             }
 
             // ── v16: pre-grouped lookup groups ──
@@ -2265,19 +2367,51 @@ impl GeometryCache {
                 case_single_groups.push(SingleGroupIndex { lookup_id, entries });
             }
 
-            // v17: pair_first_present blob — stored directly after case_single_groups
-            // zero-copy: keep its offset in mmap, no Vec copy (true mmap)
-            let pair_first_present_off = if version >= 17 {
+            // v18 only — pair_first_present is always present, no v16/v17 compat
+            let pair_first_present_off = {
                 if pos + num_glyphs > data.len() {
-                    return Err(format!("trunc v17 pair_first_present {} + {} > {}", pos, num_glyphs, data.len()));
+                    return Err(format!("trunc v18 pair_first_present {} + {} > {}", pos, num_glyphs, data.len()));
                 }
                 let off = pos;
                 pos += num_glyphs;
                 off
-            } else {
-                // v16 compat: old cache had no blob — point to 0 (no fast path), will be rebuilt next write
-                0usize
             };
+            // v18: O(1) coverage and class maps — num_glyphs*2 LE per table, after pfp blob, in order f1,f2,case_f1,case_f2
+            {
+                let bytes_per_map = num_glyphs * 2;
+                for tbl in &mut f1_tables {
+                    if pos + bytes_per_map > data.len() { return Err("trunc v18 f1 coverage_map".into()); }
+                    tbl.coverage_map_off = pos;
+                    pos += bytes_per_map;
+                }
+                for tbl in &mut f2_tables {
+                    if pos + bytes_per_map > data.len() { return Err("trunc v18 f2 coverage_map".into()); }
+                    tbl.coverage_map_off = pos;
+                    pos += bytes_per_map;
+                    if pos + bytes_per_map > data.len() { return Err("trunc v18 f2 class1_map".into()); }
+                    tbl.class1_map_off = pos;
+                    pos += bytes_per_map;
+                    if pos + bytes_per_map > data.len() { return Err("trunc v18 f2 class2_map".into()); }
+                    tbl.class2_map_off = pos;
+                    pos += bytes_per_map;
+                }
+                for tbl in &mut case_f1_tables {
+                    if pos + bytes_per_map > data.len() { return Err("trunc v18 case_f1 coverage_map".into()); }
+                    tbl.coverage_map_off = pos;
+                    pos += bytes_per_map;
+                }
+                for tbl in &mut case_f2_tables {
+                    if pos + bytes_per_map > data.len() { return Err("trunc v18 case_f2 coverage_map".into()); }
+                    tbl.coverage_map_off = pos;
+                    pos += bytes_per_map;
+                    if pos + bytes_per_map > data.len() { return Err("trunc v18 case_f2 class1_map".into()); }
+                    tbl.class1_map_off = pos;
+                    pos += bytes_per_map;
+                    if pos + bytes_per_map > data.len() { return Err("trunc v18 case_f2 class2_map".into()); }
+                    tbl.class2_map_off = pos;
+                    pos += bytes_per_map;
+                }
+            }
 
             fonts.insert(font_key, FontMmapIndex { file_hash, upem, num_glyphs, glyphs_off, cmap_off, cmap_len, single_tables, format1_tables: f1_tables, format2_tables: f2_tables, case_single_tables, case_format1_tables: case_f1_tables, case_format2_tables: case_f2_tables, pair_groups, case_pair_groups, single_groups, case_single_groups, pair_first_present_off });
         }
