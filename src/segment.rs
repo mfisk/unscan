@@ -1195,40 +1195,12 @@ fn candidate_seams(
         let me = masked_energy(mid_r, c);
         if me >= f32::INFINITY { continue; } // masked pixel, skip
         let combined = cost_fwd[mid_off + c] + cost_rev[mid_off + c] - ink_score(me, mid_r, row_ink);
-        // Width penalty: trace path to find horizontal extent.
-        let mut min_c = c;
-        let mut max_c = c;
-        {
-            let mut cur = mid_off + c;
-            loop {
-                let p = pred_fwd[cur] as usize;
-                if p == cur { break; }
-                let pc = p % seg_w;
-                if pc < min_c { min_c = pc; }
-                if pc > max_c { max_c = pc; }
-                cur = p;
-            }
-        }
-        {
-            let mut cur = mid_off + c;
-            loop {
-                let p = pred_rev[cur] as usize;
-                if p == cur { break; }
-                let pc = p % seg_w;
-                if pc < min_c { min_c = pc; }
-                if pc > max_c { max_c = pc; }
-                cur = p;
-            }
-        }
-        let width = (max_c - min_c) as f32;
         let split_col = seg_start + c as u32;
-        dp_candidates.push((split_col, combined + 0.0 * width));
+        dp_candidates.push((split_col, combined));
     }
 
     // Second pass: trace each DP candidate's path and adjust cost
-
-    // Sort DP candidates by column for local-minima pass.
-    dp_candidates.sort_by(|a, b| a.0.cmp(&b.0));
+    // dp_candidates already emitted in column order (1..seg_w-1), sort redundant.
 
     // Find local minima in DP cost (before segment penalty).
     // A local minimum is a column (or run of equal-cost consecutive columns)

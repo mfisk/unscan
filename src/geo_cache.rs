@@ -34,7 +34,13 @@
 //!     }
 
 use std::collections::{BTreeMap, HashMap, HashSet};
+use std::cell::RefCell;
 use std::path::{Path, PathBuf};
+use rustc_hash::FxHashMap;
+
+thread_local! {
+    static PAIR_CACHE: RefCell<FxHashMap<(usize,u32), ([i32;4],[i32;4])>> = RefCell::new(FxHashMap::default());
+}
 
 const BGEO_MAGIC: &[u8; 4] = b"BGEO";
 // Bump to 16 to store pre-grouped pair/single lookup groups for fast pair_adjustment_full.
@@ -481,6 +487,11 @@ impl GeometryCache {
     // Also: class_get Format2 now binary searches sorted ranges, and pair second-gid uses
     // linear for tiny sets (<=8) else binary search — both benefit from cache-build sorting.
     fn pair_adjustment_full(&self, f: &FontMmapIndex, gid1: u16, gid2: u16) -> ([i32;4],[i32;4]) {
+        // thread-local memoization — pure for given mmap font data
+        let cache_key = (f as *const FontMmapIndex as usize, ((gid1 as u32) << 16) | (gid2 as u32));
+        if let Some(hit) = PAIR_CACHE.with(|c| c.borrow().get(&cache_key).copied()) {
+            return hit;
+        }
         let d = self.data();
         let mut v1_acc = [0i32;4];
         let mut v2_acc = [0i32;4];
@@ -549,7 +560,13 @@ impl GeometryCache {
                     }
                 }
             }
-            return (v1_acc, v2_acc);
+            let res = (v1_acc, v2_acc);
+            PAIR_CACHE.with(|c| {
+                let mut m = c.borrow_mut();
+                if m.len() >= 16384 { m.clear(); }
+                m.insert(cache_key, res);
+            });
+            return res;
         }
 
         for group in &f.pair_groups {
@@ -616,7 +633,13 @@ impl GeometryCache {
                 }
             }
         }
-        (v1_acc, v2_acc)
+        let res = (v1_acc, v2_acc);
+        PAIR_CACHE.with(|c| {
+            let mut m = c.borrow_mut();
+            if m.len() >= 16384 { m.clear(); }
+            m.insert(cache_key, res);
+        });
+        res
     }
 
     // ── v15 case/cpsp conditional application ──
