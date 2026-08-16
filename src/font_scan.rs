@@ -18,9 +18,12 @@
 //! that produce at least one different glyph ID are emitted as variants.
 
 use unprint_fonts::ab_glyph::{Font, FontRef, PxScale, ScaleFont};
+use std::cell::RefCell;
 use std::collections::{HashMap, HashSet};
+use std::collections::hash_map::DefaultHasher;
+use std::hash::{Hash, Hasher};
 use std::path::{Path, PathBuf};
-use std::sync::{Mutex, OnceLock};
+use std::sync::{Arc, Mutex, OnceLock};
 use walkdir::WalkDir;
 
 /// Cache of vertical-gap counts per (font path, ligature char) — avoids
@@ -30,6 +33,89 @@ static GAP_CACHE: OnceLock<Mutex<HashMap<(PathBuf, char), usize>>> = OnceLock::n
 
 fn gap_cache() -> &'static Mutex<HashMap<(PathBuf, char), usize>> {
     GAP_CACHE.get_or_init(|| Mutex::new(HashMap::new()))
+}
+
+/// Cache of final collapsed lig sets per font path — eliminates 33.9%
+/// inclusive hot path (font_match.rs:138, font_pipeline.rs:381) which
+/// otherwise did fs::read + cmap + 5× shape per candidate per line.
+static LIG_SET_CACHE: OnceLock<Mutex<HashMap<PathBuf, HashSet<char>>>> = OnceLock::new();
+
+fn lig_set_cache() -> &'static Mutex<HashMap<PathBuf, HashSet<char>>> {
+    LIG_SET_CACHE.get_or_init(|| Mutex::new(HashMap::new()))
+}
+
+// Thread-local ShapePlan cache for lig probe — mirrors
+// crates/unprint-fonts/src/shape.rs which caches 8.3% leaf
+// find_language_feature. Keyed by (font_data_ptr, features_hash).
+type PlanKey = (usize, u64);
+thread_local! {
+    static PROBE_PLAN_CACHE: RefCell<HashMap<PlanKey, Arc<unprint_fonts::rustybuzz::ShapePlan>>> =
+        RefCell::new(HashMap::new());
+}
+
+#[inline]
+fn probe_plan_hash(features: &[unprint_fonts::rustybuzz::Feature]) -> u64 {
+    let mut h = DefaultHasher::new();
+    // Dir/Script/Lang are constant for Latin LTR probes (Directional guess
+    // always LTR, Latn), so we only hash features; if guess ever diverges
+    // the miss just rebuilds — still correct because shape_with_plan debug
+    // asserts dir/script match.
+    for f in features {
+        f.tag.hash(&mut h);
+        f.value.hash(&mut h);
+        f.start.hash(&mut h);
+        f.end.hash(&mut h);
+    }
+    h.finish()
+}
+
+#[inline]
+fn probe_plan_cached(
+    face: &unprint_fonts::rustybuzz::Face,
+    data_ptr: usize,
+    features: &[unprint_fonts::rustybuzz::Feature],
+) -> Arc<unprint_fonts::rustybuzz::ShapePlan> {
+    let hash = probe_plan_hash(features);
+    let key = (data_ptr, hash);
+    if let Some(hit) = PROBE_PLAN_CACHE.with(|c| c.borrow().get(&key).cloned()) {
+        return hit;
+    }
+    // We guess inside shape_probe; but plan creation needs dir/script/lang.
+    // All our probes are Latin LTR, no language — matches what UnicodeBuffer
+    // guess returns for ff/fi/fl etc. Using explicit None avoids needing
+    // buffer to build plan; shape_with_plan will assert dir/script match and
+    // they do match because guess → LTR Latn.
+    let plan = Arc::new(unprint_fonts::rustybuzz::ShapePlan::new(
+        face,
+        unprint_fonts::rustybuzz::Direction::LeftToRight,
+        Some(unprint_fonts::rustybuzz::script::LATIN),
+        None,
+        features,
+    ));
+    PROBE_PLAN_CACHE.with(|c| {
+        c.borrow_mut().insert(key, plan.clone());
+    });
+    plan
+}
+
+#[inline]
+fn shape_probes_collapsed(face: &unprint_fonts::rustybuzz::Face, data_ptr: usize, features: &[unprint_fonts::rustybuzz::Feature], probe: &str) -> bool {
+    let mut buf = unprint_fonts::rustybuzz::UnicodeBuffer::new();
+    buf.push_str(probe);
+    buf.guess_segment_properties();
+    // If guess diverges from our cached plan's dir/script (unlikely for ASCII
+    // probes) fall back to fresh shape — correctness over cache hit.
+    let dir = buf.direction();
+    let script = buf.script();
+    let latin_ltr = dir == unprint_fonts::rustybuzz::Direction::LeftToRight
+        && (script == unprint_fonts::rustybuzz::script::LATIN || script == unprint_fonts::rustybuzz::script::UNKNOWN);
+    if !latin_ltr {
+        let out = unprint_fonts::rustybuzz::shape(face, features, buf);
+        return out.glyph_infos().len() == 1 && out.glyph_infos()[0].glyph_id != 0;
+    }
+    let plan = probe_plan_cached(face, data_ptr, features);
+    let out = unprint_fonts::rustybuzz::shape_with_plan(face, &plan, buf);
+    out.glyph_infos().len() == 1 && out.glyph_infos()[0].glyph_id != 0
 }
 
 // ---------------------------------------------------------------------------
@@ -179,6 +265,15 @@ impl FontEntry {
     /// interior gutter to be excluded; three-char ligs (ffi, ffl) need ≥2.
     /// Only FB00–FB04 are considered; quote ligature probes are excluded.
     pub fn collapsed_lig_set(&self) -> HashSet<char> {
+        // Global memo — eliminates 33.9% inclusive hot path after first line.
+        // Final filtered set is cached, so no FS read / shaping on hits.
+        {
+            let guard = lig_set_cache().lock().unwrap();
+            if let Some(cached) = guard.get(&self.path) {
+                return cached.clone();
+            }
+        }
+
         let mut set = HashSet::new();
         // Fast path: anything already known from glyph_overrides.
         if let Some(ref ov) = self.glyph_overrides {
@@ -193,10 +288,6 @@ impl FontEntry {
         }
 
         // Probe the actual font file for cmap and GSUB liga support if not full.
-        // This handles stale caches and fonts where GSUB produced a ligature but
-        // cmap does not contain FBxx.  We gather the full supported set first,
-        // then filter by ink contiguity below so even the fast-path 5-entry case
-        // gets filtered.
         let mut data_cache: Option<Vec<u8>> = None;
         if set.len() < 5 {
             if let Ok(data) = std::fs::read(&self.path) {
@@ -217,6 +308,7 @@ impl FontEntry {
                         unprint_fonts::rustybuzz::Feature::new(liga_tag, 1, ..),
                         unprint_fonts::rustybuzz::Feature::new(dlig_tag, 1, ..),
                     ];
+                    let data_ptr = data.as_ptr() as usize;
                     for &(probe, lig_char) in LIGATURE_PROBES {
                         match lig_char {
                             '\u{FB00}' | '\u{FB01}' | '\u{FB02}' | '\u{FB03}' | '\u{FB04}' => {},
@@ -228,10 +320,7 @@ impl FontEntry {
                         if probe.chars().count() <= 1 {
                             continue;
                         }
-                        let mut buf = unprint_fonts::rustybuzz::UnicodeBuffer::new();
-                        buf.push_str(probe);
-                        let out = unprint_fonts::rustybuzz::shape(&face, &features, buf);
-                        if out.glyph_infos().len() == 1 && out.glyph_infos()[0].glyph_id != 0 {
+                        if shape_probes_collapsed(&face, data_ptr, &features, probe) {
                             set.insert(lig_char);
                         }
                     }
@@ -239,27 +328,23 @@ impl FontEntry {
                 data_cache = Some(data);
             }
         } else {
-            // Even when we had 5 entries from overrides, we still need file data
-            // for ink-contiguity filtering below.
             if let Ok(data) = std::fs::read(&self.path) {
                 data_cache = Some(data);
             }
         }
 
         // --- collapsed filtering: exclude ligs that are really two/three inks ---
-        // Use per-(path,lig) gap cache so per-line per-font work collapses to
-        // one rasterization per font in the entire run.
         if let Some(ref data) = data_cache {
             let mut to_remove = Vec::new();
-            // Load cache once for this call to avoid locking per lig.
             let path_key = self.path.clone();
+            // Clone set to iter because we mutate to_remove later; avoid holding
+            // LIG_SET_CACHE lock while holding GAP_CACHE — deadlock avoidance per spec.
             for &lig in &set.clone().into_iter().collect::<Vec<_>>() {
                 let required_gaps = match lig {
                     '\u{FB00}' | '\u{FB01}' | '\u{FB02}' => 1usize,
                     '\u{FB03}' | '\u{FB04}' => 2usize,
                     _ => continue,
                 };
-                // Fast cache lookup
                 let cached = {
                     let guard = gap_cache().lock().unwrap();
                     guard.get(&(path_key.clone(), lig)).copied()
@@ -281,6 +366,11 @@ impl FontEntry {
             }
         }
 
+        // Insert final filtered set into global cache.
+        {
+            let mut guard = lig_set_cache().lock().unwrap();
+            guard.insert(self.path.clone(), set.clone());
+        }
         set
     }
 
