@@ -989,199 +989,191 @@ fn candidate_seams(
         energy[r * img_w + abs_col]
     };
 
-    // Forward DP: cost_fwd[r * seg_w + c] = cheapest path from any top-row column
-    // down to (r, c).  Cost = sum of ink darkness along the path, plus
-    // an entry penalty each time the path moves into a darker pixel.
-    // Row-ink discount removed from DP: it's gated on run length (≥11px),
-    // which is column-dependent. VP uses it because it's a straight vertical
-    // line; DP paths wander, so the discount doesn't apply.
-    let _p = seam_params();
-    let n_cells = h as usize * seg_w;
+    // Forward DP: fused 5-predecessor single pass — cuts 5 scans of h*seg_w
+    // down to 1, precomputes cur row darkness/ink once per cell.
+    // Identical costs to prior 5-pass version: same INFINITY handling,
+    // same 0.01/0.02 horizontal penalties, same pass-through ordering.
+    let _p = seam_params(); // hoist OnceLock load
+    let n_cells = h_us * seg_w;
     let mut cost_fwd = vec![0.0f32; n_cells];
     let mut pred_fwd = vec![0u32; n_cells];
+    // Row 0 cached for reuse as prev in r=1
+    let mut prev_darks = Vec::with_capacity(seg_w);
+    for c in 0..seg_w { prev_darks.push(masked_energy(0, c)); }
     for c in 0..seg_w {
-        let dark0 = masked_energy(0, c);
+        let dark0 = prev_darks[c];
         cost_fwd[c] = ink_score(dark0, 0, row_ink)
             + delta_ink_score(dark0, 0.0, 0, 0, row_ink, max_ink);
-        pred_fwd[c] = c as u32; // self
+        pred_fwd[c] = c as u32;
     }
-    for r in 1..h as usize {
+    let mut cur_darks = vec![0.0f32; seg_w];
+    let mut cur_inks = vec![0.0f32; seg_w];
+    for r in 1..h_us {
+        for c in 0..seg_w {
+            let cd = masked_energy(r, c);
+            cur_darks[c] = cd;
+            cur_inks[c] = ink_score(cd, r, row_ink);
+        }
         let row_off = r * seg_w;
         let prev_off = (r - 1) * seg_w;
-        // Step 1: vertical from row above (same column)
+        // Single fused predecessor evaluation
         for c in 0..seg_w {
-            let cur_dark = masked_energy(r, c);
-            let cur_ink = ink_score(cur_dark, r, row_ink);
-            let prev_dark = masked_energy(r - 1, c);
-            let entry = delta_ink_score(cur_dark, prev_dark, r, r - 1, row_ink, max_ink);
-            cost_fwd[row_off + c] = cur_ink + entry + cost_fwd[prev_off + c];
-            pred_fwd[row_off + c] = (prev_off + c) as u32;
-        }
-        // Step 2: diagonal from (r-1, c-1) → (r, c)
-        // Horizontal first: (r-1, c-1) → pass (r-1, c) → (r, c).
-        for c in 1..seg_w {
-            let cur_dark = masked_energy(r, c);
-            let cur_ink = ink_score(cur_dark, r, row_ink);
-            let prev_dark = masked_energy(r - 1, c - 1);
-            let pass_dark = masked_energy(r - 1, c);
-            let pass_ink = ink_score(pass_dark, r - 1, row_ink);
-            let pass_entry = delta_ink_score(pass_dark, prev_dark, r - 1, r - 1, row_ink, max_ink);
-            let cur_entry = delta_ink_score(cur_dark, pass_dark, r, r - 1, row_ink, max_ink);
-            let via_diag = cost_fwd[prev_off + c - 1] + pass_ink + pass_entry + cur_ink + cur_entry + 0.01;
-            if via_diag < cost_fwd[row_off + c] {
-                cost_fwd[row_off + c] = via_diag;
-                pred_fwd[row_off + c] = (prev_off + c - 1) as u32;
+            let cur_dark = cur_darks[c];
+            // masked columns remain INF — keep downstream INF propagation same as before
+            if !cur_dark.is_finite() {
+                cost_fwd[row_off + c] = f32::INFINITY;
+                pred_fwd[row_off + c] = (prev_off + c) as u32;
+                continue;
             }
-        }
-        // Step 3: diagonal from (r-1, c+1) → (r, c)
-        // Horizontal first: (r-1, c+1) → pass (r-1, c) → (r, c).
-        for c in 0..seg_w - 1 {
-            let cur_dark = masked_energy(r, c);
-            let cur_ink = ink_score(cur_dark, r, row_ink);
-            let prev_dark = masked_energy(r - 1, c + 1);
-            let pass_dark = masked_energy(r - 1, c);
-            let pass_ink = ink_score(pass_dark, r - 1, row_ink);
-            let pass_entry = delta_ink_score(pass_dark, prev_dark, r - 1, r - 1, row_ink, max_ink);
-            let cur_entry = delta_ink_score(cur_dark, pass_dark, r, r - 1, row_ink, max_ink);
-            let via_diag = cost_fwd[prev_off + c + 1] + pass_ink + pass_entry + cur_ink + cur_entry + 0.01;
-            if via_diag < cost_fwd[row_off + c] {
-                cost_fwd[row_off + c] = via_diag;
-                pred_fwd[row_off + c] = (prev_off + c + 1) as u32;
+            let cur_ink = cur_inks[c];
+            // vertical from (r-1,c)
+            let prev_dark_c = prev_darks[c];
+            let mut best = cur_ink + delta_ink_score(cur_dark, prev_dark_c, r, r - 1, row_ink, max_ink)
+                + cost_fwd[prev_off + c];
+            let mut best_pred = prev_off + c;
+            // diag -1 : (r-1,c-1) via (r-1,c)
+            if c >= 1 {
+                let pd_m1 = prev_darks[c - 1];
+                let pass_dark = prev_dark_c;
+                let pass_ink = ink_score(pass_dark, r - 1, row_ink);
+                let pass_entry = delta_ink_score(pass_dark, pd_m1, r - 1, r - 1, row_ink, max_ink);
+                let cur_entry = delta_ink_score(cur_dark, pass_dark, r, r - 1, row_ink, max_ink);
+                let via = cost_fwd[prev_off + c - 1] + pass_ink + pass_entry + cur_ink + cur_entry + 0.01;
+                if via < best { best = via; best_pred = prev_off + c - 1; }
             }
-        }
-        // Step 4: double diagonal from (r-1, c-2) → (r, c)
-        // Horizontal first: (r-1, c-2) → (r-1, c-1) → (r-1, c) → (r, c).
-        for c in 2..seg_w {
-            let cur_dark = masked_energy(r, c);
-            let cur_ink = ink_score(cur_dark, r, row_ink);
-            let prev_dark = masked_energy(r - 1, c - 2);
-            let p1_dark = masked_energy(r - 1, c - 1);
-            let p2_dark = masked_energy(r - 1, c);
-            let p1_ink = ink_score(p1_dark, r - 1, row_ink);
-            let p2_ink = ink_score(p2_dark, r - 1, row_ink);
-            let p1_entry = delta_ink_score(p1_dark, prev_dark, r - 1, r - 1, row_ink, max_ink);
-            let p2_entry = delta_ink_score(p2_dark, p1_dark, r - 1, r - 1, row_ink, max_ink);
-            let cur_entry = delta_ink_score(cur_dark, p2_dark, r, r - 1, row_ink, max_ink);
-            let via = cost_fwd[prev_off + c - 2] + p1_ink + p1_entry + p2_ink + p2_entry + cur_ink + cur_entry + 0.02;
-            if via < cost_fwd[row_off + c] {
-                cost_fwd[row_off + c] = via;
-                pred_fwd[row_off + c] = (prev_off + c - 2) as u32;
+            // diag +1 : (r-1,c+1) via (r-1,c)
+            if c + 1 < seg_w {
+                let pd_p1 = prev_darks[c + 1];
+                let pass_dark = prev_dark_c;
+                let pass_ink = ink_score(pass_dark, r - 1, row_ink);
+                let pass_entry = delta_ink_score(pass_dark, pd_p1, r - 1, r - 1, row_ink, max_ink);
+                let cur_entry = delta_ink_score(cur_dark, pass_dark, r, r - 1, row_ink, max_ink);
+                let via = cost_fwd[prev_off + c + 1] + pass_ink + pass_entry + cur_ink + cur_entry + 0.01;
+                if via < best { best = via; best_pred = prev_off + c + 1; }
             }
-        }
-        // Step 5: double diagonal from (r-1, c+2) → (r, c)
-        // Horizontal first: (r-1, c+2) → (r-1, c+1) → (r-1, c) → (r, c).
-        for c in 0..seg_w.saturating_sub(2) {
-            let cur_dark = masked_energy(r, c);
-            let cur_ink = ink_score(cur_dark, r, row_ink);
-            let prev_dark = masked_energy(r - 1, c + 2);
-            let p1_dark = masked_energy(r - 1, c + 1);
-            let p2_dark = masked_energy(r - 1, c);
-            let p1_ink = ink_score(p1_dark, r - 1, row_ink);
-            let p2_ink = ink_score(p2_dark, r - 1, row_ink);
-            let p1_entry = delta_ink_score(p1_dark, prev_dark, r - 1, r - 1, row_ink, max_ink);
-            let p2_entry = delta_ink_score(p2_dark, p1_dark, r - 1, r - 1, row_ink, max_ink);
-            let cur_entry = delta_ink_score(cur_dark, p2_dark, r, r - 1, row_ink, max_ink);
-            let via = cost_fwd[prev_off + c + 2] + p1_ink + p1_entry + p2_ink + p2_entry + cur_ink + cur_entry + 0.02;
-            if via < cost_fwd[row_off + c] {
-                cost_fwd[row_off + c] = via;
-                pred_fwd[row_off + c] = (prev_off + c + 2) as u32;
+            // double -2 : (r-1,c-2) via c-1,c
+            if c >= 2 {
+                let pd_m2 = prev_darks[c - 2];
+                let p1d = prev_darks[c - 1];
+                let p2d = prev_dark_c;
+                let p1_ink = ink_score(p1d, r - 1, row_ink);
+                let p2_ink = ink_score(p2d, r - 1, row_ink);
+                let p1_entry = delta_ink_score(p1d, pd_m2, r - 1, r - 1, row_ink, max_ink);
+                let p2_entry = delta_ink_score(p2d, p1d, r - 1, r - 1, row_ink, max_ink);
+                let cur_entry = delta_ink_score(cur_dark, p2d, r, r - 1, row_ink, max_ink);
+                let via = cost_fwd[prev_off + c - 2] + p1_ink + p1_entry + p2_ink + p2_entry + cur_ink + cur_entry + 0.02;
+                if via < best { best = via; best_pred = prev_off + c - 2; }
             }
+            // double +2 : (r-1,c+2) via c+1,c
+            if c + 2 < seg_w {
+                let pd_p2 = prev_darks[c + 2];
+                let p1d = prev_darks[c + 1];
+                let p2d = prev_dark_c;
+                let p1_ink = ink_score(p1d, r - 1, row_ink);
+                let p2_ink = ink_score(p2d, r - 1, row_ink);
+                let p1_entry = delta_ink_score(p1d, pd_p2, r - 1, r - 1, row_ink, max_ink);
+                let p2_entry = delta_ink_score(p2d, p1d, r - 1, r - 1, row_ink, max_ink);
+                let cur_entry = delta_ink_score(cur_dark, p2d, r, r - 1, row_ink, max_ink);
+                let via = cost_fwd[prev_off + c + 2] + p1_ink + p1_entry + p2_ink + p2_entry + cur_ink + cur_entry + 0.02;
+                if via < best { best = via; best_pred = prev_off + c + 2; }
+            }
+            cost_fwd[row_off + c] = best;
+            pred_fwd[row_off + c] = best_pred as u32;
         }
+        std::mem::swap(&mut prev_darks, &mut cur_darks);
     }
 
-    // Reverse DP: models downward continuation from (r, c) to bottom.
+    // Reverse DP fused single pass — symmetric to forward
     let last_r = (h - 1) as usize;
     let mut cost_rev = vec![0.0f32; n_cells];
     let mut pred_rev = vec![0u32; n_cells];
     let last_off = last_r * seg_w;
+    let mut next_darks = Vec::with_capacity(seg_w);
+    for c in 0..seg_w { next_darks.push(masked_energy(last_r, c)); }
     for c in 0..seg_w {
-        let dark_last = masked_energy(last_r, c);
+        let dark_last = next_darks[c];
         cost_rev[last_off + c] = ink_score(dark_last, last_r, row_ink)
             + delta_ink_score(dark_last, 0.0, last_r, last_r, row_ink, max_ink);
-        pred_rev[last_off + c] = (last_off + c) as u32; // self
+        pred_rev[last_off + c] = (last_off + c) as u32;
     }
+    let mut cur_darks_rev = vec![0.0f32; seg_w];
+    let mut cur_inks_rev = vec![0.0f32; seg_w];
+    // next row inks cached for pass costs
+    let mut next_inks: Vec<f32> = next_darks.iter().enumerate().map(|(r2,_)| ink_score(next_darks[r2], last_r, row_ink)).collect(); // placeholder overwritten each iter
+    // Actually rebuild each iteration, start with last row values
+    for c in 0..seg_w { next_inks[c] = ink_score(next_darks[c], last_r, row_ink); }
     for r in (0..last_r).rev() {
+        for c in 0..seg_w {
+            let cd = masked_energy(r, c);
+            cur_darks_rev[c] = cd;
+            cur_inks_rev[c] = ink_score(cd, r, row_ink);
+        }
         let row_off = r * seg_w;
         let next_off = (r + 1) * seg_w;
-        // Step 1: vertical from row below (same column)
         for c in 0..seg_w {
-            let cur_dark = masked_energy(r, c);
-            let cur_ink = ink_score(cur_dark, r, row_ink);
-            let child_dark = masked_energy(r + 1, c);
-            let entry = delta_ink_score(child_dark, cur_dark, r + 1, r, row_ink, max_ink);
-            cost_rev[row_off + c] = cur_ink + entry + cost_rev[next_off + c];
-            pred_rev[row_off + c] = (next_off + c) as u32;
-        }
-        // Step 2: diagonal from (r+1, c-1) → (r, c)
-        // Physical path: (r, c) → pass-through (r, c-1) → (r+1, c-1)
-        for c in 1..seg_w {
-            let cur_dark = masked_energy(r, c);
-            let cur_ink = ink_score(cur_dark, r, row_ink);
-            let child_dark = masked_energy(r + 1, c - 1);
-            let pass_dark = masked_energy(r, c - 1);
-            let pass_ink = ink_score(pass_dark, r, row_ink);
-            let pass_entry = delta_ink_score(pass_dark, cur_dark, r, r, row_ink, max_ink);
-            let child_entry = delta_ink_score(child_dark, pass_dark, r + 1, r, row_ink, max_ink);
-            let via_diag = cost_rev[next_off + c - 1] + cur_ink + pass_ink + pass_entry + child_entry + 0.01;
-            if via_diag < cost_rev[row_off + c] {
-                cost_rev[row_off + c] = via_diag;
-                pred_rev[row_off + c] = (next_off + c - 1) as u32;
+            let cur_dark = cur_darks_rev[c];
+            if !cur_dark.is_finite() {
+                cost_rev[row_off + c] = f32::INFINITY;
+                pred_rev[row_off + c] = (next_off + c) as u32;
+                continue;
             }
-        }
-        // Step 3: diagonal from (r+1, c+1) → (r, c)
-        // Physical path: (r, c) → pass-through (r, c+1) → (r+1, c+1)
-        for c in 0..seg_w - 1 {
-            let cur_dark = masked_energy(r, c);
-            let cur_ink = ink_score(cur_dark, r, row_ink);
-            let child_dark = masked_energy(r + 1, c + 1);
-            let pass_dark = masked_energy(r, c + 1);
-            let pass_ink = ink_score(pass_dark, r, row_ink);
-            let pass_entry = delta_ink_score(pass_dark, cur_dark, r, r, row_ink, max_ink);
-            let child_entry = delta_ink_score(child_dark, pass_dark, r + 1, r, row_ink, max_ink);
-            let via_diag = cost_rev[next_off + c + 1] + cur_ink + pass_ink + pass_entry + child_entry + 0.01;
-            if via_diag < cost_rev[row_off + c] {
-                cost_rev[row_off + c] = via_diag;
-                pred_rev[row_off + c] = (next_off + c + 1) as u32;
+            let cur_ink = cur_inks_rev[c];
+            // vertical from (r+1,c)
+            let child_dark_v = next_darks[c];
+            let entry_v = delta_ink_score(child_dark_v, cur_dark, r + 1, r, row_ink, max_ink);
+            let mut best = cur_ink + entry_v + cost_rev[next_off + c];
+            let mut best_pred = next_off + c;
+            // diag -1 : (r+1,c-1) via (r,c-1)
+            if c >= 1 {
+                let pass_dark = cur_darks_rev[c - 1];
+                let pass_ink = cur_inks_rev[c - 1];
+                let pass_entry = delta_ink_score(pass_dark, cur_dark, r, r, row_ink, max_ink);
+                let child_dark = next_darks[c - 1];
+                let child_entry = delta_ink_score(child_dark, pass_dark, r + 1, r, row_ink, max_ink);
+                let via = cost_rev[next_off + c - 1] + cur_ink + pass_ink + pass_entry + child_entry + 0.01;
+                if via < best { best = via; best_pred = next_off + c - 1; }
             }
-        }
-        // Step 4: double diagonal from (r+1, c-2) → (r, c)
-        // Physical path: (r, c) → (r, c-1) → (r, c-2) → (r+1, c-2)
-        for c in 2..seg_w {
-            let cur_dark = masked_energy(r, c);
-            let cur_ink = ink_score(cur_dark, r, row_ink);
-            let child_dark = masked_energy(r + 1, c - 2);
-            let p1_dark = masked_energy(r, c - 1);
-            let p2_dark = masked_energy(r, c - 2);
-            let p1_ink = ink_score(p1_dark, r, row_ink);
-            let p2_ink = ink_score(p2_dark, r, row_ink);
-            let p1_entry = delta_ink_score(p1_dark, cur_dark, r, r, row_ink, max_ink);
-            let p2_entry = delta_ink_score(p2_dark, p1_dark, r, r, row_ink, max_ink);
-            let child_entry = delta_ink_score(child_dark, p2_dark, r + 1, r, row_ink, max_ink);
-            let via = cost_rev[next_off + c - 2] + cur_ink + p1_ink + p1_entry + p2_ink + p2_entry + child_entry + 0.02;
-            if via < cost_rev[row_off + c] {
-                cost_rev[row_off + c] = via;
-                pred_rev[row_off + c] = (next_off + c - 2) as u32;
+            // diag +1
+            if c + 1 < seg_w {
+                let pass_dark = cur_darks_rev[c + 1];
+                let pass_ink = cur_inks_rev[c + 1];
+                let pass_entry = delta_ink_score(pass_dark, cur_dark, r, r, row_ink, max_ink);
+                let child_dark = next_darks[c + 1];
+                let child_entry = delta_ink_score(child_dark, pass_dark, r + 1, r, row_ink, max_ink);
+                let via = cost_rev[next_off + c + 1] + cur_ink + pass_ink + pass_entry + child_entry + 0.01;
+                if via < best { best = via; best_pred = next_off + c + 1; }
             }
-        }
-        // Step 5: double diagonal from (r+1, c+2) → (r, c)
-        // Physical path: (r, c) → (r, c+1) → (r, c+2) → (r+1, c+2)
-        for c in 0..seg_w.saturating_sub(2) {
-            let cur_dark = masked_energy(r, c);
-            let cur_ink = ink_score(cur_dark, r, row_ink);
-            let child_dark = masked_energy(r + 1, c + 2);
-            let p1_dark = masked_energy(r, c + 1);
-            let p2_dark = masked_energy(r, c + 2);
-            let p1_ink = ink_score(p1_dark, r, row_ink);
-            let p2_ink = ink_score(p2_dark, r, row_ink);
-            let p1_entry = delta_ink_score(p1_dark, cur_dark, r, r, row_ink, max_ink);
-            let p2_entry = delta_ink_score(p2_dark, p1_dark, r, r, row_ink, max_ink);
-            let child_entry = delta_ink_score(child_dark, p2_dark, r + 1, r, row_ink, max_ink);
-            let via = cost_rev[next_off + c + 2] + cur_ink + p1_ink + p1_entry + p2_ink + p2_entry + child_entry + 0.02;
-            if via < cost_rev[row_off + c] {
-                cost_rev[row_off + c] = via;
-                pred_rev[row_off + c] = (next_off + c + 2) as u32;
+            // double -2 via (r,c-1),(r,c-2)
+            if c >= 2 {
+                let p1d = cur_darks_rev[c - 1];
+                let p2d = cur_darks_rev[c - 2];
+                let p1ink = cur_inks_rev[c - 1];
+                let p2ink = cur_inks_rev[c - 2];
+                let p1_entry = delta_ink_score(p1d, cur_dark, r, r, row_ink, max_ink);
+                let p2_entry = delta_ink_score(p2d, p1d, r, r, row_ink, max_ink);
+                let child_dark = next_darks[c - 2];
+                let child_entry = delta_ink_score(child_dark, p2d, r + 1, r, row_ink, max_ink);
+                let via = cost_rev[next_off + c - 2] + cur_ink + p1ink + p1_entry + p2ink + p2_entry + child_entry + 0.02;
+                if via < best { best = via; best_pred = next_off + c - 2; }
             }
+            // double +2
+            if c + 2 < seg_w {
+                let p1d = cur_darks_rev[c + 1];
+                let p2d = cur_darks_rev[c + 2];
+                let p1ink = cur_inks_rev[c + 1];
+                let p2ink = cur_inks_rev[c + 2];
+                let p1_entry = delta_ink_score(p1d, cur_dark, r, r, row_ink, max_ink);
+                let p2_entry = delta_ink_score(p2d, p1d, r, r, row_ink, max_ink);
+                let child_dark = next_darks[c + 2];
+                let child_entry = delta_ink_score(child_dark, p2d, r + 1, r, row_ink, max_ink);
+                let via = cost_rev[next_off + c + 2] + cur_ink + p1ink + p1_entry + p2ink + p2_entry + child_entry + 0.02;
+                if via < best { best = via; best_pred = next_off + c + 2; }
+            }
+            cost_rev[row_off + c] = best;
+            pred_rev[row_off + c] = best_pred as u32;
         }
+        std::mem::swap(&mut next_darks, &mut cur_darks_rev);
+        std::mem::swap(&mut next_inks, &mut cur_inks_rev);
     }
 
     // For each interior column at mid-row, the cheapest path through it
