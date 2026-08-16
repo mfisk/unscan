@@ -663,9 +663,18 @@ fn segment_characters_inner(
                 total: entry.cost,
             });
 
-            // Capture parent's diagonal bounds before removing (Arc clone = cheap).
+            // Capture parent's diagonal bounds and DP before removing (Arc clone = cheap).
             let parent_lp = seg_bounds.get(&entry.seg_id).and_then(|b| b.left_path.clone());
             let parent_rp = seg_bounds.get(&entry.seg_id).and_then(|b| b.right_path.clone());
+            let parent_dp_cloned: Option<SeamDp> = dp_cache.get(&entry.seg_id).map(|dp_ref| SeamDp {
+                pred_fwd: dp_ref.pred_fwd.clone(),
+                pred_rev: dp_ref.pred_rev.clone(),
+                cost_fwd: dp_ref.cost_fwd.clone(),
+                cost_rev: dp_ref.cost_rev.clone(),
+                seg_start: dp_ref.seg_start,
+                seg_w: dp_ref.seg_w,
+                h: dp_ref.h,
+            });
 
             // Perf: wrap path in Arc once (moves Vec, no clone), then Arc clones for bounds.
             // seam_paths map stores Vec for external API compat — clone once from Arc (1 Vec copy vs 2 before).
@@ -692,7 +701,11 @@ fn segment_characters_inner(
                     let sid = next_seg_id; next_seg_id += 1;
                     let lp = parent_lp.clone();
                     let rp: Option<std::sync::Arc<Vec<[u32; 2]>>> = Some(std::sync::Arc::clone(&arc_path));
-                    let (mut cands, dp) = candidate_seams(&energy, w_us, child_left_start, child_left_end, h, lp.as_ref().map(|a| a.as_slice()), rp.as_ref().map(|a| a.as_slice()), max_ink, &row_ink);
+                    let (mut cands, dp) = if let Some(ref pdp) = parent_dp_cloned {
+                        candidate_seams_child(pdp, pdp.seg_start, &energy, w_us, child_left_start, child_left_end, h, lp.as_ref().map(|a| a.as_slice()), rp.as_ref().map(|a| a.as_slice()), max_ink, &row_ink)
+                    } else {
+                        candidate_seams(&energy, w_us, child_left_start, child_left_end, h, lp.as_ref().map(|a| a.as_slice()), rp.as_ref().map(|a| a.as_slice()), max_ink, &row_ink)
+                    };
                     for (col, cost) in &cands {
                         heap.push(SeamEntry { cost: *cost + segment_penalty(child_left_start, child_left_end, *col, *cost), col: *col, seg_start: child_left_start, seg_end: child_left_end, seg_id: sid });
                     }
@@ -707,9 +720,13 @@ fn segment_characters_inner(
             {
                 if child_right_end > child_right_start + 2 {
                     let sid = next_seg_id; next_seg_id += 1;
-                    let lp: Option<std::sync::Arc<Vec<[u32; 2]>>> = Some(arc_path);
+                    let lp: Option<std::sync::Arc<Vec<[u32; 2]>>> = Some(std::sync::Arc::clone(&arc_path));
                     let rp = parent_rp.clone();
-                    let (mut cands, dp) = candidate_seams(&energy, w_us, child_right_start, child_right_end, h, lp.as_ref().map(|a| a.as_slice()), rp.as_ref().map(|a| a.as_slice()), max_ink, &row_ink);
+                    let (mut cands, dp) = if let Some(ref pdp) = parent_dp_cloned {
+                        candidate_seams_child(pdp, pdp.seg_start, &energy, w_us, child_right_start, child_right_end, h, lp.as_ref().map(|a| a.as_slice()), rp.as_ref().map(|a| a.as_slice()), max_ink, &row_ink)
+                    } else {
+                        candidate_seams(&energy, w_us, child_right_start, child_right_end, h, lp.as_ref().map(|a| a.as_slice()), rp.as_ref().map(|a| a.as_slice()), max_ink, &row_ink)
+                    };
                     for (col, cost) in &cands {
                         heap.push(SeamEntry { cost: *cost + segment_penalty(child_right_start, child_right_end, *col, *cost), col: *col, seg_start: child_right_start, seg_end: child_right_end, seg_id: sid });
                     }
@@ -802,6 +819,8 @@ fn segment_characters_inner(
 struct SeamDp {
     pred_fwd: Vec<u32>, // flat [row * seg_w + col] — packed (r, c) predecessor
     pred_rev: Vec<u32>, // flat [row * seg_w + col] — packed (r, c) predecessor
+    cost_fwd: Vec<f32>,
+    cost_rev: Vec<f32>,
     seg_start: u32,
     seg_w: usize,
     h: u32,
@@ -904,7 +923,7 @@ fn candidate_seams(
 ) -> (Vec<(u32, f32)>, SeamDp) {
     let seg_w = (seg_end - seg_start) as usize;
     if seg_w < 3 || h < 1 {
-        let dp = SeamDp { pred_fwd: Vec::new(), pred_rev: Vec::new(), seg_start, seg_w: 0, h };
+        let dp = SeamDp { pred_fwd: Vec::new(), pred_rev: Vec::new(), cost_fwd: Vec::new(), cost_rev: Vec::new(), seg_start, seg_w: 0, h };
         return (Vec::new(), dp);
     }
     let base = seg_start as usize;
@@ -1225,11 +1244,528 @@ fn candidate_seams(
         }
     }
 
-    let dp = SeamDp { pred_fwd, pred_rev, seg_start, seg_w, h };
+    let dp = SeamDp { pred_fwd, pred_rev, cost_fwd, cost_rev, seg_start, seg_w, h };
     (candidates, dp)
 }
 
-/// Uniform character boundaries.
+/// Incremental DP child reuse: given parent SeamDp (with costs), trim-copy to child
+/// segment and invalidate cells whose costs are too low because they used an
+/// out-of-bounds parent cell (masked or outside child range). Propagate invalidity
+/// forward (and reverse), then recompute only invalid region.
+#[allow(clippy::too_many_arguments)]
+fn candidate_seams_child(
+    parent: &SeamDp,
+    _parent_seg_start: u32, // == parent.seg_start, kept for clarity
+    energy: &[f32],
+    img_w: usize,
+    child_start: u32,
+    child_end: u32,
+    h: u32,
+    left_path: Option<&[[u32; 2]]>,
+    right_path: Option<&[[u32; 2]]>,
+    max_ink: f32,
+    row_ink: &[f32],
+) -> (Vec<(u32, f32)>, SeamDp) {
+    let seg_w = (child_end - child_start) as usize;
+    let h_us = h as usize;
+    if seg_w < 3 || h_us < 1 {
+        let dp = SeamDp { pred_fwd: Vec::new(), pred_rev: Vec::new(), cost_fwd: Vec::new(), cost_rev: Vec::new(), seg_start: child_start, seg_w: 0, h };
+        return (Vec::new(), dp);
+    }
+    let base = child_start as usize;
+    let parent_w = parent.seg_w;
+    let off_i32 = child_start as i32 - parent.seg_start as i32;
+    // Even if child not inside parent, clamp off and continue via invalid-propagation recompute — no fallback
+    let mut off = if off_i32 < 0 { 0usize } else { off_i32 as usize };
+    let mut force_full_invalid = false;
+    if parent_w == 0 || off + seg_w > parent_w {
+        // parent empty or child straddles outside parent — force full recompute via invalid path
+        force_full_invalid = true;
+        if parent_w == 0 {
+            off = 0;
+        } else if off >= parent_w {
+            off = 0;
+        } else if off + seg_w > parent_w {
+            // keep off as-is but we'll treat out-of-range copy as invalid
+            // clamp for array indexing safety, remainder handled by invalid logic
+            if off + seg_w > parent_w && parent_w >= seg_w {
+                off = parent_w - seg_w;
+            }
+        }
+    }
+
+    // Build per-row boundary arrays same as candidate_seams
+    const BOUND_STACK_MAX: usize = 1024;
+    let mut left_stack = [0u32; BOUND_STACK_MAX];
+    let mut right_stack = [u32::MAX; BOUND_STACK_MAX];
+    let mut left_heap: Option<Vec<u32>> = None;
+    let mut right_heap: Option<Vec<u32>> = None;
+
+    let left_bound: Option<&[u32]> = if let Some(lp) = left_path {
+        if h_us <= BOUND_STACK_MAX {
+            for e in lp {
+                let r = e[0] as usize;
+                if r < h_us && e[1] > left_stack[r] {
+                    left_stack[r] = e[1];
+                }
+            }
+            Some(&left_stack[..h_us])
+        } else {
+            let mut b = vec![0u32; h_us];
+            for e in lp {
+                let r = e[0] as usize;
+                if r < b.len() && e[1] > b[r] { b[r] = e[1]; }
+            }
+            left_heap = Some(b);
+            Some(left_heap.as_ref().unwrap().as_slice())
+        }
+    } else { None };
+    let right_bound: Option<&[u32]> = if let Some(rp) = right_path {
+        if h_us <= BOUND_STACK_MAX {
+            for e in rp {
+                let r = e[0] as usize;
+                if r < h_us && e[1] < right_stack[r] {
+                    right_stack[r] = e[1];
+                }
+            }
+            Some(&right_stack[..h_us])
+        } else {
+            let mut b = vec![u32::MAX; h_us];
+            for e in rp {
+                let r = e[0] as usize;
+                if r < b.len() && e[1] < b[r] { b[r] = e[1]; }
+            }
+            right_heap = Some(b);
+            Some(right_heap.as_ref().unwrap().as_slice())
+        }
+    } else { None };
+
+    // masked_energy_child
+    let masked_energy_child = |r: usize, c: usize| -> f32 {
+        let abs_col = base + c;
+        if let Some(lb) = left_bound {
+            if abs_col <= lb[r] as usize { return f32::INFINITY; }
+        }
+        if let Some(rb) = right_bound {
+            if abs_col >= rb[r] as usize { return f32::INFINITY; }
+        }
+        energy[r * img_w + abs_col]
+    };
+
+    let n_cells = h_us * seg_w;
+    let mut cost_fwd = vec![f32::INFINITY; n_cells];
+    let mut pred_fwd = vec![0u32; n_cells];
+    let mut cost_rev = vec![f32::INFINITY; n_cells];
+    let mut pred_rev = vec![0u32; n_cells];
+    let mut invalid_fwd = vec![false; n_cells];
+    let mut invalid_rev = vec![false; n_cells];
+
+    // ----- Trim-copy forward -----
+    // If parent empty or child outside parent, force full invalid — no fallback to separate full-DP path
+    if !force_full_invalid {
+    for r in 0..h_us {
+        let parent_row_off = r * parent_w;
+        let child_row_off = r * seg_w;
+        for c in 0..seg_w {
+            let pc = off + c;
+            if pc >= parent_w { // out-of-range for this row due to clamping
+                let c_idx = child_row_off + c;
+                invalid_fwd[c_idx] = true;
+                cost_fwd[c_idx] = f32::INFINITY;
+                continue;
+            }
+            let p_idx = parent_row_off + pc;
+            let c_idx = child_row_off + c;
+            // mask in child?
+            let child_dark = masked_energy_child(r, c);
+            if !child_dark.is_finite() {
+                // INF cell — keep INF, mark invalid so we know not to use as valid predecessor?
+                // We keep invalid flag to propagate INF outward but skip recompute later.
+                cost_fwd[c_idx] = f32::INFINITY;
+                pred_fwd[c_idx] = (parent_row_off + pc) as u32; // dummy
+                invalid_fwd[c_idx] = true; // treat as invalid source
+                continue;
+            }
+            // parent cost: if parent INF (parent masked) but child not masked, need recompute
+            if parent.cost_fwd.is_empty() {
+                // no parent costs — mark invalid for recompute via single path
+                invalid_fwd[c_idx] = true;
+                continue;
+            }
+            let p_cost = parent.cost_fwd[p_idx];
+            // check parent pred out-of-range
+            let p_pred_flat = parent.pred_fwd[p_idx] as usize;
+            let pr = p_pred_flat / parent_w;
+            let p_pred_c = p_pred_flat % parent_w;
+            let out_of_range = if r == 0 {
+                false
+            } else {
+                p_pred_c < off || p_pred_c >= off + seg_w
+            };
+            if out_of_range || !p_cost.is_finite() {
+                invalid_fwd[c_idx] = true;
+                // keep placeholder cost (will recompute)
+                cost_fwd[c_idx] = f32::INFINITY;
+                continue;
+            }
+            // valid copy — remap pred flat
+            let remapped_pred_c = p_pred_c - off;
+            let remapped_pred = (pr * seg_w + remapped_pred_c) as u32;
+            // For r>0, pr should be r-1; remapped row same
+            cost_fwd[c_idx] = p_cost;
+            pred_fwd[c_idx] = remapped_pred;
+        }
+    }
+    } else {
+        // force full invalid region — skip trim-copy, all forward cells need recompute
+        for i in 0..n_cells { invalid_fwd[i] = true; }
+    }
+
+    // Propagate invalid forward: if predecessor invalid then child invalid (too-low cost via invalid source)
+    for r in 1..h_us {
+        let row_off = r * seg_w;
+        let prev_off = (r - 1) * seg_w;
+        for c in 0..seg_w {
+            let idx = row_off + c;
+            if invalid_fwd[idx] { continue; } // already invalid
+            // masked already filtered
+            let pred = pred_fwd[idx] as usize;
+            let pr = pred / seg_w;
+            let pc = pred % seg_w;
+            if pr != r - 1 {
+                // horizontal with same row not expected in our DP; if pr==r we look at same row? ignore
+                if pr == r {
+                    // pred within same row — dependency inside row, but our DP order is left-right? predecessor still from same row not computed earlier in copy? treat as invalid if that same-row pred invalid.
+                    // For safety, if pc invalid flag in same row and that cell already marked invalid and appears earlier in evaluation order we could propagate, but we use strict < comparison later recompute will fix.
+                    if invalid_fwd[pr * seg_w + pc] {
+                        invalid_fwd[idx] = true;
+                    }
+                    continue;
+                }
+            }
+            if invalid_fwd[prev_off + pc] {
+                invalid_fwd[idx] = true;
+            }
+        }
+    }
+
+    // Recompute invalid forward cells row-major
+    // Need per-row dark caches for speed similar to fused loop
+    // We'll recompute on the fly with masked closure; skip if not invalid
+    let mut prev_darks_cache: Vec<f32> = vec![0.0; seg_w];
+    for c in 0..seg_w {
+        prev_darks_cache[c] = masked_energy_child(0, c);
+    }
+    // Row 0: any invalid row0 cells recompute directly (no predecessor)
+    for c in 0..seg_w {
+        let idx = c;
+        if !invalid_fwd[idx] { continue; }
+        let cd = masked_energy_child(0, c);
+        if !cd.is_finite() {
+            cost_fwd[idx] = f32::INFINITY;
+            pred_fwd[idx] = c as u32;
+        } else {
+            let ic = ink_score(cd, 0, row_ink) + delta_ink_score(cd, 0.0, 0, 0, row_ink, max_ink);
+            cost_fwd[idx] = ic;
+            pred_fwd[idx] = c as u32;
+            invalid_fwd[idx] = false; // fixed
+        }
+    }
+    let mut cur_darks = vec![0.0f32; seg_w];
+    let mut cur_inks = vec![0.0f32; seg_w];
+    for r in 1..h_us {
+        // build cur row dark/ink caches
+        for c in 0..seg_w {
+            let cd = masked_energy_child(r, c);
+            cur_darks[c] = cd;
+            cur_inks[c] = if cd.is_finite() { ink_score(cd, r, row_ink) } else { f32::INFINITY };
+        }
+        let row_off = r * seg_w;
+        let prev_off = (r - 1) * seg_w;
+        // prev_darks_cache holds row r-1 darks (already)
+        for c in 0..seg_w {
+            let idx = row_off + c;
+            if !invalid_fwd[idx] { continue; }
+            let cur_dark = cur_darks[c];
+            if !cur_dark.is_finite() {
+                cost_fwd[idx] = f32::INFINITY;
+                pred_fwd[idx] = (prev_off + c) as u32;
+                // remain invalid? leave as true to block downstream but INF propagation is okay
+                // keep true? Actually INF cells are considered invalid sources but we keep flag true.
+                continue;
+            }
+            let cur_ink = cur_inks[c];
+            let prev_dark_c = prev_darks_cache[c];
+            // vertical option
+            let mut best = f32::INFINITY;
+            let mut best_pred = prev_off + c;
+            if cost_fwd[prev_off + c].is_finite() {
+                best = cur_ink + delta_ink_score(cur_dark, prev_dark_c, r, r - 1, row_ink, max_ink) + cost_fwd[prev_off + c];
+            }
+            // diag -1
+            if c >= 1 {
+                let pd_m1 = prev_darks_cache[c - 1];
+                if pd_m1.is_finite() && cost_fwd[prev_off + c - 1].is_finite() {
+                    let pass_dark = prev_dark_c;
+                    if pass_dark.is_finite() {
+                        let pass_ink = ink_score(pass_dark, r - 1, row_ink);
+                        let pass_entry = delta_ink_score(pass_dark, pd_m1, r - 1, r - 1, row_ink, max_ink);
+                        let cur_entry = delta_ink_score(cur_dark, pass_dark, r, r - 1, row_ink, max_ink);
+                        let via = cost_fwd[prev_off + c - 1] + pass_ink + pass_entry + cur_ink + cur_entry + 0.01;
+                        if via < best { best = via; best_pred = prev_off + c - 1; }
+                    }
+                }
+            }
+            if c + 1 < seg_w {
+                let pd_p1 = prev_darks_cache[c + 1];
+                if pd_p1.is_finite() && cost_fwd[prev_off + c + 1].is_finite() {
+                    let pass_dark = prev_dark_c;
+                    if pass_dark.is_finite() {
+                        let pass_ink = ink_score(pass_dark, r - 1, row_ink);
+                        let pass_entry = delta_ink_score(pass_dark, pd_p1, r - 1, r - 1, row_ink, max_ink);
+                        let cur_entry = delta_ink_score(cur_dark, pass_dark, r, r - 1, row_ink, max_ink);
+                        let via = cost_fwd[prev_off + c + 1] + pass_ink + pass_entry + cur_ink + cur_entry + 0.01;
+                        if via < best { best = via; best_pred = prev_off + c + 1; }
+                    }
+                }
+            }
+            if c >= 2 {
+                let pd_m2 = prev_darks_cache[c - 2];
+                if pd_m2.is_finite() && cost_fwd[prev_off + c - 2].is_finite() {
+                    let p1d = prev_darks_cache[c - 1];
+                    let p2d = prev_dark_c;
+                    if p1d.is_finite() && p2d.is_finite() {
+                        let p1_ink = ink_score(p1d, r - 1, row_ink);
+                        let p2_ink = ink_score(p2d, r - 1, row_ink);
+                        let p1_entry = delta_ink_score(p1d, pd_m2, r - 1, r - 1, row_ink, max_ink);
+                        let p2_entry = delta_ink_score(p2d, p1d, r - 1, r - 1, row_ink, max_ink);
+                        let cur_entry = delta_ink_score(cur_dark, p2d, r, r - 1, row_ink, max_ink);
+                        let via = cost_fwd[prev_off + c - 2] + p1_ink + p1_entry + p2_ink + p2_entry + cur_ink + cur_entry + 0.02;
+                        if via < best { best = via; best_pred = prev_off + c - 2; }
+                    }
+                }
+            }
+            if c + 2 < seg_w {
+                let pd_p2 = prev_darks_cache[c + 2];
+                if pd_p2.is_finite() && cost_fwd[prev_off + c + 2].is_finite() {
+                    let p1d = prev_darks_cache[c + 1];
+                    let p2d = prev_dark_c;
+                    if p1d.is_finite() && p2d.is_finite() {
+                        let p1_ink = ink_score(p1d, r - 1, row_ink);
+                        let p2_ink = ink_score(p2d, r - 1, row_ink);
+                        let p1_entry = delta_ink_score(p1d, pd_p2, r - 1, r - 1, row_ink, max_ink);
+                        let p2_entry = delta_ink_score(p2d, p1d, r - 1, r - 1, row_ink, max_ink);
+                        let cur_entry = delta_ink_score(cur_dark, p2d, r, r - 1, row_ink, max_ink);
+                        let via = cost_fwd[prev_off + c + 2] + p1_ink + p1_entry + p2_ink + p2_entry + cur_ink + cur_entry + 0.02;
+                        if via < best { best = via; best_pred = prev_off + c + 2; }
+                    }
+                }
+            }
+            cost_fwd[idx] = best;
+            pred_fwd[idx] = best_pred as u32;
+            if best.is_finite() { invalid_fwd[idx] = false; }
+        }
+        // swap caches: cur becomes prev for next iteration
+        std::mem::swap(&mut prev_darks_cache, &mut cur_darks);
+    }
+
+    // ---- Reverse DP trim-copy ----
+    let last_r = h_us - 1;
+    if !force_full_invalid {
+    for r in 0..h_us {
+        let pr_off = r * parent_w;
+        let ch_off = r * seg_w;
+        for c in 0..seg_w {
+            let pc = off + c;
+            if pc >= parent_w {
+                let c_idx = ch_off + c;
+                cost_rev[c_idx] = f32::INFINITY;
+                invalid_rev[c_idx] = true;
+                continue;
+            }
+            let p_idx = pr_off + pc;
+            let c_idx = ch_off + c;
+            let cd = masked_energy_child(r, c);
+            if !cd.is_finite() {
+                cost_rev[c_idx] = f32::INFINITY;
+                invalid_rev[c_idx] = true;
+                continue;
+            }
+            if parent.cost_rev.is_empty() {
+                invalid_rev[c_idx] = true;
+                continue;
+            }
+            let p_cost = parent.cost_rev[p_idx];
+            let p_pred_flat = parent.pred_rev[p_idx] as usize;
+            let pr_ = p_pred_flat / parent_w;
+            let pc_ = p_pred_flat % parent_w;
+            let out_of_range = if r == last_r { false } else { pc_ < off || pc_ >= off + seg_w };
+            if out_of_range || !p_cost.is_finite() {
+                invalid_rev[c_idx] = true;
+                cost_rev[c_idx] = f32::INFINITY;
+                continue;
+            }
+            let remapped_c = pc_ - off;
+            let remapped = pr_ * seg_w + remapped_c;
+            cost_rev[c_idx] = p_cost;
+            pred_rev[c_idx] = remapped as u32;
+        }
+    }
+    } else {
+        for i in 0..n_cells { invalid_rev[i] = true; }
+    }
+    // propagate invalid upward
+    for r in (0..last_r).rev() {
+        let row_off = r * seg_w;
+        let next_off = (r + 1) * seg_w;
+        for c in 0..seg_w {
+            let idx = row_off + c;
+            if invalid_rev[idx] { continue; }
+            let pred = pred_rev[idx] as usize;
+            let pc = pred % seg_w;
+            let pr = pred / seg_w;
+            if pr == r + 1 {
+                if invalid_rev[next_off + pc] { invalid_rev[idx] = true; }
+            } else if pr == r {
+                if invalid_rev[row_off + pc] { invalid_rev[idx] = true; }
+            }
+        }
+    }
+    // recompute invalid reverse bottom-up
+    let mut next_darks_rev: Vec<f32> = vec![0.0; seg_w];
+    for c in 0..seg_w { next_darks_rev[c] = masked_energy_child(last_r, c); }
+    let mut next_inks_rev: Vec<f32> = vec![0.0; seg_w];
+    for c in 0..seg_w { next_inks_rev[c] = if next_darks_rev[c].is_finite() { ink_score(next_darks_rev[c], last_r, row_ink) } else { f32::INFINITY }; }
+    // last row already set for invalid cells
+    for c in 0..seg_w {
+        let idx = last_r * seg_w + c;
+        if invalid_rev[idx] {
+            let cd = next_darks_rev[c];
+            if cd.is_finite() {
+                cost_rev[idx] = ink_score(cd, last_r, row_ink) + delta_ink_score(cd, 0.0, last_r, last_r, row_ink, max_ink);
+                pred_rev[idx] = idx as u32;
+                invalid_rev[idx] = false;
+            } else {
+                cost_rev[idx] = f32::INFINITY;
+            }
+        }
+    }
+    let mut cur_darks_rev = vec![0.0f32; seg_w];
+    let mut cur_inks_rev = vec![0.0f32; seg_w];
+    for r in (0..last_r).rev() {
+        for c in 0..seg_w {
+            let cd = masked_energy_child(r, c);
+            cur_darks_rev[c] = cd;
+            cur_inks_rev[c] = if cd.is_finite() { ink_score(cd, r, row_ink) } else { f32::INFINITY };
+        }
+        let row_off = r * seg_w;
+        let next_off = (r + 1) * seg_w;
+        for c in 0..seg_w {
+            let idx = row_off + c;
+            if !invalid_rev[idx] { continue; }
+            let cur_dark = cur_darks_rev[c];
+            if !cur_dark.is_finite() {
+                cost_rev[idx] = f32::INFINITY;
+                pred_rev[idx] = (next_off + c) as u32;
+                continue;
+            }
+            let cur_ink = cur_inks_rev[c];
+            let child_dark_v = next_darks_rev[c];
+            let mut best = f32::INFINITY;
+            let mut best_pred = next_off + c;
+            if child_dark_v.is_finite() && cost_rev[next_off + c].is_finite() {
+                let entry_v = delta_ink_score(child_dark_v, cur_dark, r + 1, r, row_ink, max_ink);
+                best = cur_ink + entry_v + cost_rev[next_off + c];
+            }
+            if c >= 1 {
+                let pass_dark = cur_darks_rev[c - 1];
+                if pass_dark.is_finite() && next_darks_rev[c - 1].is_finite() && cost_rev[next_off + c - 1].is_finite() {
+                    let pass_ink = cur_inks_rev[c - 1];
+                    let pass_entry = delta_ink_score(pass_dark, cur_dark, r, r, row_ink, max_ink);
+                    let child_dark = next_darks_rev[c - 1];
+                    let child_entry = delta_ink_score(child_dark, pass_dark, r + 1, r, row_ink, max_ink);
+                    let via = cost_rev[next_off + c - 1] + cur_ink + pass_ink + pass_entry + child_entry + 0.01;
+                    if via < best { best = via; best_pred = next_off + c - 1; }
+                }
+            }
+            if c + 1 < seg_w {
+                let pass_dark = cur_darks_rev[c + 1];
+                if pass_dark.is_finite() && next_darks_rev[c + 1].is_finite() && cost_rev[next_off + c + 1].is_finite() {
+                    let pass_ink = cur_inks_rev[c + 1];
+                    let pass_entry = delta_ink_score(pass_dark, cur_dark, r, r, row_ink, max_ink);
+                    let child_dark = next_darks_rev[c + 1];
+                    let child_entry = delta_ink_score(child_dark, pass_dark, r + 1, r, row_ink, max_ink);
+                    let via = cost_rev[next_off + c + 1] + cur_ink + pass_ink + pass_entry + child_entry + 0.01;
+                    if via < best { best = via; best_pred = next_off + c + 1; }
+                }
+            }
+            if c >= 2 {
+                let p1d = cur_darks_rev[c - 1];
+                let p2d = cur_darks_rev[c - 2];
+                if p1d.is_finite() && p2d.is_finite() && next_darks_rev[c - 2].is_finite() && cost_rev[next_off + c - 2].is_finite() {
+                    let p1ink = cur_inks_rev[c - 1];
+                    let p2ink = cur_inks_rev[c - 2];
+                    let p1_entry = delta_ink_score(p1d, cur_dark, r, r, row_ink, max_ink);
+                    let p2_entry = delta_ink_score(p2d, p1d, r, r, row_ink, max_ink);
+                    let child_dark = next_darks_rev[c - 2];
+                    let child_entry = delta_ink_score(child_dark, p2d, r + 1, r, row_ink, max_ink);
+                    let via = cost_rev[next_off + c - 2] + cur_ink + p1ink + p1_entry + p2ink + p2_entry + child_entry + 0.02;
+                    if via < best { best = via; best_pred = next_off + c - 2; }
+                }
+            }
+            if c + 2 < seg_w {
+                let p1d = cur_darks_rev[c + 1];
+                let p2d = cur_darks_rev[c + 2];
+                if p1d.is_finite() && p2d.is_finite() && next_darks_rev[c + 2].is_finite() && cost_rev[next_off + c + 2].is_finite() {
+                    let p1ink = cur_inks_rev[c + 1];
+                    let p2ink = cur_inks_rev[c + 2];
+                    let p1_entry = delta_ink_score(p1d, cur_dark, r, r, row_ink, max_ink);
+                    let p2_entry = delta_ink_score(p2d, p1d, r, r, row_ink, max_ink);
+                    let child_dark = next_darks_rev[c + 2];
+                    let child_entry = delta_ink_score(child_dark, p2d, r + 1, r, row_ink, max_ink);
+                    let via = cost_rev[next_off + c + 2] + cur_ink + p1ink + p1_entry + p2ink + p2_entry + child_entry + 0.02;
+                    if via < best { best = via; best_pred = next_off + c + 2; }
+                }
+            }
+            cost_rev[idx] = best;
+            pred_rev[idx] = best_pred as u32;
+            if best.is_finite() { invalid_rev[idx] = false; }
+        }
+        std::mem::swap(&mut next_darks_rev, &mut cur_darks_rev);
+        std::mem::swap(&mut next_inks_rev, &mut cur_inks_rev);
+    }
+
+    // ---- Generate candidates same as candidate_seams final ----
+    let mid_r = (h as usize / 2) ;
+    let mid_off = mid_r * seg_w;
+    let mut dp_candidates: Vec<(u32, f32)> = Vec::with_capacity(seg_w.saturating_sub(2));
+    for c in 1..seg_w - 1 {
+        let me = masked_energy_child(mid_r, c);
+        if !me.is_finite() { continue; }
+        let combined = cost_fwd[mid_off + c] + cost_rev[mid_off + c] - ink_score(me, mid_r, row_ink);
+        if !combined.is_finite() { continue; }
+        dp_candidates.push((child_start + c as u32, combined));
+    }
+    let mut candidates: Vec<(u32, f32)> = Vec::new();
+    let n = dp_candidates.len();
+    if n > 0 {
+        let mut i = 0;
+        while i < n {
+            let cost = dp_candidates[i].1;
+            let run_start = i;
+            while i < n && dp_candidates[i].1 == cost && (i == run_start || dp_candidates[i].0 == dp_candidates[i - 1].0 + 1) { i += 1; }
+            let left_higher = run_start == 0 || dp_candidates[run_start - 1].1 > cost;
+            let right_higher = i >= n || dp_candidates[i].1 > cost;
+            if left_higher && right_higher {
+                let mid_idx = (run_start + i - 1) / 2;
+                candidates.push(dp_candidates[mid_idx]);
+            }
+        }
+    }
+    let dp = SeamDp { pred_fwd, pred_rev, cost_fwd, cost_rev, seg_start: child_start, seg_w, h };
+    (candidates, dp)
+}
+
 fn uniform_boundaries(width: u32, n: usize) -> Vec<u32> {
     let mut b = Vec::with_capacity(n + 1);
     for i in 0..=n {
