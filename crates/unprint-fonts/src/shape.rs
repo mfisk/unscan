@@ -7,17 +7,54 @@ use std::sync::Arc;
 
 #[derive(Clone)]
 pub struct FaceHandle {
-    data: Vec<u8>,
+    data: std::sync::Arc<Vec<u8>>,
 }
 
 impl FaceHandle {
     pub fn from_bytes(bytes: Vec<u8>) -> Result<Self, String> {
         rustybuzz::Face::from_slice(&bytes, 0).ok_or_else(|| "invalid font for shaping".to_string())?;
-        Ok(Self { data: bytes })
+        Ok(Self { data: std::sync::Arc::new(bytes) })
     }
     pub fn from_slice(bytes: &[u8]) -> Result<Self, String> {
         Self::from_bytes(bytes.to_vec())
     }
+    #[inline]
+    pub fn as_ptr_usize(&self) -> usize {
+        std::sync::Arc::as_ptr(&self.data) as *const () as usize
+    }
+}
+
+// Thread-local Face cache: Face<'a> borrows from Arc<Vec<u8>> slice.
+// We transmute Face to 'static and keep Arc alive in same cache entry
+// so the borrowed slice stays valid. Clone of Face is cheap (Arc of tables internally).
+thread_local! {
+    static FACE_CACHE: RefCell<HashMap<usize, (std::sync::Arc<Vec<u8>>, rustybuzz::Face<'static>)>> =
+        RefCell::new(HashMap::new());
+}
+
+#[inline]
+fn get_face_cached(handle: &FaceHandle) -> Option<rustybuzz::Face<'_>> {
+    let ptr = handle.as_ptr_usize();
+    // Fast path: hit
+    if let Some(entry) = FACE_CACHE.with(|c| {
+        let borrow = c.borrow();
+        borrow.get(&ptr).map(|(_, f)| f.clone())
+    }) {
+        // SAFETY: entry was 'static transmute but underlying Arc still alive in cache,
+        // and returned clone borrows same backing that cache retains.
+        // Cloning preserves same lifetimes; we return with shorter lifetime.
+        // Transmute back to inferred lifetime (still valid as long as cache holds Arc).
+        return Some(unsafe { std::mem::transmute::<rustybuzz::Face<'static>, rustybuzz::Face<'_>>(entry) });
+    }
+    // Miss: parse
+    let face = rustybuzz::Face::from_slice(handle.data.as_slice(), 0)?;
+    // Keep Arc alive in cache and store 'static version of Face
+    let static_face: rustybuzz::Face<'static> =
+        unsafe { std::mem::transmute::<rustybuzz::Face<'_>, rustybuzz::Face<'static>>(face.clone()) };
+    FACE_CACHE.with(|c| {
+        c.borrow_mut().insert(ptr, (handle.data.clone(), static_face));
+    });
+    Some(face)
 }
 
 pub type Features = Vec<rustybuzz::Feature>;
@@ -101,11 +138,11 @@ pub fn shape_words(
     words: &[&str],
     features: &[rustybuzz::Feature],
 ) -> Vec<Option<ShapedWord>> {
-    let face = match rustybuzz::Face::from_slice(&face_handle.data, 0) {
+    let face = match get_face_cached(face_handle) {
         Some(f) => f,
         None => return vec![None; words.len()],
     };
-    let data_ptr = face_handle.data.as_ptr() as usize;
+    let data_ptr = face_handle.as_ptr_usize();
     words
         .iter()
         .map(|text| shape_word_inner(&face, data_ptr, features, text))
@@ -117,8 +154,8 @@ pub fn shape_word(
     features: &[rustybuzz::Feature],
     text: &str,
 ) -> Option<ShapedWord> {
-    let face = rustybuzz::Face::from_slice(&face_handle.data, 0)?;
-    let data_ptr = face_handle.data.as_ptr() as usize;
+    let face = get_face_cached(face_handle)?;
+    let data_ptr = face_handle.as_ptr_usize();
     shape_word_inner(&face, data_ptr, features, text)
 }
 
