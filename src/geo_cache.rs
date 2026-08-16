@@ -43,11 +43,12 @@ thread_local! {
 }
 
 const BGEO_MAGIC: &[u8; 4] = b"BGEO";
-// Bump to 16 to store pre-grouped pair/single lookup groups for fast pair_adjustment_full.
+// Bump to 17 to store pair_first_present in cache itself (precomputed at build time) + pre-grouped pair/single lookup groups for fast pair_adjustment_full.
 // v15 stored case/cpsp separately and applied them only in all-caps context.
 // v16 adds: pair_groups, case_pair_groups, single_groups, case_single_groups (BTree-free fast path)
 // plus sorted ClassDef Format2 ranges for binary search in class_get.
-const BGEO_VERSION: u32 = 16;
+// v17 adds: pair_first_present blob per font (num_glyphs bytes) built from Format1/Format2 coverage at cache build time.
+const BGEO_VERSION: u32 = 17;
 
 // ---------- BE helpers for OT parsing ----------
 #[inline]
@@ -309,6 +310,7 @@ struct FontMmapIndex {
     case_pair_groups: Vec<PairGroupIndex>,
     single_groups: Vec<SingleGroupIndex>,
     case_single_groups: Vec<SingleGroupIndex>,
+    pair_first_present: Vec<u8>, // size=num_glyphs, 1 if gid has any pair kern
 }
 
 // ---------- Backward compat parse structs for test_gpos ----------
@@ -491,6 +493,18 @@ impl GeometryCache {
         let cache_key = (f as *const FontMmapIndex as usize, ((gid1 as u32) << 16) | (gid2 as u32));
         if let Some(hit) = PAIR_CACHE.with(|c| c.borrow().get(&cache_key).copied()) {
             return hit;
+        }
+        if !f.pair_first_present.is_empty() {
+            let g1 = gid1 as usize;
+            if g1 >= f.pair_first_present.len() || f.pair_first_present[g1]==0 {
+                let res = ([0i32;4],[0i32;4]);
+                PAIR_CACHE.with(|c| {
+                    let mut m = c.borrow_mut();
+                    if m.len() >= 16384 { m.clear(); }
+                    m.insert(cache_key, res);
+                });
+                return res;
+            }
         }
         let d = self.data();
         let mut v1_acc = [0i32;4];
@@ -1881,6 +1895,23 @@ impl GeometryCache {
                     w.write_all(&idx.to_le_bytes())?;
                 }
             }
+            // v17: pair_first_present blob — num_glyphs bytes, 1 if gid has any pair kern
+            {
+                let mut pfp = vec![0u8; of.num_glyphs];
+                for tbl in &of.format1_tables {
+                    for &gid in &tbl.coverage {
+                        let g = gid as usize;
+                        if g < pfp.len() { pfp[g] = 1; }
+                    }
+                }
+                for tbl in &of.format2_tables {
+                    for &gid in &tbl.coverage {
+                        let g = gid as usize;
+                        if g < pfp.len() { pfp[g] = 1; }
+                    }
+                }
+                w.write_all(&pfp)?;
+            }
         }
         w.flush()?; drop(w); std::fs::rename(&tmp, path)?; Ok(())
     }
@@ -1892,7 +1923,8 @@ impl GeometryCache {
         if data.len() < 20 { return Err("BGEO too small".into()); }
         if &data[0..4] != BGEO_MAGIC { return Err(format!("bad magic {:?}", &data[0..4])); }
         let version = u32::from_le_bytes(data[4..8].try_into().unwrap());
-        if version != BGEO_VERSION { return Err(format!("BGEO version {version}, need v{BGEO_VERSION}")); }
+        // Support v16 compat (recompute pfp) + v17 (stored pfp): accept both in transition.
+        if version != 16 && version != BGEO_VERSION { return Err(format!("BGEO version {version}, need v{BGEO_VERSION} (or v16 compat)")); }
         let catalog_hash = u64::from_le_bytes(data[8..16].try_into().unwrap());
         let n_fonts = u32::from_le_bytes(data[16..20].try_into().unwrap()) as usize;
         let mut pos = 20usize;
@@ -2221,7 +2253,37 @@ impl GeometryCache {
                 case_single_groups.push(SingleGroupIndex { lookup_id, entries });
             }
 
-            fonts.insert(font_key, FontMmapIndex { file_hash, upem, num_glyphs, glyphs_off, cmap_off, cmap_len, single_tables, format1_tables: f1_tables, format2_tables: f2_tables, case_single_tables, case_format1_tables: case_f1_tables, case_format2_tables: case_f2_tables, pair_groups, case_pair_groups, single_groups, case_single_groups });
+            // v17: pair_first_present blob — stored directly after case_single_groups
+            let pair_first_present = if version >= 17 {
+                if pos + num_glyphs > data.len() {
+                    return Err(format!("trunc v17 pair_first_present {} + {} > {}", pos, num_glyphs, data.len()));
+                }
+                let v = data[pos..pos+num_glyphs].to_vec();
+                pos += num_glyphs;
+                v
+            } else {
+                // v16 compat: recompute from Format1/Format2 coverage (old caches)
+                let mut pfp = vec![0u8; num_glyphs];
+                for tbl in &f1_tables {
+                    for i in 0..tbl.coverage_len {
+                        let off = tbl.coverage_off + i*2;
+                        if off+2>data.len() {continue}
+                        let gid=le_u16_at(data,off) as usize;
+                        if gid < pfp.len() { pfp[gid]=1 }
+                    }
+                }
+                for tbl in &f2_tables {
+                    for i in 0..tbl.coverage_len {
+                        let off = tbl.coverage_off + i*2;
+                        if off+2>data.len() {continue}
+                        let gid=le_u16_at(data,off) as usize;
+                        if gid < pfp.len() { pfp[gid]=1 }
+                    }
+                }
+                pfp
+            };
+
+            fonts.insert(font_key, FontMmapIndex { file_hash, upem, num_glyphs, glyphs_off, cmap_off, cmap_len, single_tables, format1_tables: f1_tables, format2_tables: f2_tables, case_single_tables, case_format1_tables: case_f1_tables, case_format2_tables: case_f2_tables, pair_groups, case_pair_groups, single_groups, case_single_groups, pair_first_present });
         }
         Ok((Self { mmap, fonts, _cache_path: path.to_path_buf() }, catalog_hash))
     }
