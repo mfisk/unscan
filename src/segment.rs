@@ -16,6 +16,7 @@ use crate::features::{audit_all_chars_enabled, contrast_normalize_char, is_suppo
 thread_local! {
     static CANDIDATE_SEAMS_FWD: RefCell<(Vec<f32>, Vec<u32>, Vec<f32>, Vec<f32>, Vec<f32>, Vec<f32>)> = RefCell::new((Vec::new(), Vec::new(), Vec::new(), Vec::new(), Vec::new(), Vec::new()));
     static CANDIDATE_SEAMS_REV: RefCell<(Vec<f32>, Vec<u32>, Vec<f32>, Vec<f32>, Vec<f32>, Vec<f32>)> = RefCell::new((Vec::new(), Vec::new(), Vec::new(), Vec::new(), Vec::new(), Vec::new()));
+    static SEGMENT_TL: RefCell<(Vec<f32>, Vec<f32>, Vec<f32>, Vec<f32>, Vec<f32>)> = RefCell::new((Vec::new(), Vec::new(), Vec::new(), Vec::new(), Vec::new()));
 }
 use crate::verify::WordPlacement;
 
@@ -314,6 +315,7 @@ fn segment_characters_inner(
     if splits.len() < need {
         use std::cmp::Ordering;
         use std::collections::BinaryHeap;
+        let audit_mode = diag_dir.is_some();
 
         // Ink-based energy for seam carving.  Each pixel's base cost is
         // its darkness (0 for white, 255 for black).  The DP adds an
@@ -329,18 +331,21 @@ fn segment_characters_inner(
         // couldn't distinguish between the interior of a dark stroke
         // (zero gradient) and a white gap (also zero gradient).
 
-        // Per-pixel darkness + row ink + total ink + ink_values in one scan:
-        // merges 4 passes (darkness build, total sum, row sums, ink_values fill)
-        // into a single row-major walk over raw buffer. Energy second pass stays separate
-        // because it needs darkness neighbors +-2.
+        // Per-pixel darkness + row ink + total ink + ink_values in one scan,
+        // TLS-reused arenas to avoid per-word Vec allocation (perf win 1).
         let raw_dark = img.as_raw();
         let w_us = w as usize;
         let h_us = h as usize;
         let n = w_us * h_us;
-        let mut darkness = vec![0f32; n];
-        let mut row_sums = vec![0f32; h_us];
+        // Take 5 bufs from TLS (capacity preserved across calls)
+        let (mut darkness, mut energy, mut row_sums, mut row_ink, mut ink_values): (Vec<f32>, Vec<f32>, Vec<f32>, Vec<f32>, Vec<f32>) =
+            SEGMENT_TL.with(|c| std::mem::replace(&mut *c.borrow_mut(), (Vec::new(), Vec::new(), Vec::new(), Vec::new(), Vec::new())));
+        darkness.clear(); darkness.resize(n, 0.0);
+        row_sums.clear(); row_sums.resize(h_us, 0.0);
+        energy.clear(); energy.resize(n, 0.0);
+        row_ink.clear(); row_ink.resize(h_us, 0.0);
+        ink_values.clear(); ink_values.reserve(n / 2);
         let mut total_ink: f32 = 0.0;
-        let mut ink_values: Vec<f32> = Vec::with_capacity(n / 2);
         for y in 0..h_us {
             let base = y * w_us;
             let mut row_sum = 0.0f32;
@@ -357,7 +362,6 @@ fn segment_characters_inner(
         }
 
         // Row ink fractions: what share of the word's total ink is in each row.
-        let mut row_ink = vec![0f32; h_us];
         if total_ink > 0.0 {
             let inv_total = 1.0 / total_ink;
             for y in 0..h_us {
@@ -366,8 +370,7 @@ fn segment_characters_inner(
         }
 
         // Energy map: darkness with horizontal-context discount.
-        // Flat vec: same layout as darkness.
-        let mut energy = vec![0f32; n];
+        // Flat vec: same layout as darkness (already sized).
         for y in 0..h_us {
             let row_off = y * w_us;
             for c in 0..w_us {
@@ -508,8 +511,10 @@ fn segment_characters_inner(
                 for (col, cost) in &cands {
                     heap.push(SeamEntry { cost: *cost + segment_penalty(seg_start, seg_end, *col, *cost), col: *col, seg_start, seg_end, seg_id: sid });
                 }
-                trace_candidate_costs(&mut cands, &dp, seg_start, seg_end, &energy, &row_ink,
-                    &segment_penalty, &ink_discount_for_path, seam_params().horizontal_cost, &mut candidate_paths);
+                if audit_mode {
+                    trace_candidate_costs(&mut cands, &dp, seg_start, seg_end, &energy, &row_ink,
+                        &segment_penalty, &ink_discount_for_path, seam_params().horizontal_cost, &mut candidate_paths);
+                }
                 seg_bounds.insert(sid, SegBounds { left_path: None, right_path: None });
                 dp_cache.insert(sid, dp);
             }
@@ -719,8 +724,10 @@ fn segment_characters_inner(
                     for (col, cost) in &cands {
                         heap.push(SeamEntry { cost: *cost + segment_penalty(child_left_start, child_left_end, *col, *cost), col: *col, seg_start: child_left_start, seg_end: child_left_end, seg_id: sid });
                     }
-                    trace_candidate_costs(&mut cands, &dp, child_left_start, child_left_end, &energy, &row_ink,
-                        &segment_penalty, &ink_discount_for_path, seam_params().horizontal_cost, &mut candidate_paths);
+                    if audit_mode {
+                        trace_candidate_costs(&mut cands, &dp, child_left_start, child_left_end, &energy, &row_ink,
+                            &segment_penalty, &ink_discount_for_path, seam_params().horizontal_cost, &mut candidate_paths);
+                    }
                     seg_bounds.insert(sid, SegBounds { left_path: lp, right_path: rp });
                     dp_cache.insert(sid, dp);
                 }
@@ -740,8 +747,10 @@ fn segment_characters_inner(
                     for (col, cost) in &cands {
                         heap.push(SeamEntry { cost: *cost + segment_penalty(child_right_start, child_right_end, *col, *cost), col: *col, seg_start: child_right_start, seg_end: child_right_end, seg_id: sid });
                     }
-                    trace_candidate_costs(&mut cands, &dp, child_right_start, child_right_end, &energy, &row_ink,
-                        &segment_penalty, &ink_discount_for_path, seam_params().horizontal_cost, &mut candidate_paths);
+                    if audit_mode {
+                        trace_candidate_costs(&mut cands, &dp, child_right_start, child_right_end, &energy, &row_ink,
+                            &segment_penalty, &ink_discount_for_path, seam_params().horizontal_cost, &mut candidate_paths);
+                    }
                     seg_bounds.insert(sid, SegBounds { left_path: lp, right_path: rp });
                     dp_cache.insert(sid, dp);
                 }
@@ -749,10 +758,8 @@ fn segment_characters_inner(
         }
 
         // After greedy loop: merge unused candidate paths into seam_paths
-        // for diagnostics. The report uses seam_splits to distinguish
-        // accepted seams from candidates; seam_viz uses the full map.
-        // UNPRINT_EXTRA_SEAMS controls how many: "all" or a number (default 10).
-        {
+        // for diagnostics. Only needed when auditing (win 2). Skip when audit_mode false.
+        if audit_mode {
             let extra_limit: Option<usize> = match std::env::var("UNPRINT_EXTRA_SEAMS").ok().as_deref() {
                 Some("all") | Some("ALL") => None,
                 Some(n) => n.parse().ok(),
@@ -770,6 +777,9 @@ fn segment_characters_inner(
                 added += 1;
             }
         }
+
+        // Return TLS arenas (keep capacity for next word)
+        SEGMENT_TL.with(|c| *c.borrow_mut() = (darkness, energy, row_sums, row_ink, ink_values));
 
         splits.sort();
     }
