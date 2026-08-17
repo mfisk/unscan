@@ -36,10 +36,13 @@
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::cell::RefCell;
+use std::sync::Arc;
 use rustc_hash::FxHashMap;
 
+type PredVal = Vec<(f64,f64,f64,f64)>;
+
 thread_local! {
-    static PRED_CACHE: RefCell<FxHashMap<(String, String), Vec<(f64,f64,f64,f64)>>> = RefCell::new(FxHashMap::default());
+    static PRED_CACHE: RefCell<FxHashMap<u64, Arc<PredVal>>> = RefCell::new(FxHashMap::default());
 }
 
 const BGEO_MAGIC: &[u8; 4] = b"BGEO";
@@ -1047,10 +1050,20 @@ impl GeometryCache {
     pub fn predict_glyph_positions_and_extents(&self, font_key: &str, chars: &[char]) -> Option<Vec<(f64,f64,f64,f64)>> {
         // thread-local memo: many lines re-evaluate same word for same font via
         // per_char_geo and word_scales. Cache keeps second call O(1).
-        let key_str: String = chars.iter().collect();
-        let cache_key = (font_key.to_owned(), key_str.clone());
+        //  v21: key was (String,String) causing 2 allocs per call + FxHash of owned strings.
+        //  Now: u64 FxHasher of (font_key bytes + chars) – zero alloc, single hash.
+        let cache_key: u64 = {
+            use std::hash::Hasher;
+            let mut h = rustc_hash::FxHasher::default();
+            h.write(font_key.as_bytes());
+            h.write_u8(0xFF); // separator font vs chars
+            for &c in chars {
+                h.write_u32(c as u32);
+            }
+            h.finish()
+        };
         if let Some(hit) = PRED_CACHE.with(|c| c.borrow().get(&cache_key).cloned()) {
-            return Some(hit);
+            return Some(hit.as_ref().clone());
         }
         let f = self.fonts.get(font_key)?;
         let mut gids: Vec<Option<u16>> = Vec::with_capacity(chars.len());
@@ -1062,7 +1075,7 @@ impl GeometryCache {
             PRED_CACHE.with(|c| {
                 let mut m = c.borrow_mut();
                 if m.len() > 2048 { m.clear(); }
-                m.insert(cache_key, empty.clone());
+                m.insert(cache_key, Arc::new(empty.clone()));
             });
             return Some(empty);
         }
@@ -1148,7 +1161,7 @@ impl GeometryCache {
             PRED_CACHE.with(|c| {
                 let mut m = c.borrow_mut();
                 if m.len() > 2048 { m.clear(); }
-                m.insert(cache_key, out.clone());
+                m.insert(cache_key, Arc::new(out.clone()));
             });
             Some(out)
         } else {
@@ -1231,7 +1244,7 @@ impl GeometryCache {
             PRED_CACHE.with(|c| {
                 let mut m = c.borrow_mut();
                 if m.len() > 2048 { m.clear(); }
-                m.insert(cache_key, out.clone());
+                m.insert(cache_key, Arc::new(out.clone()));
             });
             Some(out)
         }

@@ -91,10 +91,10 @@ struct SegCacheEntry {
     bounds: Vec<u32>,
     seams: HashMap<u32, Vec<[u32; 2]>>,
     summary: SegSummary,
-    // per-char crop+metrics for this k, length = k – Arc to make per-font clone cheap
-    char_crops: Vec<Option<(Arc<GrayImage>, u32, u32, u32, u32, f64, f64)>>,
-    // font-independent precomputed features for each char crop – hoisted out of per-font loop
-    pre_features: Vec<Option<crate::features::CropFeatures>>,
+    // per-char crop+metrics for this k, length = k – Arc<Vec> to make per-font clone cheap (was Vec clone 3.1%)
+    char_crops: std::sync::Arc<Vec<Option<(Arc<GrayImage>, u32, u32, u32, u32, f64, f64)>>>,
+    // font-independent precomputed features for each char crop – hoisted out of per-font loop, Arc to avoid Vec<Option<CropFeatures>> clone 3.1%
+    pre_features: std::sync::Arc<Vec<Option<crate::features::CropFeatures>>>,
 }
 
 pub fn identify_fonts(
@@ -145,8 +145,8 @@ pub fn identify_fonts(
             bounds: Vec<u32>,
             seams: Arc<HashMap<u32, Vec<[u32;2]>>>,
             summary: SegSummary,
-            char_crops: Vec<Option<(Arc<GrayImage>, u32,u32,u32,u32,f64,f64)>>, // Arc makes per-font clone cheap
-            pre_features: Vec<Option<crate::features::CropFeatures>>,
+            char_crops: std::sync::Arc<Vec<Option<(Arc<GrayImage>, u32,u32,u32,u32,f64,f64)>>>, // Arc<Vec> makes per-font clone Arc::clone cheap (was Vec<Option> 3.1%)
+            pre_features: std::sync::Arc<Vec<Option<crate::features::CropFeatures>>>,
             crop_h: u32,
             word_img: Arc<GrayImage>,
             word_text: String,
@@ -179,17 +179,17 @@ pub fn identify_fonts(
                         pre_features.push(None);
                     }
                 }
-                cache.insert(k, SegCacheEntry { bounds: b, seams: s, summary: sum, char_crops, pre_features });
+                cache.insert(k, SegCacheEntry { bounds: b, seams: s, summary: sum, char_crops: std::sync::Arc::new(char_crops), pre_features: std::sync::Arc::new(pre_features) });
             }
             let ent = cache.get(&k).unwrap();
-            // Clone needed data for WordBuild (bounds clone cheap, seams Arc clone cheap)
+            // Clone needed data for WordBuild (bounds clone cheap, seams Arc clone cheap, char_crops/pre_features now Arc clone cheap)
             builds.push(WordBuild {
                 collapsed,
                 bounds: ent.bounds.clone(),
                 seams: Arc::new(ent.seams.clone()),
                 summary: ent.summary.clone(),
-                char_crops: ent.char_crops.clone(),
-                pre_features: ent.pre_features.clone(),
+                char_crops: std::sync::Arc::clone(&ent.char_crops),
+                pre_features: std::sync::Arc::clone(&ent.pre_features),
                 crop_h: wi.img.height(),
                 word_img: wi.img.clone(),
                 word_text: wi.text.clone(),
