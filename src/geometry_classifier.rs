@@ -282,7 +282,9 @@ fn per_char_geo_cached_with_threshold(
     if !geo_cache.has_font(font_key) {
         return None;
     }
-    let mut result = Vec::new();
+    // Reserve sum of word lens to avoid push reallocations (18% inclusive hot path)
+    let total_chars: usize = wib.iter().map(|wm| wm.chars.len()).sum();
+    let mut result = Vec::with_capacity(total_chars);
     for (seg_idx, (wmeas, ws)) in wib.iter().zip(word_segs.iter()).enumerate() {
         let word_bounds = &wmeas.chars;
         if word_bounds.is_empty() {
@@ -429,7 +431,8 @@ fn per_char_geo_shaped_with_threshold(
     }
     let base_features = crate::layout::ot_features(&fe.variant_tag);
 
-    let mut result = Vec::new();
+    let total_chars: usize = wib.iter().map(|wm| wm.chars.len()).sum();
+    let mut result = Vec::with_capacity(total_chars);
     for (seg_idx, (ws, wmeas)) in word_segs.iter().zip(wib.iter()).enumerate() {
         let bounds_vec = &wmeas.chars;
         if bounds_vec.is_empty() {

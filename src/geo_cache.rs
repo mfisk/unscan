@@ -678,17 +678,34 @@ impl GeometryCache {
                         let map_len = ps.second_map_len;
                         let map_off = ps.second_map_off;
                         let map_mask = map_len - 1;
-                        let mut h = if map_len.is_power_of_two() { (gid2 as usize) & map_mask } else { (gid2 as usize) % map_len };
-                        for _ in 0..map_len {
-                            let b_off = map_off + h*2;
-                            if b_off+2 > d.len() { break; }
-                            let bucket = le_u16_at(d, b_off);
-                            if bucket == 0xFFFF { break; }
-                            let off = ps.pairs_off + (bucket as usize)*rec_size;
-                            if off+2 > d.len() { break; }
-                            let sg = le_u16_at(d, off);
-                            if sg == gid2 { found_off = Some(off); break; }
-                            h = if map_len.is_power_of_two() { (h+1) & map_mask } else { (h+1) % map_len };
+                        // Hoist whole-blob bounds check to allow unchecked inner loop
+                        let fast_ok = map_off + map_len*2 <= d.len() && ps.pairs_off + ps.pair_count*rec_size <= d.len();
+                        if fast_ok {
+                            let mut h = if map_len.is_power_of_two() { (gid2 as usize) & map_mask } else { (gid2 as usize) % map_len };
+                            for _ in 0..map_len {
+                                let b_off = map_off + h*2;
+                                // SAFETY: hoisted check ensures b_off+1 < d.len()
+                                let bucket = unsafe { (*d.get_unchecked(b_off) as u16) | ((*d.get_unchecked(b_off+1) as u16) << 8) };
+                                if bucket == 0xFFFF { break; }
+                                let off = ps.pairs_off + (bucket as usize)*rec_size;
+                                // bucket < pair_count by writer invariant, so off+1 within checked range
+                                let sg = unsafe { (*d.get_unchecked(off) as u16) | ((*d.get_unchecked(off+1) as u16) << 8) };
+                                if sg == gid2 { found_off = Some(off); break; }
+                                h = if map_len.is_power_of_two() { (h+1) & map_mask } else { (h+1) % map_len };
+                            }
+                        } else {
+                            let mut h = if map_len.is_power_of_two() { (gid2 as usize) & map_mask } else { (gid2 as usize) % map_len };
+                            for _ in 0..map_len {
+                                let b_off = map_off + h*2;
+                                if b_off+2 > d.len() { break; }
+                                let bucket = le_u16_at(d, b_off);
+                                if bucket == 0xFFFF { break; }
+                                let off = ps.pairs_off + (bucket as usize)*rec_size;
+                                if off+2 > d.len() { break; }
+                                let sg = le_u16_at(d, off);
+                                if sg == gid2 { found_off = Some(off); break; }
+                                h = if map_len.is_power_of_two() { (h+1) & map_mask } else { (h+1) % map_len };
+                            }
                         }
                     } else if ps.pair_count <= 8 {
                         // linear scan is faster for tiny sets than binary search (fewer branches, better prefetch)
@@ -952,16 +969,30 @@ impl GeometryCache {
                         let map_len = ps.second_map_len;
                         let map_off = ps.second_map_off;
                         let map_mask = map_len - 1;
-                        let mut h = if map_len.is_power_of_two() { (gid2 as usize) & map_mask } else { (gid2 as usize) % map_len };
-                        for _ in 0..map_len {
-                            let b_off = map_off + h*2;
-                            if b_off+2 > d.len() { break; }
-                            let bucket = le_u16_at(d, b_off);
-                            if bucket == 0xFFFF { break; }
-                            let off = ps.pairs_off + (bucket as usize)*rec_size;
-                            if off+2 > d.len() { break; }
-                            if le_u16_at(d, off) == gid2 { found_off = Some(off); break; }
-                            h = if map_len.is_power_of_two() { (h+1) & map_mask } else { (h+1) % map_len };
+                        let fast_ok = map_off + map_len*2 <= d.len() && ps.pairs_off + ps.pair_count*rec_size <= d.len();
+                        if fast_ok {
+                            let mut h = if map_len.is_power_of_two() { (gid2 as usize) & map_mask } else { (gid2 as usize) % map_len };
+                            for _ in 0..map_len {
+                                let b_off = map_off + h*2;
+                                let bucket = unsafe { (*d.get_unchecked(b_off) as u16) | ((*d.get_unchecked(b_off+1) as u16) << 8) };
+                                if bucket == 0xFFFF { break; }
+                                let off = ps.pairs_off + (bucket as usize)*rec_size;
+                                let sg = unsafe { (*d.get_unchecked(off) as u16) | ((*d.get_unchecked(off+1) as u16) << 8) };
+                                if sg == gid2 { found_off = Some(off); break; }
+                                h = if map_len.is_power_of_two() { (h+1) & map_mask } else { (h+1) % map_len };
+                            }
+                        } else {
+                            let mut h = if map_len.is_power_of_two() { (gid2 as usize) & map_mask } else { (gid2 as usize) % map_len };
+                            for _ in 0..map_len {
+                                let b_off = map_off + h*2;
+                                if b_off+2 > d.len() { break; }
+                                let bucket = le_u16_at(d, b_off);
+                                if bucket == 0xFFFF { break; }
+                                let off = ps.pairs_off + (bucket as usize)*rec_size;
+                                if off+2 > d.len() { break; }
+                                if le_u16_at(d, off) == gid2 { found_off = Some(off); break; }
+                                h = if map_len.is_power_of_two() { (h+1) & map_mask } else { (h+1) % map_len };
+                            }
                         }
                     } else if ps.pair_count <= 8 {
                         for i in 0..ps.pair_count {

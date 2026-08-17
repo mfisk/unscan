@@ -8,8 +8,14 @@ use image::GrayImage;
 use rustc_hash::FxHashMap;
 use std::collections::{HashMap, HashSet};
 use std::sync::OnceLock;
+use std::cell::RefCell;
 
 use crate::features::{audit_all_chars_enabled, contrast_normalize_char, is_supported, normalize_to_ink_bounds, NORM_H};
+
+// Thread-local reuse for candidate_seams forward DP buffers (task B)
+thread_local! {
+    static CANDIDATE_SEAMS_FWD: RefCell<(Vec<f32>, Vec<u32>, Vec<f32>, Vec<f32>, Vec<f32>)> = RefCell::new((Vec::new(), Vec::new(), Vec::new(), Vec::new(), Vec::new()));
+}
 use crate::verify::WordPlacement;
 
 /// Seam carving scoring parameters, configurable via environment variables
@@ -185,19 +191,19 @@ fn segment_characters_inner(
 
     let _max_ink = col_ink.iter().copied().max().unwrap_or(0);
 
-    let col_has_ink_strict: Vec<bool> = col_ink.iter().map(|&v| v > 0).collect();
+    let col_has_ink_strict: Vec<u8> = col_ink.iter().map(|&v| if v > 0 { 1u8 } else { 0u8 }).collect();
 
     let mut splits: Vec<u32> = Vec::with_capacity(need);
 
     /// Find the ink extent within [seg_start, seg_end) using the given
     /// per-column ink flags.  Returns (ink_left, ink_right_exclusive).
-    fn ink_extent(col_ink_flags: &[bool], seg_start: u32, seg_end: u32) -> (u32, u32) {
+    fn ink_extent(col_ink_flags: &[u8], seg_start: u32, seg_end: u32) -> (u32, u32) {
         let left = (seg_start..seg_end)
-            .find(|&x| col_ink_flags[x as usize])
+            .find(|&x| col_ink_flags[x as usize] != 0)
             .unwrap_or(seg_end);
         let right = (seg_start..seg_end)
             .rev()
-            .find(|&x| col_ink_flags[x as usize])
+            .find(|&x| col_ink_flags[x as usize] != 0)
             .map(|x| x + 1)
             .unwrap_or(seg_start);
         (left, right)
@@ -215,7 +221,7 @@ fn segment_characters_inner(
         let mut vp_candidates: Vec<u32> = Vec::new();
         let mut run_start: Option<u32> = None;
         for c in ink_l..ink_r {
-            if !col_has_ink_strict[c as usize] {
+            if col_has_ink_strict[c as usize] == 0 {
                 if run_start.is_none() {
                     run_start = Some(c);
                 }
@@ -1012,21 +1018,37 @@ fn candidate_seams(
     // down to 1, precomputes cur row darkness/ink once per cell.
     // Identical costs to prior 5-pass version: same INFINITY handling,
     // same 0.01/0.02 horizontal penalties, same pass-through ordering.
+    // Arena reuse: thread_local buffers to avoid 5 allocs per call.
     let _p = seam_params(); // hoist OnceLock load
     let n_cells = h_us * seg_w;
-    let mut cost_fwd = vec![0.0f32; n_cells];
-    let mut pred_fwd = vec![0u32; n_cells];
+    // Take reused buffers from thread-local (capacity preserved across calls)
+    let (mut cost_fwd, mut pred_fwd, mut prev_darks, mut cur_darks, mut cur_inks) =
+        CANDIDATE_SEAMS_FWD.with(|c| {
+            let mut s = c.borrow_mut();
+            (
+                std::mem::take(&mut s.0),
+                std::mem::take(&mut s.1),
+                std::mem::take(&mut s.2),
+                std::mem::take(&mut s.3),
+                std::mem::take(&mut s.4),
+            )
+        });
+    cost_fwd.resize(n_cells, 0.0f32);
+    // Ensure exact len n_cells (resize keeps extra initialized to 0)
+    // pred_fwd similarly
+    pred_fwd.resize(n_cells, 0u32);
+    prev_darks.resize(seg_w, 0.0f32);
+    cur_darks.resize(seg_w, 0.0f32);
+    cur_inks.resize(seg_w, 0.0f32);
     // Row 0 cached for reuse as prev in r=1
-    let mut prev_darks = Vec::with_capacity(seg_w);
-    for c in 0..seg_w { prev_darks.push(masked_energy(0, c)); }
+    for c in 0..seg_w { prev_darks[c] = masked_energy(0, c); }
     for c in 0..seg_w {
         let dark0 = prev_darks[c];
         cost_fwd[c] = ink_score(dark0, 0, row_ink)
             + delta_ink_score(dark0, 0.0, 0, 0, row_ink, max_ink);
         pred_fwd[c] = c as u32;
     }
-    let mut cur_darks = vec![0.0f32; seg_w];
-    let mut cur_inks = vec![0.0f32; seg_w];
+    // cur_darks/cur_inks reused buffers already resized
     for r in 1..h_us {
         for c in 0..seg_w {
             let cd = masked_energy(r, c);
@@ -1243,6 +1265,18 @@ fn candidate_seams(
             }
         }
     }
+
+    // Return intermediate scratch buffers to thread-local for reuse (keep max capacity)
+    let cost_fwd_cap = cost_fwd.capacity();
+    let pred_fwd_cap = pred_fwd.capacity();
+    CANDIDATE_SEAMS_FWD.with(|c| {
+        let mut s = c.borrow_mut();
+        s.2 = prev_darks;
+        s.3 = cur_darks;
+        s.4 = cur_inks;
+        s.0 = Vec::with_capacity(cost_fwd_cap);
+        s.1 = Vec::with_capacity(pred_fwd_cap);
+    });
 
     let dp = SeamDp { pred_fwd, pred_rev, cost_fwd, cost_rev, seg_start, seg_w, h };
     (candidates, dp)
