@@ -23,16 +23,16 @@ use std::collections::HashMap;
 use std::collections::hash_map::DefaultHasher;
 use std::hash::{Hash, Hasher};
 use std::path::{Path, PathBuf};
-use std::sync::{Arc, Mutex, OnceLock};
+use std::sync::{Arc, OnceLock, RwLock};
 use walkdir::WalkDir;
 
 /// Cache of vertical-gap counts per (font path, ligature char) — avoids
 /// re-rasterizing the same FB00-FB04 glyph for every candidate per line.
 /// 52% of CPU was here in nightly pprof.
-static GAP_CACHE: OnceLock<Mutex<HashMap<(PathBuf, char), usize>>> = OnceLock::new();
+static GAP_CACHE: OnceLock<RwLock<HashMap<(PathBuf, char), usize>>> = OnceLock::new();
 
-fn gap_cache() -> &'static Mutex<HashMap<(PathBuf, char), usize>> {
-    GAP_CACHE.get_or_init(|| Mutex::new(HashMap::new()))
+fn gap_cache() -> &'static RwLock<HashMap<(PathBuf, char), usize>> {
+    GAP_CACHE.get_or_init(|| RwLock::new(HashMap::new()))
 }
 
 /// Compact bitmask for FB00-FB04 ligatures: bit0=FF,1=FI,2=FL,3=FFI,4=FFL.
@@ -62,10 +62,10 @@ fn lig_contains(mask: LigMask, c: char) -> bool {
 /// Cache of final collapsed lig sets per font path — eliminates 33.9%
 /// inclusive hot path (font_match.rs:138, font_pipeline.rs:381) which
 /// otherwise did fs::read + cmap + 5× shape per candidate per line.
-static LIG_SET_CACHE: OnceLock<Mutex<HashMap<PathBuf, LigMask>>> = OnceLock::new();
+static LIG_SET_CACHE: OnceLock<RwLock<HashMap<PathBuf, LigMask>>> = OnceLock::new();
 
-fn lig_set_cache() -> &'static Mutex<HashMap<PathBuf, LigMask>> {
-    LIG_SET_CACHE.get_or_init(|| Mutex::new(HashMap::new()))
+fn lig_set_cache() -> &'static RwLock<HashMap<PathBuf, LigMask>> {
+    LIG_SET_CACHE.get_or_init(|| RwLock::new(HashMap::new()))
 }
 
 // Thread-local ShapePlan cache for lig probe — mirrors
@@ -292,7 +292,7 @@ impl FontEntry {
         // Global memo — eliminates 33.9% inclusive hot path after first line.
         // Final filtered set is cached, so no FS read / shaping on hits.
         {
-            let guard = lig_set_cache().lock().unwrap();
+            let guard = lig_set_cache().read().unwrap();
             if let Some(cached) = guard.get(&self.path) {
                 return *cached;
             }
@@ -359,14 +359,14 @@ impl FontEntry {
                     _ => continue,
                 };
                 let cached = {
-                    let guard = gap_cache().lock().unwrap();
+                    let guard = gap_cache().read().unwrap();
                     guard.get(&(path_key.clone(), lig)).copied()
                 };
                 let gaps = if let Some(g) = cached {
                     g
                 } else {
                     let g = Self::count_vertical_gaps_for_lig(data, lig);
-                    let mut guard = gap_cache().lock().unwrap();
+                    let mut guard = gap_cache().write().unwrap();
                     guard.insert((path_key.clone(), lig), g);
                     g
                 };
@@ -378,7 +378,7 @@ impl FontEntry {
 
         // Insert final filtered set into global cache.
         {
-            let mut guard = lig_set_cache().lock().unwrap();
+            let mut guard = lig_set_cache().write().unwrap();
             guard.insert(self.path.clone(), mask);
         }
         mask

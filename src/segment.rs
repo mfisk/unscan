@@ -1894,7 +1894,7 @@ pub fn segment_line(
     let mut word_segs: Vec<WordSeg> = Vec::new();
     let mut lig_word_segs: Vec<WordSeg> = Vec::new();
     let mut any_ligatures = false;
-    let mut words_with_ligatures: HashSet<usize> = HashSet::new();
+    let mut words_with_ligatures: Vec<bool> = vec![false; words.len()];
 
     for (_word_idx, &(orig_idx, word)) in sorted.iter().enumerate() {
         let audit_all = audit_all_chars_enabled();
@@ -2008,7 +2008,13 @@ pub fn segment_line(
             });
 
             any_ligatures = true;
-            words_with_ligatures.insert(word_segs.len() - 1);
+            if words_with_ligatures.len() > word_segs.len() - 1 {
+                words_with_ligatures[word_segs.len() - 1] = true;
+            } else {
+                // Resize if sorted filtering made len larger than original words.len() (shouldn't happen, but be safe)
+                words_with_ligatures.resize(word_segs.len(), false);
+                words_with_ligatures[word_segs.len() - 1] = true;
+            }
             // ── Path B: ligature segmentation (reduced n_chars) ─────
             let (bounds_lig, seams_lig, seg_summary_lig) = if let Some(ref wdir) = word_diag_dir {
                 let ldir = wdir.join("seg_lig");
@@ -2060,7 +2066,8 @@ pub fn segment_line(
     // For the ligature path, non-ligature words use plain segmentation
     if any_ligatures {
         for (idx, seg) in word_segs.iter().enumerate() {
-            if !words_with_ligatures.contains(&idx) {
+            let has_lig = idx < words_with_ligatures.len() && words_with_ligatures[idx];
+            if !has_lig {
                 lig_word_segs.push(WordSeg {
                     source_word_idx: seg.source_word_idx,
                     word_img: seg.word_img.clone(),
