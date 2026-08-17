@@ -142,7 +142,16 @@ pub fn verify_text_region(
         scan_crop, &full_render, 12, bail_below,
     );
 
-    // Ink-crop render for display - same threshold as scan box trim (single source of truth)
+    // Hot path: match_lines callers only need score/dy (fast_path and font
+    // selection). render_ink + colored diff (with Lanczos3 resize when dims
+    // differ) are only needed for audit/visualization. Skip when audit_dir
+    // is None – avoids two ink-extent scans + clone/resize per verify call.
+    if audit_dir.is_none() {
+        return VerifyResult { score, dy, render_ink: None, diff: None };
+    }
+
+    // Audit path (audit_dir Some): ink-crop render for display + colored diff.
+    // Same threshold as scan box trim (single source of truth).
     let ink_threshold = crate::ocr::INK_THRESHOLD;
     let (rw, rh) = full_render.dimensions();
     // same functions as scan trim: `< threshold` is ink.
@@ -161,12 +170,11 @@ pub fn verify_text_region(
 
     let diff = compute_colored_diff(scan_crop, &render_ink);
 
-    // Save audit images if requested.
-    if let Some(audit_path) = audit_dir {
-        let _ = scan_crop.save(audit_path.join("ssim_scan.png"));
-        let _ = render_ink.save(audit_path.join("ssim_render.png"));
-        let _ = diff.save(audit_path.join("ssim_diff.png"));
-    }
+    // Save audit images.
+    let audit_path = audit_dir.unwrap();
+    let _ = scan_crop.save(audit_path.join("ssim_scan.png"));
+    let _ = render_ink.save(audit_path.join("ssim_render.png"));
+    let _ = diff.save(audit_path.join("ssim_diff.png"));
 
     VerifyResult { score, dy, render_ink: Some(render_ink), diff: Some(diff) }
 }
