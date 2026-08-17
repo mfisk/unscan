@@ -6,7 +6,7 @@
 use std::sync::Arc;
 use image::GrayImage;
 use rustc_hash::FxHashMap;
-use std::collections::{HashMap, HashSet};
+use std::collections::HashMap;
 use std::sync::OnceLock;
 use std::cell::RefCell;
 
@@ -174,25 +174,24 @@ fn segment_characters_inner(
 
     let threshold = crate::INK_THRESH;
 
-    // Compute total ink per column (count of pixels above ink threshold). Raw buffer.
+    // Compute total ink per column (count of pixels < thresh). Row-major single scan
+    // merges col_has_ink_strict creation – cache-friendly vs column-major strided.
     let w_us = w as usize;
     let h_us = h as usize;
     let raw_img = img.as_raw();
-    let col_ink: Vec<u32> = (0..w_us)
-        .map(|x| {
-            let mut cnt = 0u32;
-            for y in 0..h_us {
-                if raw_img[y * w_us + x] < threshold {
-                    cnt += 1;
-                }
+    let mut col_ink: Vec<u32> = vec![0u32; w_us];
+    let mut col_has_ink_strict: Vec<u8> = vec![0u8; w_us];
+    for y in 0..h_us {
+        let base = y * w_us;
+        for x in 0..w_us {
+            if raw_img[base + x] < threshold {
+                col_ink[x] += 1;
+                col_has_ink_strict[x] = 1;
             }
-            cnt
-        })
-        .collect();
+        }
+    }
 
     let _max_ink = col_ink.iter().copied().max().unwrap_or(0);
-
-    let col_has_ink_strict: Vec<u8> = col_ink.iter().map(|&v| if v > 0 { 1u8 } else { 0u8 }).collect();
 
     let mut splits: Vec<u32> = Vec::with_capacity(need);
 
@@ -330,34 +329,39 @@ fn segment_characters_inner(
         // couldn't distinguish between the interior of a dark stroke
         // (zero gradient) and a white gap (also zero gradient).
 
-        // Per-pixel darkness: 0.0 for white, 255.0 for black (raw). Raw buffer single pass.
-        // Flat vec optimization: single allocation vs h Vec allocations, better cache locality.
+        // Per-pixel darkness + row ink + total ink + ink_values in one scan:
+        // merges 4 passes (darkness build, total sum, row sums, ink_values fill)
+        // into a single row-major walk over raw buffer. Energy second pass stays separate
+        // because it needs darkness neighbors +-2.
         let raw_dark = img.as_raw();
         let w_us = w as usize;
         let h_us = h as usize;
         let n = w_us * h_us;
         let mut darkness = vec![0f32; n];
+        let mut row_sums = vec![0f32; h_us];
+        let mut total_ink: f32 = 0.0;
+        let mut ink_values: Vec<f32> = Vec::with_capacity(n / 2);
         for y in 0..h_us {
             let base = y * w_us;
-            // Manual loop for auto-vectorization; no per-row Vec alloc.
+            let mut row_sum = 0.0f32;
             for x in 0..w_us {
-                darkness[base + x] = 255.0 - raw_dark[base + x] as f32;
+                let d = 255.0 - raw_dark[base + x] as f32;
+                darkness[base + x] = d;
+                row_sum += d;
+                if d > 0.0 {
+                    ink_values.push(d);
+                }
             }
+            row_sums[y] = row_sum;
+            total_ink += row_sum;
         }
 
-        // Row ink fractions: what share of the word's total ink is in each
-        // row.  Rows with heavy strokes are high; whitespace rows near zero.
-        let total_ink: f32 = darkness.iter().copied().sum();
+        // Row ink fractions: what share of the word's total ink is in each row.
         let mut row_ink = vec![0f32; h_us];
         if total_ink > 0.0 {
+            let inv_total = 1.0 / total_ink;
             for y in 0..h_us {
-                let base = y * w_us;
-                let mut sum = 0f32;
-                // Sum row slice
-                for x in 0..w_us {
-                    sum += darkness[base + x];
-                }
-                row_ink[y] = sum / total_ink;
+                row_ink[y] = row_sums[y] * inv_total;
             }
         }
 
@@ -432,14 +436,8 @@ fn segment_characters_inner(
             }
         };
 
-        // Word-level max ink (p95 of raw darkness): used by delta_ink_score
-        // to scale the entry penalty proportionally. select_nth avoids full sort O(n log n).
-        let mut ink_values: Vec<f32> = Vec::with_capacity(n);
-        for &d in &darkness {
-            if d > 0.0 {
-                ink_values.push(d);
-            }
-        }
+        // Word-level max ink (p95 of raw darkness): reused ink_values from darkness scan above.
+        // select_nth avoids full sort O(n log n).
         let max_ink = if ink_values.is_empty() {
             255.0
         } else {
@@ -520,7 +518,8 @@ fn segment_characters_inner(
         // Greedy loop: pop cheapest, split, recompute children.
         // Lazy deletion: stale seg_ids are skipped on pop instead of
         // draining and rebuilding the heap on every accepted seam.
-        let mut dead_sids: HashSet<u32> = HashSet::new();
+        // Perf: Vec<bool> dense O(1) vs HashSet<u32> hash.
+        let mut dead_sids: Vec<bool> = Vec::new();
         while splits.len() < need {
             let entry = match heap.pop() {
                 Some(e) => e,
@@ -528,7 +527,7 @@ fn segment_characters_inner(
             };
 
             // Skip candidates from dead segments (replaced or consumed).
-            if dead_sids.contains(&entry.seg_id) {
+            if (entry.seg_id as usize) < dead_sids.len() && dead_sids[entry.seg_id as usize] {
                 continue;
             }
 
@@ -559,7 +558,8 @@ fn segment_characters_inner(
                         seg_bounds.insert(sid, SegBounds { left_path: lp, right_path: rp });
                         dp_cache.insert(sid, dp);
                         // Kill old segment — retry replacement covers valid columns
-                        dead_sids.insert(entry.seg_id);
+                        if dead_sids.len() <= entry.seg_id as usize { dead_sids.resize((entry.seg_id as usize)+1, false); }
+                        dead_sids[entry.seg_id as usize] = true;
                         dp_cache.remove(&entry.seg_id);
                         seg_bounds.remove(&entry.seg_id);
                     }
@@ -577,7 +577,8 @@ fn segment_characters_inner(
                         seg_bounds.insert(sid, SegBounds { left_path: lp, right_path: rp });
                         dp_cache.insert(sid, dp);
                         // Kill old segment — retry replacement covers valid columns
-                        dead_sids.insert(entry.seg_id);
+                        if dead_sids.len() <= entry.seg_id as usize { dead_sids.resize((entry.seg_id as usize)+1, false); }
+                        dead_sids[entry.seg_id as usize] = true;
                         dp_cache.remove(&entry.seg_id);
                         seg_bounds.remove(&entry.seg_id);
                     }
@@ -691,7 +692,8 @@ fn segment_characters_inner(
 
             // Mark old segment as dead — stale entries skipped on pop.
             let old_sid = entry.seg_id;
-            dead_sids.insert(old_sid);
+            if dead_sids.len() <= old_sid as usize { dead_sids.resize((old_sid as usize)+1, false); }
+            dead_sids[old_sid as usize] = true;
             dp_cache.remove(&old_sid);
             seg_bounds.remove(&old_sid);
 
