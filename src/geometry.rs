@@ -20,8 +20,25 @@ pub fn detect_geometry(
     text_bboxes: &[(u32, u32, u32, u32)],
     min_line_length_px: u32,
 ) -> GeometryResult {
-    let gray = img.to_luma8();
-    let rgba = img.to_rgba8();
+    // Fast path reuse – same as page_cache but local to avoid extra dep.
+    let rgba = match img {
+        DynamicImage::ImageRgba8(r) => r.clone(),
+        DynamicImage::ImageRgb8(rgb) => {
+            let (w, h) = rgb.dimensions();
+            let mut out = Vec::with_capacity((w*h*4) as usize);
+            for c in rgb.as_raw().chunks_exact(3) { out.extend_from_slice(c); out.push(255); }
+            image::RgbaImage::from_raw(w, h, out).expect("rgba")
+        }
+        _ => img.to_rgba8(),
+    };
+    let gray = {
+        let (w, h) = rgba.dimensions();
+        let mut out = Vec::with_capacity((w*h) as usize);
+        for c in rgba.as_raw().chunks_exact(4) {
+            out.push(((c[0] as u32*2126 + c[1] as u32*7152 + c[2] as u32*722) / 10000) as u8);
+        }
+        image::GrayImage::from_raw(w, h, out).expect("gray")
+    };
     detect_geometry_from_buffers(&gray, &rgba, text_bboxes, min_line_length_px)
 }
 

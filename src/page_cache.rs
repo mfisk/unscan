@@ -553,6 +553,51 @@ pub struct PreparedPage {
     pub ink_thresh: u8,
 }
 
+pub(crate) fn fast_rgba8_from_dynamic(img: &DynamicImage) -> image::RgbaImage {
+    // Avoid image crate's generic CicpRgb::cast_pixels_by_layout (8.7% exclusive leaf).
+    // Fast path single scan over raw buffers.
+    match img {
+        DynamicImage::ImageRgba8(rgba) => rgba.clone(),
+        DynamicImage::ImageRgb8(rgb) => {
+            let (w, h) = rgb.dimensions();
+            let raw = rgb.as_raw();
+            let mut out = Vec::with_capacity((w * h * 4) as usize);
+            for chunk in raw.chunks_exact(3) {
+                out.extend_from_slice(chunk);
+                out.push(255);
+            }
+            // handle tail (should be none for RGB)
+            image::RgbaImage::from_raw(w, h, out).expect("rgba size")
+        }
+        DynamicImage::ImageLuma8(luma) => {
+            let (w, h) = luma.dimensions();
+            let raw = luma.as_raw();
+            let mut out = Vec::with_capacity((w * h * 4) as usize);
+            for &v in raw {
+                out.extend_from_slice(&[v, v, v, 255]);
+            }
+            image::RgbaImage::from_raw(w, h, out).expect("rgba size")
+        }
+        _ => {
+            // fallback – only for uncommon variants (e.g., LumaA)
+            img.to_rgba8()
+        }
+    }
+}
+
+pub(crate) fn fast_gray_from_rgba(rgba: &image::RgbaImage) -> image::GrayImage {
+    let (w, h) = rgba.dimensions();
+    let raw = rgba.as_raw();
+    let mut out = Vec::with_capacity((w * h) as usize);
+    // Rec.709 matching image 0.25 to_luma8 (0.2126R+0.7152G+0.0722B) – fast int approx 2126/7152/722 /10000.
+    // Avoids CicpRgb::cast_pixels_by_layout 8.7% leaf.
+    for chunk in raw.chunks_exact(4) {
+        let y = ((chunk[0] as u32 * 2126 + chunk[1] as u32 * 7152 + chunk[2] as u32 * 722) / 10000) as u8;
+        out.push(y);
+    }
+    image::GrayImage::from_raw(w, h, out).expect("gray size")
+}
+
 /// Deskew the page, run OCR (with disk cache), detect background colour,
 /// and expand word bounding boxes to actual ink extent.
 pub fn prepare_page(
@@ -561,8 +606,11 @@ pub fn prepare_page(
     dpi: u32,
     cache_dir: Option<&std::path::Path>,
 ) -> Result<PreparedPage, crate::error::ScanTextError> {
-    // Deskew
-    let orig_gray = page_img.to_luma8();
+    // Fast path: single RGBA conversion, reuse for gray + bg – avoids
+    // image::metadata::cicp::CicpRgb::cast_pixels_by_layout 8.7% leaf which
+    // was hit via two separate DynamicImage::to_luma8 / to_rgba8 full-page scans.
+    let rgba_full = fast_rgba8_from_dynamic(page_img);
+    let orig_gray = fast_gray_from_rgba(&rgba_full);
     let skew_angle = crate::deskew::detect_skew(&orig_gray);
     let deskewed_gray = if skew_angle.abs() > 5.0 {
         orig_gray
@@ -586,8 +634,8 @@ pub fn prepare_page(
     };
     let mut lines = crate::ocr::postprocess_words(&word_regions);
 
-    // Background colour
-    let bg_color = crate::color::detect_background_color(page_img);
+    // Background colour – reuse same RGBA buffer instead of page_img.to_rgba8() second scan.
+    let bg_color = crate::color::detect_background_color_from_buffer(&rgba_full);
 
     // Expand word bboxes to actual ink
     let ink_thresh = bg_color.0.saturating_sub(56);

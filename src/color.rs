@@ -31,9 +31,31 @@ pub fn detect_text_color(page_img: &DynamicImage, region: &TextRegion) -> Rgb {
 
     // Crop first — converting only the ROI is ~100-300x cheaper than
     // converting the whole page (6 Mpx -> ~25 kpx for a line).
+    // Fast variant: avoid CicpRgb generic cast 8.7% leaf by using as_raw + manual luma.
     let sub = page_img.crop_imm(x0, y0, w, h);
-    let gray = sub.to_luma8();
-    let rgba = sub.to_rgba8();
+    // Try to reuse underlying buffer type to avoid generic cast.
+    let (gray, rgba) = match &sub {
+        DynamicImage::ImageLuma8(l) => {
+            let (sw, sh) = l.dimensions();
+            // luma -> rgba expansion manual
+            let mut rbuf = Vec::with_capacity((sw * sh * 4) as usize);
+            for &v in l.as_raw() { rbuf.extend_from_slice(&[v, v, v, 255]); }
+            (l.clone(), image::RgbaImage::from_raw(sw, sh, rbuf).expect("rgba"))
+        }
+        DynamicImage::ImageRgba8(r) => {
+            // rgba -> luma fast Rec709 to match image 0.25
+            let (sw, sh) = r.dimensions();
+            let mut gbuf = Vec::with_capacity((sw * sh) as usize);
+            for chunk in r.as_raw().chunks_exact(4) {
+                gbuf.push(((chunk[0] as u32 * 2126 + chunk[1] as u32 * 7152 + chunk[2] as u32 * 722) / 10000) as u8);
+            }
+            (image::GrayImage::from_raw(sw, sh, gbuf).expect("gray"), r.clone())
+        }
+        _ => {
+            // fallback – small ROI so generic cost negligible
+            (sub.to_luma8(), sub.to_rgba8())
+        }
+    };
 
     let gray_raw = gray.as_raw();
     if gray_raw.is_empty() {
