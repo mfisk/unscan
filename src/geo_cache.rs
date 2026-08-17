@@ -48,7 +48,7 @@ const BGEO_MAGIC: &[u8; 4] = b"BGEO";
 // v16 adds: pair_groups, case_pair_groups, single_groups, case_single_groups (BTree-free fast path)
 // plus sorted ClassDef Format2 ranges for binary search in class_get.
 // v17 adds: pair_first_present blob per font (num_glyphs bytes) built from Format1/Format2 coverage at cache build time.
-const BGEO_VERSION: u32 = 20;
+const BGEO_VERSION: u32 = 21;
 
 // ---------- BE helpers for OT parsing ----------
 #[inline]
@@ -222,6 +222,8 @@ struct SingleIndex {
     stride: usize, // popcnt in i16 units
     lookup_id: u16,
     subtable_pos: u16,
+    coverage_map_off: usize,
+    coverage_map_is_u8: bool,
 }
 
 #[derive(Debug, Clone)]
@@ -504,6 +506,21 @@ impl GeometryCache {
         for group in &f.single_groups {
             for entry in &group.entries {
                 let tbl = &f.single_tables[entry.idx as usize];
+                if tbl.coverage_map_off != 0 {
+                    let fast = self.coverage_index_fast(tbl.coverage_map_off, tbl.coverage_map_is_u8, gid);
+                    if fast.is_none() { continue; }
+                    let idx = if tbl.is_single { 0 } else { fast.unwrap() };
+                    let vf = tbl.value_format;
+                    let sz = tbl.stride;
+                    let off = tbl.values_off + idx*sz*2;
+                    if off + sz*2 > d.len() { continue; }
+                    let mut p = off;
+                    if vf & 0x0001 != 0 { acc[0] += le_i16_at(d,p) as i32; p+=2; }
+                    if vf & 0x0002 != 0 { acc[1] += le_i16_at(d,p) as i32; p+=2; }
+                    if vf & 0x0004 != 0 { acc[2] += le_i16_at(d,p) as i32; p+=2; }
+                    if vf & 0x0008 != 0 { acc[3] += le_i16_at(d,p) as i32; }
+                    break;
+                }
                 let idx_opt = if tbl.is_single {
                     if self.coverage_contains(tbl.coverage_off, tbl.coverage_len, gid).is_none() { continue; }
                     Some(0usize)
@@ -660,7 +677,8 @@ impl GeometryCache {
                     if ps.second_map_len != 0 && ps.second_map_off != 0 {
                         let map_len = ps.second_map_len;
                         let map_off = ps.second_map_off;
-                        let mut h = (gid2 as usize) % map_len;
+                        let map_mask = map_len - 1;
+                        let mut h = if map_len.is_power_of_two() { (gid2 as usize) & map_mask } else { (gid2 as usize) % map_len };
                         for _ in 0..map_len {
                             let b_off = map_off + h*2;
                             if b_off+2 > d.len() { break; }
@@ -670,7 +688,7 @@ impl GeometryCache {
                             if off+2 > d.len() { break; }
                             let sg = le_u16_at(d, off);
                             if sg == gid2 { found_off = Some(off); break; }
-                            h = (h+1) % map_len;
+                            h = if map_len.is_power_of_two() { (h+1) & map_mask } else { (h+1) % map_len };
                         }
                     } else if ps.pair_count <= 8 {
                         // linear scan is faster for tiny sets than binary search (fewer branches, better prefetch)
@@ -782,6 +800,21 @@ impl GeometryCache {
         for group in &f.case_single_groups {
             for entry in &group.entries {
                 let tbl = &f.case_single_tables[entry.idx as usize];
+                if tbl.coverage_map_off != 0 {
+                    let fast = self.coverage_index_fast(tbl.coverage_map_off, tbl.coverage_map_is_u8, gid);
+                    if fast.is_none() { continue; }
+                    let idx = if tbl.is_single { 0 } else { fast.unwrap() };
+                    let vf = tbl.value_format;
+                    let sz = tbl.stride;
+                    let off = tbl.values_off + idx*sz*2;
+                    if off + sz*2 > d.len() { continue; }
+                    let mut p = off;
+                    if vf & 0x0001 != 0 { acc[0] += le_i16_at(d,p) as i32; p+=2; }
+                    if vf & 0x0002 != 0 { acc[1] += le_i16_at(d,p) as i32; p+=2; }
+                    if vf & 0x0004 != 0 { acc[2] += le_i16_at(d,p) as i32; p+=2; }
+                    if vf & 0x0008 != 0 { acc[3] += le_i16_at(d,p) as i32; }
+                    break;
+                }
                 let idx_opt = if tbl.is_single {
                     if self.coverage_contains(tbl.coverage_off, tbl.coverage_len, gid).is_none() { continue; }
                     Some(0usize)
@@ -918,7 +951,8 @@ impl GeometryCache {
                     if ps.second_map_len != 0 && ps.second_map_off != 0 {
                         let map_len = ps.second_map_len;
                         let map_off = ps.second_map_off;
-                        let mut h = (gid2 as usize) % map_len;
+                        let map_mask = map_len - 1;
+                        let mut h = if map_len.is_power_of_two() { (gid2 as usize) & map_mask } else { (gid2 as usize) % map_len };
                         for _ in 0..map_len {
                             let b_off = map_off + h*2;
                             if b_off+2 > d.len() { break; }
@@ -927,7 +961,7 @@ impl GeometryCache {
                             let off = ps.pairs_off + (bucket as usize)*rec_size;
                             if off+2 > d.len() { break; }
                             if le_u16_at(d, off) == gid2 { found_off = Some(off); break; }
-                            h = (h+1) % map_len;
+                            h = if map_len.is_power_of_two() { (h+1) & map_mask } else { (h+1) % map_len };
                         }
                     } else if ps.pair_count <= 8 {
                         for i in 0..ps.pair_count {
@@ -981,7 +1015,7 @@ impl GeometryCache {
 
     pub fn predict_glyph_positions_and_extents(&self, font_key: &str, chars: &[char]) -> Option<Vec<(f64,f64,f64,f64)>> {
         // thread-local memo: many lines re-evaluate same word for same font via
-        // per_char_geo and word_scales. Cache num_glyphs-length keys keeps second call O(1).
+        // per_char_geo and word_scales. Cache keeps second call O(1).
         let key_str: String = chars.iter().collect();
         let cache_key = (font_key.to_owned(), key_str.clone());
         if let Some(hit) = PRED_CACHE.with(|c| c.borrow().get(&cache_key).cloned()) {
@@ -1001,92 +1035,175 @@ impl GeometryCache {
             });
             return Some(empty);
         }
-
-        // ---- cheap early: pair_first_present word-level hoist (O(1) per gid) ----
-        // Build skip flags for pair lookups: if first-present byte ==0, font has no GPOS
-        // pairs starting with this gid, so pair_adjustment will be zero without table walks.
-        let mut skip_pair: Vec<bool> = vec![false; n.saturating_sub(1)];
-        let mut has_any_pair = false;
-        if n > 1 && f.pair_first_present_off != 0 {
-            let d_pf = self.data();
-            let off = f.pair_first_present_off;
-            let bitset_len = (f.num_glyphs + 7)/8;
-            if off + bitset_len <= d_pf.len() {
-                for i in 0..n-1 {
-                    let g1 = gids[i].unwrap() as usize;
-                    let is_zero = if g1 < f.num_glyphs {
-                        let byte_off = off + g1/8;
-                        ((d_pf[byte_off] >> (g1%8)) & 1) == 0
-                    } else { true };
-                    skip_pair[i] = is_zero;
-                    if !is_zero { has_any_pair = true; }
-                }
-            } else {
-                // off invalid, conservatively assume we need pairs
-                has_any_pair = true;
-                for b in &mut skip_pair { *b = false; }
-            }
-        } else if n > 1 {
-            // no pair_first_present (old cache, should not happen v18) -> keep old behavior
-            has_any_pair = true;
-        }
-
-        let mut singles: Vec<[i32;4]> = Vec::with_capacity(n);
-        for i in 0..n {
-            singles.push(self.single_adjustment_full(f, gids[i].unwrap()));
-        }
-        let mut pair_firsts: Vec<[i32;4]> = vec![[0;4]; n];
-        let mut pair_seconds: Vec<[i32;4]> = vec![[0;4]; n];
-        if n>1 && has_any_pair {
-            for i in 0..n-1 {
-                if skip_pair[i] { continue; }
-                let (v1,v2) = self.pair_adjustment_full(f, gids[i].unwrap(), gids[i+1].unwrap());
-                pair_firsts[i] = v1;
-                pair_seconds[i+1] = v2;
-            }
-        }
+        // early case detection to avoid case Vec allocs for 99% path
         let apply_case = Self::is_all_caps_context(chars) && Self::is_allcaps_variant(font_key);
-        let mut case_singles: Vec<[i32;4]> = vec![[0;4]; n];
-        let mut case_pair_firsts: Vec<[i32;4]> = vec![[0;4]; n];
-        let mut case_pair_seconds: Vec<[i32;4]> = vec![[0;4]; n];
-        if apply_case {
-            for i in 0..n { case_singles[i] = self.case_single_adjustment_full(f, gids[i].unwrap()); }
-            if n>1 {
-                for i in 0..n-1 {
-                    let (v1,v2) = self.case_pair_adjustment_full(f, gids[i].unwrap(), gids[i+1].unwrap());
-                    case_pair_firsts[i]=v1; case_pair_seconds[i+1]=v2;
+
+        const STACK_CAP: usize = 64;
+        let use_stack = n <= STACK_CAP;
+
+        if use_stack {
+            let mut singles: [[i32;4]; 64] = [[0;4]; 64];
+            let mut pair_firsts: [[i32;4]; 64] = [[0;4]; 64];
+            let mut pair_seconds: [[i32;4]; 64] = [[0;4]; 64];
+            for i in 0..n {
+                singles[i] = self.single_adjustment_full(f, gids[i].unwrap());
+            }
+            if n > 1 {
+                if f.pair_first_present_off != 0 {
+                    let d = self.data();
+                    let off = f.pair_first_present_off;
+                    let bitset_len = (f.num_glyphs + 7)/8;
+                    if off + bitset_len <= d.len() {
+                        for i in 0..n-1 {
+                            let g1 = gids[i].unwrap() as usize;
+                            if g1 >= f.num_glyphs { continue; }
+                            let byte_off = off + g1/8;
+                            if byte_off >= d.len() { continue; }
+                            if ((d[byte_off] >> (g1 % 8)) & 1) == 0 { continue; }
+                            let (v1,v2) = self.pair_adjustment_full(f, gids[i].unwrap(), gids[i+1].unwrap());
+                            pair_firsts[i] = v1;
+                            pair_seconds[i+1] = v2;
+                        }
+                    } else {
+                        for i in 0..n-1 {
+                            let (v1,v2) = self.pair_adjustment_full(f, gids[i].unwrap(), gids[i+1].unwrap());
+                            pair_firsts[i] = v1;
+                            pair_seconds[i+1] = v2;
+                        }
+                    }
+                } else {
+                    for i in 0..n-1 {
+                        let (v1,v2) = self.pair_adjustment_full(f, gids[i].unwrap(), gids[i+1].unwrap());
+                        pair_firsts[i] = v1;
+                        pair_seconds[i+1] = v2;
+                    }
                 }
             }
+            let mut case_singles: [[i32;4]; 64] = [[0;4]; 64];
+            let mut case_pair_firsts: [[i32;4]; 64] = [[0;4]; 64];
+            let mut case_pair_seconds: [[i32;4]; 64] = [[0;4]; 64];
+            if apply_case {
+                for i in 0..n { case_singles[i] = self.case_single_adjustment_full(f, gids[i].unwrap()); }
+                if n > 1 {
+                    for i in 0..n-1 {
+                        let (v1,v2) = self.case_pair_adjustment_full(f, gids[i].unwrap(), gids[i+1].unwrap());
+                        case_pair_firsts[i] = v1;
+                        case_pair_seconds[i+1] = v2;
+                    }
+                }
+            }
+            let mut out = Vec::with_capacity(n);
+            let mut cursor = 0.0f64;
+            for i in 0..n {
+                let gid = gids[i].unwrap() as usize;
+                let (adv, x0, x1, y0, y1) = self.glyph_metrics(f, gid)?;
+                let s = singles[i];
+                let pf = pair_firsts[i];
+                let ps = pair_seconds[i];
+                let cs = if apply_case { case_singles[i] } else { [0;4] };
+                let cpf = if apply_case { case_pair_firsts[i] } else { [0;4] };
+                let cps = if apply_case { case_pair_seconds[i] } else { [0;4] };
+                let x_pla = (s[0] + pf[0] + ps[0] + cs[0] + cpf[0] + cps[0]) as f64;
+                let y_pla = (s[1] + pf[1] + ps[1] + cs[1] + cpf[1] + cps[1]) as f64;
+                let x_adv_adj = (s[2] + pf[2] + ps[2] + cs[2] + cpf[2] + cps[2]) as f64;
+                let total_adv = adv + x_adv_adj;
+                let cx = cursor + x_pla + (x0 + x1)*0.5;
+                let cy = y_pla + (y0 + y1)*0.5;
+                let y_min_a = y_pla + y0 as f64;
+                let y_max_a = y_pla + y1 as f64;
+                out.push((cx,cy,y_min_a,y_max_a));
+                cursor += total_adv;
+            }
+            PRED_CACHE.with(|c| {
+                let mut m = c.borrow_mut();
+                if m.len() > 2048 { m.clear(); }
+                m.insert(cache_key, out.clone());
+            });
+            Some(out)
+        } else {
+            // heap path for long words (rare)
+            let mut singles: Vec<[i32;4]> = Vec::with_capacity(n);
+            for i in 0..n {
+                singles.push(self.single_adjustment_full(f, gids[i].unwrap()));
+            }
+            let mut pair_firsts: Vec<[i32;4]> = vec![[0;4]; n];
+            let mut pair_seconds: Vec<[i32;4]> = vec![[0;4]; n];
+            if n > 1 {
+                if f.pair_first_present_off != 0 {
+                    let d = self.data();
+                    let off = f.pair_first_present_off;
+                    let bitset_len = (f.num_glyphs + 7)/8;
+                    if off + bitset_len <= d.len() {
+                        for i in 0..n-1 {
+                            let g1 = gids[i].unwrap() as usize;
+                            if g1 >= f.num_glyphs { continue; }
+                            let byte_off = off + g1/8;
+                            if byte_off >= d.len() { continue; }
+                            if ((d[byte_off] >> (g1 % 8)) & 1) == 0 { continue; }
+                            let (v1,v2) = self.pair_adjustment_full(f, gids[i].unwrap(), gids[i+1].unwrap());
+                            pair_firsts[i] = v1;
+                            pair_seconds[i+1] = v2;
+                        }
+                    } else {
+                        for i in 0..n-1 {
+                            let (v1,v2) = self.pair_adjustment_full(f, gids[i].unwrap(), gids[i+1].unwrap());
+                            pair_firsts[i] = v1;
+                            pair_seconds[i+1] = v2;
+                        }
+                    }
+                } else {
+                    for i in 0..n-1 {
+                        let (v1,v2) = self.pair_adjustment_full(f, gids[i].unwrap(), gids[i+1].unwrap());
+                        pair_firsts[i] = v1;
+                        pair_seconds[i+1] = v2;
+                    }
+                }
+            }
+            let mut case_singles: Vec<[i32;4]> = Vec::new();
+            let mut case_pair_firsts: Vec<[i32;4]> = Vec::new();
+            let mut case_pair_seconds: Vec<[i32;4]> = Vec::new();
+            if apply_case {
+                case_singles = vec![[0;4]; n];
+                case_pair_firsts = vec![[0;4]; n];
+                case_pair_seconds = vec![[0;4]; n];
+                for i in 0..n { case_singles[i] = self.case_single_adjustment_full(f, gids[i].unwrap()); }
+                if n > 1 {
+                    for i in 0..n-1 {
+                        let (v1,v2) = self.case_pair_adjustment_full(f, gids[i].unwrap(), gids[i+1].unwrap());
+                        case_pair_firsts[i] = v1;
+                        case_pair_seconds[i+1] = v2;
+                    }
+                }
+            }
+            let mut out = Vec::with_capacity(n);
+            let mut cursor = 0.0f64;
+            for i in 0..n {
+                let gid = gids[i].unwrap() as usize;
+                let (adv, x0, x1, y0, y1) = self.glyph_metrics(f, gid)?;
+                let s = singles[i];
+                let pf = pair_firsts[i];
+                let ps = pair_seconds[i];
+                let cs = if apply_case { case_singles[i] } else { [0;4] };
+                let cpf = if apply_case { case_pair_firsts[i] } else { [0;4] };
+                let cps = if apply_case { case_pair_seconds[i] } else { [0;4] };
+                let x_pla = (s[0] + pf[0] + ps[0] + cs[0] + cpf[0] + cps[0]) as f64;
+                let y_pla = (s[1] + pf[1] + ps[1] + cs[1] + cpf[1] + cps[1]) as f64;
+                let x_adv_adj = (s[2] + pf[2] + ps[2] + cs[2] + cpf[2] + cps[2]) as f64;
+                let total_adv = adv + x_adv_adj;
+                let cx = cursor + x_pla + (x0 + x1)*0.5;
+                let cy = y_pla + (y0 + y1)*0.5;
+                let y_min_a = y_pla + y0 as f64;
+                let y_max_a = y_pla + y1 as f64;
+                out.push((cx,cy,y_min_a,y_max_a));
+                cursor += total_adv;
+            }
+            PRED_CACHE.with(|c| {
+                let mut m = c.borrow_mut();
+                if m.len() > 2048 { m.clear(); }
+                m.insert(cache_key, out.clone());
+            });
+            Some(out)
         }
-
-        let mut out = Vec::with_capacity(n);
-        let mut cursor = 0.0f64;
-        for i in 0..n {
-            let gid = gids[i].unwrap() as usize;
-            let (adv, x0, x1, y0, y1) = self.glyph_metrics(f, gid)?;
-            let s = singles[i];
-            let pf = pair_firsts[i];
-            let ps = pair_seconds[i];
-            let cs = case_singles[i];
-            let cpf = case_pair_firsts[i];
-            let cps = case_pair_seconds[i];
-            let x_pla = (s[0] + pf[0] + ps[0] + cs[0] + cpf[0] + cps[0]) as f64;
-            let y_pla = (s[1] + pf[1] + ps[1] + cs[1] + cpf[1] + cps[1]) as f64;
-            let x_adv_adj = (s[2] + pf[2] + ps[2] + cs[2] + cpf[2] + cps[2]) as f64;
-            let total_adv = adv + x_adv_adj;
-            let cx = cursor + x_pla + (x0 + x1)*0.5;
-            let cy = y_pla + (y0 + y1)*0.5;
-            let y_min_a = y_pla + y0 as f64;
-            let y_max_a = y_pla + y1 as f64;
-            out.push((cx,cy,y_min_a,y_max_a));
-            cursor += total_adv;
-        }
-        PRED_CACHE.with(|c| {
-            let mut m = c.borrow_mut();
-            if m.len() > 2048 { m.clear(); }
-            m.insert(cache_key, out.clone());
-        });
-        Some(out)
     }
 
     // reconstruct OwnedFont from mmap index for incremental reuse
@@ -2036,6 +2153,45 @@ impl GeometryCache {
                             for v in map { w.write_all(&v.to_le_bytes())?; }
                         }
                     }
+                    // v21 single tables O(1) coverage maps
+                    for tbl in &of.single_tables {
+                        let is_u8 = tbl.coverage.len() < 255;
+                        w.write_all(&[if is_u8 {0u8} else {1u8}])?;
+                        if is_u8 {
+                            let mut map = vec![0xFFu8; ng];
+                            for (i, &gid) in tbl.coverage.iter().enumerate() {
+                                let g = gid as usize;
+                                if g < ng { map[g] = i as u8; }
+                            }
+                            w.write_all(&map)?;
+                        } else {
+                            let mut map = vec![0xFFFFu16; ng];
+                            for (i, &gid) in tbl.coverage.iter().enumerate() {
+                                let g = gid as usize;
+                                if g < ng { map[g] = i as u16; }
+                            }
+                            for v in map { w.write_all(&v.to_le_bytes())?; }
+                        }
+                    }
+                    for tbl in &of.case_single_tables {
+                        let is_u8 = tbl.coverage.len() < 255;
+                        w.write_all(&[if is_u8 {0u8} else {1u8}])?;
+                        if is_u8 {
+                            let mut map = vec![0xFFu8; ng];
+                            for (i, &gid) in tbl.coverage.iter().enumerate() {
+                                let g = gid as usize;
+                                if g < ng { map[g] = i as u8; }
+                            }
+                            w.write_all(&map)?;
+                        } else {
+                            let mut map = vec![0xFFFFu16; ng];
+                            for (i, &gid) in tbl.coverage.iter().enumerate() {
+                                let g = gid as usize;
+                                if g < ng { map[g] = i as u16; }
+                            }
+                            for v in map { w.write_all(&v.to_le_bytes())?; }
+                        }
+                    }
                     // F2: coverage + class1 + class2 with flags byte
                     for tbl in &of.format2_tables {
                         let cov_u8 = tbl.coverage.len() < 255;
@@ -2285,7 +2441,7 @@ impl GeometryCache {
                 let bytes = cnt*sz*2;
                 if pos+bytes > data.len() { return Err("trunc single values".into()); }
                 pos+=bytes;
-                single_tables.push(SingleIndex { coverage_off: cov_off, coverage_len: cov_len, value_format: vf, is_single, values_off, stride: sz, lookup_id, subtable_pos });
+                single_tables.push(SingleIndex { coverage_off: cov_off, coverage_len: cov_len, value_format: vf, is_single, values_off, stride: sz, lookup_id, subtable_pos, coverage_map_off: 0, coverage_map_is_u8: false });
             }
 
             let mut f1_tables = Vec::with_capacity(n_f1);
@@ -2403,7 +2559,7 @@ impl GeometryCache {
                 let bytes = cnt*sz*2;
                 if pos+bytes > data.len() { return Err("trunc case single values".into()); }
                 pos+=bytes;
-                case_single_tables.push(SingleIndex { coverage_off: cov_off, coverage_len: cov_len, value_format: vf, is_single, values_off, stride: sz, lookup_id, subtable_pos });
+                case_single_tables.push(SingleIndex { coverage_off: cov_off, coverage_len: cov_len, value_format: vf, is_single, values_off, stride: sz, lookup_id, subtable_pos, coverage_map_off: 0, coverage_map_is_u8: false });
             }
             let mut case_f1_tables = Vec::with_capacity(n_case_f1);
             for _ in 0..n_case_f1 {
@@ -2570,7 +2726,7 @@ impl GeometryCache {
                 pos += bitset_len;
                 off
             };
-            // v20: O(1) maps compressed
+            // v20-v21: O(1) maps compressed
             {
                 for tbl in &mut f1_tables {
                     if pos + 1 > data.len() { return Err("trunc v20 f1 map flag".into()); }
@@ -2579,6 +2735,26 @@ impl GeometryCache {
                     tbl.coverage_map_is_u8 = is_u8;
                     let map_bytes = if is_u8 { num_glyphs } else { num_glyphs*2 };
                     if pos + map_bytes > data.len() { return Err("trunc v20 f1 coverage_map".into()); }
+                    tbl.coverage_map_off = pos;
+                    pos += map_bytes;
+                }
+                for tbl in &mut single_tables {
+                    if pos + 1 > data.len() { return Err("trunc v21 single map flag".into()); }
+                    let flag = data[pos]; pos+=1;
+                    let is_u8 = flag == 0;
+                    tbl.coverage_map_is_u8 = is_u8;
+                    let map_bytes = if is_u8 { num_glyphs } else { num_glyphs*2 };
+                    if pos + map_bytes > data.len() { return Err("trunc v21 single coverage_map".into()); }
+                    tbl.coverage_map_off = pos;
+                    pos += map_bytes;
+                }
+                for tbl in &mut case_single_tables {
+                    if pos + 1 > data.len() { return Err("trunc v21 case_single map flag".into()); }
+                    let flag = data[pos]; pos+=1;
+                    let is_u8 = flag == 0;
+                    tbl.coverage_map_is_u8 = is_u8;
+                    let map_bytes = if is_u8 { num_glyphs } else { num_glyphs*2 };
+                    if pos + map_bytes > data.len() { return Err("trunc v21 case_single coverage_map".into()); }
                     tbl.coverage_map_off = pos;
                     pos += map_bytes;
                 }
