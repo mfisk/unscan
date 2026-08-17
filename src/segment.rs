@@ -12,9 +12,10 @@ use std::cell::RefCell;
 
 use crate::features::{audit_all_chars_enabled, contrast_normalize_char, is_supported, normalize_to_ink_bounds, NORM_H};
 
-// Thread-local reuse for candidate_seams forward DP buffers (task B)
+// Thread-local reuse for candidate_seams forward+reverse DP buffers (perf wins)
 thread_local! {
-    static CANDIDATE_SEAMS_FWD: RefCell<(Vec<f32>, Vec<u32>, Vec<f32>, Vec<f32>, Vec<f32>)> = RefCell::new((Vec::new(), Vec::new(), Vec::new(), Vec::new(), Vec::new()));
+    static CANDIDATE_SEAMS_FWD: RefCell<(Vec<f32>, Vec<u32>, Vec<f32>, Vec<f32>, Vec<f32>, Vec<f32>)> = RefCell::new((Vec::new(), Vec::new(), Vec::new(), Vec::new(), Vec::new(), Vec::new()));
+    static CANDIDATE_SEAMS_REV: RefCell<(Vec<f32>, Vec<u32>, Vec<f32>, Vec<f32>, Vec<f32>, Vec<f32>)> = RefCell::new((Vec::new(), Vec::new(), Vec::new(), Vec::new(), Vec::new(), Vec::new()));
 }
 use crate::verify::WordPlacement;
 
@@ -432,19 +433,20 @@ fn segment_characters_inner(
         };
 
         // Word-level max ink (p95 of raw darkness): used by delta_ink_score
-        // to scale the entry penalty proportionally.
+        // to scale the entry penalty proportionally. select_nth avoids full sort O(n log n).
         let mut ink_values: Vec<f32> = Vec::with_capacity(n);
         for &d in &darkness {
             if d > 0.0 {
                 ink_values.push(d);
             }
         }
-        ink_values.sort_by(|a, b| a.partial_cmp(b).unwrap());
         let max_ink = if ink_values.is_empty() {
             255.0
         } else {
             let p95_idx = (ink_values.len() as f64 * 0.95) as usize;
             let p95_idx = p95_idx.min(ink_values.len() - 1);
+            // select_nth_unstable_by is O(n) vs sort O(n log n) – ~22k pixels per word
+            ink_values.select_nth_unstable_by(p95_idx, |a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
             ink_values[p95_idx].max(1.0) // avoid division by zero
         };
 
@@ -1018,11 +1020,11 @@ fn candidate_seams(
     // down to 1, precomputes cur row darkness/ink once per cell.
     // Identical costs to prior 5-pass version: same INFINITY handling,
     // same 0.01/0.02 horizontal penalties, same pass-through ordering.
-    // Arena reuse: thread_local buffers to avoid 5 allocs per call.
+    // Arena reuse: thread_local buffers to avoid allocs per call. 6 buffers now include prev_inks.
     let _p = seam_params(); // hoist OnceLock load
     let n_cells = h_us * seg_w;
     // Take reused buffers from thread-local (capacity preserved across calls)
-    let (mut cost_fwd, mut pred_fwd, mut prev_darks, mut cur_darks, mut cur_inks) =
+    let (mut cost_fwd, mut pred_fwd, mut prev_darks, mut cur_darks, mut cur_inks, mut prev_inks) =
         CANDIDATE_SEAMS_FWD.with(|c| {
             let mut s = c.borrow_mut();
             (
@@ -1031,6 +1033,7 @@ fn candidate_seams(
                 std::mem::take(&mut s.2),
                 std::mem::take(&mut s.3),
                 std::mem::take(&mut s.4),
+                std::mem::take(&mut s.5),
             )
         });
     cost_fwd.resize(n_cells, 0.0f32);
@@ -1040,11 +1043,13 @@ fn candidate_seams(
     prev_darks.resize(seg_w, 0.0f32);
     cur_darks.resize(seg_w, 0.0f32);
     cur_inks.resize(seg_w, 0.0f32);
+    prev_inks.resize(seg_w, 0.0f32);
     // Row 0 cached for reuse as prev in r=1
     for c in 0..seg_w { prev_darks[c] = masked_energy(0, c); }
+    for c in 0..seg_w { prev_inks[c] = ink_score(prev_darks[c], 0, row_ink); }
     for c in 0..seg_w {
         let dark0 = prev_darks[c];
-        cost_fwd[c] = ink_score(dark0, 0, row_ink)
+        cost_fwd[c] = prev_inks[c]
             + delta_ink_score(dark0, 0.0, 0, 0, row_ink, max_ink);
         pred_fwd[c] = c as u32;
     }
@@ -1057,7 +1062,7 @@ fn candidate_seams(
         }
         let row_off = r * seg_w;
         let prev_off = (r - 1) * seg_w;
-        // Single fused predecessor evaluation
+        // Single fused predecessor evaluation – prev_inks reuse avoids 5-6 ink_score calls per cell
         for c in 0..seg_w {
             let cur_dark = cur_darks[c];
             // masked columns remain INF — keep downstream INF propagation same as before
@@ -1076,7 +1081,7 @@ fn candidate_seams(
             if c >= 1 {
                 let pd_m1 = prev_darks[c - 1];
                 let pass_dark = prev_dark_c;
-                let pass_ink = ink_score(pass_dark, r - 1, row_ink);
+                let pass_ink = prev_inks[c]; // reuse – same as ink_score(pass_dark, r-1)
                 let pass_entry = delta_ink_score(pass_dark, pd_m1, r - 1, r - 1, row_ink, max_ink);
                 let cur_entry = delta_ink_score(cur_dark, pass_dark, r, r - 1, row_ink, max_ink);
                 let via = cost_fwd[prev_off + c - 1] + pass_ink + pass_entry + cur_ink + cur_entry + 0.01;
@@ -1086,7 +1091,7 @@ fn candidate_seams(
             if c + 1 < seg_w {
                 let pd_p1 = prev_darks[c + 1];
                 let pass_dark = prev_dark_c;
-                let pass_ink = ink_score(pass_dark, r - 1, row_ink);
+                let pass_ink = prev_inks[c];
                 let pass_entry = delta_ink_score(pass_dark, pd_p1, r - 1, r - 1, row_ink, max_ink);
                 let cur_entry = delta_ink_score(cur_dark, pass_dark, r, r - 1, row_ink, max_ink);
                 let via = cost_fwd[prev_off + c + 1] + pass_ink + pass_entry + cur_ink + cur_entry + 0.01;
@@ -1095,10 +1100,10 @@ fn candidate_seams(
             // double -2 : (r-1,c-2) via c-1,c
             if c >= 2 {
                 let pd_m2 = prev_darks[c - 2];
+                let p1_ink = prev_inks[c - 1];
+                let p2_ink = prev_inks[c];
                 let p1d = prev_darks[c - 1];
                 let p2d = prev_dark_c;
-                let p1_ink = ink_score(p1d, r - 1, row_ink);
-                let p2_ink = ink_score(p2d, r - 1, row_ink);
                 let p1_entry = delta_ink_score(p1d, pd_m2, r - 1, r - 1, row_ink, max_ink);
                 let p2_entry = delta_ink_score(p2d, p1d, r - 1, r - 1, row_ink, max_ink);
                 let cur_entry = delta_ink_score(cur_dark, p2d, r, r - 1, row_ink, max_ink);
@@ -1108,10 +1113,10 @@ fn candidate_seams(
             // double +2 : (r-1,c+2) via c+1,c
             if c + 2 < seg_w {
                 let pd_p2 = prev_darks[c + 2];
+                let p1_ink = prev_inks[c + 1];
+                let p2_ink = prev_inks[c];
                 let p1d = prev_darks[c + 1];
                 let p2d = prev_dark_c;
-                let p1_ink = ink_score(p1d, r - 1, row_ink);
-                let p2_ink = ink_score(p2d, r - 1, row_ink);
                 let p1_entry = delta_ink_score(p1d, pd_p2, r - 1, r - 1, row_ink, max_ink);
                 let p2_entry = delta_ink_score(p2d, p1d, r - 1, r - 1, row_ink, max_ink);
                 let cur_entry = delta_ink_score(cur_dark, p2d, r, r - 1, row_ink, max_ink);
@@ -1122,26 +1127,39 @@ fn candidate_seams(
             pred_fwd[row_off + c] = best_pred as u32;
         }
         std::mem::swap(&mut prev_darks, &mut cur_darks);
+        std::mem::swap(&mut prev_inks, &mut cur_inks);
     }
 
-    // Reverse DP fused single pass — symmetric to forward
+    // Reverse DP fused single pass — symmetric to forward, now reused via thread_local
     let last_r = (h - 1) as usize;
-    let mut cost_rev = vec![0.0f32; n_cells];
-    let mut pred_rev = vec![0u32; n_cells];
+    let (mut cost_rev, mut pred_rev, mut next_darks, mut cur_darks_rev, mut cur_inks_rev, mut next_inks) =
+        CANDIDATE_SEAMS_REV.with(|c| {
+            let mut s = c.borrow_mut();
+            (
+                std::mem::take(&mut s.0),
+                std::mem::take(&mut s.1),
+                std::mem::take(&mut s.2),
+                std::mem::take(&mut s.3),
+                std::mem::take(&mut s.4),
+                std::mem::take(&mut s.5),
+            )
+        });
+    cost_rev.resize(n_cells, 0.0f32);
+    pred_rev.resize(n_cells, 0u32);
+    next_darks.resize(seg_w, 0.0f32);
+    cur_darks_rev.resize(seg_w, 0.0f32);
+    cur_inks_rev.resize(seg_w, 0.0f32);
+    next_inks.resize(seg_w, 0.0f32);
+    for c in 0..seg_w { next_darks[c] = masked_energy(last_r, c); }
     let last_off = last_r * seg_w;
-    let mut next_darks = Vec::with_capacity(seg_w);
-    for c in 0..seg_w { next_darks.push(masked_energy(last_r, c)); }
     for c in 0..seg_w {
         let dark_last = next_darks[c];
         cost_rev[last_off + c] = ink_score(dark_last, last_r, row_ink)
             + delta_ink_score(dark_last, 0.0, last_r, last_r, row_ink, max_ink);
         pred_rev[last_off + c] = (last_off + c) as u32;
     }
-    let mut cur_darks_rev = vec![0.0f32; seg_w];
-    let mut cur_inks_rev = vec![0.0f32; seg_w];
     // next row inks cached for pass costs
-    let mut next_inks: Vec<f32> = next_darks.iter().enumerate().map(|(r2,_)| ink_score(next_darks[r2], last_r, row_ink)).collect(); // placeholder overwritten each iter
-    // Actually rebuild each iteration, start with last row values
+    // rebuild each iteration, start with last row values
     for c in 0..seg_w { next_inks[c] = ink_score(next_darks[c], last_r, row_ink); }
     for r in (0..last_r).rev() {
         for c in 0..seg_w {
@@ -1269,13 +1287,25 @@ fn candidate_seams(
     // Return intermediate scratch buffers to thread-local for reuse (keep max capacity)
     let cost_fwd_cap = cost_fwd.capacity();
     let pred_fwd_cap = pred_fwd.capacity();
+    let cost_rev_cap = cost_rev.capacity();
+    let pred_rev_cap = pred_rev.capacity();
     CANDIDATE_SEAMS_FWD.with(|c| {
         let mut s = c.borrow_mut();
         s.2 = prev_darks;
         s.3 = cur_darks;
         s.4 = cur_inks;
+        s.5 = prev_inks;
         s.0 = Vec::with_capacity(cost_fwd_cap);
         s.1 = Vec::with_capacity(pred_fwd_cap);
+    });
+    CANDIDATE_SEAMS_REV.with(|c| {
+        let mut s = c.borrow_mut();
+        s.2 = next_darks;
+        s.3 = cur_darks_rev;
+        s.4 = cur_inks_rev;
+        s.5 = next_inks;
+        s.0 = Vec::with_capacity(cost_rev_cap);
+        s.1 = Vec::with_capacity(pred_rev_cap);
     });
 
     let dp = SeamDp { pred_fwd, pred_rev, cost_fwd, cost_rev, seg_start, seg_w, h };
