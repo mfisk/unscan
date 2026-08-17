@@ -48,7 +48,7 @@ const BGEO_MAGIC: &[u8; 4] = b"BGEO";
 // v16 adds: pair_groups, case_pair_groups, single_groups, case_single_groups (BTree-free fast path)
 // plus sorted ClassDef Format2 ranges for binary search in class_get.
 // v17 adds: pair_first_present blob per font (num_glyphs bytes) built from Format1/Format2 coverage at cache build time.
-const BGEO_VERSION: u32 = 18;
+const BGEO_VERSION: u32 = 20;
 
 // ---------- BE helpers for OT parsing ----------
 #[inline]
@@ -151,12 +151,12 @@ fn file_hash_bytes(data: &[u8]) -> u64 {
 }
 
 // ---------- Owned structures (build phase only) ----------
-#[derive(Copy, Clone, Debug)]
+#[derive(Copy, Clone, Debug, PartialEq)]
 struct GlyphMetricsOwned { advance: f64, x_min: f64, x_max: f64, y_min: f64, y_max: f64 }
 
 type Val4 = [i16;4]; // [xPla, yPla, xAdv, yAdv] in order 0x1,0x2,0x4,0x8
 
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, PartialEq)]
 struct SingleTableOwned {
     coverage: Vec<u16>,
     value_format: u16, // masked 0xF
@@ -166,7 +166,7 @@ struct SingleTableOwned {
     subtable_pos: u16,
 }
 
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, PartialEq)]
 struct Format1TableOwned {
     coverage: Vec<u16>,
     val_fmt1: u16, // masked
@@ -176,13 +176,13 @@ struct Format1TableOwned {
     subtable_pos: u16,
 }
 
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, PartialEq)]
 enum ClassDefOwned {
     Format1 { start: u16, classes: Vec<u16> },
     Format2 { ranges: Vec<(u16,u16,u16)> },
 }
 
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, PartialEq)]
 struct Format2TableOwned {
     coverage: Vec<u16>,
     class_def1: ClassDefOwned,
@@ -196,6 +196,7 @@ struct Format2TableOwned {
     subtable_pos: u16,
 }
 
+#[derive(Clone, Debug, PartialEq)]
 struct OwnedFont {
     file_hash: u64,
     units_per_em: f64,
@@ -211,7 +212,7 @@ struct OwnedFont {
 }
 
 // ---------- Mmap index (runtime) ----------
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 struct SingleIndex {
     coverage_off: usize,
     coverage_len: usize,
@@ -223,10 +224,10 @@ struct SingleIndex {
     subtable_pos: u16,
 }
 
-#[derive(Debug)]
-struct PairSetIndex { pairs_off: usize, pair_count: usize }
+#[derive(Debug, Clone)]
+struct PairSetIndex { pairs_off: usize, pair_count: usize, second_map_off: usize, second_map_len: usize }
 
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 struct Format1Index {
     coverage_off: usize,
     coverage_len: usize,
@@ -238,15 +239,16 @@ struct Format1Index {
     lookup_id: u16,
     subtable_pos: u16,
     coverage_map_off: usize,
+    coverage_map_is_u8: bool,
 }
 
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 enum ClassDefIndex {
     Format1 { start: u16, count: usize, classes_off: usize },
     Format2 { count: usize, ranges_off: usize },
 }
 
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 struct Format2Index {
     coverage_off: usize,
     coverage_len: usize,
@@ -262,28 +264,31 @@ struct Format2Index {
     lookup_id: u16,
     subtable_pos: u16,
     coverage_map_off: usize,
+    coverage_map_is_u8: bool,
     class1_map_off: usize,
+    class1_map_is_u8: bool,
     class2_map_off: usize,
+    class2_map_is_u8: bool,
 }
 
 // v16 pre-grouped lookup structures — zero-alloc fast path for pair/single adjustment
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 struct PairEntryIndex {
     pos: u16,
     is_f2: bool,
     idx: u16, // index into format1_tables or format2_tables
 }
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 struct PairGroupIndex {
     lookup_id: u16,
     entries: Vec<PairEntryIndex>, // sorted by pos
 }
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 struct SingleEntryIndex {
     pos: u16,
     idx: u16, // index into single_tables
 }
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 struct SingleGroupIndex {
     lookup_id: u16,
     entries: Vec<SingleEntryIndex>, // sorted by pos
@@ -295,7 +300,7 @@ enum PairSubtableRef<'a> {
     F2(&'a Format2Index),
 }
 
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 struct FontMmapIndex {
     file_hash: u64,
     upem: f64,
@@ -432,22 +437,35 @@ impl GeometryCache {
     }
 
     #[inline]
-    fn coverage_index_fast(&self, map_off: usize, gid: u16) -> Option<usize> {
+    fn coverage_index_fast(&self, map_off: usize, is_u8: bool, gid: u16) -> Option<usize> {
         if map_off == 0 { return None; }
         let d = self.data();
-        let off = map_off + gid as usize * 2;
-        if off + 2 > d.len() { return None; }
-        let v = le_u16_at(d, off);
-        if v == 0xFFFF { None } else { Some(v as usize) }
+        if is_u8 {
+            let off = map_off + gid as usize;
+            if off >= d.len() { return None; }
+            let v = d[off];
+            if v == 0xFF { None } else { Some(v as usize) }
+        } else {
+            let off = map_off + gid as usize * 2;
+            if off + 2 > d.len() { return None; }
+            let v = le_u16_at(d, off);
+            if v == 0xFFFF { None } else { Some(v as usize) }
+        }
     }
 
     #[inline]
-    fn class_get_fast(&self, map_off: usize, gid: u16) -> Option<usize> {
+    fn class_get_fast(&self, map_off: usize, is_u8: bool, gid: u16) -> Option<usize> {
         if map_off == 0 { return None; }
         let d = self.data();
-        let off = map_off + gid as usize * 2;
-        if off + 2 > d.len() { return None; }
-        Some(le_u16_at(d, off) as usize)
+        if is_u8 {
+            let off = map_off + gid as usize;
+            if off >= d.len() { return None; }
+            Some(d[off] as usize)
+        } else {
+            let off = map_off + gid as usize * 2;
+            if off + 2 > d.len() { return None; }
+            Some(le_u16_at(d, off) as usize)
+        }
     }
 
 
@@ -520,8 +538,8 @@ impl GeometryCache {
             if g1 >= f.num_glyphs {
                 return ([0i32;4],[0i32;4]);
             }
-            let off = f.pair_first_present_off + g1;
-            if off < d.len() && d[off]==0 {
+            let byte_off = f.pair_first_present_off + g1/8;
+            if byte_off < d.len() && ((d[byte_off] >> (g1%8)) & 1) == 0 {
                 return ([0i32;4],[0i32;4]);
             }
         }
@@ -544,7 +562,7 @@ impl GeometryCache {
                     match cand {
                         PairSubtableRef::F1(tbl) => {
                             let cov_idx = if tbl.coverage_map_off != 0 {
-                        match self.coverage_index_fast(tbl.coverage_map_off, gid1) { Some(i)=>i, None=>continue }
+                        match self.coverage_index_fast(tbl.coverage_map_off, tbl.coverage_map_is_u8, gid1) { Some(i)=>i, None=>continue }
                     } else {
                         match self.coverage_contains(tbl.coverage_off, tbl.coverage_len, gid1) { Some(i)=>i, None=>continue }
                     };
@@ -574,10 +592,10 @@ impl GeometryCache {
                         }
                         PairSubtableRef::F2(tbl) => {
                             if tbl.coverage_map_off != 0 {
-                                if self.coverage_index_fast(tbl.coverage_map_off, gid1).is_none() { continue; }
+                                if self.coverage_index_fast(tbl.coverage_map_off, tbl.coverage_map_is_u8, gid1).is_none() { continue; }
                             } else if self.coverage_contains(tbl.coverage_off, tbl.coverage_len, gid1).is_none() { continue; }
-                            let c1 = if tbl.class1_map_off != 0 { self.class_get_fast(tbl.class1_map_off, gid1).unwrap_or(0) } else { self.class_get(&tbl.class1_def, gid1) };
-                            let c2 = if tbl.class2_map_off != 0 { self.class_get_fast(tbl.class2_map_off, gid2).unwrap_or(0) } else { self.class_get(&tbl.class2_def, gid2) };
+                            let c1 = if tbl.class1_map_off != 0 { self.class_get_fast(tbl.class1_map_off, tbl.class1_map_is_u8, gid1).unwrap_or(0) } else { self.class_get(&tbl.class1_def, gid1) };
+                            let c2 = if tbl.class2_map_off != 0 { self.class_get_fast(tbl.class2_map_off, tbl.class2_map_is_u8, gid2).unwrap_or(0) } else { self.class_get(&tbl.class2_def, gid2) };
                             if c1 >= tbl.class1_count || c2 >= tbl.class2_count { continue; }
                             let idx = c1 * tbl.class2_count + c2;
                             let rec_size = (tbl.sz1 + tbl.sz2)*2;
@@ -608,10 +626,10 @@ impl GeometryCache {
                 if entry.is_f2 {
                     let tbl = &f.format2_tables[entry.idx as usize];
                     if tbl.coverage_map_off != 0 {
-                        if self.coverage_index_fast(tbl.coverage_map_off, gid1).is_none() { continue; }
+                        if self.coverage_index_fast(tbl.coverage_map_off, tbl.coverage_map_is_u8, gid1).is_none() { continue; }
                     } else if self.coverage_contains(tbl.coverage_off, tbl.coverage_len, gid1).is_none() { continue; }
-                    let c1 = if tbl.class1_map_off != 0 { self.class_get_fast(tbl.class1_map_off, gid1).unwrap_or(0) } else { self.class_get(&tbl.class1_def, gid1) };
-                    let c2 = if tbl.class2_map_off != 0 { self.class_get_fast(tbl.class2_map_off, gid2).unwrap_or(0) } else { self.class_get(&tbl.class2_def, gid2) };
+                    let c1 = if tbl.class1_map_off != 0 { self.class_get_fast(tbl.class1_map_off, tbl.class1_map_is_u8, gid1).unwrap_or(0) } else { self.class_get(&tbl.class1_def, gid1) };
+                    let c2 = if tbl.class2_map_off != 0 { self.class_get_fast(tbl.class2_map_off, tbl.class2_map_is_u8, gid2).unwrap_or(0) } else { self.class_get(&tbl.class2_def, gid2) };
                     if c1 >= tbl.class1_count || c2 >= tbl.class2_count { continue; }
                     let idx = c1 * tbl.class2_count + c2;
                     let rec_size = (tbl.sz1 + tbl.sz2)*2;
@@ -632,14 +650,29 @@ impl GeometryCache {
                 } else {
                     let tbl = &f.format1_tables[entry.idx as usize];
                     let cov_idx = if tbl.coverage_map_off != 0 {
-                        match self.coverage_index_fast(tbl.coverage_map_off, gid1) { Some(i)=>i, None=>continue }
+                        match self.coverage_index_fast(tbl.coverage_map_off, tbl.coverage_map_is_u8, gid1) { Some(i)=>i, None=>continue }
                     } else {
                         match self.coverage_contains(tbl.coverage_off, tbl.coverage_len, gid1) { Some(i)=>i, None=>continue }
                     };
                     let ps = &tbl.pair_sets[cov_idx];
                     let rec_size = 2 + tbl.sz1*2 + tbl.sz2*2;
                     let mut found_off: Option<usize> = None;
-                    if ps.pair_count <= 8 {
+                    if ps.second_map_len != 0 && ps.second_map_off != 0 {
+                        let map_len = ps.second_map_len;
+                        let map_off = ps.second_map_off;
+                        let mut h = (gid2 as usize) % map_len;
+                        for _ in 0..map_len {
+                            let b_off = map_off + h*2;
+                            if b_off+2 > d.len() { break; }
+                            let bucket = le_u16_at(d, b_off);
+                            if bucket == 0xFFFF { break; }
+                            let off = ps.pairs_off + (bucket as usize)*rec_size;
+                            if off+2 > d.len() { break; }
+                            let sg = le_u16_at(d, off);
+                            if sg == gid2 { found_off = Some(off); break; }
+                            h = (h+1) % map_len;
+                        }
+                    } else if ps.pair_count <= 8 {
                         // linear scan is faster for tiny sets than binary search (fewer branches, better prefetch)
                         for i in 0..ps.pair_count {
                             let off = ps.pairs_off + i*rec_size;
@@ -789,7 +822,7 @@ impl GeometryCache {
                     match cand {
                         PairSubtableRef::F1(tbl) => {
                             let cov_idx = if tbl.coverage_map_off != 0 {
-                        match self.coverage_index_fast(tbl.coverage_map_off, gid1) { Some(i)=>i, None=>continue }
+                        match self.coverage_index_fast(tbl.coverage_map_off, tbl.coverage_map_is_u8, gid1) { Some(i)=>i, None=>continue }
                     } else {
                         match self.coverage_contains(tbl.coverage_off, tbl.coverage_len, gid1) { Some(i)=>i, None=>continue }
                     };
@@ -819,10 +852,10 @@ impl GeometryCache {
                         }
                         PairSubtableRef::F2(tbl) => {
                             if tbl.coverage_map_off != 0 {
-                                if self.coverage_index_fast(tbl.coverage_map_off, gid1).is_none() { continue; }
+                                if self.coverage_index_fast(tbl.coverage_map_off, tbl.coverage_map_is_u8, gid1).is_none() { continue; }
                             } else if self.coverage_contains(tbl.coverage_off, tbl.coverage_len, gid1).is_none() { continue; }
-                            let c1 = if tbl.class1_map_off != 0 { self.class_get_fast(tbl.class1_map_off, gid1).unwrap_or(0) } else { self.class_get(&tbl.class1_def, gid1) };
-                            let c2 = if tbl.class2_map_off != 0 { self.class_get_fast(tbl.class2_map_off, gid2).unwrap_or(0) } else { self.class_get(&tbl.class2_def, gid2) };
+                            let c1 = if tbl.class1_map_off != 0 { self.class_get_fast(tbl.class1_map_off, tbl.class1_map_is_u8, gid1).unwrap_or(0) } else { self.class_get(&tbl.class1_def, gid1) };
+                            let c2 = if tbl.class2_map_off != 0 { self.class_get_fast(tbl.class2_map_off, tbl.class2_map_is_u8, gid2).unwrap_or(0) } else { self.class_get(&tbl.class2_def, gid2) };
                             if c1 >= tbl.class1_count || c2 >= tbl.class2_count { continue; }
                             let idx = c1 * tbl.class2_count + c2;
                             let rec_size = (tbl.sz1 + tbl.sz2)*2;
@@ -851,10 +884,10 @@ impl GeometryCache {
                 if entry.is_f2 {
                     let tbl = &f.case_format2_tables[entry.idx as usize];
                     if tbl.coverage_map_off != 0 {
-                        if self.coverage_index_fast(tbl.coverage_map_off, gid1).is_none() { continue; }
+                        if self.coverage_index_fast(tbl.coverage_map_off, tbl.coverage_map_is_u8, gid1).is_none() { continue; }
                     } else if self.coverage_contains(tbl.coverage_off, tbl.coverage_len, gid1).is_none() { continue; }
-                    let c1 = if tbl.class1_map_off != 0 { self.class_get_fast(tbl.class1_map_off, gid1).unwrap_or(0) } else { self.class_get(&tbl.class1_def, gid1) };
-                    let c2 = if tbl.class2_map_off != 0 { self.class_get_fast(tbl.class2_map_off, gid2).unwrap_or(0) } else { self.class_get(&tbl.class2_def, gid2) };
+                    let c1 = if tbl.class1_map_off != 0 { self.class_get_fast(tbl.class1_map_off, tbl.class1_map_is_u8, gid1).unwrap_or(0) } else { self.class_get(&tbl.class1_def, gid1) };
+                    let c2 = if tbl.class2_map_off != 0 { self.class_get_fast(tbl.class2_map_off, tbl.class2_map_is_u8, gid2).unwrap_or(0) } else { self.class_get(&tbl.class2_def, gid2) };
                     if c1 >= tbl.class1_count || c2 >= tbl.class2_count { continue; }
                     let idx = c1 * tbl.class2_count + c2;
                     let rec_size = (tbl.sz1 + tbl.sz2)*2;
@@ -875,14 +908,28 @@ impl GeometryCache {
                 } else {
                     let tbl = &f.case_format1_tables[entry.idx as usize];
                     let cov_idx = if tbl.coverage_map_off != 0 {
-                        match self.coverage_index_fast(tbl.coverage_map_off, gid1) { Some(i)=>i, None=>continue }
+                        match self.coverage_index_fast(tbl.coverage_map_off, tbl.coverage_map_is_u8, gid1) { Some(i)=>i, None=>continue }
                     } else {
                         match self.coverage_contains(tbl.coverage_off, tbl.coverage_len, gid1) { Some(i)=>i, None=>continue }
                     };
                     let ps = &tbl.pair_sets[cov_idx];
                     let rec_size = 2 + tbl.sz1*2 + tbl.sz2*2;
                     let mut found_off: Option<usize> = None;
-                    if ps.pair_count <= 8 {
+                    if ps.second_map_len != 0 && ps.second_map_off != 0 {
+                        let map_len = ps.second_map_len;
+                        let map_off = ps.second_map_off;
+                        let mut h = (gid2 as usize) % map_len;
+                        for _ in 0..map_len {
+                            let b_off = map_off + h*2;
+                            if b_off+2 > d.len() { break; }
+                            let bucket = le_u16_at(d, b_off);
+                            if bucket == 0xFFFF { break; }
+                            let off = ps.pairs_off + (bucket as usize)*rec_size;
+                            if off+2 > d.len() { break; }
+                            if le_u16_at(d, off) == gid2 { found_off = Some(off); break; }
+                            h = (h+1) % map_len;
+                        }
+                    } else if ps.pair_count <= 8 {
                         for i in 0..ps.pair_count {
                             let off = ps.pairs_off + i*rec_size;
                             if off+2 > d.len() { break; }
@@ -955,14 +1002,44 @@ impl GeometryCache {
             return Some(empty);
         }
 
+        // ---- cheap early: pair_first_present word-level hoist (O(1) per gid) ----
+        // Build skip flags for pair lookups: if first-present byte ==0, font has no GPOS
+        // pairs starting with this gid, so pair_adjustment will be zero without table walks.
+        let mut skip_pair: Vec<bool> = vec![false; n.saturating_sub(1)];
+        let mut has_any_pair = false;
+        if n > 1 && f.pair_first_present_off != 0 {
+            let d_pf = self.data();
+            let off = f.pair_first_present_off;
+            let bitset_len = (f.num_glyphs + 7)/8;
+            if off + bitset_len <= d_pf.len() {
+                for i in 0..n-1 {
+                    let g1 = gids[i].unwrap() as usize;
+                    let is_zero = if g1 < f.num_glyphs {
+                        let byte_off = off + g1/8;
+                        ((d_pf[byte_off] >> (g1%8)) & 1) == 0
+                    } else { true };
+                    skip_pair[i] = is_zero;
+                    if !is_zero { has_any_pair = true; }
+                }
+            } else {
+                // off invalid, conservatively assume we need pairs
+                has_any_pair = true;
+                for b in &mut skip_pair { *b = false; }
+            }
+        } else if n > 1 {
+            // no pair_first_present (old cache, should not happen v18) -> keep old behavior
+            has_any_pair = true;
+        }
+
         let mut singles: Vec<[i32;4]> = Vec::with_capacity(n);
         for i in 0..n {
             singles.push(self.single_adjustment_full(f, gids[i].unwrap()));
         }
         let mut pair_firsts: Vec<[i32;4]> = vec![[0;4]; n];
         let mut pair_seconds: Vec<[i32;4]> = vec![[0;4]; n];
-        if n>1 {
+        if n>1 && has_any_pair {
             for i in 0..n-1 {
+                if skip_pair[i] { continue; }
                 let (v1,v2) = self.pair_adjustment_full(f, gids[i].unwrap(), gids[i+1].unwrap());
                 pair_firsts[i] = v1;
                 pair_seconds[i+1] = v2;
@@ -1651,380 +1728,472 @@ impl GeometryCache {
         w.write_all(&(owned_fonts.len() as u32).to_le_bytes())?;
         let mut entries: Vec<_> = owned_fonts.iter().collect();
         entries.sort_by(|(a,_),(b,_)| a.cmp(b));
-        for (font_key, of) in entries {
-            let kb = font_key.as_bytes();
-            w.write_all(&(kb.len() as u32).to_le_bytes())?; w.write_all(kb)?;
-            w.write_all(&of.file_hash.to_le_bytes())?;
-            w.write_all(&(of.units_per_em as u16).to_le_bytes())?;
-            w.write_all(&(of.num_glyphs as u16).to_le_bytes())?;
-            for gm in &of.glyphs {
-                let adv = gm.advance.round().clamp(i16::MIN as f64, i16::MAX as f64) as i16;
-                let x0 = gm.x_min.round().clamp(i16::MIN as f64, i16::MAX as f64) as i16;
-                let x1 = gm.x_max.round().clamp(i16::MIN as f64, i16::MAX as f64) as i16;
-                let y0 = gm.y_min.round().clamp(i16::MIN as f64, i16::MAX as f64) as i16;
-                let y1 = gm.y_max.round().clamp(i16::MIN as f64, i16::MAX as f64) as i16;
-                w.write_all(&adv.to_le_bytes())?; w.write_all(&x0.to_le_bytes())?; w.write_all(&x1.to_le_bytes())?; w.write_all(&y0.to_le_bytes())?; w.write_all(&y1.to_le_bytes())?;
-            }
-            w.write_all(&(of.cmap.len() as u32).to_le_bytes())?;
-            for (cp,gid) in &of.cmap { w.write_all(&cp.to_le_bytes())?; w.write_all(&gid.to_le_bytes())?; }
-            w.write_all(&(of.single_tables.len() as u16).to_le_bytes())?;
-            w.write_all(&(of.format1_tables.len() as u16).to_le_bytes())?;
-            w.write_all(&(of.format2_tables.len() as u16).to_le_bytes())?;
-            // singles — v12 layout: cov_len, lookup_id, subtable_pos, coverage, value_format, is_single, values
-            for tbl in &of.single_tables {
-                w.write_all(&(tbl.coverage.len() as u16).to_le_bytes())?;
-                w.write_all(&tbl.lookup_id.to_le_bytes())?;
-                w.write_all(&tbl.subtable_pos.to_le_bytes())?;
-                for gid in &tbl.coverage { w.write_all(&gid.to_le_bytes())?; }
-                w.write_all(&tbl.value_format.to_le_bytes())?;
-                w.write_all(&[if tbl.is_single {1u8} else {0u8}])?;
-                let cnt = if tbl.is_single { 1 } else { tbl.coverage.len() };
-                for i in 0..cnt {
-                    let v = if i < tbl.values.len() { &tbl.values[i] } else { &[0,0,0,0] };
-                    pack_vals_4(&mut w, v, tbl.value_format)?;
+        // dedup tracking: canonical_ofs[i] = Some(j) where j <= i and j canonical, i duplicate if j < i
+        let mut canonical_ofs: Vec<Option<usize>> = vec![None; entries.len()];
+        for i in 0..entries.len() {
+            let (_k_i, of_i) = entries[i];
+            let mut found: Option<usize> = None;
+            for j in 0..i {
+                if canonical_ofs[j] == Some(j) {
+                    let (_k_j, of_j) = entries[j];
+                    // deep equality via PartialEq (file_hash, glyphs, cmap, tables)
+                    if of_i == of_j {
+                        found = Some(j);
+                        break;
+                    }
                 }
             }
-            // format1 — v12: cov_len, lookup_id, subtable_pos, coverage, val_fmt1, val_fmt2, pair_sets
-            for tbl in &of.format1_tables {
-                w.write_all(&(tbl.coverage.len() as u16).to_le_bytes())?;
-                w.write_all(&tbl.lookup_id.to_le_bytes())?;
-                w.write_all(&tbl.subtable_pos.to_le_bytes())?;
-                for gid in &tbl.coverage { w.write_all(&gid.to_le_bytes())?; }
-                w.write_all(&tbl.val_fmt1.to_le_bytes())?;
-                w.write_all(&tbl.val_fmt2.to_le_bytes())?;
-                for ps in &tbl.pair_sets {
-                    w.write_all(&(ps.len() as u16).to_le_bytes())?;
-                    for (sg, v1, v2) in ps {
-                        w.write_all(&sg.to_le_bytes())?;
+            if let Some(j) = found {
+                // alias to j
+                canonical_ofs[i] = Some(j);
+                // write header with alias_flag=1
+                let font_key = entries[i].0;
+                let of = entries[i].1;
+                let kb = font_key.as_bytes();
+                w.write_all(&(kb.len() as u32).to_le_bytes())?; w.write_all(kb)?;
+                w.write_all(&of.file_hash.to_le_bytes())?;
+                w.write_all(&(of.units_per_em as u16).to_le_bytes())?;
+                w.write_all(&(of.num_glyphs as u16).to_le_bytes())?;
+                w.write_all(&[1u8])?;
+                w.write_all(&(j as u32).to_le_bytes())?;
+                continue;
+            } else {
+                canonical_ofs[i] = Some(i);
+                let font_key = entries[i].0;
+                let of = entries[i].1;
+                // intentional fallthrough to full payload after header
+                let kb = font_key.as_bytes();
+                w.write_all(&(kb.len() as u32).to_le_bytes())?; w.write_all(kb)?;
+                w.write_all(&of.file_hash.to_le_bytes())?;
+                w.write_all(&(of.units_per_em as u16).to_le_bytes())?;
+                w.write_all(&(of.num_glyphs as u16).to_le_bytes())?;
+                w.write_all(&[0u8])?; // alias_flag 0 = full
+                // --- payload same as before ---
+                for gm in &of.glyphs {
+                    let adv = gm.advance.round().clamp(i16::MIN as f64, i16::MAX as f64) as i16;
+                    let x0 = gm.x_min.round().clamp(i16::MIN as f64, i16::MAX as f64) as i16;
+                    let x1 = gm.x_max.round().clamp(i16::MIN as f64, i16::MAX as f64) as i16;
+                    let y0 = gm.y_min.round().clamp(i16::MIN as f64, i16::MAX as f64) as i16;
+                    let y1 = gm.y_max.round().clamp(i16::MIN as f64, i16::MAX as f64) as i16;
+                    w.write_all(&adv.to_le_bytes())?; w.write_all(&x0.to_le_bytes())?; w.write_all(&x1.to_le_bytes())?; w.write_all(&y0.to_le_bytes())?; w.write_all(&y1.to_le_bytes())?;
+                }
+                w.write_all(&(of.cmap.len() as u32).to_le_bytes())?;
+                for (cp,gid) in &of.cmap { w.write_all(&cp.to_le_bytes())?; w.write_all(&gid.to_le_bytes())?; }
+                w.write_all(&(of.single_tables.len() as u16).to_le_bytes())?;
+                w.write_all(&(of.format1_tables.len() as u16).to_le_bytes())?;
+                w.write_all(&(of.format2_tables.len() as u16).to_le_bytes())?;
+                // singles — v12 layout: cov_len, lookup_id, subtable_pos, coverage, value_format, is_single, values
+                for tbl in &of.single_tables {
+                    w.write_all(&(tbl.coverage.len() as u16).to_le_bytes())?;
+                    w.write_all(&tbl.lookup_id.to_le_bytes())?;
+                    w.write_all(&tbl.subtable_pos.to_le_bytes())?;
+                    for gid in &tbl.coverage { w.write_all(&gid.to_le_bytes())?; }
+                    w.write_all(&tbl.value_format.to_le_bytes())?;
+                    w.write_all(&[if tbl.is_single {1u8} else {0u8}])?;
+                    let cnt = if tbl.is_single { 1 } else { tbl.coverage.len() };
+                    for i in 0..cnt {
+                        let v = if i < tbl.values.len() { &tbl.values[i] } else { &[0,0,0,0] };
+                        pack_vals_4(&mut w, v, tbl.value_format)?;
+                    }
+                }
+                // format1 — v12: cov_len, lookup_id, subtable_pos, coverage, val_fmt1, val_fmt2, pair_sets
+                for tbl in &of.format1_tables {
+                    w.write_all(&(tbl.coverage.len() as u16).to_le_bytes())?;
+                    w.write_all(&tbl.lookup_id.to_le_bytes())?;
+                    w.write_all(&tbl.subtable_pos.to_le_bytes())?;
+                    for gid in &tbl.coverage { w.write_all(&gid.to_le_bytes())?; }
+                    w.write_all(&tbl.val_fmt1.to_le_bytes())?;
+                    w.write_all(&tbl.val_fmt2.to_le_bytes())?;
+                    for ps in &tbl.pair_sets {
+                        w.write_all(&(ps.len() as u16).to_le_bytes())?;
+                        for (sg, v1, v2) in ps {
+                            w.write_all(&sg.to_le_bytes())?;
+                            pack_vals_4(&mut w, v1, tbl.val_fmt1)?;
+                            pack_vals_4(&mut w, v2, tbl.val_fmt2)?;
+                        }
+                    }
+                }
+                // format2 — v12: cov_len, lookup_id, subtable_pos, coverage, class1_count, class2_count, val_fmt1, val_fmt2, ...
+                for tbl in &of.format2_tables {
+                    w.write_all(&(tbl.coverage.len() as u16).to_le_bytes())?;
+                    w.write_all(&tbl.lookup_id.to_le_bytes())?;
+                    w.write_all(&tbl.subtable_pos.to_le_bytes())?;
+                    for gid in &tbl.coverage { w.write_all(&gid.to_le_bytes())?; }
+                    w.write_all(&(tbl.class1_count as u16).to_le_bytes())?;
+                    w.write_all(&(tbl.class2_count as u16).to_le_bytes())?;
+                    w.write_all(&tbl.val_fmt1.to_le_bytes())?;
+                    w.write_all(&tbl.val_fmt2.to_le_bytes())?;
+                    match &tbl.class_def1 {
+                        ClassDefOwned::Format1 { start, classes } => {
+                            w.write_all(&[1u8,0])?; w.write_all(&(classes.len() as u16).to_le_bytes())?;
+                            w.write_all(&start.to_le_bytes())?;
+                            for c in classes { w.write_all(&c.to_le_bytes())?; }
+                        }
+                        ClassDefOwned::Format2 { ranges } => {
+                            w.write_all(&[2u8,0])?; w.write_all(&(ranges.len() as u16).to_le_bytes())?;
+                            w.write_all(&[0,0])?;
+                            for (s,e,c) in ranges { w.write_all(&s.to_le_bytes())?; w.write_all(&e.to_le_bytes())?; w.write_all(&c.to_le_bytes())?; }
+                        }
+                    }
+                    match &tbl.class_def2 {
+                        ClassDefOwned::Format1 { start, classes } => {
+                            w.write_all(&[1u8,0])?; w.write_all(&(classes.len() as u16).to_le_bytes())?;
+                            w.write_all(&start.to_le_bytes())?;
+                            for c in classes { w.write_all(&c.to_le_bytes())?; }
+                        }
+                        ClassDefOwned::Format2 { ranges } => {
+                            w.write_all(&[2u8,0])?; w.write_all(&(ranges.len() as u16).to_le_bytes())?;
+                            w.write_all(&[0,0])?;
+                            for (s,e,c) in ranges { w.write_all(&s.to_le_bytes())?; w.write_all(&e.to_le_bytes())?; w.write_all(&c.to_le_bytes())?; }
+                        }
+                    }
+                    for (v1,v2) in &tbl.matrix {
                         pack_vals_4(&mut w, v1, tbl.val_fmt1)?;
                         pack_vals_4(&mut w, v2, tbl.val_fmt2)?;
                     }
                 }
-            }
-            // format2 — v12: cov_len, lookup_id, subtable_pos, coverage, class1_count, class2_count, val_fmt1, val_fmt2, ...
-            for tbl in &of.format2_tables {
-                w.write_all(&(tbl.coverage.len() as u16).to_le_bytes())?;
-                w.write_all(&tbl.lookup_id.to_le_bytes())?;
-                w.write_all(&tbl.subtable_pos.to_le_bytes())?;
-                for gid in &tbl.coverage { w.write_all(&gid.to_le_bytes())?; }
-                w.write_all(&(tbl.class1_count as u16).to_le_bytes())?;
-                w.write_all(&(tbl.class2_count as u16).to_le_bytes())?;
-                w.write_all(&tbl.val_fmt1.to_le_bytes())?;
-                w.write_all(&tbl.val_fmt2.to_le_bytes())?;
-                match &tbl.class_def1 {
-                    ClassDefOwned::Format1 { start, classes } => {
-                        w.write_all(&[1u8,0])?; w.write_all(&(classes.len() as u16).to_le_bytes())?;
-                        w.write_all(&start.to_le_bytes())?;
-                        for c in classes { w.write_all(&c.to_le_bytes())?; }
-                    }
-                    ClassDefOwned::Format2 { ranges } => {
-                        w.write_all(&[2u8,0])?; w.write_all(&(ranges.len() as u16).to_le_bytes())?;
-                        w.write_all(&[0,0])?;
-                        for (s,e,c) in ranges { w.write_all(&s.to_le_bytes())?; w.write_all(&e.to_le_bytes())?; w.write_all(&c.to_le_bytes())?; }
+                // ── v15: case/cpsp tables (conditional) ──
+                w.write_all(&(of.case_single_tables.len() as u16).to_le_bytes())?;
+                w.write_all(&(of.case_format1_tables.len() as u16).to_le_bytes())?;
+                w.write_all(&(of.case_format2_tables.len() as u16).to_le_bytes())?;
+                for tbl in &of.case_single_tables {
+                    w.write_all(&(tbl.coverage.len() as u16).to_le_bytes())?;
+                    w.write_all(&tbl.lookup_id.to_le_bytes())?;
+                    w.write_all(&tbl.subtable_pos.to_le_bytes())?;
+                    for gid in &tbl.coverage { w.write_all(&gid.to_le_bytes())?; }
+                    w.write_all(&tbl.value_format.to_le_bytes())?;
+                    w.write_all(&[if tbl.is_single {1u8} else {0u8}])?;
+                    let cnt = if tbl.is_single { 1 } else { tbl.coverage.len() };
+                    for i in 0..cnt {
+                        let v = if i < tbl.values.len() { &tbl.values[i] } else { &[0,0,0,0] };
+                        pack_vals_4(&mut w, v, tbl.value_format)?;
                     }
                 }
-                match &tbl.class_def2 {
-                    ClassDefOwned::Format1 { start, classes } => {
-                        w.write_all(&[1u8,0])?; w.write_all(&(classes.len() as u16).to_le_bytes())?;
-                        w.write_all(&start.to_le_bytes())?;
-                        for c in classes { w.write_all(&c.to_le_bytes())?; }
-                    }
-                    ClassDefOwned::Format2 { ranges } => {
-                        w.write_all(&[2u8,0])?; w.write_all(&(ranges.len() as u16).to_le_bytes())?;
-                        w.write_all(&[0,0])?;
-                        for (s,e,c) in ranges { w.write_all(&s.to_le_bytes())?; w.write_all(&e.to_le_bytes())?; w.write_all(&c.to_le_bytes())?; }
-                    }
-                }
-                for (v1,v2) in &tbl.matrix {
-                    pack_vals_4(&mut w, v1, tbl.val_fmt1)?;
-                    pack_vals_4(&mut w, v2, tbl.val_fmt2)?;
-                }
-            }
-            // ── v15: case/cpsp tables (conditional) ──
-            w.write_all(&(of.case_single_tables.len() as u16).to_le_bytes())?;
-            w.write_all(&(of.case_format1_tables.len() as u16).to_le_bytes())?;
-            w.write_all(&(of.case_format2_tables.len() as u16).to_le_bytes())?;
-            for tbl in &of.case_single_tables {
-                w.write_all(&(tbl.coverage.len() as u16).to_le_bytes())?;
-                w.write_all(&tbl.lookup_id.to_le_bytes())?;
-                w.write_all(&tbl.subtable_pos.to_le_bytes())?;
-                for gid in &tbl.coverage { w.write_all(&gid.to_le_bytes())?; }
-                w.write_all(&tbl.value_format.to_le_bytes())?;
-                w.write_all(&[if tbl.is_single {1u8} else {0u8}])?;
-                let cnt = if tbl.is_single { 1 } else { tbl.coverage.len() };
-                for i in 0..cnt {
-                    let v = if i < tbl.values.len() { &tbl.values[i] } else { &[0,0,0,0] };
-                    pack_vals_4(&mut w, v, tbl.value_format)?;
-                }
-            }
-            for tbl in &of.case_format1_tables {
-                w.write_all(&(tbl.coverage.len() as u16).to_le_bytes())?;
-                w.write_all(&tbl.lookup_id.to_le_bytes())?;
-                w.write_all(&tbl.subtable_pos.to_le_bytes())?;
-                for gid in &tbl.coverage { w.write_all(&gid.to_le_bytes())?; }
-                w.write_all(&tbl.val_fmt1.to_le_bytes())?;
-                w.write_all(&tbl.val_fmt2.to_le_bytes())?;
-                for ps in &tbl.pair_sets {
-                    w.write_all(&(ps.len() as u16).to_le_bytes())?;
-                    for (sg, v1, v2) in ps {
-                        w.write_all(&sg.to_le_bytes())?;
-                        pack_vals_4(&mut w, v1, tbl.val_fmt1)?;
-                        pack_vals_4(&mut w, v2, tbl.val_fmt2)?;
-                    }
-                }
-            }
-            for tbl in &of.case_format2_tables {
-                w.write_all(&(tbl.coverage.len() as u16).to_le_bytes())?;
-                w.write_all(&tbl.lookup_id.to_le_bytes())?;
-                w.write_all(&tbl.subtable_pos.to_le_bytes())?;
-                for gid in &tbl.coverage { w.write_all(&gid.to_le_bytes())?; }
-                w.write_all(&(tbl.class1_count as u16).to_le_bytes())?;
-                w.write_all(&(tbl.class2_count as u16).to_le_bytes())?;
-                w.write_all(&tbl.val_fmt1.to_le_bytes())?;
-                w.write_all(&tbl.val_fmt2.to_le_bytes())?;
-                match &tbl.class_def1 {
-                    ClassDefOwned::Format1 { start, classes } => {
-                        w.write_all(&[1u8,0])?; w.write_all(&(classes.len() as u16).to_le_bytes())?;
-                        w.write_all(&start.to_le_bytes())?;
-                        for c in classes { w.write_all(&c.to_le_bytes())?; }
-                    }
-                    ClassDefOwned::Format2 { ranges } => {
-                        w.write_all(&[2u8,0])?; w.write_all(&(ranges.len() as u16).to_le_bytes())?;
-                        w.write_all(&[0,0])?;
-                        for (s,e,c) in ranges { w.write_all(&s.to_le_bytes())?; w.write_all(&e.to_le_bytes())?; w.write_all(&c.to_le_bytes())?; }
-                    }
-                }
-                match &tbl.class_def2 {
-                    ClassDefOwned::Format1 { start, classes } => {
-                        w.write_all(&[1u8,0])?; w.write_all(&(classes.len() as u16).to_le_bytes())?;
-                        w.write_all(&start.to_le_bytes())?;
-                        for c in classes { w.write_all(&c.to_le_bytes())?; }
-                    }
-                    ClassDefOwned::Format2 { ranges } => {
-                        w.write_all(&[2u8,0])?; w.write_all(&(ranges.len() as u16).to_le_bytes())?;
-                        w.write_all(&[0,0])?;
-                        for (s,e,c) in ranges { w.write_all(&s.to_le_bytes())?; w.write_all(&e.to_le_bytes())?; w.write_all(&c.to_le_bytes())?; }
-                    }
-                }
-                for (v1,v2) in &tbl.matrix {
-                    pack_vals_4(&mut w, v1, tbl.val_fmt1)?;
-                    pack_vals_4(&mut w, v2, tbl.val_fmt2)?;
-                }
-            }
-            // ── v16: pre-grouped lookup indexes for fast path (zero BTreeMap at runtime) ──
-            // Helper: build pair groups from owned tables
-            fn build_pair_groups(f1: &[Format1TableOwned], f2: &[Format2TableOwned]) -> Vec<(u16, Vec<(u16,u8,u16)>)> {
-                // Returns Vec<(lookup_id, entries)> where entry = (pos, kind 0=F1/1=F2, idx)
-                let mut map: BTreeMap<u16, Vec<(u16,u8,u16)>> = BTreeMap::new();
-                for (i, tbl) in f1.iter().enumerate() {
-                    map.entry(tbl.lookup_id).or_default().push((tbl.subtable_pos, 0u8, i as u16));
-                }
-                for (i, tbl) in f2.iter().enumerate() {
-                    map.entry(tbl.lookup_id).or_default().push((tbl.subtable_pos, 1u8, i as u16));
-                }
-                let mut out = Vec::with_capacity(map.len());
-                for (lid, mut entries) in map {
-                    entries.sort_by_key(|(pos,_,_)| *pos);
-                    out.push((lid, entries));
-                }
-                out
-            }
-            fn build_single_groups(singles: &[SingleTableOwned]) -> Vec<(u16, Vec<(u16,u16)>)> {
-                let mut map: BTreeMap<u16, Vec<(u16,u16)>> = BTreeMap::new();
-                for (i, tbl) in singles.iter().enumerate() {
-                    map.entry(tbl.lookup_id).or_default().push((tbl.subtable_pos, i as u16));
-                }
-                let mut out = Vec::with_capacity(map.len());
-                for (lid, mut entries) in map {
-                    entries.sort_by_key(|(pos,_)| *pos);
-                    out.push((lid, entries));
-                }
-                out
-            }
-            // pair groups
-            let pg = build_pair_groups(&of.format1_tables, &of.format2_tables);
-            w.write_all(&(pg.len() as u16).to_le_bytes())?;
-            for (lookup_id, entries) in &pg {
-                w.write_all(&lookup_id.to_le_bytes())?;
-                w.write_all(&(entries.len() as u16).to_le_bytes())?;
-                for (pos, kind, idx) in entries {
-                    w.write_all(&pos.to_le_bytes())?;
-                    w.write_all(&[*kind, 0u8])?; // kind + pad
-                    w.write_all(&idx.to_le_bytes())?;
-                }
-            }
-            let cpg = build_pair_groups(&of.case_format1_tables, &of.case_format2_tables);
-            w.write_all(&(cpg.len() as u16).to_le_bytes())?;
-            for (lookup_id, entries) in &cpg {
-                w.write_all(&lookup_id.to_le_bytes())?;
-                w.write_all(&(entries.len() as u16).to_le_bytes())?;
-                for (pos, kind, idx) in entries {
-                    w.write_all(&pos.to_le_bytes())?;
-                    w.write_all(&[*kind, 0u8])?;
-                    w.write_all(&idx.to_le_bytes())?;
-                }
-            }
-            // single groups
-            let sg = build_single_groups(&of.single_tables);
-            w.write_all(&(sg.len() as u16).to_le_bytes())?;
-            for (lookup_id, entries) in &sg {
-                w.write_all(&lookup_id.to_le_bytes())?;
-                w.write_all(&(entries.len() as u16).to_le_bytes())?;
-                for (pos, idx) in entries {
-                    w.write_all(&pos.to_le_bytes())?;
-                    w.write_all(&idx.to_le_bytes())?;
-                }
-            }
-            let csg = build_single_groups(&of.case_single_tables);
-            w.write_all(&(csg.len() as u16).to_le_bytes())?;
-            for (lookup_id, entries) in &csg {
-                w.write_all(&lookup_id.to_le_bytes())?;
-                w.write_all(&(entries.len() as u16).to_le_bytes())?;
-                for (pos, idx) in entries {
-                    w.write_all(&pos.to_le_bytes())?;
-                    w.write_all(&idx.to_le_bytes())?;
-                }
-            }
-            // v17: pair_first_present blob — num_glyphs bytes, 1 if gid has any pair kern
-            {
-                let mut pfp = vec![0u8; of.num_glyphs];
-                for tbl in &of.format1_tables {
-                    for &gid in &tbl.coverage {
-                        let g = gid as usize;
-                        if g < pfp.len() { pfp[g] = 1; }
-                    }
-                }
-                for tbl in &of.format2_tables {
-                    for &gid in &tbl.coverage {
-                        let g = gid as usize;
-                        if g < pfp.len() { pfp[g] = 1; }
-                    }
-                }
-                w.write_all(&pfp)?;
-            }
-            // v18: O(1) coverage and class maps — num_glyphs *2 LE per table, 0xFFFF sentinel for missing coverage
-            {
-                let ng = of.num_glyphs;
-                // F1 coverage map
-                for tbl in &of.format1_tables {
-                    let mut map = vec![0xFFFFu16; ng];
-                    for (i, &gid) in tbl.coverage.iter().enumerate() {
-                        let g = gid as usize;
-                        if g < ng { map[g] = i as u16; }
-                    }
-                    for v in map { w.write_all(&v.to_le_bytes())?; }
-                }
-                // F2: coverage + class1 + class2
-                for tbl in &of.format2_tables {
-                    let mut cov_map = vec![0xFFFFu16; ng];
-                    for (i, &gid) in tbl.coverage.iter().enumerate() {
-                        let g = gid as usize;
-                        if g < ng { cov_map[g] = i as u16; }
-                    }
-                    for v in cov_map { w.write_all(&v.to_le_bytes())?; }
-                    // class1 map
-                    let mut c1map = vec![0u16; ng];
-                    for g in 0..ng {
-                        let gid = g as u16;
-                        let cls = match &tbl.class_def1 {
-                            ClassDefOwned::Format1 { start, classes } => {
-                                if gid < *start { 0 } else {
-                                    let idx = (gid - *start) as usize;
-                                    if idx < classes.len() { classes[idx] } else { 0 }
-                                }
-                            }
-                            ClassDefOwned::Format2 { ranges } => {
-                                let mut c = 0u16;
-                                for (s,e,cl) in ranges {
-                                    if gid >= *s && gid <= *e { c = *cl; break; }
-                                }
-                                c
-                            }
-                        };
-                        c1map[g] = cls;
-                    }
-                    for v in c1map { w.write_all(&v.to_le_bytes())?; }
-                    let mut c2map = vec![0u16; ng];
-                    for g in 0..ng {
-                        let gid = g as u16;
-                        let cls = match &tbl.class_def2 {
-                            ClassDefOwned::Format1 { start, classes } => {
-                                if gid < *start { 0 } else {
-                                    let idx = (gid - *start) as usize;
-                                    if idx < classes.len() { classes[idx] } else { 0 }
-                                }
-                            }
-                            ClassDefOwned::Format2 { ranges } => {
-                                let mut c = 0u16;
-                                for (s,e,cl) in ranges {
-                                    if gid >= *s && gid <= *e { c = *cl; break; }
-                                }
-                                c
-                            }
-                        };
-                        c2map[g] = cls;
-                    }
-                    for v in c2map { w.write_all(&v.to_le_bytes())?; }
-                }
-                // case F1
                 for tbl in &of.case_format1_tables {
-                    let mut map = vec![0xFFFFu16; ng];
-                    for (i, &gid) in tbl.coverage.iter().enumerate() {
-                        let g = gid as usize;
-                        if g < ng { map[g] = i as u16; }
+                    w.write_all(&(tbl.coverage.len() as u16).to_le_bytes())?;
+                    w.write_all(&tbl.lookup_id.to_le_bytes())?;
+                    w.write_all(&tbl.subtable_pos.to_le_bytes())?;
+                    for gid in &tbl.coverage { w.write_all(&gid.to_le_bytes())?; }
+                    w.write_all(&tbl.val_fmt1.to_le_bytes())?;
+                    w.write_all(&tbl.val_fmt2.to_le_bytes())?;
+                    for ps in &tbl.pair_sets {
+                        w.write_all(&(ps.len() as u16).to_le_bytes())?;
+                        for (sg, v1, v2) in ps {
+                            w.write_all(&sg.to_le_bytes())?;
+                            pack_vals_4(&mut w, v1, tbl.val_fmt1)?;
+                            pack_vals_4(&mut w, v2, tbl.val_fmt2)?;
+                        }
                     }
-                    for v in map { w.write_all(&v.to_le_bytes())?; }
                 }
-                // case F2
                 for tbl in &of.case_format2_tables {
-                    let mut cov_map = vec![0xFFFFu16; ng];
-                    for (i, &gid) in tbl.coverage.iter().enumerate() {
-                        let g = gid as usize;
-                        if g < ng { cov_map[g] = i as u16; }
+                    w.write_all(&(tbl.coverage.len() as u16).to_le_bytes())?;
+                    w.write_all(&tbl.lookup_id.to_le_bytes())?;
+                    w.write_all(&tbl.subtable_pos.to_le_bytes())?;
+                    for gid in &tbl.coverage { w.write_all(&gid.to_le_bytes())?; }
+                    w.write_all(&(tbl.class1_count as u16).to_le_bytes())?;
+                    w.write_all(&(tbl.class2_count as u16).to_le_bytes())?;
+                    w.write_all(&tbl.val_fmt1.to_le_bytes())?;
+                    w.write_all(&tbl.val_fmt2.to_le_bytes())?;
+                    match &tbl.class_def1 {
+                        ClassDefOwned::Format1 { start, classes } => {
+                            w.write_all(&[1u8,0])?; w.write_all(&(classes.len() as u16).to_le_bytes())?;
+                            w.write_all(&start.to_le_bytes())?;
+                            for c in classes { w.write_all(&c.to_le_bytes())?; }
+                        }
+                        ClassDefOwned::Format2 { ranges } => {
+                            w.write_all(&[2u8,0])?; w.write_all(&(ranges.len() as u16).to_le_bytes())?;
+                            w.write_all(&[0,0])?;
+                            for (s,e,c) in ranges { w.write_all(&s.to_le_bytes())?; w.write_all(&e.to_le_bytes())?; w.write_all(&c.to_le_bytes())?; }
+                        }
                     }
-                    for v in cov_map { w.write_all(&v.to_le_bytes())?; }
-                    let mut c1map = vec![0u16; ng];
-                    for g in 0..ng {
-                        let gid = g as u16;
-                        let cls = match &tbl.class_def1 {
-                            ClassDefOwned::Format1 { start, classes } => {
-                                if gid < *start { 0 } else {
-                                    let idx = (gid - *start) as usize;
-                                    if idx < classes.len() { classes[idx] } else { 0 }
-                                }
-                            }
-                            ClassDefOwned::Format2 { ranges } => {
-                                let mut c = 0u16;
-                                for (s,e,cl) in ranges {
-                                    if gid >= *s && gid <= *e { c = *cl; break; }
-                                }
-                                c
-                            }
-                        };
-                        c1map[g] = cls;
+                    match &tbl.class_def2 {
+                        ClassDefOwned::Format1 { start, classes } => {
+                            w.write_all(&[1u8,0])?; w.write_all(&(classes.len() as u16).to_le_bytes())?;
+                            w.write_all(&start.to_le_bytes())?;
+                            for c in classes { w.write_all(&c.to_le_bytes())?; }
+                        }
+                        ClassDefOwned::Format2 { ranges } => {
+                            w.write_all(&[2u8,0])?; w.write_all(&(ranges.len() as u16).to_le_bytes())?;
+                            w.write_all(&[0,0])?;
+                            for (s,e,c) in ranges { w.write_all(&s.to_le_bytes())?; w.write_all(&e.to_le_bytes())?; w.write_all(&c.to_le_bytes())?; }
+                        }
                     }
-                    for v in c1map { w.write_all(&v.to_le_bytes())?; }
-                    let mut c2map = vec![0u16; ng];
-                    for g in 0..ng {
-                        let gid = g as u16;
-                        let cls = match &tbl.class_def2 {
-                            ClassDefOwned::Format1 { start, classes } => {
-                                if gid < *start { 0 } else {
-                                    let idx = (gid - *start) as usize;
-                                    if idx < classes.len() { classes[idx] } else { 0 }
-                                }
-                            }
-                            ClassDefOwned::Format2 { ranges } => {
-                                let mut c = 0u16;
-                                for (s,e,cl) in ranges {
-                                    if gid >= *s && gid <= *e { c = *cl; break; }
-                                }
-                                c
-                            }
-                        };
-                        c2map[g] = cls;
+                    for (v1,v2) in &tbl.matrix {
+                        pack_vals_4(&mut w, v1, tbl.val_fmt1)?;
+                        pack_vals_4(&mut w, v2, tbl.val_fmt2)?;
                     }
-                    for v in c2map { w.write_all(&v.to_le_bytes())?; }
+                }
+                // ── v16: pre-grouped lookup indexes for fast path (zero BTreeMap at runtime) ──
+                fn build_pair_groups(f1: &[Format1TableOwned], f2: &[Format2TableOwned]) -> Vec<(u16, Vec<(u16,u8,u16)>)> {
+                    let mut map: BTreeMap<u16, Vec<(u16,u8,u16)>> = BTreeMap::new();
+                    for (i, tbl) in f1.iter().enumerate() {
+                        map.entry(tbl.lookup_id).or_default().push((tbl.subtable_pos, 0u8, i as u16));
+                    }
+                    for (i, tbl) in f2.iter().enumerate() {
+                        map.entry(tbl.lookup_id).or_default().push((tbl.subtable_pos, 1u8, i as u16));
+                    }
+                    let mut out = Vec::with_capacity(map.len());
+                    for (lid, mut entries) in map {
+                        entries.sort_by_key(|(pos,_,_)| *pos);
+                        out.push((lid, entries));
+                    }
+                    out
+                }
+                fn build_single_groups(singles: &[SingleTableOwned]) -> Vec<(u16, Vec<(u16,u16)>)> {
+                    let mut map: BTreeMap<u16, Vec<(u16,u16)>> = BTreeMap::new();
+                    for (i, tbl) in singles.iter().enumerate() {
+                        map.entry(tbl.lookup_id).or_default().push((tbl.subtable_pos, i as u16));
+                    }
+                    let mut out = Vec::with_capacity(map.len());
+                    for (lid, mut entries) in map {
+                        entries.sort_by_key(|(pos,_)| *pos);
+                        out.push((lid, entries));
+                    }
+                    out
+                }
+                // pair groups
+                let pg = build_pair_groups(&of.format1_tables, &of.format2_tables);
+                w.write_all(&(pg.len() as u16).to_le_bytes())?;
+                for (lookup_id, entries) in &pg {
+                    w.write_all(&lookup_id.to_le_bytes())?;
+                    w.write_all(&(entries.len() as u16).to_le_bytes())?;
+                    for (pos, kind, idx) in entries {
+                        w.write_all(&pos.to_le_bytes())?;
+                        w.write_all(&[*kind, 0u8])?;
+                        w.write_all(&idx.to_le_bytes())?;
+                    }
+                }
+                let cpg = build_pair_groups(&of.case_format1_tables, &of.case_format2_tables);
+                w.write_all(&(cpg.len() as u16).to_le_bytes())?;
+                for (lookup_id, entries) in &cpg {
+                    w.write_all(&lookup_id.to_le_bytes())?;
+                    w.write_all(&(entries.len() as u16).to_le_bytes())?;
+                    for (pos, kind, idx) in entries {
+                        w.write_all(&pos.to_le_bytes())?;
+                        w.write_all(&[*kind, 0u8])?;
+                        w.write_all(&idx.to_le_bytes())?;
+                    }
+                }
+                // single groups
+                let sg = build_single_groups(&of.single_tables);
+                w.write_all(&(sg.len() as u16).to_le_bytes())?;
+                for (lookup_id, entries) in &sg {
+                    w.write_all(&lookup_id.to_le_bytes())?;
+                    w.write_all(&(entries.len() as u16).to_le_bytes())?;
+                    for (pos, idx) in entries {
+                        w.write_all(&pos.to_le_bytes())?;
+                        w.write_all(&idx.to_le_bytes())?;
+                    }
+                }
+                let csg = build_single_groups(&of.case_single_tables);
+                w.write_all(&(csg.len() as u16).to_le_bytes())?;
+                for (lookup_id, entries) in &csg {
+                    w.write_all(&lookup_id.to_le_bytes())?;
+                    w.write_all(&(entries.len() as u16).to_le_bytes())?;
+                    for (pos, idx) in entries {
+                        w.write_all(&pos.to_le_bytes())?;
+                        w.write_all(&idx.to_le_bytes())?;
+                    }
+                }
+                // v20: pair_first_present bitset — (ng+7)/8 bytes
+                {
+                    let ng = of.num_glyphs;
+                    let mut bits = vec![0u8; (ng+7)/8];
+                    for tbl in &of.format1_tables {
+                        for &gid in &tbl.coverage {
+                            let g = gid as usize;
+                            if g < ng { bits[g/8] |= 1u8 << (g%8); }
+                        }
+                    }
+                    for tbl in &of.format2_tables {
+                        for &gid in &tbl.coverage {
+                            let g = gid as usize;
+                            if g < ng { bits[g/8] |= 1u8 << (g%8); }
+                        }
+                    }
+                    w.write_all(&bits)?;
+                }
+                // v20: O(1) maps compressed
+                {
+                    let ng = of.num_glyphs;
+                    // F1 coverage map compressed
+                    for tbl in &of.format1_tables {
+                        let is_u8 = tbl.coverage.len() < 255;
+                        w.write_all(&[if is_u8 {0u8} else {1u8}])?;
+                        if is_u8 {
+                            let mut map = vec![0xFFu8; ng];
+                            for (i, &gid) in tbl.coverage.iter().enumerate() {
+                                let g = gid as usize;
+                                if g < ng { map[g] = i as u8; }
+                            }
+                            w.write_all(&map)?;
+                        } else {
+                            let mut map = vec![0xFFFFu16; ng];
+                            for (i, &gid) in tbl.coverage.iter().enumerate() {
+                                let g = gid as usize;
+                                if g < ng { map[g] = i as u16; }
+                            }
+                            for v in map { w.write_all(&v.to_le_bytes())?; }
+                        }
+                    }
+                    // F2: coverage + class1 + class2 with flags byte
+                    for tbl in &of.format2_tables {
+                        let cov_u8 = tbl.coverage.len() < 255;
+                        let c1_u8 = tbl.class1_count <= 256;
+                        let c2_u8 = tbl.class2_count <= 256;
+                        let flags: u8 = (if cov_u8 {0} else {1}) | (if c1_u8 {0} else {1<<1}) | (if c2_u8 {0} else {1<<2});
+                        w.write_all(&[flags])?;
+                        // coverage
+                        if cov_u8 {
+                            let mut cov_map = vec![0xFFu8; ng];
+                            for (i, &gid) in tbl.coverage.iter().enumerate() {
+                                let g = gid as usize;
+                                if g < ng { cov_map[g] = i as u8; }
+                            }
+                            w.write_all(&cov_map)?;
+                        } else {
+                            let mut cov_map = vec![0xFFFFu16; ng];
+                            for (i, &gid) in tbl.coverage.iter().enumerate() {
+                                let g = gid as usize;
+                                if g < ng { cov_map[g] = i as u16; }
+                            }
+                            for v in cov_map { w.write_all(&v.to_le_bytes())?; }
+                        }
+                        // class1
+                        if c1_u8 {
+                            let mut c1map = vec![0u8; ng];
+                            for g in 0..ng {
+                                let gid = g as u16;
+                                let cls = match &tbl.class_def1 {
+                                    ClassDefOwned::Format1 { start, classes } => {
+                                        if gid < *start { 0 } else {
+                                            let idx = (gid - *start) as usize;
+                                            if idx < classes.len() { classes[idx] } else { 0 }
+                                        }
+                                    }
+                                    ClassDefOwned::Format2 { ranges } => {
+                                        let mut c = 0u16;
+                                        for (s,e,cl) in ranges {
+                                            if gid >= *s && gid <= *e { c = *cl; break; }
+                                        }
+                                        c
+                                    }
+                                };
+                                c1map[g] = cls as u8;
+                            }
+                            w.write_all(&c1map)?;
+                        } else {
+                            let mut c1map = vec![0u16; ng];
+                            for g in 0..ng {
+                                let gid = g as u16;
+                                let cls = match &tbl.class_def1 {
+                                    ClassDefOwned::Format1 { start, classes } => {
+                                        if gid < *start { 0 } else {
+                                            let idx = (gid - *start) as usize;
+                                            if idx < classes.len() { classes[idx] } else { 0 }
+                                        }
+                                    }
+                                    ClassDefOwned::Format2 { ranges } => {
+                                        let mut c = 0u16;
+                                        for (s,e,cl) in ranges {
+                                            if gid >= *s && gid <= *e { c = *cl; break; }
+                                        }
+                                        c
+                                    }
+                                };
+                                c1map[g] = cls;
+                            }
+                            for v in c1map { w.write_all(&v.to_le_bytes())?; }
+                        }
+                        // class2
+                        if c2_u8 {
+                            let mut c2map = vec![0u8; ng];
+                            for g in 0..ng {
+                                let gid = g as u16;
+                                let cls = match &tbl.class_def2 {
+                                    ClassDefOwned::Format1 { start, classes } => {
+                                        if gid < *start { 0 } else {
+                                            let idx = (gid - *start) as usize;
+                                            if idx < classes.len() { classes[idx] } else { 0 }
+                                        }
+                                    }
+                                    ClassDefOwned::Format2 { ranges } => {
+                                        let mut c = 0u16;
+                                        for (s,e,cl) in ranges {
+                                            if gid >= *s && gid <= *e { c = *cl; break; }
+                                        }
+                                        c
+                                    }
+                                };
+                                c2map[g] = cls as u8;
+                            }
+                            w.write_all(&c2map)?;
+                        } else {
+                            let mut c2map = vec![0u16; ng];
+                            for g in 0..ng {
+                                let gid = g as u16;
+                                let cls = match &tbl.class_def2 {
+                                    ClassDefOwned::Format1 { start, classes } => {
+                                        if gid < *start { 0 } else {
+                                            let idx = (gid - *start) as usize;
+                                            if idx < classes.len() { classes[idx] } else { 0 }
+                                        }
+                                    }
+                                    ClassDefOwned::Format2 { ranges } => {
+                                        let mut c = 0u16;
+                                        for (s,e,cl) in ranges {
+                                            if gid >= *s && gid <= *e { c = *cl; break; }
+                                        }
+                                        c
+                                    }
+                                };
+                                c2map[g] = cls;
+                            }
+                            for v in c2map { w.write_all(&v.to_le_bytes())?; }
+                        }
+                    }
+                    // case F1 and F2: skip maps entirely in v20 for size (rare path)
+                }
+                // v19: Format1 second-gid O(1) hash maps — per PairSet where count>8
+                for tbl in &of.format1_tables {
+                    for ps in &tbl.pair_sets {
+                        let pc = ps.len();
+                        if pc <= 8 {
+                            w.write_all(&(0u16).to_le_bytes())?;
+                        } else {
+                            let mut sz = (pc*2).next_power_of_two();
+                            if sz > 65535 { sz = 65535; }
+                            if sz < pc { sz = pc.next_power_of_two().min(65535); }
+                            let mut buckets = vec![0xFFFFu16; sz];
+                            for (idx, (sg,_,_)) in ps.iter().enumerate() {
+                                let mut h = (*sg as usize) % sz;
+                                while buckets[h] != 0xFFFF { h = (h+1)%sz; }
+                                buckets[h] = idx as u16;
+                            }
+                            w.write_all(&(sz as u16).to_le_bytes())?;
+                            for b in buckets { w.write_all(&b.to_le_bytes())?; }
+                        }
+                    }
+                }
+                for tbl in &of.case_format1_tables {
+                    for ps in &tbl.pair_sets {
+                        let pc = ps.len();
+                        if pc <= 8 {
+                            w.write_all(&(0u16).to_le_bytes())?;
+                        } else {
+                            let mut sz = (pc*2).next_power_of_two();
+                            if sz > 65535 { sz = 65535; }
+                            if sz < pc { sz = pc.next_power_of_two().min(65535); }
+                            let mut buckets = vec![0xFFFFu16; sz];
+                            for (idx, (sg,_,_)) in ps.iter().enumerate() {
+                                let mut h = (*sg as usize) % sz;
+                                while buckets[h] != 0xFFFF { h = (h+1)%sz; }
+                                buckets[h] = idx as u16;
+                            }
+                            w.write_all(&(sz as u16).to_le_bytes())?;
+                            for b in buckets { w.write_all(&b.to_le_bytes())?; }
+                        }
+                    }
                 }
             }
         }
@@ -2043,6 +2212,7 @@ impl GeometryCache {
         let n_fonts = u32::from_le_bytes(data[16..20].try_into().unwrap()) as usize;
         let mut pos = 20usize;
         let mut fonts = HashMap::with_capacity(n_fonts);
+        let mut ordered: Vec<FontMmapIndex> = Vec::with_capacity(n_fonts);
         for _ in 0..n_fonts {
             let klen = read_u32_le(data, &mut pos)? as usize;
             if pos+klen > data.len() { return Err("trunc font_key".into()); }
@@ -2051,6 +2221,36 @@ impl GeometryCache {
             if pos+4 > data.len() { return Err("trunc upem/num_glyphs".into()); }
             let upem = u16::from_le_bytes(data[pos..pos+2].try_into().unwrap()) as f64; pos+=2;
             let num_glyphs = u16::from_le_bytes(data[pos..pos+2].try_into().unwrap()) as usize; pos+=2;
+            if pos+1 > data.len() { return Err("trunc alias_flag".into()); }
+            let alias_flag = data[pos]; pos+=1;
+            if alias_flag == 1 {
+                if pos+4 > data.len() { return Err("trunc alias target".into()); }
+                let target = u32::from_le_bytes(data[pos..pos+4].try_into().unwrap()) as usize; pos+=4;
+                if target >= ordered.len() { return Err(format!("alias target {target} out of range {}", ordered.len())); }
+                let cloned = ordered[target].clone();
+                fonts.insert(font_key, FontMmapIndex {
+                    file_hash: cloned.file_hash,
+                    upem: cloned.upem,
+                    num_glyphs: cloned.num_glyphs,
+                    glyphs_off: cloned.glyphs_off,
+                    cmap_off: cloned.cmap_off,
+                    cmap_len: cloned.cmap_len,
+                    single_tables: cloned.single_tables.clone(),
+                    format1_tables: cloned.format1_tables.clone(),
+                    format2_tables: cloned.format2_tables.clone(),
+                    case_single_tables: cloned.case_single_tables.clone(),
+                    case_format1_tables: cloned.case_format1_tables.clone(),
+                    case_format2_tables: cloned.case_format2_tables.clone(),
+                    pair_groups: cloned.pair_groups.clone(),
+                    case_pair_groups: cloned.case_pair_groups.clone(),
+                    single_groups: cloned.single_groups.clone(),
+                    case_single_groups: cloned.case_single_groups.clone(),
+                    pair_first_present_off: cloned.pair_first_present_off,
+                });
+                // need to push same clone into ordered for future alias chaining
+                ordered.push(ordered[target].clone());
+                continue;
+            }
             let glyphs_off = pos;
             let glyphs_bytes = num_glyphs*10;
             if pos+glyphs_bytes > data.len() { return Err("trunc glyphs".into()); }
@@ -2112,9 +2312,9 @@ impl GeometryCache {
                     let bytes = pc*rec_sz;
                     if pos+bytes > data.len() { return Err("trunc f1 pairs".into()); }
                     pos+=bytes;
-                    pair_sets.push(PairSetIndex { pairs_off, pair_count: pc });
+                    pair_sets.push(PairSetIndex { pairs_off, pair_count: pc, second_map_off: 0, second_map_len: 0 });
                 }
-                f1_tables.push(Format1Index { coverage_off: cov_off, coverage_len: cov_len, val_fmt1: vf1, val_fmt2: vf2, sz1, sz2, pair_sets, lookup_id, subtable_pos, coverage_map_off: 0 });
+                f1_tables.push(Format1Index { coverage_off: cov_off, coverage_len: cov_len, val_fmt1: vf1, val_fmt2: vf2, sz1, sz2, pair_sets, lookup_id, subtable_pos, coverage_map_off: 0, coverage_map_is_u8: false });
             }
 
             let mut f2_tables = Vec::with_capacity(n_f2);
@@ -2137,9 +2337,8 @@ impl GeometryCache {
                 let vf2u = vf2 as u16;
                 let sz1 = popcnt4(vf1u);
                 let sz2 = popcnt4(vf2u);
-                // cd1
                 if pos+2 > data.len() { return Err("trunc f2 cd1 fmt".into()); }
-                let fmt1 = data[pos]; pos+=2; // fmt + pad
+                let fmt1 = data[pos]; pos+=2;
                 if pos+2 > data.len() { return Err("trunc f2 cd1 cnt".into()); }
                 let cd1_cnt = u16::from_le_bytes(data[pos..pos+2].try_into().unwrap()) as usize; pos+=2;
                 if pos+2 > data.len() { return Err("trunc f2 cd1 start".into()); }
@@ -2155,7 +2354,6 @@ impl GeometryCache {
                     pos+=cd1_cnt*6;
                     ClassDefIndex::Format2 { count: cd1_cnt, ranges_off }
                 };
-                // cd2
                 if pos+2 > data.len() { return Err("trunc f2 cd2 fmt".into()); }
                 let fmt2 = data[pos]; pos+=2;
                 if pos+2 > data.len() { return Err("trunc f2 cd2 cnt".into()); }
@@ -2177,10 +2375,9 @@ impl GeometryCache {
                 let matrix_bytes = c1c*c2c*(sz1+sz2)*2;
                 if pos+matrix_bytes > data.len() { return Err("trunc f2 matrix".into()); }
                 pos+=matrix_bytes;
-                f2_tables.push(Format2Index { coverage_off: cov_off, coverage_len: cov_len, class1_count: c1c, class2_count: c2c, val_fmt1: vf1u, val_fmt2: vf2u, sz1, sz2, class1_def: cd1, class2_def: cd2, matrix_off, lookup_id, subtable_pos, coverage_map_off: 0, class1_map_off: 0, class2_map_off: 0 });
+                f2_tables.push(Format2Index { coverage_off: cov_off, coverage_len: cov_len, class1_count: c1c, class2_count: c2c, val_fmt1: vf1u, val_fmt2: vf2u, sz1, sz2, class1_def: cd1, class2_def: cd2, matrix_off, lookup_id, subtable_pos, coverage_map_off: 0, coverage_map_is_u8: false, class1_map_off: 0, class1_map_is_u8: false, class2_map_off: 0, class2_map_is_u8: false });
             }
 
-            // ── v15 case/cpsp tables ──
             if pos+6 > data.len() { return Err("trunc case counts".into()); }
             let n_case_single = u16::from_le_bytes(data[pos..pos+2].try_into().unwrap()) as usize; pos+=2;
             let n_case_f1 = u16::from_le_bytes(data[pos..pos+2].try_into().unwrap()) as usize; pos+=2;
@@ -2232,9 +2429,9 @@ impl GeometryCache {
                     let bytes = pc*rec_sz;
                     if pos+bytes > data.len() { return Err("trunc case f1 pairs".into()); }
                     pos+=bytes;
-                    pair_sets.push(PairSetIndex { pairs_off, pair_count: pc });
+                    pair_sets.push(PairSetIndex { pairs_off, pair_count: pc, second_map_off: 0, second_map_len: 0 });
                 }
-                case_f1_tables.push(Format1Index { coverage_off: cov_off, coverage_len: cov_len, val_fmt1: vf1, val_fmt2: vf2, sz1, sz2, pair_sets, lookup_id, subtable_pos, coverage_map_off: 0 });
+                case_f1_tables.push(Format1Index { coverage_off: cov_off, coverage_len: cov_len, val_fmt1: vf1, val_fmt2: vf2, sz1, sz2, pair_sets, lookup_id, subtable_pos, coverage_map_off: 0, coverage_map_is_u8: false });
             }
             let mut case_f2_tables = Vec::with_capacity(n_case_f2);
             for _ in 0..n_case_f2 {
@@ -2294,11 +2491,9 @@ impl GeometryCache {
                 let matrix_bytes = c1c*c2c*(sz1+sz2)*2;
                 if pos+matrix_bytes > data.len() { return Err("trunc case f2 matrix".into()); }
                 pos+=matrix_bytes;
-                case_f2_tables.push(Format2Index { coverage_off: cov_off, coverage_len: cov_len, class1_count: c1c, class2_count: c2c, val_fmt1: vf1u, val_fmt2: vf2u, sz1, sz2, class1_def: cd1, class2_def: cd2, matrix_off, lookup_id, subtable_pos, coverage_map_off: 0, class1_map_off: 0, class2_map_off: 0 });
+                case_f2_tables.push(Format2Index { coverage_off: cov_off, coverage_len: cov_len, class1_count: c1c, class2_count: c2c, val_fmt1: vf1u, val_fmt2: vf2u, sz1, sz2, class1_def: cd1, class2_def: cd2, matrix_off, lookup_id, subtable_pos, coverage_map_off: 0, coverage_map_is_u8: false, class1_map_off: 0, class1_map_is_u8: false, class2_map_off: 0, class2_map_is_u8: false });
             }
 
-            // ── v16: pre-grouped lookup groups ──
-            // pair groups
             if pos+2 > data.len() { return Err("trunc v16 pair_groups count".into()); }
             let n_pg = u16::from_le_bytes(data[pos..pos+2].try_into().unwrap()) as usize; pos+=2;
             let mut pair_groups = Vec::with_capacity(n_pg);
@@ -2333,7 +2528,6 @@ impl GeometryCache {
                 }
                 case_pair_groups.push(PairGroupIndex { lookup_id, entries });
             }
-            // single groups
             if pos+2 > data.len() { return Err("trunc v16 single_groups count".into()); }
             let n_sg = u16::from_le_bytes(data[pos..pos+2].try_into().unwrap()) as usize; pos+=2;
             let mut single_groups = Vec::with_capacity(n_sg);
@@ -2367,53 +2561,97 @@ impl GeometryCache {
                 case_single_groups.push(SingleGroupIndex { lookup_id, entries });
             }
 
-            // v18 only — pair_first_present is always present, no v16/v17 compat
             let pair_first_present_off = {
-                if pos + num_glyphs > data.len() {
-                    return Err(format!("trunc v18 pair_first_present {} + {} > {}", pos, num_glyphs, data.len()));
+                let bitset_len = (num_glyphs + 7)/8;
+                if pos + bitset_len > data.len() {
+                    return Err(format!("trunc v20 pair_first_present {} + {} > {}", pos, bitset_len, data.len()));
                 }
                 let off = pos;
-                pos += num_glyphs;
+                pos += bitset_len;
                 off
             };
-            // v18: O(1) coverage and class maps — num_glyphs*2 LE per table, after pfp blob, in order f1,f2,case_f1,case_f2
+            // v20: O(1) maps compressed
             {
-                let bytes_per_map = num_glyphs * 2;
                 for tbl in &mut f1_tables {
-                    if pos + bytes_per_map > data.len() { return Err("trunc v18 f1 coverage_map".into()); }
+                    if pos + 1 > data.len() { return Err("trunc v20 f1 map flag".into()); }
+                    let flag = data[pos]; pos+=1;
+                    let is_u8 = flag == 0;
+                    tbl.coverage_map_is_u8 = is_u8;
+                    let map_bytes = if is_u8 { num_glyphs } else { num_glyphs*2 };
+                    if pos + map_bytes > data.len() { return Err("trunc v20 f1 coverage_map".into()); }
                     tbl.coverage_map_off = pos;
-                    pos += bytes_per_map;
+                    pos += map_bytes;
                 }
                 for tbl in &mut f2_tables {
-                    if pos + bytes_per_map > data.len() { return Err("trunc v18 f2 coverage_map".into()); }
+                    if pos + 1 > data.len() { return Err("trunc v20 f2 flags".into()); }
+                    let flags = data[pos]; pos+=1;
+                    let cov_u8 = (flags & 0x01) == 0;
+                    let c1_u8 = (flags & 0x02) == 0;
+                    let c2_u8 = (flags & 0x04) == 0;
+                    tbl.coverage_map_is_u8 = cov_u8;
+                    tbl.class1_map_is_u8 = c1_u8;
+                    tbl.class2_map_is_u8 = c2_u8;
+                    let cov_bytes = if cov_u8 { num_glyphs } else { num_glyphs*2 };
+                    if pos + cov_bytes > data.len() { return Err("trunc v20 f2 coverage_map".into()); }
                     tbl.coverage_map_off = pos;
-                    pos += bytes_per_map;
-                    if pos + bytes_per_map > data.len() { return Err("trunc v18 f2 class1_map".into()); }
+                    pos += cov_bytes;
+                    let c1_bytes = if c1_u8 { num_glyphs } else { num_glyphs*2 };
+                    if pos + c1_bytes > data.len() { return Err("trunc v20 f2 class1_map".into()); }
                     tbl.class1_map_off = pos;
-                    pos += bytes_per_map;
-                    if pos + bytes_per_map > data.len() { return Err("trunc v18 f2 class2_map".into()); }
+                    pos += c1_bytes;
+                    let c2_bytes = if c2_u8 { num_glyphs } else { num_glyphs*2 };
+                    if pos + c2_bytes > data.len() { return Err("trunc v20 f2 class2_map".into()); }
                     tbl.class2_map_off = pos;
-                    pos += bytes_per_map;
+                    pos += c2_bytes;
                 }
                 for tbl in &mut case_f1_tables {
-                    if pos + bytes_per_map > data.len() { return Err("trunc v18 case_f1 coverage_map".into()); }
-                    tbl.coverage_map_off = pos;
-                    pos += bytes_per_map;
+                    tbl.coverage_map_off = 0;
+                    tbl.coverage_map_is_u8 = false;
                 }
                 for tbl in &mut case_f2_tables {
-                    if pos + bytes_per_map > data.len() { return Err("trunc v18 case_f2 coverage_map".into()); }
-                    tbl.coverage_map_off = pos;
-                    pos += bytes_per_map;
-                    if pos + bytes_per_map > data.len() { return Err("trunc v18 case_f2 class1_map".into()); }
-                    tbl.class1_map_off = pos;
-                    pos += bytes_per_map;
-                    if pos + bytes_per_map > data.len() { return Err("trunc v18 case_f2 class2_map".into()); }
-                    tbl.class2_map_off = pos;
-                    pos += bytes_per_map;
+                    tbl.coverage_map_off = 0;
+                    tbl.coverage_map_is_u8 = false;
+                    tbl.class1_map_off = 0;
+                    tbl.class1_map_is_u8 = false;
+                    tbl.class2_map_off = 0;
+                    tbl.class2_map_is_u8 = false;
+                }
+            }
+            // v19: Format1 second-gid hash maps O(1)
+            for tbl in &mut f1_tables {
+                for ps in &mut tbl.pair_sets {
+                    if pos+2 > data.len() { return Err("trunc v19 f1 second_map len".into()); }
+                    let map_len = u16::from_le_bytes(data[pos..pos+2].try_into().unwrap()) as usize; pos+=2;
+                    if map_len==0 {
+                        ps.second_map_off = 0;
+                        ps.second_map_len = 0;
+                    } else {
+                        if pos+map_len*2 > data.len() { return Err("trunc v19 f1 second_map entries".into()); }
+                        ps.second_map_off = pos;
+                        ps.second_map_len = map_len;
+                        pos += map_len*2;
+                    }
+                }
+            }
+            for tbl in &mut case_f1_tables {
+                for ps in &mut tbl.pair_sets {
+                    if pos+2 > data.len() { return Err("trunc v19 case_f1 second_map len".into()); }
+                    let map_len = u16::from_le_bytes(data[pos..pos+2].try_into().unwrap()) as usize; pos+=2;
+                    if map_len==0 {
+                        ps.second_map_off = 0;
+                        ps.second_map_len = 0;
+                    } else {
+                        if pos+map_len*2 > data.len() { return Err("trunc v19 case_f1 second_map entries".into()); }
+                        ps.second_map_off = pos;
+                        ps.second_map_len = map_len;
+                        pos += map_len*2;
+                    }
                 }
             }
 
-            fonts.insert(font_key, FontMmapIndex { file_hash, upem, num_glyphs, glyphs_off, cmap_off, cmap_len, single_tables, format1_tables: f1_tables, format2_tables: f2_tables, case_single_tables, case_format1_tables: case_f1_tables, case_format2_tables: case_f2_tables, pair_groups, case_pair_groups, single_groups, case_single_groups, pair_first_present_off });
+            let idx = FontMmapIndex { file_hash, upem, num_glyphs, glyphs_off, cmap_off, cmap_len, single_tables, format1_tables: f1_tables, format2_tables: f2_tables, case_single_tables, case_format1_tables: case_f1_tables, case_format2_tables: case_f2_tables, pair_groups, case_pair_groups, single_groups, case_single_groups, pair_first_present_off };
+            fonts.insert(font_key, idx.clone());
+            ordered.push(idx);
         }
         Ok((Self { mmap, fonts, _cache_path: path.to_path_buf() }, catalog_hash))
     }
