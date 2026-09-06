@@ -63,13 +63,13 @@ cargo build --release
 
 | Tool | Install | Purpose |
 |------|---------|---------|
-| `tesseract` | `apt install tesseract-ocr tesseract-ocr-eng tesseract-ocr-osd` then replace `eng.traineddata` with `tessdata_best` (15M) from https://github.com/tesseract-ocr/tessdata_best | OCR engine (eng best + osd) |
+| `tesseract` | `apt install tesseract-ocr` | OCR engine |
 | `pdftoppm` | `apt install poppler-utils` | PDF → raster |
 
 ### Install all recommended fonts
 
 ```bash
-bash tools/install-all-fonts.sh
+bash scripts/install-all-fonts.sh
 ```
 
 The script is idempotent and installs MS Core Fonts, Google Fonts families,
@@ -182,7 +182,7 @@ PDFs reference standard names all viewers understand. See
 | Script | Purpose |
 |--------|---------|
 | `tools/rasterize.py` | Rasterize vector PDFs (`rasterize`, `prepare` subcommands) |
-| `tools/install-all-fonts.sh` | Install all recommended fonts (MS Core, Google Fonts, typewriter, LaTeX) |
+| `scripts/install-all-fonts.sh` | Install all recommended fonts (MS Core, Google Fonts, typewriter, LaTeX) |
 | `test-docs/gen-specimen.py` | Generate the 6-page font timeline specimen PDF |
 | `test-docs/gen-resolution-series.py` | Generate resolution degradation series (600→fax DPI) |
 | `test-docs/gen-ligature-test.py` | Generate the ligature test PDF |
@@ -257,7 +257,7 @@ The test suite requires **Microsoft core TTF fonts** and the **specimen fonts**
 
 ```bash
 # Install required fonts (requires sudo)
-./tools/install-all-fonts.sh
+./scripts/install-all-fonts.sh
 ```
 
 ### Tests

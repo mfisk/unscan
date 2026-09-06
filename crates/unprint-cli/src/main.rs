@@ -233,7 +233,7 @@ fn load_fonts(args: &cli::Args, _classifier: &mut dyn classifier::Classifier) ->
                 fe.family_name = format!("{} [{}]", fe.family_name, era.name());
             }
             fe.data = Vec::new(); // drop bytes, will be loaded via FontCache on demand
-            // Recompute cache to include |vintage=ERA and bracket notation so font_key is unique and sorted deterministically
+            // Recompute cache to include |vintage=ERA|var so font_key is unique and sorted deterministically
             fe.recompute_font_key_cache();
             vintage_entries.push(fe);
         }
@@ -907,9 +907,7 @@ fn run(args: &cli::Args, classifier: &mut dyn classifier::Classifier) -> Result<
                             features::contrast_normalize_char(raw)
                         };
                         let verify_words = lm.corrected_words.as_deref().unwrap_or(&line.words);
-                        // Honor the winning font's ligature determination via the
-                        // durable segmentation signal carried in LineMatch.
-                        let allow_liga = lm.seg_used_ligatures;
+                        let allow_liga = lm.seg_winner.as_deref() == Some("ligature");
                         let vr = verify::verify_text_region(
                             &norm_crop,
                             fd.as_slice(),
