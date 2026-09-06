@@ -7,8 +7,6 @@
 use unprint_fonts::ab_glyph::{Font, FontRef, PxScale, ScaleFont};
 use image::{GrayImage, Luma, RgbImage};
 use crate::ocr::TextRegion;
-use std::cell::RefCell;
-use std::collections::{HashMap, VecDeque};
 
 // ---------------------------------------------------------------------------
 // FreeType variable-font axis coordination helper
@@ -73,42 +71,6 @@ pub struct VerifyResult {
     pub diff: Option<RgbImage>,
 }
 
-/// Measure each word's ink width on the scan crop: the horizontal ink
-/// extent of the word's box, falling back to the box width when the box
-/// is off-crop or holds no ink. Depends only on the crop and the word
-/// boxes — never on the font — so callers that verify the same line
-/// against several fonts measure once and reuse the widths across calls
-/// (redundancy F34). This is the single source of truth for the
-/// computation; `verify_text_region` takes the widths as a required
-/// parameter.
-pub fn measure_word_widths(
-    scan_crop: &GrayImage,
-    words: &[TextRegion],
-    crop_x: u32,
-    crop_y: u32,
-) -> Vec<u32> {
-    let ink_thresh = crate::ocr::INK_THRESHOLD;
-    let (crop_w, crop_h) = scan_crop.dimensions();
-    words
-        .iter()
-        .map(|wr| {
-            let x_off = wr.x.saturating_sub(crop_x);
-            let y_off = wr.y.saturating_sub(crop_y);
-            if x_off < crop_w && y_off < crop_h {
-                let bw = wr.width.min(crop_w.saturating_sub(x_off));
-                let bh = wr.height.min(crop_h.saturating_sub(y_off));
-                if bw >= 1 && bh >= 1 {
-                    let (il, ir) = crate::ocr::ink_horizontal_extent(
-                        scan_crop, y_off, y_off + bh, x_off, x_off + bw, ink_thresh
-                    );
-                    let mw = ir.saturating_sub(il);
-                    if mw >= 1 { mw } else { wr.width }
-                } else { wr.width }
-            } else { wr.width }
-        })
-        .collect()
-}
-
 /// Verify a vectorised text region by:
 /// 1. Computing an aspect-ratio penalty (natural advance widths vs OCR bbox widths)
 /// 2. Rendering with per-word width scaling (so ZNCC can compare glyph shapes)
@@ -117,12 +79,7 @@ pub fn measure_word_widths(
 pub fn verify_text_region(
     scan_crop: &GrayImage,
     font_data: &[u8],
-    // Path of the font file font_data was read from (F34): the cache key
-    // for the FreeType face and shaped words. The path — not the font key —
-    // identifies the bytes: two files can share a key (same name+version),
-    // but one path is one file, and fonts never change mid-run.
-    font_path: &std::path::Path,
-    text: &str,
+    _text: &str,
     words: &[TextRegion],
     crop_x: u32,
     crop_y: u32,
@@ -130,17 +87,9 @@ pub fn verify_text_region(
     variant_tag: &str,
     variations: Option<&[([u8; 4], f32)]>,
     allow_liga: bool,
-    allowed_lig: u8,
     audit_dir: Option<&std::path::Path>,
     bail_below: Option<f32>,
     override_em_px: Option<f32>,
-    frac_width: Option<f32>,
-    // Per-word ink widths from `measure_word_widths` on this same crop and
-    // these same word boxes (F34): the widths depend only on the scan, not
-    // the font, so callers verifying one line against several fonts measure
-    // once and pass the result in. Required, not optional: every caller
-    // measures (or reuses) explicitly, and the length must match `words`.
-    measured_widths: &[u32],
 ) -> VerifyResult {
     let (w, h) = scan_crop.dimensions();
 
@@ -156,37 +105,14 @@ pub fn verify_text_region(
     // in page_cache.rs.  Do NOT re-derive ink runs, split, or merge words here —
     // spacing and splitting are handled up front.  Use the boxes as-is with
     // uniform line scale (midpoint-derived override_em_px).
-    // Compute word widths from our crop's ink measurement, not Tesseract's bbox.
-    // Tesseract widths are approximate; our ink_horizontal_extent measures actual ink.
-    // The widths arrive precomputed (see `measure_word_widths`): they depend
-    // only on the scan crop and the word boxes, never on the font, so the
-    // caller measures once per line and reuses them across verify calls (F34).
-    assert_eq!(
-        measured_widths.len(),
-        words.len(),
-        "measured_widths must cover every word"
-    );
     let placements: Vec<WordPlacement> = words
         .iter()
-        .zip(measured_widths.iter())
-        .map(|(wr, &measured_w)| {
-            let x_off = wr.x.saturating_sub(crop_x);
-            let y_off = wr.y.saturating_sub(crop_y);
-            WordPlacement {
-                // Normalize the word text for this font (Mike Nov 6, 2026):
-                // a lig font renders "fi" as the single U+FB01 glyph.
-                // HarfBuzz cannot invent that ligature (Trebuchet has no
-                // GSUB liga), so the text itself must carry the FB01
-                // character before shaping. A nolig font keeps f, i
-                // separate (allowed_lig == 0 → identity).
-                text: crate::char_render::normalize_seq_for_lig_mask(
-                    &wr.text.chars().collect::<Vec<char>>(), allowed_lig,
-                ).into_iter().collect(),
-                x_off,
-                y_off,
-                width: measured_w,
-                height: wr.height,
-            }
+        .map(|wr| WordPlacement {
+            text: wr.text.clone(),
+            x_off: wr.x.saturating_sub(crop_x),
+            y_off: wr.y.saturating_sub(crop_y),
+            width: wr.width,
+            height: wr.height,
         })
         .collect();
 
@@ -194,32 +120,8 @@ pub fn verify_text_region(
     // final (post-processed) word bboxes.  This matches what the report
     // draws as the "final" cyan-dashed boxes.
 
-    // If fractional (subpixel) line width is provided, use it to compute
-    // override_em_px directly, bypassing the per-word median.
-    // Normalize the full line text the same way as the word placements
-    // (lig font: "fi" → FB01; nolig: unchanged) for the width match.
-    let norm_text: String = crate::char_render::normalize_seq_for_lig_mask(
-        &text.chars().collect::<Vec<char>>(), allowed_lig,
-    ).into_iter().collect();
-    let override_em_px = if let Some(fw) = frac_width {
-        if fw.is_finite() && fw >= 4.0 && fw <= 5000.0 {
-            if let Some(em) = crate::layout::width_matched_em_px_shaped(
-                font_data, &norm_text, fw, variant_tag, variations, allow_liga,
-            ) {
-                Some(em)
-            } else {
-                override_em_px
-            }
-        } else {
-            override_em_px
-        }
-    } else {
-        override_em_px
-    };
-
     let full_render = match render_via_freetype_scaled(
         font_data,
-        font_path,
         &placements,
         w,
         h,
@@ -325,86 +227,8 @@ pub fn compute_colored_diff(a: &GrayImage, b: &GrayImage) -> RgbImage {
 // Word-by-word renderer — width-matched scale, natural height
 // ---------------------------------------------------------------------------
 
-// ---------------------------------------------------------------------------
-// Verify caches (F34): verify_text_region runs up to 3x per line with the
-// same font, and each call used to re-parse faces and re-shape every word.
-// All caches are thread-local: match_lines runs lines on a rayon pool, and
-// neither FreeType faces nor the shaping cache are shared across threads.
-// ---------------------------------------------------------------------------
-
-// Variation coordinates as (tag, f32 bits): f32 has no Hash/Eq, so cache
-// keys carry the bit pattern. Two variation sets with equal bits shape and
-// render identically.
-fn variation_bits(variations: Option<&[([u8; 4], f32)]>) -> Vec<([u8; 4], u32)> {
-    match variations {
-        Some(vars) => vars.iter().map(|(tag, v)| (*tag, v.to_bits())).collect(),
-        None => Vec::new(),
-    }
-}
-
-// FreeType face per (font path, variations), unbounded like the rustybuzz
-// FACE_CACHE in unprint-fonts/shape.rs. Keyed by path, not font key: the
-// path identifies the bytes (two files can share a key). A cached face is
-// re-sized on every use — size is per-call state; variations are in the key
-// so they are applied once at creation.
-// No 'static library is needed: Face<Vec<u8>> owns the font bytes, and
-// Face::from_raw takes its own C-level library reference, so the face
-// keeps the underlying FT_Library alive after the creating Library drops
-// (Face::drop releases that reference). Faces are used in place via
-// get_mut — never cloned, since a clone would share the same FT_Face
-// and its mutable size/glyph-slot state.
-type FtFaceKey = (std::path::PathBuf, Vec<([u8; 4], u32)>);
-thread_local! {
-    static FT_FACE_CACHE: RefCell<HashMap<FtFaceKey, unprint_fonts::freetype::Face<Vec<u8>>>> =
-        RefCell::new(HashMap::new());
-}
-
-// Shaped words per (font path, variations, text, variant tag, allow_liga).
-// Shaping outputs are font-unit values, independent of render size, so the
-// em never enters the key. FIFO-capped (not LRU: promotion would scan the
-// order deque per hit; insertion order is enough for the per-page working
-// set, and eviction just re-shapes). Entries are small (a few short Vecs).
-const SHAPE_CACHE_CAP: usize = 4096;
-type ShapeKey = (std::path::PathBuf, Vec<([u8; 4], u32)>, String, String, bool);
-thread_local! {
-    static SHAPE_CACHE: RefCell<HashMap<ShapeKey, crate::layout::ShapedWord>> =
-        RefCell::new(HashMap::new());
-    static SHAPE_CACHE_ORDER: RefCell<VecDeque<ShapeKey>> = RefCell::new(VecDeque::new());
-}
-
-fn shape_word_cached(
-    face: &unprint_fonts::rustybuzz::Face,
-    features: &[unprint_fonts::rustybuzz::Feature],
-    text: &str,
-    allow_liga: bool,
-    key: &ShapeKey,
-) -> Option<crate::layout::ShapedWord> {
-    if let Some(shaped) = SHAPE_CACHE.with(|cache| cache.borrow().get(key).cloned()) {
-        return Some(shaped);
-    }
-    let shaped = crate::layout::shape_word(face, features, text, allow_liga)?;
-    SHAPE_CACHE.with(|cache| {
-        let mut cache = cache.borrow_mut();
-        SHAPE_CACHE_ORDER.with(|order| {
-            let mut order = order.borrow_mut();
-            while cache.len() >= SHAPE_CACHE_CAP {
-                match order.pop_front() {
-                    Some(old) => {
-                        cache.remove(&old);
-                    }
-                    None => break,
-                }
-            }
-            cache.insert(key.clone(), shaped.clone());
-            order.push_back(key.clone());
-        });
-    });
-    Some(shaped)
-}
-
 fn render_via_freetype_scaled(
     font_data: &[u8],
-    font_path: &std::path::Path,
     words: &[WordPlacement],
     canvas_w: u32,
     canvas_h: u32,
@@ -421,7 +245,6 @@ fn render_via_freetype_scaled(
     // sidebearing correction and should be the only render path.
     render_via_freetype(
         font_data,
-        font_path,
         words,
         canvas_w,
         canvas_h,
@@ -437,7 +260,6 @@ fn render_via_freetype_scaled(
 /// Subpixel glyph positioning, no intermediate PDF, no subprocess.
 fn render_via_freetype(
     font_data: &[u8],
-    font_path: &std::path::Path,
     words: &[WordPlacement],
     canvas_w: u32,
     canvas_h: u32,
@@ -447,6 +269,12 @@ fn render_via_freetype(
     allow_liga: bool,
     override_em_px: Option<f32>,
 ) -> Option<GrayImage> {
+    use std::cell::RefCell;
+
+    thread_local! {
+        static FT_LIB: RefCell<Option<unprint_fonts::freetype::Library>> = RefCell::new(None);
+    }
+
     // Compute font size from ab_glyph (consistent with coarse scoring).
     // Compute per-word em_px using rustybuzz (shaped advances with
     // sidebearing correction).  No ab_glyph fallback — it lacks sidebearing
@@ -459,58 +287,32 @@ fn render_via_freetype(
             font_ref.set_variation(tag, *val);
         }
     }
-    // One rustybuzz face for this call (F34): width_matched_em_px_shaped
-    // used to parse a fresh face per word for the em, and the render parsed
-    // another. Shaping is a pure function of (face, features, text), so one
-    // face serves every word here.
-    let mut buzz_face = unprint_fonts::rustybuzz::Face::from_slice(font_data, 0)?;
-    if let Some(vars) = variations {
-        for (tag, val) in vars {
-            let t = unprint_fonts::ttf_parser::Tag::from_bytes(tag);
-            buzz_face.set_variation(t, *val);
-        }
-    }
-    let ot_features = crate::layout::ot_features(variant_tag);
-    let var_bits = variation_bits(variations);
-    // Shape each word once (F34): previously each word was shaped once for
-    // the em (inside width_matched_em_px_shaped) and again for the render.
-    // The shaped word is reused for both, and cached across calls.
-    let shaped_words: Vec<Option<crate::layout::ShapedWord>> = words
-        .iter()
-        .map(|w| {
-            if w.text.is_empty() || w.width < 1 {
-                None
-            } else {
-                let key = (
-                    font_path.to_path_buf(),
-                    var_bits.clone(),
-                    w.text.clone(),
-                    variant_tag.to_string(),
-                    allow_liga,
-                );
-                shape_word_cached(&buzz_face, &ot_features, &w.text, allow_liga, &key)
-            }
-        })
-        .collect();
     // Font size: prefer midpoint-derived override (scale = obs_span/pred_span * upem)
     // which reuses the exact scale calculation from geometry scoring.
     // If no override is provided, fall back to width-matched median (legacy).
-    let line_em_px: f32 = match override_em_px {
-        Some(ov) if ov.is_finite() && (4.0..=500.0).contains(&ov) => ov,
-        // Invalid or absent override — fall through to width-matched.
-        // (Was two copy-pasted filter_map blocks; the branches were identical.)
-        _ => {
-            let mut ems: Vec<f32> = words
-                .iter()
-                .zip(shaped_words.iter())
-                .filter_map(|(w, s)| s.as_ref()?.ink_matched_em_px(w.width as f32))
-                .collect();
-            if ems.is_empty() {
-                return None;
-            }
-            ems.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
-            ems[ems.len() / 2]
+    let line_em_px: f32 = if let Some(ov) = override_em_px {
+        if ov.is_finite() && ov >= 4.0 && ov <= 500.0 {
+            ov
+        } else {
+            // Invalid override — fall through to width-matched
+            let mut ems: Vec<f32> = words.iter()
+                .filter(|w| !w.text.is_empty() && w.width >= 1)
+                .filter_map(|w| crate::layout::width_matched_em_px_shaped(
+                    font_data, &w.text, w.width as f32, variant_tag, variations, allow_liga,
+                )).collect();
+            if ems.is_empty() { return None; }
+            ems.sort_by(|a,b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
+            ems[ems.len()/2]
         }
+    } else {
+        let mut ems: Vec<f32> = words.iter()
+            .filter(|w| !w.text.is_empty() && w.width >= 1)
+            .filter_map(|w| crate::layout::width_matched_em_px_shaped(
+                font_data, &w.text, w.width as f32, variant_tag, variations, allow_liga,
+            )).collect();
+        if ems.is_empty() { return None; }
+        ems.sort_by(|a,b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
+        ems[ems.len()/2]
     };
 
     // Pad the render canvas so italic overshoot / wide terminal strokes
@@ -534,82 +336,33 @@ fn render_via_freetype(
     // Baseline centred in the (possibly taller) canvas
     let baseline_y = ((render_h as f32 - ink_h2) / 2.0 + sf2.ascent()) as f64;
 
-    let units_per_em = buzz_face.units_per_em() as f64;
-    let px_per_unit = render_em as f64 / units_per_em;
-
-    // FreeType face: cached per (font path, variation bits) (F34) for
-    // STATIC fonts — a face parse per verify call was the redundant setup
-    // this finding removes. The face is used in place via get_mut — never
-    // cloned, since a clone would share the same FT_Face and its mutable
-    // size/glyph-slot state. A thread-local Library creates faces on cache
-    // miss; the face keeps the library alive through its own C-level
-    // reference.
-    //
-    // VARIABLE fonts (variations is Some) do NOT use the cache: they get a
-    // fresh face per call, exactly as the original code did. Reusing a
-    // variable-font face across verify calls renders differently — BAP 840
-    // moved 14 lines (all IBMPlexSans winners, max sim delta 0.0126) while
-    // the lob stayed bit-identical. The face carries mutable variation /
-    // hinter state that a fresh face does not, and re-applying the variation
-    // coordinates after set_char_size on a reused face does not restore the
-    // original render. Fresh-face-per-call is the known-good behavior here;
-    // the shaping cache and shared buzz face still apply.
-    thread_local! {
-        static FT_LIB: RefCell<Option<unprint_fonts::freetype::Library>> = RefCell::new(None);
-    }
-    // Fresh face for variable fonts, created up front so the render below
-    // can use one `ft_face` binding for both paths. Face creation failure
-    // fails the render, as the original code did (`.ok()?`).
-    let mut fresh_face: Option<unprint_fonts::freetype::Face<Vec<u8>>> = None;
-    if variations.is_some() {
-        fresh_face = Some(FT_LIB.with(|lib_cell| -> Option<unprint_fonts::freetype::Face<Vec<u8>>> {
-            let mut borrow = lib_cell.borrow_mut();
-            if borrow.is_none() {
-                *borrow = unprint_fonts::freetype::Library::init().ok();
-            }
-            let lib = borrow.as_ref()?;
-            lib.new_memory_face2(font_data.to_vec(), 0).ok()
-        })?);
-    }
-    let ft_result: Option<GrayImage> = FT_FACE_CACHE.with(|cell| {
-        let mut cache = cell.borrow_mut();
-        let ft_face: &mut unprint_fonts::freetype::Face<Vec<u8>> = if let Some(f) = fresh_face.as_mut() {
-            f
-        } else {
-            let key: FtFaceKey = (font_path.to_path_buf(), var_bits.clone());
-            if !cache.contains_key(&key) {
-                let face = FT_LIB.with(|lib_cell| -> Option<unprint_fonts::freetype::Face<Vec<u8>>> {
-                    let mut borrow = lib_cell.borrow_mut();
-                    if borrow.is_none() {
-                        *borrow = unprint_fonts::freetype::Library::init().ok();
-                    }
-                    let lib = borrow.as_ref()?;
-                    lib.new_memory_face2(font_data.to_vec(), 0).ok()
-                })?;
-                cache.insert(key.clone(), face);
-            }
-            cache.get_mut(&key)?
-        };
-        // render_em is in pixels. Use 72 DPI so points==pixels (pixels-as-points).
-        // This is intentional, not a hack: we need pixel-exact rasterization
-        // matching the scan's pixel grid. Using 300 DPI with pt size causes
-        // FreeType to use a different internal scale, introducing subpixel
-        // differences that regress ZNCC (measured: -9 hits, -0.0082 ZNCC).
-        // Size is per-call state: reset on every use, since a cached face
-        // keeps the previous call's size.
+    // Set up FreeType (reuse thread-local library)
+    let ft_result: Option<GrayImage> = FT_LIB.with(|cell| {
+        let mut borrow = cell.borrow_mut();
+        if borrow.is_none() {
+            *borrow = unprint_fonts::freetype::Library::init().ok();
+        }
+        let lib = borrow.as_ref()?;
+        let ft_face = lib.new_memory_face2(font_data.to_vec(), 0).ok()?;
         let size_26_6 = (render_em as f64 * 64.0) as isize;
         ft_face.set_char_size(size_26_6, size_26_6, 72, 72).ok()?;
 
-        // Variations MUST be applied AFTER set_char_size, as the original
-        // code did. Applying them before sizing (e.g. once at face
-        // creation) renders variable fonts differently: lob p1 L9 (winner
-        // IBMPlexSans-300Italic, a variable font) sim moved 0.730139 ->
-        // 0.73023695 with variations-before-size, and back to 0.730139
-        // with variations-after-size. (Only the fresh-face path above ever
-        // has variations; cached faces are static fonts.)
+        // Apply variable-font axis coordinates to FreeType face
         if let Some(vars) = variations {
-            set_ft_variations(ft_face, font_data, vars);
+            set_ft_variations(&ft_face, font_data, vars);
         }
+
+    // Set up rustybuzz for shaping
+    let mut buzz_face = unprint_fonts::rustybuzz::Face::from_slice(font_data, 0)?;
+    if let Some(vars) = variations {
+        for (tag, val) in vars {
+            let t = unprint_fonts::ttf_parser::Tag::from_bytes(tag);
+            buzz_face.set_variation(t, *val);
+        }
+    }
+    let ot_features = crate::layout::ot_features(variant_tag);
+    let units_per_em = buzz_face.units_per_em() as f64;
+    let px_per_unit = render_em as f64 / units_per_em;
 
     let mut canvas = GrayImage::from_pixel(render_w, render_h, Luma([255u8]));
     {
@@ -617,14 +370,13 @@ fn render_via_freetype(
         let cw_us = render_w as usize;
         let canvas_raw = canvas.as_mut();
 
-        for (wi, word) in words.iter().enumerate() {
+        for word in words {
         if word.text.is_empty() || word.width < 1 {
             continue;
         }
 
-        // Shaped once per call above (F34) — ligature choice propagated
-        // from segmentation winner.
-        let shaped = match shaped_words[wi].as_ref() {
+        // Shape with shared helper — ligature choice propagated from segmentation winner
+        let shaped = match crate::layout::shape_word(&buzz_face, &ot_features, &word.text, allow_liga) {
             Some(s) => s,
             None => continue,
         };
@@ -641,8 +393,8 @@ fn render_via_freetype(
             let x_offset = shaped.x_offsets[i] as f64 * px_per_unit;
             let y_offset = shaped.y_offsets[i] as f64 * px_per_unit;
 
-            // Load glyph in FreeType (hinting enabled to match PDF rendering)
-            ft_face.load_glyph(glyph_id, unprint_fonts::freetype::face::LoadFlag::RENDER).ok()?;
+            // Load glyph in FreeType
+            ft_face.load_glyph(glyph_id, unprint_fonts::freetype::face::LoadFlag::RENDER | unprint_fonts::freetype::face::LoadFlag::NO_HINTING).ok()?;
             let glyph = ft_face.glyph();
             let bitmap = glyph.bitmap();
             let bmp_w = bitmap.width() as usize;
@@ -713,9 +465,96 @@ fn render_via_freetype(
     } else {
         Some(canvas)
     }
-    }); // end FT_FACE_CACHE.with
+    }); // end FT_LIB.with
 
     ft_result
+}
+
+/// Fallback: ab_glyph-based rendering (no OT shaping, legacy kern only).
+/// DISABLED: lacks sidebearing compensation, systematically underestimates
+/// font size by ~3%.  Kept for reference only.
+#[allow(dead_code)]
+fn render_words_ab_glyph(
+    font_data: &[u8],
+    words: &[WordPlacement],
+    canvas_w: u32,
+    canvas_h: u32,
+    overrides: Option<&[(char, u16)]>,
+) -> Option<GrayImage> {
+    use unprint_fonts::ab_glyph::point;
+    let font = FontRef::try_from_slice(font_data).ok()?;
+    let mut canvas = GrayImage::from_pixel(canvas_w, canvas_h, Luma([255u8]));
+
+    let (cw, ch) = canvas.dimensions();
+    // Raw-buffer for ab_glyph fallback min-blend.
+    let cw_us = cw as usize;
+    let canvas_raw = canvas.as_mut();
+
+    let mut all_em: Vec<f32> = words.iter()
+        .filter(|w| !w.text.is_empty() && w.width >= 1)
+        .filter_map(|w| crate::layout::width_matched_em_px(&font, &w.text, w.width as f32, overrides))
+        .collect();
+    if all_em.is_empty() {
+        return Some(canvas);
+    }
+    all_em.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
+    let line_em_px = all_em[all_em.len() / 2];
+    let line_scale = PxScale::from(line_em_px);
+    let sf_line = font.as_scaled(line_scale);
+    let line_baseline = crate::layout::ink_centered_baseline_px(&font, line_em_px, canvas_h as f32);
+
+    for word in words {
+        if word.text.is_empty() || word.width < 1 {
+            continue;
+        }
+
+        let natural_adv = {
+            let mut adv = 0.0f32;
+            let mut prev: Option<unprint_fonts::ab_glyph::GlyphId> = None;
+            for c in word.text.chars() {
+                let gid = crate::char_render::resolve_glyph(&font, c, overrides);
+                if let Some(p) = prev {
+                    adv += sf_line.kern(p, gid);
+                }
+                adv += sf_line.h_advance(gid);
+                prev = Some(gid);
+            }
+            adv
+        };
+        let h_scale = if natural_adv > 0.1 { word.width as f32 / natural_adv } else { 1.0 };
+
+        let mut cx = word.x_off as f32;
+        let mut prev: Option<unprint_fonts::ab_glyph::GlyphId> = None;
+
+        for c in word.text.chars() {
+            let gid = crate::char_render::resolve_glyph(&font, c, overrides);
+            if let Some(p) = prev {
+                cx += sf_line.kern(p, gid) * h_scale;
+            }
+            let glyph = gid.with_scale_and_position(line_scale, point(cx, line_baseline));
+            if let Some(og) = font.outline_glyph(glyph) {
+                let bounds = og.px_bounds();
+                let bx = bounds.min.x as i32;
+                let by = bounds.min.y as i32;
+                og.draw(|gx, gy, cov| {
+                    let px = gx as i32 + bx;
+                    let py = gy as i32 + by;
+                    if px >= 0 && py >= 0 && (px as u32) < cw && (py as u32) < ch {
+                        let val = (255.0 * (1.0 - cov)) as u8;
+                        let idx = py as usize * cw_us + px as usize;
+                        let cur = canvas_raw[idx];
+                        if val < cur {
+                            canvas_raw[idx] = val;
+                        }
+                    }
+                });
+            }
+            cx += sf_line.h_advance(gid) * h_scale;
+            prev = Some(gid);
+        }
+    }
+
+    Some(canvas)
 }
 
 // ---------------------------------------------------------------------------

@@ -119,25 +119,6 @@ pub struct Args {
     #[arg(long, value_name = "PS:WEIGHT", help_heading = "Classifier")]
     pub weight_explicit: Vec<String>,
 
-    /// Resolve a font file path, exact font key, or bare PostScript name
-    /// to its verbatim catalog font_key. Pass one or more arguments.
-    /// Prints the exact font_key from the catalog (including |nokern,
-    /// [wght=...], etc.) to stdout and exits. A path resolves to the
-    /// file's best variant; an exact key is honored as-is; a bare
-    /// PostScript name resolves to the latest version, then the shared
-    /// variant preference. This is the single source of truth for
-    /// fontkeys — Python must use this instead of constructing keys
-    /// manually. Per Mike Nov 3: Python should use verbatim strings
-    /// from the catalog.
-    #[arg(long, value_name = "PATH|KEY|NAME", help_heading = "Classifier")]
-    pub resolve_fontkey: Vec<String>,
-
-    /// Export the font catalog as JSON to the given path and exit.
-    /// The JSON contains all FontEntry records with their exact font_key,
-    /// path, postscript_name, variant_tag, and variations.
-    #[arg(long, value_name = "PATH", help_heading = "Classifier")]
-    pub export_catalog_json: Option<String>,
-
     // ── Render options ─────────────────────────────────────────────
     /// Render scale multiplier for reference character images.
     #[arg(long, default_value = "1", help_heading = "Render")]
@@ -165,13 +146,6 @@ pub struct Args {
     /// Skip per-font LDA OCR correction. Env: UNPRINT_SKIP_OCR_CORRECTION
     #[arg(long, env = "UNPRINT_SKIP_OCR_CORRECTION", help_heading = "Cache")]
     pub skip_ocr_correction: bool,
-
-    /// Enable per-font LDA OCR correction (disabled by default). When set,
-    /// the per-font LDA model may replace Tesseract misreads with better
-    /// guesses; corrections are recorded as pflda_replaced in the audit.
-    /// Env: UNPRINT_OCR_CORRECTIONS
-    #[arg(long, env = "UNPRINT_OCR_CORRECTIONS", help_heading = "Processing")]
-    pub ocr_corrections: bool,
 }
 
 impl Args {
@@ -186,8 +160,6 @@ impl Args {
             render_scale: self.render_scale,
             aa,
             binarize_threshold: self.render_binarize.filter(|&v| v > 0),
-            subpixel_dx: 0.0,
-            subpixel_dy: 0.0,
         }
     }
 
@@ -226,20 +198,9 @@ impl Args {
         self.audit.is_some()
     }
 
-    /// Whether this invocation is a utility mode that takes no document:
-    /// it answers a query and exits instead of processing an input file.
-    /// New utility flags belong here, not as another early return in
-    /// validate() (Mike Nov 6, 2026: the exemption list was the kludge).
-    pub fn is_utility_mode(&self) -> bool {
-        !self.weight_explicit.is_empty()
-            || !self.resolve_fontkey.is_empty()
-            || self.export_catalog_json.is_some()
-    }
-
-    /// Validate: utility modes need neither input nor output; document
-    /// modes require input, and output unless --test.
+    /// Validate: require input and output (unless --test or non-scan mode).
     pub fn validate(&self) -> Result<(), String> {
-        if self.is_utility_mode() {
+        if !self.weight_explicit.is_empty() {
             return Ok(());
         }
         if self.input.is_none() {

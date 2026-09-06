@@ -9,7 +9,7 @@ use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 
 use unprint_fonts::ab_glyph::FontRef;
-use image::GrayImage;
+use image::{GrayImage, RgbImage};
 
 use unprint::audit::{AuditEntry, Decision};
 
@@ -106,6 +106,39 @@ fn img_to_b64_uri(img: &GrayImage) -> String {
                 img.width(),
                 img.height(),
                 image::ExtendedColorType::L8,
+            )
+            .map_err(|e| e.to_string())?;
+            std::fs::write(&dest, &buf).map_err(|e| e.to_string())?;
+            Ok(())
+        })() {
+            let prefix = writer.dir.file_name().and_then(|n| n.to_str()).unwrap_or("images");
+            format!("{prefix}/{name}")
+        } else {
+            String::new()
+        }
+    })
+}
+
+fn rgb_img_to_b64_uri(img: &RgbImage) -> String {
+    IMAGE_WRITER.with(|wcell| {
+        let binding = wcell.borrow();
+        let writer = match binding.as_ref() {
+            Some(ww) => ww,
+            None => return String::new(),
+        };
+        let idx = writer.counter.get();
+        writer.counter.set(idx + 1);
+        let name = format!("gen-{idx:05}.png");
+        let dest = writer.dir.join(&name);
+        let mut buf = Vec::new();
+        if let Ok(()) = (|| -> Result<(), String> {
+            let encoder = image::codecs::png::PngEncoder::new(&mut buf);
+            image::ImageEncoder::write_image(
+                encoder,
+                img.as_raw(),
+                img.width(),
+                img.height(),
+                image::ExtendedColorType::Rgb8,
             )
             .map_err(|e| e.to_string())?;
             std::fs::write(&dest, &buf).map_err(|e| e.to_string())?;
@@ -227,6 +260,7 @@ fn format_geo(h_ll: Option<f32>, v_ll: Option<f32>, _ll: Option<f32>, h_err: Opt
 }
 
 fn format_char_detail(
+    rank: Option<usize>,
     prob_x_u: Option<f32>,
     glyph_score: Option<f32>,
     h_ll: Option<f32>,
@@ -237,9 +271,11 @@ fn format_char_detail(
     opp_h: Option<f32>,
     opp_v: Option<f32>,
     weight: Option<f32>,
-    h_overlap_correction_px: Option<f32>,
 ) -> String {
     let mut out = String::new();
+    if let Some(r) = rank {
+        out.push_str(&format!("<span class='font-mini'>rank {r}</span>"));
+    }
     if let Some(pu) = prob_x_u {
         if !out.is_empty() { out.push_str(", "); }
         out.push_str(&format!("<span class='num'>p={pu:.1}×u</span>"));
@@ -279,9 +315,6 @@ fn format_char_detail(
                 out.push_str(&format!("h {h:.2}"));
             } else {
                 out.push_str(&format!("<span class='{cls}'>h {h:.2}</span>"));
-            }
-            if let Some(c) = h_overlap_correction_px {
-                out.push_str(&format!("<span class='overlap-graded' title='h_ll graded overlap downweight: overlap width {c:.2}px subtracted from |h_err| (clamped at 0, sign kept)'>†</span>"));
             }
         }
         if let Some(v) = v_ll {
@@ -335,15 +368,9 @@ fn find_font_in_catalog<'a>(
     gt_font_name: &str,
 ) -> Option<&'a FontEntry> {
     let gt_stripped = ground_truth::strip_subset_prefix_str(gt_font_name);
-    // Try full explicit key first (e.g. "SourceSerif4-400Italic|version=4.00|kern|nolig[wght=400,opsz=10]"),
-    // then fall back to base PostScript name for backward compatibility.
-    // A bare name (no version specified) resolves to the latest version,
-    // then the shared variant preference. Variant entries carry
-    // "PSName|tag" so they won't collide with base "PSName".
-    font_catalog
-        .iter()
-        .find(|fe| fe.font_key() == gt_stripped)
-        .or_else(|| unprint::font_scan::best_entry_for_ps_name(font_catalog.iter(), &gt_stripped))
+    // Exact PostScript name match.  Variant entries carry "PSName|tag"
+    // so they won't collide with base "PSName" — single-pass lookup.
+    font_catalog.iter().find(|fe| fe.postscript_name == gt_stripped)
 }
 
 /// Try to find a font entry matching a CI candidate font_key.
@@ -353,109 +380,36 @@ fn find_font_by_key<'a>(font_catalog: &'a [FontEntry], font_key: &str) -> Option
 
 // ── Character selection (mirrors Python pick_interesting_observations) ──────────────
 
-/// Combined geo log-likelihood (h + v) for one font side of an observation.
-/// Prefers the precomputed combined field; falls back to summing the h/v
-/// components; None when no geo data is present at all.
-fn combined_geo_ll(combined: Option<f32>, h_ll: Option<f32>, v_ll: Option<f32>) -> Option<f32> {
-    if let Some(c) = combined {
-        return Some(c);
-    }
-    match (h_ll, v_ll) {
-        (Some(h), Some(v)) => Some(h + v),
-        (Some(h), None) => Some(h),
-        (None, Some(v)) => Some(v),
-        (None, None) => None,
-    }
-}
-
 fn pick_interesting_observations<'a>(
     chars: &'a [unprint::audit::ObservationVote],
     n_show: usize,
     _n_normal: usize,
 ) -> Vec<(usize, &'a unprint::audit::ObservationVote)> {
-    // Rank by the observation's contribution to the total score difference
-    // between chosen and ground-truth fonts: |weight * (glyphD + GEO_WEIGHT * geoD)|.
-    // This is the per-obs term of the classifier's line score
-    // (logit + GEO_WEIGHT * combined_geo) * weight, so it is exactly the
-    // "biggest delta between GT and Chosen". Absolute value: an obs where GT
-    // beats chosen by a lot is just as interesting as one where chosen beats
-    // GT. The old glyph-only prob delta was blind to geo — for variants that
-    // render identical glyphs (kern vs nokern) every prob delta is 0.0 no
-    // matter how large the geo differences are, so the picker showed the
-    // first obs by index instead of the differing ones.
-    //
-    // Balanced pick (Mike Nov 7, 2026): the table must show the characters
-    // that make GT lose, not only the ones that favor GT. Take the top half
-    // by |delta| from each side — chosen-wins (signed delta > 0) and
-    // GT-wins (signed delta < 0). If one side is short, fill the remainder
-    // from the other side by |delta|. Ties (delta == 0) are never shown:
-    // they carry no information about why GT lost.
-    let geo_weight = unprint::font_match::geo_weight();
+    // Rank by the log-probability difference between chosen and ground-truth fonts.
+    // Positive delta = chosen beats GT on this char. For a miss we want to show
+    // the chars that most favored the (incorrect) chosen font, i.e. largest
+    // delta first, not |delta|. GT-better chars (negative delta) should sort last.
     let mut scored: Vec<(usize, &unprint::audit::ObservationVote, f32)> = chars.iter()
         .enumerate()
         .filter_map(|(i, c)| {
             let cp = c.chosen_prob?;
             let gp = c.gt_font_prob?;
-            // Glyph log-probability delta: positive means chosen scores better.
-            let glyph_delta = cp.max(1e-30).ln() - gp.max(1e-30).ln();
-            // Geo log-likelihood delta (combined h+v; fall back to components).
-            let chosen_geo = combined_geo_ll(c.chosen_geo_ll, c.chosen_geo_h_ll, c.chosen_geo_v_ll);
-            let gt_geo = combined_geo_ll(c.gt_geo_ll, c.gt_geo_h_ll, c.gt_geo_v_ll);
-            let geo_delta = match (chosen_geo, gt_geo) {
-                (Some(cg), Some(gg)) => cg - gg,
-                _ => 0.0,
-            };
-            // Signed contribution: positive means chosen wins (GT loses),
-            // negative means GT wins. Keep the sign for the balanced pick.
-            let delta = c.weight * (glyph_delta + geo_weight * geo_delta);
+            // log contribution delta: positive means chosen scores better on this obs
+            let delta = cp.max(1e-30).ln() - gp.max(1e-30).ln();
             Some((i, c, delta))
         })
         .collect();
-    // Sort by |contribution| descending — biggest GT-vs-chosen delta first
-    scored.sort_by(|a, b| b.2.abs().partial_cmp(&a.2.abs()).unwrap_or(std::cmp::Ordering::Equal));
+    // Sort by delta descending — strongest evidence for chosen font first
+    scored.sort_by(|a, b| b.2.partial_cmp(&a.2).unwrap_or(std::cmp::Ordering::Equal));
 
-    // Partition into chosen-wins / GT-wins, preserving |delta| order.
-    // Ties (delta == 0) are dropped: they carry no information.
-    let per_side = n_show / 2;
-    let mut chosen_wins: Vec<(usize, &unprint::audit::ObservationVote, f32)> = scored.iter()
-        .filter(|(_, _, d)| *d > 0.0)
-        .copied()
-        .collect();
-    let mut gt_wins: Vec<(usize, &unprint::audit::ObservationVote, f32)> = scored.iter()
-        .filter(|(_, _, d)| *d < 0.0)
-        .copied()
+    let mut result: Vec<(usize, &unprint::audit::ObservationVote)> = scored.iter()
+        .take(n_show)
+        .map(|&(i, c, _)| (i, c))
         .collect();
 
-    let mut result: Vec<(usize, &unprint::audit::ObservationVote)> = Vec::new();
-    for (i, c, _) in chosen_wins.drain(..per_side.min(chosen_wins.len())) {
-        result.push((i, c));
-    }
-    for (i, c, _) in gt_wins.drain(..per_side.min(gt_wins.len())) {
-        result.push((i, c));
-    }
-    // Fill any shortfall from the side with leftovers, by |delta|.
-    let mut leftovers: Vec<(usize, &unprint::audit::ObservationVote, f32)> =
-        chosen_wins.into_iter().chain(gt_wins.into_iter()).collect();
-    leftovers.sort_by(|a, b| b.2.abs().partial_cmp(&a.2.abs()).unwrap_or(std::cmp::Ordering::Equal));
-    for (i, c, _) in leftovers.into_iter().take(n_show.saturating_sub(result.len())) {
-        result.push((i, c));
-    }
-    // Ties (delta == 0) are never shown: they carry no information about
-    // why GT lost (e.g. L2 "five" has 73 ties because lig/nolig render
-    // those chars identically). The table may have fewer than n_show rows
-    // when there are not enough non-zero deltas; that is intended
-    // (Mike Nov 7, 2026).
-
-    // If no delta could be computed at all (e.g. GT probs missing for
-    // every observation), fill with worst best_prob observations so the
-    // table is not empty. This runs only when `scored` is empty, i.e. no
-    // observation had both probs. When deltas were computable but all
-    // zero (e.g. the L2 plain path, where lig/nolig render every char
-    // identically), there is nothing meaningful to show: return empty
-    // and let the caller suppress the table, instead of filling it with
-    // misleading worst-best_prob rows (Mike Nov 7, 2026; the L2 alt
-    // table showed six 'e's from this fallback).
-    if result.is_empty() && scored.is_empty() {
+    // If we didn't get enough from the delta sort (e.g. GT probs missing),
+    // fill with worst best_prob observations
+    if result.len() < n_show {
         let used: std::collections::HashSet<usize> = result.iter().map(|(i, _)| *i).collect();
         let mut by_prob: Vec<(usize, &unprint::audit::ObservationVote)> =
             chars.iter().enumerate()
@@ -471,51 +425,6 @@ fn pick_interesting_observations<'a>(
 
     result.sort_by_key(|(i, _)| *i);
     result
-}
-
-/// Whether a font is a nolig variant, from its entry's variant tag when
-/// available, else from the font key string. Every key now carries an
-/// explicit |lig or |nolig tag, so the key string is a reliable fallback.
-fn is_nolig_font(fe: Option<&FontEntry>, key: &str) -> bool {
-    if let Some(fe) = fe {
-        fe.variant_tag.contains("nolig")
-    } else {
-        key.contains("nolig")
-    }
-}
-
-/// Whether an observation is a lig-vs-nolig comparison case: its sequence
-/// carries a ligature character (U+FB00–U+FB04) AND the two compared fonts
-/// differ in lig state (one lig, one nolig). Such observations are shown
-/// IN ADDITION TO the top 6 deltas (Mike Nov 6, 2026), not instead of them.
-fn is_lig_comparison_obs(
-    cv: &unprint::audit::ObservationVote,
-    correct_nolig: bool,
-    chosen_nolig: bool,
-) -> bool {
-    if correct_nolig == chosen_nolig {
-        return false;
-    }
-    cv.seq.iter().any(|&c| matches!(c, '\u{FB00}'..='\u{FB04}'))
-}
-
-/// Append lig/nolig comparison observations to a top-6 selection, in
-/// observation order, skipping any already shown. The B′ top 6 is kept
-/// intact; the comparison rows are additional display alongside it.
-fn append_lig_comparison_obs<'a>(
-    mut shown: Vec<(usize, &'a unprint::audit::ObservationVote)>,
-    chars: &'a [unprint::audit::ObservationVote],
-    correct_nolig: bool,
-    chosen_nolig: bool,
-) -> Vec<(usize, &'a unprint::audit::ObservationVote)> {
-    for (i, cv) in chars.iter().enumerate() {
-        if is_lig_comparison_obs(cv, correct_nolig, chosen_nolig)
-            && !shown.iter().any(|(j, _)| *j == i)
-        {
-            shown.push((i, cv));
-        }
-    }
-    shown
 }
 
 // ── Crop / image lookup ─────────────────────────────────────────────────────
@@ -598,14 +507,8 @@ impl FontDataCache {
 // ── Miss classification ─────────────────────────────────────────────────────
 
 #[derive(Clone)]
-pub struct ClassifiedEntry {
-    /// Index into the entries slice this classification was computed
-    /// from. The classification holds an index, not a borrow: enrich
-    /// mutates the entries, so a borrow cannot outlive the enrich call
-    /// (the borrow is what forced a second classification pass —
-    /// redundancy F32 residual). Consumers resolve the entry from the
-    /// entries slice passed alongside this Vec.
-    entry_index: usize,
+struct ClassifiedEntry<'a> {
+    entry: &'a AuditEntry,
     actual_font: Option<String>,
     kind: MissKind,
     /// Ground-truth effective font size in PDF points (if available).
@@ -635,27 +538,16 @@ impl MissKind {
     }
 }
 
-/// Classify each audit entry against ground truth (hit / major / minor /
-/// similarity failure / kept raster / no GT). Pure function of its inputs:
-/// the caller computes it once per run and shares the result with
-/// `enrich_audit_entries`, `compute_accuracy`, and `generate_report`
-/// (redundancy F32). The result is owned data — each entry holds the
-/// index of its audit entry, not a borrow — so the single classification
-/// can be computed before enrich mutates the entries: classification
-/// reads only bbox, page, decision, font_key_matched, and
-/// similarity_pass, none of which enrich writes (it writes miss_type,
-/// expected_font, gt_text, ocr_text, ocr_correct).
-pub fn classify_entries(
-    entries: &[AuditEntry],
+fn classify_entries<'a>(
+    entries: &'a [AuditEntry],
     gt: Option<&GroundTruth>,
     dpi: u32,
     font_catalog: &[FontEntry],
     _glyph_map: &NgramGlyphMap,
-) -> Vec<ClassifiedEntry> {
+) -> Vec<ClassifiedEntry<'a>> {
     entries
         .iter()
-        .enumerate()
-        .map(|(entry_index, e)| {
+        .map(|e| {
             let bbox_px = [
                 e.bbox.x as f32,
                 e.bbox.y as f32,
@@ -674,18 +566,14 @@ pub fn classify_entries(
                 let kind = if e.decision == Decision::KeptRaster {
                     MissKind::KeptRaster
                 } else if let Some(ref actual) = actual_font {
-                    // After GT canonicalization, both sides use catalog font_keys.
-                    // Note: strip bracketed variations (e.g. "[wght=400,opsz=10]")
-                    // for the hit/miss decision — the variation details don't
-                    // affect font identity for this purpose.  The "|" variant
-                    // attributes (e.g. "|nokern") ARE significant and are kept.
-                    let actual_base = actual.split('[').next().unwrap_or(actual);
+                    // After GT canonicalization, both sides use canonical
+                    // (weight-explicit) names.  Variant entries carry
+                    // "PSName|tag" which won't match base "PSName", so
+                    // exact equality is sufficient.
                     let ps_match = e.font_key_matched.as_ref().and_then(|fk| {
                         find_font_by_key(font_catalog, fk)
                     }).map_or(false, |fe| {
-                        let fk = fe.font_key_ref();
-                        let fk_base = fk.split('[').next().unwrap_or(fk);
-                        fk_base == actual_base
+                        fe.postscript_name == *actual
                     });
 
                     if ps_match {
@@ -701,11 +589,7 @@ pub fn classify_entries(
                             .and_then(|fk| find_font_by_key(font_catalog, fk))
                             .map(|fe| fe.path.clone());
                         let gt_path = font_catalog.iter()
-                            .find(|fe| {
-                                let fk = fe.font_key_ref();
-                                fk == actual.as_str()
-                                    || fk.split('[').next().unwrap_or(fk) == actual_base
-                            })
+                            .find(|fe| fe.postscript_name == *actual)
                             .map(|fe| fe.path.clone());
 
                         let is_minor = match (picked_path, gt_path) {
@@ -726,7 +610,7 @@ pub fn classify_entries(
                 };
 
                 ClassifiedEntry {
-                    entry_index,
+                    entry: e,
                     actual_font,
                     kind,
                     gt_font_size_pt,
@@ -741,7 +625,7 @@ pub fn classify_entries(
                     MissKind::Hit
                 };
                 ClassifiedEntry {
-                    entry_index,
+                    entry: e,
                     actual_font: None,
                     kind,
                     gt_font_size_pt: None,
@@ -754,21 +638,25 @@ pub fn classify_entries(
 /// Enrich audit entries with ground-truth classification fields
 /// (`miss_type` and `expected_font`).  Call this before writing
 /// the audit JSON so downstream tools never have to parse the HTML
-/// report. Takes the run's single precomputed classification (see
-/// `classify_entries`): the classification is 1:1 with `entries` by
-/// index, so enrich reads kind and expected font from it instead of
-/// classifying a second time (redundancy F32 residual).
+/// report.
 pub fn enrich_audit_entries(
     entries: &mut [AuditEntry],
-    classified: &[ClassifiedEntry],
     gt: Option<&GroundTruth>,
     dpi: u32,
+    font_catalog: &[FontEntry],
+    glyph_map: &NgramGlyphMap,
 ) {
-    debug_assert_eq!(entries.len(), classified.len(),
-        "classification must be 1:1 with entries");
-    for (e, ce) in entries.iter_mut().zip(classified) {
-        e.miss_type = Some(ce.kind.as_str().to_string());
-        e.expected_font = ce.actual_font.clone();
+    // classify_entries produces a 1:1 parallel vec.
+    let results: Vec<(String, Option<String>)> = {
+        let classified = classify_entries(entries, gt, dpi, font_catalog, glyph_map);
+        classified
+            .iter()
+            .map(|ce| (ce.kind.as_str().to_string(), ce.actual_font.clone()))
+            .collect()
+    };
+    for (e, (kind, expected)) in entries.iter_mut().zip(results) {
+        e.miss_type = Some(kind);
+        e.expected_font = expected;
 
         // Populate GT text and OCR text comparison
         if let Some(gt) = gt {
@@ -808,20 +696,26 @@ fn find_correct_ci_candidate(
     font_catalog: &[FontEntry],
     _glyph_map: &NgramGlyphMap,
 ) -> (Option<String>, Option<f32>, Option<usize>) {
-    let gt_key = ground_truth::strip_subset_prefix_str(actual_font);
+    let gt_ps = ground_truth::strip_subset_prefix_str(actual_font);
 
-    // font_candidates is the full ranked list (no lig/plain path split:
-    // the lig/nolig fontkeys already decide the ligature question), so
-    // GT is found here whenever it was scored. The rank is the overall
-    // rank over all scored fonts.
+    // font_candidates is always the winning path (font_pipeline.rs: winner → font_scores),
+    // font_candidates_lig is the losing path. Prioritize winner, fall back to loser
+    // so GT always shows a rank when it was scored in either path (fixes p4:L23
+    // where Caladea-400 is rank 1 in plain (loser) when ligature wins, and
+    // would otherwise show "not scored").
     let primary = &entry.font_candidates;
+    let secondary = &entry.font_candidates_lig;
 
     for (i, c) in primary.iter().enumerate() {
         if let Some(fe) = find_font_by_key(font_catalog, &c.font_key) {
-            // Compare full font_key, not postscript_name: GT annotations are now
-            // the full catalog font_key (e.g., "SourceSerif4-400|nokern[wght=400,opsz=10]"),
-            // while postscript_name is the clean name (e.g., "SourceSerif4-Regular").
-            if fe.font_key() == gt_key {
+            if fe.postscript_name == gt_ps {
+                return (Some(c.font_key.clone()), c.score, Some(i + 1));
+            }
+        }
+    }
+    for (i, c) in secondary.iter().enumerate() {
+        if let Some(fe) = find_font_by_key(font_catalog, &c.font_key) {
+            if fe.postscript_name == gt_ps {
                 return (Some(c.font_key.clone()), c.score, Some(i + 1));
             }
         }
@@ -852,13 +746,13 @@ fn segs_same(a: &[unprint::audit::WordSegSummary], b: &[unprint::audit::WordSegS
 /// Returns (html_block, chosen_zncc, gt_zncc).
 fn build_miss_block(
     ce: &ClassifiedEntry,
-    entry: &AuditEntry,
     audit_root: &Path,
     font_catalog: &[FontEntry],
     glyph_map: &NgramGlyphMap,
     font_data_cache: &mut FontDataCache,
     dpi: u32,
 ) -> (String, Option<f32>, Option<f32>) {
+    let entry = ce.entry;
     let actual_font = ce.actual_font.as_deref().map(short_key).unwrap_or_else(|| "?".into());
     let matched = entry.font_matched.as_deref().map(short_key).unwrap_or_else(|| "?".into());
 
@@ -883,10 +777,11 @@ fn build_miss_block(
         .font_matched
         .as_deref()
         .and_then(|m| {
-            // font_candidates[0] is the winner (full ranked list).
+            // font_candidates is always the winner; font_candidates_lig is loser.
             entry.font_candidates
                 .first()
                 .and_then(|c| find_font_by_key(font_catalog, &c.font_key))
+                .or_else(|| entry.font_candidates_lig.first().and_then(|c| find_font_by_key(font_catalog, &c.font_key)))
                 .or_else(|| find_font_in_catalog(font_catalog, m))
         });
 
@@ -938,6 +833,13 @@ fn build_miss_block(
         String::new()
     };
 
+    // Ligature vs plain segmentation visual comparison
+    let lig_compare_html = if let Some(ref dd) = diag_dir {
+        build_lig_comparison_block(dd, entry)
+    } else {
+        String::new()
+    };
+
     // Similarity (ZNCC) info
     let sim_html = match (entry.similarity_score, entry.similarity_pass) {
         (Some(score), Some(pass)) => {
@@ -948,39 +850,74 @@ fn build_miss_block(
         _ => String::new(),
     };
 
-    // Per-character comparison table. The picker drops zero-delta rows,
-    // so the table renders only when there is something to show: a
-    // similarity failure with chosen == GT yields an empty selection
-    // and no table.
-    let obs_table_html = if entry.obs_votes.is_empty() {
+    // Per-character comparison table (skip for similarity-only failures unless ligature path picked)
+    let obs_table_html = if entry.obs_votes.is_empty() || (ce.kind == MissKind::SimilarityFailure && entry.seg_winner.is_none()) {
         String::new()
     } else {
-        // Top 6 deltas, PLUS any lig/nolig comparison observation (Mike Nov 6,
-        // 2026): shown in addition, not instead of the top 6.
-        let obs_to_show = append_lig_comparison_obs(
-            pick_interesting_observations(&entry.obs_votes, 6, 0),
-            &entry.obs_votes,
-            is_nolig_font(correct_fe, &actual_font),
-            is_nolig_font(chosen_fe, &matched),
+        let obs_to_show = pick_interesting_observations(&entry.obs_votes, 6, 0);
+        build_observation_table(
+            entry,
+            &obs_to_show,
+            audit_root,
+            correct_fe,
+            chosen_fe,
+            &actual_font,
+            &matched,
+            gt_rank,
+            gt_score,
+            font_data_cache,
+            diag_dir.as_deref(),
+            font_catalog,
+            glyph_map,
+            "crops",
+        )
+    };
+
+    // Per-character comparison table for the alternate (lig) segmentation path
+    let obs_table_lig_html = if entry.obs_votes_lig.is_empty() || entry.seg_winner.is_none() {
+        String::new()
+    } else {
+        let winner = entry.seg_winner.as_deref().unwrap_or("?");
+        let alt_label = if winner == "ligature" { "plain" } else { "ligature" };
+        let alt_font_key = entry.font_candidates_lig.first()
+            .map(|c| c.font_key.as_str()).unwrap_or("?");
+        let alt_font = short_key(alt_font_key);
+        let alt_chosen_fe = font_catalog.iter().find(|fe| fe.font_key() == alt_font_key);
+        // GT rank/score in the alt path's candidate list (not winner's)
+        let alt_gt = if let Some(ref af) = ce.actual_font {
+            let gt_ps = ground_truth::strip_subset_prefix_str(af);
+            entry.font_candidates_lig.iter().enumerate()
+                .find(|(_, c)| {
+                    find_font_by_key(font_catalog, &c.font_key)
+                        .map_or(false, |fe| fe.postscript_name == gt_ps)
+                })
+                .map(|(i, c)| (Some(i + 1), c.score))
+                .unwrap_or((None, None))
+        } else {
+            (None, None)
+        };
+        let obs_to_show = pick_interesting_observations(&entry.obs_votes_lig, 6, 0);
+        let table = build_observation_table(
+            entry,
+            &obs_to_show,
+            audit_root,
+            correct_fe,
+            alt_chosen_fe,
+            &actual_font,
+            &alt_font,
+            alt_gt.0,
+            alt_gt.1,
+            font_data_cache,
+            diag_dir.as_deref(),
+            font_catalog,
+            glyph_map,
+            "crops_alt",
         );
-        if obs_to_show.is_empty() {
+        if table.is_empty() {
             String::new()
         } else {
-            build_observation_table(
-                entry,
-                &obs_to_show,
-                audit_root,
-                correct_fe,
-                chosen_fe,
-                &actual_font,
-                &matched,
-                gt_rank,
-                gt_score,
-                font_data_cache,
-                diag_dir.as_deref(),
-                font_catalog,
-                glyph_map,
-                "crops",
+            format!(
+                "<div class=\"seg-alt-obs\"><b>Alternate path ({alt_label}) \u{2192} {alt_font}</b>{table}</div>",
             )
         }
     };
@@ -1007,6 +944,48 @@ fn build_miss_block(
         MissKind::SimilarityFailure => format!(" [ZNCC failure]{fast_path_tag}{ocr_fail_tag}"),
         MissKind::KeptRaster => format!(" [kept raster]{ocr_fail_tag}"),
         _ => ocr_fail_tag.to_string(),
+    };
+
+    // Segmentation path comparison (ligature vs plain)
+    let seg_path_html = if let Some(ref winner) = entry.seg_winner {
+        if !entry.font_candidates_lig.is_empty() {
+            let (lig_font, lig_score, plain_font, plain_score) = if winner == "ligature" {
+                // font_candidates = ligature (winner), font_candidates_lig = plain (loser)
+                let lf = entry.font_candidates.first()
+                    .map(|c| short_key(&c.font_key)).unwrap_or_else(|| "?".into());
+                let ls = entry.font_candidates.first().and_then(|c| c.score);
+                let pf = entry.font_candidates_lig.first()
+                    .map(|c| short_key(&c.font_key)).unwrap_or_else(|| "?".into());
+                let ps = entry.font_candidates_lig.first().and_then(|c| c.score);
+                (lf, ls, pf, ps)
+            } else {
+                // font_candidates = plain (winner), font_candidates_lig = ligature (loser)
+                let pf = entry.font_candidates.first()
+                    .map(|c| short_key(&c.font_key)).unwrap_or_else(|| "?".into());
+                let ps = entry.font_candidates.first().and_then(|c| c.score);
+                let lf = entry.font_candidates_lig.first()
+                    .map(|c| short_key(&c.font_key)).unwrap_or_else(|| "?".into());
+                let ls = entry.font_candidates_lig.first().and_then(|c| c.score);
+                (lf, ls, pf, ps)
+            };
+            let lig_marker = if winner == "ligature" { " ✓" } else { "" };
+            let plain_marker = if winner == "plain" { " ✓" } else { "" };
+            let ls = lig_score.map(|s| format!("{s:.4}")).unwrap_or_else(|| "—".into());
+            let ps = plain_score.map(|s| format!("{s:.4}")).unwrap_or_else(|| "—".into());
+            format!(
+                "<div class=\"seg-paths\">\
+                 <b>Seg paths:</b> \
+                 ligature → {} ({}){} · \
+                 plain → {} ({}){}\
+                 </div>",
+                lig_font, ls, lig_marker,
+                plain_font, ps, plain_marker,
+            )
+        } else {
+            String::new()
+        }
+    } else {
+        String::new()
     };
 
     // Font candidate scores — top N with GT and chosen markers, legible tie-break context
@@ -1115,15 +1094,9 @@ fn build_miss_block(
         (gt_summary, chosen, gt)
     };
 
-    // Red "GT PRUNED" badge when GT was pruned by geometry (Mike Oct 31)
-    let gt_pruned_badge = if entry.gt_pruned {
-        " <span style=\"background:#d00;color:#fff;padding:2px 6px;border-radius:3px;font-size:0.8em;\">GT PRUNED</span>"
-    } else {
-        ""
-    };
     let html = format!(
         "<div class=\"miss\">\
-         <h3>p{}:L{}{}{}{}  </h3>\
+         <h3>p{}:L{}{}{}  </h3>\
          <div class=\"line-text-preview\">\"{}\"</div>\
          {}\
          {}\
@@ -1133,11 +1106,14 @@ fn build_miss_block(
          {}\
          {}\
          {}\
+         {}\
+         {}\
+         {}\
          </div>",
-        entry.page, entry.line_index, miss_kind_label, sim_html, gt_pruned_badge,
+        entry.page, entry.line_index, miss_kind_label, sim_html,
         text_preview,
-        font_scores_html, chosen_scan_line_html, gt_scan_line_html, gt_seg_summary_html, sim_compare_html, tie_break_html, obs_table_html,
-        ocr_override_html,
+        seg_path_html, font_scores_html, lig_compare_html, chosen_scan_line_html, gt_scan_line_html, gt_seg_summary_html, sim_compare_html, tie_break_html, obs_table_html,
+        obs_table_lig_html, ocr_override_html,
     );
     (html, entry.similarity_score, gt_sim)
 }
@@ -1149,6 +1125,119 @@ fn build_gt_segmentation_summary(entry: &AuditEntry) -> String {
         parts.push(format!("“{}” {}/{} ws{:?} seam{:?}", ws.word_text, ws.n_segments_produced, ws.n_chars_expected, ws.ws_splits, ws.seam_splits));
     }
     format!("<div class='scan-line-label'>GT Segmentation: {}</div>", parts.join(" | "))
+}
+
+/// Build ligature vs plain segmentation visual comparison.
+/// Finds word_*/seg_plain/word_crop.png and word_*/seg_lig/word_crop.png
+/// in the diag directory and renders them side by side when both exist.
+/// Also shows ZNCC render/diff images for both paths when available.
+fn build_lig_comparison_block(diag_dir: &Path, entry: &AuditEntry) -> String {
+    if entry.seg_winner.is_none() || entry.font_candidates_lig.is_empty() {
+        return String::new();
+    }
+    let winner = entry.seg_winner.as_deref().unwrap_or("?");
+    let (winner_label, loser_label) = if winner == "plain" {
+        ("Plain ✓", "Ligature")
+    } else {
+        ("Plain", "Ligature ✓")
+    };
+
+    let mut word_dirs: Vec<_> = match std::fs::read_dir(diag_dir) {
+        Ok(rd) => rd
+            .filter_map(|e| e.ok())
+            .filter(|e| {
+                e.file_name().to_string_lossy().starts_with("word_")
+                    && e.path().is_dir()
+            })
+            .collect(),
+        Err(_) => return String::new(),
+    };
+    word_dirs.sort_by_key(|d| d.file_name().to_string_lossy().to_string());
+
+    let mut rows = String::new();
+    for wd in &word_dirs {
+        let wpath = wd.path();
+        let plain_img = wpath.join("seg_plain").join("word_crop.png");
+        let lig_img = wpath.join("seg_lig").join("word_crop.png");
+        if !plain_img.exists() || !lig_img.exists() {
+            continue;
+        }
+        let plain_uri = match file_to_b64_uri(&plain_img) {
+            Some(u) => u,
+            None => continue,
+        };
+        let lig_uri = match file_to_b64_uri(&lig_img) {
+            Some(u) => u,
+            None => continue,
+        };
+        let dirname = wd.file_name().to_string_lossy().to_string();
+        let word_label = dirname.splitn(3, '_').nth(2).unwrap_or(&dirname);
+
+        rows.push_str(&format!(
+            "<tr>\
+             <td style=\"vertical-align:middle;font-size:11px;font-weight:600;padding:4px 6px;\">\
+             {word_label}</td>\
+             <td style=\"padding:2px;\"><img src=\"{plain_uri}\" \
+             style=\"max-width:100%;image-rendering:pixelated;\"/></td>\
+             <td style=\"padding:2px;\"><img src=\"{lig_uri}\" \
+             style=\"max-width:100%;image-rendering:pixelated;\"/></td></tr>",
+        ));
+    }
+
+    // ZNCC comparison: winner path renders from diag_dir, alt path from ssim_alt/
+    let mut zncc_rows = String::new();
+    let winner_render = diag_dir.join("ssim_render.png");
+    let winner_diff = diag_dir.join("ssim_diff.png");
+    let alt_render = diag_dir.join("ssim_alt").join("ssim_render.png");
+    let alt_diff = diag_dir.join("ssim_alt").join("ssim_diff.png");
+
+    if winner_render.exists() && alt_render.exists() {
+        if let (Some(wr_uri), Some(ar_uri)) = (file_to_b64_uri(&winner_render), file_to_b64_uri(&alt_render)) {
+            let (left_uri, right_uri) = if winner == "plain" { (wr_uri, ar_uri) } else { (ar_uri, wr_uri) };
+            zncc_rows.push_str(&format!(
+                "<tr>\
+                 <td style=\"vertical-align:middle;font-size:11px;font-weight:600;padding:4px 6px;\">\
+                 ZNCC render</td>\
+                 <td style=\"padding:2px;\"><img src=\"{left_uri}\" \
+                 style=\"max-width:100%;image-rendering:pixelated;\"/></td>\
+                 <td style=\"padding:2px;\"><img src=\"{right_uri}\" \
+                 style=\"max-width:100%;image-rendering:pixelated;\"/></td></tr>",
+            ));
+        }
+    }
+    if winner_diff.exists() && alt_diff.exists() {
+        if let (Some(wd_uri), Some(ad_uri)) = (file_to_b64_uri(&winner_diff), file_to_b64_uri(&alt_diff)) {
+            let (left_uri, right_uri) = if winner == "plain" { (wd_uri, ad_uri) } else { (ad_uri, wd_uri) };
+            zncc_rows.push_str(&format!(
+                "<tr>\
+                 <td style=\"vertical-align:middle;font-size:11px;font-weight:600;padding:4px 6px;\">\
+                 ZNCC diff</td>\
+                 <td style=\"padding:2px;\"><img src=\"{left_uri}\" \
+                 style=\"max-width:100%;image-rendering:pixelated;\"/></td>\
+                 <td style=\"padding:2px;\"><img src=\"{right_uri}\" \
+                 style=\"max-width:100%;image-rendering:pixelated;\"/></td></tr>",
+            ));
+        }
+    }
+
+    let all_rows = format!("{rows}{zncc_rows}");
+    if all_rows.is_empty() {
+        return String::new();
+    }
+
+    format!(
+        "<div class=\"seg-compare\">\
+         <b>Segmentation comparison</b> (winner: {winner})\
+         <table style=\"border-collapse:collapse;margin-top:4px;\">\
+         <tr><th></th>\
+         <th style=\"font-size:11px;padding:2px 6px;\">{winner_label}</th>\
+         <th style=\"font-size:11px;padding:2px 6px;\">{loser_label}</th></tr>\
+         {all_rows}\
+         </table></div>",
+        winner_label = winner_label,
+        loser_label = loser_label,
+        all_rows = all_rows,
+    )
 }
 
 fn build_scan_line_with_overlays_inner(
@@ -1323,7 +1412,7 @@ fn build_scan_line_with_overlays_inner(
          <span style=\"color:#2864dc\">│</span> v-whitespace · \
          <span style=\"color:#ff00c8\">╲</span> seam</div>\
          <div style=\"width:100%;position:relative;\">\
-         <svg viewBox=\"0 0 {canvas_w} {canvas_h}\" style=\"max-width:100%;height:auto;display:block;\" xmlns=\"http://www.w3.org/2000/svg\">\
+         <svg viewBox=\"0 0 {canvas_w} {canvas_h}\" style=\"width:100%;height:auto;display:block;\" xmlns=\"http://www.w3.org/2000/svg\">\
          <image href=\"{img_uri}\" x=\"0\" y=\"{margin_top}\" width=\"{cw}\" height=\"{ch}\" style=\"image-rendering:pixelated;\"/>\
          {overlays}\
          </svg></div>\
@@ -1443,32 +1532,18 @@ fn render_correct_font_comparison(
     // Previously GT used winner's midpoint, causing 1.6% width error for p1:L7
     // where GT 400Italic (5230) is wider than winner 300Italic (5148/5118).
     let gt_em = entry.gt_midpoint_em_px.or(entry.midpoint_em_px);
-    // Verify the GT font into a dedicated subdirectory so its ssim_*.png
-    // files sit alongside the picked font's as real audit artifacts instead
-    // of clobbering them (same idiom as the tie-break tie_N/ subdirs).
-    let correct_dir = dd.join("correct");
-    let _ = std::fs::create_dir_all(&correct_dir);
-    // Single verify for this line: measure the widths here (F34).
-    let measured_widths = unprint::verify::measure_word_widths(
-        &scan_gray, &words, entry.bbox.x, entry.bbox.y,
-    );
     let vr = unprint::verify::verify_text_region(
-        &scan_gray, font_data, &fe.path, &entry.text, &words,
+        &scan_gray, font_data, &entry.text, &words,
         entry.bbox.x, entry.bbox.y,
         fe.glyph_overrides.as_ref().map(|v| v.as_slice()),
         &fe.variant_tag, fe.variations.as_deref(),
         true,
-        fe.collapsed_lig_set(),
-        Some(&correct_dir), None,
+        None, None,
         gt_em,
-        None,
-        &measured_widths,
     );
 
-    // Reference the saved files by audit-root-relative path, exactly like the
-    // picked font's ssim_*.png on the other side of the comparison block.
-    let render_uri = file_to_b64_uri(&correct_dir.join("ssim_render.png"));
-    let diff_uri = file_to_b64_uri(&correct_dir.join("ssim_diff.png"));
+    let render_uri = vr.render_ink.as_ref().map(|r| img_to_b64_uri(r));
+    let diff_uri = vr.diff.as_ref().map(|d| rgb_img_to_b64_uri(d));
     let score = if vr.score > 0.0 { Some(vr.score) } else { None };
 
     (render_uri, diff_uri, score)
@@ -1582,13 +1657,13 @@ fn build_similarity_block(
     let render_row = if let Some(gt_uri) = correct_render_uri {
         format!(
             "<tr><td class=\"ssim-label\">Render</td>\
-             <td><img src=\"{gt_uri}\" class=\"ssim-compare-img\" style=\"width:100%;height:auto;display:block;\"></td>\
-             <td><img src=\"{render_uri}\" class=\"ssim-compare-img\" style=\"width:100%;height:auto;display:block;\"></td></tr>"
+             <td><img src=\"{gt_uri}\" class=\"ssim-compare-img\"></td>\
+             <td><img src=\"{render_uri}\" class=\"ssim-compare-img\"></td></tr>"
         )
     } else {
         format!(
             "<tr><td class=\"ssim-label\">Render</td>\
-             <td colspan=\"2\"><img src=\"{render_uri}\" class=\"ssim-compare-img\" style=\"width:100%;height:auto;display:block;\"></td></tr>"
+             <td colspan=\"2\"><img src=\"{render_uri}\" class=\"ssim-compare-img\"></td></tr>"
         )
     };
 
@@ -1596,17 +1671,17 @@ fn build_similarity_block(
     let diff_row_html = match (correct_diff_uri, &diff_row) {
         (Some(gt_diff), Some(picked_diff)) => format!(
             "<tr><td class=\"ssim-label\">Diff</td>\
-             <td><img src=\"{gt_diff}\" class=\"ssim-compare-img\" style=\"width:100%;height:auto;display:block;\"></td>\
-             <td><img src=\"{picked_diff}\" class=\"ssim-compare-img\" style=\"width:100%;height:auto;display:block;\"></td></tr>"
+             <td><img src=\"{gt_diff}\" class=\"ssim-compare-img\"></td>\
+             <td><img src=\"{picked_diff}\" class=\"ssim-compare-img\"></td></tr>"
         ),
         (Some(gt_diff), None) => format!(
             "<tr><td class=\"ssim-label\">Diff</td>\
-             <td><img src=\"{gt_diff}\" class=\"ssim-compare-img\" style=\"width:100%;height:auto;display:block;\"></td>\
+             <td><img src=\"{gt_diff}\" class=\"ssim-compare-img\"></td>\
              <td>—</td></tr>"
         ),
         (None, Some(picked_diff)) => format!(
             "<tr><td class=\"ssim-label\">Diff</td>\
-             <td colspan=\"2\"><img src=\"{picked_diff}\" class=\"ssim-compare-img\" style=\"width:100%;height:auto;display:block;\"></td></tr>"
+             <td colspan=\"2\"><img src=\"{picked_diff}\" class=\"ssim-compare-img\"></td></tr>"
         ),
         (None, None) => String::new(),
     };
@@ -1673,8 +1748,8 @@ fn build_similarity_block(
          {font_size_row}\
          {per_word_row}\
          <tr><td class=\"ssim-label\">Scan</td>\
-         <td><img src=\"{scan_uri}\" class=\"ssim-compare-img\" style=\"width:100%;height:auto;display:block;\"></td>\
-         <td><img src=\"{scan_uri}\" class=\"ssim-compare-img\" style=\"width:100%;height:auto;display:block;\"></td></tr>\
+         <td><img src=\"{scan_uri}\" class=\"ssim-compare-img\"></td>\
+         <td><img src=\"{scan_uri}\" class=\"ssim-compare-img\"></td></tr>\
          {render_row}\
          {diff_row_html}\
          <tr><td class=\"ssim-label\">ZNCC</td>\
@@ -1715,7 +1790,7 @@ fn build_tie_break_block(
     for (ti, _tc) in entry.tie_candidates.iter().enumerate() {
         let render_path = diag_dir.join(format!("tie_{}", ti)).join("ssim_render.png");
         if let Some(uri) = file_to_b64_uri(&render_path) {
-            rows.push_str(&format!("<td><img src=\"{}\" class=\"ssim-compare-img\" style=\"width:100%;height:auto;display:block;\"></td>", uri));
+            rows.push_str(&format!("<td><img src=\"{}\" class=\"ssim-compare-img\"></td>", uri));
         } else {
             rows.push_str("<td>—</td>");
         }
@@ -1727,7 +1802,7 @@ fn build_tie_break_block(
     for (ti, _tc) in entry.tie_candidates.iter().enumerate() {
         let diff_path = diag_dir.join(format!("tie_{}", ti)).join("ssim_diff.png");
         if let Some(uri) = file_to_b64_uri(&diff_path) {
-            rows.push_str(&format!("<td><img src=\"{}\" class=\"ssim-compare-img\" style=\"width:100%;height:auto;display:block;\"></td>", uri));
+            rows.push_str(&format!("<td><img src=\"{}\" class=\"ssim-compare-img\"></td>", uri));
         } else {
             rows.push_str("<td>—</td>");
         }
@@ -1769,32 +1844,26 @@ fn build_observation_table(
     _glyph_map: &NgramGlyphMap,
     crop_dir_name: &str,
 ) -> String {
-    // NOTE (Finding 5): the reference renders in this table pass NoKern.
-    // This is display-only image generation, and the report has no geo
-    // cache available (the generator is not modified to thread one). The
-    // renders are single-glyph or short-sequence reference images; the
-    // audit scores themselves are unaffected. Multi-char reference images
-    // therefore show the unkerned form. This is explicit, not a silent
-    // fallback to the legacy kern table.
-    // Build fallback geo map from GT's own observations, on GT's own
-    // segmentation. When the winner is ligature (contains ﬃ) and the GT
-    // font lacks ligature support, GT's per_char_geo is None on the winner
-    // path (pruned), so gt_geo_* are None. GT's own (plain) observations
-    // do have geo for the same characters (O, c, etc.), so use them as
-    // fallback for display. The same list sources the nolig-cell
-    // components below.
+    // Build fallback geo map from the alternate path (loser when winner is shown).
+    // When winner is ligature (contains ﬃ) and GT font lacks ligature support,
+    // its per_char_geo is None on winner path (pruned), so gt_geo_* are None.
+    // The plain (alt) path does have geo for the same characters (O, c, etc.),
+    // so we use it as fallback for display.
     use std::collections::HashMap as FbMap;
-    let gt_obs_ref: &[unprint::audit::ObservationVote] = &entry.gt_obs_votes;
-    // Map seq string -> (h_ll, v_ll, h_err, v_err, glyph_score, rank, prob, h_overlap_correction)
-    let mut gt_fallback: FbMap<String, (Option<f32>, Option<f32>, Option<f32>, Option<f32>, Option<f32>, Option<usize>, Option<f32>, Option<f32>)> = FbMap::new();
-    for ov in gt_obs_ref {
+    let alt_obs_ref: &[unprint::audit::ObservationVote] = if crop_dir_name == "crops_alt" {
+        &entry.obs_votes
+    } else {
+        &entry.obs_votes_lig
+    };
+    // Map seq string -> (h_ll, v_ll, h_err, v_err, glyph_score, rank, prob)
+    let mut gt_fallback: FbMap<String, (Option<f32>, Option<f32>, Option<f32>, Option<f32>, Option<f32>, Option<usize>, Option<f32>)> = FbMap::new();
+    for ov in alt_obs_ref {
         if ov.gt_geo_h_ll.is_some() || ov.gt_font_rank.is_some() {
             let key: String = ov.seq.iter().collect();
             // Keep first occurrence (plain path may have duplicates; first is fine)
             gt_fallback.entry(key).or_insert((
                 ov.gt_geo_h_ll, ov.gt_geo_v_ll, ov.gt_geo_h_err, ov.gt_geo_v_err,
                 ov.gt_glyph_score, ov.gt_font_rank, ov.gt_font_prob,
-                ov.gt_geo_h_overlap_correction_px,
             ));
         }
     }
@@ -1806,10 +1875,7 @@ fn build_observation_table(
 
         // Crop image + midpoint
         let (crop_uri, crop_mid) = if let Some(dd) = diag_dir {
-            // Prefer GT crop (gt_crops/) over winning-pass crop; fall back if GT segmentation differs
-            let p = find_crop_png_in(dd, "gt_crops", cv.crop_index, &cv.seq)
-                .or_else(|| find_crop_png_in(dd, crop_dir_name, cv.crop_index, &cv.seq));
-            if let Some(p) = p {
+            if let Some(p) = find_crop_png_in(dd, crop_dir_name, cv.crop_index, &cv.seq) {
                 let uri = file_to_b64_uri(&p);
                 let mid = image::open(&p).ok().map(|i| i.to_luma8()).and_then(|im| ink_midpoint(&im));
                 (uri, mid)
@@ -1832,19 +1898,11 @@ fn build_observation_table(
                             let _ = font.set_variation(tag, *val);
                         }
                     }
-                    // Normalize the sequence for THIS font (Mike Nov 6, 2026):
-                    // the observation seq is the winner's collapsed sequence
-                    // (e.g. ['\u{FB01}']). A nolig GT font must render that
-                    // segment as separate f, i glyphs; a lig font as the
-                    // single FB01 glyph. Overrides are computed from the
-                    // normalized sequence, not the raw observation seq.
-                    let render_seq = char_render::normalize_seq_for_font(fe, seq);
-                    let gid_overrides: Vec<Option<unprint_fonts::ab_glyph::GlyphId>> = render_seq.iter().map(|c| {
+                    let gid_overrides: Vec<Option<unprint_fonts::ab_glyph::GlyphId>> = seq.iter().map(|c| {
                         fe.glyph_overrides.as_ref()
                             .and_then(|ovs| ovs.iter().find(|(gc, _)| *gc == *c).map(|(_, g)| unprint_fonts::ab_glyph::GlyphId(*g)))
                     }).collect();
-                    let _disable_kern = fe.variant_tag.contains("nokern");
-                    if let Some(img) = char_render::render_ngram_fresh(&font, &render_seq, &gid_overrides, &char_render::RenderParams::default(), _disable_kern, &unprint_fonts::NoKern) {
+                    if let Some(img) = char_render::render_ngram_fresh(&font, seq, &gid_overrides, &char_render::RenderParams::default()) {
                         correct_mid = ink_midpoint(&img);
                         correct_ref_uri = Some(img_to_b64_uri(&img));
                     }
@@ -1856,12 +1914,8 @@ fn build_observation_table(
         let mut chosen_ref_uri: Option<String> = None;
         let mut chosen_mid: Option<(f32, f32)> = None;
         if let Some(fe) = chosen_fe {
-            // Normalize the sequence for THIS font (see correct ref above):
-            // a lig winner renders the combined segment as the FB01 glyph,
-            // a nolig winner as separate f, i glyphs.
-            let render_seq = char_render::normalize_seq_for_font(fe, seq);
-            if render_seq.len() == 1 {
-                if let Some(path) = find_font_ref_ngram_png(audit_root, fe, render_seq[0]) {
+            if seq.len() == 1 {
+                if let Some(path) = find_font_ref_ngram_png(audit_root, fe, seq[0]) {
                     chosen_ref_uri = file_to_b64_uri(&path);
                     if let Ok(img) = image::open(&path) {
                         chosen_mid = ink_midpoint(&img.to_luma8());
@@ -1877,12 +1931,11 @@ fn build_observation_table(
                                 let _ = font.set_variation(tag, *val);
                             }
                         }
-                        let gid_overrides: Vec<Option<unprint_fonts::ab_glyph::GlyphId>> = render_seq.iter().map(|c| {
+                        let gid_overrides: Vec<Option<unprint_fonts::ab_glyph::GlyphId>> = seq.iter().map(|c| {
                             fe.glyph_overrides.as_ref()
                                 .and_then(|ovs| ovs.iter().find(|(gc, _)| *gc == *c).map(|(_, g)| unprint_fonts::ab_glyph::GlyphId(*g)))
                         }).collect();
-                        let _disable_kern = fe.variant_tag.contains("nokern");
-                    if let Some(img) = char_render::render_ngram_fresh(&font, &render_seq, &gid_overrides, &char_render::RenderParams::default(), _disable_kern, &unprint_fonts::NoKern) {
+                        if let Some(img) = char_render::render_ngram_fresh(&font, seq, &gid_overrides, &char_render::RenderParams::default()) {
                             chosen_mid = ink_midpoint(&img);
                             chosen_ref_uri = Some(img_to_b64_uri(&img));
                         }
@@ -1891,26 +1944,11 @@ fn build_observation_table(
             }
         }
 
-        // Win/lose coloring reflects the TOTAL signed delta (glyph + geo),
-        // the same quantity the picker ranks by: weight * (glyph_delta +
-        // GEO_WEIGHT * geo_delta). Prob-only comparison was wrong for rows
-        // where geo dominates (e.g. L19 '2': prob favors GT but total +82.48
-        // favors chosen). Positive delta means chosen wins (GT loses).
         let (chosen_win_class, correct_win_class) = match (cv.chosen_prob, cv.gt_font_prob) {
             (Some(cp), Some(gp)) => {
-                let glyph_delta = cp.max(1e-30).ln() - gp.max(1e-30).ln();
-                let geo_delta = match (
-                    combined_geo_ll(cv.chosen_geo_ll, cv.chosen_geo_h_ll, cv.chosen_geo_v_ll),
-                    combined_geo_ll(cv.gt_geo_ll, cv.gt_geo_h_ll, cv.gt_geo_v_ll),
-                ) {
-                    (Some(cg), Some(gg)) => cg - gg,
-                    _ => 0.0,
-                };
-                let total_delta =
-                    cv.weight * (glyph_delta + unprint::font_match::geo_weight() * geo_delta);
-                if total_delta > 0.0 {
+                if cp > gp {
                     ("prob-win", "prob-lose")
-                } else if total_delta < 0.0 {
+                } else if gp > cp {
                     ("prob-lose", "prob-win")
                 } else {
                     ("", "")
@@ -1919,9 +1957,9 @@ fn build_observation_table(
             _ => ("", ""),
         };
 
-        let (gt_h, gt_v, gt_h_err, gt_v_err, gt_glyph, _gt_rank_f, gt_prob_f, gt_h_overlap_correction) = if cv.gt_geo_h_ll.is_none() || cv.gt_font_rank.is_none() {
+        let (gt_h, gt_v, gt_h_err, gt_v_err, gt_glyph, gt_rank_f, gt_prob_f) = if cv.gt_geo_h_ll.is_none() || cv.gt_font_rank.is_none() {
             let seq_key: String = cv.seq.iter().collect();
-            if let Some((fh, fv, fhe, fve, fg, fr, fp, fz)) = gt_fallback.get(&seq_key) {
+            if let Some((fh, fv, fhe, fve, fg, fr, fp)) = gt_fallback.get(&seq_key) {
                 (
                     cv.gt_geo_h_ll.or(*fh),
                     cv.gt_geo_v_ll.or(*fv),
@@ -1930,28 +1968,25 @@ fn build_observation_table(
                     cv.gt_glyph_score.or(*fg),
                     cv.gt_font_rank.or(*fr),
                     cv.gt_font_prob.or(*fp),
-                    cv.gt_geo_h_overlap_correction_px.or(*fz),
                 )
             } else {
-                (cv.gt_geo_h_ll, cv.gt_geo_v_ll, cv.gt_geo_h_err, cv.gt_geo_v_err, cv.gt_glyph_score, cv.gt_font_rank, cv.gt_font_prob, cv.gt_geo_h_overlap_correction_px)
+                (cv.gt_geo_h_ll, cv.gt_geo_v_ll, cv.gt_geo_h_err, cv.gt_geo_v_err, cv.gt_glyph_score, cv.gt_font_rank, cv.gt_font_prob)
             }
         } else {
-            (cv.gt_geo_h_ll, cv.gt_geo_v_ll, cv.gt_geo_h_err, cv.gt_geo_v_err, cv.gt_glyph_score, cv.gt_font_rank, cv.gt_font_prob, cv.gt_geo_h_overlap_correction_px)
+            (cv.gt_geo_h_ll, cv.gt_geo_v_ll, cv.gt_geo_h_err, cv.gt_geo_v_err, cv.gt_glyph_score, cv.gt_font_rank, cv.gt_font_prob)
         };
         // For GT debugging: pass each side's opponent for per-dimension coloring
         let chosen_detail = format_char_detail(
-            cv.chosen_prob, cv.chosen_glyph_score,
+            cv.chosen_rank, cv.chosen_prob, cv.chosen_glyph_score,
             cv.chosen_geo_h_ll, cv.chosen_geo_v_ll,
             cv.chosen_geo_h_err, cv.chosen_geo_v_err,
-            gt_glyph, gt_h, gt_v, Some(cv.weight),
-            cv.chosen_geo_h_overlap_correction_px
+            gt_glyph, gt_h, gt_v, Some(cv.weight)
         );
         let correct_detail = format_char_detail(
-            gt_prob_f, gt_glyph,
+            gt_rank_f, gt_prob_f, gt_glyph,
             gt_h, gt_v,
             gt_h_err, gt_v_err,
-            cv.chosen_glyph_score, cv.chosen_geo_h_ll, cv.chosen_geo_v_ll, Some(cv.weight),
-            gt_h_overlap_correction
+            cv.chosen_glyph_score, cv.chosen_geo_h_ll, cv.chosen_geo_v_ll, Some(cv.weight)
         );
 
         let chosen_score_label = if !chosen_detail.is_empty() {
@@ -1964,80 +1999,6 @@ fn build_observation_table(
             format!("<div class='sub {correct_win_class}'>{correct_detail}</div>")
         } else {
             String::new()
-        };
-
-        // Ligature comparison (Mike Nov 7, 2026): if the observation seq
-        // carries a ligature character and the correct font is nolig, the
-        // correct cell must show the two separate component characters,
-        // each with its own render and scores, sourced from GT's own
-        // observations (GT's segmentation, where the components are
-        // separate characters). A single FB01 cell has no GT data (the
-        // nolig font has no FB01), so it renders empty. Do NOT combine
-        // the component scores into one FB01 cell.
-        let correct_cell_inner = {
-            let has_lig = seq.iter().any(|&c| matches!(c, '\u{FB00}'..='\u{FB04}'));
-            if has_lig && is_nolig_font(correct_fe, correct_font_name) {
-                let components = unprint::segment::expand_ligature_chars(seq);
-                let mut parts: Vec<String> = Vec::new();
-                if components.len() > 1 {
-                    for (j, comp) in components.iter().enumerate() {
-                        // Components sit at consecutive crop indices starting
-                        // at the ligature's crop index (ligature at crop C
-                        // -> components at C, C+1, ...).
-                        let comp_ov = gt_obs_ref.iter().find(|ov| {
-                            ov.seq.len() == 1 && ov.seq[0] == *comp
-                                && ov.crop_index == cv.crop_index + j
-                        });
-                        if let Some(ov) = comp_ov {
-                            // Render this component with the nolig font.
-                            let mut comp_uri: Option<String> = None;
-                            if let Some(fe) = correct_fe {
-                                if let Some(data) = font_data_cache.load(&fe.path) {
-                                    if let Ok(mut font) = FontRef::try_from_slice(data) {
-                                        if let Some(ref vars) = fe.variations {
-                                            use unprint_fonts::ab_glyph::VariableFont;
-                                            for (tag, val) in vars {
-                                                let _ = font.set_variation(tag, *val);
-                                            }
-                                        }
-                                        let gid_overrides: Vec<Option<unprint_fonts::ab_glyph::GlyphId>> = [*comp].iter().map(|c| {
-                                            fe.glyph_overrides.as_ref()
-                                                .and_then(|ovs| ovs.iter().find(|(gc, _)| *gc == *c).map(|(_, g)| unprint_fonts::ab_glyph::GlyphId(*g)))
-                                        }).collect();
-                                        let _disable_kern = fe.variant_tag.contains("nokern");
-                                        // Single-glyph render: kerning is undefined for one
-                                        // glyph (no pair), so NoKern is never consulted.
-                                        if let Some(img) = char_render::render_ngram_fresh(&font, &[*comp], &gid_overrides, &char_render::RenderParams::default(), _disable_kern, &unprint_fonts::NoKern) {
-                                            comp_uri = Some(img_to_b64_uri(&img));
-                                        }
-                                    }
-                                }
-                            }
-                            // Format this component's own GT scores.
-                            let comp_detail = format_char_detail(
-                                ov.gt_font_prob, ov.gt_glyph_score,
-                                ov.gt_geo_h_ll, ov.gt_geo_v_ll,
-                                ov.gt_geo_h_err, ov.gt_geo_v_err,
-                                cv.chosen_glyph_score, cv.chosen_geo_h_ll, cv.chosen_geo_v_ll, Some(ov.weight),
-                                ov.gt_geo_h_overlap_correction_px
-                            );
-                            let comp_label = if !comp_detail.is_empty() {
-                                format!("<div class='sub'>{comp_detail}</div>")
-                            } else {
-                                String::new()
-                            };
-                            parts.push(format!("<div class=\"img-stat\">{}{}</div>", img_td(comp_uri.as_deref()), comp_label));
-                        }
-                    }
-                }
-                if !parts.is_empty() {
-                    format!("<div style=\"display:flex;flex-direction:column;gap:4px;\">{}</div>", parts.join(""))
-                } else {
-                    format!("<div class=\"img-stat\">{}{}</div>", img_td(correct_ref_uri.as_deref()), correct_score_label)
-                }
-            } else {
-                format!("<div class=\"img-stat\">{}{}</div>", img_td(correct_ref_uri.as_deref()), correct_score_label)
-            }
         };
 
         // OCR letter for this observation — show corrected char, and original if it was pflda-replaced
@@ -2068,11 +2029,12 @@ fn build_observation_table(
             "<tr>\
              <td class=\"ocr-col\"><span class=\"char-label\">{ocr_label}</span></td>\
              <td class=\"img-td\">{}</td>\
-             <td class=\"img-td {correct_win_class}\">{}</td>\
+             <td class=\"img-td {correct_win_class}\"><div class=\"img-stat\">{}{}</div></td>\
              <td class=\"img-td {chosen_win_class}\"><div class=\"img-stat\">{}{}</div></td>\
              </tr>",
             img_td(crop_uri.as_deref()),
-            correct_cell_inner,
+            img_td(correct_ref_uri.as_deref()),
+            correct_score_label,
             img_td(chosen_ref_uri.as_deref()),
             chosen_score_label,
         ));
@@ -2085,8 +2047,12 @@ fn build_observation_table(
         _ => "not scored".into(),
     };
 
-    // The chosen font is CI candidate #1 (font_candidates[0] is the winner).
-    let path_candidates = &entry.font_candidates;
+    // The chosen font is CI candidate #1 from the appropriate path
+    let path_candidates = if crop_dir_name == "crops_alt" {
+        &entry.font_candidates_lig
+    } else {
+        &entry.font_candidates
+    };
     let chosen_rank_info = path_candidates
         .first()
         .map(|c| {
@@ -2170,7 +2136,6 @@ img.ci {
 .prob-lose { background: #ffebee; border-left: 3px solid #ef5350; padding-left: 4px; }
 .dim-win { color: #2e7d32; font-weight: 700; }
 .dim-lose { color: #c62828; }
-.overlap-graded { color: #6a1b9a; font-weight: 700; }
 .prob-win .dim-win, .prob-lose .dim-lose { font-weight: 800; }
 .img-td.prob-win { outline: 2px solid #4caf50; outline-offset: -1px; }
 .img-td.prob-lose { outline: 1px solid #ef9a9a; }
@@ -2200,7 +2165,7 @@ img.ci {
   font-size: 10px; font-weight: 600; color: #555; width: 50px; text-align: right;
 }
 .ssim-compare-img {
-  max-width: 100%; width: 100%; height: auto; image-rendering: pixelated;
+  max-width: 100%; image-rendering: pixelated;
   display: block;
 }
 .tie-break-block {
@@ -2216,13 +2181,7 @@ img.ci {
 .scan-line-block {
   margin: 6px 0 10px 0; padding: 0; background: #f0f4f0;
   border: 1px solid #c0c8c0; border-radius: 4px; overflow: hidden;
-  box-sizing: border-box; width: 100%; max-width: 100%;
-}
-.scan-line-block svg {
-  max-width: 100%;
-}
-.scan-line-block img {
-  max-width: 100%; height: auto;
+  box-sizing: border-box; width: 100%;
 }
 .scan-line-label { font-size: 10px; font-weight: 600; color: #555; margin: 8px 8px 4px 8px; }
 .ocr-wrong-badge { background: #f0a020; color: white; padding: 1px 6px; border-radius: 3px; font-size: 11px; font-weight: 700; }
@@ -2249,26 +2208,24 @@ pub struct AccuracyResult {
     pub ocr_wrong_hits: usize,
 }
 
-/// Compute accuracy counts from a precomputed entry classification (see
-/// `classify_entries`) without generating any HTML or audit I/O. Used by
-/// --test for fast scoring. The caller computes the classification once
-/// per run and shares it with `enrich_audit_entries` and
-/// `generate_report` (redundancy F32). `entries` is the slice the
-/// classification was computed from, 1:1 by index; it supplies the
-/// enriched OCR fields the classification itself does not hold.
+/// Compute accuracy without generating any HTML or audit I/O.
+/// Used by --test for fast scoring.
 pub fn compute_accuracy(
     entries: &[AuditEntry],
-    classified: &[ClassifiedEntry],
+    gt: Option<&GroundTruth>,
+    dpi: u32,
+    font_catalog: &[FontEntry],
+    glyph_map: &NgramGlyphMap,
 ) -> AccuracyResult {
-    debug_assert_eq!(entries.len(), classified.len(),
-        "classification must be 1:1 with entries");
+    let classified = classify_entries(entries, gt, dpi, font_catalog, glyph_map);
+
     let mut hits = 0usize;
     let mut major_misses = 0usize;
     let mut minor_misses = 0usize;
     let mut similarity_failures = 0usize;
     let mut kept_raster = 0usize;
 
-    for ce in classified {
+    for ce in &classified {
         match ce.kind {
             MissKind::Hit => hits += 1,
             MissKind::MajorMiss => major_misses += 1,
@@ -2294,9 +2251,9 @@ pub fn compute_accuracy(
         let mut c_hits = 0usize;
         let mut w_total = 0usize;
         let mut w_hits = 0usize;
-        for ce in classified {
+        for ce in &classified {
             let is_hit = matches!(ce.kind, MissKind::Hit | MissKind::MinorMiss);
-            match entries[ce.entry_index].ocr_correct {
+            match ce.entry.ocr_correct {
                 Some(true) => { c_total += 1; if is_hit { c_hits += 1; } },
                 Some(false) => { w_total += 1; if is_hit { w_hits += 1; } },
                 None => {},
@@ -2321,17 +2278,11 @@ pub fn compute_accuracy(
     }
 }
 
-/// Build the HTML report. Takes a precomputed entry classification (see
-/// `classify_entries`): the caller computes it once per run and shares it
-/// with `enrich_audit_entries` and `compute_accuracy` (redundancy F32).
-/// `entries` is the slice the classification was computed from, 1:1 by
-/// index; each classified entry resolves its audit entry through
-/// `entries[ce.entry_index]`.
 pub fn generate_report(
     report_path: &Path,
     audit_root: &Path,
     entries: &[AuditEntry],
-    classified: &[ClassifiedEntry],
+    gt: Option<&GroundTruth>,
     dpi: u32,
     font_catalog: &[FontEntry],
     glyph_map: &NgramGlyphMap,
@@ -2347,8 +2298,7 @@ pub fn generate_report(
     IMAGE_WRITER.with(|w| *w.borrow_mut() = Some(writer));
     AUDIT_ROOT_TL.with(|a| *a.borrow_mut() = Some(audit_root.to_path_buf()));
 
-    debug_assert_eq!(entries.len(), classified.len(),
-        "classification must be 1:1 with entries");
+    let classified = classify_entries(entries, gt, dpi, font_catalog, glyph_map);
 
     let mut hits: Vec<&ClassifiedEntry> = Vec::new();
     let mut major_misses: Vec<&ClassifiedEntry> = Vec::new();
@@ -2356,7 +2306,7 @@ pub fn generate_report(
     let mut similarity_failures: Vec<&ClassifiedEntry> = Vec::new();
     let mut kept_raster: Vec<&ClassifiedEntry> = Vec::new();
     let mut no_ground_truth: Vec<&ClassifiedEntry> = Vec::new();
-    for ce in classified {
+    for ce in &classified {
         match ce.kind {
             MissKind::Hit => hits.push(ce),
             MissKind::MajorMiss => major_misses.push(ce),
@@ -2370,10 +2320,10 @@ pub fn generate_report(
     // Collect ALL OCR-wrong entries (any miss kind) – these move to the very end.
     // Previously only Hit|MinorMiss were moved, leaving 303 Major+82 ZNCC with OCR WRONG at front.
     let mut ocr_misses: Vec<&ClassifiedEntry> = classified.iter()
-        .filter(|ce| entries[ce.entry_index].ocr_correct == Some(false))
+        .filter(|ce| ce.entry.ocr_correct == Some(false))
         .collect();
     ocr_misses.sort_by(|a, b| {
-        entries[a.entry_index].similarity_score.partial_cmp(&entries[b.entry_index].similarity_score).unwrap_or(std::cmp::Ordering::Equal)
+        a.entry.similarity_score.partial_cmp(&b.entry.similarity_score).unwrap_or(std::cmp::Ordering::Equal)
     });
 
     // Accuracy stats should be computed on the full set BEFORE we filter for display.
@@ -2392,89 +2342,76 @@ pub fn generate_report(
 
 
     // Filtered views for display – OCR-wrong entries are excluded here and shown only in final section.
-    let major_misses_display: Vec<&ClassifiedEntry> = major_misses.iter().filter(|ce| entries[ce.entry_index].ocr_correct != Some(false)).copied().collect();
-    let minor_misses_display: Vec<&ClassifiedEntry> = minor_misses.iter().filter(|ce| entries[ce.entry_index].ocr_correct != Some(false)).copied().collect();
-    let similarity_failures_display: Vec<&ClassifiedEntry> = similarity_failures.iter().filter(|ce| entries[ce.entry_index].ocr_correct != Some(false)).copied().collect();
-    let kept_raster_display: Vec<&ClassifiedEntry> = kept_raster.iter().filter(|ce| entries[ce.entry_index].ocr_correct != Some(false)).copied().collect();
-    let hits_display: Vec<&ClassifiedEntry> = hits.iter().filter(|ce| entries[ce.entry_index].ocr_correct != Some(false)).copied().collect();
+    let major_misses_display: Vec<&ClassifiedEntry> = major_misses.iter().filter(|ce| ce.entry.ocr_correct != Some(false)).copied().collect();
+    let minor_misses_display: Vec<&ClassifiedEntry> = minor_misses.iter().filter(|ce| ce.entry.ocr_correct != Some(false)).copied().collect();
+    let similarity_failures_display: Vec<&ClassifiedEntry> = similarity_failures.iter().filter(|ce| ce.entry.ocr_correct != Some(false)).copied().collect();
+    let kept_raster_display: Vec<&ClassifiedEntry> = kept_raster.iter().filter(|ce| ce.entry.ocr_correct != Some(false)).copied().collect();
+    let hits_display: Vec<&ClassifiedEntry> = hits.iter().filter(|ce| ce.entry.ocr_correct != Some(false)).copied().collect();
 
     // Sort each miss category by increasing ZNCC (worst visual matches first) – using filtered lists
     let mut major_misses_sorted = major_misses_display.clone();
     major_misses_sorted.sort_by(|a, b| {
-        entries[a.entry_index].similarity_score.partial_cmp(&entries[b.entry_index].similarity_score).unwrap_or(std::cmp::Ordering::Equal)
+        a.entry.similarity_score.partial_cmp(&b.entry.similarity_score).unwrap_or(std::cmp::Ordering::Equal)
     });
     let mut minor_misses_sorted = minor_misses_display.clone();
     minor_misses_sorted.sort_by(|a, b| {
-        entries[a.entry_index].similarity_score.partial_cmp(&entries[b.entry_index].similarity_score).unwrap_or(std::cmp::Ordering::Equal)
+        a.entry.similarity_score.partial_cmp(&b.entry.similarity_score).unwrap_or(std::cmp::Ordering::Equal)
     });
     let mut similarity_failures_sorted = similarity_failures_display.clone();
     similarity_failures_sorted.sort_by(|a, b| {
-        entries[a.entry_index].similarity_score.partial_cmp(&entries[b.entry_index].similarity_score).unwrap_or(std::cmp::Ordering::Equal)
+        a.entry.similarity_score.partial_cmp(&b.entry.similarity_score).unwrap_or(std::cmp::Ordering::Equal)
     });
     let mut kept_raster_sorted = kept_raster_display.clone();
     kept_raster_sorted.sort_by(|a, b| {
-        entries[a.entry_index].similarity_score.partial_cmp(&entries[b.entry_index].similarity_score).unwrap_or(std::cmp::Ordering::Equal)
+        a.entry.similarity_score.partial_cmp(&b.entry.similarity_score).unwrap_or(std::cmp::Ordering::Equal)
     });
     let mut hits_sorted = hits_display.clone();
     let mut no_gt_sorted = no_ground_truth.clone();
     if meta.report_all {
         hits_sorted.sort_by(|a, b| {
-            entries[a.entry_index].similarity_score.partial_cmp(&entries[b.entry_index].similarity_score).unwrap_or(std::cmp::Ordering::Equal)
+            a.entry.similarity_score.partial_cmp(&b.entry.similarity_score).unwrap_or(std::cmp::Ordering::Equal)
         });
         no_gt_sorted.sort_by(|a, b| {
-            entries[a.entry_index].similarity_score.partial_cmp(&entries[b.entry_index].similarity_score).unwrap_or(std::cmp::Ordering::Equal)
+            a.entry.similarity_score.partial_cmp(&b.entry.similarity_score).unwrap_or(std::cmp::Ordering::Equal)
         });
     }
 
     let mut font_data_cache = FontDataCache::new();
 
-    // F35: build each displayed entry's block once and reuse it. An entry
-    // appears in its kind section, in the OCR-miss section when OCR is
-    // wrong, and in All Lines when --report-all — and every
-    // build_miss_block re-verifies the GT font, so without this the same
-    // entry was verified up to 3 times. Entries shown in no section (hits
-    // and no-ground-truth lines with correct OCR, without --report-all)
-    // are not built, exactly as before.
-    let mut block_cache: HashMap<(usize, usize), String> = HashMap::new();
-    for ce in classified {
-        let shown = meta.report_all
-            || entries[ce.entry_index].ocr_correct == Some(false)
-            || !matches!(ce.kind, MissKind::Hit | MissKind::NoGroundTruth);
-        if shown {
-            let (html, _chosen_zncc, _gt_zncc) = build_miss_block(
-                ce, &entries[ce.entry_index], audit_root, font_catalog, glyph_map, &mut font_data_cache, dpi,
-            );
-            block_cache.insert((entries[ce.entry_index].page, entries[ce.entry_index].line_index), html);
-        }
-    }
-    // Look up a pre-built block for a displayed entry. Panics on a missing
-    // entry: the `shown` predicate above must cover every displayed set.
-    let block_for = |ce: &ClassifiedEntry| -> &str {
-        &block_cache[&(entries[ce.entry_index].page, entries[ce.entry_index].line_index)]
-    };
-
     // Build major miss blocks (OCR-wrong already filtered out)
     let mut major_miss_blocks = String::new();
     for ce in &major_misses_sorted {
-        major_miss_blocks.push_str(block_for(ce));
+        let (html, _chosen_zncc, _gt_zncc) = build_miss_block(
+            ce, audit_root, font_catalog, glyph_map, &mut font_data_cache, dpi,
+        );
+        major_miss_blocks.push_str(&html);
     }
 
     // Build minor miss blocks — OCR-miss already filtered
     let mut minor_miss_blocks = String::new();
     for ce in &minor_misses_sorted {
-        minor_miss_blocks.push_str(block_for(ce));
+        let (html, _chosen_zncc, _gt_zncc) = build_miss_block(
+            ce, audit_root, font_catalog, glyph_map, &mut font_data_cache, dpi,
+        );
+        minor_miss_blocks.push_str(&html);
     }
 
     // Build similarity failure blocks (OCR-wrong filtered out)
     let mut sim_fail_blocks = String::new();
     for ce in &similarity_failures_sorted {
-        sim_fail_blocks.push_str(block_for(ce));
+        let (html, _chosen_zncc, _gt_zncc) = build_miss_block(
+            ce, audit_root, font_catalog, glyph_map, &mut font_data_cache, dpi,
+        );
+        sim_fail_blocks.push_str(&html);
     }
 
     // Build kept-raster blocks (OCR-wrong filtered out)
     let mut raster_blocks = String::new();
     for ce in &kept_raster_sorted {
-        raster_blocks.push_str(block_for(ce));
+        let (html, _chosen_zncc, _gt_zncc) = build_miss_block(
+            ce, audit_root, font_catalog, glyph_map, &mut font_data_cache, dpi,
+        );
+        raster_blocks.push_str(&html);
     }
 
     // Build hits / no_ground_truth blocks when --report-all
@@ -2483,10 +2420,16 @@ pub fn generate_report(
     let mut no_gt_blocks = String::new();
     if meta.report_all {
         for ce in &hits_sorted {
-            hits_blocks.push_str(block_for(ce));
+            let (html, _chosen_zncc, _gt_zncc) = build_miss_block(
+                ce, audit_root, font_catalog, glyph_map, &mut font_data_cache, dpi,
+            );
+            hits_blocks.push_str(&html);
         }
         for ce in &no_gt_sorted {
-            no_gt_blocks.push_str(block_for(ce));
+            let (html, _chosen_zncc, _gt_zncc) = build_miss_block(
+                ce, audit_root, font_catalog, glyph_map, &mut font_data_cache, dpi,
+            );
+            no_gt_blocks.push_str(&html);
         }
     }
 
@@ -2494,7 +2437,10 @@ pub fn generate_report(
     // Use full miss block so font info is preserved even for major misses.
     let mut ocr_miss_blocks = String::new();
     for ce in &ocr_misses {
-        ocr_miss_blocks.push_str(block_for(ce));
+        let (html, _chosen_zncc, _gt_zncc) = build_miss_block(
+            ce, audit_root, font_catalog, glyph_map, &mut font_data_cache, dpi,
+        );
+        ocr_miss_blocks.push_str(&html);
     }
 
     let sim_fail_section = if !sim_fail_blocks.is_empty() {
@@ -2549,14 +2495,17 @@ pub fn generate_report(
     // Full unfiltered listing when --audit-all / --report-all
     // Shows every line in page/line order regardless of hit/miss.
     let (all_lines_section, report_title) = if meta.report_all {
-        let mut all_sorted = classified.to_vec();
+        let mut all_sorted = classified.clone();
         all_sorted.sort_by(|a, b| {
-            entries[a.entry_index].page.cmp(&entries[b.entry_index].page)
-                .then(entries[a.entry_index].line_index.cmp(&entries[b.entry_index].line_index))
+            a.entry.page.cmp(&b.entry.page)
+                .then(a.entry.line_index.cmp(&b.entry.line_index))
         });
         let mut blocks = String::new();
         for ce in &all_sorted {
-            blocks.push_str(block_for(ce));
+            let (html, _chosen_zncc, _gt_zncc) = build_miss_block(
+                ce, audit_root, font_catalog, glyph_map, &mut font_data_cache, dpi,
+            );
+            blocks.push_str(&html);
         }
         let section = format!(
             "<h2 style=\"margin-top:2em;\">All Lines ({} lines)</h2>{}",
@@ -2616,17 +2565,17 @@ pub fn generate_report(
         let mut zncc = 0usize;
         let mut major = 0usize;
         let mut mrne = 0usize;
-        for ce in classified {
+        for ce in &classified {
             if ce.actual_font.is_none() {
                 continue; // only GT lines
             }
             // ocr miss: ocr_correct == false (enriched in enrich_audit_entries)
-            if entries[ce.entry_index].ocr_correct == Some(false) {
+            if ce.entry.ocr_correct == Some(false) {
                 ocr += 1;
             }
             // zncc miss: similarity_pass == false regardless of ps_match
             // This is the independent ZNCC attribute, not the mutually-exclusive SimilarityFailure.
-            if entries[ce.entry_index].similarity_pass == Some(false) {
+            if ce.entry.similarity_pass == Some(false) {
                 zncc += 1;
             }
             match ce.kind {
@@ -2670,12 +2619,12 @@ pub fn generate_report(
         let mut total = 0usize;
         let mut p_true = 0usize;
         let mut p_false = 0usize;
-        for ce in classified {
-            let gt_text = match entries[ce.entry_index].gt_text.as_deref() {
+        for ce in &classified {
+            let gt_text = match ce.entry.gt_text.as_deref() {
                 Some(t) => t,
                 None => continue,
             };
-            let ocr_text = match entries[ce.entry_index].ocr_text.as_deref() {
+            let ocr_text = match ce.entry.ocr_text.as_deref() {
                 Some(t) => t,
                 None => continue,
             };
@@ -2683,7 +2632,7 @@ pub fn generate_report(
             let ocr_chars: Vec<char> = ocr_text.chars().filter(|c| !c.is_whitespace()).collect();
 
             // Corrected text from word_bboxes (same source as chosen font verify)
-            let corrected_text: String = entries[ce.entry_index].word_bboxes.iter()
+            let corrected_text: String = ce.entry.word_bboxes.iter()
                 .map(|wb| wb.text.as_str()).collect::<Vec<_>>().join(" ");
             let corrected_chars: Vec<char> = corrected_text.chars()
                 .filter(|c| !c.is_whitespace()).collect();
@@ -2750,43 +2699,6 @@ pub fn generate_report(
         meta.classifier, render_opts, elapsed_str,
     );
 
-    // Timestamp for the report header (Mike 2026-11-02: include date and time)
-    let timestamp = {
-        use std::time::{SystemTime, UNIX_EPOCH};
-        let now = SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .map(|d| d.as_secs())
-            .unwrap_or(0);
-        // Format as YYYY-MM-DD HH:MM:SS UTC (simple, no external deps)
-        let days = now / 86400;
-        let secs = now % 86400;
-        let hours = secs / 3600;
-        let mins = (secs % 3600) / 60;
-        let secs = secs % 60;
-        // Days since 1970-01-01 to YYYY-MM-DD (approximate, good enough for header)
-        // Use a simple conversion via chrono-like math
-        let (y, m, d) = {
-            let mut y = 1970;
-            let mut d = days as i64;
-            loop {
-                let leap = (y % 4 == 0 && y % 100 != 0) || y % 400 == 0;
-                let yd = if leap { 366 } else { 365 };
-                if d < yd { break; }
-                d -= yd;
-                y += 1;
-            }
-            let leap = (y % 4 == 0 && y % 100 != 0) || y % 400 == 0;
-            let mdays = [31, if leap {29} else {28}, 31, 30, 31, 30, 31, 31, 30, 31, 30, 31];
-            let mut mo = 0;
-            while d >= mdays[mo] as i64 {
-                d -= mdays[mo] as i64;
-                mo += 1;
-            }
-            (y, mo + 1, d + 1)
-        };
-        format!("{:04}-{:02}-{:02} {:02}:{:02}:{:02} UTC", y, m, d, hours, mins, secs)
-    };
-
     let html = format!(
         "<!DOCTYPE html>\n\
          <html>\n\
@@ -2797,7 +2709,6 @@ pub fn generate_report(
          <body style=\"background: white; color: #222;\">\n\
          {CSS}\n\
          <h2>{report_title}</h2>\n\
-         <div class=\"summary\" style=\"color:#666;font-size:0.9em;\">Generated: {timestamp}</div>\n\
          <div class=\"summary\">{sim_summary}</div>\n\
          <div class=\"summary\">{font_summary}</div>\n\
          <div class=\"summary\">{independent_summary}</div>\n\
@@ -2812,10 +2723,6 @@ pub fn generate_report(
          <b>×u, higher = better</b>. Values below the threshold (default 6×u) are noise.\n\
          <b>ZNCC</b> (per-line) = zero-mean normalized cross-correlation between scanned line \
          and re-render; <b>-1–1, higher = more similar</b>.\n\
-         <b>†</b> after an h value means that pair's h_ll got the graded overlap \
-         downweighting (unreliable pitch: overlapping ink boxes + DP seam cut ink); \
-         hover for the overlap width in px subtracted from |h_err| \
-         (clamped at 0, sign kept, original sigma).\n\
          </div>\n\
          {all_lines_section}\n\
          <h2>Major Misses ({n_major})</h2>\n\

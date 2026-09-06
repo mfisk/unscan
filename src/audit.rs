@@ -22,7 +22,9 @@ pub struct WordSegSummary {
     pub mismatch: bool,
     pub ws_splits: Vec<u32>,
     pub seam_splits: Vec<u32>,
+    #[serde(skip_serializing)]
     pub seam_paths: Arc<HashMap<u32, Vec<[u32; 2]>>>,
+    #[serde(skip_serializing)]
     pub seam_costs: Arc<HashMap<u32, crate::segment::SeamCost>>,
 }
 
@@ -48,14 +50,15 @@ pub struct AuditEntry {
     pub font_candidates: Vec<FontCandidate>,
     #[serde(skip_serializing_if = "Vec::is_empty")]
     pub obs_votes: Vec<ObservationVote>,
-    /// GT font's own per-observation votes, on GT's own segmentation
-    /// (GT's collapsed ligature set: collapsed for lig GT, uncollapsed
-    /// for nolig GT). The report reads GT's per-char data on GT's own
-    /// segmentation from these — the nolig-cell components and the
-    /// GT-geo fallback when the winner's segmentation collapses a
-    /// ligature the GT font renders as separate characters.
+    /// Ligature-segmented font candidates (when ligature sequences are present).
     #[serde(skip_serializing_if = "Vec::is_empty")]
-    pub gt_obs_votes: Vec<ObservationVote>,
+    pub font_candidates_lig: Vec<FontCandidate>,
+    /// Ligature-segmented per-observation font-scoring votes.
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub obs_votes_lig: Vec<ObservationVote>,
+    /// Which segmentation path won: "plain" or "ligature".
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub seg_winner: Option<String>,
     /// Word-level bounding boxes for this line (for miss-report visualisation).
     #[serde(skip_serializing_if = "Vec::is_empty")]
     pub word_bboxes: Vec<WordBBox>,
@@ -101,14 +104,6 @@ pub struct AuditEntry {
     /// GT font per-word segmentation summaries – always included when GT scored.
     #[serde(skip_serializing_if = "Vec::is_empty")]
     pub gt_word_segmentation: Vec<WordSegSummary>,
-    /// Per-character GT geometry log-likelihoods (h_ll + v_ll) in observation order.
-    /// Enables offline evaluation of pruning statistics (min, mean, etc.) without re-running.
-    #[serde(skip_serializing_if = "Vec::is_empty")]
-    pub gt_per_char_geo_ll: Vec<f32>,
-    /// Whether GT would have been pruned by the geometry gate (min_ll < threshold)
-    /// if not protected by ensure_set. Flags lines where --test changes the outcome.
-    #[serde(skip_serializing_if = "std::ops::Not::not")]
-    pub gt_pruned: bool,
     /// PFLDA OCR corrections with decision data.
     #[serde(skip_serializing_if = "Vec::is_empty")]
     pub ocr_corrections: Vec<OcrCorrection>,
@@ -221,11 +216,6 @@ pub struct ObservationVote {
     // ── Geo scores ───────────────────────────────────────────────
     #[serde(skip_serializing_if = "Option::is_none")]
     pub chosen_geo_h_ll: Option<f32>,
-    /// Likely overlap error (px) subtracted from |h_err| for the graded
-    /// downweight applied to this pair's h_ll. Present only when the
-    /// overlap downweight fired.
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub chosen_geo_h_overlap_correction_px: Option<f32>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub chosen_geo_v_ll: Option<f32>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -234,11 +224,6 @@ pub struct ObservationVote {
     pub chosen_geo_v_err: Option<f32>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub gt_geo_h_ll: Option<f32>,
-    /// Likely overlap error (px) subtracted from |h_err| for the graded
-    /// downweight applied to this pair's h_ll. Present only when the
-    /// overlap downweight fired.
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub gt_geo_h_overlap_correction_px: Option<f32>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub gt_geo_v_ll: Option<f32>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -250,35 +235,6 @@ pub struct ObservationVote {
     pub chosen_geo_ll: Option<f32>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub gt_geo_ll: Option<f32>,
-    // ── Absolute midpoint/pitch data (Finding 10) ──────────────────
-    // Observed and predicted character midpoints (word-image px), pitches
-    // (px; None for word-initial chars, which have no previous char),
-    // per-word scale (px per font unit), and observed ink width (px).
-    // Recorded so per-line geometry can be re-derived from audit.json.
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub chosen_obs_cx: Option<f32>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub chosen_pred_cx: Option<f32>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub chosen_obs_pitch: Option<f32>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub chosen_pred_pitch: Option<f32>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub chosen_geo_scale: Option<f32>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub chosen_ink_width: Option<f32>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub gt_obs_cx: Option<f32>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub gt_pred_cx: Option<f32>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub gt_obs_pitch: Option<f32>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub gt_pred_pitch: Option<f32>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub gt_geo_scale: Option<f32>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub gt_ink_width: Option<f32>,
 }
 
 #[derive(Debug, Serialize, Clone)]

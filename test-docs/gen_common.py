@@ -19,23 +19,6 @@ from pathlib import Path
 SCRIPT_DIR = Path(__file__).resolve().parent
 REPO_ROOT = SCRIPT_DIR.parent
 
-
-def resolve_fontkey_via_api(unprint_bin, font_path):
-    """Get verbatim font_key from Rust catalog via --resolve-fontkey.
-
-    This is the single source of truth for fontkeys. Never construct
-    fontkeys in Python; always ask Rust.
-    """
-    result = subprocess.run(
-        [unprint_bin, "--resolve-fontkey", font_path],
-        capture_output=True, text=True, timeout=30
-    )
-    if result.returncode != 0:
-        raise RuntimeError(
-            f"--resolve-fontkey failed for {font_path}: {result.stderr[:200]}"
-        )
-    return result.stdout.strip()
-
 # Ensure tools/ is on path for pdf_font_annotate / rasterize
 sys.path.insert(0, str(REPO_ROOT / "tools"))
 from pdf_font_annotate import make_weight_explicit, annotate_canonical_names, read_postscript_name  # noqa: E402
@@ -69,7 +52,6 @@ FAMILIES = {
     "SpecialElite": "Special Elite",
     # System / MS Core Fonts
     "TimesNewRoman": "Times New Roman",
-    "Nimbus": "Nimbus Roman",  # URW Base 35 clone of Times (NimbusRoman-*.otf)
     "CourierNew": "Courier New",
     "NimbusSans": "Arial",
     "Arial": "Arial",
@@ -124,11 +106,11 @@ def fc_find(family, style="Regular"):
             capture_output=True, text=True,
         )
         for line in r.stdout.strip().split("\n"):
-            if line and line.lower().endswith((".ttf", ".otf")) and line not in candidates:
+            if line and line.lower().endswith(".ttf") and line not in candidates:
                 candidates.append(line)
 
     if not candidates:
-        raise RuntimeError(f"fc_find: no .ttf/.otf candidates for '{family}' style='{style}'")
+        raise RuntimeError(f"fc_find: no .ttf candidates for '{family}' style='{style}'")
 
     exact_static = []
     variable = []
@@ -228,27 +210,7 @@ def escape_html(text):
     return text.replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;").replace('"', "&quot;")
 
 
-def css_family_name(family):
-    """Sanitize a fontkey for use as a CSS font-family name.
-
-    A comma inside a quoted CSS family name breaks the @font-face match
-    through the WeasyPrint/Pango stack: Pango splits font descriptions on
-    commas, so the family never matches its @font-face rule and the
-    renderer falls back to the default sans (Noto Sans). Verified with a
-    minimal render: family 'OpenSans-400|nokern|nolig[wght=400,wdth=100]'
-    embedded Noto-Sans, while the same font under
-    'OpenSans-400_nokern_nolig_wght400_wdth100' embedded OpenSans.
-
-    The GT annotation is the verbatim fontkey and is untouched — this only
-    changes the CSS rendering name. It must be applied in BOTH the
-    @font-face rule (here) and the element style (callers), using this one
-    helper, so the two can never drift apart.
-    """
-    return family.replace(",", "_")
-
-
 def _font_face_rule(family, ttf_path, weight="400", style="normal"):
-    family = css_family_name(family)
     return (
         f"@font-face {{\n"
         f"  font-family: '{family}';\n"
@@ -338,263 +300,41 @@ def _read_ps_and_weight_from_descriptor(font_desc):
     return None, None
 
 
-def _resolve_fallback_font_ps(ps_name, unprint_bin):
-    """Resolve a PDF font that is not in the specimen's resolved set
-    (e.g. a WeasyPrint fallback font like Noto Sans) to its verbatim
-    catalog fontkey, via fontconfig + --resolve-fontkey.
-
-    Returns the fontkey string, or None if the font cannot be resolved
-    (the caller then raises with the PDF-font context). Rust applies
-    the same preference scoring as the old whole-catalog lookup, so
-    the result is identical.
-    """
-    style = "Regular"
-    family = ps_name.replace("-", " ")
-    # Style suffixes, longest first. Dash forms ('NotoSans-Italic') take
-    # precedence; bare CamelCase forms ('NotoSansItalic') follow. The
-    # embedded PS name can carry either (e.g. 'NotoSans-Regular').
-    for suffix, st in [("-BoldItalic", "Bold Italic"), ("-Bold", "Bold"),
-                       ("-Italic", "Italic"), ("-Oblique", "Italic"),
-                       ("-Regular", "Regular"),
-                       ("BoldItalic", "Bold Italic"), ("Bold", "Bold"),
-                       ("Italic", "Italic"), ("Oblique", "Italic"),
-                       ("Regular", "Regular")]:
-        if ps_name.endswith(suffix):
-            family = ps_name[:-len(suffix)].replace("-", " ")
-            style = st
-            break
-    try:
-        path = fc_find(family, style)
-        return resolve_fontkey_via_api(unprint_bin, path)
-    except Exception:
-        return None
-
-
-def build_canonical_map_from_pdf(pdf_path, all_font_files, catalog_by_path=None, font_entries=None, unprint_bin=None):
+def build_canonical_map_from_pdf(pdf_path, all_font_files):
     """Build canonical_map by extracting PS names from embedded font data in PDF.
 
     Returns dict: raw BaseFont (subset-stripped) -> canonical PS name.
-
-    If font_entries is provided (dict from gen-specimen.py: base -> {variant: entry}),
-    uses it directly to map PDF fonts to the EXACT fontkeys used during generation.
-    This is the correct approach for variable fonts where multiple weights share
-    the same PS name — the PDF BaseFont name (e.g., "Source-Serif-4-Bold") is parsed
-    to get the variant, then looked up in font_entries to get the full fontkey
-    (including axes like [opsz=20]).
-
-    If catalog_by_path is provided (dict: font file path -> {'font_key',
-    'path'}, built by the caller from verbatim --resolve-fontkey results),
-    uses those fontkeys directly. Rust is the single source of truth;
-    Python never re-implements the preference scoring and never needs
-    the whole-catalog JSON dump (Mike Nov 6, 2026).
-
-    If neither is provided, falls back to legacy behavior (may be incorrect for
-    variable fonts).
     """
     import pikepdf
     from fontTools.ttLib import TTFont as FTFont
-    import re
-
-    # (Removed _normalize_ps and _strip_weight per architectural change #3:
-    #  font_key is opaque, use exact matching only. No heuristics.)
-
-    # If font_entries provided, build direct mapping from PDF font names
-    # This is the CORRECT approach — uses the exact entries from generation
-    if font_entries:
-        # Build a lookup: normalized family name -> base key in font_entries
-        # font_entries keys are like "SourceSerif4", PDF names are like "Source-Serif-4-Bold"
-        def _norm_pdf_family(pdf_name):
-            # Remove variant suffixes: -Bold, -Italic, -BoldItalic, etc.
-            # Also handle trailing comma (WeasyPrint quirk for regular)
-            name = pdf_name.strip()
-            # Remove trailing comma (WeasyPrint quirk)
-            if name.endswith(','):
-                name = name[:-1]
-            # Remove variant suffixes
-            for suffix in ['-BoldItalic', '-Bold', '-Italic', '-Oblique', '-Regular']:
-                if name.endswith(suffix):
-                    name = name[:-len(suffix)]
-                    break
-            # Normalize: remove dashes, lowercase
-            return re.sub(r'[^a-z0-9]', '', name.lower())
-        
-        def _parse_variant(pdf_name):
-            # Extract variant from PDF font name
-            # e.g., "Source-Serif-4-Bold" -> "bold", "Source-Serif-4-Italic" -> "italic"
-            name_lower = pdf_name.lower()
-            if 'bolditalic' in name_lower or ('bold' in name_lower and 'italic' in name_lower):
-                return 'bold'  # Use bold entry (italic bold not separately tracked)
-            elif 'bold' in name_lower:
-                return 'bold'
-            elif 'italic' in name_lower or 'oblique' in name_lower:
-                return 'italic'
-            else:
-                return 'regular'
-        
-        # Build family lookup
-        family_to_base = {}
-        for base in font_entries.keys():
-            # Normalize base: "SourceSerif4" -> "sourceserif4"
-            norm_base = re.sub(r'[^a-z0-9]', '', base.lower())
-            family_to_base[norm_base] = base
-        
-        # Parse PDF and build map
-        pdf = pikepdf.open(pdf_path)
-        canonical_map = {}
-        pdf_font_names = set()
-        for page in pdf.pages:
-            if '/Resources' in page and '/Font' in page.Resources:
-                for font_ref in page.Resources.Font.values():
-                    try:
-                        font = pdf.get_object(font_ref.objgen)
-                    except:
-                        font = font_ref
-                    if '/BaseFont' in font:
-                        raw_bf = str(font.BaseFont)
-                        # Strip subset prefix
-                        clean_bf = raw_bf.split('+')[-1]
-                        pdf_font_names.add((raw_bf, clean_bf))
-        pdf.close()
-        
-        for raw_bf, clean_bf in pdf_font_names:
-            # Parse family and variant from clean_bf
-            norm_family = _norm_pdf_family(clean_bf)
-            variant = _parse_variant(clean_bf)
-            
-            base = family_to_base.get(norm_family)
-            if not base:
-                # PDF font not in specimen (e.g., DejaVu-Sans for UI/fallback).
-                # Skip it — we only need mappings for specimen fonts.
-                # The legacy catalog-based path below will handle it if needed.
-                continue
-            
-            variants_dict = font_entries.get(base, {})
-            entry = variants_dict.get(variant)
-            if not entry:
-                # Fallback to regular if variant not found (e.g., bolditalic -> bold)
-                entry = variants_dict.get('regular')
-            if not entry or not isinstance(entry, dict):
-                raise RuntimeError(
-                    f"No font entry for '{base}' variant '{variant}' (PDF font '{raw_bf}'). "
-                    f"Fix the specimen."
-                )
-
-            # Use the entry's own font_key verbatim. The entry is the exact
-            # variant picked during generation, and its key came from the Rust
-            # scanner through the catalog, so Rust remains the single source
-            # of truth for key formatting. Do NOT re-resolve by file path:
-            # a path identifies the file, not the instance, and
-            # --resolve-fontkey returns a variable font's DEFAULT instance,
-            # discarding the picked variant (e.g. a line rendered in
-            # Open-Sans-Bold was annotated OpenSans-400).
-            fontkey = entry.get('font_key', '')
-            if not fontkey:
-                raise RuntimeError(
-                    f"Font entry for '{base}' variant '{variant}' has no font_key. Fix the catalog."
-                )
-            
-            # Map both raw and clean names to the fontkey
-            canonical_map[raw_bf] = fontkey
-            canonical_map[clean_bf] = fontkey
-        
-        return canonical_map
-
-    # catalog_by_path maps a font file path to its catalog entry dict
-    # {'font_key', 'path'}. The caller builds it from verbatim
-    # --resolve-fontkey results, so the preference scoring already
-    # happened in Rust. No JSON dump, no Python copy of Rust scoring
-    # (Mike Nov 6, 2026: the dump path was the legacy kludge).
-    if catalog_by_path is None:
-        catalog_by_path = {}
 
     ps_to_canonical = {}
     ps_to_orig_weight = {}
-
-    # PS-name -> catalog entry, built from the resolved set only
-    # (populated in the all_font_files loop below, where each file's
-    # PS name is read from the file itself). A PDF font outside the
-    # resolved set is handled on demand in the PDF loop below
-    # (fallback-font resolution).
-    ps_to_entry = {}
-    
-    # For each file, also add the file's PS name mapping (for non-variable fonts)
     for path in all_font_files:
-        catalog_entry = catalog_by_path.get(str(path))
-        if catalog_entry:
-            # Use the catalog's font_key directly.
-            # The font_key already includes |nokern, [wght=...], etc.
-            # Get the raw PS name from the file for mapping (exact match only)
-            from pdf_font_annotate import read_postscript_name
-            raw_ps = read_postscript_name(str(path))
-            if raw_ps:
-                ps_to_canonical[raw_ps] = catalog_entry['font_key']
-                ps_to_entry[raw_ps] = catalog_entry
-        else:
-            # Path not in catalog - try fallback for deduped files (same content, different path).
-            # Rust dedupes by content hash; fontconfig may return the deduped path.
-            # Fallback: find catalog entry in same directory with same file size.
-            fallback_entry = None
+        orig_ps, canonical_ps, _ = make_weight_explicit(path)
+        if orig_ps and canonical_ps:
+            ps_to_canonical[orig_ps] = canonical_ps
             try:
-                path_str = str(path)
-                path_dir = os.path.dirname(path_str)
-                path_size = os.path.getsize(path_str)
-                for cat_path_str, cat_entry in catalog_by_path.items():
-                    if os.path.dirname(cat_path_str) == path_dir:
-                        try:
-                            if os.path.getsize(cat_path_str) == path_size:
-                                fallback_entry = cat_entry
-                                break
-                        except OSError:
-                            pass
-            except OSError:
-                pass
-
-            if fallback_entry:
-                # Use the deduped catalog entry
-                catalog_entry = fallback_entry
-                from pdf_font_annotate import read_postscript_name
-                raw_ps = read_postscript_name(str(path))
-                if raw_ps:
-                    ps_to_canonical[raw_ps] = catalog_entry['font_key']
-                    ps_to_entry[raw_ps] = catalog_entry
-                    norm = _normalize_ps(raw_ps)
-                    if norm not in ps_to_canonical:
-                        pass
-            else:
-                # Catalog doesn't have this font - ERROR OUT (per Mike: "Error out instead of a silent skip")
-                raise RuntimeError(
-                    f"Font file not in catalog: {path}. "
-                    f"Specimen uses a font not in the catalog. Fix the catalog or specimen."
-                )
-        # Still need weight for the PDF parsing logic below
-        if path not in ps_to_orig_weight:
-            try:
-                tt = FTFont(str(path))
-                # Get orig_ps for weight mapping
-                from pdf_font_annotate import read_postscript_name
-                rps = read_postscript_name(str(path))
-                if rps:
-                    ps_to_orig_weight[rps] = tt['OS/2'].usWeightClass
+                tt = FTFont(path)
+                ps_to_orig_weight[orig_ps] = tt['OS/2'].usWeightClass
                 tt.close()
             except Exception:
                 pass
 
-    # A passed unprint_bin wins; otherwise discover it. (The font_entries
-    # branch above already used the passed value.)
+    script_dir = os.path.dirname(os.path.abspath(__file__))
+    repo_root = os.path.dirname(script_dir)
+    unprint_bin = None
+    for bin_path in [
+        os.path.join(repo_root, "target", "release", "unprint"),
+        os.path.join(repo_root, "target", "release", "unscan"),
+        os.path.join(repo_root, "target", "debug", "unprint"),
+        os.path.join(repo_root, "target", "debug", "unscan"),
+    ]:
+        if os.path.exists(bin_path):
+            unprint_bin = bin_path
+            break
     if unprint_bin is None:
-        script_dir = os.path.dirname(os.path.abspath(__file__))
-        repo_root = os.path.dirname(script_dir)
-        for bin_path in [
-            os.path.join(repo_root, "target", "release", "unprint"),
-            os.path.join(repo_root, "target", "release", "unscan"),
-            os.path.join(repo_root, "target", "debug", "unprint"),
-            os.path.join(repo_root, "target", "debug", "unscan"),
-        ]:
-            if os.path.exists(bin_path):
-                unprint_bin = bin_path
-                break
-        if unprint_bin is None:
-            unprint_bin = "unprint"
+        unprint_bin = "unprint"
 
     canonical_map = {}
     pdf = pikepdf.open(str(pdf_path))
@@ -618,47 +358,29 @@ def build_canonical_map_from_pdf(pdf_path, all_font_files, catalog_by_path=None,
             if not embedded_ps:
                 continue
             orig_weight = ps_to_orig_weight.get(embedded_ps)
-            # Use catalog ONLY - no reconstruction via --weight-explicit (per Mike's directive).
-            # Try exact match, then normalized matching.
-            if embedded_ps in ps_to_canonical:
+            if embedded_weight is not None and orig_weight is not None and embedded_weight != orig_weight:
+                try:
+                    r = subprocess.run(
+                        [unprint_bin, "--weight-explicit", f"{embedded_ps}:{embedded_weight}"],
+                        capture_output=True, text=True
+                    )
+                    canonical_map[raw_bf] = r.stdout.strip() if r.returncode == 0 and r.stdout.strip() else embedded_ps
+                except FileNotFoundError:
+                    canonical_map[raw_bf] = embedded_ps
+            elif embedded_ps in ps_to_canonical:
                 canonical_map[raw_bf] = ps_to_canonical[embedded_ps]
             else:
-                # Try normalized matching against catalog entries
-                # (handles Playfair-Display-Bold vs PlayfairDisplay-700, etc.)
-                # Try embedded_ps first, then raw_bf (PDF BaseFont name)
-                # Exact match only (architectural change #3: no normalization heuristics).
-                # Try embedded PS name first, then raw BaseFont (both with subset prefix stripped).
-                ps_entry = None
-                for name_to_try in [embedded_ps, raw_bf]:
-                    if not name_to_try:
-                        continue
-                    # Strip subset prefix (e.g., "ABCDEF+DejaVuSans" -> "DejaVuSans")
-                    # The catalog's postscript_name is the clean raw name.
-                    clean_name = name_to_try.split('+')[-1]
-                    ps_entry = ps_to_entry.get(clean_name)
-                    if ps_entry:
-                        break
-                if ps_entry is None:
-                    # Not in the resolved set: a fallback font the renderer
-                    # pulled in (e.g. Noto Sans for a glyph the specimen
-                    # fonts lack). Resolve it on demand via fontconfig +
-                    # --resolve-fontkey; Rust applies the same preference
-                    # scoring, so the result matches the old whole-catalog
-                    # lookup. Unresolvable here is fatal, as before.
-                    fallback_key = _resolve_fallback_font_ps(embedded_ps, unprint_bin)
-                    if fallback_key:
-                        ps_to_entry[embedded_ps] = {'font_key': fallback_key, 'path': ''}
-                        ps_to_canonical[embedded_ps] = fallback_key
-                        ps_entry = ps_to_entry[embedded_ps]
-                if ps_entry:
-                    canonical_map[raw_bf] = ps_entry['font_key']
+                if embedded_weight is not None:
+                    try:
+                        r = subprocess.run(
+                            [unprint_bin, "--weight-explicit", f"{embedded_ps}:{embedded_weight}"],
+                            capture_output=True, text=True
+                        )
+                        canonical_map[raw_bf] = r.stdout.strip() if r.returncode == 0 and r.stdout.strip() else embedded_ps
+                    except FileNotFoundError:
+                        canonical_map[raw_bf] = embedded_ps
                 else:
-                    # No catalog match - ERROR OUT (do not silently skip)
-                    # Per Mike: "Error out instead of a silent skip"
-                    raise RuntimeError(
-                        f"No catalog entry for PDF font '{raw_bf}' (embedded: '{embedded_ps}'). "
-                        f"Specimen uses a font not in the catalog. Fix the catalog or specimen."
-                    )
+                    canonical_map[raw_bf] = embedded_ps
     pdf.close()
     return canonical_map
 

@@ -177,52 +177,6 @@ pub fn setup() -> bool {
     ensure_fixtures()
 }
 
-/// Ensure the vintage specimen PDFs exist, generating them if missing.
-///
-/// Runs `test-docs/gen-vintage-specimen.py` with the same unprint binary
-/// the test harness resolves (via `unscan_bin()`), so the specimen's
-/// `--resolve-fontkey` calls and the audit run against one binary. The
-/// PDFs are git-ignored build products: a fresh checkout has none, and
-/// without this the t66 test fails before it starts. Regeneration takes
-/// ~10s and rewrites both PDFs (plus `vintage-font-keys.json`); existing
-/// PDFs are left untouched.
-pub fn ensure_vintage_specimen() {
-    let gt = test_doc("vintage-specimen-gt.pdf");
-    let raster = test_doc("vintage-specimen-rasterized.pdf");
-    if gt.exists() && raster.exists() {
-        return;
-    }
-    let manifest = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
-    let script = manifest
-        .join("test-docs")
-        .join("gen-vintage-specimen.py");
-    let bin = unscan_bin();
-    eprintln!("  Vintage specimen missing — generating via gen-vintage-specimen.py ...");
-    let output = Command::new("python3")
-        .arg(&script)
-        .args(["--unprint-bin", bin.to_str().unwrap()])
-        .current_dir(&manifest)
-        .output()
-        .unwrap_or_else(|e| panic!("failed to launch {}: {}", script.display(), e));
-    assert!(
-        output.status.success(),
-        "gen-vintage-specimen.py failed (exit {:?}):\n{}",
-        output.status.code(),
-        String::from_utf8_lossy(&output.stderr)
-    );
-    assert!(
-        gt.exists(),
-        "gen-vintage-specimen.py did not produce {}",
-        gt.display()
-    );
-    assert!(
-        raster.exists(),
-        "gen-vintage-specimen.py did not produce {}",
-        raster.display()
-    );
-    eprintln!("  Vintage specimen generated.");
-}
-
 // ── Run wrappers ─────────────────────────────────────────────────────
 
 /// Run unscan with output to /dev/null and return combined stdout+stderr.
@@ -399,10 +353,6 @@ pub struct AccuracyResult {
     pub similarity_failures: usize,
     pub compared: usize,
     pub accuracy: f64,
-    /// BAP-convention hits: exact hits + minor misses.
-    pub primary_hits: usize,
-    /// Mean ZNCC similarity score across entries that have one.
-    pub zncc_avg: f64,
     pub report_path: PathBuf,
 }
 
@@ -462,10 +412,8 @@ pub fn measure_accuracy(raster: &Path, vector: &Path, label: &str) -> AccuracyRe
     let minor_misses = json["minor_misses"].as_u64().unwrap_or(0) as usize;
     let major_misses = json["major_misses"].as_u64().unwrap_or(0) as usize;
     let similarity_failures = json["similarity_failures"].as_u64().unwrap_or(0) as usize;
-    let primary_hits = json["primary_hits"].as_u64().unwrap_or(0) as usize;
-    let zncc_avg = json["zncc_avg"].as_f64().unwrap_or(0.0);
 
     let accuracy = if compared > 0 { hits as f64 / compared as f64 } else { 0.0 };
 
-    AccuracyResult { hits, minor_misses, major_misses, similarity_failures, compared, accuracy, primary_hits, zncc_avg, report_path }
+    AccuracyResult { hits, minor_misses, major_misses, similarity_failures, compared, accuracy, report_path }
 }

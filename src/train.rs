@@ -3,12 +3,10 @@
 //! Moved from `src/bin/train.rs` into the main binary as a library module.
 //! Called via `unprint --train-lda`.
 
-use std::collections::{HashMap, HashSet};
+use std::collections::HashMap;
 use std::io::{BufReader, BufWriter, Read, Write};
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
 use std::sync::atomic::{AtomicUsize, Ordering};
-
-use serde::{Deserialize, Serialize};
 
 use rand::prelude::*;
 use rand::rngs::SmallRng;
@@ -618,28 +616,52 @@ pub fn subsample_eval(n: usize, max_eval: usize, seed: u64) -> Vec<usize> {
 // Main
 // ---------------------------------------------------------------------------
 
-/// Subpixel offsets for training robustness (Mike Nov 3, 2026).
-/// MuPDF rasterization positions glyphs at fractional pixel coordinates;
-/// training must cover x and y variations. Quarter-pixel steps (Mike Nov 4, 2026).
-///
-/// Each glyph group produces exactly one training record per (dx, dy) pair,
-/// so a sequence's record count is `groups * SUBPIXEL_OFFSET_COUNT`.
-/// The render loop and the cache validation share these constants, so the two
-/// sides of the count comparison can never drift apart again. Do not change
-/// the steps without updating the render loop and validation together.
-const SUBPIXEL_STEPS: [f32; 4] = [0.0, 0.25, 0.5, 0.75];
-const SUBPIXEL_OFFSET_COUNT: usize = SUBPIXEL_STEPS.len() * SUBPIXEL_STEPS.len();
 
-/// Scan the training catalog: base fonts plus vintage variants, sorted by
-/// font key — the same set runtime `load_fonts` produces. Shared by
-/// `run_train` and `load_geo_cache_for_training` so the geo cache is built
-/// for exactly the catalog training renders.
-fn scan_training_catalog(font_dir: &[PathBuf], max_fonts: usize) -> Vec<crate::font_scan::FontEntry> {
+pub fn run_train(mut args: TrainArgs) {
+    // Respect wrapper env first, otherwise cap to avoid OOM on 7.8GB no-swap.
+    // Previous version always forced 4 threads, ignoring RAYON_NUM_THREADS=1,
+    // which caused VSZ bloat when each thread held font data + PNG encoders.
+    let max_threads = std::env::var("RAYON_NUM_THREADS")
+        .ok()
+        .and_then(|s| s.parse::<usize>().ok())
+        .unwrap_or_else(|| {
+            std::thread::available_parallelism()
+                .map(|n| n.get())
+                .unwrap_or(2)
+                .min(4)
+        });
+    let _ = rayon::ThreadPoolBuilder::new()
+        .num_threads(max_threads)
+        .build_global();
+
+    if args.heights.is_empty() {
+        args.heights = vec![features::NORM_H];
+    }
+
+    // In --fast mode: alternating heights, single AA variant
+    let active_heights: Vec<u32> = if args.fast {
+        args.heights.iter().step_by(2).copied().collect()
+    } else {
+        args.heights.clone()
+    };
+    let aa_variants: Vec<AaVariant> = if args.fast {
+        vec![AaVariant::Native]
+    } else {
+        vec![AaVariant::Native, AaVariant::Blur05, AaVariant::Sharpen]
+    };
+
+    eprintln!("Heights: {:?}{}", active_heights, if args.fast { " (fast)" } else { "" });
+    eprintln!("AA variants: {}{}", aa_variants.len(), if args.fast { " (fast)" } else { "" });
+    eprintln!("Epochs: {}", args.epochs);
+    eprintln!("Learning rate: {}", args.lr);
+    eprintln!("Margin: {}", args.margin);
+
+    // ── 1. Scan fonts (base + vintage, matching runtime load_fonts) ──
     // Runtime load_fonts adds vintage variants from msttcorefonts via
     // ensure_vintage_fonts. Training must include the same set, otherwise
     // catalog_hash (base only) != catalog.bin (base+vintage) and LDA
     // weights are considered stale forever → infinite retrain loop.
-    let font_dirs: Vec<PathBuf> = font_scan::default_font_dirs(font_dir);
+    let font_dirs: Vec<PathBuf> = font_scan::default_font_dirs(&args.font_dir);
 
     let mut catalog = font_scan::scan_fonts(&font_dirs, false);
 
@@ -686,287 +708,16 @@ fn scan_training_catalog(font_dir: &[PathBuf], max_fonts: usize) -> Vec<crate::f
     }
     catalog.extend(vintage_entries);
 
+
     // Sort by font_key for deterministic font_id assignment, matching
     // FontRegistry::new() ordering so runtime and training agree.
     catalog.sort_by(|a, b| a.font_key().cmp(&b.font_key()));
     eprintln!("  {} font entries found (base {} + vintage {})", catalog.len(), base_count, catalog.len() - base_count);
 
-    if max_fonts > 0 && catalog.len() > max_fonts {
-        catalog.truncate(max_fonts);
-        eprintln!("  Limiting to {} fonts (--max-fonts)", max_fonts);
+    if args.max_fonts > 0 && catalog.len() > args.max_fonts {
+        catalog.truncate(args.max_fonts);
+        eprintln!("  Limiting to {} fonts (--max-fonts)", args.max_fonts);
     }
-    catalog
-}
-
-/// Load (or build) the geo cache for the training catalog (Finding 5).
-/// Used by the classifier retraining fallbacks, which have only a font
-/// directory — no registry and no geo cache — but must still pass a real
-/// provider to `run_train`. The cache file is shared with the runtime, so
-/// this reuses the runtime cache when the catalog hash matches.
-pub fn load_geo_cache_for_training(font_dir: &[PathBuf], quiet: bool) -> crate::geo_cache::GeometryCache {
-    let catalog = scan_training_catalog(font_dir, 0);
-    let registry = crate::font_scan::FontRegistry::new(catalog);
-    let font_cache = crate::font_cache::FontCache::new(crate::font_cache::DEFAULT_CAPACITY);
-    crate::geo_cache::GeometryCache::load_or_build(&registry, &font_cache, quiet)
-}
-
-/// Feature-file path for one (sequence, height, AA) combination.
-/// Hoisted to module level so the Phase 1 checkpoint helpers share the
-/// exact path construction with run_train (single source of truth).
-fn combo_path(feat_dir: &Path, seq: &[char], ht: u32, aa_name: &str) -> PathBuf {
-    feat_dir.join(format!("{}_h{}_{}.bin", seq_key(seq), ht, aa_name))
-}
-
-// ---------------------------------------------------------------------------
-// Phase 1 resume checkpoint (perf proposal 4.4, Nov 2026)
-// ---------------------------------------------------------------------------
-//
-// Problem: a cold retrain restarts from font 0 on every interruption —
-// Phase 1 streamed all samples into tmp files and renamed them to final
-// only at the very end, so a kill (reboot, OOM) discarded hours of work
-// and a full cold retrain never completed under the ~2h reboot cadence.
-//
-// Protocol: after each 30-font chunk is written, Phase 1 flushes all
-// writers and then atomically records a checkpoint (tmp file + rename)
-// holding the number of fonts completed and the per-(combo, seq) record
-// counts. The flush-then-checkpoint order is the commit point: the
-// checkpoint only ever claims records already durable in the tmp files.
-//
-// A resume is accepted ONLY if every fingerprint field matches the
-// current run (catalog hash, font count, ink threshold, sequence count,
-// glyph-map hash, needed combos) AND every tmp file's size matches its
-// recorded count exactly (0 bytes for 0 records, else 12-byte header +
-// count * record bytes). Any mismatch — a torn write, a changed catalog,
-// a rebuilt glyph map, a corrupted file — discards the checkpoint (tmp
-// files + checkpoint deleted) and restarts Phase 1 from font 0. A
-// half-written file for the interrupted font can therefore never be
-// accepted: its size cannot match any recorded count, and the restart
-// re-renders it. Restarting is always correct; it only costs time.
-//
-// Resume state lives in the feature dir (the checkpoint JSON + the tmp
-// feature files) and never depends on the glyph PNG cache.
-
-/// Format version of the Phase 1 checkpoint file. Bump when the struct changes.
-const PHASE1_CHECKPOINT_VERSION: u32 = 1;
-/// Checkpoint file name inside the feature dir.
-const PHASE1_CHECKPOINT_NAME: &str = "phase1_checkpoint.json";
-
-/// Resume checkpoint for Phase 1 of training. Written atomically after
-/// each chunk; deleted when Phase 1 completes.
-#[derive(Serialize, Deserialize)]
-struct Phase1Checkpoint {
-    version: u32,
-    catalog_hash: u64,
-    total_fonts: usize,
-    fonts_done: usize,
-    ink_thresh: u8,
-    n_seqs: usize,
-    glyph_map_hash: u64,
-    needed_combos: Vec<(u32, usize)>,
-    /// Record counts, indexed [combo_idx][si]. The manifest is written
-    /// from these at the end, so they must match the tmp files exactly.
-    combo_counts: Vec<Vec<usize>>,
-}
-
-fn phase1_checkpoint_path(feat_dir: &Path) -> PathBuf {
-    feat_dir.join(PHASE1_CHECKPOINT_NAME)
-}
-
-/// Bytes per feature record: 4-byte glyph_id + FEAT_LEN f32s.
-fn phase1_record_bytes() -> usize {
-    4 + FEAT_LEN * 4
-}
-
-/// Expected tmp-file size for `count` records: empty when nothing has
-/// been written yet (the header is written with the first sample),
-/// otherwise the 12-byte header plus one record per sample.
-fn phase1_expected_tmp_size(count: usize) -> u64 {
-    if count == 0 {
-        0
-    } else {
-        12 + count as u64 * phase1_record_bytes() as u64
-    }
-}
-
-/// Stable (cross-process) hash of a file's bytes. FxHasher has a fixed
-/// seed, unlike DefaultHasher. A missing/unreadable file hashes as empty
-/// input, so a file that appears/disappears between runs fails validation.
-fn hash_file_bytes(path: &Path) -> u64 {
-    use std::hash::Hasher;
-    let mut hasher = rustc_hash::FxHasher::default();
-    if let Ok(bytes) = std::fs::read(path) {
-        hasher.write(&bytes);
-    }
-    hasher.finish()
-}
-
-/// Atomically write the checkpoint (tmp file + rename, like the manifests).
-fn write_phase1_checkpoint(feat_dir: &Path, ckpt: &Phase1Checkpoint) {
-    let path = phase1_checkpoint_path(feat_dir);
-    let tmp_path = crate::atomic_file::tmp_for(&path);
-    let json = serde_json::to_string(ckpt).expect("serialize phase1 checkpoint");
-    std::fs::write(&tmp_path, json).expect("write phase1 checkpoint tmp");
-    std::fs::rename(&tmp_path, &path).expect("atomic rename phase1 checkpoint");
-}
-
-/// Load and parse the checkpoint, if one exists and parses. Any failure
-/// (missing file, bad JSON, wrong version) returns None — the caller
-/// treats that as "no usable checkpoint" and restarts from font 0.
-fn load_phase1_checkpoint(feat_dir: &Path) -> Option<Phase1Checkpoint> {
-    let path = phase1_checkpoint_path(feat_dir);
-    let json = std::fs::read_to_string(&path).ok()?;
-    let ckpt: Phase1Checkpoint = serde_json::from_str(&json).ok()?;
-    if ckpt.version != PHASE1_CHECKPOINT_VERSION {
-        return None;
-    }
-    Some(ckpt)
-}
-
-/// Delete the checkpoint and all Phase 1 tmp files for the needed combos.
-/// Used when a checkpoint fails validation (restart from font 0) and when
-/// starting fresh, so a new run never appends to orphaned tmp files.
-fn discard_phase1_checkpoint(
-    feat_dir: &Path,
-    sequences: &[Vec<char>],
-    needed_combos: &[(u32, usize)],
-) {
-    let _ = std::fs::remove_file(phase1_checkpoint_path(feat_dir));
-    for seq in sequences {
-        for &(ht, aa_idx) in needed_combos {
-            let aa_name = crate::features::AaVariant::all()[aa_idx].name();
-            let final_path = combo_path(feat_dir, seq, ht, aa_name);
-            let _ = std::fs::remove_file(crate::atomic_file::tmp_for(&final_path));
-        }
-    }
-}
-
-/// Validate a checkpoint against the current run. Returns true only if
-/// the fingerprint matches exactly AND every tmp file exists with exactly
-/// the recorded size. Anything else is a corrupt/stale checkpoint.
-fn validate_phase1_checkpoint(
-    ckpt: &Phase1Checkpoint,
-    feat_dir: &Path,
-    sequences: &[Vec<char>],
-    needed_combos: &[(u32, usize)],
-    catalog_hash: u64,
-    total_fonts: usize,
-    glyph_map_hash: u64,
-) -> bool {
-    if ckpt.catalog_hash != catalog_hash
-        || ckpt.total_fonts != total_fonts
-        || ckpt.fonts_done > total_fonts
-        || ckpt.ink_thresh != crate::INK_THRESH
-        || ckpt.n_seqs != sequences.len()
-        || ckpt.glyph_map_hash != glyph_map_hash
-        || ckpt.needed_combos != needed_combos
-        || ckpt.combo_counts.len() != needed_combos.len()
-        || ckpt
-            .combo_counts
-            .iter()
-            .any(|counts| counts.len() != sequences.len())
-    {
-        return false;
-    }
-    // Every tmp file must exist with exactly the recorded size. A file
-    // that is short (torn flush) or long (killed between flush and
-    // checkpoint write) fails validation and forces a restart.
-    for (combo_idx, &(ht, aa_idx)) in needed_combos.iter().enumerate() {
-        let aa_name = crate::features::AaVariant::all()[aa_idx].name();
-        for (si, seq) in sequences.iter().enumerate() {
-            let final_path = combo_path(feat_dir, seq, ht, aa_name);
-            let tmp_path = crate::atomic_file::tmp_for(&final_path);
-            let expected = phase1_expected_tmp_size(ckpt.combo_counts[combo_idx][si]);
-            match std::fs::metadata(&tmp_path) {
-                Ok(m) if m.len() == expected => {}
-                _ => return false,
-            }
-        }
-    }
-    true
-}
-
-/// Validate a per-combo feature-manifest header, returning the sequence
-/// count when the manifest is usable. Shared by `run_train` (which decides
-/// full vs incremental rebuilds) and `RuntimeTrainingData::from_registry`
-/// (which decides whether the runtime OCR-correction data is available):
-/// both read the same feature files, so both must apply the same validity
-/// rules. A single source of truth here — the two call sites previously
-/// checked different header formats, which left RTD permanently dormant
-/// after the v2 writer dropped the `fonts=` tag.
-fn parse_manifest_header(header: &str, n_seqs_expected: usize) -> Option<usize> {
-    let h = header.trim();
-    // Manifests are tagged with the ink threshold their features were
-    // extracted at; a threshold change invalidates the cache and forces
-    // feature regeneration so training and scoring never mix thresholds.
-    let th_tag = format!("th={}", crate::INK_THRESH);
-    if !h.split_whitespace().any(|t| t == th_tag) {
-        return None;
-    }
-    // New format: "seqs=106" or "v2 seqs=106"
-    if let Some(rest) = h.strip_prefix("seqs=") {
-        return rest.parse::<usize>().ok().filter(|&n| n==n_seqs_expected);
-    }
-    if h.starts_with("v2 ") {
-        if let Some(rest) = h.strip_prefix("v2 ") {
-            if let Some(s) = rest.strip_prefix("seqs=") {
-                return s.parse::<usize>().ok().filter(|&n| n==n_seqs_expected);
-            }
-        }
-    }
-    // Old format: "fonts=2743 seqs=106" — accept if seqs matches, ignore fonts
-    if h.contains("seqs=") {
-        for part in h.split_whitespace() {
-            if let Some(s) = part.strip_prefix("seqs=") {
-                if let Ok(n) = s.parse::<usize>() { if n==n_seqs_expected { return Some(n); } }
-            }
-        }
-    }
-    None
-}
-
-pub fn run_train(mut args: TrainArgs, geo_cache: &crate::geo_cache::GeometryCache) {
-    // Respect wrapper env first, otherwise cap to avoid OOM on 7.8GB no-swap.
-    // Previous version always forced 4 threads, ignoring RAYON_NUM_THREADS=1,
-    // which caused VSZ bloat when each thread held font data + PNG encoders.
-    let max_threads = std::env::var("RAYON_NUM_THREADS")
-        .ok()
-        .and_then(|s| s.parse::<usize>().ok())
-        .unwrap_or_else(|| {
-            std::thread::available_parallelism()
-                .map(|n| n.get())
-                .unwrap_or(2)
-                .min(4)
-        });
-    let _ = rayon::ThreadPoolBuilder::new()
-        .num_threads(max_threads)
-        .build_global();
-
-    if args.heights.is_empty() {
-        args.heights = vec![features::NORM_H];
-    }
-
-    // In --fast mode: alternating heights, single AA variant
-    let active_heights: Vec<u32> = if args.fast {
-        args.heights.iter().step_by(2).copied().collect()
-    } else {
-        args.heights.clone()
-    };
-    let aa_variants: Vec<AaVariant> = if args.fast {
-        vec![AaVariant::Native]
-    } else {
-        vec![AaVariant::Native, AaVariant::Blur05, AaVariant::Sharpen]
-    };
-
-    eprintln!("Heights: {:?}{}", active_heights, if args.fast { " (fast)" } else { "" });
-    eprintln!("AA variants: {}{}", aa_variants.len(), if args.fast { " (fast)" } else { "" });
-    eprintln!("Epochs: {}", args.epochs);
-    eprintln!("Learning rate: {}", args.lr);
-    eprintln!("Margin: {}", args.margin);
-
-    // ── 1. Scan fonts (base + vintage, matching runtime load_fonts) ──
-    // Shared with load_geo_cache_for_training so the geo cache is built
-    // for exactly the catalog training renders.
-    let catalog = scan_training_catalog(&args.font_dir, args.max_fonts);
 
     // Single-char only — bigrams disabled per 2026-07-19, no bigram glyph building
     let sequences: Vec<Vec<char>> = features::supported_chars().iter().map(|&c| vec![c]).collect();
@@ -987,9 +738,13 @@ pub fn run_train(mut args: TrainArgs, geo_cache: &crate::geo_cache::GeometryCach
         .map(|(i, fe)| (fe.font_key(), i as u32))
         .collect();
 
-    // Compute catalog hash with the same algorithm as FontRegistry so the
-    // weights stamped here validate against runtime's catalog.bin hash.
-    let catalog_hash = font_scan::FontRegistry::compute_hash(&catalog);
+    // Compute catalog hash for cache validation (same algorithm as FontRegistry).
+    let catalog_hash = {
+        use std::hash::{Hash, Hasher};
+        let mut hasher = rustc_hash::FxHasher::default();
+        for fe in &catalog { fe.font_key().hash(&mut hasher); }
+        hasher.finish()
+    };
 
     // Build family groups: font_id → family_id, family_id → Vec<font_id>
     let mut family_name_to_id: HashMap<&str, u32> = HashMap::new();
@@ -1076,28 +831,26 @@ pub fn run_train(mut args: TrainArgs, geo_cache: &crate::geo_cache::GeometryCach
 
         catalog.iter().for_each(|fe| {
             let fk = fe.font_key_ref().to_owned();
-            // GPOS pair kern (Finding 5): one provider per font. These
-            // renders are single-char (sequences are unigrams), so the
-            // provider is never consulted — but the render API requires one,
-            // and passing the real provider keeps it correct if bigrams are
-            // ever re-enabled.
-            let kern = geo_cache.kern_provider(&fk);
-            // Nokern variants render with zero kern (Finding 5): the
-            // provider also reports 0 for a nokern font, but disable_kern
-            // is the render API's own switch and must reflect the variant.
-            let disable_kern = fe.variant_tag.contains("nokern");
             let mut local_hashes: Vec<(usize, u64)> = Vec::with_capacity(sequences.len());
             let mut need_render: Vec<usize> = Vec::new();
 
             for (si, seq) in sequences.iter().enumerate() {
-                // No-PNG-cache training (train-nocache-pngs): reuse the old
-                // glyph map's hash directly. Renders are deterministic, so the
-                // hash is valid without the PNG existence check main uses to
-                // validate it. No PNG is read here.
                 if let Some(old) = old_gmap.as_ref() {
                     if let Some(hash) = old.hash_for_font(seq, &fk) {
-                        local_hashes.push((si, hash));
-                        continue;
+                        let path = crate::char_render::ngram_cache_path(seq, hash, &prewarm_params);
+                        // Atomic-safe reuse check: exists + non-trivial size.
+                        // A SIGKILL during previous img.save could leave a 0-byte or truncated file.
+                        // Such files would still `exists()` but fail to decode; treat as miss.
+                        if path.exists() {
+                            if let Ok(md) = std::fs::metadata(&path) {
+                                if md.len() > 64 {
+                                    local_hashes.push((si, hash));
+                                    continue;
+                                }
+                            }
+                            // Corrupt/partial file detected — delete so fresh render heals it.
+                            let _ = std::fs::remove_file(&path);
+                        }
                     }
                 }
                 need_render.push(si);
@@ -1116,9 +869,9 @@ pub fn run_train(mut args: TrainArgs, geo_cache: &crate::geo_cache::GeometryCach
                         return;
                     }
                 };
-                let font = match fe.font_ref_with_variations(&font_data) {
-                    Some(f) => f,
-                    None => {
+                let font = match unprint_fonts::ab_glyph::FontRef::try_from_slice(&font_data) {
+                    Ok(f) => f,
+                    Err(_) => {
                         prewarm_reused.fetch_add(reused, Ordering::Relaxed);
                         let done = prewarm_done.fetch_add(1, Ordering::Relaxed) + 1;
                         if done % 500 == 0 || done == prewarm_total {
@@ -1141,11 +894,40 @@ pub fn run_train(mut args: TrainArgs, geo_cache: &crate::geo_cache::GeometryCach
                             })
                         })
                         .collect();
-                    if let Some(img) = crate::char_render::render_ngram_fresh(&font, seq, &gid_overrides, &prewarm_params, disable_kern, &kern
+                    if let Some(img) = crate::char_render::render_ngram_fresh(
+                        &font,
+                        seq,
+                        &gid_overrides,
+                        &prewarm_params,
                     ) {
-                        // No-PNG-cache training (train-nocache-pngs): hash the
-                        // in-memory render for the glyph map; do not save the PNG.
                         let hash = crate::glyph_map::hash_image(&img);
+                        let path = crate::char_render::ngram_cache_path(seq, hash, &prewarm_params);
+                        // Always atomic write to heal any prior partial file; rename is atomic.
+                        // Explicit encoder needed — `.tmp` breaks `image::save` format detection.
+                        let tmp = crate::atomic_file::tmp_for(&path);
+                        if let Some(parent) = tmp.parent() {
+                            let _ = std::fs::create_dir_all(parent);
+                        }
+                        let ok = (|| -> std::io::Result<()> {
+                            use std::fs::File;
+                            use std::io::BufWriter;
+                            use image::codecs::png::PngEncoder;
+                            use image::ImageEncoder;
+                            let f = File::create(&tmp)?;
+                            let mut w = BufWriter::new(f);
+                            let enc = PngEncoder::new(&mut w);
+                            enc.write_image(img.as_raw(), img.width(), img.height(), image::ExtendedColorType::L8)
+                                .map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e))?;
+                            use std::io::Write;
+                            w.flush()?;
+                            Ok(())
+                        })()
+                        .is_ok();
+                        if ok {
+                            let _ = std::fs::rename(&tmp, &path);
+                        } else {
+                            let _ = std::fs::remove_file(&tmp);
+                        }
                         local_hashes.push((si, hash));
                         rendered += 1;
                     }
@@ -1202,7 +984,7 @@ pub fn run_train(mut args: TrainArgs, geo_cache: &crate::geo_cache::GeometryCach
             total_deduped
         );
         eprintln!(
-            "  Pre-warm reused {} glyph-map hashes and rendered {} missing glyphs",
+            "  Pre-warm reused {} cached PNGs and rendered {} missing glyphs",
             prewarm_reused.load(Ordering::Relaxed),
             prewarm_rendered.load(Ordering::Relaxed)
         );
@@ -1230,8 +1012,45 @@ pub fn run_train(mut args: TrainArgs, geo_cache: &crate::geo_cache::GeometryCach
     let _all_heights: &[u32] = &args.heights;
     let all_aa: &[AaVariant] = AaVariant::all();
 
+    /// Build a stable codepoint-based key for a character sequence.
+    fn seq_key(seq: &[char]) -> String {
+        seq.iter().map(|c| format!("{:04X}", *c as u32)).collect::<Vec<_>>().join("_")
+    }
+    fn combo_path(feat_dir: &std::path::Path, seq: &[char], ht: u32, aa_name: &str) -> std::path::PathBuf {
+        feat_dir.join(format!("{}_h{}_{}.bin", seq_key(seq), ht, aa_name))
+    }
     fn manifest_combo_path(feat_dir: &std::path::Path, ht: u32, aa_name: &str) -> std::path::PathBuf {
         feat_dir.join(format!("manifest_h{}_{}.txt", ht, aa_name))
+    }
+    fn parse_manifest_header(header: &str, n_seqs_expected: usize) -> Option<usize> {
+        let h = header.trim();
+        // Manifests are tagged with the ink threshold their features were
+        // extracted at; a threshold change invalidates the cache and forces
+        // feature regeneration so training and scoring never mix thresholds.
+        let th_tag = format!("th={}", crate::INK_THRESH);
+        if !h.split_whitespace().any(|t| t == th_tag) {
+            return None;
+        }
+        // New format: "seqs=106" or "v2 seqs=106"
+        if let Some(rest) = h.strip_prefix("seqs=") {
+            return rest.parse::<usize>().ok().filter(|&n| n==n_seqs_expected);
+        }
+        if h.starts_with("v2 ") {
+            if let Some(rest) = h.strip_prefix("v2 ") {
+                if let Some(s) = rest.strip_prefix("seqs=") {
+                    return s.parse::<usize>().ok().filter(|&n| n==n_seqs_expected);
+                }
+            }
+        }
+        // Old format: "fonts=2743 seqs=106" — accept if seqs matches, ignore fonts
+        if h.contains("seqs=") {
+            for part in h.split_whitespace() {
+                if let Some(s) = part.strip_prefix("seqs=") {
+                    if let Ok(n) = s.parse::<usize>() { if n==n_seqs_expected { return Some(n); } }
+                }
+            }
+        }
+        None
     }
     // Load manifest counts if it exists and header seqs matches.
     // Returns None if missing or malformed. Does NOT check font count or mtime
@@ -1271,57 +1090,10 @@ pub fn run_train(mut args: TrainArgs, geo_cache: &crate::geo_cache::GeometryCach
     let mut cached_combos: Vec<(u32, usize, Vec<usize>)> = Vec::new();
     let mut incr_combos: Vec<IncrInfo> = Vec::new();
 
-    // Catalog font keys, for deciding which glyph groups are still live.
-    // A glyph group is live iff at least one of its font keys is in the
-    // current catalog. Groups whose fonts have all left the catalog (or been
-    // renamed to a key that joined a different group) can never be rendered,
-    // so counting them as "expected" makes the validation conclude the cache
-    // is short by those groups on every run and re-attempt an incremental
-    // append that adds nothing. (Measured 2026-11-09: 207 such dead groups
-    // across the 106 sequences, all beyond the file's record prefix; every
-    // group with records in the file is live.)
-    let catalog_keys: HashSet<&str> = catalog.iter().map(|fe| fe.font_key_ref()).collect();
-
-    // Current per-seq glyph counts for increment comparison, in sequences order.
-    // Count only LIVE groups (at least one member font key in the current
-    // catalog). Dead groups have no records and can never gain any, so they
-    // must not inflate the expected record count.
+    // Current per-seq glyph counts for increment comparison, in sequences order
     let current_counts_by_seq: Vec<usize> = sequences.iter()
-        .map(|seq| glyph_map.groups.get(seq).map(|gs| gs.iter()
-            .filter(|g| g.font_keys.iter().any(|k| catalog_keys.contains(k.as_str())))
-            .count()).unwrap_or(0))
-        .collect();
-
-    // Total per-seq glyph groups (live + dead), in sequences order. Glyph ids
-    // are dense indices into the map's group list, so the incremental loop's
-    // gid upper bound is the total count, not the live count.
-    let total_groups_by_seq: Vec<usize> = sequences.iter()
         .map(|seq| glyph_map.groups.get(seq).map(|gs| gs.len()).unwrap_or(0))
         .collect();
-
-    // Verify manifest counts against actual file sizes. The manifest may have
-    // been written by buggy counting code; the file is the source of truth.
-    // Returns file-derived counts, or None if any file is missing/corrupt.
-    let verify_manifest_counts = |ht: u32, aa_idx: usize, manifest_counts: &[usize]| -> Option<Vec<usize>> {
-        let aa_name = all_aa[aa_idx].name();
-        let mut file_counts = Vec::with_capacity(n_seqs);
-        for (si, seq) in sequences.iter().enumerate() {
-            let fpath = combo_path(&feat_dir, seq, ht, aa_name);
-            let cnt = std::fs::metadata(&fpath)
-                .map(|m| {
-                    let sz = m.len();
-                    if sz < 12 { 0 } else { ((sz - 12) / 256) as usize }
-                })
-                .unwrap_or(0);
-            // If manifest claims more than file holds, manifest is wrong
-            if manifest_counts[si] != cnt {
-                eprintln!("  Manifest mismatch for h{} {} seq {}: manifest={}, file={} — using file count",
-                    ht, aa_name, si, manifest_counts[si], cnt);
-            }
-            file_counts.push(cnt);
-        }
-        Some(file_counts)
-    };
 
     for &ht in &active_heights {
         for (aa_idx, _) in aa_variants.iter().enumerate() {
@@ -1330,39 +1102,16 @@ pub fn run_train(mut args: TrainArgs, geo_cache: &crate::geo_cache::GeometryCach
                     full_needed.push((ht, aa_idx));
                     continue;
                 }
-                // Use file-derived counts, not manifest, as the baseline.
-                // The manifest may be overstated by buggy counting code.
-                let old_counts = verify_manifest_counts(ht, aa_idx, &old_counts)
-                    .unwrap_or(old_counts);
                 let mut is_cached = true;
                 let mut needs_incr = false;
-                for ((&live_groups, &total_groups), &old_records) in current_counts_by_seq.iter()
-                    .zip(total_groups_by_seq.iter())
-                    .zip(old_counts.iter())
-                {
-                    // current_counts_by_seq holds LIVE glyph GROUP counts; old_counts holds
-                    // RECORD counts from the file (one record per subpixel offset).
-                    // Convert groups to expected records so the comparison is like-for-like.
-                    // Comparing groups directly to records always concluded the cache
-                    // had "shrunk" and forced a full rebuild on every run.
-                    // The shrink check uses TOTAL groups, not live groups: the glyph
-                    // map is append-only, so a file holding more records than the map
-                    // has groups means shrink/corruption. A live group that dies (its
-                    // fonts leave the catalog) after its records were written must NOT
-                    // trigger a full rebuild — its records are still valid training
-                    // data, they just belong to a font no longer in the catalog.
-                    // The incremental check uses LIVE groups only: dead groups have
-                    // no records and can never gain any, so they must not make the
-                    // cache look short.
-                    let live_records = live_groups * SUBPIXEL_OFFSET_COUNT;
-                    let total_records = total_groups * SUBPIXEL_OFFSET_COUNT;
-                    if total_records < old_records {
+                for (_i, (&cur, &old)) in current_counts_by_seq.iter().zip(old_counts.iter()).enumerate() {
+                    if cur < old {
                         is_cached = false;
                         needs_incr = false;
-                        break; // cached file has more records than current groups → shrink/corruption → full rebuild
-                    } else if live_records > old_records {
+                        break; // corruption / shrink → full rebuild
+                    } else if cur > old {
                         is_cached = false;
-                        needs_incr = true; // cached file is missing records for live groups
+                        needs_incr = true;
                     }
                 }
                 if is_cached {
@@ -1386,10 +1135,6 @@ pub fn run_train(mut args: TrainArgs, geo_cache: &crate::geo_cache::GeometryCach
             .sum();
         eprintln!("\nReusing {} cached combos ({} samples) — glyph ids stable",
             cached_combos.len(), total_cached);
-        // No Phase 1 work: any checkpoint from an interrupted run is stale
-        // (its combos are cached now), so drop it rather than leaving a
-        // misleading resume point behind.
-        let _ = std::fs::remove_file(phase1_checkpoint_path(&feat_dir));
     } else {
         if !needed_combos.is_empty() {
             eprintln!("\nFull render needed for {} combos ({} fully cached, {} incremental pending)",
@@ -1405,47 +1150,9 @@ pub fn run_train(mut args: TrainArgs, geo_cache: &crate::geo_cache::GeometryCach
         // Build a set of needed combos for the inner loop
         let _needed_set: std::collections::HashSet<(u32, usize)> = needed_combos.iter().copied().collect();
 
-        // Resume (perf 4.4): accept a checkpoint from an interrupted run
-        // ONLY if its fingerprint matches this run exactly and every tmp
-        // file's size matches its recorded count. Anything else discards
-        // the checkpoint and restarts from font 0 — restarting is always
-        // correct, it only costs time.
-        let glyph_map_hash = hash_file_bytes(&crate::glyph_map::NgramGlyphMap::default_path());
-        let resumed = load_phase1_checkpoint(&feat_dir).and_then(|ck| {
-            if validate_phase1_checkpoint(
-                &ck,
-                &feat_dir,
-                &sequences,
-                &needed_combos,
-                catalog_hash,
-                catalog.len(),
-                glyph_map_hash,
-            ) {
-                Some(ck)
-            } else {
-                eprintln!("  Phase 1 checkpoint invalid (fingerprint or tmp-file mismatch) — discarding, restarting from font 0");
-                None
-            }
-        });
-        let (fonts_done, mut combo_counts) = match &resumed {
-            Some(ck) => {
-                eprintln!("  Resuming Phase 1 from font {}/{} (checkpoint validated)",
-                    ck.fonts_done, catalog.len());
-                (ck.fonts_done, ck.combo_counts.clone())
-            }
-            None => {
-                // No valid checkpoint: remove any stale checkpoint/tmp files
-                // so a fresh run never appends to orphaned tmp files.
-                discard_phase1_checkpoint(&feat_dir, &sequences, &needed_combos);
-                (0usize, vec![vec![0usize; n_seqs]; needed_combos.len()])
-            }
-        };
-        progress.store(fonts_done, Ordering::Relaxed);
-
         // Open writers: indexed by (ci, combo_index)
         // combo_index is position in needed_combos
-        // On resume the tmp files are opened for append (their contents
-        // were validated above); on a fresh start they are truncated.
+        let n_combos = needed_combos.len();
         let mut combo_tmp_paths: Vec<Vec<(std::path::PathBuf, std::path::PathBuf)>> = Vec::new();
         let mut combo_writers: Vec<Vec<BufWriter<std::fs::File>>> = (0..n_seqs).map(|si| {
             let mut paths_row = Vec::new();
@@ -1453,15 +1160,10 @@ pub fn run_train(mut args: TrainArgs, geo_cache: &crate::geo_cache::GeometryCach
                 let aa_name = all_aa[aa_idx].name();
                 let final_path = combo_path(&feat_dir, &sequences[si], ht, aa_name);
                 let tmp_path = crate::atomic_file::tmp_for(&final_path);
-                let file = if resumed.is_some() {
-                    std::fs::OpenOptions::new()
-                        .append(true)
-                        .open(&tmp_path)
-                        .expect("open combo feature tmp for append")
-                } else {
-                    std::fs::File::create(&tmp_path).expect("create combo feature file")
-                };
-                let w = BufWriter::with_capacity(64 * 1024, file);
+                let w = BufWriter::with_capacity(
+                    64 * 1024,
+                    std::fs::File::create(&tmp_path).expect("create combo feature file"),
+                );
                 paths_row.push((tmp_path, final_path));
                 w
             }).collect();
@@ -1469,21 +1171,10 @@ pub fn run_train(mut args: TrainArgs, geo_cache: &crate::geo_cache::GeometryCach
             writers
         }).collect();
 
-        // Test-only fault injection (perf 4.4 resume test): abort Phase 1
-        // at the next chunk boundary once N fonts are done, leaving tmp
-        // files + checkpoint on disk with no manifests — the same on-disk
-        // state a SIGKILL/reboot leaves. The panic unwinds after the
-        // previous chunk's flush + checkpoint, so all state is consistent.
-        let abort_after_fonts: Option<usize> = std::env::var("UNPRINT_TRAIN_ABORT_AFTER_FONTS")
-            .ok()
-            .and_then(|s| s.parse().ok());
+        // Per-combo per-char counts
+        let mut combo_counts: Vec<Vec<usize>> = vec![vec![0usize; n_seqs]; n_combos];
 
-        for chunk_start in (fonts_done..catalog.len()).step_by(chunk_size) {
-            if let Some(n) = abort_after_fonts {
-                if chunk_start >= n {
-                    panic!("UNPRINT_TRAIN_ABORT_AFTER_FONTS: aborting Phase 1 at font {chunk_start} (test fault injection)");
-                }
-            }
+        for chunk_start in (0..catalog.len()).step_by(chunk_size) {
             let chunk_end = (chunk_start + chunk_size).min(catalog.len());
             let chunk = &catalog[chunk_start..chunk_end];
 
@@ -1507,15 +1198,6 @@ pub fn run_train(mut args: TrainArgs, geo_cache: &crate::geo_cache::GeometryCach
                 };
 
                 let fk = fe.font_key_ref().to_owned();
-                // GPOS pair kern (Finding 5): one provider per font. These
-                // renders are single-char (sequences are unigrams), so the
-                // provider is never consulted — but the render API requires
-                // one, and passing the real provider keeps it correct if
-                // bigrams are ever re-enabled.
-                let kern = geo_cache.kern_provider(&fk);
-                // Nokern variants render with zero kern (Finding 5): see
-                // the prewarm site above.
-                let disable_kern = fe.variant_tag.contains("nokern");
                 let overrides = fe.glyph_overrides.as_deref();
                 let mut samples = Vec::with_capacity(sequences.len() * needed_combos.len());
 
@@ -1540,22 +1222,33 @@ pub fn run_train(mut args: TrainArgs, geo_cache: &crate::geo_cache::GeometryCach
                     }).collect();
 
                     for &(ht, aa_idx_all) in &needed_combos {
-                        // Subpixel offsets for training robustness (Mike Nov 3, 2026).
-                        // MuPDF rasterization positions glyphs at fractional pixel
-                        // coordinates; training must cover x and y variations.
-                        // Quarter-pixel offsets (Mike Nov 4, 2026).
-                        for &dx in &SUBPIXEL_STEPS {
-                            for &dy in &SUBPIXEL_STEPS {
                         let mut params = args.render_params.clone();
                         params.height = ht;
                         params.aa = all_aa[aa_idx_all];
-                        params.subpixel_dx = dx;
-                        params.subpixel_dy = dy;
-                        // No-PNG-cache training (train-nocache-pngs): always render
-                        // fresh in memory and compute features directly. No cache
-                        // load, no PNG save. Renders are deterministic, so the
-                        // features are identical to the cached path's.
-                        let img = crate::char_render::render_ngram_fresh(&font, seq, &gid_overrides, &params, disable_kern, &kern);
+                        let matches_prewarm_params = params.height == prewarm_params.height
+                            && params.render_scale == prewarm_params.render_scale
+                            && params.aa == prewarm_params.aa
+                            && params.binarize_threshold == prewarm_params.binarize_threshold;
+                        let img = if matches_prewarm_params {
+                            glyph_map
+                                .hash_for_font(seq, &fk)
+                                .and_then(|hash| crate::char_render::load_cached_ngram(seq, hash, &params))
+                                .or_else(|| {
+                                    crate::char_render::render_ngram_fresh(
+                                        &font,
+                                        seq,
+                                        &gid_overrides,
+                                        &params,
+                                    )
+                                })
+                        } else {
+                            crate::char_render::render_ngram_fresh(
+                                &font,
+                                seq,
+                                &gid_overrides,
+                                &params,
+                            )
+                        };
                         let img = match img {
                             Some(img) => img,
                             None => continue,
@@ -1574,8 +1267,6 @@ pub fn run_train(mut args: TrainArgs, geo_cache: &crate::geo_cache::GeometryCach
                             glyph_id,
                             features: feats.as_slice(),
                         }));
-                            } // end dy
-                        } // end dx
                     }
                 }
 
@@ -1605,29 +1296,6 @@ pub fn run_train(mut args: TrainArgs, geo_cache: &crate::geo_cache::GeometryCach
                     combo_counts[combo_idx][si] += 1;
                 }
             }
-
-            // Checkpoint (perf 4.4): flush writers, then atomically record
-            // progress. The flush-then-checkpoint order is the commit
-            // protocol — the checkpoint only claims records already in the
-            // tmp files, so a kill at any point leaves either the old
-            // checkpoint (valid, resume from it) or tmp files that fail
-            // validation (restart from font 0). Never a torn resume.
-            for char_ws in &mut combo_writers {
-                for w in char_ws {
-                    w.flush().expect("flush combo features for checkpoint");
-                }
-            }
-            write_phase1_checkpoint(&feat_dir, &Phase1Checkpoint {
-                version: PHASE1_CHECKPOINT_VERSION,
-                catalog_hash,
-                total_fonts: catalog.len(),
-                fonts_done: chunk_end,
-                ink_thresh: crate::INK_THRESH,
-                n_seqs,
-                glyph_map_hash,
-                needed_combos: needed_combos.clone(),
-                combo_counts: combo_counts.clone(),
-            });
         }
 
         // Flush, close, and atomically rename all writers
@@ -1657,9 +1325,6 @@ pub fn run_train(mut args: TrainArgs, geo_cache: &crate::geo_cache::GeometryCach
             std::fs::rename(&tmp_mpath, &mpath).expect("atomic rename manifest");
         }
 
-        // Phase 1 complete: the checkpoint has served its purpose.
-        let _ = std::fs::remove_file(phase1_checkpoint_path(&feat_dir));
-
         let rendered_samples: usize = combo_counts.iter().flat_map(|c| c.iter()).sum();
         let render_secs_inner = start.elapsed().as_secs_f64();
         eprintln!("\nFull rendering complete: {} new samples in {:.1}s", rendered_samples, render_secs_inner);
@@ -1678,40 +1343,11 @@ pub fn run_train(mut args: TrainArgs, geo_cache: &crate::geo_cache::GeometryCach
 
             for info in &incr_combos {
                 let aa_name = all_aa[info.aa_idx].name();
-                // Actual per-seq sample counts for this combo. Derive the baseline
-                // from the file size, NOT from the manifest. The manifest may have
-                // been written by buggy counting code (overstated), but the file
-                // is the source of truth: 12-byte header + 256 bytes per record
-                // (4-byte glyph_id + 63 floats). A glyph render or feature
-                // computation can also fail, so the file may hold fewer than the
-                // expected (live_groups - old_groups) * SUBPIXEL_OFFSET_COUNT new samples. The manifest and
-                // cached_combos must record what was actually written, otherwise
-                // the read phase over-reads and hits end of file.
-                let mut actual_counts: Vec<usize> = Vec::with_capacity(n_seqs);
-                for (si, seq) in sequences.iter().enumerate() {
-                    let fpath = combo_path(&feat_dir, seq, info.ht, aa_name);
-                    let cnt = std::fs::metadata(&fpath)
-                        .map(|m| {
-                            let sz = m.len();
-                            if sz < 12 { 0 } else { ((sz - 12) / 256) as usize }
-                        })
-                        .unwrap_or(0);
-                    actual_counts.push(cnt);
-                }
                 // For this combo, for each seq where cur > old, render only gids >= old
                 for (si, seq) in sequences.iter().enumerate() {
-                    // actual_counts holds RECORD counts from the file; the gid threshold
-                    // below needs a GROUP count, so convert. current_counts_by_seq is
-                    // already in groups. (Comparing a gid to a record count always
-                    // concluded every gid was "old", so the incremental path never ran.)
-                    let old_records = actual_counts[si];
-                    let old_groups = old_records / SUBPIXEL_OFFSET_COUNT;
-                    // live_groups is the number of groups that must have records;
-                    // total_groups is the gid upper bound (glyph ids are dense
-                    // indices into the map's group list, live + dead).
-                    let live_groups = current_counts_by_seq[si];
-                    let total_groups = total_groups_by_seq[si];
-                    if live_groups <= old_groups { continue; }
+                    let old_cnt = info.old_counts[si];
+                    let cur_cnt = current_counts_by_seq[si];
+                    if cur_cnt <= old_cnt { continue; }
                     let fpath = combo_path(&feat_dir, seq, info.ht, aa_name);
                     // Open existing file for append. File already has header.
                     let mut file = std::fs::OpenOptions::new()
@@ -1720,85 +1356,57 @@ pub fn run_train(mut args: TrainArgs, geo_cache: &crate::geo_cache::GeometryCach
                         .unwrap_or_else(|e| panic!("open for append {:?}: {e}", fpath));
                     let mut new_samples = 0usize;
                     // Iterate over fonts to find those whose gid is in new range and are reps
-                    // To bound work, we iterate catalog but skip early if gid < old_groups
+                    // To bound work, we iterate catalog but skip early if gid < old_cnt
                     for fe in catalog.iter() {
                         let fk = fe.font_key_ref();
                         let gid = match glyph_map.glyph_id_for_font(seq, fk) {
                             Some(id) => id,
                             None => continue,
                         };
-                        if gid < old_groups { continue; } // old gid, already in file
-                        if gid >= total_groups { continue; } // should not happen
-                        // Render each live group exactly once, via its first
-                        // member that is still in the catalog. The representative
-                        // is not necessarily member 0: a font rename leaves the
-                        // old key at index 0 and the new key later in the list,
-                        // and requiring index 0 would skip the group forever.
-                        let rep_font = glyph_map.fonts_for_glyph(seq, gid).iter()
-                            .find(|k| catalog_keys.contains(k.as_str()));
-                        let Some(rep_font) = rep_font else { continue; };
+                        if gid < old_cnt { continue; } // old gid, already in file
+                        if gid >= cur_cnt { continue; } // should not happen
+                        let rep_font = &glyph_map.fonts_for_glyph(seq, gid)[0];
                         if rep_font != fk { continue; }
 
-                        // Render this new glyph for this combo, at every subpixel
-                        // offset — the same SUBPIXEL_OFFSET_COUNT records per group
-                        // the full render writes. Rendering only one offset would
-                        // leave the file's record count short of
-                        // groups * SUBPIXEL_OFFSET_COUNT, so the next validation
-                        // would re-trigger incremental and append the same groups again.
+                        // Render this new glyph for this combo
                         let font_data = match std::fs::read(&fe.path) { Ok(d)=>d, Err(_)=>continue };
-                        let Some(font) = fe.font_ref_with_variations(&font_data) else { continue };
-                        // GPOS pair kern (Finding 5): one provider per font.
-                        // This render is single-char (sequences are unigrams),
-                        // so the provider is never consulted — but the render
-                        // API requires one, and passing the real provider
-                        // keeps it correct if bigrams are ever re-enabled.
-                        let kern = geo_cache.kern_provider(fk);
-                        // Nokern variants render with zero kern (Finding 5):
-                        // see the prewarm site above.
-                        let disable_kern = fe.variant_tag.contains("nokern");
+                        let font = match unprint_fonts::ab_glyph::FontRef::try_from_slice(&font_data) { Ok(f)=>f, Err(_)=>continue };
                         let overrides = fe.glyph_overrides.as_deref();
                         let gid_overrides: Vec<Option<unprint_fonts::ab_glyph::GlyphId>> = seq.iter().map(|c| {
                             overrides.and_then(|ovs| ovs.iter().find(|(ch, _)| *ch == *c).map(|(_, g)| unprint_fonts::ab_glyph::GlyphId(*g)))
                         }).collect();
-                        for &dx in &SUBPIXEL_STEPS {
-                            for &dy in &SUBPIXEL_STEPS {
-                                let mut params = args.render_params.clone();
-                                params.height = info.ht;
-                                params.aa = all_aa[info.aa_idx];
-                                params.subpixel_dx = dx;
-                                params.subpixel_dy = dy;
-                                let img = crate::char_render::render_ngram_fresh(&font, seq, &gid_overrides, &params, disable_kern, &kern);
-                                let img = match img { Some(i)=>i, None=>continue };
-                                let feats = match compute_features(&img, false) { Some(f)=>f, None=>continue };
-                                {
-                                    use std::io::Write;
-                                    let g32 = gid as u32;
-                                    file.write_all(&g32.to_le_bytes()).expect("write gid");
-                                    let arr = feats.as_slice();
-                                    for &fv in &arr {
-                                        file.write_all(&fv.to_le_bytes()).expect("write feat");
-                                    }
-                                }
-                                new_samples += 1;
-                                incr_total_new += 1;
+                        let mut params = args.render_params.clone();
+                        params.height = info.ht;
+                        params.aa = all_aa[info.aa_idx];
+                        let img = crate::char_render::render_ngram_fresh(&font, seq, &gid_overrides, &params);
+                        let img = match img { Some(i)=>i, None=>continue };
+                        let feats = match compute_features(&img, false) { Some(f)=>f, None=>continue };
+                        {
+                            use std::io::Write;
+                            let g32 = gid as u32;
+                            file.write_all(&g32.to_le_bytes()).expect("write gid");
+                            let arr = feats.as_slice();
+                            for &fv in &arr {
+                                file.write_all(&fv.to_le_bytes()).expect("write feat");
                             }
                         }
+                        new_samples += 1;
+                        incr_total_new += 1;
                     }
-                    eprintln!("  h{} {} seq {} ({:?}): +{} new samples ({}→{} live groups, {} total)", info.ht, aa_name, si, seq, new_samples, old_groups, live_groups, total_groups);
-                    actual_counts[si] = old_records + new_samples;
+                    eprintln!("  h{} {} seq {} ({:?}): +{} new glyphs ({}→{})", info.ht, aa_name, si, seq, new_samples, old_cnt, cur_cnt);
                 }
-                // Update manifest for this combo to the ACTUAL new counts
+                // Update manifest for this combo to new counts
                 let mpath = manifest_combo_path(&feat_dir, info.ht, aa_name);
                 let tmp_mpath = crate::atomic_file::tmp_for(&mpath);
                 let mut manifest = format!("th={} seqs={}", crate::INK_THRESH, n_seqs);
                 for ci in 0..n_seqs {
                     manifest.push('\n');
-                    manifest.push_str(&actual_counts[ci].to_string());
+                    manifest.push_str(&current_counts_by_seq[ci].to_string());
                 }
                 std::fs::write(&tmp_mpath, &manifest).expect("write incr manifest");
                 std::fs::rename(&tmp_mpath, &mpath).expect("atomic rename incr manifest");
-                // Push to cached_combos with actual counts
-                cached_combos.push((info.ht, info.aa_idx, actual_counts));
+                // Push to cached_combos with updated counts
+                cached_combos.push((info.ht, info.aa_idx, current_counts_by_seq.clone()));
             }
             eprintln!("Incremental append done: +{} samples in {:.1}s", incr_total_new, incr_start.elapsed().as_secs_f64());
         }
@@ -2275,11 +1883,8 @@ impl RuntimeTrainingData {
                 if let Ok(content) = std::fs::read_to_string(&mpath) {
                     let mut lines = content.lines();
                     if let Some(header) = lines.next() {
-                        // Same header validity as run_train: the v2 writer
-                        // emits `th=240 seqs=106`; requiring the old
-                        // `fonts={N} seqs=106` format here left RTD
-                        // permanently dormant (no cached combos → None).
-                        if parse_manifest_header(header, n_seqs).is_some() {
+                        let expected = format!("fonts={} seqs={}", catalog.len(), n_seqs);
+                        if header.trim() == expected {
                             let counts: Vec<usize> = lines
                                 .filter_map(|l| l.trim().parse::<usize>().ok())
                                 .collect();

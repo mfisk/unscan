@@ -51,40 +51,21 @@ fn lig_bit(c: char) -> Option<u8> {
         _ => None,
     }
 }
+#[inline]
+#[allow(dead_code)]
+fn lig_contains(mask: LigMask, c: char) -> bool {
+    if let Some(b) = lig_bit(c) {
+        (mask & (1u8 << b)) != 0
+    } else { false }
+}
 
 /// Cache of final collapsed lig sets per font path — eliminates 33.9%
 /// inclusive hot path (font_match.rs:138, font_pipeline.rs:381) which
 /// otherwise did fs::read + cmap + 5× shape per candidate per line.
-static LIG_SET_CACHE: OnceLock<RwLock<HashMap<String, LigMask>>> = OnceLock::new();
+static LIG_SET_CACHE: OnceLock<RwLock<HashMap<PathBuf, LigMask>>> = OnceLock::new();
 
-fn lig_set_cache() -> &'static RwLock<HashMap<String, LigMask>> {
+fn lig_set_cache() -> &'static RwLock<HashMap<PathBuf, LigMask>> {
     LIG_SET_CACHE.get_or_init(|| RwLock::new(HashMap::new()))
-}
-
-/// Cache of variant-independent ligature support masks per font path.
-/// The support mask depends only on the font file (GSUB + glyph ink), not
-/// on the variant tag, so it is keyed by path. Used for GT segmentation
-/// (Finding 9): the GT font's segmentation must match the image, and the
-/// image's ligature-ness is a property of the font's rendering, not of the
-/// variant tag.
-static LIG_SUPPORT_CACHE: OnceLock<RwLock<HashMap<PathBuf, LigMask>>> = OnceLock::new();
-
-fn lig_support_cache() -> &'static RwLock<HashMap<PathBuf, LigMask>> {
-    LIG_SUPPORT_CACHE.get_or_init(|| RwLock::new(HashMap::new()))
-}
-
-/// Cache of variant-independent ligature overlap masks per font path.
-/// The overlap mask records, for each FB00–FB04 pair, whether the separate
-/// component glyphs overlap when placed adjacently (default instance), so a
-/// nolig render of the font still produces fused ink for that pair. Used
-/// for GT segmentation (Finding 9 refinement): a nolig GT font whose
-/// separate f/i do not overlap renders separate ink, and collapsing it
-/// corrupts the GT geometry and similarity (BAP 622: five "Lining
-/// figures" digit lines regressed). Keyed by path.
-static LIG_OVERLAP_CACHE: OnceLock<RwLock<HashMap<PathBuf, LigMask>>> = OnceLock::new();
-
-fn lig_overlap_cache() -> &'static RwLock<HashMap<PathBuf, LigMask>> {
-    LIG_OVERLAP_CACHE.get_or_init(|| RwLock::new(HashMap::new()))
 }
 
 // Thread-local ShapePlan cache for lig probe — mirrors
@@ -229,61 +210,16 @@ pub struct FontEntry {
     /// Included in font_key to avoid colliding with base entry.
     /// String (not Era) to avoid circular dep with vintage_cache crate.
     pub vintage_era: Option<String>,
-    /// (min, default, max) of the `opsz` (optical size) axis, captured during
-    /// the font scan while the font file bytes are available. None for fonts
-    /// without an optical-size axis. `identify_fonts` uses this to synthesize
-    /// the size-derived `|opszN` candidate; it cannot be re-derived later
-    /// because `data` is dropped after the scan. Serialized in the scan cache.
-    pub opsz_range: Option<(f32, f32, f32)>,
-    /// True if the font file contains a GPOS table. Captured during the scan
-    /// while the font file bytes are available; cannot be re-derived later
-    /// because `data` is dropped after the scan. Used by the shared font-key
-    /// preference (`font_key_preference_score`) for --resolve-fontkey and
-    /// classifier tiebreaking. Serialized in the scan cache (v17+).
-    pub has_gpos: bool,
-    /// True if the font file has kerning data (legacy `kern` table with at
-    /// least one pair, or a GPOS `kern` feature with at least one lookup).
-    /// Captured during the scan while the font file bytes are available;
-    /// cannot be re-derived later because `data` is dropped after the scan.
-    /// Drives the shared font-key preference: a font with kerning renders
-    /// kerned by default, so the kerned variant wins the default pick.
-    /// (GPOS presence alone does not imply kerning — legacy `kern` tables
-    /// kern in rendering too.) Serialized in the scan cache (v18+).
-    pub has_kern: bool,
-    /// Font version from the `head` table `fontRevision` field, formatted
-    /// as "major.minor" (e.g. "2.50"). Captured during the scan while the
-    /// font file bytes are available; cannot be re-derived later because
-    /// `data` is dropped after the scan. Part of the font key
-    /// (`|version=X`): two files with the same PostScript name but
-    /// different versions (e.g. Win31 Times v2.50 vs modern Times v2.82)
-    /// are different fonts and must not collide. Identical files share
-    /// a version, so they share a key and dedup naturally. Serialized
-    /// in the scan cache (v20+).
-    pub font_version: String,
 }
 
 impl FontEntry {
-    /// Append `|variant_tag` segments to a PostScript name, skipping any
-    /// segment already present as a trailing `|segment`. Variant entries
-    /// store the OT tag in `postscript_name` already (`PS|salt`, for exact
-    /// GT matching), so a verbatim append would duplicate it (`PS|salt|salt`).
-    /// Each tag appears at most once in the resulting key.
-    fn append_variant_tag(mut k: String, variant_tag: &str) -> String {
-        for seg in variant_tag.split('|') {
-            if seg.is_empty() {
-                continue;
-            }
-            if !k.ends_with(&format!("|{seg}")) {
-                k.push('|');
-                k.push_str(seg);
-            }
-        }
-        k
-    }
-
     #[inline]
     pub fn compute_font_key(postscript_name: &str, variant_tag: &str) -> String {
-        Self::append_variant_tag(postscript_name.to_owned(), variant_tag)
+        if variant_tag.is_empty() {
+            postscript_name.to_owned()
+        } else {
+            format!("{}|{}", postscript_name, variant_tag)
+        }
     }
 
     #[inline]
@@ -291,46 +227,19 @@ impl FontEntry {
         postscript_name: &str,
         variant_tag: &str,
         vintage_era: Option<&str>,
-        variations: &Variations,
-        font_version: &str,
+        has_var: bool,
     ) -> String {
-        // The font version (|version=X, from the head table fontRevision)
-        // goes immediately after the PostScript name, before any variant
-        // tags: it identifies WHICH font file this is (e.g. Win31 Times
-        // v2.50 vs modern Times v2.82 share a PostScript name but are
-        // different fonts). OT variant entries pass "PS|tag" as the name,
-        // so insert before the first '|' to keep the version adjacent to
-        // the bare PostScript name. An empty version (tombstones) omits
-        // the tag.
-        let mut k = postscript_name.to_owned();
-        if !font_version.is_empty() {
-            let tag = format!("|version={font_version}");
-            match k.find('|') {
-                Some(idx) => k.insert_str(idx, &tag),
-                None => k.push_str(&tag),
-            }
-        }
-        let mut k = Self::append_variant_tag(k, variant_tag);
-        if let Some(vars) = variations {
-            if !vars.is_empty() {
-                k.push('[');
-                for (i, (tag, val)) in vars.iter().enumerate() {
-                    if i > 0 {
-                        k.push(',');
-                    }
-                    let tag_str = std::str::from_utf8(tag).unwrap_or("????");
-                    if val.fract() == 0.0 {
-                        k.push_str(&format!("{}={}", tag_str, *val as i32));
-                    } else {
-                        k.push_str(&format!("{}={}", tag_str, val));
-                    }
-                }
-                k.push(']');
-            }
-        }
+        let mut k = if variant_tag.is_empty() {
+            postscript_name.to_owned()
+        } else {
+            format!("{}|{}", postscript_name, variant_tag)
+        };
         if let Some(era) = vintage_era {
             k.push_str("|vintage=");
             k.push_str(era);
+        }
+        if has_var {
+            k.push_str("|var");
         }
         k
     }
@@ -356,45 +265,13 @@ impl FontEntry {
 
     /// Recompute cache after mutating vintage_era or variant fields (used for vintage generation).
     pub fn recompute_font_key_cache(&mut self) {
+        let has_var = self.variations.is_some();
         self.font_key_cache = Self::compute_font_key_full(
             &self.postscript_name,
             &self.variant_tag,
             self.vintage_era.as_deref(),
-            &self.variations,
-            &self.font_version,
+            has_var,
         );
-    }
-
-    fn assign_default_variations(&mut self, default_variations: Variations) {
-        if let Some(default_axes) = default_variations {
-            self.variations = Some(default_axes);
-            self.recompute_font_key_cache();
-        }
-    }
-
-    /// Apply variable-font axis coordinates to a FontRef/FontVec.
-    /// Centralizes FontEntry -> FontRef variation handling so all render
-    /// paths (char_render, train prewarm, train missing-feature) apply the
-    /// same coordinates.
-    #[inline]
-    pub fn apply_variations<F: unprint_fonts::ab_glyph::VariableFont>(&self, font: &mut F) {
-        if let Some(vars) = &self.variations {
-            for (tag, val) in vars {
-                let _ = font.set_variation(tag, *val);
-            }
-        }
-    }
-
-    /// Create a FontRef from borrowed data and apply this entry's variations.
-    /// Returns None if the data is not a valid font.
-    #[inline]
-    pub fn font_ref_with_variations<'a>(
-        &self,
-        data: &'a [u8],
-    ) -> Option<unprint_fonts::ab_glyph::FontRef<'a>> {
-        let mut font = unprint_fonts::ab_glyph::FontRef::try_from_slice(data).ok()?;
-        self.apply_variations(&mut font);
-        Some(font)
     }
 
     /// Set of ligature unicode codepoints (FB00–FB04) that this font
@@ -412,146 +289,15 @@ impl FontEntry {
     /// interior gutter to be excluded; three-char ligs (ffi, ffl) need ≥2.
     /// Only FB00–FB04 are considered; quote ligature probes are excluded.
     pub fn collapsed_lig_set(&self) -> LigMask {
-        // nolig variant: disable ligature collapsing entirely.
-        // The cache is keyed by fontkey (not path) so nolig variants
-        // get their own entry (0) distinct from the base variant's set.
-        if self.variant_tag.contains("nolig") {
-            return 0;
-        }
         // Global memo — eliminates 33.9% inclusive hot path after first line.
-        // Final filtered set is cached by fontkey, so no FS read / shaping on hits.
-        let fk = self.font_key_cache.clone();
+        // Final filtered set is cached, so no FS read / shaping on hits.
         {
             let guard = lig_set_cache().read().unwrap();
-            if let Some(cached) = guard.get(&fk) {
+            if let Some(cached) = guard.get(&self.path) {
                 return *cached;
             }
         }
-        let mask = self.ligature_support_mask();
-        // Insert final filtered set into global cache (keyed by fontkey).
-        {
-            let mut guard = lig_set_cache().write().unwrap();
-            guard.insert(fk, mask);
-        }
-        mask
-    }
 
-    /// Set of ligature unicode codepoints (FB00–FB04) this font truly
-    /// collapses as one contiguous ink blob, IGNORING the variant tag.
-    ///
-    /// This is the same GSUB + glyph-ink computation as
-    /// `collapsed_lig_set`, but without the nolig early-return. The support
-    /// mask is a property of the font file, not of the variant: a font that
-    /// has a fused f_i ligature glyph renders fused "fi" ink whenever its
-    /// liga feature fires, whatever the variant key says.
-    ///
-    /// Used for GT segmentation (Finding 9): the GT font's segmentation must
-    /// match the image, and the image's ligature-ness is a property of the
-    /// font's rendering, not of the variant tag. A nolig GT key on a line
-    /// whose render used ligatures would otherwise force an 8-way split of a
-    /// fused "fi", cutting solid ink and giving the correct font a
-    /// catastrophic geometry penalty (p1 l19 "figures:": GT 'i' h_err
-    /// -4.9 px, h_ll -39.08, ~50 points against the correct font).
-    /// Cached by font path (variant-independent).
-    pub fn ligature_support_mask(&self) -> LigMask {
-        let path_key = self.path.clone();
-        {
-            let guard = lig_support_cache().read().unwrap();
-            if let Some(cached) = guard.get(&path_key) {
-                return *cached;
-            }
-        }
-        let mask = self.compute_ligature_support_mask();
-        {
-            let mut guard = lig_support_cache().write().unwrap();
-            guard.insert(path_key, mask);
-        }
-        mask
-    }
-
-    /// Set of ligature codepoints (FB00–FB04) whose separate component
-    /// glyphs overlap when placed adjacently (default instance), so a nolig
-    /// render of this font still produces fused ink for that pair.
-    /// E.g. EB Garamond's f (xMax 420) and i (xMin 24, after f advance
-    /// 318) overlap by 78 font units, so even a nolig render fuses "fi".
-    /// Most fonts have a clear gap between f and i, so their nolig render
-    /// has separate ink and must NOT be collapsed in GT segmentation.
-    /// Cached by font path (variant-independent).
-    pub fn ligature_overlap_mask(&self) -> LigMask {
-        let path_key = self.path.clone();
-        {
-            let guard = lig_overlap_cache().read().unwrap();
-            if let Some(cached) = guard.get(&path_key) {
-                return *cached;
-            }
-        }
-        let mask = self.compute_ligature_overlap_mask();
-        {
-            let mut guard = lig_overlap_cache().write().unwrap();
-            guard.insert(path_key, mask);
-        }
-        mask
-    }
-
-    /// Core overlap computation: for each FB00–FB04 pair, check whether any
-    /// adjacent pair of component glyphs overlaps (first glyph's ink right
-    /// edge past the second glyph's ink left edge when placed at the first
-    /// glyph's advance). Default-instance metrics; kern is ignored (the raw
-    /// glyph overlap dominates the fused-vs-separate determination).
-    fn compute_ligature_overlap_mask(&self) -> LigMask {
-        let mut mask: LigMask = 0;
-        let data = match std::fs::read(&self.path) {
-            Ok(d) => d,
-            Err(_) => return 0,
-        };
-        let face = match unprint_fonts::ttf_parser::Face::parse(&data, 0) {
-            Ok(f) => f,
-            Err(_) => return 0,
-        };
-        // (ligature char, component chars in order).
-        const PAIRS: &[(char, &[char])] = &[
-            ('\u{FB00}', &['f', 'f']),
-            ('\u{FB01}', &['f', 'i']),
-            ('\u{FB02}', &['f', 'l']),
-            ('\u{FB03}', &['f', 'f', 'i']),
-            ('\u{FB04}', &['f', 'f', 'l']),
-        ];
-        for &(lig, comps) in PAIRS {
-            let Some(b) = lig_bit(lig) else { continue };
-            let mut overlaps = false;
-            for w in comps.windows(2) {
-                let (a, c) = (w[0], w[1]);
-                let (Some(ga), Some(gc)) = (face.glyph_index(a), face.glyph_index(c)) else { continue };
-                if ga.0 == 0 || gc.0 == 0 { continue; }
-                let adv_a = face.glyph_hor_advance(ga).unwrap_or(0) as i32;
-                let (Some(bb_a), Some(bb_c)) = (face.glyph_bounding_box(ga), face.glyph_bounding_box(gc)) else { continue };
-                // First glyph's ink right edge vs second glyph's ink left
-                // edge when the second glyph starts at the first's advance.
-                if (bb_a.x_max as i32) - (adv_a + bb_c.x_min as i32) > 0 {
-                    overlaps = true;
-                    break;
-                }
-            }
-            if overlaps {
-                mask |= 1u8 << b;
-            }
-        }
-        mask
-    }
-
-    /// Ligature mask for GT segmentation (Finding 9): collapse a pair when
-    /// the render would produce fused ink — either the variant is lig
-    /// (`collapsed_lig_set` covers it) or the separate glyphs overlap so
-    /// even a nolig render fuses the ink. A nolig GT font whose separate
-    /// glyphs do not overlap renders separate ink and must not be collapsed.
-    pub fn gt_ligature_mask(&self) -> LigMask {
-        self.collapsed_lig_set() | (self.ligature_support_mask() & self.ligature_overlap_mask())
-    }
-
-    /// Core ligature-support computation: glyph_overrides + cmap + GSUB
-    /// shaping, filtered by the glyph-ink gutter check. No variant-tag
-    /// gate. See `collapsed_lig_set` for the filter semantics.
-    fn compute_ligature_support_mask(&self) -> LigMask {
         let mut mask: LigMask = 0;
         // Fast path: anything already known from glyph_overrides.
         if let Some(ref ov) = self.glyph_overrides {
@@ -630,7 +376,18 @@ impl FontEntry {
             }
         }
 
+        // Insert final filtered set into global cache.
+        {
+            let mut guard = lig_set_cache().write().unwrap();
+            guard.insert(self.path.clone(), mask);
+        }
         mask
+    }
+
+    /// Back-compat shim: old name kept for any missed call sites.
+    #[allow(dead_code)]
+    pub fn allowed_lig_set(&self) -> LigMask {
+        self.collapsed_lig_set()
     }
 
     /// Count interior 100% top-to-bottom white vertical gutters inside the glyph
@@ -745,34 +502,6 @@ impl FontEntry {
         }
         valid
     }
-
-    /// (min, default, max) for the `opsz` axis, or None if this font has no
-    /// optical-size axis. Returns the range captured during the font scan
-    /// while the font file bytes were available.
-    pub fn opsz_axis_range(&self) -> Option<(f32, f32, f32)> {
-        self.opsz_range
-    }
-}
-
-/// Parse a synthetic `|opszN` suffix from a candidate fontkey.
-///
-/// Returns `(base_key, Some(opsz))` when the key ends with `|opsz` followed by
-/// a number, else `(key, None)`. Used to resolve synthetic per-line optical-
-/// size candidates back to their registry entry plus an opsz override.
-pub fn parse_opsz_suffix(key: &str) -> (&str, Option<f32>) {
-    if let Some(idx) = key.rfind("|opsz") {
-        if let Ok(v) = key[idx + 5..].parse::<f32>() {
-            return (&key[..idx], Some(v));
-        }
-    }
-    (key, None)
-}
-
-/// Build a synthetic candidate fontkey for a non-default optical size.
-/// The base key is the registry entry's key; the suffix makes it a distinct
-/// candidate so geometry cache, scoring, and audit all distinguish it.
-pub fn opsz_synth_key(base_key: &str, opsz: f32) -> String {
-    format!("{}|opsz{}", base_key, opsz.round() as i32)
 }
 
 /// Indexed collection of discovered fonts, keyed by `font_key()`.
@@ -807,36 +536,13 @@ impl FontRegistry {
         Self { entries, by_key, catalog_hash }
     }
 
-    /// Content hash of the rendering catalog. Besides the stable font key,
-    /// include the source-file fingerprint, variation coordinates, and glyph
-    /// overrides because each can change rendered glyph identity without
-    /// changing the key.
-    pub fn compute_hash(entries: &[FontEntry]) -> u64 {
+    /// Content hash of the catalog: hash of sorted font_keys.
+    /// Changes when fonts are added, removed, or renamed.
+    fn compute_hash(entries: &[FontEntry]) -> u64 {
         use std::hash::{Hash, Hasher};
         let mut hasher = rustc_hash::FxHasher::default();
         for e in entries {
             e.font_key_ref().hash(&mut hasher);
-            source_file_fingerprint(&e.path).hash(&mut hasher);
-            match &e.variations {
-                Some(axes) => {
-                    1u8.hash(&mut hasher);
-                    for (tag, value) in axes {
-                        tag.hash(&mut hasher);
-                        value.to_bits().hash(&mut hasher);
-                    }
-                }
-                None => 0u8.hash(&mut hasher),
-            }
-            match &e.glyph_overrides {
-                Some(overrides) => {
-                    1u8.hash(&mut hasher);
-                    for (ch, glyph_id) in overrides {
-                        ch.hash(&mut hasher);
-                        glyph_id.hash(&mut hasher);
-                    }
-                }
-                None => 0u8.hash(&mut hasher),
-            }
         }
         hasher.finish()
     }
@@ -972,56 +678,6 @@ pub fn default_font_dirs(extra: &[PathBuf]) -> Vec<PathBuf> {
     dirs
 }
 
-/// Find the MS Core Fonts directory from the environment — never a
-/// hardcoded user-specific path. First asks fontconfig (`fc-list`, the
-/// standard font-finding utility) where Times New Roman lives and takes
-/// that file's directory; if that fails, checks $MSTTCOREFONTS_DIR, then
-/// $HOME/.local/share/fonts/msttcorefonts, then the system
-/// /usr/share/fonts/truetype/msttcorefonts. Returns the first directory
-/// that contains times.ttf, or None if none is found (the caller handles
-/// the missing case — vintage generation is skipped, no crash).
-pub fn find_msttcorefonts_dir() -> Option<PathBuf> {
-    // fontconfig knows where the fonts are, whatever dir they were
-    // installed in. `fc-list "Times New Roman" file` prints one
-    // "<path>: " line per matching file.
-    if let Ok(out) = std::process::Command::new("fc-list")
-        .args(["Times New Roman", "file"])
-        .output()
-    {
-        if out.status.success() {
-            let text = String::from_utf8_lossy(&out.stdout);
-            for line in text.lines() {
-                let path = line.split(':').next().unwrap_or("").trim();
-                let p = PathBuf::from(path);
-                if p
-                    .file_name()
-                    .map(|n| n.eq_ignore_ascii_case("times.ttf"))
-                    .unwrap_or(false)
-                    && p.is_file()
-                {
-                    if let Some(dir) = p.parent() {
-                        return Some(dir.to_path_buf());
-                    }
-                }
-            }
-        }
-    }
-    let mut candidates: Vec<PathBuf> = Vec::new();
-    if let Ok(d) = std::env::var("MSTTCOREFONTS_DIR") {
-        candidates.push(PathBuf::from(d));
-    }
-    if let Ok(home) = std::env::var("HOME") {
-        candidates.push(PathBuf::from(home).join(".local/share/fonts/msttcorefonts"));
-    }
-    candidates.push(PathBuf::from("/usr/share/fonts/truetype/msttcorefonts"));
-    for dir in candidates {
-        if dir.join("times.ttf").is_file() {
-            return Some(dir);
-        }
-    }
-    None
-}
-
 
 // ---------------------------------------------------------------------------
 // Font scan cache (FSCN)
@@ -1055,9 +711,7 @@ pub fn find_msttcorefonts_dir() -> Option<PathBuf> {
 //     typographic_family_len: u32 le + [u8; typographic_family_len]
 
 const FSCN_MAGIC: &[u8; 4] = b"FSCN";
-// v20: font_version field (|version=X in font keys) + content-based identity.
-// v21: variable-font weight instances get the full kern/lig/opsz permutation.
-const FSCN_VERSION: u32 = 21;
+const FSCN_VERSION: u32 = 6;
 
 pub(crate) fn scan_cache_path() -> PathBuf {
     crate::cache::paths::font_scan_bin()
@@ -1095,22 +749,6 @@ fn collect_font_paths(dirs: &[PathBuf]) -> Vec<PathBuf> {
     paths
 }
 
-fn source_file_fingerprint(path: &Path) -> u64 {
-    use std::hash::{Hash, Hasher};
-    let Ok(metadata) = std::fs::metadata(path) else {
-        return 0;
-    };
-    let mut hasher = rustc_hash::FxHasher::default();
-    metadata.len().hash(&mut hasher);
-    if let Ok(modified) = metadata.modified() {
-        if let Ok(duration) = modified.duration_since(std::time::UNIX_EPOCH) {
-            duration.as_secs().hash(&mut hasher);
-            duration.subsec_nanos().hash(&mut hasher);
-        }
-    }
-    hasher.finish()
-}
-
 fn write_str(w: &mut impl std::io::Write, s: &str) -> std::io::Result<()> {
     w.write_all(&(s.len() as u32).to_le_bytes())?;
     w.write_all(s.as_bytes())?;
@@ -1125,13 +763,6 @@ fn read_str(r: &mut &[u8]) -> Option<String> {
     let s = std::str::from_utf8(&r[..len]).ok()?.to_string();
     *r = &r[len..];
     Some(s)
-}
-
-fn read_u64(r: &mut &[u8]) -> Option<u64> {
-    if r.len() < 8 { return None; }
-    let v = u64::from_le_bytes(r[..8].try_into().ok()?);
-    *r = &r[8..];
-    Some(v)
 }
 
 fn read_u32(r: &mut &[u8]) -> Option<u32> {
@@ -1194,11 +825,8 @@ fn write_scan_cache(path: &Path, entries: &[FontEntry]) -> std::io::Result<()> {
     w.write_all(&(entries.len() as u32).to_le_bytes())?;
 
     for e in entries {
-        // Path plus source fingerprint. A package upgrade can replace a font
-        // in place without changing its path; stale cached names, axes, and
-        // glyph overrides must not survive that replacement.
+        // path (as UTF-8 lossy)
         write_str(&mut w, &e.path.to_string_lossy())?;
-        w.write_all(&source_file_fingerprint(&e.path).to_le_bytes())?;
         write_str(&mut w, &e.family_name)?;
         write_str(&mut w, &e.postscript_name)?;
         write_str(&mut w, &e.raw_postscript_name)?;
@@ -1232,18 +860,6 @@ fn write_scan_cache(path: &Path, entries: &[FontEntry]) -> std::io::Result<()> {
             }
         }
 
-        // opsz_range: Option<(f32, f32, f32)> - v10+
-        // None encodes as the 0xFFFFFFFF sentinel; Some encodes as three
-        // bare f32s (an axis min is never NaN, so the sentinel is unambiguous).
-        match &e.opsz_range {
-            None => w.write_all(&0xFFFF_FFFFu32.to_le_bytes())?,
-            Some((min, default, max)) => {
-                w.write_all(&min.to_le_bytes())?;
-                w.write_all(&default.to_le_bytes())?;
-                w.write_all(&max.to_le_bytes())?;
-            }
-        }
-
         write_str(&mut w, &e.typographic_family)?;
 
         // vintage_era (Option<String>) - v3+
@@ -1253,15 +869,6 @@ fn write_scan_cache(path: &Path, entries: &[FontEntry]) -> std::io::Result<()> {
                 write_str(&mut w, s)?;
             }
         }
-
-        // has_gpos - v17+
-        w.write_all(&[e.has_gpos as u8])?;
-
-        // has_kern - v18+
-        w.write_all(&[e.has_kern as u8])?;
-
-        // font_version - v20+
-        write_str(&mut w, &e.font_version)?;
     }
 
     w.flush()?;
@@ -1288,18 +895,6 @@ fn read_scan_cache(path: &Path, quiet: bool) -> Option<Vec<FontEntry>> {
     let mut entries = Vec::with_capacity(n);
     for _ in 0..n {
         let path_str = read_str(&mut r)?;
-        let path_buf = PathBuf::from(&path_str);
-        let cached_source_fingerprint = read_u64(&mut r)?;
-        let live_source_fingerprint = source_file_fingerprint(&path_buf);
-        if cached_source_fingerprint != live_source_fingerprint {
-            if !quiet {
-                eprintln!(
-                    "[scan] Font source changed in place: {} — rescanning...",
-                    path_buf.display()
-                );
-            }
-            return None;
-        }
         let family_name = read_str(&mut r)?;
         let postscript_name = read_str(&mut r)?;
         let raw_postscript_name = read_str(&mut r)?;
@@ -1339,23 +934,6 @@ fn read_scan_cache(path: &Path, quiet: bool) -> Option<Vec<FontEntry>> {
             Some(vars)
         };
 
-        // opsz_range: Option<(f32, f32, f32)> - v10+
-        let opsz_range = {
-            if r.len() < 4 {
-                return None;
-            }
-            let sentinel = u32::from_le_bytes([r[0], r[1], r[2], r[3]]);
-            if sentinel == 0xFFFF_FFFF {
-                r = &r[4..];
-                None
-            } else {
-                let min = read_f32(&mut r)?;
-                let default = read_f32(&mut r)?;
-                let max = read_f32(&mut r)?;
-                Some((min, default, max))
-            }
-        };
-
         let typographic_family = read_str(&mut r)?;
 
         // vintage_era: Option<String> - v3+, with backwards compat for v2
@@ -1382,17 +960,8 @@ fn read_scan_cache(path: &Path, quiet: bool) -> Option<Vec<FontEntry>> {
             None
         };
 
-        // has_gpos - v17+
-        let has_gpos = read_u8(&mut r)? != 0;
-
-        // has_kern - v18+
-        let has_kern = read_u8(&mut r)? != 0;
-
-        // font_version - v20+
-        let font_version = read_str(&mut r)?;
-
         entries.push(FontEntry {
-            path: path_buf,
+            path: PathBuf::from(path_str),
             family_name,
             postscript_name: postscript_name.clone(),
             raw_postscript_name,
@@ -1403,22 +972,18 @@ fn read_scan_cache(path: &Path, quiet: bool) -> Option<Vec<FontEntry>> {
             oldstyle_figures,
             variant_tag: variant_tag.clone(),
             font_key_cache: {
+                let has_var = variations.is_some();
                 FontEntry::compute_font_key_full(
                     &postscript_name,
                     &variant_tag,
                     vintage_era.as_deref(),
-                    &variations,
-                    &font_version,
+                    has_var,
                 )
             },
             glyph_overrides,
             variations,
             typographic_family,
             vintage_era,
-            opsz_range,
-            has_gpos,
-            has_kern,
-            font_version,
         });
     }
 
@@ -1468,25 +1033,18 @@ fn dedup_fonts(mut fonts: Vec<FontEntry>, quiet: bool) -> Vec<FontEntry> {
         // Intentionally do NOT filter them out anymore.
     }
 
-    dedup_font_entries_by_key(fonts, quiet)
-}
-
-/// Deduplicate a complete registry generation after callers append entries
-/// (for example, vintage variants) to an already-deduplicated base scan.
-pub fn dedup_font_entries_by_key(mut fonts: Vec<FontEntry>, quiet: bool) -> Vec<FontEntry> {
-    use std::collections::HashSet;
-    let mut seen_keys: HashSet<String> = HashSet::new();
-    let before = fonts.len();
-    fonts.retain(|f| seen_keys.insert(f.font_key()));
-    let removed = before - fonts.len();
-    if removed > 0 && !quiet {
-        eprintln!(
-            "[scan] Deduped {} entries by font_key ({} → {})",
-            removed,
-            before,
-            fonts.len()
-        );
+    // Dedup by font_key (now includes vintage_era and |var marker, so static vs variable vs vintage distinct)
+    {
+        use std::collections::HashSet;
+        let mut seen_keys: HashSet<String> = HashSet::new();
+        let before = fonts.len();
+        fonts.retain(|f| seen_keys.insert(f.font_key()));
+        let removed = before - fonts.len();
+        if removed > 0 {
+            if !quiet { eprintln!("[scan] Deduped {} entries by font_key ({} → {})", removed, before, fonts.len()); }
+        }
     }
+
     fonts
 }
 
@@ -1511,14 +1069,8 @@ pub fn scan_fonts(dirs: &[PathBuf], quiet: bool) -> Vec<FontEntry> {
     let current_set: std::collections::HashSet<&PathBuf> = current_paths.iter().collect();
     let cached_set: std::collections::HashSet<&PathBuf> = cached_by_path.keys().collect();
 
-    // Sort: HashSet difference order is non-deterministic, and the dedup
-    // below keeps the FIRST entry per font_key. Without sorting, which
-    // copy of a duplicated font survives varies run to run, so
-    // --resolve-fontkey intermittently fails for the dropped path.
-    let mut added: Vec<&PathBuf> = current_set.difference(&cached_set).copied().collect();
-    added.sort();
-    let mut removed: Vec<&PathBuf> = cached_set.difference(&current_set).copied().collect();
-    removed.sort();
+    let added: Vec<&PathBuf> = current_set.difference(&cached_set).copied().collect();
+    let removed: Vec<&PathBuf> = cached_set.difference(&current_set).copied().collect();
     let cache_changed = !added.is_empty() || !removed.is_empty();
 
     if !cache_changed {
@@ -1601,30 +1153,12 @@ pub fn scan_fonts(dirs: &[PathBuf], quiet: bool) -> Vec<FontEntry> {
     let aliases = build_alias_table();
     for path in &added {
         if let Some(fe) = load_font_entry(path, &aliases) {
-                // Unprint's supported sequences are Latin. Keep unsupported
-                // fonts out of the catalog at scan time so every downstream
-                // cache sees the same eligible set. This also excludes
-                // NotoColorEmoji, whose CBDT glyph data previously expanded
-                // indexing to millions of entries.
-                let has_latin = unprint_fonts::ttf_parser::Face::parse(&fe.data, 0)
-                    .ok()
-                    .is_some_and(|face| {
-                        ('a'..='z').any(|ch| {
-                            face.glyph_index(ch).is_some_and(|glyph_id| glyph_id.0 != 0)
-                        })
-                    });
-                if !has_latin {
-                    continue;
-                }
-
                 let _fig_label = if fe.oldstyle_figures { "OLDSTYLE" } else { "lining" };
 
                 // Detect ligature glyphs (liga + dlig)
                 let ligatures = detect_ligature_glyphs(&fe.data);
                 if !ligatures.is_empty() {
                 }
-
-                let (default_variations, opsz_range) = detect_default_variations(path);
 
                 // Probe all OT features — emit a variant entry for each that changes glyphs
                 // Skip when allowlist has no variant entries (common for 6-font tests)
@@ -1633,11 +1167,6 @@ pub fn scan_fonts(dirs: &[PathBuf], quiet: bool) -> Vec<FontEntry> {
                 } else {
                     Vec::new()
                 };
-                // Kern/nokern is explicit in every font key (no implicit
-                // default): variant entries render kerned when the font has
-                // kerning data, nokern otherwise. Reused for OT variants,
-                // allcaps, and weight instances below.
-                let kern_tag = if fe.has_kern { "kern" } else { "nokern" };
                 for (tag, overrides) in &variants {
                     // Merge ligature overrides into each variant
                     let mut combined = overrides.clone();
@@ -1646,12 +1175,6 @@ pub fn scan_fonts(dirs: &[PathBuf], quiet: bool) -> Vec<FontEntry> {
                             combined.push((lig_c, gid));
                         }
                     }
-                    // Variant entries carry the kern/nokern tag explicitly
-                    // (appended after the OT tag): they render kerned unless
-                    // the font has no kerning data. Lig is explicit too:
-                    // variants render with ligatures on (|lig); there is no
-                    // nolig permutation for OT variants.
-                    let var_tag = format!("{}|{}|lig", tag, kern_tag);
                     let var_entry = FontEntry {
                         path: fe.path.clone(),
                         family_name: format!("{} [{}]", fe.family_name, tag),
@@ -1666,22 +1189,12 @@ pub fn scan_fonts(dirs: &[PathBuf], quiet: bool) -> Vec<FontEntry> {
                         class: fe.class,
                         data: Vec::new(), // bytes not retained
                         oldstyle_figures: fe.oldstyle_figures,
-                        variant_tag: var_tag.clone(),
-                        font_key_cache: FontEntry::compute_font_key_full(
-                            &format!("{}|{}", fe.postscript_name, tag),
-                            &var_tag,
-                            None,
-                            &default_variations,
-                            &fe.font_version,
-                        ),
+                        variant_tag: tag.clone(),
+                        font_key_cache: format!("{}|{}|{}", fe.postscript_name, tag, tag),
                         glyph_overrides: Some(combined),
-                        variations: default_variations.clone(),
+                        variations: None,
                         typographic_family: fe.typographic_family.clone(),
                         vintage_era: None,
-                        opsz_range,
-                        has_gpos: fe.has_gpos,
-                        has_kern: fe.has_kern,
-                        font_version: fe.font_version.clone(),
                     };
                     fonts.push(var_entry);
                 }
@@ -1698,10 +1211,6 @@ pub fn scan_fonts(dirs: &[PathBuf], quiet: bool) -> Vec<FontEntry> {
                         for &(lig_c, gid) in &ligatures {
                             combined_lig.push((lig_c, gid));
                         }
-                        // Allcaps entries carry the kern/nokern tag explicitly,
-                        // like OT variants (render kerned unless no kern data).
-                        // Lig is explicit too (|lig — ligatures on).
-                        let allcaps_tag = format!("{}|{}|lig", tag, kern_tag);
                         let allcaps_entry = FontEntry {
                             path: fe.path.clone(),
                             family_name: format!("{} [{}]", fe.family_name, tag),
@@ -1712,30 +1221,18 @@ pub fn scan_fonts(dirs: &[PathBuf], quiet: bool) -> Vec<FontEntry> {
                             class: fe.class,
                             data: Vec::new(),
                             oldstyle_figures: fe.oldstyle_figures,
-                            variant_tag: allcaps_tag.clone(),
-                            font_key_cache: FontEntry::compute_font_key_full(
-                                &format!("{}|{}", fe.postscript_name, tag),
-                                &allcaps_tag,
-                                None,
-                                &default_variations,
-                                &fe.font_version,
-                            ),
+                            variant_tag: tag.clone(),
+                            font_key_cache: format!("{}|{}|{}", fe.postscript_name, tag, tag),
                             glyph_overrides: if combined_lig.is_empty() { None } else { Some(combined_lig) },
-                            variations: default_variations.clone(),
+                            variations: None,
                             typographic_family: fe.typographic_family.clone(),
                             vintage_era: None,
-                            opsz_range,
-                            has_gpos: fe.has_gpos,
-                            has_kern: fe.has_kern,
-                            font_version: fe.font_version.clone(),
                         };
                         fonts.push(allcaps_entry);
                     }
                 }
                 // Drop font bytes — metadata + path is all we keep.
                 // Index build and matching load from path on demand.
-                // Compute kern feature BEFORE clearing data (needed for nokern variants).
-                let has_kern = font_has_kern_feature(&fe.data);
                 let mut fe = fe;
                 fe.data = Vec::new();
                 // Add ligature overrides to base entry
@@ -1748,147 +1245,60 @@ pub fn scan_fonts(dirs: &[PathBuf], quiet: bool) -> Vec<FontEntry> {
                 // ── Variable font weight instances ──────────────────────
                 // If the font has a wght axis, emit additional entries at
                 // each named-instance weight so the font matcher indexes bold/light/
-                // etc. renderings from the same file. Each weight instance
-                // gets the SAME kern/lig/opsz permutation as the base
-                // entry — a single kern|lig entry per weight cannot
-                // represent e.g. "400 italic, nokern, opsz 10", so the
-                // classifier could never match that rendering exactly.
+                // etc. renderings from the same file.
                 let weight_instances = detect_weight_instances(path, fe.class);
-                let has_ligatures = fe.collapsed_lig_set() != 0;
+                let is_variable = !weight_instances.is_empty();
                 for wi in &weight_instances {
                     let var_ps = make_weight_explicit(&fe.raw_postscript_name, wi.os2_weight);
-                    let var_variations = Some(wi.axes.clone());
-                    let wght_tag = format!("wght{}", wi.os2_weight);
-                    let var_opts = var_perm_opts(&var_variations);
-                    for &is_nokern in kern_perm_opts(has_kern) {
-                        for &is_nolig in lig_perm_opts(has_ligatures) {
-                            for variations in &var_opts {
-                                let var_tag = append_kern_lig_markers(&wght_tag, is_nokern, is_nolig);
-                                let mut var_fe = FontEntry {
-                                    path: fe.path.clone(),
-                                    family_name: format!("{} [{}]", fe.family_name, var_tag),
-                                    postscript_name: var_ps.clone(),
-                                    raw_postscript_name: fe.raw_postscript_name.clone(),
-                                    is_bold: wi.os2_weight >= 700,
-                                    is_italic: fe.is_italic,
-                                    class: fe.class,
-                                    data: Vec::new(),
-                                    oldstyle_figures: fe.oldstyle_figures,
-                                    variant_tag: var_tag.clone(),
-                                    // Bracket notation distinguishes static "SourceSerif4-400Italic"
-                                    // from variable "SourceSerif4-400Italic|wght400[wght=400,opsz=20]"
-                                    // after normalization.
-                                    font_key_cache: FontEntry::compute_font_key_full(
-                                        &var_ps,
-                                        &var_tag,
-                                        None,
-                                        variations,
-                                        &fe.font_version,
-                                    ),
-                                    glyph_overrides: None,
-                                    variations: variations.clone(),
-                                    typographic_family: fe.typographic_family.clone(),
-                                    vintage_era: None,
-                                    opsz_range,
-                                    has_gpos: fe.has_gpos,
-                                    has_kern: fe.has_kern,
-                                    font_version: fe.font_version.clone(),
-                                };
-                                // Add ligature overrides to weight-instance entry
-                                if !ligatures.is_empty() {
-                                    var_fe.glyph_overrides = Some(ligatures.clone());
-                                }
-                                fonts.push(var_fe);
-                            }
-                        }
+                    let var_tag = format!("wght{}", wi.os2_weight);
+                    let mut var_fe = FontEntry {
+                        path: fe.path.clone(),
+                        family_name: format!("{} [{}]", fe.family_name, var_tag),
+                        postscript_name: var_ps.clone(),
+                        raw_postscript_name: fe.raw_postscript_name.clone(),
+                        is_bold: wi.os2_weight >= 700,
+                        is_italic: fe.is_italic,
+                        class: fe.class,
+                        data: Vec::new(),
+                        oldstyle_figures: fe.oldstyle_figures,
+                        variant_tag: var_tag.clone(),
+                        // Include |var so static "SourceSerif4-400Italic" and
+                        // variable "SourceSerif4-400Italic|wght400|var" remain
+                        // distinct after normalization.
+                        font_key_cache: FontEntry::compute_font_key_full(
+                            &var_ps,
+                            &var_tag,
+                            None,
+                            true,
+                        ),
+                        glyph_overrides: None,
+                        variations: Some(wi.axes.clone()),
+                        typographic_family: fe.typographic_family.clone(),
+                        vintage_era: None,
+                    };
+                    // Add ligature overrides to weight-instance entry
+                    if !ligatures.is_empty() {
+                        var_fe.glyph_overrides = Some(ligatures.clone());
                     }
+                    fonts.push(var_fe);
                 }
 
                 // If this file is variable, mark the base entry as variable
-                // too (variations Some) so its key becomes "...[wght=400,opsz=20]"
-                // and does not collide with the static counterpart after normalization.
-                // The base entry must use every axis's declared default. Using
-                // the first non-default weight instance here mislabeled and
-                // rendered 400-weight base fonts at another weight (for example
-                // Source Serif 4 at 200 and Libre Bodoni/Baskerville at 500).
-                fe.assign_default_variations(default_variations);
-                fe.opsz_range = opsz_range;
-
-                // Emit all permutations of the kern/lig/opsz variant dimensions.
-                // - kern: [kern, nokern] if the font has kerning data, else [nokern].
-                //   A font with no kerning renders identically with the kern
-                //   feature on or off, so a kerned variant would be a
-                //   byte-identical duplicate. Emit only the nokern variant,
-                //   which honestly labels the rendering.
-                //   The PDF specimen's embedded subsets lack GPOS (stripped during
-                //   subsetting), so the scan has no kerning applied. The installed
-                //   full fonts do apply kerning, causing letter-spacing mismatch.
-                //   The nokern variant disables the 'kern' OpenType feature during
-                //   shaping, matching the PDF's kerning-less rendering.
-                // - lig: [lig, nolig] if the font has ligature glyphs, else [lig].
-                //   The lig variant uses the font's ligature set (collapses fi→ﬁ
-                //   when the font has a true ligature). The nolig variant disables
-                //   ligature collapsing, matching documents that render f and i
-                //   as separate glyphs. Lig/nolig is explicit in every font key
-                //   — no implicit default: lig variants carry |lig, nolig
-                //   variants carry |nolig.
-                // - opsz: [base, opsz10] if the font has an opsz axis, else [base].
-                // The classifier scores all permutations and picks the best.
-                // The same permutation applies to the variable-font weight
-                // instances above; the option computation is shared (see
-                // kern_perm_opts / lig_perm_opts / var_perm_opts).
-                let kern_opts = kern_perm_opts(has_kern);
-                let lig_opts = lig_perm_opts(has_ligatures);
-                let var_opts = var_perm_opts(&fe.variations);
-                for &is_nokern in kern_opts {
-                    for &is_nolig in lig_opts {
-                        for variations in &var_opts {
-                            // Combine base variant_tag with kern/nokern and
-                            // lig/nolig markers. Kern/nokern and lig/nolig are
-                            // explicit in every font key — no implicit default:
-                            // kerned variants carry |kern, nokern variants
-                            // carry |nokern; ligature-enabled variants carry
-                            // |lig, nolig variants carry |nolig.
-                            // Use "|" separator to avoid ambiguity.
-                            let variant_tag = append_kern_lig_markers(&fe.variant_tag, is_nokern, is_nolig);
-                            let mut family_name = fe.family_name.clone();
-                            if is_nokern {
-                                family_name = format!("{} [nokern]", family_name);
-                            }
-                            if is_nolig {
-                                family_name = format!("{} [nolig]", family_name);
-                            }
-                            let entry = FontEntry {
-                                path: fe.path.clone(),
-                                family_name,
-                                postscript_name: fe.postscript_name.clone(),
-                                raw_postscript_name: fe.raw_postscript_name.clone(),
-                                is_bold: fe.is_bold,
-                                is_italic: fe.is_italic,
-                                class: fe.class,
-                                data: Vec::new(),
-                                oldstyle_figures: fe.oldstyle_figures,
-                                variant_tag: variant_tag.clone(),
-                                font_key_cache: FontEntry::compute_font_key_full(
-                                    &fe.postscript_name,
-                                    &variant_tag,
-                                    None,
-                                    variations,
-                                    &fe.font_version,
-                                ),
-                                glyph_overrides: fe.glyph_overrides.clone(),
-                                variations: variations.clone(),
-                                typographic_family: fe.typographic_family.clone(),
-                                vintage_era: None,
-                                opsz_range,
-                                has_gpos: fe.has_gpos,
-                                has_kern: fe.has_kern,
-                                font_version: fe.font_version.clone(),
-                            };
-                            fonts.push(entry);
-                        }
-                    }
+                // too (variations Some) so its key becomes "...|var" and does
+                // not collide with the static counterpart after normalization.
+                if is_variable {
+                    // Use the first instance's axes as representative; base
+                    // entry's variations presence is what matters for key.
+                    fe.variations = Some(weight_instances[0].axes.clone());
+                    fe.font_key_cache = FontEntry::compute_font_key_full(
+                        &fe.postscript_name,
+                        &fe.variant_tag,
+                        fe.vintage_era.as_deref(),
+                        true,
+                    );
                 }
+
+                fonts.push(fe);
         }
     }
 
@@ -1914,10 +1324,6 @@ pub fn scan_fonts(dirs: &[PathBuf], quiet: bool) -> Vec<FontEntry> {
                     variations: None,
                     typographic_family: String::new(),
                     vintage_era: None,
-                    opsz_range: None,
-                    has_gpos: false,
-                    has_kern: false,
-                    font_version: String::new(),
                 });
             }
         }
@@ -2273,130 +1679,6 @@ struct WeightInstance {
     axes: Vec<([u8; 4], f32)>,
 }
 
-/// Return every variation axis pinned to its declared default for the base
-/// entry. The base font's canonical weight/style describes these coordinates;
-/// non-default weight instances are emitted separately below.
-///
-/// For `opsz` (optical size), we use the font's declared default. The
-/// renderer's actual opsz behavior (font default vs CSS `font-optical-sizing:
-/// auto` = pt size) is not recoverable from the raster alone, so
-/// `identify_fonts` scores a second synthetic candidate at the size-derived
-/// opsz (`|opszN` fontkey suffix); the better geometry wins. See
-/// `parse_opsz_suffix` / `opsz_synth_key`.
-///
-/// Returns `(default_variations, opsz_range)`:
-/// - `default_variations`: every axis pinned to its declared default
-///   (`None` for static fonts).
-/// - `opsz_range`: `(min, default, max)` of the `opsz` axis when the font has
-///   one. Captured here because the font bytes are dropped after the scan
-///   and the range cannot be re-derived from the entry later.
-fn detect_default_variations(path: &Path) -> (Variations, Option<(f32, f32, f32)>) {
-    use unprint_fonts::ab_glyph::{FontRef, VariableFont};
-
-    let data = match std::fs::read(path) {
-        Ok(d) => d,
-        Err(_) => return (None, None),
-    };
-    let font = match FontRef::try_from_slice(&data) {
-        Ok(f) => f,
-        Err(_) => return (None, None),
-    };
-    let axes = font.variations();
-    if axes.is_empty() {
-        return (None, None);
-    }
-    let opsz_range = axes
-        .iter()
-        .find(|a| &a.tag == b"opsz")
-        .map(|a| (a.min_value, a.default_value, a.max_value));
-    let variations = Some(
-        axes.iter()
-            .map(|axis| (axis.tag, axis.default_value))
-            .collect(),
-    );
-    (variations, opsz_range)
-}
-
-/// Create opsz=10 variations from existing variations, if the font has an opsz axis.
-/// Returns None if the font has no opsz axis, or if opsz is already 10.
-/// Otherwise returns variations with opsz set to 10.0, all other axes unchanged.
-fn make_opsz10_variations(variations: &Variations) -> Variations {
-    let vars = variations.as_ref()?;
-    let mut has_opsz = false;
-    let mut already_10 = false;
-    for (tag, val) in vars.iter() {
-        if tag == b"opsz" {
-            has_opsz = true;
-            if (*val - 10.0).abs() < 0.001 {
-                already_10 = true;
-            }
-            break;
-        }
-    }
-    if !has_opsz || already_10 {
-        return None;
-    }
-    let new_vars: Vec<([u8; 4], f32)> = vars
-        .iter()
-        .map(|(tag, val)| {
-            if tag == b"opsz" {
-                (*tag, 10.0)
-            } else {
-                (*tag, *val)
-            }
-        })
-        .collect();
-    Some(new_vars)
-}
-
-/// Kern options for the kern/lig/opsz permutation shared by the base
-/// entry and the variable-font weight instances. Values are `is_nokern`:
-/// [kern, nokern] when the font has kerning data, else [nokern] only —
-/// a font with no kerning renders identically with the kern feature on
-/// or off, so a kerned variant would be a byte-identical duplicate.
-fn kern_perm_opts(has_kern: bool) -> &'static [bool] {
-    if has_kern {
-        &[false, true]
-    } else {
-        &[true]
-    }
-}
-
-/// Lig options for the kern/lig/opsz permutation. Values are `is_nolig`:
-/// [lig, nolig] when the font has ligature glyphs, else [lig] only.
-fn lig_perm_opts(has_ligatures: bool) -> &'static [bool] {
-    if has_ligatures {
-        &[false, true]
-    } else {
-        &[false]
-    }
-}
-
-/// Opsz options for the kern/lig/opsz permutation: the given variations
-/// plus an opsz=10 variant when the font has an opsz axis not already
-/// at 10.
-fn var_perm_opts(variations: &Variations) -> Vec<Variations> {
-    let mut opts = vec![variations.clone()];
-    if let Some(opsz10_vars) = make_opsz10_variations(variations) {
-        opts.push(Some(opsz10_vars));
-    }
-    opts
-}
-
-/// Append the kern/nokern and lig/nolig markers to a variant tag.
-/// Both are explicit in every font key — no implicit default. An empty
-/// base tag yields just the two markers; otherwise they are appended
-/// after the base tag with `|` separators, kern first then lig.
-fn append_kern_lig_markers(base_tag: &str, is_nokern: bool, is_nolig: bool) -> String {
-    let kern = if is_nokern { "nokern" } else { "kern" };
-    let lig = if is_nolig { "nolig" } else { "lig" };
-    if base_tag.is_empty() {
-        format!("{kern}|{lig}")
-    } else {
-        format!("{base_tag}|{kern}|{lig}")
-    }
-}
-
 /// Detect named weight instances for a variable font.
 ///
 /// Returns instances at each named weight that differs from the default.
@@ -2450,9 +1732,6 @@ fn detect_weight_instances(path: &Path, _class: FontClass) -> Vec<WeightInstance
     };
 
     // Build axis pinning: set wght to each weight, all other axes to default
-    // (including opsz, which uses the font's declared default for consistency
-    // with detect_default_variations; per-line synthetic `|opszN` candidates
-    // handle the size-derived optical size at scoring time).
     let other_axes: Vec<([u8; 4], f32)> = axes.iter()
         .filter(|a| &a.tag != b"wght")
         .map(|a| (a.tag, a.default_value))
@@ -2560,222 +1839,6 @@ fn font_has_caps_tables(data: &[u8]) -> bool {
     false
 }
 
-/// Returns true if the font actually has kerning data available.
-/// Used to decide whether to emit a kerned variant: a font with no kerning
-/// renders identically with the kern feature on or off, so a kerned variant
-/// would be a byte-identical duplicate of the nokern variant.
-/// Kerning counts as available when:
-/// - the legacy `kern` table has at least one pair (format 0), or any
-///   class-based (format 2/3) subtable, which carries kerning by construction; or
-/// - the GPOS table has a `kern` feature with at least one lookup
-///   (a kern feature's lookups are PairAdjustment by definition).
-/// True if the font data contains a GPOS table.
-pub fn font_has_gpos(data: &[u8]) -> bool {
-    let face = match unprint_fonts::ttf_parser::Face::parse(data, 0) {
-        Ok(f) => f,
-        Err(_) => return false,
-    };
-    let gpos_tag = unprint_fonts::ttf_parser::Tag::from_bytes(b"GPOS");
-    face.raw_face().table(gpos_tag).is_some()
-}
-
-/// True if `seg` is an OpenType feature tag that selects a non-default
-/// rendering: oldstyle/lining figures, small caps, swash/stylistic/
-/// titling/historical alternates, stylistic sets, or the allcaps
-/// (case+cpsp) variant. This is exactly the tag set the scan emits as
-/// variant entries (`VARIANT_FEATURES` plus `allcaps`); kern/nokern,
-/// lig/nolig, wght/opsz axis values, and `vintage=` are not OT features.
-/// The specimen renders default features only, so a variant carrying one
-/// of these tags never matches the specimen's default rendering.
-fn is_ot_feature_tag(seg: &str) -> bool {
-    matches!(
-        seg,
-        "onum" | "lnum" | "smcp" | "c2sc" | "swsh" | "salt" | "titl" | "hist" | "allcaps"
-    ) || (seg.len() == 4
-        && seg.starts_with("ss")
-        && seg[2..].bytes().all(|b| b.is_ascii_digit()))
-}
-
-/// Numeric font version parsed from the `|version=X` key segment, in
-/// hundredths (2.50 → 250, 10.00 → 1000), for numeric comparison —
-/// string comparison would wrongly rank "10.00" below "2.50".
-/// A key without a version tag (tombstones omit it) scores 0 and loses
-/// to any versioned key. The minor part is read as two digits ("5" →
-/// 50, "505" → 50); `font_revision` always formats two decimals, so
-/// anything else is malformed input handled defensively.
-fn font_key_version(font_key: &str) -> u32 {
-    for seg in font_key.split('|').skip(1) {
-        let Some(v) = seg.strip_prefix("version=") else { continue };
-        let v = v.split('[').next().unwrap_or(v);
-        let (major_s, minor_s) = match v.split_once('.') {
-            Some((a, b)) => (a, b),
-            None => (v, ""),
-        };
-        let major: u32 = major_s.parse().unwrap_or(0);
-        let mut digits = minor_s.chars().filter(|c| c.is_ascii_digit());
-        let d1 = digits.next().and_then(|c| c.to_digit(10)).unwrap_or(0);
-        let d2 = digits.next().and_then(|c| c.to_digit(10)).unwrap_or(0);
-        return major.saturating_mul(100).saturating_add(d1 * 10 + d2);
-    }
-    0
-}
-
-/// Preference for font-key selection and classifier tiebreaking.
-/// Single source of truth, shared by --resolve-fontkey
-/// (crates/unprint-cli/src/main.rs) and the classifier tiebreakers
-/// (font_match.rs fine-score sort, font_pipeline.rs exact-tie
-/// resolution and GT resolution).
-///
-/// Returns `(version, variant_score)`, compared lexicographically:
-/// the numeric font version DOMINATES — when no version is specified
-/// (an exact-score tie between versions, or a bare PostScript-name
-/// query), the highest version wins (10.00 > 2.50, numeric, not
-/// string order). The variant score breaks ties within one version:
-/// font with kerning data → +4 for kern (not nokern); font without
-/// kerning → +4 for nokern; +2 for nolig; +1 for opsz=10; −10 per
-/// OT-feature variant tag (onum, lnum, smcp, c2sc, swsh, salt, titl,
-/// hist, ss01–ss20, allcaps) and −10 per non-default weight instance
-/// (`|wghtN`), so the base/default variant always wins the default-GT
-/// pick over an OT-feature variant or a non-default weight. Higher
-/// wins. The kerning signal is `has_kern` (legacy `kern` table
-/// or GPOS `kern` feature), not GPOS presence: a font with a legacy
-/// `kern` table but no GPOS (e.g. Trebuchet, Arial) still renders
-/// kerned by default, so its kerned variant is the default pick.
-/// Lig is explicit in the key but scores 0 (the default); nolig keeps
-/// +2, so the nolig variant still wins the default-GT pick.
-/// A key without a version tag scores version 0 and loses to any
-/// versioned key. An exact key match (version specified) bypasses
-/// this preference entirely — callers check exact matches first.
-pub fn font_key_preference_score(font_key: &str, has_kern: bool) -> (u32, i32) {
-    let version = font_key_version(font_key);
-    let mut s = 0;
-    let is_nokern = font_key.contains("nokern");
-    // If has_kern: +4 for kern (not nokern).
-    // If !has_kern: +4 for nokern.
-    if has_kern != is_nokern {
-        s += 4;
-    }
-    if font_key.contains("nolig") {
-        s += 2;
-    }
-    if font_key.contains("opsz=10") {
-        s += 1;
-    }
-    // Non-default variants must never be the default pick: the specimen
-    // renders default features at the font's default weight, so an
-    // OT-feature variant or a `|wghtN` weight instance never matches the
-    // default rendering. Segment 0 is the PostScript name, never a tag;
-    // bracketed variations (`[wght=400,...]`) are stripped before matching.
-    // The `wghtN` case matters: the scan only emits a weight instance for
-    // a weight other than the declared default, and the instance must
-    // never outscore the honest base entry at the default weight (e.g. a
-    // kern-less variable font's `|wght400|nokern` instance would otherwise
-    // tie the `|nokern|nolig` base entry on the kern dimension).
-    for seg in font_key.split('|').skip(1) {
-        let seg = seg.split('[').next().unwrap_or(seg);
-        if is_ot_feature_tag(seg) {
-            s -= 10;
-        }
-        if seg.len() > 4
-            && seg.starts_with("wght")
-            && seg[4..].bytes().all(|b| b.is_ascii_digit())
-        {
-            s -= 10;
-        }
-    }
-    (version, s)
-}
-
-/// Best registry entry for a bare PostScript name (no version
-/// specified): latest version, then the shared variant preference,
-/// then the lowest font key (deterministic final fallback, matching
-/// the fine-score sort). Exact-match callers check `by_key` first —
-/// this helper is only for version-less queries.
-pub fn best_entry_for_ps_name<'a, I>(entries: I, ps_name: &str) -> Option<&'a FontEntry>
-where
-    I: Iterator<Item = &'a FontEntry>,
-{
-    entries.filter(|fe| fe.postscript_name == ps_name).max_by(|a, b| {
-        let pa = font_key_preference_score(a.font_key_ref(), a.has_kern);
-        let pb = font_key_preference_score(b.font_key_ref(), b.has_kern);
-        // Max-by prefers the greater; reverse the key comparison so
-        // the lowest key wins a full preference tie (same as the
-        // fine-score sort's key-asc final fallback).
-        pa.cmp(&pb).then_with(|| b.font_key_ref().cmp(a.font_key_ref()))
-    })
-}
-
-/// Font version from the `head` table `fontRevision` field, formatted
-/// as "major.minor" with two decimals (e.g. "2.50"). `fontRevision` is a
-/// 16.16 fixed-point at offset 4 of the `head` table (after the 4-byte
-/// table version). Returns an empty string if the font has no parseable
-/// `head` table. Two-decimal rounding matches the conventional display
-/// (fontTools reports the same values); versions finer than 0.01 (rare
-/// in practice) round to the nearest hundredth.
-fn font_revision(data: &[u8]) -> String {
-    let face = match unprint_fonts::ttf_parser::Face::parse(data, 0) {
-        Ok(f) => f,
-        Err(_) => return String::new(),
-    };
-    let head_tag = unprint_fonts::ttf_parser::Tag::from_bytes(b"head");
-    let Some(head) = face.raw_face().table(head_tag) else {
-        return String::new();
-    };
-    if head.len() < 8 {
-        return String::new();
-    }
-    let raw = u32::from_be_bytes([head[4], head[5], head[6], head[7]]);
-    let major = raw >> 16;
-    let frac = (raw & 0xFFFF) as f64 / 65536.0;
-    let minor = (frac * 100.0).round() as u32;
-    if minor >= 100 {
-        // Fractional part rounds up to the next major (e.g. 2.9999 -> 3.00).
-        format!("{}.00", major + 1)
-    } else {
-        format!("{}.{:02}", major, minor)
-    }
-}
-
-fn font_has_kern_feature(data: &[u8]) -> bool {
-    let face = match unprint_fonts::ttf_parser::Face::parse(data, 0) {
-        Ok(f) => f,
-        Err(_) => return false,
-    };
-    let tables = face.tables();
-    // Legacy `kern` table: needs at least one pair. A present-but-empty
-    // table (or subtables with no pairs) is no kerning.
-    if let Some(kern) = &tables.kern {
-        for sub in kern.subtables {
-            match sub.format {
-                unprint_fonts::ttf_parser::kern::Format::Format0(ref s0) => {
-                    if s0.pairs.len() > 0 {
-                        return true;
-                    }
-                }
-                unprint_fonts::ttf_parser::kern::Format::Format2(_)
-                | unprint_fonts::ttf_parser::kern::Format::Format3(_) => {
-                    return true;
-                }
-                _ => {}
-            }
-        }
-    }
-    // GPOS `kern` feature with at least one lookup.
-    if let Some(gpos) = &tables.gpos {
-        let kern_tag = unprint_fonts::ttf_parser::Tag::from_bytes(b"kern");
-        if let Some(feature) = gpos.features.find(kern_tag) {
-            if feature.lookup_indices.len() > 0 {
-                return true;
-            }
-        }
-        return false;
-    }
-    // GPOS table exists but failed to parse: fail open (assume kerning may
-    // be present) so a parse quirk can't drop the kerned variant.
-    let gpos_tag = unprint_fonts::ttf_parser::Tag::from_bytes(b"GPOS");
-    face.raw_face().table(gpos_tag).is_some()
-}
-
 /// Ligature probe sequences: (input_chars, unicode_ligature_char).
 /// We shape the input chars with liga/dlig features and check if the
 /// shaper produces a single glyph (i.e. a ligature substitution fired).
@@ -2850,17 +1913,6 @@ fn detect_ligature_glyphs(data: &[u8]) -> Vec<(char, u16)> {
 pub fn make_weight_explicit(ps_name: &str, weight: u16) -> String {
     if ps_name.is_empty() {
         return ps_name.to_string();
-    }
-
-    // Special case: Arial Black is a distinct family, not Arial at weight 900.
-    // The file's usWeightClass lies (says 400), but 400 is reasonable for the
-    // Arial Black family (it's the regular weight of that family).
-    // Per Mike Nov 2: "Black should be part of font family rather than a weight."
-    if ps_name == "Arial-Black" {
-        // Preserve "Black" as part of family name, don't strip it.
-        // Use the provided weight (400 is reasonable for this family).
-        let weight_str = weight.to_string();
-        return format!("ArialBlack-{}", weight_str);
     }
 
     let weight_str = weight.to_string();
@@ -3164,17 +2216,6 @@ pub fn load_font_entry(path: &Path, aliases: &HashMap<String, Alias>) -> Option<
     let _ = unprint_fonts::ab_glyph::FontRef::try_from_slice(&data).ok()?;
 
     let oldstyle_figures = detect_oldstyle_figures(&data);
-    // GPOS presence, captured while the bytes are available — drives the
-    // shared font-key preference (see font_key_preference_score). The
-    // scan drops `data` after this, so it cannot be re-derived later.
-    let has_gpos = font_has_gpos(&data);
-    // Kerning data, captured while the bytes are available — the shared
-    // font-key preference's kern/nokern signal. Same lifetime constraint
-    // as has_gpos: computed here, stored on the entry, serialized.
-    let has_kern = font_has_kern_feature(&data);
-    // Font version, captured while the bytes are available — part of the
-    // font key (|version=X). Same lifetime constraint as has_gpos/has_kern.
-    let font_version = font_revision(&data);
     let meta = read_font_metadata(&data);
     let raw_ps_name = meta.nid6_postscript;
     let os2_weight = meta.weight_class;
@@ -3191,13 +2232,7 @@ pub fn load_font_entry(path: &Path, aliases: &HashMap<String, Alias>) -> Option<
     // Try alias table first (exact match on lowercase stem)
     if let Some(alias) = aliases.get(&stem_lower) {
         let class = classify(alias.family);
-        let font_key_cache = FontEntry::compute_font_key_full(
-            &postscript_name,
-            "",
-            None,
-            &None,
-            &font_version,
-        );
+        let font_key_cache = postscript_name.clone();
         return Some(FontEntry {
             path: path.to_path_buf(),
             family_name: alias.family.to_string(),
@@ -3214,10 +2249,6 @@ pub fn load_font_entry(path: &Path, aliases: &HashMap<String, Alias>) -> Option<
             variations: None,
             typographic_family,
             vintage_era: None,
-            opsz_range: None,
-            has_gpos,
-            has_kern,
-            font_version: font_version.clone(),
         });
     }
 
@@ -3240,13 +2271,7 @@ pub fn load_font_entry(path: &Path, aliases: &HashMap<String, Alias>) -> Option<
         || stem_lower.ends_with("it");
     let class = classify(&family_name);
 
-    let font_key_cache = FontEntry::compute_font_key_full(
-        &postscript_name,
-        "",
-        None,
-        &None,
-        &font_version,
-    );
+    let font_key_cache = postscript_name.clone();
     Some(FontEntry {
         path: path.to_path_buf(),
         family_name,
@@ -3263,10 +2288,6 @@ pub fn load_font_entry(path: &Path, aliases: &HashMap<String, Alias>) -> Option<
         variations: None,
         typographic_family,
         vintage_era: None,
-        opsz_range: None,
-        has_gpos,
-        has_kern,
-        font_version,
     })
 }
 
@@ -3298,299 +2319,4 @@ pub fn scan_fonts_uncached(dirs: &[PathBuf]) -> Vec<FontEntry> {
         }
     }
     fonts
-}
-
-#[cfg(test)]
-mod catalog_hash_tests {
-    use super::*;
-
-    fn entry(variations: Variations, glyph_overrides: Option<Vec<(char, u16)>>) -> FontEntry {
-        let font_key_cache = FontEntry::compute_font_key_full(
-            "Test-400",
-            "",
-            None,
-            &variations,
-            "1.00",
-        );
-        FontEntry {
-            path: PathBuf::from("/font.ttf"),
-            family_name: "Test".to_string(),
-            postscript_name: "Test-400".to_string(),
-            raw_postscript_name: "Test-Regular".to_string(),
-            is_bold: false,
-            is_italic: false,
-            class: FontClass::Serif,
-            data: Vec::new(),
-            oldstyle_figures: false,
-            variant_tag: String::new(),
-            font_key_cache,
-            glyph_overrides,
-            variations,
-            typographic_family: "Test".to_string(),
-            vintage_era: None,
-            opsz_range: None,
-            has_gpos: false,
-            has_kern: false,
-            font_version: "1.00".to_string(),
-        }
-    }
-
-    #[test]
-    fn cache_freshness_base_entry_uses_declared_variation_defaults() {
-        // Start with non-variable fixture (no brackets), assign defaults, expect transition to bracket notation
-        let mut base = FontEntry {
-            path: PathBuf::from("/font.ttf"),
-            family_name: "Test".to_string(),
-            postscript_name: "Test-400".to_string(),
-            raw_postscript_name: "Test-Regular".to_string(),
-            is_bold: false,
-            is_italic: false,
-            class: FontClass::Serif,
-            data: Vec::new(),
-            oldstyle_figures: false,
-            variant_tag: String::new(),
-            font_key_cache: "Test-400".to_string(),
-            glyph_overrides: None,
-            variations: None,
-            typographic_family: "Test".to_string(),
-            vintage_era: None,
-            opsz_range: None,
-            has_gpos: false,
-            has_kern: false,
-            font_version: "1.00".to_string(),
-        };
-        // Test fixture: arbitrary variation coordinates (opsz value is not
-        // significant here; detect_default_variations now uses the font's
-        // declared default).
-        let defaults = vec![(*b"wght", 400.0), (*b"opsz", 10.0)];
-        base.assign_default_variations(Some(defaults.clone()));
-
-        assert_eq!(base.variations, Some(defaults));
-        assert_eq!(base.font_key_ref(), "Test-400|version=1.00[wght=400,opsz=10]");
-    }
-
-    #[test]
-    fn complete_generation_deduplicates_appended_entries_by_font_key() {
-        let first = entry(None, None);
-        let duplicate = entry(None, None);
-        let deduped = dedup_font_entries_by_key(vec![first, duplicate], true);
-        assert_eq!(deduped.len(), 1);
-        assert_eq!(deduped[0].font_key_ref(), "Test-400|version=1.00");
-    }
-
-    #[test]
-    fn catalog_hash_includes_variation_coordinates() {
-        let at_default = entry(Some(vec![(*b"wght", 400.0), (*b"opsz", 20.0)]), None);
-        let wrong_weight = entry(Some(vec![(*b"wght", 200.0), (*b"opsz", 20.0)]), None);
-        assert_ne!(
-            FontRegistry::compute_hash(&[at_default]),
-            FontRegistry::compute_hash(&[wrong_weight]),
-        );
-    }
-
-    #[test]
-    fn cache_freshness_catalog_hash_includes_source_file_fingerprint() {
-        let dir = tempfile::tempdir().expect("create temp directory");
-        let first_path = dir.path().join("first.ttf");
-        let second_path = dir.path().join("second.ttf");
-        std::fs::write(&first_path, b"first payload").expect("write first source");
-        std::fs::write(&second_path, b"different second payload").expect("write second source");
-
-        let mut first = entry(None, None);
-        first.path = first_path;
-        let mut second = entry(None, None);
-        second.path = second_path;
-
-        assert_ne!(
-            FontRegistry::compute_hash(&[first]),
-            FontRegistry::compute_hash(&[second]),
-        );
-    }
-
-    #[test]
-    fn catalog_hash_includes_glyph_overrides() {
-        let base = entry(None, Some(vec![('f', 10)]));
-        let changed = entry(None, Some(vec![('f', 11)]));
-        assert_ne!(
-            FontRegistry::compute_hash(&[base]),
-            FontRegistry::compute_hash(&[changed]),
-        );
-    }
-
-    #[test]
-    fn catalog_hash_wght_500_vs_400_distinct() {
-        // Same file, same key, but wght axis differs – must produce distinct hash
-        // (regression: stale variation-blind reuse would keep same BGEO)
-        let wght_500 = entry(Some(vec![(*b"wght", 500.0)]), None);
-        let wght_400 = entry(Some(vec![(*b"wght", 400.0)]), None);
-        let h500 = FontRegistry::compute_hash(&[wght_500]);
-        let h400 = FontRegistry::compute_hash(&[wght_400]);
-        assert_ne!(h500, h400, "wght 500 vs 400 should change catalog hash to force BGEO rebuild");
-    }
-
-    #[test]
-    fn catalog_hash_opsz_change_rebuilds() {
-        // opsz is often same PS name but different rendering metrics; hash must change
-        let opsz_12 = entry(Some(vec![(*b"wght", 400.0), (*b"opsz", 12.0)]), None);
-        let opsz_20 = entry(Some(vec![(*b"wght", 400.0), (*b"opsz", 20.0)]), None);
-        assert_ne!(
-            FontRegistry::compute_hash(&[opsz_12]),
-            FontRegistry::compute_hash(&[opsz_20]),
-            "opsz change should invalidate BGEO and training caches"
-        );
-    }
-
-    #[test]
-    fn catalog_hash_distinct_coords_produce_distinct_classes() {
-        // Different variation coords should lead to distinct render hashes/classes
-        // We test via catalog hash as proxy for class identity
-        let a = entry(Some(vec![(*b"wght", 400.0), (*b"wdth", 100.0)]), None);
-        let b = entry(Some(vec![(*b"wght", 400.0), (*b"wdth", 75.0)]), None);
-        let c = entry(Some(vec![(*b"wght", 700.0), (*b"wdth", 100.0)]), None);
-        let ha = FontRegistry::compute_hash(&[a]);
-        let hb = FontRegistry::compute_hash(&[b]);
-        let hc = FontRegistry::compute_hash(&[c]);
-        assert_ne!(ha, hb);
-        assert_ne!(ha, hc);
-        assert_ne!(hb, hc);
-    }
-
-    #[test]
-    fn runtime_train_hash_equality() {
-        // Train's old hash was font_key-only; runtime includes variations.
-        // This test asserts equality – will fail until train uses same hash.
-        // We simulate train's old logic vs new.
-        use std::hash::{Hash, Hasher};
-        let fe = entry(Some(vec![(*b"wght", 400.0), (*b"opsz", 12.0)]), Some(vec![('a', 5)]));
-        let runtime_hash = FontRegistry::compute_hash(&[fe.clone()]);
-        // Simulate old train hash (font_key only)
-        let mut old_hasher = rustc_hash::FxHasher::default();
-        fe.font_key().hash(&mut old_hasher);
-        let old_train_hash = old_hasher.finish();
-        // New train hash should use compute_hash – they should match runtime
-        // If this assert fails, it means train still uses old logic.
-        // For now we assert runtime != old (to show bug), and runtime == new.
-        assert_ne!(runtime_hash, old_train_hash, "old train hash is variation-blind – should differ from runtime");
-        // New correct train hash:
-        let new_train_hash = FontRegistry::compute_hash(&[fe]);
-        assert_eq!(runtime_hash, new_train_hash, "runtime and train hashes must be identical");
-    }
-
-    #[test]
-    fn opsz_base_uses_declared_default_and_captures_range() {
-        // Source Serif 4 has opsz axis min 8 default 20 max 60.
-        // The base candidate pins every axis to its declared default
-        // (opsz=20); the size-derived opsz now comes from the synthetic
-        // `|opszN` candidate in identify_fonts, not from this function.
-        // This function must also capture the axis range so the synthesis
-        // gate (FontEntry::opsz_axis_range) can fire.
-        let path = PathBuf::from("/home/hatch/.local/share/fonts/ofl/sourceserif4/SourceSerif4-Italic[opsz,wght].ttf");
-        if !path.exists() {
-            // Skip if font not installed (CI may not have it)
-            return;
-        }
-        let (vars_opt, opsz_range) = super::detect_default_variations(&path);
-        let vars = vars_opt.expect("should have variations");
-        let opsz = vars.iter().find(|(tag, _)| tag == b"opsz").map(|(_, v)| *v);
-        assert!(opsz.is_some(), "opsz axis should be present");
-        let opsz_val = opsz.unwrap();
-        assert!((opsz_val - 20.0).abs() < 0.01, "opsz should be 20 (declared default), got {}", opsz_val);
-        // Ensure wght is still default 400
-        let wght = vars.iter().find(|(tag, _)| tag == b"wght").map(|(_, v)| *v).unwrap_or(0.0);
-        assert!((wght - 400.0).abs() < 0.5, "wght should be default 400, got {}", wght);
-        // The axis range must be captured for synthesis.
-        let (min, default, max) = opsz_range.expect("opsz_range should be captured");
-        assert!((min - 8.0).abs() < 0.01, "opsz min should be 8, got {}", min);
-        assert!((default - 20.0).abs() < 0.01, "opsz default should be 20, got {}", default);
-        assert!((max - 60.0).abs() < 0.01, "opsz max should be 60, got {}", max);
-    }
-
-    #[test]
-    fn opsz_weight_instances_use_same_opsz() {
-        // Weight instances pin non-wght axes to their declared defaults,
-        // matching the base entry (opsz=20 for Source Serif 4). The
-        // size-derived opsz comes from the synthetic `|opszN` candidate.
-        let path = PathBuf::from("/home/hatch/.local/share/fonts/ofl/sourceserif4/SourceSerif4-Italic[opsz,wght].ttf");
-        if !path.exists() {
-            return;
-        }
-        let instances = super::detect_weight_instances(&path, super::FontClass::Serif);
-        assert!(!instances.is_empty(), "should have weight instances");
-        for inst in &instances {
-            let opsz = inst.axes.iter().find(|(tag, _)| tag == b"opsz").map(|(_, v)| *v);
-            assert!(opsz.is_some(), "weight instance should have opsz");
-            let v = opsz.unwrap();
-            assert!((v - 20.0).abs() < 0.01, "weight instance opsz should be 20 (declared default), got {}", v);
-        }
-    }
-
-    #[test]
-    fn opsz_render_training_bgeo_verification_same_coords() {
-        // All downstream consumers (char_render, train, geo_cache, verify)
-        // use FontEntry::apply_variations, which applies the stored variations.
-        // If catalog has opsz=10, they all receive identical coords.
-        // This test proves that a FontEntry with opsz=10, when applied to a
-        // FontRef, actually sets the variation, and that different opsz values
-        // produce distinct hashes (so they remain distinct where geometry differs).
-        let fe_10 = entry(Some(vec![(*b"wght", 400.0), (*b"opsz", 10.0)]), None);
-        let fe_20 = entry(Some(vec![(*b"wght", 400.0), (*b"opsz", 20.0)]), None);
-        // Same opsz should produce same hash, different opsz different hash
-        let h10_a = FontRegistry::compute_hash(&[fe_10.clone()]);
-        let h10_b = FontRegistry::compute_hash(&[entry(Some(vec![(*b"wght", 400.0), (*b"opsz", 10.0)]), None)]);
-        let h20 = FontRegistry::compute_hash(&[fe_20]);
-        assert_eq!(h10_a, h10_b, "same opsz should give same hash (identical coords)");
-        assert_ne!(h10_a, h20, "different opsz should give different hash (distinct geometry)");
-    }
-
-    #[test]
-    fn preference_version_dominates_variant() {
-        // Newest version wins even when the older version has the better
-        // variant score: v2.82 kern (4) beats v2.50 kern+nolig (6).
-        let old = super::font_key_preference_score("TimesNewRomanPSMT-400|version=2.50|kern|nolig", true);
-        let new = super::font_key_preference_score("TimesNewRomanPSMT-400|version=2.82|kern|lig", true);
-        assert_eq!(old, (250, 6));
-        assert_eq!(new, (282, 4));
-        assert!(new > old, "version must dominate the variant score");
-    }
-
-    #[test]
-    fn preference_version_compares_numerically() {
-        // 10.00 > 2.50 numerically; string comparison would rank "10.00" below "2.50".
-        let low = super::font_key_preference_score("X-400|version=2.50|kern|nolig", true);
-        let high = super::font_key_preference_score("X-400|version=10.00|kern|nolig", true);
-        assert_eq!(low.0, 250);
-        assert_eq!(high.0, 1000);
-        assert!(high > low, "10.00 must beat 2.50");
-    }
-
-    #[test]
-    fn preference_variant_breaks_same_version_tie() {
-        // Within one version, the existing variant preference decides.
-        let lig = super::font_key_preference_score("X-400|version=2.82|kern|lig", true);
-        let nolig = super::font_key_preference_score("X-400|version=2.82|kern|nolig", true);
-        assert_eq!(lig, (282, 4));
-        assert_eq!(nolig, (282, 6));
-        assert!(nolig > lig, "nolig must win within the same version");
-    }
-
-    #[test]
-    fn preference_missing_version_loses() {
-        // A key without a version tag scores version 0 and loses to any
-        // versioned key, whatever the variant score.
-        let unversioned = super::font_key_preference_score("X-400|kern|nolig", true);
-        let versioned = super::font_key_preference_score("X-400|version=1.00|kern|lig", true);
-        assert_eq!(unversioned, (0, 6));
-        assert_eq!(versioned, (100, 4));
-        assert!(versioned > unversioned, "versioned must beat unversioned");
-    }
-
-    #[test]
-    fn font_key_version_parses_hundredths() {
-        assert_eq!(super::font_key_version("X-400|version=2.50|kern|nolig"), 250);
-        assert_eq!(super::font_key_version("X-400|version=10.00|kern|nolig"), 1000);
-        assert_eq!(super::font_key_version("X-400|version=1.00"), 100);
-        assert_eq!(super::font_key_version("X-400|version=2.5|kern|nolig"), 250);
-        assert_eq!(super::font_key_version("X-400|kern|nolig"), 0);
-        assert_eq!(super::font_key_version("X-400|version=abc|kern|nolig"), 0);
-    }
 }

@@ -1,5 +1,5 @@
 [workspace]
-members = ["crates/unprint-fonts", "crates/unprint-geometry", "crates/unprint-classify", "crates/unprint-report", "crates/unprint-cli"]
+members = ["crates/unprint-fonts", "crates/unprint-geometry", "crates/unprint-classify", "crates/unprint-ocr", "crates/unprint-report", "crates/unprint-cli"]
 resolver = "2"
 
 [workspace.dependencies]
@@ -36,6 +36,10 @@ edition = "2021"
 description = "Replace raster/scanned text with native vector text — zero information loss, maximum vectorization"
 license = "MIT"
 autobins = false
+
+[[bin]]
+name = "gen_training_data"
+path = "src/bin/gen_training_data.rs"
 
 [dependencies]
 clap = { workspace = true }

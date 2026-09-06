@@ -52,6 +52,21 @@ pub fn take_obs_stats() -> Option<ObsStats> {
     LAST_OBS_STATS.with(|cell| cell.borrow_mut().take())
 }
 
+thread_local! {
+    /// OOD confidence weight: min(1, med_nn / min_d). Always written by softmax_probs().
+    static LAST_OOD_WEIGHT: std::cell::Cell<f32> = const { std::cell::Cell::new(1.0) };
+}
+
+/// Retrieve the OOD confidence weight from the last softmax_probs() call.
+/// Returns min(1, med_nn / min_d): 1.0 when on-distribution, decaying toward 0 for OOD.
+pub fn take_ood_weight() -> f32 {
+    LAST_OOD_WEIGHT.with(|cell| {
+        let w = cell.get();
+        cell.set(1.0);
+        w
+    })
+}
+
 
 
 fn stash_obs_stats(min_d: f32, dists: &[(u32, f32)], sigma_sq: f32, med_nn: f32, softmax_probs: &[(u32, f32)]) {
@@ -91,10 +106,12 @@ fn softmax_unsorted(dists: &[(u32, f32)], sigma_sq: f32, med_nn: f32) -> (Vec<(u
     } else {
         let p = 1.0 / dists.len() as f32;
         let uniform: Vec<(u32, f32)> = dists.iter().map(|(id, _)| (*id, p)).collect();
-        // For degenerate sigma, min_d is 0 → stash with min_d=0
+        // For degenerate sigma, OOD weight is 1.0 and min_d is 0 → stash with min_d=0
         // to match previous early-return behaviour (no min_d calc originally).
         // Compute min_d for stash consistency anyway.
         let min_d = dists.iter().map(|(_, d)| *d).fold(f32::INFINITY, f32::min);
+        let ood_w = 1.0;
+        LAST_OOD_WEIGHT.with(|cell| cell.set(ood_w));
         stash_obs_stats(min_d, dists, sigma_sq, med_nn, &uniform);
         return (uniform, true);
     };
@@ -108,6 +125,13 @@ fn softmax_unsorted(dists: &[(u32, f32)], sigma_sq: f32, med_nn: f32) -> (Vec<(u
     } else {
         (dists.iter().zip(raw.iter()).map(|((id, _), &r)| (*id, r / sum)).collect::<Vec<(u32, f32)>>(), false)
     };
+    // Always stash OOD confidence weight (not gated by UNPRINT_OBS_STATS)
+    let ood_w = if min_d > 1e-30 && med_nn > 1e-30 {
+        (med_nn / min_d).min(1.0)
+    } else {
+        1.0
+    };
+    LAST_OOD_WEIGHT.with(|cell| cell.set(ood_w));
     stash_obs_stats(min_d, dists, sigma, med_nn, &softmax);
     (softmax, is_uniform)
 }
@@ -1907,6 +1931,42 @@ impl MahalanobisClassifier {
                 (fid, mean)
             }).collect();
 
+            // ── New per-char forward cache: means/{code:08x}.bin ──────────
+            // Populate means cache for lazy Unicode expansion. Format:
+            //   b"MEAN" | version | char_code | feat_dim | n_entries
+            //   per entry: font_key_len | font_key | file_hash | count | mean[feat_dim]
+            // Atomic write via tmp+rename. file_hash = mtime+size FNV (same as geo_cache).
+            if seq.len() == 1 {
+                let code = seq[0] as u32;
+                let mut mean_entries: Vec<crate::per_char_cache::MeanEntry> = Vec::new();
+                mean_entries.reserve(class_means.len() * 2);
+                for (&glyph_id, mean_f64) in &class_means {
+                    let count = font_indices.get(&glyph_id).map(|v| v.len() as u32).unwrap_or(1);
+                    // glyph_id is group index into glyph_map for this seq
+                    let font_keys = ctx.glyph_map.fonts_for_glyph(seq, glyph_id as usize);
+                    // mean as f32 — share Arc to avoid per-font Vec clone bloat (was Vec clone 200x per group).
+                    let mean_arc: std::sync::Arc<[f32]> = mean_f64.iter().map(|&v| v as f32).collect::<Vec<_>>().into();
+                    for fk in font_keys {
+                        if let Some(&font_idx) = ctx.font_id_map.get(fk) {
+                            if let Some(fe) = ctx.catalog.get(font_idx as usize) {
+                                let fhash = crate::per_char_cache::file_meta_hash(&fe.path);
+                                mean_entries.push(crate::per_char_cache::MeanEntry{
+                                    font_key: fk.clone(),
+                                    file_hash: fhash,
+                                    count,
+                                    mean: mean_arc.clone(),
+                                });
+                            }
+                        }
+                    }
+                }
+                if !mean_entries.is_empty() {
+                    if let Err(e) = crate::per_char_cache::write_means_atomic(code, FEAT_LEN, &mean_entries) {
+                        eprintln!("Warning: failed to write means cache for U+{:04X}: {e}", code);
+                    }
+                }
+            }
+
             // Within-class scatter Sw
             let mut sw = vec![0.0f64; FEAT_LEN * FEAT_LEN];
             for (&fid, indices) in &font_indices {
@@ -2244,16 +2304,6 @@ impl LdaClassifier {
             }
             if font_indices.len() < ctx.min_fonts.max(2) { skipped += 1; continue; }
 
-            // Deterministic class order: std HashMap iteration is
-            // randomized per instance, so iterating font_indices /
-            // class_means directly makes the fit — and the weights file —
-            // differ between runs on identical inputs (float accumulation
-            // order, Jacobi eigenvector signs, RNG consumption order).
-            // Sort the glyph ids once and iterate that everywhere order
-            // matters, so training is reproducible.
-            let mut sorted_fids: Vec<u32> = font_indices.keys().copied().collect();
-            sorted_fids.sort_unstable();
-
             let n = samples.len();
 
             // Class means and global mean
@@ -2273,10 +2323,39 @@ impl LdaClassifier {
                 (fid, mean)
             }).collect();
 
+            // ── New per-char forward cache: means/{code:08x}.bin ──────────
+            if seq.len() == 1 {
+                let code = seq[0] as u32;
+                let mut mean_entries: Vec<crate::per_char_cache::MeanEntry> = Vec::new();
+                mean_entries.reserve(class_means.len() * 2);
+                for (&glyph_id, mean_f64) in &class_means {
+                    let count = font_indices.get(&glyph_id).map(|v| v.len() as u32).unwrap_or(1);
+                    let font_keys = ctx.glyph_map.fonts_for_glyph(seq, glyph_id as usize);
+                    let mean_arc: std::sync::Arc<[f32]> = mean_f64.iter().map(|&v| v as f32).collect::<Vec<_>>().into();
+                    for fk in font_keys {
+                        if let Some(&font_idx) = ctx.font_id_map.get(fk) {
+                            if let Some(fe) = ctx.catalog.get(font_idx as usize) {
+                                let fhash = crate::per_char_cache::file_meta_hash(&fe.path);
+                                mean_entries.push(crate::per_char_cache::MeanEntry{
+                                    font_key: fk.clone(),
+                                    file_hash: fhash,
+                                    count,
+                                    mean: mean_arc.clone(),
+                                });
+                            }
+                        }
+                    }
+                }
+                if !mean_entries.is_empty() {
+                    if let Err(e) = crate::per_char_cache::write_means_atomic(code, FEAT_LEN, &mean_entries) {
+                        eprintln!("Warning: failed to write means cache for U+{:04X}: {e}", code);
+                    }
+                }
+            }
+
             // Within-class scatter Sw
             let mut sw = vec![0.0f64; FEAT_LEN * FEAT_LEN];
-            for &fid in &sorted_fids {
-                let indices = &font_indices[&fid];
+            for (&fid, indices) in &font_indices {
                 let cm = &class_means[&fid];
                 for &i in indices {
                     for a in 0..FEAT_LEN {
@@ -2325,8 +2404,7 @@ impl LdaClassifier {
             }
 
             // Whiten class means
-            let mut centroid_fids: Vec<u32> = class_means.keys().copied().collect();
-            centroid_fids.sort_unstable();
+            let centroid_fids: Vec<u32> = class_means.keys().copied().collect();
             let whitened_means: Vec<Vec<f64>> = centroid_fids.iter().map(|fid| {
                 let cm = &class_means[fid];
                 let mut centered = vec![0.0f64; FEAT_LEN];
@@ -2380,8 +2458,7 @@ impl LdaClassifier {
             let target_dist = 0.03f64;
             let mut within_dists: Vec<f64> = Vec::new();
             let mut rng_cal = SmallRng::seed_from_u64(si as u64 + 9999);
-            for &fid in &sorted_fids {
-                let indices = &font_indices[&fid];
+            for (&_fid, indices) in &font_indices {
                 if indices.len() < 2 { continue; }
                 let npairs = 5.min(indices.len() * (indices.len() - 1) / 2);
                 for _ in 0..npairs {
@@ -2520,10 +2597,7 @@ impl LdaClassifier {
         let mut model = NgramModel::new(ctx.catalog_hash);
         for (seq, actual_dim, proj, sigma, class_means, d95) in &lda_chars {
             let mut centroids: Vec<(u32, Vec<f32>)> = Vec::with_capacity(class_means.len());
-            let mut write_fids: Vec<u32> = class_means.keys().copied().collect();
-            write_fids.sort_unstable();
-            for &fid in &write_fids {
-                let mean = &class_means[&fid];
+            for (&fid, mean) in class_means {
                 let mut embedded = vec![0.0f32; *actual_dim];
                 for d in 0..*actual_dim {
                     for j in 0..FEAT_LEN {
@@ -3226,18 +3300,18 @@ fn read_catalog_hash() -> Option<u64> {
     Some(u64::from_le_bytes(data[8..16].try_into().unwrap()))
 }
 
-/// Check if any training feature manifest was extracted at a different ink
-/// threshold than the current build. The manifest header carries the ink
-/// threshold its features were extracted at; a threshold change genuinely
-/// invalidates the features, so the weights must be retrained.
-/// Note: mtime is deliberately NOT compared against font_scan.bin. Glyph-id
-/// stability comes from the glyph map's append-only construction, and font
-/// catalog identity is already enforced by the catalog_hash content check in
-/// load_or_train. A rescan with an unchanged font set must not retrain.
+/// Check if any training feature manifest is older than font_scan.bin.
+/// If so, any classifier weights derived from those features are suspect
+/// (glyph IDs may correspond to a stale catalog ordering).
 fn training_features_stale() -> bool {
     if !crate::cache::is_default_cache_dir() {
         return false;
     }
+    let scan_path = crate::font_scan::scan_cache_path();
+    let scan_mtime = match std::fs::metadata(&scan_path).and_then(|m| m.modified()) {
+        Ok(t) => t,
+        Err(_) => return false, // no font_scan cache → nothing to compare
+    };
     let feat_dir = crate::cache::paths::training_dir();
     let entries = match std::fs::read_dir(&feat_dir) {
         Ok(e) => e,
@@ -3261,6 +3335,13 @@ fn training_features_stale() -> bool {
             }
         } else {
             return true;
+        }
+        if let Ok(meta) = entry.metadata() {
+            if let Ok(mtime) = meta.modified() {
+                if mtime < scan_mtime {
+                    return true;
+                }
+            }
         }
     }
     false
@@ -3330,7 +3411,7 @@ where
                                 default_path.display());
                             // fall through to auto-train below
                         } else if training_features_stale() {
-                            eprintln!("{name} weights at {} stale (training features extracted at a different ink threshold), retraining...",
+                            eprintln!("{name} weights at {} suspect (training features older than font_scan cache), retraining...",
                                 default_path.display());
                             // fall through to auto-train below
                         } else if weights_older_than_features(default_path) {
@@ -3372,22 +3453,16 @@ where
 }
 
 fn train_lda(font_dir: &[std::path::PathBuf], render_params: &crate::char_render::RenderParams, output: &std::path::Path) {
-    // GPOS pair kern (Finding 5): this retraining fallback has only a font
-    // directory, so it loads the geo cache for the training catalog itself
-    // and passes it to run_train. No render path falls back to legacy kern.
-    let geo_cache = crate::train::load_geo_cache_for_training(font_dir, false);
     crate::train::run_train(crate::train::TrainArgs {
         output: output.to_path_buf(),
         font_dir: font_dir.to_vec(),
         render_params: render_params.clone(),
         lda: true,
         ..crate::train::TrainArgs::default()
-    }, &geo_cache);
+    });
 }
 
 fn train_fisher(font_dir: &[std::path::PathBuf], render_params: &crate::char_render::RenderParams, output: &std::path::Path) {
-    // GPOS pair kern (Finding 5): see train_lda.
-    let geo_cache = crate::train::load_geo_cache_for_training(font_dir, false);
     crate::train::run_train(crate::train::TrainArgs {
         output: output.to_path_buf(),
         font_dir: font_dir.to_vec(),
@@ -3395,12 +3470,10 @@ fn train_fisher(font_dir: &[std::path::PathBuf], render_params: &crate::char_ren
         fisher: true,
         lda: false,
         ..crate::train::TrainArgs::default()
-    }, &geo_cache);
+    });
 }
 
 fn train_mahalanobis(font_dir: &[std::path::PathBuf], render_params: &crate::char_render::RenderParams, output: &std::path::Path) {
-    // GPOS pair kern (Finding 5): see train_lda.
-    let geo_cache = crate::train::load_geo_cache_for_training(font_dir, false);
     crate::train::run_train(crate::train::TrainArgs {
         output: output.to_path_buf(),
         font_dir: font_dir.to_vec(),
@@ -3408,24 +3481,20 @@ fn train_mahalanobis(font_dir: &[std::path::PathBuf], render_params: &crate::cha
         mahalanobis: true,
         lda: false,
         ..crate::train::TrainArgs::default()
-    }, &geo_cache);
+    });
 }
 
 fn train_triplet(font_dir: &[std::path::PathBuf], render_params: &crate::char_render::RenderParams, output: &std::path::Path) {
-    // GPOS pair kern (Finding 5): see train_lda.
-    let geo_cache = crate::train::load_geo_cache_for_training(font_dir, false);
     crate::train::run_train(crate::train::TrainArgs {
         output: output.to_path_buf(),
         font_dir: font_dir.to_vec(),
         render_params: render_params.clone(),
         lda: false,
         ..crate::train::TrainArgs::default()
-    }, &geo_cache);
+    });
 }
 
 fn train_mlp(font_dir: &[std::path::PathBuf], render_params: &crate::char_render::RenderParams, output: &std::path::Path) {
-    // GPOS pair kern (Finding 5): see train_lda.
-    let geo_cache = crate::train::load_geo_cache_for_training(font_dir, false);
     crate::train::run_train(crate::train::TrainArgs {
         output: output.to_path_buf(),
         font_dir: font_dir.to_vec(),
@@ -3433,7 +3502,7 @@ fn train_mlp(font_dir: &[std::path::PathBuf], render_params: &crate::char_render
         mlp: true,
         lda: false,
         ..crate::train::TrainArgs::default()
-    }, &geo_cache);
+    });
 }
 
 /// Build a classifier by name.
@@ -3495,15 +3564,13 @@ pub fn build_classifier(
                     Err(e) => {
                         eprintln!("Glyph map stale or missing ({e}), retraining...");
                         let lda_path = default_lda_weights_path();
-                        // GPOS pair kern (Finding 5): see train_lda.
-                        let geo_cache = crate::train::load_geo_cache_for_training(font_dirs, false);
                         crate::train::run_train(crate::train::TrainArgs {
                             output: lda_path,
                             font_dir: font_dirs.to_vec(),
                             render_params: render_params.clone(),
                             lda: true,
                             ..crate::train::TrainArgs::default()
-                        }, &geo_cache);
+                        });
                         crate::glyph_map::NgramGlyphMap::load(&gmap_path)
                             .unwrap_or_else(|e2| {
                                 eprintln!("Retraining did not produce a valid glyph map ({e2})");
