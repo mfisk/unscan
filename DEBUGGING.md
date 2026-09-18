@@ -792,3 +792,39 @@ failures.
 uncropped page image to confirm which font the line is rendered in. If CI says
 SourceSans3 and the line text says "Source Code Pro, is beloved by
 programmers" — maybe CI is right.
+
+## Ligature Debugging
+
+When a line containing "ff", "fi", "fl", "ffi", or "ffl" fails ZNCC, the
+likely cause is a ligature rendering mismatch. The scan may contain the
+ligature glyph (joined "ff") while unprint's render uses two separate glyphs,
+or vice versa.
+
+**Quick diagnosis:**
+
+1. Identify the failing line in the report (e.g., `p1:L6 "Mayr-Duffner."`).
+   The text contains "ff" in "Duffner".
+
+2. Compare `ssim_scan.png` vs `ssim_render.png` in the line's audit directory
+   (e.g., `p1_L006_Mayr_Duffner_/`). If the scan shows a joined "ff" ligature
+   but the render shows two separate "f" glyphs, the render did not apply
+   the ligature.
+
+3. Check the font's ligature support:
+   ```bash
+   python3 -c "
+   from fontTools.ttLib import TTFont
+   f = TTFont('path/to/font.ttf')
+   print('ff ligature (U+FB00):', 0xFB00 in f.getBestCmap())
+   "
+   ```
+
+4. The root cause is typically in `src/geometry_classifier.rs:451`:
+   `allow_liga` is set based on `is_ligature_char()`, which checks for
+   Unicode ligature *characters* (U+FB00), not for "ff" *sequences*.
+   A word with two 'f' chars gets `allow_liga=false`, so HarfBuzz does not
+   substitute the ligature.
+
+**Do not fix by disabling ligatures in the source PDF.** The ground truth
+is correct — the fix belongs in unprint's rendering (both verification
+render in `src/verify.rs` and PDF output in `src/pdf_out.rs`).

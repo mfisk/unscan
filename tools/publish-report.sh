@@ -7,7 +7,7 @@ set -euo pipefail
 # - bracket chars [](),+ in font_ref names break sandbox URL serving → sanitize to _
 # - Space (Hatch Spaces / static hosting) enforces 500-file limit per publish
 #   — font_refs alone is ~20k files (20895 in 2026-08-08 inkfix), pdirs ~525, images ~1.3k
-#   → Space cannot host BAP reports directly. Use workspace/your_files (sandbox://)
+#   → Space cannot host BAP reports directly. Use workspace/unprint (sandbox://)
 #   which has no such limit. If you must use Space, tar or prune font_refs.
 #   p2:L84 is the tightest case: 1px AA fringe 212/230 must count as ink (threshold 255)
 #   or ZNCC sees blue-left/red-right shift. See crates/unprint-geometry/src/params.rs:10.
@@ -17,9 +17,9 @@ set -euo pipefail
 SRC="${1:-test-docs/audit}"
 PREFIX="${2:-report}"
 TS="$(date +%Y%m%d-%H%M%S)"
-OUTBASE="${HOME}/workspace/your_files"
+OUTBASE="${HOME}/workspace/unprint"
 # fallback if HOME not set
-if [ ! -d "$OUTBASE" ]; then OUTBASE="/home/hatch/workspace/your_files"; fi
+if [ ! -d "$OUTBASE" ]; then OUTBASE="/home/hatch/workspace/unprint"; fi
 OUTDIR="${OUTBASE}/${PREFIX}-${TS}"
 mkdir -p "$OUTDIR"
 

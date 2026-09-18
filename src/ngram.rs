@@ -57,9 +57,9 @@ pub fn build_ngram_glyph_map(
                 return Vec::new();
             }
         };
-        let font = match unprint_fonts::ab_glyph::FontRef::try_from_slice(&font_data) {
-            Ok(f) => f,
-            Err(_) => {
+        let font = match fe.font_ref_with_variations(&font_data) {
+            Some(f) => f,
+            None => {
                 progress.fetch_add(1, Ordering::Relaxed);
                 return Vec::new();
             }
@@ -193,9 +193,9 @@ pub fn generate_ngram_training_data(
                     return Vec::new();
                 }
             };
-            let font = match unprint_fonts::ab_glyph::FontRef::try_from_slice(&font_data) {
-                Ok(f) => f,
-                Err(_) => {
+            let font = match fe.font_ref_with_variations(&font_data) {
+                Some(f) => f,
+                None => {
                     progress.fetch_add(1, Ordering::Relaxed);
                     return Vec::new();
                 }
