@@ -3300,18 +3300,18 @@ fn read_catalog_hash() -> Option<u64> {
     Some(u64::from_le_bytes(data[8..16].try_into().unwrap()))
 }
 
-/// Check if any training feature manifest is older than font_scan.bin.
-/// If so, any classifier weights derived from those features are suspect
-/// (glyph IDs may correspond to a stale catalog ordering).
+/// Check if any training feature manifest was extracted at a different ink
+/// threshold than the current build. The manifest header carries the ink
+/// threshold its features were extracted at; a threshold change genuinely
+/// invalidates the features, so the weights must be retrained.
+/// Note: mtime is deliberately NOT compared against font_scan.bin. Glyph-id
+/// stability comes from the glyph map's append-only construction, and font
+/// catalog identity is already enforced by the catalog_hash content check in
+/// load_or_train. A rescan with an unchanged font set must not retrain.
 fn training_features_stale() -> bool {
     if !crate::cache::is_default_cache_dir() {
         return false;
     }
-    let scan_path = crate::font_scan::scan_cache_path();
-    let scan_mtime = match std::fs::metadata(&scan_path).and_then(|m| m.modified()) {
-        Ok(t) => t,
-        Err(_) => return false, // no font_scan cache → nothing to compare
-    };
     let feat_dir = crate::cache::paths::training_dir();
     let entries = match std::fs::read_dir(&feat_dir) {
         Ok(e) => e,
@@ -3335,13 +3335,6 @@ fn training_features_stale() -> bool {
             }
         } else {
             return true;
-        }
-        if let Ok(meta) = entry.metadata() {
-            if let Ok(mtime) = meta.modified() {
-                if mtime < scan_mtime {
-                    return true;
-                }
-            }
         }
     }
     false
@@ -3411,7 +3404,7 @@ where
                                 default_path.display());
                             // fall through to auto-train below
                         } else if training_features_stale() {
-                            eprintln!("{name} weights at {} suspect (training features older than font_scan cache), retraining...",
+                            eprintln!("{name} weights at {} stale (training features extracted at a different ink threshold), retraining...",
                                 default_path.display());
                             // fall through to auto-train below
                         } else if weights_older_than_features(default_path) {

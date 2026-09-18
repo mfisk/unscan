@@ -150,6 +150,9 @@ pub fn load_cached_ngram(
 ///
 /// 1. Check glyph_map for a known hash → try image cache → return on hit.
 /// 2. On miss: load font from fe.path, render, update glyph_map and image cache.
+///
+/// The caller owns glyph-map publication; this function never writes the
+/// process-wide glyph-map cache implicitly.
 pub fn render_ngram(
     fe: &crate::font_scan::FontEntry,
     seq: &[char],
@@ -167,7 +170,8 @@ pub fn render_ngram(
 
     // Cache miss: load font, render, update caches
     let font_data = std::fs::read(&fe.path).ok()?;
-    let font = unprint_fonts::ab_glyph::FontRef::try_from_slice(&font_data).ok()?;
+    let mut font = unprint_fonts::ab_glyph::FontRef::try_from_slice(&font_data).ok()?;
+    fe.apply_variations(&mut font);
     let gid_overrides: Vec<Option<GlyphId>> = seq.iter().map(|c| {
         fe.glyph_overrides.as_deref()
             .and_then(|ovs| ovs.iter().find(|(ch, _)| *ch == *c).map(|(_, g)| GlyphId(*g)))

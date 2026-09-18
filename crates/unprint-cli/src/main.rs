@@ -907,7 +907,9 @@ fn run(args: &cli::Args, classifier: &mut dyn classifier::Classifier) -> Result<
                             features::contrast_normalize_char(raw)
                         };
                         let verify_words = lm.corrected_words.as_deref().unwrap_or(&line.words);
-                        let allow_liga = lm.seg_winner.as_deref() == Some("ligature");
+                        // Honor the winning font's ligature determination via the
+                        // durable segmentation signal carried in LineMatch.
+                        let allow_liga = lm.seg_used_ligatures;
                         let vr = verify::verify_text_region(
                             &norm_crop,
                             fd.as_slice(),
