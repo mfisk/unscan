@@ -67,6 +67,11 @@ pub struct LineMatch {
     pub font_scores_lig: Vec<(String, Option<f32>)>,
     pub observations_lig: Vec<font_match::ObservationDetail>,
     pub seg_winner: Option<String>,
+    /// Whether the winning segmentation used ligature-collapsed chars
+    /// (U+FB00–U+FB04). Derived from the winning WordSeg chars at match time.
+    /// This is the durable ligature signal: unlike ObservationDetail.ch, the
+    /// segmentation chars are never rewritten by OCR correction.
+    pub seg_used_ligatures: bool,
     pub diag_seg_dir: Option<PathBuf>,
     /// Per-observation ranks/probs for the winner path.
     pub obs_rank_probs: ObsRankProbs,
@@ -276,6 +281,9 @@ pub fn match_lines(
                     font_scores_lig: Vec::new(),
                     observations_lig: Vec::new(),
                     seg_winner: None,
+                    // Fast path performs no segmentation; re-verification is
+                    // skipped for these lines (fast_path_score is Some).
+                    seg_used_ligatures: false,
                     diag_seg_dir: None,
                     obs_rank_probs: ObsRankProbs::default(),
                     alt_obs_rank_probs: ObsRankProbs::default(),
@@ -1059,7 +1067,13 @@ pub fn match_lines(
             (mp, gt_mp)
         };
 
-        LineMatch { font_result, text_color, font_scores, observations, font_scores_lig, observations_lig, seg_winner, diag_seg_dir, obs_rank_probs, alt_obs_rank_probs, tie_candidates: tie_candidates_audit, corrected_words, fast_path: false, fast_path_score: None, midpoint_em_px, gt_midpoint_em_px, word_seg_summaries, gt_word_seg_summaries, ocr_corrections: ocr_correction_audit }
+        // Durable ligature signal: the winning segmentation's chars carry the
+        // collapsed ligature codepoints selected during scoring.
+        let seg_used_ligatures = winning_segs.iter()
+            .flat_map(|ws| ws.chars.iter())
+            .any(|c| crate::font_scan::is_ligature_char(*c));
+
+        LineMatch { font_result, text_color, font_scores, observations, font_scores_lig, observations_lig, seg_winner, seg_used_ligatures, diag_seg_dir, obs_rank_probs, alt_obs_rank_probs, tie_candidates: tie_candidates_audit, corrected_words, fast_path: false, fast_path_score: None, midpoint_em_px, gt_midpoint_em_px, word_seg_summaries, gt_word_seg_summaries, ocr_corrections: ocr_correction_audit }
     }).collect();
 
     let fp_hits = fast_path_hits.load(Ordering::Relaxed);

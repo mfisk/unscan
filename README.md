@@ -63,7 +63,7 @@ cargo build --release
 
 | Tool | Install | Purpose |
 |------|---------|---------|
-| `tesseract` | `apt install tesseract-ocr` | OCR engine |
+| `tesseract` | `apt install tesseract-ocr tesseract-ocr-eng tesseract-ocr-osd` then replace `eng.traineddata` with `tessdata_best` (15M) from https://github.com/tesseract-ocr/tessdata_best | OCR engine (eng best + osd) |
 | `pdftoppm` | `apt install poppler-utils` | PDF → raster |
 
 ### Install all recommended fonts

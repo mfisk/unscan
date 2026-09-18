@@ -738,13 +738,9 @@ pub fn run_train(mut args: TrainArgs) {
         .map(|(i, fe)| (fe.font_key(), i as u32))
         .collect();
 
-    // Compute catalog hash for cache validation (same algorithm as FontRegistry).
-    let catalog_hash = {
-        use std::hash::{Hash, Hasher};
-        let mut hasher = rustc_hash::FxHasher::default();
-        for fe in &catalog { fe.font_key().hash(&mut hasher); }
-        hasher.finish()
-    };
+    // Compute catalog hash with the same algorithm as FontRegistry so the
+    // weights stamped here validate against runtime's catalog.bin hash.
+    let catalog_hash = font_scan::FontRegistry::compute_hash(&catalog);
 
     // Build family groups: font_id → family_id, family_id → Vec<font_id>
     let mut family_name_to_id: HashMap<&str, u32> = HashMap::new();
@@ -869,9 +865,9 @@ pub fn run_train(mut args: TrainArgs) {
                         return;
                     }
                 };
-                let font = match unprint_fonts::ab_glyph::FontRef::try_from_slice(&font_data) {
-                    Ok(f) => f,
-                    Err(_) => {
+                let font = match fe.font_ref_with_variations(&font_data) {
+                    Some(f) => f,
+                    None => {
                         prewarm_reused.fetch_add(reused, Ordering::Relaxed);
                         let done = prewarm_done.fetch_add(1, Ordering::Relaxed) + 1;
                         if done % 500 == 0 || done == prewarm_total {
@@ -1343,6 +1339,12 @@ pub fn run_train(mut args: TrainArgs) {
 
             for info in &incr_combos {
                 let aa_name = all_aa[info.aa_idx].name();
+                // Actual per-seq sample counts for this combo. A glyph render or
+                // feature computation can fail, so the file may hold fewer than
+                // the expected (cur_cnt - old_cnt) new samples. The manifest and
+                // cached_combos must record what was actually written, otherwise
+                // the read phase over-reads and hits end of file.
+                let mut actual_counts = info.old_counts.clone();
                 // For this combo, for each seq where cur > old, render only gids >= old
                 for (si, seq) in sequences.iter().enumerate() {
                     let old_cnt = info.old_counts[si];
@@ -1370,7 +1372,7 @@ pub fn run_train(mut args: TrainArgs) {
 
                         // Render this new glyph for this combo
                         let font_data = match std::fs::read(&fe.path) { Ok(d)=>d, Err(_)=>continue };
-                        let font = match unprint_fonts::ab_glyph::FontRef::try_from_slice(&font_data) { Ok(f)=>f, Err(_)=>continue };
+                        let Some(font) = fe.font_ref_with_variations(&font_data) else { continue };
                         let overrides = fe.glyph_overrides.as_deref();
                         let gid_overrides: Vec<Option<unprint_fonts::ab_glyph::GlyphId>> = seq.iter().map(|c| {
                             overrides.and_then(|ovs| ovs.iter().find(|(ch, _)| *ch == *c).map(|(_, g)| unprint_fonts::ab_glyph::GlyphId(*g)))
@@ -1394,19 +1396,20 @@ pub fn run_train(mut args: TrainArgs) {
                         incr_total_new += 1;
                     }
                     eprintln!("  h{} {} seq {} ({:?}): +{} new glyphs ({}→{})", info.ht, aa_name, si, seq, new_samples, old_cnt, cur_cnt);
+                    actual_counts[si] = old_cnt + new_samples;
                 }
-                // Update manifest for this combo to new counts
+                // Update manifest for this combo to the ACTUAL new counts
                 let mpath = manifest_combo_path(&feat_dir, info.ht, aa_name);
                 let tmp_mpath = crate::atomic_file::tmp_for(&mpath);
                 let mut manifest = format!("th={} seqs={}", crate::INK_THRESH, n_seqs);
                 for ci in 0..n_seqs {
                     manifest.push('\n');
-                    manifest.push_str(&current_counts_by_seq[ci].to_string());
+                    manifest.push_str(&actual_counts[ci].to_string());
                 }
                 std::fs::write(&tmp_mpath, &manifest).expect("write incr manifest");
                 std::fs::rename(&tmp_mpath, &mpath).expect("atomic rename incr manifest");
-                // Push to cached_combos with updated counts
-                cached_combos.push((info.ht, info.aa_idx, current_counts_by_seq.clone()));
+                // Push to cached_combos with actual counts
+                cached_combos.push((info.ht, info.aa_idx, actual_counts));
             }
             eprintln!("Incremental append done: +{} samples in {:.1}s", incr_total_new, incr_start.elapsed().as_secs_f64());
         }
