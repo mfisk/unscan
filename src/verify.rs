@@ -344,6 +344,11 @@ fn render_via_freetype(
         }
         let lib = borrow.as_ref()?;
         let ft_face = lib.new_memory_face2(font_data.to_vec(), 0).ok()?;
+        // render_em is in pixels. Use 72 DPI so points==pixels (pixels-as-points).
+        // This is intentional, not a hack: we need pixel-exact rasterization
+        // matching the scan's pixel grid. Using 300 DPI with pt size causes
+        // FreeType to use a different internal scale, introducing subpixel
+        // differences that regress ZNCC (measured: -9 hits, -0.0082 ZNCC).
         let size_26_6 = (render_em as f64 * 64.0) as isize;
         ft_face.set_char_size(size_26_6, size_26_6, 72, 72).ok()?;
 
@@ -393,8 +398,8 @@ fn render_via_freetype(
             let x_offset = shaped.x_offsets[i] as f64 * px_per_unit;
             let y_offset = shaped.y_offsets[i] as f64 * px_per_unit;
 
-            // Load glyph in FreeType
-            ft_face.load_glyph(glyph_id, unprint_fonts::freetype::face::LoadFlag::RENDER | unprint_fonts::freetype::face::LoadFlag::NO_HINTING).ok()?;
+            // Load glyph in FreeType (hinting enabled to match PDF rendering)
+            ft_face.load_glyph(glyph_id, unprint_fonts::freetype::face::LoadFlag::RENDER).ok()?;
             let glyph = ft_face.glyph();
             let bitmap = glyph.bitmap();
             let bmp_w = bitmap.width() as usize;

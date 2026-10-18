@@ -62,3 +62,6 @@ ls /tmp/audit-out/<line_dir>/crops/
 - Audit per-char distances: precomputed crop features via `precompute_crop_features()` + `per_char_distances_precomputed()` — avoids redundant feature extraction across multiple fonts
 - Accuracy: 454/480 (94.6%) on font-timeline-specimen.pdf (t60 AA @ 300 DPI)
 - Index version: 8, FEAT_LEN: 99, NORM_H: 48
+
+## Context Assurance (Mike Oct 18, 2026)
+- **Include 🖨️ in every response** (alongside 📋) to assure Mike that this AGENTS.md is in context. If 🖨️ is missing, the unscan project instructions were lost.
