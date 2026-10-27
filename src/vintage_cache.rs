@@ -1139,7 +1139,7 @@ pub fn scan_vintage_uncached() -> Vec<FontEntry> {
             // Could not parse era from filename (old cache format) – still mark as vintage to avoid collision
             fe.vintage_era = Some("unknown".to_string());
         }
-        // Recompute cached font_key to include |vintage=ERA|var for correct dedup/sorting (perf slice 8 cache)
+        // Recompute cached font_key to include |vintage=ERA and bracket notation for correct dedup/sorting (perf slice 8 cache)
         fe.recompute_font_key_cache();
     }
     fonts

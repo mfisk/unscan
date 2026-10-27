@@ -9,7 +9,7 @@ use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 
 use unprint_fonts::ab_glyph::FontRef;
-use image::{GrayImage, RgbImage};
+use image::GrayImage;
 
 use unprint::audit::{AuditEntry, Decision};
 
@@ -106,39 +106,6 @@ fn img_to_b64_uri(img: &GrayImage) -> String {
                 img.width(),
                 img.height(),
                 image::ExtendedColorType::L8,
-            )
-            .map_err(|e| e.to_string())?;
-            std::fs::write(&dest, &buf).map_err(|e| e.to_string())?;
-            Ok(())
-        })() {
-            let prefix = writer.dir.file_name().and_then(|n| n.to_str()).unwrap_or("images");
-            format!("{prefix}/{name}")
-        } else {
-            String::new()
-        }
-    })
-}
-
-fn rgb_img_to_b64_uri(img: &RgbImage) -> String {
-    IMAGE_WRITER.with(|wcell| {
-        let binding = wcell.borrow();
-        let writer = match binding.as_ref() {
-            Some(ww) => ww,
-            None => return String::new(),
-        };
-        let idx = writer.counter.get();
-        writer.counter.set(idx + 1);
-        let name = format!("gen-{idx:05}.png");
-        let dest = writer.dir.join(&name);
-        let mut buf = Vec::new();
-        if let Ok(()) = (|| -> Result<(), String> {
-            let encoder = image::codecs::png::PngEncoder::new(&mut buf);
-            image::ImageEncoder::write_image(
-                encoder,
-                img.as_raw(),
-                img.width(),
-                img.height(),
-                image::ExtendedColorType::Rgb8,
             )
             .map_err(|e| e.to_string())?;
             std::fs::write(&dest, &buf).map_err(|e| e.to_string())?;
@@ -1532,18 +1499,25 @@ fn render_correct_font_comparison(
     // Previously GT used winner's midpoint, causing 1.6% width error for p1:L7
     // where GT 400Italic (5230) is wider than winner 300Italic (5148/5118).
     let gt_em = entry.gt_midpoint_em_px.or(entry.midpoint_em_px);
+    // Verify the GT font into a dedicated subdirectory so its ssim_*.png
+    // files sit alongside the picked font's as real audit artifacts instead
+    // of clobbering them (same idiom as the tie-break tie_N/ subdirs).
+    let correct_dir = dd.join("correct");
+    let _ = std::fs::create_dir_all(&correct_dir);
     let vr = unprint::verify::verify_text_region(
         &scan_gray, font_data, &entry.text, &words,
         entry.bbox.x, entry.bbox.y,
         fe.glyph_overrides.as_ref().map(|v| v.as_slice()),
         &fe.variant_tag, fe.variations.as_deref(),
         true,
-        None, None,
+        Some(&correct_dir), None,
         gt_em,
     );
 
-    let render_uri = vr.render_ink.as_ref().map(|r| img_to_b64_uri(r));
-    let diff_uri = vr.diff.as_ref().map(|d| rgb_img_to_b64_uri(d));
+    // Reference the saved files by audit-root-relative path, exactly like the
+    // picked font's ssim_*.png on the other side of the comparison block.
+    let render_uri = file_to_b64_uri(&correct_dir.join("ssim_render.png"));
+    let diff_uri = file_to_b64_uri(&correct_dir.join("ssim_diff.png"));
     let score = if vr.score > 0.0 { Some(vr.score) } else { None };
 
     (render_uri, diff_uri, score)

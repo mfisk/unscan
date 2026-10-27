@@ -1091,6 +1091,30 @@ pub fn run_train(mut args: TrainArgs) {
         .map(|seq| glyph_map.groups.get(seq).map(|gs| gs.len()).unwrap_or(0))
         .collect();
 
+    // Verify manifest counts against actual file sizes. The manifest may have
+    // been written by buggy counting code; the file is the source of truth.
+    // Returns file-derived counts, or None if any file is missing/corrupt.
+    let verify_manifest_counts = |ht: u32, aa_idx: usize, manifest_counts: &[usize]| -> Option<Vec<usize>> {
+        let aa_name = all_aa[aa_idx].name();
+        let mut file_counts = Vec::with_capacity(n_seqs);
+        for (si, seq) in sequences.iter().enumerate() {
+            let fpath = combo_path(&feat_dir, seq, ht, aa_name);
+            let cnt = std::fs::metadata(&fpath)
+                .map(|m| {
+                    let sz = m.len();
+                    if sz < 12 { 0 } else { ((sz - 12) / 256) as usize }
+                })
+                .unwrap_or(0);
+            // If manifest claims more than file holds, manifest is wrong
+            if manifest_counts[si] != cnt {
+                eprintln!("  Manifest mismatch for h{} {} seq {}: manifest={}, file={} — using file count",
+                    ht, aa_name, si, manifest_counts[si], cnt);
+            }
+            file_counts.push(cnt);
+        }
+        Some(file_counts)
+    };
+
     for &ht in &active_heights {
         for (aa_idx, _) in aa_variants.iter().enumerate() {
             if let Some(old_counts) = load_manifest_counts(ht, aa_idx) {
@@ -1098,6 +1122,10 @@ pub fn run_train(mut args: TrainArgs) {
                     full_needed.push((ht, aa_idx));
                     continue;
                 }
+                // Use file-derived counts, not manifest, as the baseline.
+                // The manifest may be overstated by buggy counting code.
+                let old_counts = verify_manifest_counts(ht, aa_idx, &old_counts)
+                    .unwrap_or(old_counts);
                 let mut is_cached = true;
                 let mut needs_incr = false;
                 for (_i, (&cur, &old)) in current_counts_by_seq.iter().zip(old_counts.iter()).enumerate() {
@@ -1339,15 +1367,29 @@ pub fn run_train(mut args: TrainArgs) {
 
             for info in &incr_combos {
                 let aa_name = all_aa[info.aa_idx].name();
-                // Actual per-seq sample counts for this combo. A glyph render or
-                // feature computation can fail, so the file may hold fewer than
-                // the expected (cur_cnt - old_cnt) new samples. The manifest and
+                // Actual per-seq sample counts for this combo. Derive the baseline
+                // from the file size, NOT from the manifest. The manifest may have
+                // been written by buggy counting code (overstated), but the file
+                // is the source of truth: 12-byte header + 256 bytes per record
+                // (4-byte glyph_id + 63 floats). A glyph render or feature
+                // computation can also fail, so the file may hold fewer than the
+                // expected (cur_cnt - old_cnt) new samples. The manifest and
                 // cached_combos must record what was actually written, otherwise
                 // the read phase over-reads and hits end of file.
-                let mut actual_counts = info.old_counts.clone();
+                let mut actual_counts: Vec<usize> = Vec::with_capacity(n_seqs);
+                for (si, seq) in sequences.iter().enumerate() {
+                    let fpath = combo_path(&feat_dir, seq, info.ht, aa_name);
+                    let cnt = std::fs::metadata(&fpath)
+                        .map(|m| {
+                            let sz = m.len();
+                            if sz < 12 { 0 } else { ((sz - 12) / 256) as usize }
+                        })
+                        .unwrap_or(0);
+                    actual_counts.push(cnt);
+                }
                 // For this combo, for each seq where cur > old, render only gids >= old
                 for (si, seq) in sequences.iter().enumerate() {
-                    let old_cnt = info.old_counts[si];
+                    let old_cnt = actual_counts[si];
                     let cur_cnt = current_counts_by_seq[si];
                     if cur_cnt <= old_cnt { continue; }
                     let fpath = combo_path(&feat_dir, seq, info.ht, aa_name);
