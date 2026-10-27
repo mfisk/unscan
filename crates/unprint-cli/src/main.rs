@@ -233,7 +233,7 @@ fn load_fonts(args: &cli::Args, _classifier: &mut dyn classifier::Classifier) ->
                 fe.family_name = format!("{} [{}]", fe.family_name, era.name());
             }
             fe.data = Vec::new(); // drop bytes, will be loaded via FontCache on demand
-            // Recompute cache to include |vintage=ERA|var so font_key is unique and sorted deterministically
+            // Recompute cache to include |vintage=ERA and bracket notation so font_key is unique and sorted deterministically
             fe.recompute_font_key_cache();
             vintage_entries.push(fe);
         }
