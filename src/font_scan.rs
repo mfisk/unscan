@@ -233,19 +233,33 @@ impl FontEntry {
         postscript_name: &str,
         variant_tag: &str,
         vintage_era: Option<&str>,
-        has_var: bool,
+        variations: &Variations,
     ) -> String {
         let mut k = if variant_tag.is_empty() {
             postscript_name.to_owned()
         } else {
             format!("{}|{}", postscript_name, variant_tag)
         };
+        if let Some(vars) = variations {
+            if !vars.is_empty() {
+                k.push('[');
+                for (i, (tag, val)) in vars.iter().enumerate() {
+                    if i > 0 {
+                        k.push(',');
+                    }
+                    let tag_str = std::str::from_utf8(tag).unwrap_or("????");
+                    if val.fract() == 0.0 {
+                        k.push_str(&format!("{}={}", tag_str, *val as i32));
+                    } else {
+                        k.push_str(&format!("{}={}", tag_str, val));
+                    }
+                }
+                k.push(']');
+            }
+        }
         if let Some(era) = vintage_era {
             k.push_str("|vintage=");
             k.push_str(era);
-        }
-        if has_var {
-            k.push_str("|var");
         }
         k
     }
@@ -271,12 +285,11 @@ impl FontEntry {
 
     /// Recompute cache after mutating vintage_era or variant fields (used for vintage generation).
     pub fn recompute_font_key_cache(&mut self) {
-        let has_var = self.variations.is_some();
         self.font_key_cache = Self::compute_font_key_full(
             &self.postscript_name,
             &self.variant_tag,
             self.vintage_era.as_deref(),
-            has_var,
+            &self.variations,
         );
     }
 
@@ -800,7 +813,7 @@ pub fn default_font_dirs(extra: &[PathBuf]) -> Vec<PathBuf> {
 //     typographic_family_len: u32 le + [u8; typographic_family_len]
 
 const FSCN_MAGIC: &[u8; 4] = b"FSCN";
-const FSCN_VERSION: u32 = 13;
+const FSCN_VERSION: u32 = 15;
 
 pub(crate) fn scan_cache_path() -> PathBuf {
     crate::cache::paths::font_scan_bin()
@@ -1128,12 +1141,11 @@ fn read_scan_cache(path: &Path, quiet: bool) -> Option<Vec<FontEntry>> {
             oldstyle_figures,
             variant_tag: variant_tag.clone(),
             font_key_cache: {
-                let has_var = variations.is_some();
                 FontEntry::compute_font_key_full(
                     &postscript_name,
                     &variant_tag,
                     vintage_era.as_deref(),
-                    has_var,
+                    &variations,
                 )
             },
             glyph_overrides,
@@ -1376,7 +1388,7 @@ pub fn scan_fonts(dirs: &[PathBuf], quiet: bool) -> Vec<FontEntry> {
                             &format!("{}|{}", fe.postscript_name, tag),
                             tag,
                             None,
-                            default_variations.is_some(),
+                            &default_variations,
                         ),
                         glyph_overrides: Some(combined),
                         variations: default_variations.clone(),
@@ -1414,7 +1426,7 @@ pub fn scan_fonts(dirs: &[PathBuf], quiet: bool) -> Vec<FontEntry> {
                                 &format!("{}|{}", fe.postscript_name, tag),
                                 &tag,
                                 None,
-                                default_variations.is_some(),
+                                &default_variations,
                             ),
                             glyph_overrides: if combined_lig.is_empty() { None } else { Some(combined_lig) },
                             variations: default_variations.clone(),
@@ -1446,6 +1458,7 @@ pub fn scan_fonts(dirs: &[PathBuf], quiet: bool) -> Vec<FontEntry> {
                 for wi in &weight_instances {
                     let var_ps = make_weight_explicit(&fe.raw_postscript_name, wi.os2_weight);
                     let var_tag = format!("wght{}", wi.os2_weight);
+                    let var_variations = Some(wi.axes.clone());
                     let mut var_fe = FontEntry {
                         path: fe.path.clone(),
                         family_name: format!("{} [{}]", fe.family_name, var_tag),
@@ -1457,17 +1470,17 @@ pub fn scan_fonts(dirs: &[PathBuf], quiet: bool) -> Vec<FontEntry> {
                         data: Vec::new(),
                         oldstyle_figures: fe.oldstyle_figures,
                         variant_tag: var_tag.clone(),
-                        // Include |var so static "SourceSerif4-400Italic" and
-                        // variable "SourceSerif4-400Italic|wght400|var" remain
-                        // distinct after normalization.
+                        // Bracket notation distinguishes static "SourceSerif4-400Italic"
+                        // from variable "SourceSerif4-400Italic|wght400[wght=400,opsz=20]"
+                        // after normalization.
                         font_key_cache: FontEntry::compute_font_key_full(
                             &var_ps,
                             &var_tag,
                             None,
-                            true,
+                            &var_variations,
                         ),
                         glyph_overrides: None,
-                        variations: Some(wi.axes.clone()),
+                        variations: var_variations,
                         typographic_family: fe.typographic_family.clone(),
                         vintage_era: None,
                         opsz_range,
@@ -1480,63 +1493,14 @@ pub fn scan_fonts(dirs: &[PathBuf], quiet: bool) -> Vec<FontEntry> {
                 }
 
                 // If this file is variable, mark the base entry as variable
-                // too (variations Some) so its key becomes "...|var" and does
-                // not collide with the static counterpart after normalization.
+                // too (variations Some) so its key becomes "...[wght=400,opsz=20]"
+                // and does not collide with the static counterpart after normalization.
                 // The base entry must use every axis's declared default. Using
                 // the first non-default weight instance here mislabeled and
                 // rendered 400-weight base fonts at another weight (for example
                 // Source Serif 4 at 200 and Libre Bodoni/Baskerville at 500).
                 fe.assign_default_variations(default_variations);
                 fe.opsz_range = opsz_range;
-
-                // Emit opsz variant entries for variable fonts with an optical
-                // size axis. Each variant gets a distinct key (|opszN) and its
-                // own variations list with the opsz value set. During training,
-                // glyph data is rendered with that opsz, so the classifier
-                // learns to distinguish optical sizes as separate classes.
-                // The base entry (pushed below) uses the default opsz.
-                if let Some((min, default, max)) = opsz_range {
-                    // Representative opsz values: min and max. Skip default
-                    // since the base entry already covers it.
-                    for opsz_val in [min, max] {
-                        // Skip if too close to default (avoid duplicate)
-                        if (opsz_val - default).abs() < 1.0 {
-                            continue;
-                        }
-                        let opsz_int = opsz_val.round() as i32;
-                        let mut var_variations = fe.variations.clone().unwrap_or_default();
-                        // Replace or add opsz
-                        if let Some(pos) = var_variations.iter().position(|(tag, _)| tag == b"opsz") {
-                            var_variations[pos] = (*b"opsz", opsz_val);
-                        } else {
-                            var_variations.push((*b"opsz", opsz_val));
-                        }
-                        let opsz_entry = FontEntry {
-                            path: fe.path.clone(),
-                            family_name: format!("{} [opsz{}]", fe.family_name, opsz_int),
-                            postscript_name: format!("{}|opsz{}", fe.postscript_name, opsz_int),
-                            raw_postscript_name: fe.raw_postscript_name.clone(),
-                            is_bold: fe.is_bold,
-                            is_italic: fe.is_italic,
-                            class: fe.class,
-                            data: Vec::new(),
-                            oldstyle_figures: fe.oldstyle_figures,
-                            variant_tag: fe.variant_tag.clone(),
-                            font_key_cache: FontEntry::compute_font_key_full(
-                                &format!("{}|opsz{}", fe.postscript_name, opsz_int),
-                                &fe.variant_tag,
-                                None,
-                                true,
-                            ),
-                            glyph_overrides: fe.glyph_overrides.clone(),
-                            variations: Some(var_variations),
-                            typographic_family: fe.typographic_family.clone(),
-                            vintage_era: None,
-                            opsz_range,
-                        };
-                        fonts.push(opsz_entry);
-                    }
-                }
 
                 // Emit a |nokern variant for fonts with GPOS kerning data.
                 // The PDF specimen's embedded subsets lack GPOS (stripped during
@@ -1567,7 +1531,7 @@ pub fn scan_fonts(dirs: &[PathBuf], quiet: bool) -> Vec<FontEntry> {
                             &format!("{}|nokern", fe.postscript_name),
                             &nokern_tag,
                             None,
-                            fe.variations.is_some(),
+                            &fe.variations,
                         ),
                         glyph_overrides: fe.glyph_overrides.clone(),
                         variations: fe.variations.clone(),
@@ -1576,9 +1540,51 @@ pub fn scan_fonts(dirs: &[PathBuf], quiet: bool) -> Vec<FontEntry> {
                         opsz_range,
                     };
                     fonts.push(nokern_entry);
+                    // Also emit opsz=10 nokern variant if font has opsz axis
+                    if let Some(opsz10_vars) = make_opsz10_variations(&fe.variations) {
+                        let nokern_opsz10_entry = FontEntry {
+                            path: fe.path.clone(),
+                            family_name: format!("{} [nokern]", fe.family_name),
+                            postscript_name: format!("{}|nokern", fe.postscript_name),
+                            raw_postscript_name: fe.raw_postscript_name.clone(),
+                            is_bold: fe.is_bold,
+                            is_italic: fe.is_italic,
+                            class: fe.class,
+                            data: Vec::new(),
+                            oldstyle_figures: fe.oldstyle_figures,
+                            variant_tag: nokern_tag.clone(),
+                            font_key_cache: FontEntry::compute_font_key_full(
+                                &format!("{}|nokern", fe.postscript_name),
+                                &nokern_tag,
+                                None,
+                                &Some(opsz10_vars.clone()),
+                            ),
+                            glyph_overrides: fe.glyph_overrides.clone(),
+                            variations: Some(opsz10_vars),
+                            typographic_family: fe.typographic_family.clone(),
+                            vintage_era: None,
+                            opsz_range,
+                        };
+                        fonts.push(nokern_opsz10_entry);
+                    }
                 }
 
+                // Emit opsz=10 base variant if font has opsz axis
+                let opsz10_fe = make_opsz10_variations(&fe.variations).map(|opsz10_vars| {
+                    let mut fe10 = fe.clone();
+                    fe10.variations = Some(opsz10_vars.clone());
+                    fe10.font_key_cache = FontEntry::compute_font_key_full(
+                        &fe.postscript_name,
+                        &fe.variant_tag,
+                        None,
+                        &Some(opsz10_vars),
+                    );
+                    fe10
+                });
                 fonts.push(fe);
+                if let Some(fe10) = opsz10_fe {
+                    fonts.push(fe10);
+                }
         }
     }
 
@@ -2002,6 +2008,38 @@ fn detect_default_variations(path: &Path) -> (Variations, Option<(f32, f32, f32)
             .collect(),
     );
     (variations, opsz_range)
+}
+
+/// Create opsz=10 variations from existing variations, if the font has an opsz axis.
+/// Returns None if the font has no opsz axis, or if opsz is already 10.
+/// Otherwise returns variations with opsz set to 10.0, all other axes unchanged.
+fn make_opsz10_variations(variations: &Variations) -> Variations {
+    let vars = variations.as_ref()?;
+    let mut has_opsz = false;
+    let mut already_10 = false;
+    for (tag, val) in vars.iter() {
+        if tag == b"opsz" {
+            has_opsz = true;
+            if (*val - 10.0).abs() < 0.001 {
+                already_10 = true;
+            }
+            break;
+        }
+    }
+    if !has_opsz || already_10 {
+        return None;
+    }
+    let new_vars: Vec<([u8; 4], f32)> = vars
+        .iter()
+        .map(|(tag, val)| {
+            if tag == b"opsz" {
+                (*tag, 10.0)
+            } else {
+                (*tag, *val)
+            }
+        })
+        .collect();
+    Some(new_vars)
 }
 
 /// Detect named weight instances for a variable font.
@@ -2682,6 +2720,12 @@ mod catalog_hash_tests {
     use super::*;
 
     fn entry(variations: Variations, glyph_overrides: Option<Vec<(char, u16)>>) -> FontEntry {
+        let font_key_cache = FontEntry::compute_font_key_full(
+            "Test-400",
+            "",
+            None,
+            &variations,
+        );
         FontEntry {
             path: PathBuf::from("/font.ttf"),
             family_name: "Test".to_string(),
@@ -2693,7 +2737,7 @@ mod catalog_hash_tests {
             data: Vec::new(),
             oldstyle_figures: false,
             variant_tag: String::new(),
-            font_key_cache: "Test-400|var".to_string(),
+            font_key_cache,
             glyph_overrides,
             variations,
             typographic_family: "Test".to_string(),
@@ -2704,7 +2748,7 @@ mod catalog_hash_tests {
 
     #[test]
     fn cache_freshness_base_entry_uses_declared_variation_defaults() {
-        // Start with non-variable fixture (no |var), assign defaults, expect transition to |var
+        // Start with non-variable fixture (no brackets), assign defaults, expect transition to bracket notation
         let mut base = FontEntry {
             path: PathBuf::from("/font.ttf"),
             family_name: "Test".to_string(),
@@ -2730,7 +2774,7 @@ mod catalog_hash_tests {
         base.assign_default_variations(Some(defaults.clone()));
 
         assert_eq!(base.variations, Some(defaults));
-        assert_eq!(base.font_key_ref(), "Test-400|var");
+        assert_eq!(base.font_key_ref(), "Test-400[wght=400,opsz=10]");
     }
 
     #[test]
@@ -2739,7 +2783,7 @@ mod catalog_hash_tests {
         let duplicate = entry(None, None);
         let deduped = dedup_font_entries_by_key(vec![first, duplicate], true);
         assert_eq!(deduped.len(), 1);
-        assert_eq!(deduped[0].font_key_ref(), "Test-400|var");
+        assert_eq!(deduped[0].font_key_ref(), "Test-400");
     }
 
     #[test]
