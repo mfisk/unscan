@@ -22,7 +22,7 @@ use common::{test_doc, ensure_index};
 /// Poppler renders with different hinting than the CI's FreeType backend.
 /// Old metric (primary_hits) had 92% threshold.
 /// Strict metric (hit only) scores 52.4% (264/504).
-const MIN_ACCURACY_POPPLER_AA: f64 = 0.52;
+const MIN_ACCURACY_POPPLER_AA: f64 = 0.72;
 
 #[test]
 fn specimen_font_accuracy_poppler() {
