@@ -1168,10 +1168,12 @@ mod tests {
             data: vec![],
             oldstyle_figures: false,
             variant_tag: String::new(),
+            font_key_cache: "dejavusans-400".to_string(),
             glyph_overrides: None,
             variations: None,
             typographic_family: "DejaVu Sans".to_string(),
             vintage_era: None,
+            opsz_range: None,
         };
         let p1 = vintage_cache_path(&fe, Era::PostScript);
         let p2 = vintage_cache_path(&fe, Era::PostScript);

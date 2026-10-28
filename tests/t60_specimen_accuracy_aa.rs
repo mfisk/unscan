@@ -16,7 +16,7 @@ use common::{test_doc, ensure_index};
 /// Minimum acceptable accuracy (strict hits / compared).
 /// Old metric counted minor_misses as hits (primary_hits); scored 80.6%.
 /// Strict metric counts only exact font matches; scores 52.5% (265/505).
-const MIN_ACCURACY: f64 = 0.52;
+const MIN_ACCURACY: f64 = 0.72;
 
 #[test]
 fn specimen_font_accuracy_aa() {
