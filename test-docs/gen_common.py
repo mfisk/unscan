@@ -106,11 +106,11 @@ def fc_find(family, style="Regular"):
             capture_output=True, text=True,
         )
         for line in r.stdout.strip().split("\n"):
-            if line and line.lower().endswith(".ttf") and line not in candidates:
+            if line and line.lower().endswith((".ttf", ".otf")) and line not in candidates:
                 candidates.append(line)
 
     if not candidates:
-        raise RuntimeError(f"fc_find: no .ttf candidates for '{family}' style='{style}'")
+        raise RuntimeError(f"fc_find: no .ttf/.otf candidates for '{family}' style='{style}'")
 
     exact_static = []
     variable = []
