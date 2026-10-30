@@ -17,7 +17,12 @@ use crate::classifier::{self, ObsStats};
 use crate::segment::{WordSeg, SegSummary, collapse_ligature_chars_for_allowed, segment_characters, char_crop_and_metrics};
 use crate::geometry_classifier::{CharInkBounds, WordGeoMeasurement};
 
-const GEO_WEIGHT: f32 = 1.0;
+static GEO_WEIGHT: std::sync::LazyLock<f32> = std::sync::LazyLock::new(|| {
+    std::env::var("UNPRINT_GEO_WEIGHT")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(1.0)
+});
 const MIDPOINT_PRUNE_BASE: f32 = -2.0; // tighter still - avg logit typical -1 to -1.5, -3 was still loose
 
 #[derive(Debug, Clone)]
@@ -450,7 +455,7 @@ pub fn identify_fonts(
             let thresh = min_ngram_prob / n_glyphs;
             if prob < thresh { continue; }
             let combined_geo = t.geo_h_ll + t.geo_v_ll;
-            let lp = logit * t.weight + GEO_WEIGHT * combined_geo;
+            let lp = logit * t.weight + *GEO_WEIGHT * combined_geo;
             log_probs.push((lp, 1.0));
             ood_probs.push((lp, 1.0));
             obs_for_this.push(ObservationDetail {
