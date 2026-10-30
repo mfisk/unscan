@@ -148,6 +148,10 @@ pub fn measure_char_ink_bounds(
         let mut y_min = h as usize;
         let mut y_max = 0usize;
         let mut has_ink = false;
+        // Subpixel geometry: per-column and per-row max darkness (255 - pixel),
+        // for fractional edge computation. Darkest pixel in the column/row.
+        let mut col_dark = vec![0u8; w as usize];
+        let mut row_dark = vec![0u8; h as usize];
 
         for y in 0..h as usize {
             // Determine per-row left/right limits – handles horizontal moves (multiple seam cols in one row)
@@ -220,6 +224,11 @@ pub fn measure_char_ink_bounds(
                     let base = y * w_us;
                     raw_word[base + x]
                 };
+                // Track max darkness for subpixel edge fractions (all pixels;
+                // white gives 0 and never affects the max).
+                let darkness = 255u8.saturating_sub(pixel);
+                if darkness > col_dark[x] { col_dark[x] = darkness; }
+                if darkness > row_dark[y] { row_dark[y] = darkness; }
                 if pixel < crate::INK_THRESH {
                     has_ink = true;
                     if x < x_min { x_min = x; }
@@ -246,19 +255,32 @@ pub fn measure_char_ink_bounds(
                 frac_right: x1_rect as f64,
             }
         } else {
-            let cx = (x_min + x_max) as f64 / 2.0;
-            let cy = (y_min + y_max) as f64 / 2.0;
+            // Subpixel edges: edge column darkness as fraction of the
+            // character's darkest column/row. A half-dark edge column
+            // contributes only half its pixel width.
+            let d_max_col = col_dark[x0_rect..x1_rect].iter().max().copied().unwrap_or(0);
+            let d_max_row = row_dark.iter().max().copied().unwrap_or(0);
+            let f_left = if d_max_col > 0 { col_dark[x_min] as f64 / d_max_col as f64 } else { 1.0 };
+            let f_right = if d_max_col > 0 { col_dark[x_max] as f64 / d_max_col as f64 } else { 1.0 };
+            let f_top = if d_max_row > 0 { row_dark[y_min] as f64 / d_max_row as f64 } else { 1.0 };
+            let f_bottom = if d_max_row > 0 { row_dark[y_max] as f64 / d_max_row as f64 } else { 1.0 };
+            let frac_left = x_min as f64 + (1.0 - f_left);
+            let frac_right = x_max as f64 + f_right;
+            let frac_top = y_min as f64 + (1.0 - f_top);
+            let frac_bottom = y_max as f64 + f_bottom;
+            let cx = (frac_left + frac_right) / 2.0;
+            let cy = (frac_top + frac_bottom) / 2.0;
             CharInkBounds {
                 cx,
                 cy,
-                width: (x_max - x_min + 1) as f64,
-                height: (y_max - y_min + 1) as f64,
+                width: frac_right - frac_left,
+                height: frac_bottom - frac_top,
                 x_min: x_min as u32,
                 x_max: x_max as u32,
                 y_min: y_min as u32,
                 y_max: y_max as u32,
-                frac_left: x_min as f64,
-                frac_right: x_max as f64 + 1.0,
+                frac_left,
+                frac_right,
             }
         };
         result.push(cb);
