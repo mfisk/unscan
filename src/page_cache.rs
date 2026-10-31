@@ -15,6 +15,32 @@
 use crate::ocr::TextRegion;
 use image::{DynamicImage, GrayImage};
 use std::path::{Path, PathBuf};
+use std::sync::LazyLock;
+
+/// sRGB → linear light lookup table (256 entries).
+/// Linearizes gamma-encoded scanner/PDF pixels so downstream darkness
+/// measurements (subpixel edges, thresholds) operate in linear light.
+/// LUT[i] = 255 * (i/255)^2.2, rounded to u8.
+static SRGB_TO_LINEAR: LazyLock<[u8; 256]> = LazyLock::new(|| {
+    let mut lut = [0u8; 256];
+    for (i, v) in lut.iter_mut().enumerate() {
+        let srgb = i as f64 / 255.0;
+        let linear = srgb.powf(2.2);
+        *v = (linear * 255.0).round().clamp(0.0, 255.0) as u8;
+    }
+    lut
+});
+
+/// Linearize an sRGB gamma-encoded grayscale image to linear light, in place.
+/// SIMD-friendly: simple LUT lookup loop that auto-vectorizes.
+/// Call once per page, right after grayscale conversion, before any processing.
+fn linearize_page_gray(img: &mut GrayImage) {
+    let lut = &*SRGB_TO_LINEAR;
+    // Use as_mut for in-place mutation; compiler auto-vectorizes the LUT loop.
+    for px in img.as_mut().iter_mut() {
+        *px = lut[*px as usize];
+    }
+}
 
 /// Cached OCR results for a single page.
 #[derive(serde::Serialize, serde::Deserialize)]
@@ -610,7 +636,11 @@ pub fn prepare_page(
     // image::metadata::cicp::CicpRgb::cast_pixels_by_layout 8.7% leaf which
     // was hit via two separate DynamicImage::to_luma8 / to_rgba8 full-page scans.
     let rgba_full = fast_rgba8_from_dynamic(page_img);
-    let orig_gray = fast_gray_from_rgba(&rgba_full);
+    let mut orig_gray = fast_gray_from_rgba(&rgba_full);
+    // Linearize sRGB gamma-encoded pixels to linear light, up front.
+    // All downstream darkness measurements (subpixel, thresholds) now operate
+    // in linear space with simple integer math.
+    linearize_page_gray(&mut orig_gray);
     let skew_angle = crate::deskew::detect_skew(&orig_gray);
     let deskewed_gray = if skew_angle.abs() > 5.0 {
         orig_gray
