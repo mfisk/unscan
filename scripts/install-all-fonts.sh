@@ -64,6 +64,19 @@ apt_packages=(
   fonts-open-sans fonts-roboto fonts-roboto-unhinted unzip
 )
 
+# With --brew: skip apt for fonts (use brew casks + direct downloads instead).
+# Keep apt for non-font tools (tesseract, weasyprint, python libs, etc.).
+if [[ "$USE_BREW" == "1" ]]; then
+  filtered=()
+  for pkg in "${apt_packages[@]}"; do
+    case "$pkg" in
+      fonts-*|texlive-fonts-recommended) continue ;;
+      *) filtered+=("$pkg") ;;
+    esac
+  done
+  apt_packages=("${filtered[@]}")
+fi
+
 # A reset can preserve dpkg's database while dropping package payloads.  A
 # status-only check therefore reports "installed" even when the executable,
 # Python module, or font files are gone.  Check every package-owned path and
