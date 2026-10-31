@@ -105,14 +105,33 @@ pub fn verify_text_region(
     // in page_cache.rs.  Do NOT re-derive ink runs, split, or merge words here —
     // spacing and splitting are handled up front.  Use the boxes as-is with
     // uniform line scale (midpoint-derived override_em_px).
+    // Compute word widths from our crop's ink measurement, not Tesseract's bbox.
+    // Tesseract widths are approximate; our ink_horizontal_extent measures actual ink.
+    let ink_thresh = crate::ocr::INK_THRESHOLD;
+    let (crop_w, crop_h) = scan_crop.dimensions();
     let placements: Vec<WordPlacement> = words
         .iter()
-        .map(|wr| WordPlacement {
-            text: wr.text.clone(),
-            x_off: wr.x.saturating_sub(crop_x),
-            y_off: wr.y.saturating_sub(crop_y),
-            width: wr.width,
-            height: wr.height,
+        .map(|wr| {
+            let x_off = wr.x.saturating_sub(crop_x);
+            let y_off = wr.y.saturating_sub(crop_y);
+            let measured_w = if x_off < crop_w && y_off < crop_h {
+                let bw = wr.width.min(crop_w.saturating_sub(x_off));
+                let bh = wr.height.min(crop_h.saturating_sub(y_off));
+                if bw >= 1 && bh >= 1 {
+                    let (il, ir) = crate::ocr::ink_horizontal_extent(
+                        scan_crop, y_off, y_off + bh, x_off, x_off + bw, ink_thresh
+                    );
+                    let mw = ir.saturating_sub(il);
+                    if mw >= 1 { mw } else { wr.width }
+                } else { wr.width }
+            } else { wr.width };
+            WordPlacement {
+                text: wr.text.clone(),
+                x_off,
+                y_off,
+                width: measured_w,
+                height: wr.height,
+            }
         })
         .collect();
 
