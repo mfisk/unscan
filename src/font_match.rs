@@ -23,7 +23,7 @@ static GEO_WEIGHT: std::sync::LazyLock<f32> = std::sync::LazyLock::new(|| {
         .and_then(|v| v.parse().ok())
         .unwrap_or(1.0)
 });
-const MIDPOINT_PRUNE_BASE: f32 = -2.0; // tighter still - avg logit typical -1 to -1.5, -3 was still loose
+pub const MIDPOINT_PRUNE_BASE: f32 = -1.2; // median-based: per Mike; gamma-linearized data has different score distribution than linear calibration data
 
 #[derive(Debug, Clone)]
 pub struct FontMatchResult {
@@ -125,7 +125,7 @@ pub fn identify_fonts(
     for &fk in ensure_font_keys { ensure_set.insert(fk); }
     let allow_opt = crate::cache::font_allowlist();
 
-    let prune_threshold = MIDPOINT_PRUNE_BASE * thoroughness.max(0.1);
+    let prune_threshold = (MIDPOINT_PRUNE_BASE * thoroughness).min(-0.01);
 
     let mut scored: Vec<(String, f32)> = Vec::new();
     let mut best_observations: Vec<ObservationDetail> = Vec::new();
@@ -134,6 +134,31 @@ pub fn identify_fonts(
     let mut best_path_score = f32::MIN;
     let mut best_score = f32::MIN;
     let mut pruned_count: usize = 0;
+
+    // Two-pass: pass 0 with geometry pruning; if no non-ensure fonts survive,
+    // pass 1 disables pruning so the glyph classifier gets a chance.
+    let mut gt_median_ll_pass0: f32 = f32::INFINITY;
+    for pass in 0..2 {
+        let do_prune = pass == 0;
+        if pass == 1 {
+            // Fallback triggered: pass 0 pruned all non-ensure fonts.
+            // Log for performance diagnosis.
+            if audit {
+                eprintln!("midpoint prune FALLBACK: pass 0 yielded zero non-ensure survivors and GT median {:.2} < threshold {:.2}, re-running without pruning", gt_median_ll_pass0, prune_threshold);
+            }
+            scored.clear();
+            best_observations.clear();
+            gt_observations.clear();
+            gt_best_score = f32::MIN;
+            best_path_score = f32::MIN;
+            best_score = f32::MIN;
+            pruned_count = 0;
+            // Reset seg caches for clean second pass
+            seg_caches = (0..word_infos.len()).map(|_| HashMap::new()).collect();
+        }
+        let mut non_ensure_survivors: usize = 0;
+        let mut total_survivors: usize = 0;
+        let mut gt_median_ll: f32 = f32::INFINITY;
 
     for fe in font_registry.iter() {
         let fk: &str = fe.font_key_ref();
@@ -309,16 +334,17 @@ pub fn identify_fonts(
         let mut geo_grid: Vec<Vec<Option<(f32,f32,f32,f32)>>> = builds.iter().map(|wb| vec![None; wb.collapsed.len()]).collect();
         match &geo_opt {
             None => {
-                if !is_ensure { pruned_count+=1; continue; }
+                if do_prune && !is_ensure { pruned_count+=1; continue; }
             }
             Some(geos) if geos.is_empty() => {},
             Some(geos) => {
-                let mut min_ll = f32::INFINITY;
-                for g in geos {
-                    let ll = (g.h_ll + g.v_ll) as f32;
-                    if ll < min_ll { min_ll = ll; }
-                }
-                if !is_ensure && min_ll < prune_threshold { pruned_count+=1; continue; }
+                // Use median (not min) for pruning: robust to single outlier characters.
+                // Threshold set to include 100% of GT fonts (max median_ll = -0.01).
+                let mut lls: Vec<f32> = geos.iter().map(|g| (g.h_ll + g.v_ll) as f32).collect();
+                lls.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
+                let median_ll = if lls.is_empty() { f32::INFINITY } else { lls[lls.len() / 2] };
+                if is_ensure { gt_median_ll = median_ll; }
+                if do_prune && !is_ensure && median_ll < prune_threshold { pruned_count+=1; continue; }
                 // fill grid after prune check – same geos reused
                 for g in geos {
                     if g.seg_idx < geo_grid.len() && g.orig_idx < geo_grid[g.seg_idx].len() {
@@ -331,7 +357,9 @@ pub fn identify_fonts(
                     }
                 }
             }
-        };
+        }
+        if !is_ensure { non_ensure_survivors += 1; };
+        total_survivors += 1;
 
         // Now compute features and logits for scoring temps
         // Need to map temps to actual crops: we have to retrieve norm images from builds
@@ -509,7 +537,20 @@ pub fn identify_fonts(
         }
 
         scored.push((fk.to_owned(), score));
-    }
+    } // end for fe in font_registry.iter()
+
+        // Fallback only if GT is out of threshold AND no non-GT fonts survived.
+        // If GT passes threshold, pruning is working correctly — don't fallback.
+        // If GT fails but some others survive, let the classifier decide — don't fallback.
+        if non_ensure_survivors > 0 || gt_median_ll >= prune_threshold {
+            break; // Success
+        }
+        // If pass 0 yielded zero non-ensure survivors AND GT is out of threshold,
+        // loop continues to pass 1 (no pruning)
+        if pass == 0 {
+            gt_median_ll_pass0 = gt_median_ll;
+        }
+    } // end for pass in 0..2
 
     if pruned_count > 0 && audit {
         eprintln!("midpoint prune: pruned {}/{} fonts at threshold {:.2} (base {:.1} * thoroughness {:.2})", pruned_count, font_registry.iter().count(), prune_threshold, MIDPOINT_PRUNE_BASE, thoroughness);
