@@ -104,6 +104,14 @@ pub struct AuditEntry {
     /// GT font per-word segmentation summaries – always included when GT scored.
     #[serde(skip_serializing_if = "Vec::is_empty")]
     pub gt_word_segmentation: Vec<WordSegSummary>,
+    /// Per-character GT geometry log-likelihoods (h_ll + v_ll) in observation order.
+    /// Enables offline evaluation of pruning statistics (min, mean, etc.) without re-running.
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub gt_per_char_geo_ll: Vec<f32>,
+    /// Whether GT would have been pruned by the geometry gate (min_ll < threshold)
+    /// if not protected by ensure_set. Flags lines where --test changes the outcome.
+    #[serde(skip_serializing_if = "std::ops::Not::not")]
+    pub gt_pruned: bool,
     /// PFLDA OCR corrections with decision data.
     #[serde(skip_serializing_if = "Vec::is_empty")]
     pub ocr_corrections: Vec<OcrCorrection>,
