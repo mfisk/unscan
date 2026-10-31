@@ -115,6 +115,14 @@ def rasterize(
             if blur_radius > 0:
                 im = im.filter(ImageFilter.GaussianBlur(radius=blur_radius))
 
+        # Always apply sRGB gamma encoding to simulate scanner output.
+        # Scanners produce gamma-encoded images; the linear raster from
+        # FreeType/PyMuPDF must be encoded to match real scan-PDFs.
+        arr = np.array(im, dtype=np.float32) / 255.0
+        # sRGB EOTF approximation: V_out = V_in^(1/2.2)
+        arr = np.power(np.clip(arr, 0, 1), 1.0 / 2.2)
+        im = Image.fromarray((arr * 255).astype(np.uint8), mode=im.mode)
+
         out_png = os.path.join(tmpdir, f"final_{len(final_pages):03d}.png")
         im.save(out_png, dpi=(dpi, dpi))
         final_pages.append(out_png)
