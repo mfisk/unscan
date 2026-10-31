@@ -64,17 +64,26 @@ apt_packages=(
   fonts-open-sans fonts-roboto fonts-roboto-unhinted unzip
 )
 
-# With --brew: skip apt for fonts (use brew casks + direct downloads instead).
-# Keep apt for non-font tools (tesseract, weasyprint, python libs, etc.).
+# With --brew: use brew for everything, skip apt entirely.
+# Brew formulae for non-font tools; casks for fonts.
+brew_tools=(
+  fontconfig cabextract tesseract weasyprint unzip
+  python3  # provides pip for python modules
+)
 if [[ "$USE_BREW" == "1" ]]; then
-  filtered=()
-  for pkg in "${apt_packages[@]}"; do
-    case "$pkg" in
-      fonts-*|texlive-fonts-recommended) continue ;;
-      *) filtered+=("$pkg") ;;
-    esac
-  done
-  apt_packages=("${filtered[@]}")
+  if command -v brew >/dev/null 2>&1 || [[ -x /home/linuxbrew/.linuxbrew/bin/brew ]]; then
+    export PATH="/home/linuxbrew/.linuxbrew/bin:$PATH"
+    echo "[brew] Installing non-font tools..."
+    for tool in "${brew_tools[@]}"; do
+      echo "  $tool"
+      su brew -c "brew install $tool" 2>&1 | tail -1 || echo "  WARN: $tool failed"
+    done
+    # Python modules via pip (brew python)
+    echo "[brew] Installing Python modules via pip..."
+    su brew -c "/home/linuxbrew/.linuxbrew/bin/pip3 install pikepdf fonttools pillow pymupdf img2pdf numpy" 2>&1 | tail -2 || echo "  WARN: pip install failed"
+  fi
+  # Skip apt entirely when using brew
+  apt_packages=()
 fi
 
 # A reset can preserve dpkg's database while dropping package payloads.  A
