@@ -12,13 +12,17 @@ command -v debconf-set-selections >/dev/null 2>&1 &&
   sudo debconf-set-selections || true
 
 apt_packages=(
-  fontconfig curl cabextract tesseract-ocr weasyprint
+  fonts-crosextra-carlito fonts-crosextra-caladea
+  fonts-liberation fonts-lmodern texlive-fonts-recommended fonts-texgyre
+  fonts-noto fonts-noto-core fonts-noto-cjk fonts-noto-color-emoji
+  fonts-noto-extra fonts-noto-mono fonts-noto-ui-core fonts-noto-ui-extra
+  fonts-noto-unhinted
+  fonts-courier-prime fontconfig curl cabextract tesseract-ocr weasyprint
   python3-pikepdf python3-fonttools python3-pil python3-fitz
-  python3-img2pdf python3-numpy unzip
+  python3-img2pdf python3-numpy
+  fonts-ebgaramond fonts-ibm-plex fonts-inter fonts-lato
+  fonts-open-sans fonts-roboto fonts-roboto-unhinted unzip
 )
-# NOTE: All font packages removed from apt (Mike Oct 31). Fonts are now
-# installed exclusively to $HOME/.local/share/fonts via direct downloads
-# below. This survives VM rootfs rebuilds which wipe /usr/share/fonts.
 
 # A reset can preserve dpkg's database while dropping package payloads.  A
 # status-only check therefore reports "installed" even when the executable,
@@ -164,46 +168,6 @@ GF_PATHS=(
   ofl/sourceserif4/SourceSerif4[opsz,wght].ttf
   ofl/sourceserif4/SourceSerif4-Italic[opsz,wght].ttf
   apache/specialelite/SpecialElite-Regular.ttf
-  # Fonts previously via apt, now direct download (Mike Oct 31)
-  # Carlito (metric-compatible Calibri)
-  ofl/carlito/Carlito-Regular.ttf
-  ofl/carlito/Carlito-Bold.ttf
-  ofl/carlito/Carlito-Italic.ttf
-  ofl/carlito/Carlito-BoldItalic.ttf
-  # Caladea (metric-compatible Cambria)
-  ofl/caladea/Caladea-Regular.ttf
-  ofl/caladea/Caladea-Bold.ttf
-  ofl/caladea/Caladea-Italic.ttf
-  ofl/caladea/Caladea-BoldItalic.ttf
-  # IBM Plex Sans
-  ofl/ibmplexsans/IBMPlexSans-Regular.ttf
-  ofl/ibmplexsans/IBMPlexSans-Bold.ttf
-  ofl/ibmplexsans/IBMPlexSans-Italic.ttf
-  ofl/ibmplexsans/IBMPlexSans-BoldItalic.ttf
-  # Inter
-  ofl/inter/Inter[opsz,wght].ttf
-  ofl/inter/Inter-Italic[opsz,wght].ttf
-  # Lato
-  ofl/lato/Lato-Regular.ttf
-  ofl/lato/Lato-Bold.ttf
-  ofl/lato/Lato-Italic.ttf
-  ofl/lato/Lato-BoldItalic.ttf
-  # Roboto
-  apache/roboto/Roboto-Regular.ttf
-  apache/roboto/Roboto-Bold.ttf
-  apache/roboto/Roboto-Italic.ttf
-  apache/roboto/Roboto-BoldItalic.ttf
-  # EB Garamond
-  ofl/ebgaramond/EBGaramond[wght].ttf
-  ofl/ebgaramond/EBGaramond-Italic[wght].ttf
-  # Courier Prime
-  ofl/courierprime/CourierPrime-Regular.ttf
-  ofl/courierprime/CourierPrime-Bold.ttf
-  ofl/courierprime/CourierPrime-Italic.ttf
-  ofl/courierprime/CourierPrime-BoldItalic.ttf
-  # Noto Sans
-  ofl/notosans/NotoSans[wdth,wght].ttf
-  ofl/notosans/NotoSans-Italic[wdth,wght].ttf
 )
 
 for p in "${GF_PATHS[@]}"; do
