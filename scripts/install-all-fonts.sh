@@ -4,12 +4,52 @@ set -euo pipefail
 FONTS="$HOME/.local/share/fonts"
 GF="https://raw.githubusercontent.com/google/fonts/main"
 
+# --brew: use Homebrew casks for fonts where available, direct downloads for rest.
+# Requires brew in PATH (installed as 'brew' user to /home/linuxbrew).
+# Default (no flag): use apt for fonts (normal computers).
+USE_BREW=0
+if [[ "${1:-}" == "--brew" ]]; then
+  USE_BREW=1
+  shift
+fi
+
 export DEBIAN_FRONTEND=noninteractive
+
+# --- brew fonts (optional, with --brew flag) ---
+# Uses Homebrew casks for fonts where available. Requires brew in PATH.
+# The brew user installs to /home/linuxbrew which persists across reboots.
+if [[ "$USE_BREW" == "1" ]]; then
+  if ! command -v brew >/dev/null 2>&1; then
+    # Try brew user install location
+    export PATH="/home/linuxbrew/.linuxbrew/bin:$PATH"
+  fi
+  if command -v brew >/dev/null 2>&1; then
+    echo "[brew] Installing font casks..."
+    for cask in "${brew_font_casks[@]}"; do
+      echo "  $cask"
+      su brew -c "brew install --cask $cask" 2>&1 | tail -2 || echo "  WARN: $cask failed, will use direct download"
+    done
+  else
+    echo "[brew] WARNING: brew not found, falling back to direct downloads" >&2
+  fi
+fi
 
 # --- apt (packaged fonts + install prerequisites) ---
 command -v debconf-set-selections >/dev/null 2>&1 &&
   echo "ttf-mscorefonts-installer msttcorefonts/accepted-mscorefonts-eula select true" |
   sudo debconf-set-selections || true
+
+# Brew casks for fonts (used with --brew flag). Casks install to
+# /home/linuxbrew/.linuxbrew/Caskroom, which persists across reboots.
+# Falls back to direct downloads below for fonts without casks.
+brew_font_casks=(
+  font-carlito font-caladea
+  font-liberation
+  font-noto font-noto-sans font-noto-serif font-noto-mono
+  font-courier-prime
+  font-eb-garamond font-ibm-plex font-inter font-lato
+  font-open-sans font-roboto
+)
 
 apt_packages=(
   fonts-crosextra-carlito fonts-crosextra-caladea
