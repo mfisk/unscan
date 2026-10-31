@@ -1061,9 +1061,15 @@ fn build_miss_block(
         (gt_summary, chosen, gt)
     };
 
+    // Red "GT PRUNED" badge when GT was pruned by geometry (Mike Oct 31)
+    let gt_pruned_badge = if entry.gt_pruned {
+        " <span style=\"background:#d00;color:#fff;padding:2px 6px;border-radius:3px;font-size:0.8em;\">GT PRUNED</span>"
+    } else {
+        ""
+    };
     let html = format!(
         "<div class=\"miss\">\
-         <h3>p{}:L{}{}{}  </h3>\
+         <h3>p{}:L{}{}{}{}  </h3>\
          <div class=\"line-text-preview\">\"{}\"</div>\
          {}\
          {}\
@@ -1077,7 +1083,7 @@ fn build_miss_block(
          {}\
          {}\
          </div>",
-        entry.page, entry.line_index, miss_kind_label, sim_html,
+        entry.page, entry.line_index, miss_kind_label, sim_html, gt_pruned_badge,
         text_preview,
         seg_path_html, font_scores_html, lig_compare_html, chosen_scan_line_html, gt_scan_line_html, gt_seg_summary_html, sim_compare_html, tie_break_html, obs_table_html,
         obs_table_lig_html, ocr_override_html,

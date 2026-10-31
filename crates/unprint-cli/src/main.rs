@@ -374,6 +374,8 @@ fn build_audit_entry(
         word_segmentation: lm.word_seg_summaries.clone(),
         gt_word_segmentation: lm.gt_word_seg_summaries.clone(),
         ocr_corrections: lm.ocr_corrections.clone(),
+        gt_per_char_geo_ll: Vec::new(),
+        gt_pruned: false,
     }
 }
 
