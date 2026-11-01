@@ -1518,6 +1518,7 @@ fn render_correct_font_comparison(
         true,
         Some(&correct_dir), None,
         gt_em,
+        None,
     );
 
     // Reference the saved files by audit-root-relative path, exactly like the

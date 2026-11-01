@@ -79,7 +79,7 @@ pub struct VerifyResult {
 pub fn verify_text_region(
     scan_crop: &GrayImage,
     font_data: &[u8],
-    _text: &str,
+    text: &str,
     words: &[TextRegion],
     crop_x: u32,
     crop_y: u32,
@@ -90,6 +90,7 @@ pub fn verify_text_region(
     audit_dir: Option<&std::path::Path>,
     bail_below: Option<f32>,
     override_em_px: Option<f32>,
+    frac_width: Option<f32>,
 ) -> VerifyResult {
     let (w, h) = scan_crop.dimensions();
 
@@ -138,6 +139,24 @@ pub fn verify_text_region(
     // Both scan and render use the word-union bbox — the union of all
     // final (post-processed) word bboxes.  This matches what the report
     // draws as the "final" cyan-dashed boxes.
+
+    // If fractional (subpixel) line width is provided, use it to compute
+    // override_em_px directly, bypassing the per-word median.
+    let override_em_px = if let Some(fw) = frac_width {
+        if fw.is_finite() && fw >= 4.0 && fw <= 5000.0 {
+            if let Some(em) = crate::layout::width_matched_em_px_shaped(
+                font_data, text, fw, variant_tag, variations, allow_liga,
+            ) {
+                Some(em)
+            } else {
+                override_em_px
+            }
+        } else {
+            override_em_px
+        }
+    } else {
+        override_em_px
+    };
 
     let full_render = match render_via_freetype_scaled(
         font_data,

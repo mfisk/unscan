@@ -256,6 +256,7 @@ pub fn match_lines(
                 None,
                 Some(FAST_PATH_MIN_SSIM),
                 None,
+                None,
             );
             if vr.score >= FAST_PATH_MIN_SSIM {
                 fast_path_hits.fetch_add(1, Ordering::Relaxed);
@@ -491,10 +492,26 @@ pub fn match_lines(
                             None => continue,
                         };
                         let midpoint_em_px = crate::geometry_classifier::median_em_px_from_midpoints(font_key, &segs, &wib, geo_cache);
+                        // Fractional line width from subpixel ink bounds
+                        let frac_width: Option<f32> = {
+                            let mut min_l = f64::INFINITY;
+                            let mut max_r = f64::NEG_INFINITY;
+                            for w in &wib {
+                                for c in &w.chars {
+                                    if c.frac_left < min_l { min_l = c.frac_left; }
+                                    if c.frac_right > max_r { max_r = c.frac_right; }
+                                }
+                            }
+                            if max_r > min_l && min_l.is_finite() {
+                                Some((max_r - min_l) as f32)
+                            } else {
+                                None
+                            }
+                        };
                         let vr = verify::verify_text_region(
                             &norm_crop, &fd, &line.text, &line.words, line.x, line.y,
                             fe.glyph_overrides.as_deref(), &fe.variant_tag, fe.variations.as_deref(),
-                            true, tie_audit_dir.as_deref(), None, None,
+                            true, tie_audit_dir.as_deref(), None, None, frac_width,
                         );
                         tie_sim_results.push((fe.font_key(), fe.family_name.clone(), vr.score));
                         if best.as_ref().map_or(true, |(_, bs, _, _, _, _)| {
