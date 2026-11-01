@@ -571,7 +571,7 @@ def generate_html(font_paths):
         if rl not in font_paths:
             raise RuntimeError(
                 f"Font '{rl}' (family '{section['font_family']}') not resolved — "
-                f"run scripts/install-all-fonts.sh to install missing fonts"
+                f"run tools/install-all-fonts.sh to install missing fonts"
             )
 
         align = "justify" if section.get("alignment") == "justify" else "left"
