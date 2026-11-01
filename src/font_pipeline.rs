@@ -494,7 +494,7 @@ pub fn match_lines(
                         let vr = verify::verify_text_region(
                             &norm_crop, &fd, &line.text, &line.words, line.x, line.y,
                             fe.glyph_overrides.as_deref(), &fe.variant_tag, fe.variations.as_deref(),
-                            true, tie_audit_dir.as_deref(), None, midpoint_em_px,
+                            true, tie_audit_dir.as_deref(), None, None,
                         );
                         tie_sim_results.push((fe.font_key(), fe.family_name.clone(), vr.score));
                         if best.as_ref().map_or(true, |(_, bs, _, _, _, _)| {
