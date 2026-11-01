@@ -259,6 +259,21 @@ fi
 # Verify the actual font payload owned by each apt package.  Checking only
 # fc-match would allow a downloaded font with the same family to hide a broken
 # package installation.
+# In --brew mode, skip dpkg verification (packages not installed via apt);
+# instead verify families are available via fontconfig.
+if [[ "$USE_BREW" == "1" ]]; then
+  BREW_FONT_FAMILIES=(
+    "Carlito" "Caladea" "Liberation Sans" "Noto Sans" "Courier Prime"
+    "EB Garamond" "IBM Plex Sans" "Inter" "Lato" "Open Sans" "Roboto"
+  )
+  for family in "${BREW_FONT_FAMILIES[@]}"; do
+    if ! fc-match "$family" >/dev/null 2>&1; then
+      echo "ERROR: font family not available: $family" >&2
+      exit 1
+    fi
+  done
+  echo "[brew] All font families verified via fontconfig"
+else
 PACKAGED_FONT_FAMILIES=(
   "fonts-crosextra-carlito|Carlito"
   "fonts-crosextra-caladea|Caladea"
@@ -303,6 +318,7 @@ for expectation in "${PACKAGED_FONT_FAMILIES[@]}"; do
     exit 1
   fi
 done
+fi  # end USE_BREW check
 
 # Verify every executable and Python dependency used by the fixture generator.
 # Missing imports must fail installation now, not fail a lob later.
