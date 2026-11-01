@@ -80,7 +80,7 @@ if [[ "$USE_BREW" == "1" ]]; then
     done
     # Python modules via pip (brew python)
     echo "[brew] Installing Python modules via pip..."
-    su brew -c "cd /home/brew && /home/linuxbrew/.linuxbrew/bin/pip3 install pikepdf fonttools pillow pymupdf img2pdf numpy" 2>&1 | tail -2 || echo "  WARN: pip install failed"
+    su brew -c "cd /home/brew && /home/linuxbrew/.linuxbrew/bin/pip3 install --break-system-packages pikepdf fonttools pillow pymupdf img2pdf numpy" 2>&1 | tail -2 || echo "  WARN: pip install failed"
   fi
   # Skip apt entirely when using brew
   apt_packages=()
