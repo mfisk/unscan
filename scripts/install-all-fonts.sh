@@ -240,20 +240,16 @@ GF_PATHS=(
   ofl/caladea/Caladea-Bold.ttf
   ofl/caladea/Caladea-Italic.ttf
   ofl/caladea/Caladea-BoldItalic.ttf
-  ofl/ibmplexsans/IBMPlexSans-Regular.ttf
-  ofl/ibmplexsans/IBMPlexSans-Bold.ttf
-  ofl/ibmplexsans/IBMPlexSans-Italic.ttf
-  ofl/ibmplexsans/IBMPlexSans-BoldItalic.ttf
+  ofl/ibmplexsans/IBMPlexSans[wdth,wght].ttf
+  ofl/ibmplexsans/IBMPlexSans-Italic[wdth,wght].ttf
   ofl/inter/Inter[opsz,wght].ttf
   ofl/inter/Inter-Italic[opsz,wght].ttf
   ofl/lato/Lato-Regular.ttf
   ofl/lato/Lato-Bold.ttf
   ofl/lato/Lato-Italic.ttf
   ofl/lato/Lato-BoldItalic.ttf
-  apache/roboto/Roboto-Regular.ttf
-  apache/roboto/Roboto-Bold.ttf
-  apache/roboto/Roboto-Italic.ttf
-  apache/roboto/Roboto-BoldItalic.ttf
+  ofl/roboto/Roboto[wdth,wght].ttf
+  ofl/roboto/Roboto-Italic[wdth,wght].ttf
   ofl/ebgaramond/EBGaramond[wght].ttf
   ofl/ebgaramond/EBGaramond-Italic[wght].ttf
   ofl/courierprime/CourierPrime-Regular.ttf
