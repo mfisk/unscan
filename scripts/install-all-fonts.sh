@@ -230,6 +230,38 @@ GF_PATHS=(
   ofl/sourceserif4/SourceSerif4[opsz,wght].ttf
   ofl/sourceserif4/SourceSerif4-Italic[opsz,wght].ttf
   apache/specialelite/SpecialElite-Regular.ttf
+  # Direct downloads supplement apt (for environments without apt fonts,
+  # e.g., VM rootfs wipes). Apt remains the default for normal users.
+  ofl/carlito/Carlito-Regular.ttf
+  ofl/carlito/Carlito-Bold.ttf
+  ofl/carlito/Carlito-Italic.ttf
+  ofl/carlito/Carlito-BoldItalic.ttf
+  ofl/caladea/Caladea-Regular.ttf
+  ofl/caladea/Caladea-Bold.ttf
+  ofl/caladea/Caladea-Italic.ttf
+  ofl/caladea/Caladea-BoldItalic.ttf
+  ofl/ibmplexsans/IBMPlexSans-Regular.ttf
+  ofl/ibmplexsans/IBMPlexSans-Bold.ttf
+  ofl/ibmplexsans/IBMPlexSans-Italic.ttf
+  ofl/ibmplexsans/IBMPlexSans-BoldItalic.ttf
+  ofl/inter/Inter[opsz,wght].ttf
+  ofl/inter/Inter-Italic[opsz,wght].ttf
+  ofl/lato/Lato-Regular.ttf
+  ofl/lato/Lato-Bold.ttf
+  ofl/lato/Lato-Italic.ttf
+  ofl/lato/Lato-BoldItalic.ttf
+  apache/roboto/Roboto-Regular.ttf
+  apache/roboto/Roboto-Bold.ttf
+  apache/roboto/Roboto-Italic.ttf
+  apache/roboto/Roboto-BoldItalic.ttf
+  ofl/ebgaramond/EBGaramond[wght].ttf
+  ofl/ebgaramond/EBGaramond-Italic[wght].ttf
+  ofl/courierprime/CourierPrime-Regular.ttf
+  ofl/courierprime/CourierPrime-Bold.ttf
+  ofl/courierprime/CourierPrime-Italic.ttf
+  ofl/courierprime/CourierPrime-BoldItalic.ttf
+  ofl/notosans/NotoSans[wdth,wght].ttf
+  ofl/notosans/NotoSans-Italic[wdth,wght].ttf
 )
 
 for p in "${GF_PATHS[@]}"; do
