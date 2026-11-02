@@ -92,6 +92,94 @@ pub fn detect_skew(img: &GrayImage) -> f32 {
         return 0.0;
     }
 
+    // Bloomberg confidence checks (SPIE 1995 §2.4): do not rotate on a
+    // spurious peak.  All three must pass, otherwise return 0° explicitly.
+    //
+    // 1. Peak height vs. average background (noise-to-signal ratio).
+    //    A genuine skew peak stands well above the background vote level.
+    let avg_sum = theta_sums.iter().sum::<u64>() as f64 / n_theta as f64;
+    if avg_sum > 0.0 {
+        let peak_to_bg = best_sum as f64 / avg_sum;
+        // Require peak at least 2x background; otherwise insufficient signal.
+        if peak_to_bg < 2.0 {
+            return 0.0;
+        }
+    }
+
+    // 2. Peak height vs. second-highest peak (distinctness).
+    //    A spurious peak from noise/slashes will have a close runner-up.
+    let mut second_best: u64 = 0;
+    for (i, &s) in theta_sums.iter().enumerate() {
+        // Exclude peak and its immediate neighbors (parabolic fit region).
+        if i + 1 >= best_ti && i <= best_ti + 1 {
+            continue;
+        }
+        if s > second_best {
+            second_best = s;
+        }
+    }
+    if second_best > 0 {
+        let peak_to_second = best_sum as f64 / second_best as f64;
+        // Require peak at least 1.5x the runner-up.
+        if peak_to_second < 1.5 {
+            return 0.0;
+        }
+    }
+
+    // 3. Peak narrowness via parabolic-fit curvature.
+    //    A sharp peak (high curvature) indicates a well-defined angle;
+    //    a broad flat peak indicates noise.
+    //    Also require minimum evidence: votes must span ≥2 distinct
+    //    text-line bands (ρ clusters), otherwise a single line (or slash
+    //    artifacts) can produce a false peak.
+    let (narrow, n_bands) = if best_ti > 0 && best_ti < n_theta - 1 {
+        let left = theta_sums[best_ti - 1] as f64;
+        let center = best_sum as f64;
+        let right = theta_sums[best_ti + 1] as f64;
+        let denom = 2.0 * center - left - right;
+        // Narrow if curvature is positive and significant relative to peak.
+        let is_narrow = denom > 0.0 && denom > center * 0.05;
+
+        // Count distinct ρ bands contributing to the peak θ.
+        // A band is a cluster of ρ bins with votes >= threshold, separated
+        // by gaps of at least 20px (approx line spacing at this scale).
+        let mut bands = 0;
+        let mut in_band = false;
+        let mut gap_len = 0;
+        for ri in 0..n_rho {
+            let votes = accum[best_ti * n_rho + ri];
+            if votes >= threshold {
+                if !in_band {
+                    // Start new band (either first, or after sufficient gap)
+                    if bands == 0 || gap_len >= 20 {
+                        bands += 1;
+                    }
+                    in_band = true;
+                }
+                gap_len = 0;
+            } else {
+                if in_band {
+                    in_band = false;
+                    gap_len = 1;
+                } else if gap_len > 0 {
+                    gap_len += 1;
+                }
+            }
+        }
+        (is_narrow, bands)
+    } else {
+        (false, 0)
+    };
+
+    if !narrow {
+        return 0.0;
+    }
+    // Require at least 2 distinct line bands; a single line (or isolated
+    // artifacts) does not provide sufficient evidence for deskew.
+    if n_bands < 2 {
+        return 0.0;
+    }
+
     // Parabolic interpolation around peak for sub-step accuracy
     let skew = if best_ti > 0 && best_ti < n_theta - 1 {
         let left = theta_sums[best_ti - 1] as f64;
