@@ -2307,6 +2307,17 @@ pub fn make_weight_explicit(ps_name: &str, weight: u16) -> String {
         return ps_name.to_string();
     }
 
+    // Special case: Arial Black is a distinct family, not Arial at weight 900.
+    // The file's usWeightClass lies (says 400), but 400 is reasonable for the
+    // Arial Black family (it's the regular weight of that family).
+    // Per Mike Nov 2: "Black should be part of font family rather than a weight."
+    if ps_name == "Arial-Black" {
+        // Preserve "Black" as part of family name, don't strip it.
+        // Use the provided weight (400 is reasonable for this family).
+        let weight_str = weight.to_string();
+        return format!("ArialBlack-{}", weight_str);
+    }
+
     let weight_str = weight.to_string();
 
     // Detect italic from original PS name — we canonicalize all italic forms
