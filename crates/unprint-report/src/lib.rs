@@ -335,9 +335,12 @@ fn find_font_in_catalog<'a>(
     gt_font_name: &str,
 ) -> Option<&'a FontEntry> {
     let gt_stripped = ground_truth::strip_subset_prefix_str(gt_font_name);
-    // Exact PostScript name match.  Variant entries carry "PSName|tag"
-    // so they won't collide with base "PSName" — single-pass lookup.
-    font_catalog.iter().find(|fe| fe.postscript_name == gt_stripped)
+    // Try full explicit key first (e.g. "SourceSerif4-400Italic[wght=400,opsz=10]"),
+    // then fall back to base PostScript name for backward compatibility.
+    // Variant entries carry "PSName|tag" so they won't collide with base "PSName".
+    font_catalog.iter().find(|fe| {
+        fe.font_key() == gt_stripped || fe.postscript_name == gt_stripped
+    })
 }
 
 /// Try to find a font entry matching a CI candidate font_key.
@@ -533,14 +536,18 @@ fn classify_entries<'a>(
                 let kind = if e.decision == Decision::KeptRaster {
                     MissKind::KeptRaster
                 } else if let Some(ref actual) = actual_font {
-                    // After GT canonicalization, both sides use canonical
-                    // (weight-explicit) names.  Variant entries carry
-                    // "PSName|tag" which won't match base "PSName", so
-                    // exact equality is sufficient.
+                    // After GT canonicalization, both sides use catalog font_keys.
+                    // Note: strip bracketed variations (e.g. "[wght=400,opsz=10]")
+                    // for the hit/miss decision — the variation details don't
+                    // affect font identity for this purpose.  The "|" variant
+                    // attributes (e.g. "|nokern") ARE significant and are kept.
+                    let actual_base = actual.split('[').next().unwrap_or(actual);
                     let ps_match = e.font_key_matched.as_ref().and_then(|fk| {
                         find_font_by_key(font_catalog, fk)
                     }).map_or(false, |fe| {
-                        fe.postscript_name == *actual
+                        let fk = fe.font_key_ref();
+                        let fk_base = fk.split('[').next().unwrap_or(fk);
+                        fk_base == actual_base
                     });
 
                     if ps_match {
@@ -556,7 +563,11 @@ fn classify_entries<'a>(
                             .and_then(|fk| find_font_by_key(font_catalog, fk))
                             .map(|fe| fe.path.clone());
                         let gt_path = font_catalog.iter()
-                            .find(|fe| fe.postscript_name == *actual)
+                            .find(|fe| {
+                                let fk = fe.font_key_ref();
+                                fk == actual.as_str()
+                                    || fk.split('[').next().unwrap_or(fk) == actual_base
+                            })
                             .map(|fe| fe.path.clone());
 
                         let is_minor = match (picked_path, gt_path) {
@@ -663,7 +674,7 @@ fn find_correct_ci_candidate(
     font_catalog: &[FontEntry],
     _glyph_map: &NgramGlyphMap,
 ) -> (Option<String>, Option<f32>, Option<usize>) {
-    let gt_ps = ground_truth::strip_subset_prefix_str(actual_font);
+    let gt_key = ground_truth::strip_subset_prefix_str(actual_font);
 
     // font_candidates is always the winning path (font_pipeline.rs: winner → font_scores),
     // font_candidates_lig is the losing path. Prioritize winner, fall back to loser
@@ -675,14 +686,17 @@ fn find_correct_ci_candidate(
 
     for (i, c) in primary.iter().enumerate() {
         if let Some(fe) = find_font_by_key(font_catalog, &c.font_key) {
-            if fe.postscript_name == gt_ps {
+            // Compare full font_key, not postscript_name: GT annotations are now
+            // the full catalog font_key (e.g., "SourceSerif4-400|nokern[wght=400,opsz=10]"),
+            // while postscript_name is the clean name (e.g., "SourceSerif4-Regular").
+            if fe.font_key() == gt_key {
                 return (Some(c.font_key.clone()), c.score, Some(i + 1));
             }
         }
     }
     for (i, c) in secondary.iter().enumerate() {
         if let Some(fe) = find_font_by_key(font_catalog, &c.font_key) {
-            if fe.postscript_name == gt_ps {
+            if fe.font_key() == gt_key {
                 return (Some(c.font_key.clone()), c.score, Some(i + 1));
             }
         }
@@ -852,11 +866,11 @@ fn build_miss_block(
         let alt_chosen_fe = font_catalog.iter().find(|fe| fe.font_key() == alt_font_key);
         // GT rank/score in the alt path's candidate list (not winner's)
         let alt_gt = if let Some(ref af) = ce.actual_font {
-            let gt_ps = ground_truth::strip_subset_prefix_str(af);
+            let gt_key = ground_truth::strip_subset_prefix_str(af);
             entry.font_candidates_lig.iter().enumerate()
                 .find(|(_, c)| {
                     find_font_by_key(font_catalog, &c.font_key)
-                        .map_or(false, |fe| fe.postscript_name == gt_ps)
+                        .map_or(false, |fe| fe.font_key() == gt_key)
                 })
                 .map(|(i, c)| (Some(i + 1), c.score))
                 .unwrap_or((None, None))
@@ -1385,7 +1399,7 @@ fn build_scan_line_with_overlays_inner(
          <span style=\"color:#2864dc\">│</span> v-whitespace · \
          <span style=\"color:#ff00c8\">╲</span> seam</div>\
          <div style=\"width:100%;position:relative;\">\
-         <svg viewBox=\"0 0 {canvas_w} {canvas_h}\" style=\"width:100%;height:auto;display:block;\" xmlns=\"http://www.w3.org/2000/svg\">\
+         <svg viewBox=\"0 0 {canvas_w} {canvas_h}\" style=\"max-width:100%;height:auto;display:block;\" xmlns=\"http://www.w3.org/2000/svg\">\
          <image href=\"{img_uri}\" x=\"0\" y=\"{margin_top}\" width=\"{cw}\" height=\"{ch}\" style=\"image-rendering:pixelated;\"/>\
          {overlays}\
          </svg></div>\
@@ -1638,13 +1652,13 @@ fn build_similarity_block(
     let render_row = if let Some(gt_uri) = correct_render_uri {
         format!(
             "<tr><td class=\"ssim-label\">Render</td>\
-             <td><img src=\"{gt_uri}\" class=\"ssim-compare-img\"></td>\
-             <td><img src=\"{render_uri}\" class=\"ssim-compare-img\"></td></tr>"
+             <td><img src=\"{gt_uri}\" class=\"ssim-compare-img\" style=\"width:100%;height:auto;display:block;\"></td>\
+             <td><img src=\"{render_uri}\" class=\"ssim-compare-img\" style=\"width:100%;height:auto;display:block;\"></td></tr>"
         )
     } else {
         format!(
             "<tr><td class=\"ssim-label\">Render</td>\
-             <td colspan=\"2\"><img src=\"{render_uri}\" class=\"ssim-compare-img\"></td></tr>"
+             <td colspan=\"2\"><img src=\"{render_uri}\" class=\"ssim-compare-img\" style=\"width:100%;height:auto;display:block;\"></td></tr>"
         )
     };
 
@@ -1652,17 +1666,17 @@ fn build_similarity_block(
     let diff_row_html = match (correct_diff_uri, &diff_row) {
         (Some(gt_diff), Some(picked_diff)) => format!(
             "<tr><td class=\"ssim-label\">Diff</td>\
-             <td><img src=\"{gt_diff}\" class=\"ssim-compare-img\"></td>\
-             <td><img src=\"{picked_diff}\" class=\"ssim-compare-img\"></td></tr>"
+             <td><img src=\"{gt_diff}\" class=\"ssim-compare-img\" style=\"width:100%;height:auto;display:block;\"></td>\
+             <td><img src=\"{picked_diff}\" class=\"ssim-compare-img\" style=\"width:100%;height:auto;display:block;\"></td></tr>"
         ),
         (Some(gt_diff), None) => format!(
             "<tr><td class=\"ssim-label\">Diff</td>\
-             <td><img src=\"{gt_diff}\" class=\"ssim-compare-img\"></td>\
+             <td><img src=\"{gt_diff}\" class=\"ssim-compare-img\" style=\"width:100%;height:auto;display:block;\"></td>\
              <td>—</td></tr>"
         ),
         (None, Some(picked_diff)) => format!(
             "<tr><td class=\"ssim-label\">Diff</td>\
-             <td colspan=\"2\"><img src=\"{picked_diff}\" class=\"ssim-compare-img\"></td></tr>"
+             <td colspan=\"2\"><img src=\"{picked_diff}\" class=\"ssim-compare-img\" style=\"width:100%;height:auto;display:block;\"></td></tr>"
         ),
         (None, None) => String::new(),
     };
@@ -1729,8 +1743,8 @@ fn build_similarity_block(
          {font_size_row}\
          {per_word_row}\
          <tr><td class=\"ssim-label\">Scan</td>\
-         <td><img src=\"{scan_uri}\" class=\"ssim-compare-img\"></td>\
-         <td><img src=\"{scan_uri}\" class=\"ssim-compare-img\"></td></tr>\
+         <td><img src=\"{scan_uri}\" class=\"ssim-compare-img\" style=\"width:100%;height:auto;display:block;\"></td>\
+         <td><img src=\"{scan_uri}\" class=\"ssim-compare-img\" style=\"width:100%;height:auto;display:block;\"></td></tr>\
          {render_row}\
          {diff_row_html}\
          <tr><td class=\"ssim-label\">ZNCC</td>\
@@ -1771,7 +1785,7 @@ fn build_tie_break_block(
     for (ti, _tc) in entry.tie_candidates.iter().enumerate() {
         let render_path = diag_dir.join(format!("tie_{}", ti)).join("ssim_render.png");
         if let Some(uri) = file_to_b64_uri(&render_path) {
-            rows.push_str(&format!("<td><img src=\"{}\" class=\"ssim-compare-img\"></td>", uri));
+            rows.push_str(&format!("<td><img src=\"{}\" class=\"ssim-compare-img\" style=\"width:100%;height:auto;display:block;\"></td>", uri));
         } else {
             rows.push_str("<td>—</td>");
         }
@@ -1783,7 +1797,7 @@ fn build_tie_break_block(
     for (ti, _tc) in entry.tie_candidates.iter().enumerate() {
         let diff_path = diag_dir.join(format!("tie_{}", ti)).join("ssim_diff.png");
         if let Some(uri) = file_to_b64_uri(&diff_path) {
-            rows.push_str(&format!("<td><img src=\"{}\" class=\"ssim-compare-img\"></td>", uri));
+            rows.push_str(&format!("<td><img src=\"{}\" class=\"ssim-compare-img\" style=\"width:100%;height:auto;display:block;\"></td>", uri));
         } else {
             rows.push_str("<td>—</td>");
         }
@@ -1883,7 +1897,8 @@ fn build_observation_table(
                         fe.glyph_overrides.as_ref()
                             .and_then(|ovs| ovs.iter().find(|(gc, _)| *gc == *c).map(|(_, g)| unprint_fonts::ab_glyph::GlyphId(*g)))
                     }).collect();
-                    if let Some(img) = char_render::render_ngram_fresh(&font, seq, &gid_overrides, &char_render::RenderParams::default()) {
+                    let _disable_kern = fe.variant_tag.contains("nokern");
+                    if let Some(img) = char_render::render_ngram_fresh(&font, seq, &gid_overrides, &char_render::RenderParams::default(), _disable_kern) {
                         correct_mid = ink_midpoint(&img);
                         correct_ref_uri = Some(img_to_b64_uri(&img));
                     }
@@ -1916,7 +1931,8 @@ fn build_observation_table(
                             fe.glyph_overrides.as_ref()
                                 .and_then(|ovs| ovs.iter().find(|(gc, _)| *gc == *c).map(|(_, g)| unprint_fonts::ab_glyph::GlyphId(*g)))
                         }).collect();
-                        if let Some(img) = char_render::render_ngram_fresh(&font, seq, &gid_overrides, &char_render::RenderParams::default()) {
+                        let _disable_kern = fe.variant_tag.contains("nokern");
+                    if let Some(img) = char_render::render_ngram_fresh(&font, seq, &gid_overrides, &char_render::RenderParams::default(), _disable_kern) {
                             chosen_mid = ink_midpoint(&img);
                             chosen_ref_uri = Some(img_to_b64_uri(&img));
                         }
@@ -2146,7 +2162,7 @@ img.ci {
   font-size: 10px; font-weight: 600; color: #555; width: 50px; text-align: right;
 }
 .ssim-compare-img {
-  max-width: 100%; image-rendering: pixelated;
+  max-width: 100%; width: 100%; height: auto; image-rendering: pixelated;
   display: block;
 }
 .tie-break-block {
@@ -2162,7 +2178,13 @@ img.ci {
 .scan-line-block {
   margin: 6px 0 10px 0; padding: 0; background: #f0f4f0;
   border: 1px solid #c0c8c0; border-radius: 4px; overflow: hidden;
-  box-sizing: border-box; width: 100%;
+  box-sizing: border-box; width: 100%; max-width: 100%;
+}
+.scan-line-block svg {
+  max-width: 100%;
+}
+.scan-line-block img {
+  max-width: 100%; height: auto;
 }
 .scan-line-label { font-size: 10px; font-weight: 600; color: #555; margin: 8px 8px 4px 8px; }
 .ocr-wrong-badge { background: #f0a020; color: white; padding: 1px 6px; border-radius: 3px; font-size: 11px; font-weight: 700; }
@@ -2680,6 +2702,43 @@ pub fn generate_report(
         meta.classifier, render_opts, elapsed_str,
     );
 
+    // Timestamp for the report header (Mike 2026-11-02: include date and time)
+    let timestamp = {
+        use std::time::{SystemTime, UNIX_EPOCH};
+        let now = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .map(|d| d.as_secs())
+            .unwrap_or(0);
+        // Format as YYYY-MM-DD HH:MM:SS UTC (simple, no external deps)
+        let days = now / 86400;
+        let secs = now % 86400;
+        let hours = secs / 3600;
+        let mins = (secs % 3600) / 60;
+        let secs = secs % 60;
+        // Days since 1970-01-01 to YYYY-MM-DD (approximate, good enough for header)
+        // Use a simple conversion via chrono-like math
+        let (y, m, d) = {
+            let mut y = 1970;
+            let mut d = days as i64;
+            loop {
+                let leap = (y % 4 == 0 && y % 100 != 0) || y % 400 == 0;
+                let yd = if leap { 366 } else { 365 };
+                if d < yd { break; }
+                d -= yd;
+                y += 1;
+            }
+            let leap = (y % 4 == 0 && y % 100 != 0) || y % 400 == 0;
+            let mdays = [31, if leap {29} else {28}, 31, 30, 31, 30, 31, 31, 30, 31, 30, 31];
+            let mut mo = 0;
+            while d >= mdays[mo] as i64 {
+                d -= mdays[mo] as i64;
+                mo += 1;
+            }
+            (y, mo + 1, d + 1)
+        };
+        format!("{:04}-{:02}-{:02} {:02}:{:02}:{:02} UTC", y, m, d, hours, mins, secs)
+    };
+
     let html = format!(
         "<!DOCTYPE html>\n\
          <html>\n\
@@ -2690,6 +2749,7 @@ pub fn generate_report(
          <body style=\"background: white; color: #222;\">\n\
          {CSS}\n\
          <h2>{report_title}</h2>\n\
+         <div class=\"summary\" style=\"color:#666;font-size:0.9em;\">Generated: {timestamp}</div>\n\
          <div class=\"summary\">{sim_summary}</div>\n\
          <div class=\"summary\">{font_summary}</div>\n\
          <div class=\"summary\">{independent_summary}</div>\n\

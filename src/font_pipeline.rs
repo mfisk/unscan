@@ -97,6 +97,8 @@ pub struct LineMatch {
     pub word_seg_summaries: Vec<crate::audit::WordSegSummary>,
     /// GT font segmentation summaries – always included when GT scored, even on misses.
     pub gt_word_seg_summaries: Vec<crate::audit::WordSegSummary>,
+    /// GT font per-character geometry log-likelihoods (h_ll+v_ll) for pruning analysis.
+    pub gt_per_char_geo_ll: Vec<f32>,
     /// PFLDA OCR corrections with decision data.
     pub ocr_corrections: Vec<crate::audit::OcrCorrection>,
 }
@@ -296,6 +298,7 @@ pub fn match_lines(
                     gt_midpoint_em_px: None,
                     word_seg_summaries: Vec::new(),
                     gt_word_seg_summaries: Vec::new(),
+                    gt_per_char_geo_ll: Vec::new(),
                     ocr_corrections: Vec::new(),
                 };
             } else if li < 3 {
@@ -324,6 +327,7 @@ pub fn match_lines(
         let font_scores: Vec<(String, Option<f32>)>;
         let mut observations: Vec<font_match::ObservationDetail>;
         let gt_observations: Vec<font_match::ObservationDetail>;
+        let gt_per_char_geo_ll: Vec<f32>;
         let font_scores_lig: Vec<(String, Option<f32>)>;
         let observations_lig: Vec<font_match::ObservationDetail>;
         let seg_winner: Option<String>;
@@ -362,7 +366,9 @@ pub fn match_lines(
             let audit_all = crate::features::audit_all_chars_enabled();
             let mut char_counts: std::collections::HashMap<char, usize> = std::collections::HashMap::new();
             let mut sorted: Vec<(usize, &crate::ocr::TextRegion)> = line.words.iter().enumerate().collect();
-            sorted.sort_by(|a,b| b.1.text.chars().count().cmp(&a.1.text.chars().count()));
+            // Sort left-to-right by x-position for correct character ordering.
+            // (Was: sort by char count descending, which reversed word order and broke geometry.)
+            sorted.sort_by(|a,b| a.1.x.cmp(&b.1.x));
             let mut infos = Vec::new();
             for (orig_idx, w) in sorted {
                 if w.width == 0 || w.height == 0 { continue; }
@@ -421,15 +427,33 @@ pub fn match_lines(
         let (font_result, tie_candidates_audit, gt_font_key, winning_segs, winning_wib, winning_pos_map, winning_crops) = {
 
             // ── Resolve ground-truth font key (if available) ─────
+            // In --test mode, the GT MUST resolve to a registry entry. If the lookup
+            // fails, error out instead of silently proceeding with an empty ensure list
+            // (which would allow geometry pruning to eliminate the GT).
             let gt_font_key: Option<String> = ground_truth.as_ref().and_then(|gt| {
                 let bbox_px = [line.x as f32, line.y as f32,
                                (line.x + line.width) as f32,
                                (line.y + line.height) as f32];
                 let gt_font_name = gt.lookup_font(page_num, &bbox_px, args.dpi)?;
                 let gt_ps = ground_truth::strip_subset_prefix_str(gt_font_name);
-                font_registry.iter()
-                    .find(|fe| fe.postscript_name == gt_ps)
-                    .map(|fe| fe.font_key())
+                // Match against full explicit key (with bracketed variations)
+                // as well as base postscript_name, since GT annotations now
+                // carry the full form (e.g., "SourceSerif4-400Italic[wght=400,opsz=10]").
+                let found = font_registry.iter()
+                    .find(|fe| fe.postscript_name == gt_ps || fe.font_key() == gt_ps)
+                    .map(|fe| fe.font_key());
+                if found.is_none() {
+                    // GT lookup failed in test mode — this is a bug, not a skip.
+                    // The GT annotation refers to a font not in the registry.
+                    eprintln!(
+                        "ERROR: GT font '{}' (page {}) not found in font registry. \
+                         The GT annotation is invalid or the registry is incomplete. \
+                         Aborting instead of silently skipping GT scoring.",
+                        gt_ps, page_num
+                    );
+                    std::process::exit(1);
+                }
+                found
             });
             let ensure_keys: Vec<&str> = gt_font_key.as_deref().into_iter().collect();
 
@@ -447,6 +471,7 @@ pub fn match_lines(
                 geo_cache,
             );
 
+            gt_per_char_geo_ll = scoring.gt_per_char_geo_ll;
             font_scores = scoring.scores.into_iter().map(|(k,s)| (k, Some(s))).collect();
             observations = scoring.observations;
             gt_observations = scoring.gt_observations;
@@ -1090,7 +1115,7 @@ pub fn match_lines(
             .flat_map(|ws| ws.chars.iter())
             .any(|c| crate::font_scan::is_ligature_char(*c));
 
-        LineMatch { font_result, text_color, font_scores, observations, font_scores_lig, observations_lig, seg_winner, seg_used_ligatures, diag_seg_dir, obs_rank_probs, alt_obs_rank_probs, tie_candidates: tie_candidates_audit, corrected_words, fast_path: false, fast_path_score: None, midpoint_em_px, gt_midpoint_em_px, word_seg_summaries, gt_word_seg_summaries, ocr_corrections: ocr_correction_audit }
+        LineMatch { font_result, text_color, font_scores, observations, font_scores_lig, observations_lig, seg_winner, seg_used_ligatures, diag_seg_dir, obs_rank_probs, alt_obs_rank_probs, tie_candidates: tie_candidates_audit, corrected_words, fast_path: false, fast_path_score: None, midpoint_em_px, gt_midpoint_em_px, word_seg_summaries, gt_word_seg_summaries, gt_per_char_geo_ll, ocr_corrections: ocr_correction_audit }
     }).collect();
 
     let fp_hits = fast_path_hits.load(Ordering::Relaxed);

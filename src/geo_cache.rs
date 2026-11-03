@@ -341,6 +341,10 @@ pub struct GeometryCache {
     mmap: memmap2::Mmap,
     fonts: HashMap<String, FontMmapIndex>,
     _cache_path: PathBuf,
+    /// Glyph override maps for OT variants (smcp, onum, ss01, ss02).
+    /// Maps font_key -> (char -> overridden glyph ID).
+    /// Populated in-memory from FontRegistry; not serialized in mmap.
+    glyph_overrides: HashMap<String, HashMap<char, u16>>,
 }
 
 impl GeometryCache {
@@ -349,6 +353,17 @@ impl GeometryCache {
     }
 
     pub fn has_font(&self, font_key: &str) -> bool { self.fonts.contains_key(font_key) }
+
+    /// Populate the in-memory glyph override map from the font registry.
+    /// Called after cache load/build since overrides are not serialized in the mmap.
+    pub fn populate_glyph_overrides(&mut self, font_registry: &crate::font_scan::FontRegistry) {
+        for fe in font_registry.entries() {
+            if let Some(ref overrides) = fe.glyph_overrides {
+                let map: HashMap<char, u16> = overrides.iter().cloned().collect();
+                self.glyph_overrides.insert(fe.font_key(), map);
+            }
+        }
+    }
 
     pub fn units_per_em(&self, font_key: &str) -> Option<f64> {
         self.fonts.get(font_key).map(|f| f.upem)
@@ -1067,7 +1082,21 @@ impl GeometryCache {
         }
         let f = self.fonts.get(font_key)?;
         let mut gids: Vec<Option<u16>> = Vec::with_capacity(chars.len());
-        for &c in chars { gids.push(self.cmap_gid(f, c)); }
+        // Use glyph overrides for OT variants (smcp, onum, etc.) — they map
+        // chars to different glyph IDs than the default cmap.
+        let overrides = self.glyph_overrides.get(font_key);
+        for &c in chars {
+            let gid = if let Some(ov) = overrides {
+                if let Some(&ogid) = ov.get(&c) {
+                    Some(ogid)
+                } else {
+                    self.cmap_gid(f, c)
+                }
+            } else {
+                self.cmap_gid(f, c)
+            };
+            gids.push(gid);
+        }
         for g in &gids { if g.is_none() { return None; } }
         let n = gids.len();
         if n==0 {
@@ -1082,6 +1111,12 @@ impl GeometryCache {
         // early case detection to avoid case Vec allocs for 99% path
         let apply_case = Self::is_all_caps_context(chars) && Self::is_allcaps_variant(font_key);
 
+        // Nokern variants disable kerning: the 'kern' OpenType feature is
+        // off during shaping (see layout.rs), so geometry predictions must
+        // also skip pair kerning adjustments. Otherwise the nokern variant
+        // gets identical scores to the kerned variant, which is wrong.
+        let disable_kern = font_key.contains("nokern");
+
         const STACK_CAP: usize = 64;
         let use_stack = n <= STACK_CAP;
 
@@ -1092,7 +1127,7 @@ impl GeometryCache {
             for i in 0..n {
                 singles[i] = self.single_adjustment_full(f, gids[i].unwrap());
             }
-            if n > 1 {
+            if n > 1 && !disable_kern {
                 if f.pair_first_present_off != 0 {
                     let d = self.data();
                     let off = f.pair_first_present_off;
@@ -1128,7 +1163,7 @@ impl GeometryCache {
             let mut case_pair_seconds: [[i32;4]; 64] = [[0;4]; 64];
             if apply_case {
                 for i in 0..n { case_singles[i] = self.case_single_adjustment_full(f, gids[i].unwrap()); }
-                if n > 1 {
+                if n > 1 && !disable_kern {
                     for i in 0..n-1 {
                         let (v1,v2) = self.case_pair_adjustment_full(f, gids[i].unwrap(), gids[i+1].unwrap());
                         case_pair_firsts[i] = v1;
@@ -1172,7 +1207,7 @@ impl GeometryCache {
             }
             let mut pair_firsts: Vec<[i32;4]> = vec![[0;4]; n];
             let mut pair_seconds: Vec<[i32;4]> = vec![[0;4]; n];
-            if n > 1 {
+            if n > 1 && !disable_kern {
                 if f.pair_first_present_off != 0 {
                     let d = self.data();
                     let off = f.pair_first_present_off;
@@ -1211,7 +1246,7 @@ impl GeometryCache {
                 case_pair_firsts = vec![[0;4]; n];
                 case_pair_seconds = vec![[0;4]; n];
                 for i in 0..n { case_singles[i] = self.case_single_adjustment_full(f, gids[i].unwrap()); }
-                if n > 1 {
+                if n > 1 && !disable_kern {
                     for i in 0..n-1 {
                         let (v1,v2) = self.case_pair_adjustment_full(f, gids[i].unwrap(), gids[i+1].unwrap());
                         case_pair_firsts[i] = v1;
@@ -1599,7 +1634,9 @@ impl GeometryCache {
                 Ok((old_cache, old_catalog_hash)) => {
                     if old_catalog_hash == catalog_hash {
                         if !quiet { eprintln!("[geo-cache] Reusing valid Font geometry cache with {} fonts (hash match)", old_cache.fonts.len()); }
-                        return old_cache;
+                        let mut cache = old_cache;
+                        cache.populate_glyph_overrides(font_registry);
+                        return cache;
                     }
                     // Hash mismatch — incremental reuse but keep old_cache for reuse
                     let mut old_owned: HashMap<String, OwnedFont> = HashMap::new();
@@ -1861,18 +1898,22 @@ impl GeometryCache {
 
         let elapsed = t_build_start.elapsed().as_secs_f64();
         if !quiet { eprintln!("[geo-cache] Built Font geometry cache in {:.1}s ({} total, {} reused, {} built, GPOS full incl singles, Unicode both formats)", elapsed, n_total, n_reused, n_built); }
-        let tmp_cache = Self { mmap: memmap2::MmapOptions::new().len(0).map_anon().unwrap().make_read_only().unwrap(), fonts: HashMap::new(), _cache_path: cache_path.clone() };
+        let tmp_cache = Self { mmap: memmap2::MmapOptions::new().len(0).map_anon().unwrap().make_read_only().unwrap(), fonts: HashMap::new(), _cache_path: cache_path.clone(), glyph_overrides: HashMap::new() };
         if let Err(e) = tmp_cache.write_bin_from_owned(&cache_path, catalog_hash, &owned_fonts) {
             eprintln!("warning: failed to write geo cache to {}: {e}", cache_path.display());
         } else {
             if !quiet { eprintln!("[geo-cache] Wrote {} fonts to {}", owned_fonts.len(), cache_path.display()); }
         }
         match Self::load(&cache_path) {
-            Ok((mmap_cache,_)) => mmap_cache,
+            Ok((mmap_cache,_)) => {
+                let mut cache = mmap_cache;
+                cache.populate_glyph_overrides(font_registry);
+                cache
+            },
             Err(e) => {
                 eprintln!("failed to reload just-written cache: {e}, returning empty");
                 let empty_mmap = memmap2::MmapOptions::new().len(0).map_anon().unwrap().make_read_only().unwrap();
-                Self { mmap: empty_mmap, fonts: HashMap::new(), _cache_path: cache_path }
+                Self { mmap: empty_mmap, fonts: HashMap::new(), _cache_path: cache_path, glyph_overrides: HashMap::new() }
             }
         }
     }
@@ -2873,7 +2914,7 @@ impl GeometryCache {
             fonts.insert(font_key, idx.clone());
             ordered.push(idx);
         }
-        Ok((Self { mmap, fonts, _cache_path: path.to_path_buf() }, catalog_hash))
+        Ok((Self { mmap, fonts, _cache_path: path.to_path_buf(), glyph_overrides: HashMap::new() }, catalog_hash))
     }
 
     // compatibility for tests - returns old kern-only view

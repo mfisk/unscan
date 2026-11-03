@@ -15,6 +15,7 @@ canonical-map logic via gen_common.py (single source of truth).
 """
 
 from pathlib import Path
+import os
 
 SCRIPT_DIR = Path(__file__).resolve().parent
 OUT_DIR = SCRIPT_DIR
@@ -41,61 +42,215 @@ def _is_primary_family(base):
     return base not in {"ArialMT", "Arial-BoldMT", "CourierNewPSMT", "TimesNewRomanPSMT",
                          "PrestigeEliteNormal", "NimbusSansL"}
 
-def resolve_all_fonts():
-    """Resolve all font families via fontconfig.
+def resolve_all_fonts(catalog_json=None):
+    """Resolve all font families via the font catalog (not fontconfig).
 
-    Returns (font_paths, all_font_files):
-      font_paths[base] = {'regular': path, 'bold': path, 'italic': path}
+    Per architectural change #2: the specimen must pick catalog entries directly,
+    not rely on fontconfig resolution which can disagree with the Rust scan.
+
+    Returns (font_entries, all_font_files):
+      font_entries[base] = {'regular': entry, 'bold': entry, 'italic': entry}
+        where entry is the catalog dict with 'path' and 'font_key'
       all_font_files: deduplicated list of all resolved TTF paths
+
+    Raises RuntimeError if a family/style has no catalog entry (per Mike's
+    "error out instead of silent skip" rule).
     """
-    font_paths = {}
+    import json
+    import re
+
+    if not catalog_json:
+        raise RuntimeError("resolve_all_fonts requires catalog_json (catalog-based resolution)")
+
+    with open(catalog_json) as f:
+        catalog = json.load(f)
+
+    # Build lookup: normalized family prefix -> list of entries
+    # e.g., "dejavusans" -> [DejaVuSans-400, DejaVuSans-700, ...]
+    def _norm_family(name):
+        # "DejaVu Sans" -> "dejavusans", "EB Garamond" -> "ebgaramond"
+        return re.sub(r'[^a-z0-9]', '', name.lower())
+
+    # Index catalog by normalized font_key prefix
+    # font_key like "DejaVuSans-400" -> prefix "dejavusans"
+    # font_key like "SourceSans3-200[wght=200]" -> prefix "sourcesans3"
+    prefix_to_entries = {}
+    for entry in catalog:
+        fk = entry.get('font_key', '')
+        # Extract family prefix: everything before "-<digit>" (weight)
+        # "SourceSans3-200[wght=200]" -> "SourceSans3"
+        m = re.match(r'^(.+?)-\d', fk)
+        if m:
+            prefix_raw = m.group(1)
+        else:
+            prefix_raw = re.split(r'[|\[]', fk)[0]
+        prefix = _norm_family(prefix_raw)
+        prefix_to_entries.setdefault(prefix, []).append(entry)
+
+    def _find_entry(family, style, base=None):
+        """Find catalog entry for family+style. Errors out if not found or ambiguous.
+        
+        Tries family name first, then base name (if provided), then suffix variations.
+        """
+        candidates = []
+        # Try family name, then base name
+        names_to_try = [family]
+        if base and base != family:
+            names_to_try.append(base)
+        for name in names_to_try:
+            norm = _norm_family(name)
+            candidates = prefix_to_entries.get(norm, [])
+            if candidates:
+                if name != family:
+                    print(f"  NOTE: {family} mapped via base name '{name}'")
+                break
+            # Try suffix variations
+            for suffix in ["ps", "mt", "psmt", "normal"]:
+                candidates = prefix_to_entries.get(norm + suffix, [])
+                if candidates:
+                    print(f"  NOTE: {family} mapped to '{norm + suffix}' variant")
+                    break
+            if candidates:
+                break
+        if not candidates:
+            norm_fam = _norm_family(family)
+            raise RuntimeError(
+                f"No catalog entry for family '{family}' (normalized: '{norm_fam}'). "
+                f"Specimen requires a catalog entry. Fix the catalog or specimen."
+            )
+
+        # Filter by style
+        if style == "Regular":
+            # Want weight 400, not italic, prefer non-variant (or nokern per specimen policy)
+            matches = [e for e in candidates
+                       if '400' in e.get('font_key', '')
+                       and 'italic' not in e.get('font_key', '').lower()]
+        elif style == "Bold":
+            matches = [e for e in candidates
+                       if '700' in e.get('font_key', '')
+                       and 'italic' not in e.get('font_key', '').lower()]
+            if not matches:
+                # Fallback to nearby weights
+                for w in ("800", "900", "600", "500"):
+                    matches = [e for e in candidates
+                               if w in e.get('font_key', '')
+                               and 'italic' not in e.get('font_key', '').lower()]
+                    if matches:
+                        print(f"  NOTE: {family} has no Bold — using weight {w}")
+                        break
+        elif style == "Italic":
+            matches = [e for e in candidates
+                       if 'italic' in e.get('font_key', '').lower()]
+        else:
+            matches = []
+
+        if not matches:
+            raise RuntimeError(
+                f"No catalog entry for '{family}' style '{style}'. "
+                f"Found {len(candidates)} candidates for family, none match style."
+            )
+
+        # Prefer nokern variant (specimen renders with font-kerning: none)
+        nokern = [e for e in matches if 'nokern' in e.get('font_key', '')]
+        if nokern:
+            matches = nokern
+
+        # Prefer opsz=10 if available
+        opsz10 = [e for e in matches if 'opsz=10' in e.get('font_key', '')]
+        if opsz10:
+            matches = opsz10
+
+        # Return first (deterministic: sorted by font_key)
+        matches.sort(key=lambda e: e.get('font_key', ''))
+        return matches[0]
+
+    font_entries = {}
     all_font_files = []
     seen = set()
+
+    # Pre-check: collect all families missing from catalog before starting.
+    # Error out with the complete list (not one-by-one whack-a-mole).
+    missing_families = []
+    for base, family in FAMILIES.items():
+        if not _is_primary_family(base):
+            continue
+        # Try family name first, then base name (e.g., "Prestige Elite" -> "prestigeelite",
+        # but catalog has "prestigeelitenormal" from base "PrestigeEliteNormal")
+        candidates = []
+        for name_to_try in [family, base]:
+            norm = _norm_family(name_to_try)
+            candidates = prefix_to_entries.get(norm, [])
+            if candidates:
+                break
+            # Try suffix variations
+            for suffix in ["ps", "mt", "psmt", "normal"]:
+                candidates = prefix_to_entries.get(norm + suffix, [])
+                if candidates:
+                    break
+            if candidates:
+                break
+        if not candidates:
+            missing_families.append((base, family))
+    if missing_families:
+        msg = "Specimen requires catalog entries for the following families, but they are missing:\n"
+        for base, family in missing_families:
+            msg += f"  - {base}: '{family}'\n"
+        msg += "Fix the catalog (install fonts) or remove them from FAMILIES in gen_common.py."
+        raise RuntimeError(msg)
 
     for base, family in FAMILIES.items():
         if not _is_primary_family(base):
             continue
-        paths = {}
-        reg = fc_find(family, "Regular")
-        paths['regular'] = reg
+        entries = {}
+        reg = _find_entry(family, "Regular", base=base)
+        entries['regular'] = reg
 
         try:
-            bold = fc_find(family, "Bold")
+            bold = _find_entry(family, "Bold", base=base)
         except RuntimeError:
-            bold = None
-            for fallback_style in ("ExtraBold", "Black", "SemiBold", "Medium"):
-                try:
-                    bold = fc_find(family, fallback_style)
-                    print(f"  NOTE: {family} has no Bold — CSS fallback to {fallback_style}")
-                    break
-                except RuntimeError:
-                    continue
-            if bold is None:
-                print(f"  NOTE: {family} has no Bold or nearby weight — using Regular")
-                bold = reg
-        paths['bold'] = bold
+            # WARNING: No Bold in catalog — falling back to Regular (400).
+            # The HTML renders with font-weight:bold, but GT annotation is 400
+            # (the font file used). For families without a true bold variant
+            # (e.g. IBM Plex Serif, Prestige Elite).
+            print(f"  WARNING: {family} has no Bold — falling back to 400")
+            bold = reg
+        entries['bold'] = bold
 
         try:
-            italic = fc_find(family, "Italic")
+            italic = _find_entry(family, "Italic", base=base)
         except RuntimeError:
-            print(f"  NOTE: {family} has no Italic — using Regular")
+            # WARNING: No Italic in catalog — falling back to Regular.
+            # The HTML renders with font-style:italic, but GT annotation is the
+            # regular fontkey (the font file used). For families without a true
+            # italic variant.
+            print(f"  WARNING: {family} has no Italic — falling back to Regular")
             italic = reg
-        paths['italic'] = italic
+        entries['italic'] = italic
 
-        font_paths[base] = paths
-        for p in [reg, bold, italic]:
+        font_entries[base] = entries
+        for e in [reg, bold, italic]:
+            p = e['path']
             if p not in seen:
                 seen.add(p)
                 all_font_files.append(p)
 
-    return font_paths, all_font_files
+    return font_entries, all_font_files
 
 
 def _font_face_css(font_paths):
-    """Generate @font-face CSS rules from resolved font paths."""
+    """Generate @font-face CSS rules from resolved font paths.
+
+    font_paths[base][variant] is either a path string (legacy) or a catalog
+    entry dict with 'path' and 'font_key' (catalog-based resolution).
+    """
     entries = []
     for base, paths in font_paths.items():
-        for variant, path in paths.items():
+        for variant, path_or_entry in paths.items():
+            # Extract path from entry dict or use string directly
+            if isinstance(path_or_entry, dict):
+                path = path_or_entry.get('path', '')
+            else:
+                path = path_or_entry
             weight = '700' if variant == 'bold' else '400'
             style = 'italic' if variant == 'italic' else 'normal'
             entries.append((base, path, weight, style))
@@ -561,9 +716,15 @@ def generate_html(font_paths):
     font_face_css = _font_face_css(font_paths)
 
     # SourceSerif4 for source lines — resolve its italic path
-    ss4_it = font_paths.get("SourceSerif4", {}).get("italic", "")
+    # font_paths values are entry dicts (catalog-based) or path strings (legacy)
+    def _get_path(base, variant):
+        v = font_paths.get(base, {}).get(variant, "")
+        if isinstance(v, dict):
+            return v.get('path', '')
+        return v
+    ss4_it = _get_path("SourceSerif4", "italic")
     # PlayfairDisplay for title
-    pd_reg = font_paths.get("PlayfairDisplay", {}).get("regular", "")
+    pd_reg = _get_path("PlayfairDisplay", "regular")
 
     sections_html = []
     for section in SECTIONS:
@@ -573,6 +734,124 @@ def generate_html(font_paths):
                 f"Font '{rl}' (family '{section['font_family']}') not resolved — "
                 f"run scripts/install-all-fonts.sh to install missing fonts"
             )
+
+        # Get kerning value from catalog entry (architectural: use the kerning
+        # value returned by font catalog matching, which prefers nokern when available)
+        # If entry is not a dict, ERROR OUT (per Mike: no silent fallback, be consistent).
+        def _kerning_css(variant):
+            entry = font_paths[rl].get(variant, {})
+            if not isinstance(entry, dict):
+                raise RuntimeError(
+                    f"Font entry for '{rl}' variant '{variant}' is not a dict: {type(entry)}. "
+                    f"Cannot determine CSS from fontkey. Fix the catalog or specimen."
+                )
+            fk = entry.get('font_key', '')
+            if 'nokern' in fk:
+                return 'font-kerning: none;'
+            return 'font-kerning: normal;'
+        
+        # Get font-weight CSS from catalog entry — MUST match the fontkey exactly.
+        # Planned font -> fontkey -> render. Never hardcode.
+        # If entry is not a dict, ERROR OUT (per Mike: no silent fallback).
+        def _weight_css(variant):
+            entry = font_paths[rl].get(variant, {})
+            if not isinstance(entry, dict):
+                raise RuntimeError(
+                    f"Font entry for '{rl}' variant '{variant}' is not a dict: {type(entry)}. "
+                    f"Cannot determine CSS from fontkey. Fix the catalog or specimen."
+                )
+            fk = entry.get('font_key', '')
+            import re
+            # Check for weight in fontkey. Use precise patterns to avoid substring false positives.
+            # Format examples:
+            #   SourceSerif4-700|wght700[wght=700,opsz=20]
+            #   SourceSerif4-400|nokern[wght=400,opsz=10]
+            #   PrestigeEliteNormal-400 (no suffix)
+            # Look for |wghtNNN or -NNN followed by | or [ or end-of-string
+            if re.search(r'\|wght700\b', fk) or re.search(r'-700([\|\[]|$)', fk):
+                return 'font-weight: bold;'
+            elif re.search(r'\|wght400\b', fk) or re.search(r'-400([\|\[]|$)', fk):
+                return 'font-weight: 400;'
+            # For other weights, extract numeric value
+            m = re.search(r'\|wght(\d+)\b', fk)
+            if m:
+                return f"font-weight: {m.group(1)};"
+            # Try -NNN pattern at end or before |/[
+            m = re.search(r'-(\d+)([\|\[]|$)', fk)
+            if m:
+                weight = m.group(1)
+                # Map common weights to CSS
+                if weight == '700':
+                    return 'font-weight: bold;'
+                elif weight == '400':
+                    return 'font-weight: 400;'
+                else:
+                    return f'font-weight: {weight};'
+            # Else: cannot determine — error out (no silent fallback)
+            raise RuntimeError(
+                f"Cannot determine font-weight for '{rl}' variant '{variant}': "
+                f"fontkey '{fk}' has no recognizable weight info. Fix the catalog."
+            )
+        
+        # Get font-style CSS from catalog entry — MUST match the fontkey exactly.
+        # Planned font -> fontkey -> render. Never hardcode.
+        # If entry is not a dict, ERROR OUT (per Mike: no silent fallback).
+        def _style_css(variant):
+            entry = font_paths[rl].get(variant, {})
+            if not isinstance(entry, dict):
+                raise RuntimeError(
+                    f"Font entry for '{rl}' variant '{variant}' is not a dict: {type(entry)}. "
+                    f"Cannot determine CSS from fontkey. Fix the catalog or specimen."
+                )
+            fk = entry.get('font_key', '').lower()
+            if 'italic' in fk:
+                return 'font-style: italic;'
+            # If variant is 'italic' but fontkey has no 'italic', it's a fallback to Regular.
+            # CSS must match the fontkey (not italic), not the planned variant.
+            return 'font-style: normal;'
+        
+        # Get font-variation-settings CSS from catalog entry — MUST match the fontkey exactly.
+        # Planned font -> fontkey -> render. Never hardcode.
+        # Parses [wght=...,opsz=...] from fontkey and generates CSS.
+        # Note: wght is handled via font-weight (WeasyPrint bug #1981), so we skip it here.
+        # Only opsz (and other non-wght axes) go in font-variation-settings.
+        def _variation_css(variant):
+            entry = font_paths[rl].get(variant, {})
+            if not isinstance(entry, dict):
+                raise RuntimeError(
+                    f"Font entry for '{rl}' variant '{variant}' is not a dict: {type(entry)}. "
+                    f"Cannot determine CSS from fontkey. Fix the catalog or specimen."
+                )
+            fk = entry.get('font_key', '')
+            # Extract variations from [tag=value,...]
+            import re
+            m = re.search(r'\[([^\]]+)\]', fk)
+            if not m:
+                return ''
+            variations = []
+            for part in m.group(1).split(','):
+                part = part.strip()
+                if '=' not in part:
+                    continue
+                tag, value = part.split('=', 1)
+                tag = tag.strip()
+                value = value.strip()
+                # Skip wght (handled via font-weight per WeasyPrint bug #1981)
+                if tag == 'wght':
+                    continue
+                variations.append(f"'{tag}' {value}")
+            if variations:
+                return f"font-variation-settings: {', '.join(variations)};"
+            return ''
+        
+        kern_regular = _kerning_css('regular')
+        kern_bold = _kerning_css('bold')
+        weight_bold = _weight_css('bold')
+        style_italic = _style_css('italic')
+        kern_italic = _kerning_css('italic')
+        var_regular = _variation_css('regular')
+        var_bold = _variation_css('bold')
+        var_italic = _variation_css('italic')
 
         align = "justify" if section.get("alignment") == "justify" else "left"
 
@@ -598,14 +877,14 @@ def generate_html(font_paths):
         sections_html.append(f"""
 <div class="section">
   {img_html}
-  <h2 style="font-family: '{rl}'; font-weight: bold;">{_escape(section["era"])}</h2>
+  <h2 style="font-family: '{rl}'; {weight_bold} {kern_bold} {var_bold}">{_escape(section["era"])}</h2>
   <p class="source">Font: {_escape(section["source"])}</p>
-  <p class="blurb" style="font-family: '{rl}'; text-align: {align};">{blurb}</p>
-  <p class="sample" style="font-family: '{rl}'; font-weight: bold; text-align: {align};">Bold: The quick brown fox jumps over 1,234,567,890 lazy dogs.</p>
-  <p class="sample" style="font-family: '{rl}'; font-style: italic; text-align: {align};">Italic: The quick brown fox jumps over 1,234,567,890 lazy dogs.</p>
-  <p class="alpha" style="font-family: '{rl}';">ABCDEFGHIJKLMNOPQRSTUVWXYZ</p>
-  <p class="alpha" style="font-family: '{rl}';">abcdefghijklmnopqrstuvwxyz</p>
-  <p class="alpha" style="font-family: '{rl}';">Lining figures: 0 1 2 3 4 5 6 7 8 9</p>
+  <p class="blurb" style="font-family: '{rl}'; text-align: {align}; {kern_regular} {var_regular}">{blurb}</p>
+  <p class="sample" style="font-family: '{rl}'; {weight_bold} text-align: {align}; {kern_bold} {var_bold}">Bold: The quick brown fox jumps over 1,234,567,890 lazy dogs.</p>
+  <p class="sample" style="font-family: '{rl}'; {style_italic} text-align: {align}; {kern_italic} {var_italic}">Italic: The quick brown fox jumps over 1,234,567,890 lazy dogs.</p>
+  <p class="alpha" style="font-family: '{rl}'; {kern_regular} {var_regular}">ABCDEFGHIJKLMNOPQRSTUVWXYZ</p>
+  <p class="alpha" style="font-family: '{rl}'; {kern_regular} {var_regular}">abcdefghijklmnopqrstuvwxyz</p>
+  <p class="alpha" style="font-family: '{rl}'; {kern_regular} {var_regular}">Lining figures: 0 1 2 3 4 5 6 7 8 9</p>
 </div>""")
 
     all_sections = "\n".join(sections_html)
@@ -755,18 +1034,48 @@ _rasterize_mod = _imp("rasterize")
 
 
 def main():
-    print("Resolving fonts...")
-    font_paths, all_font_files = resolve_all_fonts()
-    print(f"  {len(font_paths)} font families resolved")
+    # Export font catalog FIRST (architectural change #2: specimen picks from catalog)
+    import os
+    import subprocess
+    import json
+    catalog_json = "/tmp/unprint-catalog.json"
+    print("Exporting font catalog...")
+    script_dir = os.path.dirname(os.path.abspath(__file__))
+    repo_root = os.path.dirname(script_dir)
+    unprint_bin = None
+    for bp in [
+        os.path.join(repo_root, "target", "release", "unprint"),
+        os.path.join(repo_root, "target", "debug", "unprint"),
+    ]:
+        if os.path.exists(bp):
+            unprint_bin = bp
+            break
+    if unprint_bin:
+        try:
+            result = subprocess.run(
+                [unprint_bin, "--export-catalog-json", catalog_json, "-o", "/dev/null", "/dev/null"],
+                capture_output=True, timeout=180)
+            if result.returncode != 0:
+                raise RuntimeError(f"Catalog export failed: {result.stderr.decode()[:500]}")
+        except Exception as e:
+            raise RuntimeError(f"Catalog export failed: {e}. Cannot build specimen without catalog.")
+    else:
+        raise RuntimeError("Unprint binary not found. Cannot build specimen without catalog.")
+
+    print("Resolving fonts from catalog...")
+    font_entries, all_font_files = resolve_all_fonts(catalog_json)
+    print(f"  {len(font_entries)} font families resolved")
     print(f"  {len(all_font_files)} unique font files")
 
     out_pdf = OUT_DIR / "font-timeline-specimen.pdf"
     print(f"Building vector specimen: {out_pdf}")
-    build_specimen(out_pdf, font_paths)
+    build_specimen(out_pdf, font_entries)
 
     # Build canonical map from actual PDF BaseFont names
+    # Uses font_entries directly (the exact entries used during generation)
+    # This ensures the annotation matches the render for variable fonts.
     print("Building canonical map from PDF font names...")
-    canonical_map = build_canonical_map_from_pdf(str(out_pdf), all_font_files)
+    canonical_map = build_canonical_map_from_pdf(str(out_pdf), all_font_files, catalog_json, font_entries)
     print(f"  {len(canonical_map)} mappings built")
 
     # Annotate font dictionaries with /UnprintCanonical
