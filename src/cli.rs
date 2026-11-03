@@ -119,6 +119,21 @@ pub struct Args {
     #[arg(long, value_name = "PS:WEIGHT", help_heading = "Classifier")]
     pub weight_explicit: Vec<String>,
 
+    /// Resolve a font file path to its verbatim catalog font_key.
+    /// Pass one or more font file paths. Prints the exact font_key
+    /// from the catalog (including |nokern, [wght=...], etc.) to stdout
+    /// and exits. This is the single source of truth for fontkeys —
+    /// Python must use this instead of constructing keys manually.
+    /// Per Mike Nov 3: Python should use verbatim strings from the catalog.
+    #[arg(long, value_name = "PATH", help_heading = "Classifier")]
+    pub resolve_fontkey: Vec<String>,
+
+    /// Export the font catalog as JSON to the given path and exit.
+    /// The JSON contains all FontEntry records with their exact font_key,
+    /// path, postscript_name, variant_tag, and variations.
+    #[arg(long, value_name = "PATH", help_heading = "Classifier")]
+    pub export_catalog_json: Option<String>,
+
     // ── Render options ─────────────────────────────────────────────
     /// Render scale multiplier for reference character images.
     #[arg(long, default_value = "1", help_heading = "Render")]
@@ -201,6 +216,9 @@ impl Args {
     /// Validate: require input and output (unless --test or non-scan mode).
     pub fn validate(&self) -> Result<(), String> {
         if !self.weight_explicit.is_empty() {
+            return Ok(());
+        }
+        if !self.resolve_fontkey.is_empty() {
             return Ok(());
         }
         if self.input.is_none() {
