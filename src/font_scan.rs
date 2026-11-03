@@ -1519,7 +1519,7 @@ pub fn scan_fonts(dirs: &[PathBuf], quiet: bool) -> Vec<FontEntry> {
                     let nokern_entry = FontEntry {
                         path: fe.path.clone(),
                         family_name: format!("{} [nokern]", fe.family_name),
-                        postscript_name: format!("{}|nokern", fe.postscript_name),
+                        postscript_name: fe.postscript_name.clone(),
                         raw_postscript_name: fe.raw_postscript_name.clone(),
                         is_bold: fe.is_bold,
                         is_italic: fe.is_italic,
@@ -1528,7 +1528,7 @@ pub fn scan_fonts(dirs: &[PathBuf], quiet: bool) -> Vec<FontEntry> {
                         oldstyle_figures: fe.oldstyle_figures,
                         variant_tag: nokern_tag.clone(),
                         font_key_cache: FontEntry::compute_font_key_full(
-                            &format!("{}|nokern", fe.postscript_name),
+                            &fe.postscript_name,
                             &nokern_tag,
                             None,
                             &fe.variations,
@@ -1545,7 +1545,7 @@ pub fn scan_fonts(dirs: &[PathBuf], quiet: bool) -> Vec<FontEntry> {
                         let nokern_opsz10_entry = FontEntry {
                             path: fe.path.clone(),
                             family_name: format!("{} [nokern]", fe.family_name),
-                            postscript_name: format!("{}|nokern", fe.postscript_name),
+                            postscript_name: fe.postscript_name.clone(),
                             raw_postscript_name: fe.raw_postscript_name.clone(),
                             is_bold: fe.is_bold,
                             is_italic: fe.is_italic,
@@ -1554,7 +1554,7 @@ pub fn scan_fonts(dirs: &[PathBuf], quiet: bool) -> Vec<FontEntry> {
                             oldstyle_figures: fe.oldstyle_figures,
                             variant_tag: nokern_tag.clone(),
                             font_key_cache: FontEntry::compute_font_key_full(
-                                &format!("{}|nokern", fe.postscript_name),
+                                &fe.postscript_name,
                                 &nokern_tag,
                                 None,
                                 &Some(opsz10_vars.clone()),
@@ -2213,22 +2213,17 @@ fn font_has_kern_feature(data: &[u8]) -> bool {
         Ok(f) => f,
         Err(_) => return false,
     };
-    // Check GPOS for 'kern' feature tag
-    let tag = unprint_fonts::ttf_parser::Tag::from_bytes(b"GPOS");
-    let Some(tbl) = face.raw_face().table(tag) else { return false };
-    if tbl.len() < 10 { return false; }
-    let feature_list_off = u16::from_be_bytes([tbl[6], tbl[7]]) as usize;
-    if feature_list_off + 2 > tbl.len() { return false; }
-    let feature_count = u16::from_be_bytes([tbl[feature_list_off], tbl[feature_list_off+1]]) as usize;
-    for i in 0..feature_count {
-        let rec_off = feature_list_off + 2 + i*6;
-        if rec_off + 6 > tbl.len() { break; }
-        let t = &tbl[rec_off..rec_off+4];
-        if t == b"kern" {
-            return true;
-        }
+    // Check for old-style 'kern' table
+    let kern_tag = unprint_fonts::ttf_parser::Tag::from_bytes(b"kern");
+    if face.raw_face().table(kern_tag).is_some() {
+        return true;
     }
-    false
+    // If font has GPOS, assume it may have kerning and create nokern variant.
+    // This is conservative (may create unnecessary variants) but correct
+    // (won't miss fonts that need the variant). Manual FeatureList parsing
+    // proved fragile across variable fonts.
+    let gpos_tag = unprint_fonts::ttf_parser::Tag::from_bytes(b"GPOS");
+    face.raw_face().table(gpos_tag).is_some()
 }
 
 /// Ligature probe sequences: (input_chars, unicode_ligature_char).
