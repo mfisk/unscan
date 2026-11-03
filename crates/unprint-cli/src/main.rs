@@ -80,6 +80,105 @@ fn main() {
         std::process::exit(0);
     }
 
+    // ── resolve-fontkey: path -> verbatim catalog font_key ────────────
+    // Per Mike Nov 3: Python must use verbatim strings from the catalog,
+    // not construct fontkeys. This is the single source of truth.
+    if !args.resolve_fontkey.is_empty() {
+        let font_dirs = font_scan::default_font_dirs(&args.font_dir);
+        let catalog = font_scan::scan_fonts(&font_dirs, args.quiet);
+        // Build path -> best entry map (prefer nokern, then opsz=10)
+        // Same preference logic as Python was doing, now in Rust.
+        use std::collections::HashMap;
+        use std::path::PathBuf;
+        let mut path_to_entry: HashMap<PathBuf, &font_scan::FontEntry> = HashMap::new();
+        for fe in &catalog {
+            let path = fe.path.clone();
+            let existing = path_to_entry.get(&path);
+            let should_replace = match existing {
+                None => true,
+                Some(existing_fe) => {
+                    let entry_nokern = fe.font_key().contains("nokern");
+                    let existing_nokern = existing_fe.font_key().contains("nokern");
+                    if entry_nokern && !existing_nokern {
+                        true
+                    } else if entry_nokern == existing_nokern {
+                        // Prefer opsz=10
+                        let entry_opsz10 = fe.font_key().contains("opsz=10");
+                        let existing_opsz10 = existing_fe.font_key().contains("opsz=10");
+                        entry_opsz10 && !existing_opsz10
+                    } else {
+                        false
+                    }
+                }
+            };
+            if should_replace {
+                path_to_entry.insert(path, fe);
+            }
+        }
+        for path_str in &args.resolve_fontkey {
+            let path = PathBuf::from(path_str);
+            match path_to_entry.get(&path) {
+                Some(fe) => println!("{}", fe.font_key()),
+                None => {
+                    eprintln!("No catalog entry for path {:?}", path_str);
+                    std::process::exit(1);
+                }
+            }
+        }
+        std::process::exit(0);
+    }
+
+    // ── export-catalog-json: dump FontEntry records and exit ─────────
+    if let Some(out_path) = &args.export_catalog_json {
+        use serde::Serialize;
+        use std::collections::HashMap;
+        #[derive(Serialize)]
+        struct CatalogEntry {
+            font_key: String,
+            path: String,
+            /// All file paths with identical content (deduped by Rust scan).
+            /// The primary `path` is the canonical one; others are byte-identical duplicates.
+            all_paths: Vec<String>,
+            postscript_name: String,
+            variant_tag: String,
+        }
+        // Load the font catalog (same as classifier does)
+        let font_dirs = font_scan::default_font_dirs(&args.font_dir);
+        let catalog = font_scan::scan_fonts(&font_dirs, args.quiet);
+        // Group by font_key to collect all deduped paths.
+        // scan_fonts() dedupes by content hash, keeping one path per font_key.
+        // For explicitness, we re-scan without dedup to find all paths.
+        // Simpler: use the primary path; the Python fallback handles duplicates via size matching.
+        // TODO: Implement full duplicate tracking in scan_fonts() for complete explicitness.
+        // Build lightweight export records (no font bytes)
+        // Note: postscript_name is the CLEAN name from the font file (raw_postscript_name),
+        // not the variant-suffixed version. This ensures exact matching with PDF BaseFont names.
+        let export: Vec<CatalogEntry> = catalog.iter().map(|fe| {
+            let primary = fe.path.to_string_lossy().to_string();
+            CatalogEntry {
+                font_key: fe.font_key(),
+                path: primary.clone(),
+                all_paths: vec![primary],
+                postscript_name: fe.raw_postscript_name.clone(),
+                variant_tag: fe.variant_tag.clone(),
+            }
+        }).collect();
+        // Serialize to JSON
+        let json = match serde_json::to_string_pretty(&export) {
+            Ok(j) => j,
+            Err(e) => {
+                eprintln!("Failed to serialize catalog: {}", e);
+                std::process::exit(1);
+            }
+        };
+        if let Err(e) = std::fs::write(out_path, json) {
+            eprintln!("Failed to write {}: {}", out_path, e);
+            std::process::exit(1);
+        }
+        println!("Exported {} font entries to {}", export.len(), out_path);
+        std::process::exit(0);
+    }
+
     // ── Build the classifier based on --classifier flag ──────────────
     let mut clf: Box<dyn classifier::Classifier> = classifier::build_classifier(
         &args.classifier,
@@ -374,7 +473,7 @@ fn build_audit_entry(
         word_segmentation: lm.word_seg_summaries.clone(),
         gt_word_segmentation: lm.gt_word_seg_summaries.clone(),
         ocr_corrections: lm.ocr_corrections.clone(),
-        gt_per_char_geo_ll: Vec::new(),
+        gt_per_char_geo_ll: lm.gt_per_char_geo_ll.clone(),
         gt_pruned: false,
     }
 }
@@ -596,7 +695,7 @@ fn run(args: &cli::Args, classifier: &mut dyn classifier::Classifier) -> Result<
                         overrides.and_then(|ovs| ovs.iter().find(|(ch, _)| *ch == *c).map(|(_, g)| unprint_fonts::ab_glyph::GlyphId(*g)))
                     }).collect();
 
-                    let img = match char_render::render_ngram_fresh(&font, seq, &gid_overrides, &render_params) {
+                    let img = match char_render::render_ngram_fresh(&font, seq, &gid_overrides, &render_params, fe.variant_tag.contains("nokern")) {
                         Some(img) => img,
                         None => continue,
                     };

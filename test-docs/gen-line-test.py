@@ -44,6 +44,8 @@ HARDCODED = [
     ("PTSerif-400Italic", "Italic: The quick brown fox jumps over 1,234,567,890 lazy"),
     ("SourceSerif4-400It", "Font: Originally for IBM Executive typewriters — 12 characters per inch"),
     ("Georgia-400", "Matthew Carter created Georgia in 1993."),
+    ("Arial-ItalicMT-400Italic", "Italic: The quick brown fox jumps over 1,234,567,890"),
+    ("SourceSerif4-400It", "Font: fonts.google.com/specimen/Jost — OFL, Owen Earl"),
 ]
 
 def parse_args():
@@ -69,6 +71,41 @@ def main():
         print("Usage:")
         print("  gen-line-test.py --hardcoded")
         sys.exit(1)
+
+    # Find unprint binary for --resolve-fontkey.
+    # Per Mike Nov 3: Python must use verbatim catalog fontkeys via Rust,
+    # not construct them or match in Python. The --resolve-fontkey flag
+    # is the single source of truth.
+    import subprocess
+    repo_root = SCRIPT_DIR.parent
+    unprint_bin = None
+    for bp in [
+        repo_root / "target" / "release" / "unprint",
+        repo_root / "target" / "debug" / "unprint",
+    ]:
+        if bp.exists():
+            unprint_bin = str(bp)
+            break
+    if not unprint_bin:
+        print("ERROR: unprint binary not found, cannot resolve verbatim fontkeys", file=sys.stderr)
+        sys.exit(1)
+
+    def resolve_fontkey_verbatim(ttf_path):
+        """Get verbatim fontkey from Rust via --resolve-fontkey."""
+        try:
+            r = subprocess.run(
+                [unprint_bin, "--resolve-fontkey", str(ttf_path)],
+                capture_output=True, text=True, timeout=30
+            )
+            if r.returncode == 0:
+                return r.stdout.strip()
+            else:
+                print(f"ERROR: --resolve-fontkey failed for {ttf_path}: {r.stderr}", file=sys.stderr)
+                sys.exit(1)
+        except Exception as e:
+            print(f"ERROR: Failed to resolve fontkey for {ttf_path}: {e}", file=sys.stderr)
+            sys.exit(1)
+
     ttf_paths_for_map = []
     lines = []
     font_face_entries = []
@@ -84,11 +121,15 @@ def main():
                 print(f"ERROR: empty line for font '{expected_font}'", file=sys.stderr)
                 sys.exit(1)
             print(f"hardcoded: text='{text}', expected={expected_font}")
-            ttf_path, canonical_name, css_weight, css_style = resolve_expected_font(expected_font)
-            print(f"  font: {ttf_path}, canonical: {canonical_name}")
+            ttf_path, _, css_weight, css_style = resolve_expected_font(expected_font)
+            # Use verbatim fontkey from Rust via --resolve-fontkey.
+            # Per Mike Nov 3: Python must use verbatim strings from catalog,
+            # not construct them. Rust is the single source of truth.
+            verbatim_key = resolve_fontkey_verbatim(ttf_path)
+            print(f"  font: {ttf_path}, canonical: {verbatim_key} (verbatim from catalog)")
             ttf_paths_for_map.append(ttf_path)
-            font_face_entries.append((canonical_name, ttf_path, css_weight, css_style))
-            lines.append((text, canonical_name, str(ttf_path), css_weight, css_style))
+            font_face_entries.append((verbatim_key, ttf_path, css_weight, css_style))
+            lines.append((text, verbatim_key, str(ttf_path), css_weight, css_style))
     else:
         if ':' in args[0]:
             page_lines = [(int(a.split(':')[0]), int(a.split(':')[1])) for a in args]
@@ -113,10 +154,14 @@ def main():
                 sys.exit(1)
             if not text.endswith('.'):
                 text += '.'
-            ttf_path, canonical_name, css_weight, css_style = resolve_expected_font(expected_font)
+            ttf_path, _, css_weight, css_style = resolve_expected_font(expected_font)
+            # Use verbatim fontkey from Rust via --resolve-fontkey.
+            # Per Mike Nov 3: Python must use verbatim strings from catalog,
+            # not construct them. Rust is the single source of truth.
+            verbatim_key = resolve_fontkey_verbatim(ttf_path)
             ttf_paths_for_map.append(ttf_path)
-            font_face_entries.append((canonical_name, ttf_path, css_weight, css_style))
-            lines.append((text, canonical_name, str(ttf_path), css_weight, css_style))
+            font_face_entries.append((verbatim_key, ttf_path, css_weight, css_style))
+            lines.append((text, verbatim_key, str(ttf_path), css_weight, css_style))
 
     for text, _, _, _, _ in lines:
         if not text.strip():
@@ -136,6 +181,36 @@ def main():
         stripped = text.rstrip('.').strip()
         is_alpha = stripped in ("abcdefghijklmnopqrstuvwxyz", "ABCDEFGHIJKLMNOPQRSTUVWXYZ")
         pt = 9 if is_alpha else 10
+        # Make variations explicit in the CSS to match the font catalog's
+        # explicit variants (e.g. SourceSerif4 [wght=400,opsz=10]). Without
+        # this, Pango uses font defaults, causing systematic mismatches
+        # between the PDF and our predictor. Emit ALL fvar axes.
+        variation_css = ""
+        try:
+            from fontTools.ttLib import TTFont
+            _f = TTFont(ttf_path, lazy=True)
+            if 'fvar' in _f:
+                _settings = []
+                for _ax in _f['fvar'].axes:
+                    _tag = _ax.axisTag
+                    # SKIP wght: font-weight CSS already controls weight.
+                    # Including 'wght' triggers WeasyPrint issue #1981.
+                    if _tag == 'wght':
+                        continue
+                    # Catalog uses explicit optical-size-10 variants;
+                    # other axes use their fvar defaults.
+                    if _tag == 'opsz':
+                        _val = 10.0
+                    else:
+                        _val = _ax.defaultValue
+                    # Format as int if whole number
+                    _vstr = str(int(_val)) if _val == int(_val) else str(_val)
+                    _settings.append(f"'{_tag}' {_vstr}")
+                if _settings:
+                    variation_css = "font-variation-settings: " + ", ".join(_settings) + "; "
+            _f.close()
+        except Exception:
+            pass
         # Keep first 10 lines (8 + 2) together to share word-gap stats and prevent
         # alphabet j/k split. Only isolate the final Matthew Carter line.
         if idx == len(lines) - 1 and len(lines) > 8:
@@ -143,6 +218,12 @@ def main():
         lines_html.append(
             f'<p style="font-family: \'{canonical_name}\'; '
             f'font-weight: {css_weight}; font-style: {css_style}; '
+            f'{variation_css}'
+            f'font-kerning: none; '
+            f'font-variant-caps: normal; '
+            f'font-variant-numeric: lining-nums; '
+            f'font-variant-ligatures: normal; '
+            f'font-feature-settings: "ss01" 0, "ss02" 0, "case" 0, "cpsp" 0, "dlig" 0; '
             f'font-size: {pt}pt; white-space: nowrap; margin:0; padding:0;">'
             f'{_escape(text)}</p>'
         )
@@ -182,7 +263,16 @@ p {{
     gt_pdf = str(SCRIPT_DIR / "line-test-gt.pdf")
     render_html_to_pdf(html, gt_pdf, base_url=SCRIPT_DIR)
     print(f"wrote: {gt_pdf}")
-    canonical_map = build_canonical_map_from_pdf(gt_pdf, ttf_paths_for_map)
+    # Export catalog for GT annotation via build_canonical_map_from_pdf.
+    # The map uses verbatim fontkeys from the catalog.
+    catalog_json = "/tmp/unprint-catalog.json"
+    try:
+        subprocess.run([unprint_bin, "--export-catalog-json", catalog_json],
+                     capture_output=True, timeout=120)
+    except Exception as e:
+        print(f"ERROR: Failed to export catalog: {e}", file=sys.stderr)
+        sys.exit(1)
+    canonical_map = build_canonical_map_from_pdf(gt_pdf, ttf_paths_for_map, catalog_json)
     annotated, missing = annotate_canonical_names(gt_pdf, canonical_map)
     print(f"annotated {annotated} fonts, missing: {missing}")
     rast_pdf = str(SCRIPT_DIR / "line-test.pdf")

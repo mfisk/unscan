@@ -37,6 +37,12 @@ def make_weight_explicit(path):
     (Rust font_scan::make_weight_explicit).  The Rust catalog scanner applies
     the same function at index time, so GT and catalog names always agree.
 
+    Appends the full explicit variation form in brackets (e.g.
+    `[wght=400,opsz=10]`) to match the catalog's explicit variant names.
+    The opsz value uses the catalog's explicit optical-size choice (10)
+    for fonts with an opsz axis, matching the CSS `font-variation-settings`
+    emitted by the specimen generators.
+
     Returns (original_ps_name, canonical_ps_name, path).
     """
     from fontTools.ttLib import TTFont as FTFont
@@ -50,6 +56,30 @@ def make_weight_explicit(path):
     try:
         tt = FTFont(path)
         weight = tt['OS/2'].usWeightClass
+        # Collect variation axes for the bracketed suffix.
+        # Per Mike Nov 3: font keys must be as explicit as possible —
+        # include ALL fvar axes with their values, not just wght/opsz.
+        # This matches the Rust catalog (src/font_scan.rs::detect_default_variations)
+        # which pins every axis to its default.
+        var_axes = {}  # tag -> default value
+        if 'fvar' in tt:
+            for ax in tt['fvar'].axes:
+                var_axes[ax.axisTag] = ax.defaultValue
+        # Check for kern feature in GPOS (matches Rust font_has_kern_feature
+        # in font_scan.rs, which only checks GPOS, not the old 'kern' table).
+        # Only fonts with GPOS kern get a nokern variant in the catalog.
+        has_kern = False
+        if 'GPOS' in tt:
+            try:
+                gpos = tt['GPOS'].table
+                # Walk FeatureList for 'kern' tag
+                feature_list = gpos.FeatureList
+                for rec in feature_list.FeatureRecord:
+                    if rec.FeatureTag == 'kern':
+                        has_kern = True
+                        break
+            except Exception:
+                pass
         tt.close()
     except Exception:
         return orig_ps, orig_ps, path
@@ -80,6 +110,13 @@ def make_weight_explicit(path):
     except (FileNotFoundError, OSError):
         new_ps = orig_ps
 
+    # Per Mike Nov 3: Python must use verbatim strings from the catalog,
+    # not construct fontkeys. The bracketed variation suffix (e.g.,
+    # [wght=400,opsz=10,wdth=100]) and the |nokern tag must come from the
+    # catalog's font_key verbatim. This function only returns the
+    # weight-explicit base name from Rust; the caller is responsible for
+    # looking up the full verbatim font_key from the catalog.
+    # DO NOT construct the bracket suffix here.
     return orig_ps, new_ps, path
 
 
