@@ -978,7 +978,9 @@ impl GroundTruth {
                 let raw = strip_subset_prefix(&span.font_name).to_string();
                 // If the name already matches a canonical postscript_name
                 // (e.g., from /UnprintCanonical in an annotated PDF), keep it.
-                if catalog.iter().any(|fe| fe.postscript_name == raw) {
+                // Also accept the full explicit form with bracketed variations
+                // (e.g., "SourceSerif4-400Italic[wght=400,opsz=10]").
+                if catalog.iter().any(|fe| fe.postscript_name == raw || fe.font_key() == raw) {
                     span.font_name = raw;
                 } else if let Some(fe) = catalog.iter().find(|fe| fe.raw_postscript_name == raw) {
                     // Wild PDF: map raw PS name → canonical via catalog.

@@ -90,6 +90,7 @@ pub struct FontIdResult {
     pub observations: Vec<ObservationDetail>,      // winning font
     pub gt_observations: Vec<ObservationDetail>,   // GT font (from ensure list) if present
     pub path_score: f32,
+    pub gt_per_char_geo_ll: Vec<f32>,              // GT font per-char (h_ll+v_ll), empty if no GT
 }
 
 struct SegCacheEntry {
@@ -115,7 +116,7 @@ pub fn identify_fonts(
     geo_cache: &crate::geo_cache::GeometryCache,
 ) -> FontIdResult {
     if word_infos.is_empty() {
-        return FontIdResult { scores: Vec::new(), observations: Vec::new(), gt_observations: Vec::new(), path_score: f32::MIN };
+        return FontIdResult { scores: Vec::new(), observations: Vec::new(), gt_observations: Vec::new(), path_score: f32::MIN, gt_per_char_geo_ll: Vec::new() };
     }
 
     let mut seg_caches: Vec<HashMap<usize, SegCacheEntry>> =
@@ -138,6 +139,7 @@ pub fn identify_fonts(
     // Two-pass: pass 0 with geometry pruning; if no non-ensure fonts survive,
     // pass 1 disables pruning so the glyph classifier gets a chance.
     let mut gt_median_ll_pass0: f32 = f32::INFINITY;
+    let mut gt_per_char_ll_final: Vec<f32> = Vec::new();
     for pass in 0..2 {
         let do_prune = pass == 0;
         if pass == 1 {
@@ -343,7 +345,7 @@ pub fn identify_fonts(
                 let mut lls: Vec<f32> = geos.iter().map(|g| (g.h_ll + g.v_ll) as f32).collect();
                 lls.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
                 let median_ll = if lls.is_empty() { f32::INFINITY } else { lls[lls.len() / 2] };
-                if is_ensure { gt_median_ll = median_ll; }
+                if is_ensure { gt_median_ll = median_ll; gt_per_char_ll_final = lls.clone(); }
                 if do_prune && !is_ensure && median_ll < prune_threshold { pruned_count+=1; continue; }
                 // fill grid after prune check – same geos reused
                 for g in geos {
@@ -569,10 +571,10 @@ pub fn identify_fonts(
     }
 
     if scored.is_empty() {
-        return FontIdResult { scores: Vec::new(), observations: best_observations, gt_observations, path_score: f32::MIN };
+        return FontIdResult { scores: Vec::new(), observations: best_observations, gt_observations, path_score: f32::MIN, gt_per_char_geo_ll: Vec::new() };
     }
 
     scored.sort_unstable_by(|a,b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal).then_with(|| a.0.cmp(&b.0)));
 
-    FontIdResult { scores: scored, observations: best_observations, gt_observations, path_score: best_path_score }
+    FontIdResult { scores: scored, observations: best_observations, gt_observations, path_score: best_path_score, gt_per_char_geo_ll: gt_per_char_ll_final }
 }

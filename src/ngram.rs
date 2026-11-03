@@ -74,9 +74,8 @@ pub fn build_ngram_glyph_map(
                 overrides.and_then(|ovs| ovs.iter().find(|(ch, _)| *ch == *c).map(|(_, g)| unprint_fonts::ab_glyph::GlyphId(*g)))
             }).collect();
 
-            if let Some(img) = crate::char_render::render_ngram_fresh(
-                &font, seq, &gid_overrides, &params,
-            ) {
+            if let Some(img) = crate::char_render::render_ngram_fresh(&font, seq, &gid_overrides, &params, false
+                    ) {
                 let hash = crate::glyph_map::hash_image(&img);
                 // Write image cache — always atomic; heals partial files from killed runs.
                 // Must use explicit encoder: `img.save(.tmp)` fails when extension is `.tmp`.
@@ -234,7 +233,7 @@ pub fn generate_ngram_training_data(
                         params.aa = aa;
 
                         let img = match crate::char_render::render_ngram_fresh(
-                            &font, &[c1, c2], &gid_overrides, &params,
+                            &font, &[c1, c2], &gid_overrides, &params, false,
                         ) {
                             Some(img) => img,
                             None => continue,

@@ -890,11 +890,7 @@ pub fn run_train(mut args: TrainArgs) {
                             })
                         })
                         .collect();
-                    if let Some(img) = crate::char_render::render_ngram_fresh(
-                        &font,
-                        seq,
-                        &gid_overrides,
-                        &prewarm_params,
+                    if let Some(img) = crate::char_render::render_ngram_fresh(&font, seq, &gid_overrides, &prewarm_params, false
                     ) {
                         let hash = crate::glyph_map::hash_image(&img);
                         let path = crate::char_render::ngram_cache_path(seq, hash, &prewarm_params);
@@ -1258,20 +1254,12 @@ pub fn run_train(mut args: TrainArgs) {
                                 .hash_for_font(seq, &fk)
                                 .and_then(|hash| crate::char_render::load_cached_ngram(seq, hash, &params))
                                 .or_else(|| {
-                                    crate::char_render::render_ngram_fresh(
-                                        &font,
-                                        seq,
-                                        &gid_overrides,
-                                        &params,
-                                    )
+                                    crate::char_render::render_ngram_fresh(&font, seq, &gid_overrides, &params, false
+                    )
                                 })
                         } else {
-                            crate::char_render::render_ngram_fresh(
-                                &font,
-                                seq,
-                                &gid_overrides,
-                                &params,
-                            )
+                            crate::char_render::render_ngram_fresh(&font, seq, &gid_overrides, &params, false
+                    )
                         };
                         let img = match img {
                             Some(img) => img,
@@ -1422,7 +1410,7 @@ pub fn run_train(mut args: TrainArgs) {
                         let mut params = args.render_params.clone();
                         params.height = info.ht;
                         params.aa = all_aa[info.aa_idx];
-                        let img = crate::char_render::render_ngram_fresh(&font, seq, &gid_overrides, &params);
+                        let img = crate::char_render::render_ngram_fresh(&font, seq, &gid_overrides, &params, false);
                         let img = match img { Some(i)=>i, None=>continue };
                         let feats = match compute_features(&img, false) { Some(f)=>f, None=>continue };
                         {

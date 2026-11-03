@@ -689,6 +689,14 @@ pub fn word_scales_for_font(
         let Some(pred) = geo_cache.predict_glyph_positions(font_key, &seg.chars) else { continue };
         if pred.len() < 2 { continue; }
         let Some(s) = crate::geometry_scale::center_span_scale(obs_first, obs_last, pred[0].0, pred[pred.len()-1].0) else { continue };
+        // DEBUG: log per-word scale for em_px debugging
+        if std::env::var("UNPRINT_DEBUG_EM_PX").is_ok() {
+            let word: String = seg.chars.iter().collect();
+            let obs_span = obs_last - obs_first;
+            let pred_span = pred[pred.len()-1].0 - pred[0].0;
+            eprintln!("[EM_PX_DEBUG] font={} word='{}' obs_span={:.2} pred_span={:.2} scale={:.4}",
+                font_key, word, obs_span, pred_span, s);
+        }
         scales.push(s);
     }
     scales

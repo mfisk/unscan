@@ -177,7 +177,8 @@ pub fn render_ngram(
             .and_then(|ovs| ovs.iter().find(|(ch, _)| *ch == *c).map(|(_, g)| GlyphId(*g)))
     }).collect();
 
-    let img = render_ngram_fresh(&font, seq, &gid_overrides, params)?;
+    let disable_kern = fe.variant_tag.contains("nokern");
+    let img = render_ngram_fresh(&font, seq, &gid_overrides, params, disable_kern)?;
     let img_hash = glyph_map::hash_image(&img);
 
     // Update glyph_map
@@ -197,6 +198,7 @@ pub fn render_ngram_fresh<F: Font>(
     seq: &[char],
     gid_overrides: &[Option<GlyphId>],
     params: &RenderParams,
+    disable_kern: bool,
 ) -> Option<GrayImage> {
     if seq.is_empty() {
         return None;
@@ -242,12 +244,13 @@ pub fn render_ngram_fresh<F: Font>(
     let sf = font.as_scaled(scale);
     let baseline_y = sf.ascent();
 
-    // Position glyphs with advances and kerning
+    // Position glyphs with advances and kerning (unless disabled for nokern variants)
     let mut x_pos = Vec::with_capacity(gids.len());
     x_pos.push(0.0f32);
     for i in 1..gids.len() {
         let prev_x = x_pos[i - 1];
-        x_pos.push(prev_x + sf.h_advance(gids[i - 1]) + sf.kern(gids[i - 1], gids[i]));
+        let kern = if disable_kern { 0.0 } else { sf.kern(gids[i - 1], gids[i]) };
+        x_pos.push(prev_x + sf.h_advance(gids[i - 1]) + kern);
     }
 
     // Outline all glyphs and compute combined bounding box
@@ -407,7 +410,7 @@ pub fn render_ref_chars(json_str: &str) {
         if font.glyph_id(c).0 == 0 {
             continue;
         }
-        if let Some(img) = render_ngram_fresh(&font, &[c], &[None], &RenderParams::default()) {
+        if let Some(img) = render_ngram_fresh(&font, &[c], &[None], &RenderParams::default(), false) {
             let fname = format!("U+{:04X}.png", c as u32);
             let final_path = out.join(&fname);
             let _ = atomic_save_png(&img, &final_path);
