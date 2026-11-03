@@ -1075,7 +1075,9 @@ def main():
     # Uses font_entries directly (the exact entries used during generation)
     # This ensures the annotation matches the render for variable fonts.
     print("Building canonical map from PDF font names...")
-    canonical_map = build_canonical_map_from_pdf(str(out_pdf), all_font_files, catalog_json, font_entries)
+    canonical_map = build_canonical_map_from_pdf(
+        str(out_pdf), all_font_files, catalog_json, font_entries, unprint_bin
+    )
     print(f"  {len(canonical_map)} mappings built")
 
     # Annotate font dictionaries with /UnprintCanonical
