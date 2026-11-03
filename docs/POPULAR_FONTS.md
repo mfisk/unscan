@@ -4,7 +4,7 @@ This guide covers the most common font families you'll encounter in scanned
 documents, organised by document type. Install the right fonts and unprint
 will match them accurately; miss one and that text stays raster.
 
-> **Quick install:** `bash scripts/install-all-fonts.sh` handles everything
+> **Quick install:** `bash tools/install-all-fonts.sh` handles everything
 > listed here in one shot. See [`FONT_INSTALL.md`](FONT_INSTALL.md) for
 > details on what the script does.
 

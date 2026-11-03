@@ -13,7 +13,7 @@ If a font is missing, install the real font from Google Fonts or the upstream di
 Run the automated installer:
 
 ```bash
-sudo bash scripts/install-all-fonts.sh
+sudo bash tools/install-all-fonts.sh
 ```
 
 This script:
@@ -40,7 +40,7 @@ Real fonts are installed to:
 ## Installation
 
 ```bash
-./scripts/install-all-fonts.sh
+./tools/install-all-fonts.sh
 ```
 
 ## Why this matters
