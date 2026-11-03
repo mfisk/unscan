@@ -19,6 +19,23 @@ from pathlib import Path
 SCRIPT_DIR = Path(__file__).resolve().parent
 REPO_ROOT = SCRIPT_DIR.parent
 
+
+def resolve_fontkey_via_api(unprint_bin, font_path):
+    """Get verbatim font_key from Rust catalog via --resolve-fontkey.
+
+    This is the single source of truth for fontkeys. Never construct
+    fontkeys in Python; always ask Rust.
+    """
+    result = subprocess.run(
+        [unprint_bin, "--resolve-fontkey", font_path],
+        capture_output=True, text=True, timeout=30
+    )
+    if result.returncode != 0:
+        raise RuntimeError(
+            f"--resolve-fontkey failed for {font_path}: {result.stderr[:200]}"
+        )
+    return result.stdout.strip()
+
 # Ensure tools/ is on path for pdf_font_annotate / rasterize
 sys.path.insert(0, str(REPO_ROOT / "tools"))
 from pdf_font_annotate import make_weight_explicit, annotate_canonical_names, read_postscript_name  # noqa: E402
@@ -300,7 +317,7 @@ def _read_ps_and_weight_from_descriptor(font_desc):
     return None, None
 
 
-def build_canonical_map_from_pdf(pdf_path, all_font_files, catalog_json=None, font_entries=None):
+def build_canonical_map_from_pdf(pdf_path, all_font_files, catalog_json=None, font_entries=None, unprint_bin=None):
     """Build canonical_map by extracting PS names from embedded font data in PDF.
 
     Returns dict: raw BaseFont (subset-stripped) -> canonical PS name.
@@ -408,8 +425,13 @@ def build_canonical_map_from_pdf(pdf_path, all_font_files, catalog_json=None, fo
                     f"No font entry for '{base}' variant '{variant}' (PDF font '{raw_bf}'). "
                     f"Fix the specimen."
                 )
-            
-            fontkey = entry.get('font_key', '')
+
+            # Use --resolve-fontkey (Rust as single source of truth) if available,
+            # otherwise fall back to catalog's font_key (may be stale).
+            if unprint_bin and entry.get('path'):
+                fontkey = resolve_fontkey_via_api(unprint_bin, entry['path'])
+            else:
+                fontkey = entry.get('font_key', '')
             if not fontkey:
                 raise RuntimeError(
                     f"Font entry for '{base}' variant '{variant}' has no font_key. Fix the catalog."
