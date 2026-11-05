@@ -485,7 +485,7 @@ pub fn identify_fonts(
             let thresh = min_ngram_prob / n_glyphs;
             if prob < thresh { continue; }
             let combined_geo = t.geo_h_ll + t.geo_v_ll;
-            let lp = logit * t.weight + *GEO_WEIGHT * combined_geo;
+            let lp = (logit + *GEO_WEIGHT * combined_geo) * t.weight;
             log_probs.push((lp, 1.0));
             ood_probs.push((lp, 1.0));
             obs_for_this.push(ObservationDetail {
