@@ -1,17 +1,18 @@
-//! Vintage font cache — locally build old-school era variants from modern fonts.
+//! Vintage font cache — locally build old-school era variants
+//! from modern fonts.
 //!
 //! Licensing: NO REDISTRIBUTION of generated fonts.
 //!   Unprint builds these fonts on the user's machine from modern fonts the user
 //!   already has (OFL / Apache 2.0 / system fonts). The vintage variants are written
-//!   to `~/.cache/unprint/vintage/` and never checked into git or distributed.
-//!   Only the *transformation code* (this module + era configs) is shipped.
+//!   to `~/.cache/unprint/vintage-fonts/` and never checked into git or distributed.
+//!   Only the transformation code (this module + era configs) is shipped.
 //!
 //! Design:
 //!   - Early in `run()`, after scanning base fonts, we call `ensure_vintage_fonts()`
 //!   - For each base font, we lookup its birth year via `font_history::font_birth_year`
 //!   - If birth year is unknown => skip (prevents 1988 Comic Sans)
 //!   - If birth year <= era.start_year => font existed at that era, so we generate variant
-//!   - Cache path = `~/.cache/unprint/vintage/<sanitized>-<era>-<hash>.ttf`
+//!   - Cache path = `~/.cache/unprint/vintage-fonts/<sanitized>-<era>-<hash>.ttf`
 //!   - If cached file exists and is newer than base, reuse; else regenerate
 //!   - Currently stubbed as copy + log (safe to ship); TODO: replace with write-fonts transform
 //!
@@ -635,10 +636,10 @@ pub fn was_shipped_with_family_or_ps(family: &str, ps_name: &str, era: Era) -> b
     false
 }
 
-/// Vintage cache directory: ~/.cache/unprint/vintage
+/// Vintage cache directory: ~/.cache/unprint/vintage-fonts
 pub fn vintage_cache_dir() -> PathBuf {
     let home = std::env::var("HOME").unwrap_or_else(|_| ".".to_string());
-    PathBuf::from(home).join(".cache").join("unprint").join("vintage")
+    PathBuf::from(home).join(".cache").join("unprint").join("vintage-fonts")
 }
 
 /// Compute sanitized family string for filenames.

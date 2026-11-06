@@ -71,6 +71,12 @@ pub struct RenderParams {
     /// Binarize threshold after normalization.  None = keep grayscale.
     /// Some(128) = binarize at 128 (pixels < 128 → black, >= 128 → white).
     pub binarize_threshold: Option<u8>,
+    /// Subpixel offset in x (fractional pixels, 0.0-1.0). For training
+    /// robustness to MuPDF-style subpixel positioning during PDF rasterization.
+    /// (Mike Nov 3, 2026: invasive subpixel training varies both x and y)
+    pub subpixel_dx: f32,
+    /// Subpixel offset in y (fractional pixels, 0.0-1.0).
+    pub subpixel_dy: f32,
 }
 
 impl Default for RenderParams {
@@ -80,6 +86,8 @@ impl Default for RenderParams {
             render_scale: 1,
             aa: AaVariant::Native,
             binarize_threshold: None,
+            subpixel_dx: 0.0,
+            subpixel_dy: 0.0,
         }
     }
 }
@@ -115,9 +123,12 @@ pub fn ngram_cache_path(
         None => "bnone".to_string(),
     };
     let aa_dir = format!("{}_{}", params.aa.name(), binarize_tag);
+    // Include subpixel offsets in path (Mike Nov 4, 2026) — otherwise
+    // dx=0.25 would collide with dx=0 in cache.
+    let sp_dir = format!("dx{}_dy{}", params.subpixel_dx, params.subpixel_dy);
     let fname = format!("{}.png", glyph_map::hash_hex(img_hash));
 
-    cache_dir().join(params_dir).join(aa_dir).join(seq_dir_name(seq)).join(fname)
+    cache_dir().join(params_dir).join(aa_dir).join(sp_dir).join(seq_dir_name(seq)).join(fname)
 }
 
 /// Load a cached ngram image by its content hash.
@@ -261,7 +272,13 @@ pub fn render_ngram_fresh<F: Font>(
     let mut max_y = f32::MIN;
 
     for (i, &gid) in gids.iter().enumerate() {
-        let g = gid.with_scale_and_position(scale, point(x_pos[i], baseline_y));
+        // Apply subpixel offsets for training robustness (Mike Nov 3, 2026).
+        // MuPDF-style rasterization positions glyphs at fractional pixel
+        // coordinates; training must cover these variations.
+        let g = gid.with_scale_and_position(
+            scale,
+            point(x_pos[i] + params.subpixel_dx, baseline_y + params.subpixel_dy)
+        );
         let outlined = font.outline_glyph(g)?;
         let b = outlined.px_bounds();
         min_x = min_x.min(b.min.x);
