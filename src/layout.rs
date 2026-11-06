@@ -163,9 +163,13 @@ pub fn ot_features(variant_tag: &str) -> Vec<unprint_fonts::rustybuzz::Feature> 
     // Disable kerning for nokern variants. The PDF specimen's embedded subsets
     // lack GPOS kerning data, so the scan has no kerning. To match, we must
     // disable the 'kern' feature when shaping with a nokern variant.
+    // For kerned variants, explicitly enable kerning so it actually applies
+    // (HarfBuzz does not enable it by default in this context).
+    let kern_tag = unprint_fonts::ttf_parser::Tag::from_bytes(b"kern");
     if variant_tag.contains("nokern") {
-        let kern_tag = unprint_fonts::ttf_parser::Tag::from_bytes(b"kern");
         features.push(unprint_fonts::rustybuzz::Feature::new(kern_tag, 0, ..));
+    } else {
+        features.push(unprint_fonts::rustybuzz::Feature::new(kern_tag, 1, ..));
     }
 
     if variant_tag.is_empty() {
