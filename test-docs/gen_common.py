@@ -341,11 +341,25 @@ def _font_has_gpos(path):
     return has
 
 
+def _is_ot_feature_tag(seg):
+    """True if seg is an OpenType feature tag selecting a non-default
+    rendering (onum, lnum, smcp, c2sc, swsh, salt, titl, hist, ss01-ss20,
+    allcaps). Mirrors font_scan::is_ot_feature_tag in Rust."""
+    if seg in ("onum", "lnum", "smcp", "c2sc", "swsh", "salt", "titl",
+               "hist", "allcaps"):
+        return True
+    return len(seg) == 4 and seg.startswith("ss") and seg[2:].isdigit()
+
+
 def _resolve_score(font_key, has_gpos=False):
     """Mirror of the shared font-key preference in Rust
     (src/font_scan.rs font_key_preference_score, used by --resolve-fontkey
     and the classifier tiebreakers): GPOS font +4 kern, non-GPOS +4 nokern,
-    nolig +2, opsz=10 +1. Higher score wins. Keep in sync with Rust —
+    nolig +2, opsz=10 +1, -10 per OT-feature variant tag (onum, lnum,
+    smcp, c2sc, swsh, salt, titl, hist, ss01-ss20, allcaps) and -10 per
+    non-default weight instance (`|wghtN`), so the base/default variant
+    always wins the default-GT pick over an OT-feature variant or a
+    non-default weight. Higher score wins. Keep in sync with Rust —
     Python must not invent its own preference."""
     s = 0
     is_nokern = "nokern" in font_key
@@ -357,6 +371,16 @@ def _resolve_score(font_key, has_gpos=False):
         s += 2  # prefer nolig
     if "opsz=10" in font_key:
         s += 1  # tiebreaker
+    # Non-default variants must never be the default pick: the specimen
+    # renders default features at the font's default weight. Segment 0 is
+    # the PostScript name, never a tag; bracketed variations
+    # (`[wght=400,...]`) are stripped before matching.
+    for seg in font_key.split("|")[1:]:
+        seg = seg.split("[", 1)[0]
+        if _is_ot_feature_tag(seg):
+            s -= 10
+        if len(seg) > 4 and seg.startswith("wght") and seg[4:].isdigit():
+            s -= 10
     return s
 
 
