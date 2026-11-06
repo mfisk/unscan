@@ -255,11 +255,7 @@ impl FontEntry {
         vintage_era: Option<&str>,
         variations: &Variations,
     ) -> String {
-        let mut k = if variant_tag.is_empty() {
-            postscript_name.to_owned()
-        } else {
-            format!("{}|{}", postscript_name, variant_tag)
-        };
+        let mut k = Self::append_variant_tag(postscript_name.to_owned(), variant_tag);
         if let Some(vars) = variations {
             if !vars.is_empty() {
                 k.push('[');
@@ -2258,12 +2254,33 @@ pub fn font_has_gpos(data: &[u8]) -> bool {
     face.raw_face().table(gpos_tag).is_some()
 }
 
+/// True if `seg` is an OpenType feature tag that selects a non-default
+/// rendering: oldstyle/lining figures, small caps, swash/stylistic/
+/// titling/historical alternates, stylistic sets, or the allcaps
+/// (case+cpsp) variant. This is exactly the tag set the scan emits as
+/// variant entries (`VARIANT_FEATURES` plus `allcaps`); kern/nokern,
+/// nolig, wght/opsz axis values, and `vintage=` are not OT features.
+/// The specimen renders default features only, so a variant carrying one
+/// of these tags never matches the specimen's default rendering.
+fn is_ot_feature_tag(seg: &str) -> bool {
+    matches!(
+        seg,
+        "onum" | "lnum" | "smcp" | "c2sc" | "swsh" | "salt" | "titl" | "hist" | "allcaps"
+    ) || (seg.len() == 4
+        && seg.starts_with("ss")
+        && seg[2..].bytes().all(|b| b.is_ascii_digit()))
+}
+
 /// Preference score for font-key selection and classifier tiebreaking.
 /// Single source of truth, shared by --resolve-fontkey
 /// (crates/unprint-cli/src/main.rs) and the classifier tiebreakers
 /// (font_match.rs fine-score sort, font_pipeline.rs exact-tie resolution).
 /// GPOS font → +4 for kern (not nokern); non-GPOS font → +4 for nokern;
-/// +2 for nolig; +1 for opsz=10. Higher score wins.
+/// +2 for nolig; +1 for opsz=10; −10 per OT-feature variant tag (onum,
+/// lnum, smcp, c2sc, swsh, salt, titl, hist, ss01–ss20, allcaps) and
+/// −10 per non-default weight instance (`|wghtN`), so the base/default
+/// variant always wins the default-GT pick over an OT-feature variant
+/// or a non-default weight. Higher score wins.
 pub fn font_key_preference_score(font_key: &str, has_gpos: bool) -> i32 {
     let mut s = 0;
     let is_nokern = font_key.contains("nokern");
@@ -2277,6 +2294,28 @@ pub fn font_key_preference_score(font_key: &str, has_gpos: bool) -> i32 {
     }
     if font_key.contains("opsz=10") {
         s += 1;
+    }
+    // Non-default variants must never be the default pick: the specimen
+    // renders default features at the font's default weight, so an
+    // OT-feature variant or a `|wghtN` weight instance never matches the
+    // default rendering. Segment 0 is the PostScript name, never a tag;
+    // bracketed variations (`[wght=400,...]`) are stripped before matching.
+    // The `wghtN` case matters: the scan only emits a weight instance for
+    // a weight other than the declared default, and for a kern-less
+    // variable font (e.g. OpenSans, which has no kern data so no kern
+    // base entries exist) the instance's spurious +4 would otherwise
+    // outscore the honest `|nokern|nolig` base entry.
+    for seg in font_key.split('|').skip(1) {
+        let seg = seg.split('[').next().unwrap_or(seg);
+        if is_ot_feature_tag(seg) {
+            s -= 10;
+        }
+        if seg.len() > 4
+            && seg.starts_with("wght")
+            && seg[4..].bytes().all(|b| b.is_ascii_digit())
+        {
+            s -= 10;
+        }
     }
     s
 }
