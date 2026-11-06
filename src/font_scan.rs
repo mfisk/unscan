@@ -62,9 +62,9 @@ fn lig_contains(mask: LigMask, c: char) -> bool {
 /// Cache of final collapsed lig sets per font path — eliminates 33.9%
 /// inclusive hot path (font_match.rs:138, font_pipeline.rs:381) which
 /// otherwise did fs::read + cmap + 5× shape per candidate per line.
-static LIG_SET_CACHE: OnceLock<RwLock<HashMap<PathBuf, LigMask>>> = OnceLock::new();
+static LIG_SET_CACHE: OnceLock<RwLock<HashMap<String, LigMask>>> = OnceLock::new();
 
-fn lig_set_cache() -> &'static RwLock<HashMap<PathBuf, LigMask>> {
+fn lig_set_cache() -> &'static RwLock<HashMap<String, LigMask>> {
     LIG_SET_CACHE.get_or_init(|| RwLock::new(HashMap::new()))
 }
 
@@ -340,11 +340,18 @@ impl FontEntry {
     /// interior gutter to be excluded; three-char ligs (ffi, ffl) need ≥2.
     /// Only FB00–FB04 are considered; quote ligature probes are excluded.
     pub fn collapsed_lig_set(&self) -> LigMask {
+        // nolig variant: disable ligature collapsing entirely.
+        // The cache is keyed by fontkey (not path) so nolig variants
+        // get their own entry (0) distinct from the base variant's set.
+        if self.variant_tag.contains("nolig") {
+            return 0;
+        }
         // Global memo — eliminates 33.9% inclusive hot path after first line.
-        // Final filtered set is cached, so no FS read / shaping on hits.
+        // Final filtered set is cached by fontkey, so no FS read / shaping on hits.
+        let fk = self.font_key_cache.clone();
         {
             let guard = lig_set_cache().read().unwrap();
-            if let Some(cached) = guard.get(&self.path) {
+            if let Some(cached) = guard.get(&fk) {
                 return *cached;
             }
         }
@@ -427,10 +434,10 @@ impl FontEntry {
             }
         }
 
-        // Insert final filtered set into global cache.
+        // Insert final filtered set into global cache (keyed by fontkey).
         {
             let mut guard = lig_set_cache().write().unwrap();
-            guard.insert(self.path.clone(), mask);
+            guard.insert(fk, mask);
         }
         mask
     }
@@ -1502,88 +1509,79 @@ pub fn scan_fonts(dirs: &[PathBuf], quiet: bool) -> Vec<FontEntry> {
                 fe.assign_default_variations(default_variations);
                 fe.opsz_range = opsz_range;
 
-                // Emit a |nokern variant for fonts with GPOS kerning data.
-                // The PDF specimen's embedded subsets lack GPOS (stripped during
-                // subsetting), so the scan has no kerning applied. The installed
-                // full fonts do apply kerning, causing letter-spacing mismatch.
-                // The nokern variant disables the 'kern' OpenType feature during
-                // shaping, matching the PDF's kerning-less rendering.
-                if has_kern {
-                    // Combine base variant_tag with nokern marker so ot_features
-                    // can disable kerning. Use "|" separator to avoid ambiguity.
-                    let nokern_tag = if fe.variant_tag.is_empty() {
-                        "nokern".to_string()
-                    } else {
-                        format!("{}|nokern", fe.variant_tag)
-                    };
-                    let nokern_entry = FontEntry {
-                        path: fe.path.clone(),
-                        family_name: format!("{} [nokern]", fe.family_name),
-                        postscript_name: fe.postscript_name.clone(),
-                        raw_postscript_name: fe.raw_postscript_name.clone(),
-                        is_bold: fe.is_bold,
-                        is_italic: fe.is_italic,
-                        class: fe.class,
-                        data: Vec::new(),
-                        oldstyle_figures: fe.oldstyle_figures,
-                        variant_tag: nokern_tag.clone(),
-                        font_key_cache: FontEntry::compute_font_key_full(
-                            &fe.postscript_name,
-                            &nokern_tag,
-                            None,
-                            &fe.variations,
-                        ),
-                        glyph_overrides: fe.glyph_overrides.clone(),
-                        variations: fe.variations.clone(),
-                        typographic_family: fe.typographic_family.clone(),
-                        vintage_era: None,
-                        opsz_range,
-                    };
-                    fonts.push(nokern_entry);
-                    // Also emit opsz=10 nokern variant if font has opsz axis
-                    if let Some(opsz10_vars) = make_opsz10_variations(&fe.variations) {
-                        let nokern_opsz10_entry = FontEntry {
-                            path: fe.path.clone(),
-                            family_name: format!("{} [nokern]", fe.family_name),
-                            postscript_name: fe.postscript_name.clone(),
-                            raw_postscript_name: fe.raw_postscript_name.clone(),
-                            is_bold: fe.is_bold,
-                            is_italic: fe.is_italic,
-                            class: fe.class,
-                            data: Vec::new(),
-                            oldstyle_figures: fe.oldstyle_figures,
-                            variant_tag: nokern_tag.clone(),
-                            font_key_cache: FontEntry::compute_font_key_full(
-                                &fe.postscript_name,
-                                &nokern_tag,
-                                None,
-                                &Some(opsz10_vars.clone()),
-                            ),
-                            glyph_overrides: fe.glyph_overrides.clone(),
-                            variations: Some(opsz10_vars),
-                            typographic_family: fe.typographic_family.clone(),
-                            vintage_era: None,
-                            opsz_range,
-                        };
-                        fonts.push(nokern_opsz10_entry);
-                    }
+                // Emit all permutations of the kern/lig/opsz variant dimensions.
+                // - kern: [kern, nokern] if the font has kerning data, else [kern].
+                //   The PDF specimen's embedded subsets lack GPOS (stripped during
+                //   subsetting), so the scan has no kerning applied. The installed
+                //   full fonts do apply kerning, causing letter-spacing mismatch.
+                //   The nokern variant disables the 'kern' OpenType feature during
+                //   shaping, matching the PDF's kerning-less rendering.
+                // - lig: [lig, nolig] if the font has ligature glyphs, else [lig].
+                //   The lig variant uses the font's ligature set (collapses fi→ﬁ
+                //   when the font has a true ligature). The nolig variant disables
+                //   ligature collapsing, matching documents that render f and i
+                //   as separate glyphs.
+                // - opsz: [base, opsz10] if the font has an opsz axis, else [base].
+                // The classifier scores all permutations and picks the best.
+                let kern_opts: &[bool] = if has_kern { &[false, true] } else { &[false] };
+                let lig_opts: &[bool] = if fe.collapsed_lig_set() != 0 { &[false, true] } else { &[false] };
+                let mut var_opts: Vec<Variations> = vec![fe.variations.clone()];
+                if let Some(opsz10_vars) = make_opsz10_variations(&fe.variations) {
+                    var_opts.push(Some(opsz10_vars));
                 }
-
-                // Emit opsz=10 base variant if font has opsz axis
-                let opsz10_fe = make_opsz10_variations(&fe.variations).map(|opsz10_vars| {
-                    let mut fe10 = fe.clone();
-                    fe10.variations = Some(opsz10_vars.clone());
-                    fe10.font_key_cache = FontEntry::compute_font_key_full(
-                        &fe.postscript_name,
-                        &fe.variant_tag,
-                        None,
-                        &Some(opsz10_vars),
-                    );
-                    fe10
-                });
-                fonts.push(fe);
-                if let Some(fe10) = opsz10_fe {
-                    fonts.push(fe10);
+                for &is_nokern in kern_opts {
+                    for &is_nolig in lig_opts {
+                        for variations in &var_opts {
+                            // Combine base variant_tag with nokern/nolig markers.
+                            // Use "|" separator to avoid ambiguity.
+                            let mut variant_tag = fe.variant_tag.clone();
+                            if is_nokern {
+                                variant_tag = if variant_tag.is_empty() {
+                                    "nokern".to_string()
+                                } else {
+                                    format!("{}|nokern", variant_tag)
+                                };
+                            }
+                            if is_nolig {
+                                variant_tag = if variant_tag.is_empty() {
+                                    "nolig".to_string()
+                                } else {
+                                    format!("{}|nolig", variant_tag)
+                                };
+                            }
+                            let mut family_name = fe.family_name.clone();
+                            if is_nokern {
+                                family_name = format!("{} [nokern]", family_name);
+                            }
+                            if is_nolig {
+                                family_name = format!("{} [nolig]", family_name);
+                            }
+                            let entry = FontEntry {
+                                path: fe.path.clone(),
+                                family_name,
+                                postscript_name: fe.postscript_name.clone(),
+                                raw_postscript_name: fe.raw_postscript_name.clone(),
+                                is_bold: fe.is_bold,
+                                is_italic: fe.is_italic,
+                                class: fe.class,
+                                data: Vec::new(),
+                                oldstyle_figures: fe.oldstyle_figures,
+                                variant_tag: variant_tag.clone(),
+                                font_key_cache: FontEntry::compute_font_key_full(
+                                    &fe.postscript_name,
+                                    &variant_tag,
+                                    None,
+                                    variations,
+                                ),
+                                glyph_overrides: fe.glyph_overrides.clone(),
+                                variations: variations.clone(),
+                                typographic_family: fe.typographic_family.clone(),
+                                vintage_era: None,
+                                opsz_range,
+                            };
+                            fonts.push(entry);
+                        }
+                    }
                 }
         }
     }

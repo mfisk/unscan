@@ -168,6 +168,7 @@ pub fn identify_fonts(
             if !allow.contains(fk) && !ensure_set.contains(fk) { continue; }
         }
         let is_ensure = ensure_set.contains(fk);
+        // collapsed_lig_set() returns 0 for nolig variants (cached by fontkey).
         let allowed = fe.collapsed_lig_set();
 
         // Build per-font structures using cached cuts + char crops (per-k cache)
