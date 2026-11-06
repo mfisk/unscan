@@ -115,6 +115,19 @@ const FAST_PATH_MIN_SSIM: f32 = 0.95;
 /// Returns `(line_matches, fast_path_hit_count)`.
 
 /// Save observation crops to a subdirectory under diag_dir.
+/// Save observation crop images for the audit report.
+///
+/// INVARIANT: The `crops` slice MUST contain exactly the images used for glyph
+/// scoring. Both `crops` (via `build_scoring_windows_with_geo` in ngram.rs) and
+/// the scoring path (via `wb.char_crops` in font_match.rs) call the same pure
+/// function `char_crop_and_metrics` with identical inputs:
+/// - `wi.img` / `seg.word_img`: same word image (seg.word_img is wi.img.clone())
+/// - character index `i` / `pos`: same position
+/// - `&b` / `&seg.boundaries`: same segmentation boundaries
+/// - `&s` / `&seg.seam_paths`: same seam paths
+/// - `crop_h` / `seg.crop_h`: same height (wi.img.height())
+/// Since `char_crop_and_metrics` is deterministic, the outputs are byte-identical.
+/// Do NOT change either call site to use different inputs without updating both.
 fn save_obs_crops(
     diag_dir: &Path,
     subdir: &str,
