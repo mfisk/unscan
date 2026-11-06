@@ -497,6 +497,9 @@ pub fn match_lines(
 
                 if tied.len() >= 2 {
                     let mut best: Option<(font_match::FontMatchResult, f32, Vec<crate::segment::WordSeg>, Vec<crate::geometry_classifier::WordGeoMeasurement>, Vec<image::GrayImage>, Vec<(usize,usize)>)> = None;
+                    // Shared font-key preference of the current best (same as
+                    // --resolve-fontkey). Breaks exact SSIM ties.
+                    let mut best_pref: i32 = i32::MIN;
                     let mut tie_sim_results: Vec<(String,String,f32)> = Vec::new();
                     let mut ti = 0usize;
                     for font_key in tied.iter() {
@@ -540,9 +543,16 @@ pub fn match_lines(
                             true, tie_audit_dir.as_deref(), None, None, frac_width,
                         );
                         tie_sim_results.push((fe.font_key(), fe.family_name.clone(), vr.score));
+                        // Highest SSIM wins. On an exact SSIM tie, the shared
+                        // font-key preference decides (same as --resolve-fontkey
+                        // and the fine-score sort) — it replaces the old
+                        // prefer-empty-variant_tag rule, which disagreed with
+                        // the shared preference for non-GPOS fonts.
+                        let pref = crate::font_scan::font_key_preference_score(&fe.font_key(), fe.has_gpos);
                         if best.as_ref().map_or(true, |(_, bs, _, _, _, _)| {
-                            vr.score > *bs || (vr.score == *bs && prev_variant_pref(best.as_ref(), fe))
+                            vr.score > *bs || (vr.score == *bs && pref > best_pref)
                         }) {
+                            best_pref = pref;
                             best = Some((font_match::FontMatchResult {
                                 font_name: fe.font_key(),
                                 font_path: fe.path.clone(),
@@ -603,13 +613,6 @@ pub fn match_lines(
                 (None, Vec::new(), gt_font_key, Vec::new(), Vec::new(), Vec::new(), Vec::new())
             }
         };
-
-        // helper for tie variant preference – moved outside loop capture
-        fn prev_variant_pref(prev: Option<&(font_match::FontMatchResult, f32, Vec<crate::segment::WordSeg>, Vec<crate::geometry_classifier::WordGeoMeasurement>, Vec<image::GrayImage>, Vec<(usize,usize)>)>, fe: &crate::font_scan::FontEntry) -> bool {
-            if let Some((prev_fm, _, _, _, _, _)) = prev {
-                !prev_fm.variant_tag.is_empty() && fe.variant_tag.is_empty()
-            } else { false }
-        }
 
         // ── Ground-truth gated audit detail ─────────────────────────
         // When --audit is set, check if this line is a miss before

@@ -216,16 +216,36 @@ pub struct FontEntry {
     /// the size-derived `|opszN` candidate; it cannot be re-derived later
     /// because `data` is dropped after the scan. Serialized in the scan cache.
     pub opsz_range: Option<(f32, f32, f32)>,
+    /// True if the font file contains a GPOS table. Captured during the scan
+    /// while the font file bytes are available; cannot be re-derived later
+    /// because `data` is dropped after the scan. Used by the shared font-key
+    /// preference (`font_key_preference_score`) for --resolve-fontkey and
+    /// classifier tiebreaking. Serialized in the scan cache (v17+).
+    pub has_gpos: bool,
 }
 
 impl FontEntry {
+    /// Append `|variant_tag` segments to a PostScript name, skipping any
+    /// segment already present as a trailing `|segment`. Variant entries
+    /// store the OT tag in `postscript_name` already (`PS|salt`, for exact
+    /// GT matching), so a verbatim append would duplicate it (`PS|salt|salt`).
+    /// Each tag appears at most once in the resulting key.
+    fn append_variant_tag(mut k: String, variant_tag: &str) -> String {
+        for seg in variant_tag.split('|') {
+            if seg.is_empty() {
+                continue;
+            }
+            if !k.ends_with(&format!("|{seg}")) {
+                k.push('|');
+                k.push_str(seg);
+            }
+        }
+        k
+    }
+
     #[inline]
     pub fn compute_font_key(postscript_name: &str, variant_tag: &str) -> String {
-        if variant_tag.is_empty() {
-            postscript_name.to_owned()
-        } else {
-            format!("{}|{}", postscript_name, variant_tag)
-        }
+        Self::append_variant_tag(postscript_name.to_owned(), variant_tag)
     }
 
     #[inline]
@@ -820,7 +840,7 @@ pub fn default_font_dirs(extra: &[PathBuf]) -> Vec<PathBuf> {
 //     typographic_family_len: u32 le + [u8; typographic_family_len]
 
 const FSCN_MAGIC: &[u8; 4] = b"FSCN";
-const FSCN_VERSION: u32 = 15;
+const FSCN_VERSION: u32 = 17;
 
 pub(crate) fn scan_cache_path() -> PathBuf {
     crate::cache::paths::font_scan_bin()
@@ -1016,6 +1036,9 @@ fn write_scan_cache(path: &Path, entries: &[FontEntry]) -> std::io::Result<()> {
                 write_str(&mut w, s)?;
             }
         }
+
+        // has_gpos - v17+
+        w.write_all(&[e.has_gpos as u8])?;
     }
 
     w.flush()?;
@@ -1136,6 +1159,9 @@ fn read_scan_cache(path: &Path, quiet: bool) -> Option<Vec<FontEntry>> {
             None
         };
 
+        // has_gpos - v17+
+        let has_gpos = read_u8(&mut r)? != 0;
+
         entries.push(FontEntry {
             path: path_buf,
             family_name,
@@ -1160,6 +1186,7 @@ fn read_scan_cache(path: &Path, quiet: bool) -> Option<Vec<FontEntry>> {
             typographic_family,
             vintage_era,
             opsz_range,
+            has_gpos,
         });
     }
 
@@ -1402,6 +1429,7 @@ pub fn scan_fonts(dirs: &[PathBuf], quiet: bool) -> Vec<FontEntry> {
                         typographic_family: fe.typographic_family.clone(),
                         vintage_era: None,
                         opsz_range,
+                        has_gpos: fe.has_gpos,
                     };
                     fonts.push(var_entry);
                 }
@@ -1440,6 +1468,7 @@ pub fn scan_fonts(dirs: &[PathBuf], quiet: bool) -> Vec<FontEntry> {
                             typographic_family: fe.typographic_family.clone(),
                             vintage_era: None,
                             opsz_range,
+                            has_gpos: fe.has_gpos,
                         };
                         fonts.push(allcaps_entry);
                     }
@@ -1491,6 +1520,7 @@ pub fn scan_fonts(dirs: &[PathBuf], quiet: bool) -> Vec<FontEntry> {
                         typographic_family: fe.typographic_family.clone(),
                         vintage_era: None,
                         opsz_range,
+                        has_gpos: fe.has_gpos,
                     };
                     // Add ligature overrides to weight-instance entry
                     if !ligatures.is_empty() {
@@ -1510,7 +1540,11 @@ pub fn scan_fonts(dirs: &[PathBuf], quiet: bool) -> Vec<FontEntry> {
                 fe.opsz_range = opsz_range;
 
                 // Emit all permutations of the kern/lig/opsz variant dimensions.
-                // - kern: [kern, nokern] if the font has kerning data, else [kern].
+                // - kern: [kern, nokern] if the font has kerning data, else [nokern].
+                //   A font with no kerning renders identically with the kern
+                //   feature on or off, so a kerned variant would be a
+                //   byte-identical duplicate. Emit only the nokern variant,
+                //   which honestly labels the rendering.
                 //   The PDF specimen's embedded subsets lack GPOS (stripped during
                 //   subsetting), so the scan has no kerning applied. The installed
                 //   full fonts do apply kerning, causing letter-spacing mismatch.
@@ -1523,7 +1557,7 @@ pub fn scan_fonts(dirs: &[PathBuf], quiet: bool) -> Vec<FontEntry> {
                 //   as separate glyphs.
                 // - opsz: [base, opsz10] if the font has an opsz axis, else [base].
                 // The classifier scores all permutations and picks the best.
-                let kern_opts: &[bool] = if has_kern { &[false, true] } else { &[false] };
+                let kern_opts: &[bool] = if has_kern { &[false, true] } else { &[true] };
                 let lig_opts: &[bool] = if fe.collapsed_lig_set() != 0 { &[false, true] } else { &[false] };
                 let mut var_opts: Vec<Variations> = vec![fe.variations.clone()];
                 if let Some(opsz10_vars) = make_opsz10_variations(&fe.variations) {
@@ -1578,6 +1612,7 @@ pub fn scan_fonts(dirs: &[PathBuf], quiet: bool) -> Vec<FontEntry> {
                                 typographic_family: fe.typographic_family.clone(),
                                 vintage_era: None,
                                 opsz_range,
+                                has_gpos: fe.has_gpos,
                             };
                             fonts.push(entry);
                         }
@@ -1609,6 +1644,7 @@ pub fn scan_fonts(dirs: &[PathBuf], quiet: bool) -> Vec<FontEntry> {
                     typographic_family: String::new(),
                     vintage_era: None,
                     opsz_range: None,
+                    has_gpos: false,
                 });
             }
         }
@@ -2203,23 +2239,84 @@ fn font_has_caps_tables(data: &[u8]) -> bool {
     false
 }
 
-/// Returns true if the font's GPOS contains a 'kern' Feature.
-/// Used to decide whether to emit a |nokern variant. Fonts without GPOS kerning
-/// don't need a nokern variant (it would be identical to the base).
+/// Returns true if the font actually has kerning data available.
+/// Used to decide whether to emit a kerned variant: a font with no kerning
+/// renders identically with the kern feature on or off, so a kerned variant
+/// would be a byte-identical duplicate of the nokern variant.
+/// Kerning counts as available when:
+/// - the legacy `kern` table has at least one pair (format 0), or any
+///   class-based (format 2/3) subtable, which carries kerning by construction; or
+/// - the GPOS table has a `kern` feature with at least one lookup
+///   (a kern feature's lookups are PairAdjustment by definition).
+/// True if the font data contains a GPOS table.
+pub fn font_has_gpos(data: &[u8]) -> bool {
+    let face = match unprint_fonts::ttf_parser::Face::parse(data, 0) {
+        Ok(f) => f,
+        Err(_) => return false,
+    };
+    let gpos_tag = unprint_fonts::ttf_parser::Tag::from_bytes(b"GPOS");
+    face.raw_face().table(gpos_tag).is_some()
+}
+
+/// Preference score for font-key selection and classifier tiebreaking.
+/// Single source of truth, shared by --resolve-fontkey
+/// (crates/unprint-cli/src/main.rs) and the classifier tiebreakers
+/// (font_match.rs fine-score sort, font_pipeline.rs exact-tie resolution).
+/// GPOS font → +4 for kern (not nokern); non-GPOS font → +4 for nokern;
+/// +2 for nolig; +1 for opsz=10. Higher score wins.
+pub fn font_key_preference_score(font_key: &str, has_gpos: bool) -> i32 {
+    let mut s = 0;
+    let is_nokern = font_key.contains("nokern");
+    // If has_gpos: +4 for kern (not nokern).
+    // If !has_gpos: +4 for nokern.
+    if has_gpos != is_nokern {
+        s += 4;
+    }
+    if font_key.contains("nolig") {
+        s += 2;
+    }
+    if font_key.contains("opsz=10") {
+        s += 1;
+    }
+    s
+}
+
 fn font_has_kern_feature(data: &[u8]) -> bool {
     let face = match unprint_fonts::ttf_parser::Face::parse(data, 0) {
         Ok(f) => f,
         Err(_) => return false,
     };
-    // Check for old-style 'kern' table
-    let kern_tag = unprint_fonts::ttf_parser::Tag::from_bytes(b"kern");
-    if face.raw_face().table(kern_tag).is_some() {
-        return true;
+    let tables = face.tables();
+    // Legacy `kern` table: needs at least one pair. A present-but-empty
+    // table (or subtables with no pairs) is no kerning.
+    if let Some(kern) = &tables.kern {
+        for sub in kern.subtables {
+            match sub.format {
+                unprint_fonts::ttf_parser::kern::Format::Format0(ref s0) => {
+                    if s0.pairs.len() > 0 {
+                        return true;
+                    }
+                }
+                unprint_fonts::ttf_parser::kern::Format::Format2(_)
+                | unprint_fonts::ttf_parser::kern::Format::Format3(_) => {
+                    return true;
+                }
+                _ => {}
+            }
+        }
     }
-    // If font has GPOS, assume it may have kerning and create nokern variant.
-    // This is conservative (may create unnecessary variants) but correct
-    // (won't miss fonts that need the variant). Manual FeatureList parsing
-    // proved fragile across variable fonts.
+    // GPOS `kern` feature with at least one lookup.
+    if let Some(gpos) = &tables.gpos {
+        let kern_tag = unprint_fonts::ttf_parser::Tag::from_bytes(b"kern");
+        if let Some(feature) = gpos.features.find(kern_tag) {
+            if feature.lookup_indices.len() > 0 {
+                return true;
+            }
+        }
+        return false;
+    }
+    // GPOS table exists but failed to parse: fail open (assume kerning may
+    // be present) so a parse quirk can't drop the kerned variant.
     let gpos_tag = unprint_fonts::ttf_parser::Tag::from_bytes(b"GPOS");
     face.raw_face().table(gpos_tag).is_some()
 }
@@ -2612,6 +2709,10 @@ pub fn load_font_entry(path: &Path, aliases: &HashMap<String, Alias>) -> Option<
     let _ = unprint_fonts::ab_glyph::FontRef::try_from_slice(&data).ok()?;
 
     let oldstyle_figures = detect_oldstyle_figures(&data);
+    // GPOS presence, captured while the bytes are available — drives the
+    // shared font-key preference (see font_key_preference_score). The
+    // scan drops `data` after this, so it cannot be re-derived later.
+    let has_gpos = font_has_gpos(&data);
     let meta = read_font_metadata(&data);
     let raw_ps_name = meta.nid6_postscript;
     let os2_weight = meta.weight_class;
@@ -2646,6 +2747,7 @@ pub fn load_font_entry(path: &Path, aliases: &HashMap<String, Alias>) -> Option<
             typographic_family,
             vintage_era: None,
             opsz_range: None,
+            has_gpos,
         });
     }
 
@@ -2686,6 +2788,7 @@ pub fn load_font_entry(path: &Path, aliases: &HashMap<String, Alias>) -> Option<
         typographic_family,
         vintage_era: None,
         opsz_range: None,
+        has_gpos,
     })
 }
 
@@ -2747,6 +2850,7 @@ mod catalog_hash_tests {
             typographic_family: "Test".to_string(),
             vintage_era: None,
             opsz_range: None,
+            has_gpos: false,
         }
     }
 
@@ -2770,6 +2874,7 @@ mod catalog_hash_tests {
             typographic_family: "Test".to_string(),
             vintage_era: None,
             opsz_range: None,
+            has_gpos: false,
         };
         // Test fixture: arbitrary variation coordinates (opsz value is not
         // significant here; detect_default_variations now uses the font's

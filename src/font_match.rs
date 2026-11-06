@@ -575,7 +575,29 @@ pub fn identify_fonts(
         return FontIdResult { scores: Vec::new(), observations: best_observations, gt_observations, path_score: f32::MIN, gt_per_char_geo_ll: Vec::new() };
     }
 
-    scored.sort_unstable_by(|a,b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal).then_with(|| a.0.cmp(&b.0)));
+    // Tiebreak on identical fine scores with the shared font-key preference
+    // (same as --resolve-fontkey: GPOS → kern, non-GPOS → nokern; nolig;
+    // opsz=10).
+    // Font-key order is the final deterministic fallback.
+    // Preferences are precomputed once — the comparator must stay cheap.
+    // Owned String keys: borrowing scored's keys would conflict with the
+    // mutable sort below.
+    let prefs: std::collections::HashMap<String, i32> = scored
+        .iter()
+        .map(|(k, _)| {
+            let p = font_registry
+                .by_key(k)
+                .map(|fe| crate::font_scan::font_key_preference_score(k, fe.has_gpos))
+                .unwrap_or(0);
+            (k.clone(), p)
+        })
+        .collect();
+    scored.sort_unstable_by(|a, b| {
+        b.1.partial_cmp(&a.1)
+            .unwrap_or(std::cmp::Ordering::Equal)
+            .then_with(|| prefs[&b.0].cmp(&prefs[&a.0]))
+            .then_with(|| a.0.cmp(&b.0))
+    });
 
     FontIdResult { scores: scored, observations: best_observations, gt_observations, path_score: best_path_score, gt_per_char_geo_ll: gt_per_char_ll_final }
 }

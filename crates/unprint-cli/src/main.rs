@@ -86,8 +86,11 @@ fn main() {
     if !args.resolve_fontkey.is_empty() {
         let font_dirs = font_scan::default_font_dirs(&args.font_dir);
         let catalog = font_scan::scan_fonts(&font_dirs, args.quiet);
-        // Build path -> best entry map (prefer nokern, then opsz=10)
-        // Same preference logic as Python was doing, now in Rust.
+        // Build path -> best entry map. Shared preference with the
+        // classifier tiebreakers (font_scan::font_key_preference_score):
+        // prefer kern for GPOS fonts, nokern otherwise; nolig; then opsz=10.
+        // The entry's stored has_gpos flag is the source of truth — the
+        // scan drops font bytes, so parsing fe.data here always fails.
         use std::collections::HashMap;
         use std::path::PathBuf;
         let mut path_to_entry: HashMap<PathBuf, &font_scan::FontEntry> = HashMap::new();
@@ -97,18 +100,9 @@ fn main() {
             let should_replace = match existing {
                 None => true,
                 Some(existing_fe) => {
-                    let entry_nokern = fe.font_key().contains("nokern");
-                    let existing_nokern = existing_fe.font_key().contains("nokern");
-                    if entry_nokern && !existing_nokern {
-                        true
-                    } else if entry_nokern == existing_nokern {
-                        // Prefer opsz=10
-                        let entry_opsz10 = fe.font_key().contains("opsz=10");
-                        let existing_opsz10 = existing_fe.font_key().contains("opsz=10");
-                        entry_opsz10 && !existing_opsz10
-                    } else {
-                        false
-                    }
+                    // Higher preference score wins.
+                    font_scan::font_key_preference_score(&fe.font_key(), fe.has_gpos)
+                        > font_scan::font_key_preference_score(&existing_fe.font_key(), existing_fe.has_gpos)
                 }
             };
             if should_replace {
