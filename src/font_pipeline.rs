@@ -917,14 +917,14 @@ pub fn match_lines(
                     if gi >= gt_sorted.len() { break; }
                     if gt_sorted[gi].ch == wo.ch {
                         let go = gt_sorted[gi];
-                        rp.gt_ranks.insert(wo.crop_index, 1);
-                        if let Some(p) = go.prob { rp.gt_probs.insert(wo.crop_index, p); }
-                        else if go.best_prob > 0.0 { rp.gt_probs.insert(wo.crop_index, go.best_prob); }
-                        if let Some(gs) = go.glyph_score { rp.gt_glyph_scores.insert(wo.crop_index, gs); }
-                        if let Some(h) = go.geo_h_ll { rp.gt_geo_h_ll.insert(wo.crop_index, h); }
-                        if let Some(v) = go.geo_v_ll { rp.gt_geo_v_ll.insert(wo.crop_index, v); }
-                        if let Some(he) = go.geo_h_err { rp.gt_geo_h_err.insert(wo.crop_index, he); }
-                        if let Some(ve) = go.geo_v_err { rp.gt_geo_v_err.insert(wo.crop_index, ve); }
+                        rp.gt_ranks.insert(go.crop_index, 1);
+                        if let Some(p) = go.prob { rp.gt_probs.insert(go.crop_index, p); }
+                        else if go.best_prob > 0.0 { rp.gt_probs.insert(go.crop_index, go.best_prob); }
+                        if let Some(gs) = go.glyph_score { rp.gt_glyph_scores.insert(go.crop_index, gs); }
+                        if let Some(h) = go.geo_h_ll { rp.gt_geo_h_ll.insert(go.crop_index, h); }
+                        if let Some(v) = go.geo_v_ll { rp.gt_geo_v_ll.insert(go.crop_index, v); }
+                        if let Some(he) = go.geo_h_err { rp.gt_geo_h_err.insert(go.crop_index, he); }
+                        if let Some(ve) = go.geo_v_err { rp.gt_geo_v_err.insert(go.crop_index, ve); }
                         gi += 1;
                     } else {
                         // Look ahead for same char – skip GT extras (e.g. f, fi before c).
@@ -937,14 +937,14 @@ pub fn match_lines(
                         }
                         if let Some(fidx) = found {
                             let go = gt_sorted[fidx];
-                            rp.gt_ranks.insert(wo.crop_index, 1);
-                            if let Some(p) = go.prob { rp.gt_probs.insert(wo.crop_index, p); }
-                            else if go.best_prob > 0.0 { rp.gt_probs.insert(wo.crop_index, go.best_prob); }
-                            if let Some(gs) = go.glyph_score { rp.gt_glyph_scores.insert(wo.crop_index, gs); }
-                            if let Some(h) = go.geo_h_ll { rp.gt_geo_h_ll.insert(wo.crop_index, h); }
-                            if let Some(v) = go.geo_v_ll { rp.gt_geo_v_ll.insert(wo.crop_index, v); }
-                            if let Some(he) = go.geo_h_err { rp.gt_geo_h_err.insert(wo.crop_index, he); }
-                            if let Some(ve) = go.geo_v_err { rp.gt_geo_v_err.insert(wo.crop_index, ve); }
+                            rp.gt_ranks.insert(go.crop_index, 1);
+                            if let Some(p) = go.prob { rp.gt_probs.insert(go.crop_index, p); }
+                            else if go.best_prob > 0.0 { rp.gt_probs.insert(go.crop_index, go.best_prob); }
+                            if let Some(gs) = go.glyph_score { rp.gt_glyph_scores.insert(go.crop_index, gs); }
+                            if let Some(h) = go.geo_h_ll { rp.gt_geo_h_ll.insert(go.crop_index, h); }
+                            if let Some(v) = go.geo_v_ll { rp.gt_geo_v_ll.insert(go.crop_index, v); }
+                            if let Some(he) = go.geo_h_err { rp.gt_geo_h_err.insert(go.crop_index, he); }
+                            if let Some(ve) = go.geo_v_err { rp.gt_geo_v_err.insert(go.crop_index, ve); }
                             gi = fidx + 1;
                         } else {
                             // No GT counterpart (e.g. winner ffi not supported by GT Caladea) – leave —.
