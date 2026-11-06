@@ -353,6 +353,10 @@ pub struct AccuracyResult {
     pub similarity_failures: usize,
     pub compared: usize,
     pub accuracy: f64,
+    /// BAP-convention hits: exact hits + minor misses.
+    pub primary_hits: usize,
+    /// Mean ZNCC similarity score across entries that have one.
+    pub zncc_avg: f64,
     pub report_path: PathBuf,
 }
 
@@ -412,8 +416,10 @@ pub fn measure_accuracy(raster: &Path, vector: &Path, label: &str) -> AccuracyRe
     let minor_misses = json["minor_misses"].as_u64().unwrap_or(0) as usize;
     let major_misses = json["major_misses"].as_u64().unwrap_or(0) as usize;
     let similarity_failures = json["similarity_failures"].as_u64().unwrap_or(0) as usize;
+    let primary_hits = json["primary_hits"].as_u64().unwrap_or(0) as usize;
+    let zncc_avg = json["zncc_avg"].as_f64().unwrap_or(0.0);
 
     let accuracy = if compared > 0 { hits as f64 / compared as f64 } else { 0.0 };
 
-    AccuracyResult { hits, minor_misses, major_misses, similarity_failures, compared, accuracy, report_path }
+    AccuracyResult { hits, minor_misses, major_misses, similarity_failures, compared, accuracy, primary_hits, zncc_avg, report_path }
 }
