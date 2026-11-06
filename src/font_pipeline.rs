@@ -393,6 +393,7 @@ pub fn match_lines(
 
         // Helper to build per-font WordSegs + wib for any font entry (used for tie and winner recompute)
         let build_for_font = |fe: &crate::font_scan::FontEntry, infos: &[font_match::WordImgInfo]| -> Option<(Vec<crate::segment::WordSeg>, Vec<crate::geometry_classifier::WordGeoMeasurement>, Vec<image::GrayImage>, Vec<(usize,usize)>)> {
+            // collapsed_lig_set() returns 0 for nolig variants (cached by fontkey).
             let allowed = fe.collapsed_lig_set();
             let mut segs: Vec<crate::segment::WordSeg> = Vec::with_capacity(infos.len());
             for wi in infos {
