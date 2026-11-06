@@ -51,7 +51,7 @@ const BGEO_MAGIC: &[u8; 4] = b"BGEO";
 // v16 adds: pair_groups, case_pair_groups, single_groups, case_single_groups (BTree-free fast path)
 // plus sorted ClassDef Format2 ranges for binary search in class_get.
 // v17 adds: pair_first_present blob per font (num_glyphs bytes) built from Format1/Format2 coverage at cache build time.
-const BGEO_VERSION: u32 = 21;
+const BGEO_VERSION: u32 = 22;
 
 // ---------- BE helpers for OT parsing ----------
 #[inline]
@@ -1701,55 +1701,10 @@ impl GeometryCache {
 
             let font_data = match font_cache.load(&fe.path) { Ok(d) => d, Err(_) => continue, };
 
-            // ── Efficient dedup for OT feature variants ──────────────
-            // OT variants (onum, smcp, ss01 etc.) have variations=None and share
-            // same file + same geometry as base font — reuse base's already-built
-            // metrics instead of re-parsing the same file.
-            if fe.variations.is_none() && !fe.variant_tag.is_empty() && !fe.variant_tag.starts_with("wght") {
-                // Try to find base font (same path, no variant) already built in this run
-                if let Some(base_key) = font_registry.entries().iter()
-                    .find(|e| e.path == fe.path && e.variant_tag.is_empty())
-                    .map(|e| e.font_key())
-                {
-                    if let Some(base_owned) = owned_fonts.get(&base_key) {
-                        owned_fonts.insert(font_key.clone(), OwnedFont {
-                            file_hash: fhash,
-                            units_per_em: base_owned.units_per_em,
-                            num_glyphs: base_owned.num_glyphs,
-                            glyphs: base_owned.glyphs.clone(),
-                            cmap: base_owned.cmap.clone(),
-                            single_tables: base_owned.single_tables.clone(),
-                            format1_tables: base_owned.format1_tables.clone(),
-                            format2_tables: base_owned.format2_tables.clone(),
-                            case_single_tables: base_owned.case_single_tables.clone(),
-                            case_format1_tables: base_owned.case_format1_tables.clone(),
-                            case_format2_tables: base_owned.case_format2_tables.clone(),
-                        });
-                        n_reused += 1;
-                        continue;
-                    }
-                    // Also check old_owned for base (warm start)
-                    if let Some(old_base) = old_owned.get(&base_key) {
-                        if old_base.file_hash == fhash {
-                            owned_fonts.insert(font_key.clone(), OwnedFont {
-                                file_hash: fhash,
-                                units_per_em: old_base.units_per_em,
-                                num_glyphs: old_base.num_glyphs,
-                                glyphs: old_base.glyphs.clone(),
-                                cmap: old_base.cmap.clone(),
-                                single_tables: old_base.single_tables.clone(),
-                                format1_tables: old_base.format1_tables.clone(),
-                                format2_tables: old_base.format2_tables.clone(),
-                                case_single_tables: old_base.case_single_tables.clone(),
-                                case_format1_tables: old_base.case_format1_tables.clone(),
-                                case_format2_tables: old_base.case_format2_tables.clone(),
-                            });
-                            n_reused += 1;
-                            continue;
-                        }
-                    }
-                }
-            }
+            // NOTE (Mike Nov 3, 2026): No dedup for OT variants. Geo metrics are about
+            // SPACING, not glyph shape. Every variant (nokern, smcp, onum, ss01, etc.)
+            // has potentially different spacing and must build its own metrics.
+            // "DEDUP is wrong for geo."
 
             let ttf_face = match unprint_fonts::ttf_parser::Face::parse(&font_data, 0) { Ok(f) => f, Err(_) => continue, };
             let upem = ttf_face.units_per_em() as f64;
