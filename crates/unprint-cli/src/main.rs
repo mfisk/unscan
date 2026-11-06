@@ -88,7 +88,9 @@ fn main() {
         let catalog = font_scan::scan_fonts(&font_dirs, args.quiet);
         // Build path -> best entry map. Shared preference with the
         // classifier tiebreakers (font_scan::font_key_preference_score):
-        // prefer kern for GPOS fonts, nokern otherwise; nolig; then opsz=10.
+        // prefer kern for GPOS fonts, nokern otherwise; nolig; then opsz=10;
+        // OT-feature variants and non-default weight instances (-10 each)
+        // never win the default pick.
         // The entry's stored has_gpos flag is the source of truth — the
         // scan drops font bytes, so parsing fe.data here always fails.
         use std::collections::HashMap;

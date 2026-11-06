@@ -581,7 +581,7 @@ pub fn identify_fonts(
 
     // Tiebreak on identical fine scores with the shared font-key preference
     // (same as --resolve-fontkey: GPOS → kern, non-GPOS → nokern; nolig;
-    // opsz=10).
+    // opsz=10; OT-feature variants and non-default weight instances -10).
     // Font-key order is the final deterministic fallback.
     // Preferences are precomputed once — the comparator must stay cheap.
     // Owned String keys: borrowing scored's keys would conflict with the
