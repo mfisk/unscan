@@ -1870,7 +1870,10 @@ fn build_observation_table(
 
         // Crop image + midpoint
         let (crop_uri, crop_mid) = if let Some(dd) = diag_dir {
-            if let Some(p) = find_crop_png_in(dd, crop_dir_name, cv.crop_index, &cv.seq) {
+            // Prefer GT crop (gt_crops/) over winning-pass crop; fall back if GT segmentation differs
+            let p = find_crop_png_in(dd, "gt_crops", cv.crop_index, &cv.seq)
+                .or_else(|| find_crop_png_in(dd, crop_dir_name, cv.crop_index, &cv.seq));
+            if let Some(p) = p {
                 let uri = file_to_b64_uri(&p);
                 let mid = image::open(&p).ok().map(|i| i.to_luma8()).and_then(|im| ink_midpoint(&im));
                 (uri, mid)
