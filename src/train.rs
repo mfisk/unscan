@@ -1242,9 +1242,17 @@ pub fn run_train(mut args: TrainArgs) {
                     }).collect();
 
                     for &(ht, aa_idx_all) in &needed_combos {
+                        // Subpixel offsets for training robustness (Mike Nov 3, 2026).
+                        // MuPDF rasterization positions glyphs at fractional pixel
+                        // coordinates; training must cover x and y variations.
+                        // Quarter-pixel offsets (Mike Nov 4, 2026).
+                        for &dx in &[0.0f32, 0.25f32, 0.5f32, 0.75f32] {
+                            for &dy in &[0.0f32, 0.25f32, 0.5f32, 0.75f32] {
                         let mut params = args.render_params.clone();
                         params.height = ht;
                         params.aa = all_aa[aa_idx_all];
+                        params.subpixel_dx = dx;
+                        params.subpixel_dy = dy;
                         let matches_prewarm_params = params.height == prewarm_params.height
                             && params.render_scale == prewarm_params.render_scale
                             && params.aa == prewarm_params.aa
@@ -1252,7 +1260,21 @@ pub fn run_train(mut args: TrainArgs) {
                         let img = if matches_prewarm_params {
                             glyph_map
                                 .hash_for_font(seq, &fk)
-                                .and_then(|hash| crate::char_render::load_cached_ngram(seq, hash, &params))
+                                .and_then(|hash| {
+                                    // Try cache first
+                                    if let Some(img) = crate::char_render::load_cached_ngram(seq, hash, &params) {
+                                        Some(img)
+                                    } else {
+                                        // Cache miss: render fresh and save to cache
+                                        let img = crate::char_render::render_ngram_fresh(&font, seq, &gid_overrides, &params, false)?;
+                                        let path = crate::char_render::ngram_cache_path(seq, hash, &params);
+                                        if let Some(parent) = path.parent() {
+                                            let _ = std::fs::create_dir_all(parent);
+                                        }
+                                        let _ = img.save(&path);
+                                        Some(img)
+                                    }
+                                })
                                 .or_else(|| {
                                     crate::char_render::render_ngram_fresh(&font, seq, &gid_overrides, &params, false
                     )
@@ -1279,6 +1301,8 @@ pub fn run_train(mut args: TrainArgs) {
                             glyph_id,
                             features: feats.as_slice(),
                         }));
+                            } // end dy
+                        } // end dx
                     }
                 }
 

@@ -169,14 +169,13 @@ pub mod paths {
     pub fn catalog_bin() -> PathBuf { cache_dir().join("catalog.bin") }
     pub fn geo_cache_bin() -> PathBuf { cache_dir().join("geo-cache.bin") }
     pub fn glyph_map_bin() -> PathBuf { cache_dir().join("glyph-map.bin") }
-    pub fn lda_weights_bin() -> PathBuf { cache_dir().join("lda-weights.bin") }
+    pub fn lda_weights_bin() -> PathBuf { cache_dir().join("lda-weights-global.bin") }
     pub fn fisher_weights_bin() -> PathBuf { cache_dir().join("fisher-weights.bin") }
     pub fn triplet_weights_bin() -> PathBuf { cache_dir().join("triplet-weights.bin") }
     pub fn mahalanobis_weights_bin() -> PathBuf { cache_dir().join("mahalanobis-weights.bin") }
     pub fn mlp_weights_bin() -> PathBuf { cache_dir().join("mlp-weights.bin") }
     pub fn per_font_lda_dir() -> PathBuf { cache_dir().join("per-font-lda") }
-    pub fn training_dir() -> PathBuf { cache_dir().join("training") }
-    pub fn chars_dir() -> PathBuf { cache_dir().join("chars") }
-    pub fn means_dir() -> PathBuf { cache_dir().join("means") }
-    pub fn lda_dir() -> PathBuf { cache_dir().join("lda") }
+    pub fn training_dir() -> PathBuf { cache_dir().join("glyph-features") }
+    pub fn chars_dir() -> PathBuf { cache_dir().join("glyph-renders") }
+    pub fn lda_dir() -> PathBuf { cache_dir().join("lda-models-per-char") }
 }
