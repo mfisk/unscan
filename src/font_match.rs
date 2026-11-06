@@ -150,7 +150,11 @@ pub fn identify_fonts(
             }
             scored.clear();
             best_observations.clear();
-            gt_observations.clear();
+            // NOTE (Mike Nov 3, 2026): Do NOT clear gt_observations on fallback.
+            // The fallback re-runs without pruning, but if GT scoring fails on
+            // pass 1, we need the pass 0 GT observations for audit functionality.
+            // Pass 1 will overwrite gt_observations if GT scores successfully.
+            // Clearing here breaks GT scoring and audit when pass 1 fails.
             gt_best_score = f32::MIN;
             best_path_score = f32::MIN;
             best_score = f32::MIN;
