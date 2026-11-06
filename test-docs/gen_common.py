@@ -317,6 +317,49 @@ def _read_ps_and_weight_from_descriptor(font_desc):
     return None, None
 
 
+_gpos_cache = {}
+
+
+def _font_has_gpos(path):
+    """True if the font file at path contains a GPOS table.
+
+    Cached per path. Mirrors font_scan::font_has_gpos in Rust. Used to
+    give _resolve_score the same GPOS-aware preference as --resolve-fontkey.
+    Unreadable files default to False (prefer nokern), matching Rust's
+    fail-closed parse behavior.
+    """
+    if path in _gpos_cache:
+        return _gpos_cache[path]
+    has = False
+    try:
+        from fontTools.ttLib import TTFont as FTFont
+        with FTFont(path, lazy=True) as tt:
+            has = "GPOS" in tt
+    except Exception:
+        has = False
+    _gpos_cache[path] = has
+    return has
+
+
+def _resolve_score(font_key, has_gpos=False):
+    """Mirror of the shared font-key preference in Rust
+    (src/font_scan.rs font_key_preference_score, used by --resolve-fontkey
+    and the classifier tiebreakers): GPOS font +4 kern, non-GPOS +4 nokern,
+    nolig +2, opsz=10 +1. Higher score wins. Keep in sync with Rust —
+    Python must not invent its own preference."""
+    s = 0
+    is_nokern = "nokern" in font_key
+    # If has_gpos: +4 for kern (not nokern).
+    # If !has_gpos: +4 for nokern.
+    if has_gpos != is_nokern:
+        s += 4
+    if "nolig" in font_key:
+        s += 2  # prefer nolig
+    if "opsz=10" in font_key:
+        s += 1  # tiebreaker
+    return s
+
+
 def build_canonical_map_from_pdf(pdf_path, all_font_files, catalog_json=None, font_entries=None, unprint_bin=None):
     """Build canonical_map by extracting PS names from embedded font data in PDF.
 
@@ -330,7 +373,8 @@ def build_canonical_map_from_pdf(pdf_path, all_font_files, catalog_json=None, fo
     (including axes like [opsz=20]).
 
     If catalog_json is provided (path to unprint --export-catalog-json output),
-    uses the catalog's font_key directly (preferring nokern variants) instead
+    uses the catalog's font_key directly (preferring the --resolve-fontkey
+    preference: kern, nolig, then opsz=10) instead
     of reconstructing via make_weight_explicit. This avoids duplicating the
     Rust catalog logic in Python.
 
@@ -449,8 +493,9 @@ def build_canonical_map_from_pdf(pdf_path, all_font_files, catalog_json=None, fo
         try:
             with open(catalog_json) as f:
                 catalog = json.load(f)
-            # Group by path, prefer nokern variant with opsz=10
-            # The specimen renders with opsz=10, so GT must match that variant.
+            # Group by path, preferring the --resolve-fontkey preference
+            # (GPOS-aware: kern +4 / nokern +4, nolig +2, opsz=10 +1).
+            # Must match Rust scoring.
             for entry in catalog:
                 path = entry.get('path')
                 if not path:
@@ -459,18 +504,8 @@ def build_canonical_map_from_pdf(pdf_path, all_font_files, catalog_json=None, fo
                 if existing is None:
                     catalog_by_path[path] = entry
                     continue
-                # Prefer nokern over non-nokern
-                entry_nokern = 'nokern' in entry.get('variant_tag', '')
-                existing_nokern = 'nokern' in existing.get('variant_tag', '')
-                if entry_nokern and not existing_nokern:
-                    catalog_by_path[path] = entry
-                    continue
-                if not entry_nokern and existing_nokern:
-                    continue
-                # Both nokern or both non-nokern: prefer opsz=10
-                entry_opsz10 = 'opsz=10' in entry.get('font_key', '')
-                existing_opsz10 = 'opsz=10' in existing.get('font_key', '')
-                if entry_opsz10 and not existing_opsz10:
+                gpos = _font_has_gpos(path)
+                if _resolve_score(entry.get('font_key', ''), gpos) > _resolve_score(existing.get('font_key', ''), gpos):
                     catalog_by_path[path] = entry
         except Exception:
             pass
@@ -482,7 +517,8 @@ def build_canonical_map_from_pdf(pdf_path, all_font_files, catalog_json=None, fo
     # For variable fonts, there are multiple entries per path (different weights).
     # We need to match PDF BaseFont names (e.g., "Playfair-Display-Bold") to
     # catalog entries (e.g., "PlayfairDisplay-700|wght700[wght=700]").
-    # Prefer nokern+opsz10 variants when multiple match
+    # Prefer the --resolve-fontkey preference (kern +4, nolig +2, opsz=10 +1)
+    # when multiple entries match.
     # Build exact PS-name -> catalog entry map (architectural change #3: opaque font_key,
     # no normalization heuristics). The catalog's postscript_name is the clean
     # raw_postscript_name from the font file, which should exactly match the
@@ -497,22 +533,14 @@ def build_canonical_map_from_pdf(pdf_path, all_font_files, catalog_json=None, fo
                 if not ps_name:
                     continue
                 # Exact match only — no normalization, no guessing.
-                # If multiple entries share the same PS name, prefer nokern, then opsz=10.
+                # If multiple entries share the same PS name, prefer the
+                # --resolve-fontkey preference (GPOS-aware: kern +4 / nokern
+                # +4, nolig +2, opsz=10 +1).
                 existing = ps_to_entry.get(ps_name)
                 if existing is None:
                     ps_to_entry[ps_name] = entry
-                else:
-                    # Prefer nokern over non-nokern
-                    entry_nokern = 'nokern' in entry.get('font_key', '')
-                    existing_nokern = 'nokern' in existing.get('font_key', '')
-                    if entry_nokern and not existing_nokern:
-                        ps_to_entry[ps_name] = entry
-                    elif entry_nokern == existing_nokern:
-                        # Prefer opsz=10
-                        entry_opsz10 = 'opsz=10' in entry.get('font_key', '')
-                        existing_opsz10 = 'opsz=10' in existing.get('font_key', '')
-                        if entry_opsz10 and not existing_opsz10:
-                            ps_to_entry[ps_name] = entry
+                elif _resolve_score(entry.get('font_key', ''), _font_has_gpos(entry.get('path'))) > _resolve_score(existing.get('font_key', ''), _font_has_gpos(existing.get('path'))):
+                    ps_to_entry[ps_name] = entry
         except Exception as e:
             # Catalog load failure is fatal — cannot annotate without it
             raise RuntimeError(f"Failed to load catalog {catalog_json}: {e}")
