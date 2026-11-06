@@ -37,10 +37,6 @@ description = "Replace raster/scanned text with native vector text — zero info
 license = "MIT"
 autobins = false
 
-[[bin]]
-name = "gen_training_data"
-path = "src/bin/gen_training_data.rs"
-
 [dependencies]
 clap = { workspace = true }
 image = { workspace = true }

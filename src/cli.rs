@@ -175,6 +175,8 @@ impl Args {
             render_scale: self.render_scale,
             aa,
             binarize_threshold: self.render_binarize.filter(|&v| v > 0),
+            subpixel_dx: 0.0,
+            subpixel_dy: 0.0,
         }
     }
 
