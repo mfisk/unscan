@@ -616,6 +616,17 @@ pub fn subsample_eval(n: usize, max_eval: usize, seed: u64) -> Vec<usize> {
 // Main
 // ---------------------------------------------------------------------------
 
+/// Subpixel offsets for training robustness (Mike Nov 3, 2026).
+/// MuPDF rasterization positions glyphs at fractional pixel coordinates;
+/// training must cover x and y variations. Quarter-pixel steps (Mike Nov 4, 2026).
+///
+/// Each glyph group produces exactly one training record per (dx, dy) pair,
+/// so a sequence's record count is `groups * SUBPIXEL_OFFSET_COUNT`.
+/// The render loop and the cache validation share these constants, so the two
+/// sides of the count comparison can never drift apart again. Do not change
+/// the steps without updating the render loop and validation together.
+const SUBPIXEL_STEPS: [f32; 4] = [0.0, 0.25, 0.5, 0.75];
+const SUBPIXEL_OFFSET_COUNT: usize = SUBPIXEL_STEPS.len() * SUBPIXEL_STEPS.len();
 
 pub fn run_train(mut args: TrainArgs) {
     // Respect wrapper env first, otherwise cap to avoid OOM on 7.8GB no-swap.
@@ -1124,14 +1135,20 @@ pub fn run_train(mut args: TrainArgs) {
                     .unwrap_or(old_counts);
                 let mut is_cached = true;
                 let mut needs_incr = false;
-                for (_i, (&cur, &old)) in current_counts_by_seq.iter().zip(old_counts.iter()).enumerate() {
-                    if cur < old {
+                for (&cur_groups, &old_records) in current_counts_by_seq.iter().zip(old_counts.iter()) {
+                    // current_counts_by_seq holds glyph GROUP counts; old_counts holds
+                    // RECORD counts from the file (one record per subpixel offset).
+                    // Convert groups to expected records so the comparison is like-for-like.
+                    // Comparing groups directly to records always concluded the cache
+                    // had "shrunk" and forced a full rebuild on every run.
+                    let cur_records = cur_groups * SUBPIXEL_OFFSET_COUNT;
+                    if cur_records < old_records {
                         is_cached = false;
                         needs_incr = false;
-                        break; // corruption / shrink → full rebuild
-                    } else if cur > old {
+                        break; // cached file has more records than current groups need → shrink/corruption → full rebuild
+                    } else if cur_records > old_records {
                         is_cached = false;
-                        needs_incr = true;
+                        needs_incr = true; // cached file is missing records → new groups (or skipped renders)
                     }
                 }
                 if is_cached {
@@ -1246,8 +1263,8 @@ pub fn run_train(mut args: TrainArgs) {
                         // MuPDF rasterization positions glyphs at fractional pixel
                         // coordinates; training must cover x and y variations.
                         // Quarter-pixel offsets (Mike Nov 4, 2026).
-                        for &dx in &[0.0f32, 0.25f32, 0.5f32, 0.75f32] {
-                            for &dy in &[0.0f32, 0.25f32, 0.5f32, 0.75f32] {
+                        for &dx in &SUBPIXEL_STEPS {
+                            for &dy in &SUBPIXEL_STEPS {
                         let mut params = args.render_params.clone();
                         params.height = ht;
                         params.aa = all_aa[aa_idx_all];
@@ -1385,7 +1402,7 @@ pub fn run_train(mut args: TrainArgs) {
                 // is the source of truth: 12-byte header + 256 bytes per record
                 // (4-byte glyph_id + 63 floats). A glyph render or feature
                 // computation can also fail, so the file may hold fewer than the
-                // expected (cur_cnt - old_cnt) new samples. The manifest and
+                // expected (cur_groups - old_groups) * SUBPIXEL_OFFSET_COUNT new samples. The manifest and
                 // cached_combos must record what was actually written, otherwise
                 // the read phase over-reads and hits end of file.
                 let mut actual_counts: Vec<usize> = Vec::with_capacity(n_seqs);
@@ -1401,9 +1418,14 @@ pub fn run_train(mut args: TrainArgs) {
                 }
                 // For this combo, for each seq where cur > old, render only gids >= old
                 for (si, seq) in sequences.iter().enumerate() {
-                    let old_cnt = actual_counts[si];
-                    let cur_cnt = current_counts_by_seq[si];
-                    if cur_cnt <= old_cnt { continue; }
+                    // actual_counts holds RECORD counts from the file; the gid threshold
+                    // below needs a GROUP count, so convert. current_counts_by_seq is
+                    // already in groups. (Comparing a gid to a record count always
+                    // concluded every gid was "old", so the incremental path never ran.)
+                    let old_records = actual_counts[si];
+                    let old_groups = old_records / SUBPIXEL_OFFSET_COUNT;
+                    let cur_groups = current_counts_by_seq[si];
+                    if cur_groups <= old_groups { continue; }
                     let fpath = combo_path(&feat_dir, seq, info.ht, aa_name);
                     // Open existing file for append. File already has header.
                     let mut file = std::fs::OpenOptions::new()
@@ -1412,45 +1434,56 @@ pub fn run_train(mut args: TrainArgs) {
                         .unwrap_or_else(|e| panic!("open for append {:?}: {e}", fpath));
                     let mut new_samples = 0usize;
                     // Iterate over fonts to find those whose gid is in new range and are reps
-                    // To bound work, we iterate catalog but skip early if gid < old_cnt
+                    // To bound work, we iterate catalog but skip early if gid < old_groups
                     for fe in catalog.iter() {
                         let fk = fe.font_key_ref();
                         let gid = match glyph_map.glyph_id_for_font(seq, fk) {
                             Some(id) => id,
                             None => continue,
                         };
-                        if gid < old_cnt { continue; } // old gid, already in file
-                        if gid >= cur_cnt { continue; } // should not happen
+                        if gid < old_groups { continue; } // old gid, already in file
+                        if gid >= cur_groups { continue; } // should not happen
                         let rep_font = &glyph_map.fonts_for_glyph(seq, gid)[0];
                         if rep_font != fk { continue; }
 
-                        // Render this new glyph for this combo
+                        // Render this new glyph for this combo, at every subpixel
+                        // offset — the same SUBPIXEL_OFFSET_COUNT records per group
+                        // the full render writes. Rendering only one offset would
+                        // leave the file's record count short of
+                        // groups * SUBPIXEL_OFFSET_COUNT, so the next validation
+                        // would re-trigger incremental and append the same groups again.
                         let font_data = match std::fs::read(&fe.path) { Ok(d)=>d, Err(_)=>continue };
                         let Some(font) = fe.font_ref_with_variations(&font_data) else { continue };
                         let overrides = fe.glyph_overrides.as_deref();
                         let gid_overrides: Vec<Option<unprint_fonts::ab_glyph::GlyphId>> = seq.iter().map(|c| {
                             overrides.and_then(|ovs| ovs.iter().find(|(ch, _)| *ch == *c).map(|(_, g)| unprint_fonts::ab_glyph::GlyphId(*g)))
                         }).collect();
-                        let mut params = args.render_params.clone();
-                        params.height = info.ht;
-                        params.aa = all_aa[info.aa_idx];
-                        let img = crate::char_render::render_ngram_fresh(&font, seq, &gid_overrides, &params, false);
-                        let img = match img { Some(i)=>i, None=>continue };
-                        let feats = match compute_features(&img, false) { Some(f)=>f, None=>continue };
-                        {
-                            use std::io::Write;
-                            let g32 = gid as u32;
-                            file.write_all(&g32.to_le_bytes()).expect("write gid");
-                            let arr = feats.as_slice();
-                            for &fv in &arr {
-                                file.write_all(&fv.to_le_bytes()).expect("write feat");
+                        for &dx in &SUBPIXEL_STEPS {
+                            for &dy in &SUBPIXEL_STEPS {
+                                let mut params = args.render_params.clone();
+                                params.height = info.ht;
+                                params.aa = all_aa[info.aa_idx];
+                                params.subpixel_dx = dx;
+                                params.subpixel_dy = dy;
+                                let img = crate::char_render::render_ngram_fresh(&font, seq, &gid_overrides, &params, false);
+                                let img = match img { Some(i)=>i, None=>continue };
+                                let feats = match compute_features(&img, false) { Some(f)=>f, None=>continue };
+                                {
+                                    use std::io::Write;
+                                    let g32 = gid as u32;
+                                    file.write_all(&g32.to_le_bytes()).expect("write gid");
+                                    let arr = feats.as_slice();
+                                    for &fv in &arr {
+                                        file.write_all(&fv.to_le_bytes()).expect("write feat");
+                                    }
+                                }
+                                new_samples += 1;
+                                incr_total_new += 1;
                             }
                         }
-                        new_samples += 1;
-                        incr_total_new += 1;
                     }
-                    eprintln!("  h{} {} seq {} ({:?}): +{} new glyphs ({}→{})", info.ht, aa_name, si, seq, new_samples, old_cnt, cur_cnt);
-                    actual_counts[si] = old_cnt + new_samples;
+                    eprintln!("  h{} {} seq {} ({:?}): +{} new samples ({}→{} groups)", info.ht, aa_name, si, seq, new_samples, old_groups, cur_groups);
+                    actual_counts[si] = old_records + new_samples;
                 }
                 // Update manifest for this combo to the ACTUAL new counts
                 let mpath = manifest_combo_path(&feat_dir, info.ht, aa_name);
