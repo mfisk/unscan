@@ -591,7 +591,7 @@ pub fn identify_fonts(
         .map(|(k, _)| {
             let p = font_registry
                 .by_key(k)
-                .map(|fe| crate::font_scan::font_key_preference_score(k, fe.has_gpos))
+                .map(|fe| crate::font_scan::font_key_preference_score(k, fe.has_kern))
                 .unwrap_or(0);
             (k.clone(), p)
         })

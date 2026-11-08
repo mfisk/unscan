@@ -193,7 +193,9 @@ pub fn ot_features(variant_tag: &str) -> Vec<unprint_fonts::rustybuzz::Feature> 
     // ... rest of existing logic, pushing to features instead of returning
     // For brevity, handle the simple 4-char tag case
     for part in variant_tag.split('|') {
-        if part == "nokern" || part == "allcaps" || part == "caps" || part.is_empty() {
+        // kern/nokern and lig/nolig are variant dimensions, not OT feature
+        // tags: "lig" must not be pushed as a (bogus) "lig " feature.
+        if part == "nokern" || part == "kern" || part == "lig" || part == "nolig" || part == "allcaps" || part == "caps" || part.is_empty() {
             continue;
         }
         if part.len() <= 4 {
