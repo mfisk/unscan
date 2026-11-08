@@ -1530,6 +1530,7 @@ fn render_correct_font_comparison(
         fe.glyph_overrides.as_ref().map(|v| v.as_slice()),
         &fe.variant_tag, fe.variations.as_deref(),
         true,
+        fe.collapsed_lig_set(),
         Some(&correct_dir), None,
         gt_em,
         None,
@@ -1896,12 +1897,19 @@ fn build_observation_table(
                             let _ = font.set_variation(tag, *val);
                         }
                     }
-                    let gid_overrides: Vec<Option<unprint_fonts::ab_glyph::GlyphId>> = seq.iter().map(|c| {
+                    // Normalize the sequence for THIS font (Mike Nov 6, 2026):
+                    // the observation seq is the winner's collapsed sequence
+                    // (e.g. ['\u{FB01}']). A nolig GT font must render that
+                    // segment as separate f, i glyphs; a lig font as the
+                    // single FB01 glyph. Overrides are computed from the
+                    // normalized sequence, not the raw observation seq.
+                    let render_seq = char_render::normalize_seq_for_font(fe, seq);
+                    let gid_overrides: Vec<Option<unprint_fonts::ab_glyph::GlyphId>> = render_seq.iter().map(|c| {
                         fe.glyph_overrides.as_ref()
                             .and_then(|ovs| ovs.iter().find(|(gc, _)| *gc == *c).map(|(_, g)| unprint_fonts::ab_glyph::GlyphId(*g)))
                     }).collect();
                     let _disable_kern = fe.variant_tag.contains("nokern");
-                    if let Some(img) = char_render::render_ngram_fresh(&font, seq, &gid_overrides, &char_render::RenderParams::default(), _disable_kern) {
+                    if let Some(img) = char_render::render_ngram_fresh(&font, &render_seq, &gid_overrides, &char_render::RenderParams::default(), _disable_kern) {
                         correct_mid = ink_midpoint(&img);
                         correct_ref_uri = Some(img_to_b64_uri(&img));
                     }
@@ -1913,8 +1921,12 @@ fn build_observation_table(
         let mut chosen_ref_uri: Option<String> = None;
         let mut chosen_mid: Option<(f32, f32)> = None;
         if let Some(fe) = chosen_fe {
-            if seq.len() == 1 {
-                if let Some(path) = find_font_ref_ngram_png(audit_root, fe, seq[0]) {
+            // Normalize the sequence for THIS font (see correct ref above):
+            // a lig winner renders the combined segment as the FB01 glyph,
+            // a nolig winner as separate f, i glyphs.
+            let render_seq = char_render::normalize_seq_for_font(fe, seq);
+            if render_seq.len() == 1 {
+                if let Some(path) = find_font_ref_ngram_png(audit_root, fe, render_seq[0]) {
                     chosen_ref_uri = file_to_b64_uri(&path);
                     if let Ok(img) = image::open(&path) {
                         chosen_mid = ink_midpoint(&img.to_luma8());
@@ -1930,12 +1942,12 @@ fn build_observation_table(
                                 let _ = font.set_variation(tag, *val);
                             }
                         }
-                        let gid_overrides: Vec<Option<unprint_fonts::ab_glyph::GlyphId>> = seq.iter().map(|c| {
+                        let gid_overrides: Vec<Option<unprint_fonts::ab_glyph::GlyphId>> = render_seq.iter().map(|c| {
                             fe.glyph_overrides.as_ref()
                                 .and_then(|ovs| ovs.iter().find(|(gc, _)| *gc == *c).map(|(_, g)| unprint_fonts::ab_glyph::GlyphId(*g)))
                         }).collect();
                         let _disable_kern = fe.variant_tag.contains("nokern");
-                    if let Some(img) = char_render::render_ngram_fresh(&font, seq, &gid_overrides, &char_render::RenderParams::default(), _disable_kern) {
+                    if let Some(img) = char_render::render_ngram_fresh(&font, &render_seq, &gid_overrides, &char_render::RenderParams::default(), _disable_kern) {
                             chosen_mid = ink_midpoint(&img);
                             chosen_ref_uri = Some(img_to_b64_uri(&img));
                         }

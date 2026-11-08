@@ -1007,6 +1007,10 @@ fn run(args: &cli::Args, classifier: &mut dyn classifier::Classifier) -> Result<
                         // Honor the winning font's ligature determination via the
                         // durable segmentation signal carried in LineMatch.
                         let allow_liga = lm.seg_used_ligatures;
+                        // The winner arrives as a FontMatchResult (no
+                        // FontEntry); resolve its lig set through the registry.
+                        let fm_lig = font_registry.by_key(&fm.font_key)
+                            .map(|fe| fe.collapsed_lig_set()).unwrap_or(0);
                         let vr = verify::verify_text_region(
                             &norm_crop,
                             fd.as_slice(),
@@ -1017,6 +1021,7 @@ fn run(args: &cli::Args, classifier: &mut dyn classifier::Classifier) -> Result<
                             &fm.variant_tag,
                             fm.variations.as_deref(),
                             allow_liga,
+                            fm_lig,
                             lm.diag_seg_dir.as_deref(),
                             None,
                             None,
@@ -1043,6 +1048,7 @@ fn run(args: &cli::Args, classifier: &mut dyn classifier::Classifier) -> Result<
                                             &alt_fe.variant_tag,
                                             alt_fe.variations.as_deref(),
                                             allow_liga_alt,
+                                            alt_fe.collapsed_lig_set(),
                                             alt_audit_dir.as_deref(),
                                             None,
                                             None,
