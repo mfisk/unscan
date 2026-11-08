@@ -222,6 +222,15 @@ pub struct FontEntry {
     /// preference (`font_key_preference_score`) for --resolve-fontkey and
     /// classifier tiebreaking. Serialized in the scan cache (v17+).
     pub has_gpos: bool,
+    /// True if the font file has kerning data (legacy `kern` table with at
+    /// least one pair, or a GPOS `kern` feature with at least one lookup).
+    /// Captured during the scan while the font file bytes are available;
+    /// cannot be re-derived later because `data` is dropped after the scan.
+    /// Drives the shared font-key preference: a font with kerning renders
+    /// kerned by default, so the kerned variant wins the default pick.
+    /// (GPOS presence alone does not imply kerning — legacy `kern` tables
+    /// kern in rendering too.) Serialized in the scan cache (v18+).
+    pub has_kern: bool,
 }
 
 impl FontEntry {
@@ -836,7 +845,8 @@ pub fn default_font_dirs(extra: &[PathBuf]) -> Vec<PathBuf> {
 //     typographic_family_len: u32 le + [u8; typographic_family_len]
 
 const FSCN_MAGIC: &[u8; 4] = b"FSCN";
-const FSCN_VERSION: u32 = 17;
+// v19: lig/nolig explicit in variant_tag (|lig on ligature-enabled entries).
+const FSCN_VERSION: u32 = 19;
 
 pub(crate) fn scan_cache_path() -> PathBuf {
     crate::cache::paths::font_scan_bin()
@@ -1035,6 +1045,9 @@ fn write_scan_cache(path: &Path, entries: &[FontEntry]) -> std::io::Result<()> {
 
         // has_gpos - v17+
         w.write_all(&[e.has_gpos as u8])?;
+
+        // has_kern - v18+
+        w.write_all(&[e.has_kern as u8])?;
     }
 
     w.flush()?;
@@ -1158,6 +1171,9 @@ fn read_scan_cache(path: &Path, quiet: bool) -> Option<Vec<FontEntry>> {
         // has_gpos - v17+
         let has_gpos = read_u8(&mut r)? != 0;
 
+        // has_kern - v18+
+        let has_kern = read_u8(&mut r)? != 0;
+
         entries.push(FontEntry {
             path: path_buf,
             family_name,
@@ -1183,6 +1199,7 @@ fn read_scan_cache(path: &Path, quiet: bool) -> Option<Vec<FontEntry>> {
             vintage_era,
             opsz_range,
             has_gpos,
+            has_kern,
         });
     }
 
@@ -1391,6 +1408,11 @@ pub fn scan_fonts(dirs: &[PathBuf], quiet: bool) -> Vec<FontEntry> {
                 } else {
                     Vec::new()
                 };
+                // Kern/nokern is explicit in every font key (no implicit
+                // default): variant entries render kerned when the font has
+                // kerning data, nokern otherwise. Reused for OT variants,
+                // allcaps, and weight instances below.
+                let kern_tag = if fe.has_kern { "kern" } else { "nokern" };
                 for (tag, overrides) in &variants {
                     // Merge ligature overrides into each variant
                     let mut combined = overrides.clone();
@@ -1399,6 +1421,12 @@ pub fn scan_fonts(dirs: &[PathBuf], quiet: bool) -> Vec<FontEntry> {
                             combined.push((lig_c, gid));
                         }
                     }
+                    // Variant entries carry the kern/nokern tag explicitly
+                    // (appended after the OT tag): they render kerned unless
+                    // the font has no kerning data. Lig is explicit too:
+                    // variants render with ligatures on (|lig); there is no
+                    // nolig permutation for OT variants.
+                    let var_tag = format!("{}|{}|lig", tag, kern_tag);
                     let var_entry = FontEntry {
                         path: fe.path.clone(),
                         family_name: format!("{} [{}]", fe.family_name, tag),
@@ -1413,10 +1441,10 @@ pub fn scan_fonts(dirs: &[PathBuf], quiet: bool) -> Vec<FontEntry> {
                         class: fe.class,
                         data: Vec::new(), // bytes not retained
                         oldstyle_figures: fe.oldstyle_figures,
-                        variant_tag: tag.clone(),
+                        variant_tag: var_tag.clone(),
                         font_key_cache: FontEntry::compute_font_key_full(
                             &format!("{}|{}", fe.postscript_name, tag),
-                            tag,
+                            &var_tag,
                             None,
                             &default_variations,
                         ),
@@ -1426,6 +1454,7 @@ pub fn scan_fonts(dirs: &[PathBuf], quiet: bool) -> Vec<FontEntry> {
                         vintage_era: None,
                         opsz_range,
                         has_gpos: fe.has_gpos,
+                        has_kern: fe.has_kern,
                     };
                     fonts.push(var_entry);
                 }
@@ -1442,6 +1471,10 @@ pub fn scan_fonts(dirs: &[PathBuf], quiet: bool) -> Vec<FontEntry> {
                         for &(lig_c, gid) in &ligatures {
                             combined_lig.push((lig_c, gid));
                         }
+                        // Allcaps entries carry the kern/nokern tag explicitly,
+                        // like OT variants (render kerned unless no kern data).
+                        // Lig is explicit too (|lig — ligatures on).
+                        let allcaps_tag = format!("{}|{}|lig", tag, kern_tag);
                         let allcaps_entry = FontEntry {
                             path: fe.path.clone(),
                             family_name: format!("{} [{}]", fe.family_name, tag),
@@ -1452,10 +1485,10 @@ pub fn scan_fonts(dirs: &[PathBuf], quiet: bool) -> Vec<FontEntry> {
                             class: fe.class,
                             data: Vec::new(),
                             oldstyle_figures: fe.oldstyle_figures,
-                            variant_tag: tag.clone(),
+                            variant_tag: allcaps_tag.clone(),
                             font_key_cache: FontEntry::compute_font_key_full(
                                 &format!("{}|{}", fe.postscript_name, tag),
-                                &tag,
+                                &allcaps_tag,
                                 None,
                                 &default_variations,
                             ),
@@ -1465,6 +1498,7 @@ pub fn scan_fonts(dirs: &[PathBuf], quiet: bool) -> Vec<FontEntry> {
                             vintage_era: None,
                             opsz_range,
                             has_gpos: fe.has_gpos,
+                            has_kern: fe.has_kern,
                         };
                         fonts.push(allcaps_entry);
                     }
@@ -1489,7 +1523,12 @@ pub fn scan_fonts(dirs: &[PathBuf], quiet: bool) -> Vec<FontEntry> {
                 let weight_instances = detect_weight_instances(path, fe.class);
                 for wi in &weight_instances {
                     let var_ps = make_weight_explicit(&fe.raw_postscript_name, wi.os2_weight);
-                    let var_tag = format!("wght{}", wi.os2_weight);
+                    // Weight instances carry the kern/nokern tag explicitly
+                    // (appended after wght): they render kerned unless the
+                    // font has no kerning data. Lig is explicit too (|lig —
+                    // ligatures on); there is no nolig permutation for
+                    // weight instances.
+                    let var_tag = format!("wght{}|{}|lig", wi.os2_weight, kern_tag);
                     let var_variations = Some(wi.axes.clone());
                     let mut var_fe = FontEntry {
                         path: fe.path.clone(),
@@ -1517,6 +1556,7 @@ pub fn scan_fonts(dirs: &[PathBuf], quiet: bool) -> Vec<FontEntry> {
                         vintage_era: None,
                         opsz_range,
                         has_gpos: fe.has_gpos,
+                        has_kern: fe.has_kern,
                     };
                     // Add ligature overrides to weight-instance entry
                     if !ligatures.is_empty() {
@@ -1550,7 +1590,9 @@ pub fn scan_fonts(dirs: &[PathBuf], quiet: bool) -> Vec<FontEntry> {
                 //   The lig variant uses the font's ligature set (collapses fi→ﬁ
                 //   when the font has a true ligature). The nolig variant disables
                 //   ligature collapsing, matching documents that render f and i
-                //   as separate glyphs.
+                //   as separate glyphs. Lig/nolig is explicit in every font key
+                //   — no implicit default: lig variants carry |lig, nolig
+                //   variants carry |nolig.
                 // - opsz: [base, opsz10] if the font has an opsz axis, else [base].
                 // The classifier scores all permutations and picks the best.
                 let kern_opts: &[bool] = if has_kern { &[false, true] } else { &[true] };
@@ -1562,7 +1604,12 @@ pub fn scan_fonts(dirs: &[PathBuf], quiet: bool) -> Vec<FontEntry> {
                 for &is_nokern in kern_opts {
                     for &is_nolig in lig_opts {
                         for variations in &var_opts {
-                            // Combine base variant_tag with nokern/nolig markers.
+                            // Combine base variant_tag with kern/nokern and
+                            // lig/nolig markers. Kern/nokern and lig/nolig are
+                            // explicit in every font key — no implicit default:
+                            // kerned variants carry |kern, nokern variants
+                            // carry |nokern; ligature-enabled variants carry
+                            // |lig, nolig variants carry |nolig.
                             // Use "|" separator to avoid ambiguity.
                             let mut variant_tag = fe.variant_tag.clone();
                             if is_nokern {
@@ -1571,12 +1618,24 @@ pub fn scan_fonts(dirs: &[PathBuf], quiet: bool) -> Vec<FontEntry> {
                                 } else {
                                     format!("{}|nokern", variant_tag)
                                 };
+                            } else {
+                                variant_tag = if variant_tag.is_empty() {
+                                    "kern".to_string()
+                                } else {
+                                    format!("{}|kern", variant_tag)
+                                };
                             }
                             if is_nolig {
                                 variant_tag = if variant_tag.is_empty() {
                                     "nolig".to_string()
                                 } else {
                                     format!("{}|nolig", variant_tag)
+                                };
+                            } else {
+                                variant_tag = if variant_tag.is_empty() {
+                                    "lig".to_string()
+                                } else {
+                                    format!("{}|lig", variant_tag)
                                 };
                             }
                             let mut family_name = fe.family_name.clone();
@@ -1609,6 +1668,7 @@ pub fn scan_fonts(dirs: &[PathBuf], quiet: bool) -> Vec<FontEntry> {
                                 vintage_era: None,
                                 opsz_range,
                                 has_gpos: fe.has_gpos,
+                                has_kern: fe.has_kern,
                             };
                             fonts.push(entry);
                         }
@@ -1641,6 +1701,7 @@ pub fn scan_fonts(dirs: &[PathBuf], quiet: bool) -> Vec<FontEntry> {
                     vintage_era: None,
                     opsz_range: None,
                     has_gpos: false,
+                    has_kern: false,
                 });
             }
         }
@@ -2259,7 +2320,7 @@ pub fn font_has_gpos(data: &[u8]) -> bool {
 /// titling/historical alternates, stylistic sets, or the allcaps
 /// (case+cpsp) variant. This is exactly the tag set the scan emits as
 /// variant entries (`VARIANT_FEATURES` plus `allcaps`); kern/nokern,
-/// nolig, wght/opsz axis values, and `vintage=` are not OT features.
+/// lig/nolig, wght/opsz axis values, and `vintage=` are not OT features.
 /// The specimen renders default features only, so a variant carrying one
 /// of these tags never matches the specimen's default rendering.
 fn is_ot_feature_tag(seg: &str) -> bool {
@@ -2275,18 +2336,24 @@ fn is_ot_feature_tag(seg: &str) -> bool {
 /// Single source of truth, shared by --resolve-fontkey
 /// (crates/unprint-cli/src/main.rs) and the classifier tiebreakers
 /// (font_match.rs fine-score sort, font_pipeline.rs exact-tie resolution).
-/// GPOS font → +4 for kern (not nokern); non-GPOS font → +4 for nokern;
-/// +2 for nolig; +1 for opsz=10; −10 per OT-feature variant tag (onum,
-/// lnum, smcp, c2sc, swsh, salt, titl, hist, ss01–ss20, allcaps) and
-/// −10 per non-default weight instance (`|wghtN`), so the base/default
-/// variant always wins the default-GT pick over an OT-feature variant
-/// or a non-default weight. Higher score wins.
-pub fn font_key_preference_score(font_key: &str, has_gpos: bool) -> i32 {
+/// Font with kerning data → +4 for kern (not nokern); font without
+/// kerning → +4 for nokern; +2 for nolig; +1 for opsz=10; −10 per
+/// OT-feature variant tag (onum, lnum, smcp, c2sc, swsh, salt, titl,
+/// hist, ss01–ss20, allcaps) and −10 per non-default weight instance
+/// (`|wghtN`), so the base/default variant always wins the default-GT
+/// pick over an OT-feature variant or a non-default weight. Higher
+/// score wins. The kerning signal is `has_kern` (legacy `kern` table
+/// or GPOS `kern` feature), not GPOS presence: a font with a legacy
+/// `kern` table but no GPOS (e.g. Trebuchet, Arial) still renders
+/// kerned by default, so its kerned variant is the default pick.
+/// Lig is explicit in the key but scores 0 (the default); nolig keeps
+/// +2, so the nolig variant still wins the default-GT pick.
+pub fn font_key_preference_score(font_key: &str, has_kern: bool) -> i32 {
     let mut s = 0;
     let is_nokern = font_key.contains("nokern");
-    // If has_gpos: +4 for kern (not nokern).
-    // If !has_gpos: +4 for nokern.
-    if has_gpos != is_nokern {
+    // If has_kern: +4 for kern (not nokern).
+    // If !has_kern: +4 for nokern.
+    if has_kern != is_nokern {
         s += 4;
     }
     if font_key.contains("nolig") {
@@ -2301,10 +2368,10 @@ pub fn font_key_preference_score(font_key: &str, has_gpos: bool) -> i32 {
     // default rendering. Segment 0 is the PostScript name, never a tag;
     // bracketed variations (`[wght=400,...]`) are stripped before matching.
     // The `wghtN` case matters: the scan only emits a weight instance for
-    // a weight other than the declared default, and for a kern-less
-    // variable font (e.g. OpenSans, which has no kern data so no kern
-    // base entries exist) the instance's spurious +4 would otherwise
-    // outscore the honest `|nokern|nolig` base entry.
+    // a weight other than the declared default, and the instance must
+    // never outscore the honest base entry at the default weight (e.g. a
+    // kern-less variable font's `|wght400|nokern` instance would otherwise
+    // tie the `|nokern|nolig` base entry on the kern dimension).
     for seg in font_key.split('|').skip(1) {
         let seg = seg.split('[').next().unwrap_or(seg);
         if is_ot_feature_tag(seg) {
@@ -2752,6 +2819,10 @@ pub fn load_font_entry(path: &Path, aliases: &HashMap<String, Alias>) -> Option<
     // shared font-key preference (see font_key_preference_score). The
     // scan drops `data` after this, so it cannot be re-derived later.
     let has_gpos = font_has_gpos(&data);
+    // Kerning data, captured while the bytes are available — the shared
+    // font-key preference's kern/nokern signal. Same lifetime constraint
+    // as has_gpos: computed here, stored on the entry, serialized.
+    let has_kern = font_has_kern_feature(&data);
     let meta = read_font_metadata(&data);
     let raw_ps_name = meta.nid6_postscript;
     let os2_weight = meta.weight_class;
@@ -2787,6 +2858,7 @@ pub fn load_font_entry(path: &Path, aliases: &HashMap<String, Alias>) -> Option<
             vintage_era: None,
             opsz_range: None,
             has_gpos,
+            has_kern,
         });
     }
 
@@ -2828,6 +2900,7 @@ pub fn load_font_entry(path: &Path, aliases: &HashMap<String, Alias>) -> Option<
         vintage_era: None,
         opsz_range: None,
         has_gpos,
+        has_kern,
     })
 }
 
@@ -2890,6 +2963,7 @@ mod catalog_hash_tests {
             vintage_era: None,
             opsz_range: None,
             has_gpos: false,
+            has_kern: false,
         }
     }
 
@@ -2914,6 +2988,7 @@ mod catalog_hash_tests {
             vintage_era: None,
             opsz_range: None,
             has_gpos: false,
+            has_kern: false,
         };
         // Test fixture: arbitrary variation coordinates (opsz value is not
         // significant here; detect_default_variations now uses the font's

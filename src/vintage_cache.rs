@@ -1007,8 +1007,14 @@ pub fn ensure_vintage_fonts(base_fonts: &[FontEntry], eras: &[Era]) -> Vec<PathB
         if base.path.starts_with(&dir_canon) || base.path.to_string_lossy().contains("/vintage/") {
             continue;
         }
-        // Skip OT feature variants to keep cache small; allow base and wght instances
-        if !base.variant_tag.is_empty() && !base.variant_tag.starts_with("wght") {
+        // Skip OT feature variants to keep cache small; allow the kerned
+        // base entry and wght instances. Kern/nokern and lig/nolig are
+        // explicit in every font key now, so the base entry carries
+        // |kern|lig ("" for legacy entries) — the old empty-tag check
+        // would skip every base entry.
+        let tag = base.variant_tag.as_str();
+        let is_wght = tag.split('|').any(|seg| seg.starts_with("wght"));
+        if !(tag.is_empty() || tag == "kern" || tag == "kern|lig" || is_wght) {
             continue;
         }
 
@@ -1175,6 +1181,8 @@ mod tests {
             typographic_family: "DejaVu Sans".to_string(),
             vintage_era: None,
             opsz_range: None,
+            has_gpos: false,
+            has_kern: false,
         };
         let p1 = vintage_cache_path(&fe, Era::PostScript);
         let p2 = vintage_cache_path(&fe, Era::PostScript);

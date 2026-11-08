@@ -8,9 +8,11 @@
 //! Baseline (2026-11-05, regenerated specimens, tiebreaker unification
 //! + has_gpos fix): 14/20 primary hits (70.0%), ZNCC avg 0.9214.
 //! The 6 similarity failures all pick the correct font
-//! (TrebuchetMS-400|nokern|nolig) but score ZNCC 0.857-0.894, below
+//! (TrebuchetMS-400|kern|nolig) but score ZNCC 0.857-0.894, below
 //! the 0.90 hit threshold — subpixel-phase rasterization, not
 //! misidentification. There are 0 major misses.
+//! (GT key was TrebuchetMS-400|nokern|nolig before the Nov 6 has_kern
+//! preference fix; the fixture renders kerned, so the kerned key is correct.)
 //!
 //! Prerequisites: run ./regen-specimens.sh first to generate the fixture.
 //!

@@ -749,6 +749,29 @@ def generate_html(font_paths):
             if 'nokern' in fk:
                 return 'font-kerning: none;'
             return 'font-kerning: normal;'
+
+        # Get ligature value from catalog entry (architectural: use the
+        # fontkey, never the CSS default). Lig/nolig is explicit in every
+        # font key: lig variants carry |lig, nolig variants carry |nolig.
+        # If entry is not a dict, ERROR OUT (per Mike: no silent fallback).
+        # 'nolig' is checked first: 'lig' is a substring of 'nolig'.
+        def _ligatures_css(variant):
+            entry = font_paths[rl].get(variant, {})
+            if not isinstance(entry, dict):
+                raise RuntimeError(
+                    f"Font entry for '{rl}' variant '{variant}' is not a dict: {type(entry)}. "
+                    f"Cannot determine CSS from fontkey. Fix the catalog or specimen."
+                )
+            fk = entry.get('font_key', '')
+            if 'nolig' in fk:
+                return 'font-variant-ligatures: none;'
+            if '|lig' in fk:
+                return 'font-variant-ligatures: normal;'
+            # No lig/nolig tag — error out (no silent fallback to the CSS default).
+            raise RuntimeError(
+                f"Cannot determine font-variant-ligatures for '{rl}' variant '{variant}': "
+                f"fontkey '{fk}' has neither |lig nor |nolig. Fix the catalog."
+            )
         
         # Get font-weight CSS from catalog entry — MUST match the fontkey exactly.
         # Planned font -> fontkey -> render. Never hardcode.
@@ -846,9 +869,12 @@ def generate_html(font_paths):
         
         kern_regular = _kerning_css('regular')
         kern_bold = _kerning_css('bold')
+        lig_regular = _ligatures_css('regular')
+        lig_bold = _ligatures_css('bold')
         weight_bold = _weight_css('bold')
         style_italic = _style_css('italic')
         kern_italic = _kerning_css('italic')
+        lig_italic = _ligatures_css('italic')
         var_regular = _variation_css('regular')
         var_bold = _variation_css('bold')
         var_italic = _variation_css('italic')
@@ -877,14 +903,14 @@ def generate_html(font_paths):
         sections_html.append(f"""
 <div class="section">
   {img_html}
-  <h2 style="font-family: '{rl}'; {weight_bold} {kern_bold} {var_bold}">{_escape(section["era"])}</h2>
+  <h2 style="font-family: '{rl}'; {weight_bold} {kern_bold} {lig_bold} {var_bold}">{_escape(section["era"])}</h2>
   <p class="source">Font: {_escape(section["source"])}</p>
-  <p class="blurb" style="font-family: '{rl}'; text-align: {align}; {kern_regular} {var_regular}">{blurb}</p>
-  <p class="sample" style="font-family: '{rl}'; {weight_bold} text-align: {align}; {kern_bold} {var_bold}">Bold: The quick brown fox jumps over 1,234,567,890 lazy dogs.</p>
-  <p class="sample" style="font-family: '{rl}'; {style_italic} text-align: {align}; {kern_italic} {var_italic}">Italic: The quick brown fox jumps over 1,234,567,890 lazy dogs.</p>
-  <p class="alpha" style="font-family: '{rl}'; {kern_regular} {var_regular}">ABCDEFGHIJKLMNOPQRSTUVWXYZ</p>
-  <p class="alpha" style="font-family: '{rl}'; {kern_regular} {var_regular}">abcdefghijklmnopqrstuvwxyz</p>
-  <p class="alpha" style="font-family: '{rl}'; {kern_regular} {var_regular}">Lining figures: 0 1 2 3 4 5 6 7 8 9</p>
+  <p class="blurb" style="font-family: '{rl}'; text-align: {align}; {kern_regular} {lig_regular} {var_regular}">{blurb}</p>
+  <p class="sample" style="font-family: '{rl}'; {weight_bold} text-align: {align}; {kern_bold} {lig_bold} {var_bold}">Bold: The quick brown fox jumps over 1,234,567,890 lazy dogs.</p>
+  <p class="sample" style="font-family: '{rl}'; {style_italic} text-align: {align}; {kern_italic} {lig_italic} {var_italic}">Italic: The quick brown fox jumps over 1,234,567,890 lazy dogs.</p>
+  <p class="alpha" style="font-family: '{rl}'; {kern_regular} {lig_regular} {var_regular}">ABCDEFGHIJKLMNOPQRSTUVWXYZ</p>
+  <p class="alpha" style="font-family: '{rl}'; {kern_regular} {lig_regular} {var_regular}">abcdefghijklmnopqrstuvwxyz</p>
+  <p class="alpha" style="font-family: '{rl}'; {kern_regular} {lig_regular} {var_regular}">Lining figures: 0 1 2 3 4 5 6 7 8 9</p>
 </div>""")
 
     all_sections = "\n".join(sections_html)
