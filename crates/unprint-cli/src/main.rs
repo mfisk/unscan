@@ -446,11 +446,7 @@ fn build_audit_entry(
             .map(|(fk, s)| FontCandidate { font_key: fk.clone(), score: *s })
             .collect(),
         obs_votes: lm.observations.iter().map(|d| obs_vote(d, &lm.obs_rank_probs)).collect(),
-        font_candidates_lig: lm.font_scores_lig.iter()
-            .map(|(fk, s)| FontCandidate { font_key: fk.clone(), score: *s })
-            .collect(),
-        obs_votes_lig: lm.observations_lig.iter().map(|d| obs_vote(d, &lm.alt_obs_rank_probs)).collect(),
-        seg_winner: lm.seg_winner.clone(),
+        gt_obs_votes: lm.gt_observations.iter().map(|d| obs_vote(d, &lm.gt_obs_rank_probs)).collect(),
         word_bboxes: lm.corrected_words.as_deref().unwrap_or(&line.words).iter().map(|w| WordBBox {
             text: w.text.clone(), x: w.x, y: w.y, width: w.width, height: w.height, confidence: w.confidence,
         }).collect(),
@@ -1034,37 +1030,6 @@ fn run(args: &cli::Args, classifier: &mut dyn classifier::Classifier) -> Result<
                             None,
                             None,
                         );
-                        // Verify alt segmentation path's top font for ZNCC comparison
-                        if lm.seg_winner.is_some() && !lm.font_scores_lig.is_empty() {
-                            if let Some((ref alt_key, _)) = lm.font_scores_lig.first() {
-                                if let Some(alt_fe) = font_registry.by_key(alt_key) {
-                                    if let Ok(alt_fd) = font_cache.load(&alt_fe.path) {
-                                        let alt_audit_dir = lm.diag_seg_dir.as_ref().map(|d| {
-                                            let p = d.join("ssim_alt");
-                                            let _ = std::fs::create_dir_all(&p);
-                                            p
-                                        });
-                                        let allow_liga_alt = lm.seg_winner.as_deref() != Some("ligature");
-                                        let _alt_vr = verify::verify_text_region(
-                                            &norm_crop,
-                                            alt_fd.as_slice(),
-                                            &line.text,
-                                            verify_words,
-                                            line.x, line.y,
-                                            alt_fe.glyph_overrides.as_deref(),
-                                            &alt_fe.variant_tag,
-                                            alt_fe.variations.as_deref(),
-                                            allow_liga_alt,
-                                            alt_fe.collapsed_lig_set(),
-                                            alt_audit_dir.as_deref(),
-                                            None,
-                                            None,
-                                            None,
-                                        );
-                                    }
-                                }
-                            }
-                        }
                         let pass = vr.score >= MIN_VERIFY_SIMILARITY;
                         (Some(vr.score), Some(pass))
                     } else {
