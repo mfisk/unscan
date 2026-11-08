@@ -227,7 +227,6 @@ fn format_geo(h_ll: Option<f32>, v_ll: Option<f32>, _ll: Option<f32>, h_err: Opt
 }
 
 fn format_char_detail(
-    rank: Option<usize>,
     prob_x_u: Option<f32>,
     glyph_score: Option<f32>,
     h_ll: Option<f32>,
@@ -240,9 +239,6 @@ fn format_char_detail(
     weight: Option<f32>,
 ) -> String {
     let mut out = String::new();
-    if let Some(r) = rank {
-        out.push_str(&format!("<span class='font-mini'>rank {r}</span>"));
-    }
     if let Some(pu) = prob_x_u {
         if !out.is_empty() { out.push_str(", "); }
         out.push_str(&format!("<span class='num'>p={pu:.1}×u</span>"));
@@ -350,36 +346,109 @@ fn find_font_by_key<'a>(font_catalog: &'a [FontEntry], font_key: &str) -> Option
 
 // ── Character selection (mirrors Python pick_interesting_observations) ──────────────
 
+/// Combined geo log-likelihood (h + v) for one font side of an observation.
+/// Prefers the precomputed combined field; falls back to summing the h/v
+/// components; None when no geo data is present at all.
+fn combined_geo_ll(combined: Option<f32>, h_ll: Option<f32>, v_ll: Option<f32>) -> Option<f32> {
+    if let Some(c) = combined {
+        return Some(c);
+    }
+    match (h_ll, v_ll) {
+        (Some(h), Some(v)) => Some(h + v),
+        (Some(h), None) => Some(h),
+        (None, Some(v)) => Some(v),
+        (None, None) => None,
+    }
+}
+
 fn pick_interesting_observations<'a>(
     chars: &'a [unprint::audit::ObservationVote],
     n_show: usize,
     _n_normal: usize,
 ) -> Vec<(usize, &'a unprint::audit::ObservationVote)> {
-    // Rank by the log-probability difference between chosen and ground-truth fonts.
-    // Positive delta = chosen beats GT on this char. For a miss we want to show
-    // the chars that most favored the (incorrect) chosen font, i.e. largest
-    // delta first, not |delta|. GT-better chars (negative delta) should sort last.
+    // Rank by the observation's contribution to the total score difference
+    // between chosen and ground-truth fonts: |weight * (glyphD + GEO_WEIGHT * geoD)|.
+    // This is the per-obs term of the classifier's line score
+    // (logit + GEO_WEIGHT * combined_geo) * weight, so it is exactly the
+    // "biggest delta between GT and Chosen". Absolute value: an obs where GT
+    // beats chosen by a lot is just as interesting as one where chosen beats
+    // GT. The old glyph-only prob delta was blind to geo — for variants that
+    // render identical glyphs (kern vs nokern) every prob delta is 0.0 no
+    // matter how large the geo differences are, so the picker showed the
+    // first obs by index instead of the differing ones.
+    //
+    // Balanced pick (Mike Nov 7, 2026): the table must show the characters
+    // that make GT lose, not only the ones that favor GT. Take the top half
+    // by |delta| from each side — chosen-wins (signed delta > 0) and
+    // GT-wins (signed delta < 0). If one side is short, fill the remainder
+    // from the other side by |delta|. Ties (delta == 0) are never shown:
+    // they carry no information about why GT lost.
+    let geo_weight = unprint::font_match::geo_weight();
     let mut scored: Vec<(usize, &unprint::audit::ObservationVote, f32)> = chars.iter()
         .enumerate()
         .filter_map(|(i, c)| {
             let cp = c.chosen_prob?;
             let gp = c.gt_font_prob?;
-            // log contribution delta: positive means chosen scores better on this obs
-            let delta = cp.max(1e-30).ln() - gp.max(1e-30).ln();
+            // Glyph log-probability delta: positive means chosen scores better.
+            let glyph_delta = cp.max(1e-30).ln() - gp.max(1e-30).ln();
+            // Geo log-likelihood delta (combined h+v; fall back to components).
+            let chosen_geo = combined_geo_ll(c.chosen_geo_ll, c.chosen_geo_h_ll, c.chosen_geo_v_ll);
+            let gt_geo = combined_geo_ll(c.gt_geo_ll, c.gt_geo_h_ll, c.gt_geo_v_ll);
+            let geo_delta = match (chosen_geo, gt_geo) {
+                (Some(cg), Some(gg)) => cg - gg,
+                _ => 0.0,
+            };
+            // Signed contribution: positive means chosen wins (GT loses),
+            // negative means GT wins. Keep the sign for the balanced pick.
+            let delta = c.weight * (glyph_delta + geo_weight * geo_delta);
             Some((i, c, delta))
         })
         .collect();
-    // Sort by delta descending — strongest evidence for chosen font first
-    scored.sort_by(|a, b| b.2.partial_cmp(&a.2).unwrap_or(std::cmp::Ordering::Equal));
+    // Sort by |contribution| descending — biggest GT-vs-chosen delta first
+    scored.sort_by(|a, b| b.2.abs().partial_cmp(&a.2.abs()).unwrap_or(std::cmp::Ordering::Equal));
 
-    let mut result: Vec<(usize, &unprint::audit::ObservationVote)> = scored.iter()
-        .take(n_show)
-        .map(|&(i, c, _)| (i, c))
+    // Partition into chosen-wins / GT-wins, preserving |delta| order.
+    // Ties (delta == 0) are dropped: they carry no information.
+    let per_side = n_show / 2;
+    let mut chosen_wins: Vec<(usize, &unprint::audit::ObservationVote, f32)> = scored.iter()
+        .filter(|(_, _, d)| *d > 0.0)
+        .copied()
+        .collect();
+    let mut gt_wins: Vec<(usize, &unprint::audit::ObservationVote, f32)> = scored.iter()
+        .filter(|(_, _, d)| *d < 0.0)
+        .copied()
         .collect();
 
-    // If we didn't get enough from the delta sort (e.g. GT probs missing),
-    // fill with worst best_prob observations
-    if result.len() < n_show {
+    let mut result: Vec<(usize, &unprint::audit::ObservationVote)> = Vec::new();
+    for (i, c, _) in chosen_wins.drain(..per_side.min(chosen_wins.len())) {
+        result.push((i, c));
+    }
+    for (i, c, _) in gt_wins.drain(..per_side.min(gt_wins.len())) {
+        result.push((i, c));
+    }
+    // Fill any shortfall from the side with leftovers, by |delta|.
+    let mut leftovers: Vec<(usize, &unprint::audit::ObservationVote, f32)> =
+        chosen_wins.into_iter().chain(gt_wins.into_iter()).collect();
+    leftovers.sort_by(|a, b| b.2.abs().partial_cmp(&a.2.abs()).unwrap_or(std::cmp::Ordering::Equal));
+    for (i, c, _) in leftovers.into_iter().take(n_show.saturating_sub(result.len())) {
+        result.push((i, c));
+    }
+    // Ties (delta == 0) are never shown: they carry no information about
+    // why GT lost (e.g. L2 "five" has 73 ties because lig/nolig render
+    // those chars identically). The table may have fewer than n_show rows
+    // when there are not enough non-zero deltas; that is intended
+    // (Mike Nov 7, 2026).
+
+    // If no delta could be computed at all (e.g. GT probs missing for
+    // every observation), fill with worst best_prob observations so the
+    // table is not empty. This runs only when `scored` is empty, i.e. no
+    // observation had both probs. When deltas were computable but all
+    // zero (e.g. the L2 plain path, where lig/nolig render every char
+    // identically), there is nothing meaningful to show: return empty
+    // and let the caller suppress the table, instead of filling it with
+    // misleading worst-best_prob rows (Mike Nov 7, 2026; the L2 alt
+    // table showed six 'e's from this fallback).
+    if result.is_empty() && scored.is_empty() {
         let used: std::collections::HashSet<usize> = result.iter().map(|(i, _)| *i).collect();
         let mut by_prob: Vec<(usize, &unprint::audit::ObservationVote)> =
             chars.iter().enumerate()
@@ -395,6 +464,51 @@ fn pick_interesting_observations<'a>(
 
     result.sort_by_key(|(i, _)| *i);
     result
+}
+
+/// Whether a font is a nolig variant, from its entry's variant tag when
+/// available, else from the font key string. Every key now carries an
+/// explicit |lig or |nolig tag, so the key string is a reliable fallback.
+fn is_nolig_font(fe: Option<&FontEntry>, key: &str) -> bool {
+    if let Some(fe) = fe {
+        fe.variant_tag.contains("nolig")
+    } else {
+        key.contains("nolig")
+    }
+}
+
+/// Whether an observation is a lig-vs-nolig comparison case: its sequence
+/// carries a ligature character (U+FB00–U+FB04) AND the two compared fonts
+/// differ in lig state (one lig, one nolig). Such observations are shown
+/// IN ADDITION TO the top 6 deltas (Mike Nov 6, 2026), not instead of them.
+fn is_lig_comparison_obs(
+    cv: &unprint::audit::ObservationVote,
+    correct_nolig: bool,
+    chosen_nolig: bool,
+) -> bool {
+    if correct_nolig == chosen_nolig {
+        return false;
+    }
+    cv.seq.iter().any(|&c| matches!(c, '\u{FB00}'..='\u{FB04}'))
+}
+
+/// Append lig/nolig comparison observations to a top-6 selection, in
+/// observation order, skipping any already shown. The B′ top 6 is kept
+/// intact; the comparison rows are additional display alongside it.
+fn append_lig_comparison_obs<'a>(
+    mut shown: Vec<(usize, &'a unprint::audit::ObservationVote)>,
+    chars: &'a [unprint::audit::ObservationVote],
+    correct_nolig: bool,
+    chosen_nolig: bool,
+) -> Vec<(usize, &'a unprint::audit::ObservationVote)> {
+    for (i, cv) in chars.iter().enumerate() {
+        if is_lig_comparison_obs(cv, correct_nolig, chosen_nolig)
+            && !shown.iter().any(|(j, _)| *j == i)
+        {
+            shown.push((i, cv));
+        }
+    }
+    shown
 }
 
 // ── Crop / image lookup ─────────────────────────────────────────────────────
@@ -835,7 +949,14 @@ fn build_miss_block(
     let obs_table_html = if entry.obs_votes.is_empty() || (ce.kind == MissKind::SimilarityFailure && entry.seg_winner.is_none()) {
         String::new()
     } else {
-        let obs_to_show = pick_interesting_observations(&entry.obs_votes, 6, 0);
+        // Top 6 deltas, PLUS any lig/nolig comparison observation (Mike Nov 6,
+        // 2026): shown in addition, not instead of the top 6.
+        let obs_to_show = append_lig_comparison_obs(
+            pick_interesting_observations(&entry.obs_votes, 6, 0),
+            &entry.obs_votes,
+            is_nolig_font(correct_fe, &actual_font),
+            is_nolig_font(chosen_fe, &matched),
+        );
         build_observation_table(
             entry,
             &obs_to_show,
@@ -877,29 +998,44 @@ fn build_miss_block(
         } else {
             (None, None)
         };
-        let obs_to_show = pick_interesting_observations(&entry.obs_votes_lig, 6, 0);
-        let table = build_observation_table(
-            entry,
-            &obs_to_show,
-            audit_root,
-            correct_fe,
-            alt_chosen_fe,
-            &actual_font,
-            &alt_font,
-            alt_gt.0,
-            alt_gt.1,
-            font_data_cache,
-            diag_dir.as_deref(),
-            font_catalog,
-            glyph_map,
-            "crops_alt",
+        // Top 6 deltas, PLUS any lig/nolig comparison observation (Mike Nov 6,
+        // 2026): shown in addition, not instead of the top 6.
+        let obs_to_show = append_lig_comparison_obs(
+            pick_interesting_observations(&entry.obs_votes_lig, 6, 0),
+            &entry.obs_votes_lig,
+            is_nolig_font(correct_fe, &actual_font),
+            is_nolig_font(alt_chosen_fe, &alt_font),
         );
-        if table.is_empty() {
+        // No meaningful (non-zero delta) observations on the alt path and
+        // no lig comparison rows: suppress the table instead of showing
+        // misleading fallback rows (Mike Nov 7, 2026; the L2 plain path
+        // showed six 'e's from the worst-best_prob fallback).
+        if obs_to_show.is_empty() {
             String::new()
         } else {
-            format!(
-                "<div class=\"seg-alt-obs\"><b>Alternate path ({alt_label}) \u{2192} {alt_font}</b>{table}</div>",
-            )
+            let table = build_observation_table(
+                entry,
+                &obs_to_show,
+                audit_root,
+                correct_fe,
+                alt_chosen_fe,
+                &actual_font,
+                &alt_font,
+                alt_gt.0,
+                alt_gt.1,
+                font_data_cache,
+                diag_dir.as_deref(),
+                font_catalog,
+                glyph_map,
+                "crops_alt",
+            );
+            if table.is_empty() {
+                String::new()
+            } else {
+                format!(
+                    "<div class=\"seg-alt-obs\"><b>Alternate path ({alt_label}) \u{2192} {alt_font}</b>{table}</div>",
+                )
+            }
         }
     };
 
@@ -1968,11 +2104,26 @@ fn build_observation_table(
             }
         }
 
+        // Win/lose coloring reflects the TOTAL signed delta (glyph + geo),
+        // the same quantity the picker ranks by: weight * (glyph_delta +
+        // GEO_WEIGHT * geo_delta). Prob-only comparison was wrong for rows
+        // where geo dominates (e.g. L19 '2': prob favors GT but total +82.48
+        // favors chosen). Positive delta means chosen wins (GT loses).
         let (chosen_win_class, correct_win_class) = match (cv.chosen_prob, cv.gt_font_prob) {
             (Some(cp), Some(gp)) => {
-                if cp > gp {
+                let glyph_delta = cp.max(1e-30).ln() - gp.max(1e-30).ln();
+                let geo_delta = match (
+                    combined_geo_ll(cv.chosen_geo_ll, cv.chosen_geo_h_ll, cv.chosen_geo_v_ll),
+                    combined_geo_ll(cv.gt_geo_ll, cv.gt_geo_h_ll, cv.gt_geo_v_ll),
+                ) {
+                    (Some(cg), Some(gg)) => cg - gg,
+                    _ => 0.0,
+                };
+                let total_delta =
+                    cv.weight * (glyph_delta + unprint::font_match::geo_weight() * geo_delta);
+                if total_delta > 0.0 {
                     ("prob-win", "prob-lose")
-                } else if gp > cp {
+                } else if total_delta < 0.0 {
                     ("prob-lose", "prob-win")
                 } else {
                     ("", "")
@@ -1981,7 +2132,7 @@ fn build_observation_table(
             _ => ("", ""),
         };
 
-        let (gt_h, gt_v, gt_h_err, gt_v_err, gt_glyph, gt_rank_f, gt_prob_f) = if cv.gt_geo_h_ll.is_none() || cv.gt_font_rank.is_none() {
+        let (gt_h, gt_v, gt_h_err, gt_v_err, gt_glyph, _gt_rank_f, gt_prob_f) = if cv.gt_geo_h_ll.is_none() || cv.gt_font_rank.is_none() {
             let seq_key: String = cv.seq.iter().collect();
             if let Some((fh, fv, fhe, fve, fg, fr, fp)) = gt_fallback.get(&seq_key) {
                 (
@@ -2001,13 +2152,13 @@ fn build_observation_table(
         };
         // For GT debugging: pass each side's opponent for per-dimension coloring
         let chosen_detail = format_char_detail(
-            cv.chosen_rank, cv.chosen_prob, cv.chosen_glyph_score,
+            cv.chosen_prob, cv.chosen_glyph_score,
             cv.chosen_geo_h_ll, cv.chosen_geo_v_ll,
             cv.chosen_geo_h_err, cv.chosen_geo_v_err,
             gt_glyph, gt_h, gt_v, Some(cv.weight)
         );
         let correct_detail = format_char_detail(
-            gt_rank_f, gt_prob_f, gt_glyph,
+            gt_prob_f, gt_glyph,
             gt_h, gt_v,
             gt_h_err, gt_v_err,
             cv.chosen_glyph_score, cv.chosen_geo_h_ll, cv.chosen_geo_v_ll, Some(cv.weight)
@@ -2023,6 +2174,76 @@ fn build_observation_table(
             format!("<div class='sub {correct_win_class}'>{correct_detail}</div>")
         } else {
             String::new()
+        };
+
+        // Ligature comparison (Mike Nov 7, 2026): if the observation seq
+        // carries a ligature character and the correct font is nolig, the
+        // correct cell must show the two separate component characters,
+        // each with its own render and scores, sourced from the plain-path
+        // observations. A single FB01 cell has no GT data (the nolig font
+        // has no FB01), so it renders empty. Do NOT combine the component
+        // scores into one FB01 cell.
+        let correct_cell_inner = {
+            let has_lig = seq.iter().any(|&c| matches!(c, '\u{FB00}'..='\u{FB04}'));
+            if has_lig && is_nolig_font(correct_fe, correct_font_name) {
+                let components = unprint::segment::expand_ligature_chars(seq);
+                let mut parts: Vec<String> = Vec::new();
+                if components.len() > 1 {
+                    for (j, comp) in components.iter().enumerate() {
+                        // Components sit at consecutive crop indices starting
+                        // at the ligature's crop index (ligature at crop C
+                        // -> components at C, C+1, ...).
+                        let comp_ov = alt_obs_ref.iter().find(|ov| {
+                            ov.seq.len() == 1 && ov.seq[0] == *comp
+                                && ov.crop_index == cv.crop_index + j
+                        });
+                        if let Some(ov) = comp_ov {
+                            // Render this component with the nolig font.
+                            let mut comp_uri: Option<String> = None;
+                            if let Some(fe) = correct_fe {
+                                if let Some(data) = font_data_cache.load(&fe.path) {
+                                    if let Ok(mut font) = FontRef::try_from_slice(data) {
+                                        if let Some(ref vars) = fe.variations {
+                                            use unprint_fonts::ab_glyph::VariableFont;
+                                            for (tag, val) in vars {
+                                                let _ = font.set_variation(tag, *val);
+                                            }
+                                        }
+                                        let gid_overrides: Vec<Option<unprint_fonts::ab_glyph::GlyphId>> = [*comp].iter().map(|c| {
+                                            fe.glyph_overrides.as_ref()
+                                                .and_then(|ovs| ovs.iter().find(|(gc, _)| *gc == *c).map(|(_, g)| unprint_fonts::ab_glyph::GlyphId(*g)))
+                                        }).collect();
+                                        let _disable_kern = fe.variant_tag.contains("nokern");
+                                        if let Some(img) = char_render::render_ngram_fresh(&font, &[*comp], &gid_overrides, &char_render::RenderParams::default(), _disable_kern) {
+                                            comp_uri = Some(img_to_b64_uri(&img));
+                                        }
+                                    }
+                                }
+                            }
+                            // Format this component's own GT scores.
+                            let comp_detail = format_char_detail(
+                                ov.gt_font_prob, ov.gt_glyph_score,
+                                ov.gt_geo_h_ll, ov.gt_geo_v_ll,
+                                ov.gt_geo_h_err, ov.gt_geo_v_err,
+                                cv.chosen_glyph_score, cv.chosen_geo_h_ll, cv.chosen_geo_v_ll, Some(ov.weight)
+                            );
+                            let comp_label = if !comp_detail.is_empty() {
+                                format!("<div class='sub'>{comp_detail}</div>")
+                            } else {
+                                String::new()
+                            };
+                            parts.push(format!("<div class=\"img-stat\">{}{}</div>", img_td(comp_uri.as_deref()), comp_label));
+                        }
+                    }
+                }
+                if !parts.is_empty() {
+                    format!("<div style=\"display:flex;flex-direction:column;gap:4px;\">{}</div>", parts.join(""))
+                } else {
+                    format!("<div class=\"img-stat\">{}{}</div>", img_td(correct_ref_uri.as_deref()), correct_score_label)
+                }
+            } else {
+                format!("<div class=\"img-stat\">{}{}</div>", img_td(correct_ref_uri.as_deref()), correct_score_label)
+            }
         };
 
         // OCR letter for this observation — show corrected char, and original if it was pflda-replaced
@@ -2053,12 +2274,11 @@ fn build_observation_table(
             "<tr>\
              <td class=\"ocr-col\"><span class=\"char-label\">{ocr_label}</span></td>\
              <td class=\"img-td\">{}</td>\
-             <td class=\"img-td {correct_win_class}\"><div class=\"img-stat\">{}{}</div></td>\
+             <td class=\"img-td {correct_win_class}\">{}</td>\
              <td class=\"img-td {chosen_win_class}\"><div class=\"img-stat\">{}{}</div></td>\
              </tr>",
             img_td(crop_uri.as_deref()),
-            img_td(correct_ref_uri.as_deref()),
-            correct_score_label,
+            correct_cell_inner,
             img_td(chosen_ref_uri.as_deref()),
             chosen_score_label,
         ));

@@ -23,6 +23,13 @@ static GEO_WEIGHT: std::sync::LazyLock<f32> = std::sync::LazyLock::new(|| {
         .and_then(|v| v.parse().ok())
         .unwrap_or(1.0)
 });
+
+/// Geo weight used in font scoring (`UNPRINT_GEO_WEIGHT`, default 1.0).
+/// Shared with the report crate so the observation picker ranks by the same
+/// per-observation score contribution as the classifier.
+pub fn geo_weight() -> f32 {
+    *GEO_WEIGHT
+}
 pub const MIDPOINT_PRUNE_BASE: f32 = -1.2; // median-based: per Mike; gamma-linearized data has different score distribution than linear calibration data
 
 #[derive(Debug, Clone)]
