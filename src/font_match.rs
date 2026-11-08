@@ -89,6 +89,7 @@ pub struct FontIdResult {
     pub scores: Vec<(String, f32)>,
     pub observations: Vec<ObservationDetail>,      // winning font
     pub gt_observations: Vec<ObservationDetail>,   // GT font (from ensure list) if present
+    pub alt_observations: Vec<ObservationDetail>,  // best font on the opposite lig/plain path from the winner (for the report's alternate-path ligature comparison)
     pub path_score: f32,
     pub gt_per_char_geo_ll: Vec<f32>,              // GT font per-char (h_ll+v_ll), empty if no GT
 }
@@ -116,7 +117,7 @@ pub fn identify_fonts(
     geo_cache: &crate::geo_cache::GeometryCache,
 ) -> FontIdResult {
     if word_infos.is_empty() {
-        return FontIdResult { scores: Vec::new(), observations: Vec::new(), gt_observations: Vec::new(), path_score: f32::MIN, gt_per_char_geo_ll: Vec::new() };
+        return FontIdResult { scores: Vec::new(), observations: Vec::new(), gt_observations: Vec::new(), alt_observations: Vec::new(), path_score: f32::MIN, gt_per_char_geo_ll: Vec::new() };
     }
 
     let mut seg_caches: Vec<HashMap<usize, SegCacheEntry>> =
@@ -135,6 +136,16 @@ pub fn identify_fonts(
     let mut best_path_score = f32::MIN;
     let mut best_score = f32::MIN;
     let mut pruned_count: usize = 0;
+    // Best font + observations on each lig/plain path, for the report's
+    // alternate-path ligature comparison. The alt path is the best font on
+    // the opposite path from the winner; its observations become
+    // FontIdResult.alt_observations. Tracked alongside best_observations
+    // (cleared on pass-1 fallback the same way).
+    let mut best_lig_score = f32::MIN;
+    let mut best_lig_obs: Vec<ObservationDetail> = Vec::new();
+    let mut best_plain_score = f32::MIN;
+    let mut best_plain_obs: Vec<ObservationDetail> = Vec::new();
+    let mut best_is_lig = false;
 
     // Two-pass: pass 0 with geometry pruning; if no non-ensure fonts survive,
     // pass 1 disables pruning so the glyph classifier gets a chance.
@@ -150,6 +161,13 @@ pub fn identify_fonts(
             }
             scored.clear();
             best_observations.clear();
+            // Alt-path trackers follow best_observations (cleared on fallback,
+            // unlike gt_observations which must survive pass 1).
+            best_lig_obs.clear();
+            best_plain_obs.clear();
+            best_lig_score = f32::MIN;
+            best_plain_score = f32::MIN;
+            best_is_lig = false;
             // NOTE (Mike Nov 3, 2026): Do NOT clear gt_observations on fallback.
             // The fallback re-runs without pruning, but if GT scoring fails on
             // pass 1, we need the pass 0 GT observations for audit functionality.
@@ -174,6 +192,17 @@ pub fn identify_fonts(
         let is_ensure = ensure_set.contains(fk);
         // collapsed_lig_set() returns 0 for nolig variants (cached by fontkey).
         let allowed = fe.collapsed_lig_set();
+        // Lig-path membership (same definition as font_pipeline's two-path
+        // split): this font is on the ligature path iff its collapsed set
+        // is non-empty AND collapsing this line's words with it actually
+        // merges something. Used to track the best font on each path for
+        // the report's alternate-path ligature comparison.
+        let on_lig_path = allowed != 0
+            && word_infos.iter().any(|wi| {
+                crate::segment::collapse_ligature_chars_for_allowed(&wi.orig_chars, allowed)
+                    .len()
+                    < wi.orig_chars.len()
+            });
 
         // Build per-font structures using cached cuts + char crops (per-k cache)
         let mut word_segs: Vec<WordSeg> = Vec::with_capacity(word_infos.len());
@@ -528,9 +557,24 @@ pub fn identify_fonts(
             best_score = score;
             best_path_score = path_score;
             best_observations = obs_for_this.clone();
+            best_is_lig = on_lig_path;
         } else if (score - best_score).abs() < 1e-6 && path_score > best_path_score {
             best_path_score = path_score;
             best_observations = obs_for_this.clone();
+            best_is_lig = on_lig_path;
+        }
+
+        // Best font on each lig/plain path (for the alternate-path ligature
+        // comparison). The alt is the best font on the opposite path from
+        // the winner, chosen after the loop.
+        if on_lig_path {
+            if score > best_lig_score {
+                best_lig_score = score;
+                best_lig_obs = obs_for_this.clone();
+            }
+        } else if score > best_plain_score {
+            best_plain_score = score;
+            best_plain_obs = obs_for_this.clone();
         }
 
         if is_ensure {
@@ -576,13 +620,13 @@ pub fn identify_fonts(
     }
 
     if scored.is_empty() {
-        return FontIdResult { scores: Vec::new(), observations: best_observations, gt_observations, path_score: f32::MIN, gt_per_char_geo_ll: Vec::new() };
+        return FontIdResult { scores: Vec::new(), observations: best_observations, gt_observations, alt_observations: Vec::new(), path_score: f32::MIN, gt_per_char_geo_ll: Vec::new() };
     }
 
     // Tiebreak on identical fine scores with the shared font-key preference
-    // (same as --resolve-fontkey: GPOS → kern, non-GPOS → nokern; nolig;
-    // opsz=10; OT-feature variants and non-default weight instances -10).
-    // Font-key order is the final deterministic fallback.
+    // (same as --resolve-fontkey: kerned font → kern, kern-less → nokern;
+    // nolig; opsz=10; OT-feature variants and non-default weight
+    // instances -10). Font-key order is the final deterministic fallback.
     // Preferences are precomputed once — the comparator must stay cheap.
     // Owned String keys: borrowing scored's keys would conflict with the
     // mutable sort below.
@@ -603,5 +647,13 @@ pub fn identify_fonts(
             .then_with(|| a.0.cmp(&b.0))
     });
 
-    FontIdResult { scores: scored, observations: best_observations, gt_observations, path_score: best_path_score, gt_per_char_geo_ll: gt_per_char_ll_final }
+    // Alternate-path observations: best font on the opposite lig/plain path
+    // from the winner. Empty if either path has no scored font.
+    let alt_observations = if best_is_lig {
+        best_plain_obs
+    } else {
+        best_lig_obs
+    };
+
+    FontIdResult { scores: scored, observations: best_observations, gt_observations, alt_observations, path_score: best_path_score, gt_per_char_geo_ll: gt_per_char_ll_final }
 }

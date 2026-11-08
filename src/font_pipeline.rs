@@ -58,6 +58,96 @@ pub struct ObsRankProbs {
     pub gt_geo_v_err: HashMap<usize, f32>,
 }
 
+/// Build per-observation rank/prob/glyph/geo maps for one path's observations
+/// against the GT observations (no recompute — `identify_fonts` already
+/// computed best_prob, logit as glyph_score, and geo_ll for each path).
+/// Used for the winning path (observations + GT) and the alternate/losing
+/// path (observations_lig + GT), so the report's alternate-path ligature
+/// comparison table has the same data as the winning-path table.
+fn build_obs_rank_probs(
+    observations: &[font_match::ObservationDetail],
+    gt_observations: &[font_match::ObservationDetail],
+) -> ObsRankProbs {
+    let mut rp = ObsRankProbs::default();
+    for obs in observations {
+        rp.chosen_ranks.insert(obs.crop_index, 1);
+        // prefer actual prob from classifier, fall back to best_prob
+        if let Some(p) = obs.prob { rp.chosen_probs.insert(obs.crop_index, p); }
+        else if obs.best_prob > 0.0 { rp.chosen_probs.insert(obs.crop_index, obs.best_prob); }
+        if let Some(gs) = obs.glyph_score { rp.chosen_glyph_scores.insert(obs.crop_index, gs); }
+        else if obs.best_prob > 0.0 { rp.chosen_glyph_scores.insert(obs.crop_index, obs.best_prob.ln()); }
+        if let Some(h) = obs.geo_h_ll { rp.chosen_geo_h_ll.insert(obs.crop_index, h); }
+        if let Some(v) = obs.geo_v_ll { rp.chosen_geo_v_ll.insert(obs.crop_index, v); }
+        if let Some(he) = obs.geo_h_err { rp.chosen_geo_h_err.insert(obs.crop_index, he); }
+        if let Some(ve) = obs.geo_v_err { rp.chosen_geo_v_err.insert(obs.crop_index, ve); }
+    }
+    // GT side – from scoring.gt_observations (ensure font)
+    // When window counts differ (ligature difference, e.g. Office 4 vs 5 glyphs),
+    // direct crop_index mapping mis-aligns later chars (c/e vs T...). Use
+    // sequential char-equality mapping for differing k, keep direct ti
+    // mapping when k equal (common case, including p3:L34).
+    if observations.len() == gt_observations.len() {
+        for obs in gt_observations {
+            rp.gt_ranks.insert(obs.crop_index, 1);
+            if let Some(p) = obs.prob { rp.gt_probs.insert(obs.crop_index, p); }
+            else if obs.best_prob > 0.0 { rp.gt_probs.insert(obs.crop_index, obs.best_prob); }
+            if let Some(gs) = obs.glyph_score { rp.gt_glyph_scores.insert(obs.crop_index, gs); }
+            if let Some(h) = obs.geo_h_ll { rp.gt_geo_h_ll.insert(obs.crop_index, h); }
+            if let Some(v) = obs.geo_v_ll { rp.gt_geo_v_ll.insert(obs.crop_index, v); }
+            if let Some(he) = obs.geo_h_err { rp.gt_geo_h_err.insert(obs.crop_index, he); }
+            if let Some(ve) = obs.geo_v_err { rp.gt_geo_v_err.insert(obs.crop_index, ve); }
+        }
+    } else {
+        // Differing k – align by glyph identity, not ordinal.
+        let mut win_sorted: Vec<&font_match::ObservationDetail> = observations.iter().collect();
+        win_sorted.sort_by_key(|o| o.crop_index);
+        let mut gt_sorted: Vec<&font_match::ObservationDetail> = gt_observations.iter().collect();
+        gt_sorted.sort_by_key(|o| o.crop_index);
+        let mut gi = 0usize;
+        for wo in win_sorted {
+            // If we've exhausted GT, remaining winner glyphs (e.g. ffi) have no GT counterpart.
+            if gi >= gt_sorted.len() { break; }
+            if gt_sorted[gi].ch == wo.ch {
+                let go = gt_sorted[gi];
+                rp.gt_ranks.insert(wo.crop_index, 1);
+                if let Some(p) = go.prob { rp.gt_probs.insert(wo.crop_index, p); }
+                else if go.best_prob > 0.0 { rp.gt_probs.insert(wo.crop_index, go.best_prob); }
+                if let Some(gs) = go.glyph_score { rp.gt_glyph_scores.insert(wo.crop_index, gs); }
+                if let Some(h) = go.geo_h_ll { rp.gt_geo_h_ll.insert(wo.crop_index, h); }
+                if let Some(v) = go.geo_v_ll { rp.gt_geo_v_ll.insert(wo.crop_index, v); }
+                if let Some(he) = go.geo_h_err { rp.gt_geo_h_err.insert(wo.crop_index, he); }
+                if let Some(ve) = go.geo_v_err { rp.gt_geo_v_err.insert(wo.crop_index, ve); }
+                gi += 1;
+            } else {
+                // Look ahead for same char – skip GT extras (e.g. f, fi before c).
+                let mut found: Option<usize> = None;
+                for look in gi+1..(gi+6).min(gt_sorted.len()) {
+                    if gt_sorted[look].ch == wo.ch {
+                        found = Some(look);
+                        break;
+                    }
+                }
+                if let Some(fidx) = found {
+                    let go = gt_sorted[fidx];
+                    rp.gt_ranks.insert(wo.crop_index, 1);
+                    if let Some(p) = go.prob { rp.gt_probs.insert(wo.crop_index, p); }
+                    else if go.best_prob > 0.0 { rp.gt_probs.insert(wo.crop_index, go.best_prob); }
+                    if let Some(gs) = go.glyph_score { rp.gt_glyph_scores.insert(wo.crop_index, gs); }
+                    if let Some(h) = go.geo_h_ll { rp.gt_geo_h_ll.insert(wo.crop_index, h); }
+                    if let Some(v) = go.geo_v_ll { rp.gt_geo_v_ll.insert(wo.crop_index, v); }
+                    if let Some(he) = go.geo_h_err { rp.gt_geo_h_err.insert(wo.crop_index, he); }
+                    if let Some(ve) = go.geo_v_err { rp.gt_geo_v_err.insert(wo.crop_index, ve); }
+                    gi = fidx + 1;
+                } else {
+                    // No GT counterpart (e.g. winner ffi not supported by GT Caladea) – leave —.
+                    // Do not advance gi, keep GT pointer on current for next winner char.
+                }
+            }
+        }
+    }
+    rp
+}
+
 /// Per-line font matching result produced by [`match_lines`].
 pub struct LineMatch {
     pub font_result: Option<font_match::FontMatchResult>,
@@ -495,7 +585,10 @@ pub fn match_lines(
             observations = scoring.observations;
             gt_observations = scoring.gt_observations;
             font_scores_lig = Vec::new();
-            observations_lig = Vec::new();
+            // Alternate-path observations: best font on the opposite
+            // lig/plain path from the winner (populated by identify_fonts).
+            // These become the report's obs_votes_lig / alternate-path table.
+            observations_lig = scoring.alt_observations;
             seg_winner = None;
             // keep winning crops empty for now – filled after tie resolution
             // (winning_* computed below for reuse)
@@ -880,87 +973,8 @@ pub fn match_lines(
         // `identify_fonts` already computed best_prob, logit (as glyph_score), geo_ll
         // for the winning font path + GT path. Populate ObsRankProbs so the report's
         // per-char table has data.
-        let obs_rank_probs = {
-            let mut rp = ObsRankProbs::default();
-            for obs in &observations {
-                rp.chosen_ranks.insert(obs.crop_index, 1);
-                // prefer actual prob from classifier, fall back to best_prob
-                if let Some(p) = obs.prob { rp.chosen_probs.insert(obs.crop_index, p); }
-                else if obs.best_prob > 0.0 { rp.chosen_probs.insert(obs.crop_index, obs.best_prob); }
-                if let Some(gs) = obs.glyph_score { rp.chosen_glyph_scores.insert(obs.crop_index, gs); }
-                else if obs.best_prob > 0.0 { rp.chosen_glyph_scores.insert(obs.crop_index, obs.best_prob.ln()); }
-                if let Some(h) = obs.geo_h_ll { rp.chosen_geo_h_ll.insert(obs.crop_index, h); }
-                if let Some(v) = obs.geo_v_ll { rp.chosen_geo_v_ll.insert(obs.crop_index, v); }
-                if let Some(he) = obs.geo_h_err { rp.chosen_geo_h_err.insert(obs.crop_index, he); }
-                if let Some(ve) = obs.geo_v_err { rp.chosen_geo_v_err.insert(obs.crop_index, ve); }
-            }
-            // GT side – from scoring.gt_observations (ensure font)
-            // When window counts differ (ligature difference, e.g. Office 4 vs 5 glyphs),
-            // direct crop_index mapping mis-aligns later chars (c/e vs T...). Use
-            // sequential char-equality mapping for differing k, keep direct ti
-            // mapping when k equal (common case, including p3:L34).
-            if observations.len() == gt_observations.len() {
-                for obs in &gt_observations {
-                    rp.gt_ranks.insert(obs.crop_index, 1);
-                    if let Some(p) = obs.prob { rp.gt_probs.insert(obs.crop_index, p); }
-                    else if obs.best_prob > 0.0 { rp.gt_probs.insert(obs.crop_index, obs.best_prob); }
-                    if let Some(gs) = obs.glyph_score { rp.gt_glyph_scores.insert(obs.crop_index, gs); }
-                    if let Some(h) = obs.geo_h_ll { rp.gt_geo_h_ll.insert(obs.crop_index, h); }
-                    if let Some(v) = obs.geo_v_ll { rp.gt_geo_v_ll.insert(obs.crop_index, v); }
-                    if let Some(he) = obs.geo_h_err { rp.gt_geo_h_err.insert(obs.crop_index, he); }
-                    if let Some(ve) = obs.geo_v_err { rp.gt_geo_v_err.insert(obs.crop_index, ve); }
-                }
-            } else {
-                // Differing k – align by glyph identity, not ordinal.
-                let mut win_sorted: Vec<&font_match::ObservationDetail> = observations.iter().collect();
-                win_sorted.sort_by_key(|o| o.crop_index);
-                let mut gt_sorted: Vec<&font_match::ObservationDetail> = gt_observations.iter().collect();
-                gt_sorted.sort_by_key(|o| o.crop_index);
-                let mut gi = 0usize;
-                for wo in win_sorted {
-                    // If we've exhausted GT, remaining winner glyphs (e.g. ffi) have no GT counterpart.
-                    if gi >= gt_sorted.len() { break; }
-                    if gt_sorted[gi].ch == wo.ch {
-                        let go = gt_sorted[gi];
-                        rp.gt_ranks.insert(go.crop_index, 1);
-                        if let Some(p) = go.prob { rp.gt_probs.insert(go.crop_index, p); }
-                        else if go.best_prob > 0.0 { rp.gt_probs.insert(go.crop_index, go.best_prob); }
-                        if let Some(gs) = go.glyph_score { rp.gt_glyph_scores.insert(go.crop_index, gs); }
-                        if let Some(h) = go.geo_h_ll { rp.gt_geo_h_ll.insert(go.crop_index, h); }
-                        if let Some(v) = go.geo_v_ll { rp.gt_geo_v_ll.insert(go.crop_index, v); }
-                        if let Some(he) = go.geo_h_err { rp.gt_geo_h_err.insert(go.crop_index, he); }
-                        if let Some(ve) = go.geo_v_err { rp.gt_geo_v_err.insert(go.crop_index, ve); }
-                        gi += 1;
-                    } else {
-                        // Look ahead for same char – skip GT extras (e.g. f, fi before c).
-                        let mut found: Option<usize> = None;
-                        for look in gi+1..(gi+6).min(gt_sorted.len()) {
-                            if gt_sorted[look].ch == wo.ch {
-                                found = Some(look);
-                                break;
-                            }
-                        }
-                        if let Some(fidx) = found {
-                            let go = gt_sorted[fidx];
-                            rp.gt_ranks.insert(go.crop_index, 1);
-                            if let Some(p) = go.prob { rp.gt_probs.insert(go.crop_index, p); }
-                            else if go.best_prob > 0.0 { rp.gt_probs.insert(go.crop_index, go.best_prob); }
-                            if let Some(gs) = go.glyph_score { rp.gt_glyph_scores.insert(go.crop_index, gs); }
-                            if let Some(h) = go.geo_h_ll { rp.gt_geo_h_ll.insert(go.crop_index, h); }
-                            if let Some(v) = go.geo_v_ll { rp.gt_geo_v_ll.insert(go.crop_index, v); }
-                            if let Some(he) = go.geo_h_err { rp.gt_geo_h_err.insert(go.crop_index, he); }
-                            if let Some(ve) = go.geo_v_err { rp.gt_geo_v_err.insert(go.crop_index, ve); }
-                            gi = fidx + 1;
-                        } else {
-                            // No GT counterpart (e.g. winner ffi not supported by GT Caladea) – leave —.
-                            // Do not advance gi, keep GT pointer on current for next winner char.
-                        }
-                    }
-                }
-            }
-            rp
-        };
-        let alt_obs_rank_probs = ObsRankProbs::default();
+        let obs_rank_probs = build_obs_rank_probs(&observations, &gt_observations);
+        let alt_obs_rank_probs = build_obs_rank_probs(&observations_lig, &gt_observations);
 
         // Save crop PNGs and scan line image for ALL audited lines (not just
         // misses), so similarity-failure lines have crops in the report too.
@@ -1136,6 +1150,114 @@ pub fn match_lines(
         let seg_used_ligatures = winning_segs.iter()
             .flat_map(|ws| ws.chars.iter())
             .any(|c| crate::font_scan::is_ligature_char(*c));
+
+        // ── Ligature/plain two-path split (Mike Nov 6, 2026) ──
+        // The old dual-path scoring is gone — per-font collapse lives
+        // inside identify_fonts — so seg_winner / font_scores_lig were
+        // always None/empty and the report's Segmentation comparison
+        // block could never render. Derive both paths from the
+        // already-scored font list instead (no rescoring, no classifier
+        // change): a font is on the ligature path for this line iff its
+        // collapsed ligature set actually changes this line's text;
+        // otherwise it is on the plain path. The winning path is the
+        // overall winner's path; the losing path's candidates become
+        // font_scores_lig. font_scores narrows to the winning path only,
+        // matching the report's long-standing expectation
+        // ("font_candidates is always the winning path").
+        let (seg_winner, font_scores, font_scores_lig) = {
+            let line_chars: Vec<char> = line.text.chars().collect();
+            // Collapsible iff collapsing with every ligature allowed changes
+            // the length. (collapse_ligature_chars is private to segment.rs;
+            // the public for_allowed with all five ligature bits set — FB00
+            // through FB04 — is the same unconditional collapse.)
+            let collapsible =
+                crate::segment::collapse_ligature_chars_for_allowed(&line_chars, 0b11111).len()
+                    < line_chars.len();
+            if !collapsible || font_scores.is_empty() {
+                (seg_winner, font_scores, font_scores_lig)
+            } else {
+                let mut lig_path: Vec<(String, Option<f32>)> = Vec::new();
+                let mut plain_path: Vec<(String, Option<f32>)> = Vec::new();
+                for (k, s) in &font_scores {
+                    let on_lig_path = font_registry.by_key(k).map_or(false, |fe| {
+                        let m = fe.collapsed_lig_set();
+                        m != 0
+                            && crate::segment::collapse_ligature_chars_for_allowed(&line_chars, m)
+                                .len()
+                                < line_chars.len()
+                    });
+                    if on_lig_path {
+                        lig_path.push((k.clone(), *s));
+                    } else {
+                        plain_path.push((k.clone(), *s));
+                    }
+                }
+                if lig_path.is_empty() || plain_path.is_empty() {
+                    (seg_winner, font_scores, font_scores_lig)
+                } else {
+                    let winner_key = font_scores[0].0.as_str();
+                    let winner_on_lig = lig_path.iter().any(|(k, _)| k.as_str() == winner_key);
+                    if winner_on_lig {
+                        (Some("ligature".to_string()), lig_path, plain_path)
+                    } else {
+                        (Some("plain".to_string()), plain_path, lig_path)
+                    }
+                }
+            }
+        };
+
+        // ── Emit plain/ligature word segmentation crops for the report's
+        // Segmentation comparison block ──
+        // segment_line (the old writer of word_*/seg_plain + seg_lig) is
+        // dead code and the only seg_lig crops on disk are Aug-2 fossils
+        // in lines the current specimen no longer has. Emit the crops
+        // here, from the same segment_characters() the scorer uses, for
+        // words where the two paths actually differ: plain (original
+        // chars) vs ligature (collapsed per the lig-path font's set).
+        // Both word_crop.png (raw word) and final_overlay.png (split
+        // lines — the visible difference) are written; the report
+        // prefers the overlay.
+        if let (Some(ref ddir), Some(ref winner)) = (diag_seg_dir.as_ref(), seg_winner.as_ref()) {
+            let lig_mask = {
+                let lig_key = if winner.as_str() == "ligature" {
+                    font_scores.first().map(|(k, _)| k.as_str())
+                } else {
+                    font_scores_lig.first().map(|(k, _)| k.as_str())
+                };
+                lig_key
+                    .and_then(|k| font_registry.by_key(k))
+                    .map_or(0, |fe| fe.collapsed_lig_set())
+            };
+            if lig_mask != 0 {
+                for wi in &word_infos {
+                    let plain_len = wi.orig_chars.len();
+                    let lig_len = crate::segment::collapse_ligature_chars_for_allowed(
+                        &wi.orig_chars, lig_mask,
+                    )
+                    .len();
+                    if lig_len >= plain_len || plain_len == 0 {
+                        continue;
+                    }
+                    let slug = crate::seg_diag::sanitize_text(&wi.text);
+                    let wdir = ddir.join(format!("word_{:03}_{}", wi.source_idx, slug));
+                    for (sub, n) in [("seg_plain", plain_len), ("seg_lig", lig_len)] {
+                        let sdir = wdir.join(sub);
+                        let _ = std::fs::create_dir_all(&sdir);
+                        let _ = wi.img.save(sdir.join("word_crop.png"));
+                        let (_bounds, seams, summary) =
+                            crate::segment::segment_characters(&wi.img, n);
+                        crate::seg_diag::save_split_overlay_with_paths(
+                            &wi.img,
+                            &summary.ws_splits,
+                            &summary.seam_splits,
+                            &[],
+                            &seams,
+                            &sdir.join("final_overlay.png"),
+                        );
+                    }
+                }
+            }
+        }
 
         LineMatch { font_result, text_color, font_scores, observations, font_scores_lig, observations_lig, seg_winner, seg_used_ligatures, diag_seg_dir, obs_rank_probs, alt_obs_rank_probs, tie_candidates: tie_candidates_audit, corrected_words, fast_path: false, fast_path_score: None, midpoint_em_px, gt_midpoint_em_px, word_seg_summaries, gt_word_seg_summaries, gt_per_char_geo_ll, ocr_corrections: ocr_correction_audit }
     }).collect();

@@ -1144,8 +1144,20 @@ fn build_lig_comparison_block(diag_dir: &Path, entry: &AuditEntry) -> String {
     let mut rows = String::new();
     for wd in &word_dirs {
         let wpath = wd.path();
-        let plain_img = wpath.join("seg_plain").join("word_crop.png");
-        let lig_img = wpath.join("seg_lig").join("word_crop.png");
+        // Prefer the segmentation overlay (split lines visible — the
+        // actual difference between the paths); fall back to the raw
+        // word crop. The raw crops are identical in both dirs, so
+        // showing them side by side proves nothing.
+        let pick = |sub: &str| {
+            let over = wpath.join(sub).join("final_overlay.png");
+            if over.exists() {
+                over
+            } else {
+                wpath.join(sub).join("word_crop.png")
+            }
+        };
+        let plain_img = pick("seg_plain");
+        let lig_img = pick("seg_lig");
         if !plain_img.exists() || !lig_img.exists() {
             continue;
         }
