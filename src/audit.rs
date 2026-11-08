@@ -49,15 +49,14 @@ pub struct AuditEntry {
     pub font_candidates: Vec<FontCandidate>,
     #[serde(skip_serializing_if = "Vec::is_empty")]
     pub obs_votes: Vec<ObservationVote>,
-    /// Ligature-segmented font candidates (when ligature sequences are present).
+    /// GT font's own per-observation votes, on GT's own segmentation
+    /// (GT's collapsed ligature set: collapsed for lig GT, uncollapsed
+    /// for nolig GT). The report reads GT's per-char data on GT's own
+    /// segmentation from these — the nolig-cell components and the
+    /// GT-geo fallback when the winner's segmentation collapses a
+    /// ligature the GT font renders as separate characters.
     #[serde(skip_serializing_if = "Vec::is_empty")]
-    pub font_candidates_lig: Vec<FontCandidate>,
-    /// Ligature-segmented per-observation font-scoring votes.
-    #[serde(skip_serializing_if = "Vec::is_empty")]
-    pub obs_votes_lig: Vec<ObservationVote>,
-    /// Which segmentation path won: "plain" or "ligature".
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub seg_winner: Option<String>,
+    pub gt_obs_votes: Vec<ObservationVote>,
     /// Word-level bounding boxes for this line (for miss-report visualisation).
     #[serde(skip_serializing_if = "Vec::is_empty")]
     pub word_bboxes: Vec<WordBBox>,

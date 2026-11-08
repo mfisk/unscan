@@ -790,26 +790,17 @@ fn find_correct_ci_candidate(
 ) -> (Option<String>, Option<f32>, Option<usize>) {
     let gt_key = ground_truth::strip_subset_prefix_str(actual_font);
 
-    // font_candidates is always the winning path (font_pipeline.rs: winner → font_scores),
-    // font_candidates_lig is the losing path. Prioritize winner, fall back to loser
-    // so GT always shows a rank when it was scored in either path (fixes p4:L23
-    // where Caladea-400 is rank 1 in plain (loser) when ligature wins, and
-    // would otherwise show "not scored").
+    // font_candidates is the full ranked list (no lig/plain path split:
+    // the lig/nolig fontkeys already decide the ligature question), so
+    // GT is found here whenever it was scored. The rank is the overall
+    // rank over all scored fonts.
     let primary = &entry.font_candidates;
-    let secondary = &entry.font_candidates_lig;
 
     for (i, c) in primary.iter().enumerate() {
         if let Some(fe) = find_font_by_key(font_catalog, &c.font_key) {
             // Compare full font_key, not postscript_name: GT annotations are now
             // the full catalog font_key (e.g., "SourceSerif4-400|nokern[wght=400,opsz=10]"),
             // while postscript_name is the clean name (e.g., "SourceSerif4-Regular").
-            if fe.font_key() == gt_key {
-                return (Some(c.font_key.clone()), c.score, Some(i + 1));
-            }
-        }
-    }
-    for (i, c) in secondary.iter().enumerate() {
-        if let Some(fe) = find_font_by_key(font_catalog, &c.font_key) {
             if fe.font_key() == gt_key {
                 return (Some(c.font_key.clone()), c.score, Some(i + 1));
             }
@@ -872,11 +863,10 @@ fn build_miss_block(
         .font_matched
         .as_deref()
         .and_then(|m| {
-            // font_candidates is always the winner; font_candidates_lig is loser.
+            // font_candidates[0] is the winner (full ranked list).
             entry.font_candidates
                 .first()
                 .and_then(|c| find_font_by_key(font_catalog, &c.font_key))
-                .or_else(|| entry.font_candidates_lig.first().and_then(|c| find_font_by_key(font_catalog, &c.font_key)))
                 .or_else(|| find_font_in_catalog(font_catalog, m))
         });
 
@@ -928,13 +918,6 @@ fn build_miss_block(
         String::new()
     };
 
-    // Ligature vs plain segmentation visual comparison
-    let lig_compare_html = if let Some(ref dd) = diag_dir {
-        build_lig_comparison_block(dd, entry)
-    } else {
-        String::new()
-    };
-
     // Similarity (ZNCC) info
     let sim_html = match (entry.similarity_score, entry.similarity_pass) {
         (Some(score), Some(pass)) => {
@@ -945,8 +928,11 @@ fn build_miss_block(
         _ => String::new(),
     };
 
-    // Per-character comparison table (skip for similarity-only failures unless ligature path picked)
-    let obs_table_html = if entry.obs_votes.is_empty() || (ce.kind == MissKind::SimilarityFailure && entry.seg_winner.is_none()) {
+    // Per-character comparison table. The picker drops zero-delta rows,
+    // so the table renders only when there is something to show: a
+    // similarity failure with chosen == GT yields an empty selection
+    // and no table.
+    let obs_table_html = if entry.obs_votes.is_empty() {
         String::new()
     } else {
         // Top 6 deltas, PLUS any lig/nolig comparison observation (Mike Nov 6,
@@ -957,85 +943,25 @@ fn build_miss_block(
             is_nolig_font(correct_fe, &actual_font),
             is_nolig_font(chosen_fe, &matched),
         );
-        build_observation_table(
-            entry,
-            &obs_to_show,
-            audit_root,
-            correct_fe,
-            chosen_fe,
-            &actual_font,
-            &matched,
-            gt_rank,
-            gt_score,
-            font_data_cache,
-            diag_dir.as_deref(),
-            font_catalog,
-            glyph_map,
-            "crops",
-        )
-    };
-
-    // Per-character comparison table for the alternate (lig) segmentation path
-    let obs_table_lig_html = if entry.obs_votes_lig.is_empty() || entry.seg_winner.is_none() {
-        String::new()
-    } else {
-        let winner = entry.seg_winner.as_deref().unwrap_or("?");
-        let alt_label = if winner == "ligature" { "plain" } else { "ligature" };
-        let alt_font_key = entry.font_candidates_lig.first()
-            .map(|c| c.font_key.as_str()).unwrap_or("?");
-        let alt_font = short_key(alt_font_key);
-        let alt_chosen_fe = font_catalog.iter().find(|fe| fe.font_key() == alt_font_key);
-        // GT rank/score in the alt path's candidate list (not winner's)
-        let alt_gt = if let Some(ref af) = ce.actual_font {
-            let gt_key = ground_truth::strip_subset_prefix_str(af);
-            entry.font_candidates_lig.iter().enumerate()
-                .find(|(_, c)| {
-                    find_font_by_key(font_catalog, &c.font_key)
-                        .map_or(false, |fe| fe.font_key() == gt_key)
-                })
-                .map(|(i, c)| (Some(i + 1), c.score))
-                .unwrap_or((None, None))
-        } else {
-            (None, None)
-        };
-        // Top 6 deltas, PLUS any lig/nolig comparison observation (Mike Nov 6,
-        // 2026): shown in addition, not instead of the top 6.
-        let obs_to_show = append_lig_comparison_obs(
-            pick_interesting_observations(&entry.obs_votes_lig, 6, 0),
-            &entry.obs_votes_lig,
-            is_nolig_font(correct_fe, &actual_font),
-            is_nolig_font(alt_chosen_fe, &alt_font),
-        );
-        // No meaningful (non-zero delta) observations on the alt path and
-        // no lig comparison rows: suppress the table instead of showing
-        // misleading fallback rows (Mike Nov 7, 2026; the L2 plain path
-        // showed six 'e's from the worst-best_prob fallback).
         if obs_to_show.is_empty() {
             String::new()
         } else {
-            let table = build_observation_table(
+            build_observation_table(
                 entry,
                 &obs_to_show,
                 audit_root,
                 correct_fe,
-                alt_chosen_fe,
+                chosen_fe,
                 &actual_font,
-                &alt_font,
-                alt_gt.0,
-                alt_gt.1,
+                &matched,
+                gt_rank,
+                gt_score,
                 font_data_cache,
                 diag_dir.as_deref(),
                 font_catalog,
                 glyph_map,
-                "crops_alt",
-            );
-            if table.is_empty() {
-                String::new()
-            } else {
-                format!(
-                    "<div class=\"seg-alt-obs\"><b>Alternate path ({alt_label}) \u{2192} {alt_font}</b>{table}</div>",
-                )
-            }
+                "crops",
+            )
         }
     };
 
@@ -1061,48 +987,6 @@ fn build_miss_block(
         MissKind::SimilarityFailure => format!(" [ZNCC failure]{fast_path_tag}{ocr_fail_tag}"),
         MissKind::KeptRaster => format!(" [kept raster]{ocr_fail_tag}"),
         _ => ocr_fail_tag.to_string(),
-    };
-
-    // Segmentation path comparison (ligature vs plain)
-    let seg_path_html = if let Some(ref winner) = entry.seg_winner {
-        if !entry.font_candidates_lig.is_empty() {
-            let (lig_font, lig_score, plain_font, plain_score) = if winner == "ligature" {
-                // font_candidates = ligature (winner), font_candidates_lig = plain (loser)
-                let lf = entry.font_candidates.first()
-                    .map(|c| short_key(&c.font_key)).unwrap_or_else(|| "?".into());
-                let ls = entry.font_candidates.first().and_then(|c| c.score);
-                let pf = entry.font_candidates_lig.first()
-                    .map(|c| short_key(&c.font_key)).unwrap_or_else(|| "?".into());
-                let ps = entry.font_candidates_lig.first().and_then(|c| c.score);
-                (lf, ls, pf, ps)
-            } else {
-                // font_candidates = plain (winner), font_candidates_lig = ligature (loser)
-                let pf = entry.font_candidates.first()
-                    .map(|c| short_key(&c.font_key)).unwrap_or_else(|| "?".into());
-                let ps = entry.font_candidates.first().and_then(|c| c.score);
-                let lf = entry.font_candidates_lig.first()
-                    .map(|c| short_key(&c.font_key)).unwrap_or_else(|| "?".into());
-                let ls = entry.font_candidates_lig.first().and_then(|c| c.score);
-                (lf, ls, pf, ps)
-            };
-            let lig_marker = if winner == "ligature" { " ✓" } else { "" };
-            let plain_marker = if winner == "plain" { " ✓" } else { "" };
-            let ls = lig_score.map(|s| format!("{s:.4}")).unwrap_or_else(|| "—".into());
-            let ps = plain_score.map(|s| format!("{s:.4}")).unwrap_or_else(|| "—".into());
-            format!(
-                "<div class=\"seg-paths\">\
-                 <b>Seg paths:</b> \
-                 ligature → {} ({}){} · \
-                 plain → {} ({}){}\
-                 </div>",
-                lig_font, ls, lig_marker,
-                plain_font, ps, plain_marker,
-            )
-        } else {
-            String::new()
-        }
-    } else {
-        String::new()
     };
 
     // Font candidate scores — top N with GT and chosen markers, legible tie-break context
@@ -1229,14 +1113,11 @@ fn build_miss_block(
          {}\
          {}\
          {}\
-         {}\
-         {}\
-         {}\
          </div>",
         entry.page, entry.line_index, miss_kind_label, sim_html, gt_pruned_badge,
         text_preview,
-        seg_path_html, font_scores_html, lig_compare_html, chosen_scan_line_html, gt_scan_line_html, gt_seg_summary_html, sim_compare_html, tie_break_html, obs_table_html,
-        obs_table_lig_html, ocr_override_html,
+        font_scores_html, chosen_scan_line_html, gt_scan_line_html, gt_seg_summary_html, sim_compare_html, tie_break_html, obs_table_html,
+        ocr_override_html,
     );
     (html, entry.similarity_score, gt_sim)
 }
@@ -1248,131 +1129,6 @@ fn build_gt_segmentation_summary(entry: &AuditEntry) -> String {
         parts.push(format!("“{}” {}/{} ws{:?} seam{:?}", ws.word_text, ws.n_segments_produced, ws.n_chars_expected, ws.ws_splits, ws.seam_splits));
     }
     format!("<div class='scan-line-label'>GT Segmentation: {}</div>", parts.join(" | "))
-}
-
-/// Build ligature vs plain segmentation visual comparison.
-/// Finds word_*/seg_plain/word_crop.png and word_*/seg_lig/word_crop.png
-/// in the diag directory and renders them side by side when both exist.
-/// Also shows ZNCC render/diff images for both paths when available.
-fn build_lig_comparison_block(diag_dir: &Path, entry: &AuditEntry) -> String {
-    if entry.seg_winner.is_none() || entry.font_candidates_lig.is_empty() {
-        return String::new();
-    }
-    let winner = entry.seg_winner.as_deref().unwrap_or("?");
-    let (winner_label, loser_label) = if winner == "plain" {
-        ("Plain ✓", "Ligature")
-    } else {
-        ("Plain", "Ligature ✓")
-    };
-
-    let mut word_dirs: Vec<_> = match std::fs::read_dir(diag_dir) {
-        Ok(rd) => rd
-            .filter_map(|e| e.ok())
-            .filter(|e| {
-                e.file_name().to_string_lossy().starts_with("word_")
-                    && e.path().is_dir()
-            })
-            .collect(),
-        Err(_) => return String::new(),
-    };
-    word_dirs.sort_by_key(|d| d.file_name().to_string_lossy().to_string());
-
-    let mut rows = String::new();
-    for wd in &word_dirs {
-        let wpath = wd.path();
-        // Prefer the segmentation overlay (split lines visible — the
-        // actual difference between the paths); fall back to the raw
-        // word crop. The raw crops are identical in both dirs, so
-        // showing them side by side proves nothing.
-        let pick = |sub: &str| {
-            let over = wpath.join(sub).join("final_overlay.png");
-            if over.exists() {
-                over
-            } else {
-                wpath.join(sub).join("word_crop.png")
-            }
-        };
-        let plain_img = pick("seg_plain");
-        let lig_img = pick("seg_lig");
-        if !plain_img.exists() || !lig_img.exists() {
-            continue;
-        }
-        let plain_uri = match file_to_b64_uri(&plain_img) {
-            Some(u) => u,
-            None => continue,
-        };
-        let lig_uri = match file_to_b64_uri(&lig_img) {
-            Some(u) => u,
-            None => continue,
-        };
-        let dirname = wd.file_name().to_string_lossy().to_string();
-        let word_label = dirname.splitn(3, '_').nth(2).unwrap_or(&dirname);
-
-        rows.push_str(&format!(
-            "<tr>\
-             <td style=\"vertical-align:middle;font-size:11px;font-weight:600;padding:4px 6px;\">\
-             {word_label}</td>\
-             <td style=\"padding:2px;\"><img src=\"{plain_uri}\" \
-             style=\"max-width:100%;image-rendering:pixelated;\"/></td>\
-             <td style=\"padding:2px;\"><img src=\"{lig_uri}\" \
-             style=\"max-width:100%;image-rendering:pixelated;\"/></td></tr>",
-        ));
-    }
-
-    // ZNCC comparison: winner path renders from diag_dir, alt path from ssim_alt/
-    let mut zncc_rows = String::new();
-    let winner_render = diag_dir.join("ssim_render.png");
-    let winner_diff = diag_dir.join("ssim_diff.png");
-    let alt_render = diag_dir.join("ssim_alt").join("ssim_render.png");
-    let alt_diff = diag_dir.join("ssim_alt").join("ssim_diff.png");
-
-    if winner_render.exists() && alt_render.exists() {
-        if let (Some(wr_uri), Some(ar_uri)) = (file_to_b64_uri(&winner_render), file_to_b64_uri(&alt_render)) {
-            let (left_uri, right_uri) = if winner == "plain" { (wr_uri, ar_uri) } else { (ar_uri, wr_uri) };
-            zncc_rows.push_str(&format!(
-                "<tr>\
-                 <td style=\"vertical-align:middle;font-size:11px;font-weight:600;padding:4px 6px;\">\
-                 ZNCC render</td>\
-                 <td style=\"padding:2px;\"><img src=\"{left_uri}\" \
-                 style=\"max-width:100%;image-rendering:pixelated;\"/></td>\
-                 <td style=\"padding:2px;\"><img src=\"{right_uri}\" \
-                 style=\"max-width:100%;image-rendering:pixelated;\"/></td></tr>",
-            ));
-        }
-    }
-    if winner_diff.exists() && alt_diff.exists() {
-        if let (Some(wd_uri), Some(ad_uri)) = (file_to_b64_uri(&winner_diff), file_to_b64_uri(&alt_diff)) {
-            let (left_uri, right_uri) = if winner == "plain" { (wd_uri, ad_uri) } else { (ad_uri, wd_uri) };
-            zncc_rows.push_str(&format!(
-                "<tr>\
-                 <td style=\"vertical-align:middle;font-size:11px;font-weight:600;padding:4px 6px;\">\
-                 ZNCC diff</td>\
-                 <td style=\"padding:2px;\"><img src=\"{left_uri}\" \
-                 style=\"max-width:100%;image-rendering:pixelated;\"/></td>\
-                 <td style=\"padding:2px;\"><img src=\"{right_uri}\" \
-                 style=\"max-width:100%;image-rendering:pixelated;\"/></td></tr>",
-            ));
-        }
-    }
-
-    let all_rows = format!("{rows}{zncc_rows}");
-    if all_rows.is_empty() {
-        return String::new();
-    }
-
-    format!(
-        "<div class=\"seg-compare\">\
-         <b>Segmentation comparison</b> (winner: {winner})\
-         <table style=\"border-collapse:collapse;margin-top:4px;\">\
-         <tr><th></th>\
-         <th style=\"font-size:11px;padding:2px 6px;\">{winner_label}</th>\
-         <th style=\"font-size:11px;padding:2px 6px;\">{loser_label}</th></tr>\
-         {all_rows}\
-         </table></div>",
-        winner_label = winner_label,
-        loser_label = loser_label,
-        all_rows = all_rows,
-    )
 }
 
 fn build_scan_line_with_overlays_inner(
@@ -1988,20 +1744,18 @@ fn build_observation_table(
     _glyph_map: &NgramGlyphMap,
     crop_dir_name: &str,
 ) -> String {
-    // Build fallback geo map from the alternate path (loser when winner is shown).
-    // When winner is ligature (contains ﬃ) and GT font lacks ligature support,
-    // its per_char_geo is None on winner path (pruned), so gt_geo_* are None.
-    // The plain (alt) path does have geo for the same characters (O, c, etc.),
-    // so we use it as fallback for display.
+    // Build fallback geo map from GT's own observations, on GT's own
+    // segmentation. When the winner is ligature (contains ﬃ) and the GT
+    // font lacks ligature support, GT's per_char_geo is None on the winner
+    // path (pruned), so gt_geo_* are None. GT's own (plain) observations
+    // do have geo for the same characters (O, c, etc.), so use them as
+    // fallback for display. The same list sources the nolig-cell
+    // components below.
     use std::collections::HashMap as FbMap;
-    let alt_obs_ref: &[unprint::audit::ObservationVote] = if crop_dir_name == "crops_alt" {
-        &entry.obs_votes
-    } else {
-        &entry.obs_votes_lig
-    };
+    let gt_obs_ref: &[unprint::audit::ObservationVote] = &entry.gt_obs_votes;
     // Map seq string -> (h_ll, v_ll, h_err, v_err, glyph_score, rank, prob)
     let mut gt_fallback: FbMap<String, (Option<f32>, Option<f32>, Option<f32>, Option<f32>, Option<f32>, Option<usize>, Option<f32>)> = FbMap::new();
-    for ov in alt_obs_ref {
+    for ov in gt_obs_ref {
         if ov.gt_geo_h_ll.is_some() || ov.gt_font_rank.is_some() {
             let key: String = ov.seq.iter().collect();
             // Keep first occurrence (plain path may have duplicates; first is fine)
@@ -2179,10 +1933,11 @@ fn build_observation_table(
         // Ligature comparison (Mike Nov 7, 2026): if the observation seq
         // carries a ligature character and the correct font is nolig, the
         // correct cell must show the two separate component characters,
-        // each with its own render and scores, sourced from the plain-path
-        // observations. A single FB01 cell has no GT data (the nolig font
-        // has no FB01), so it renders empty. Do NOT combine the component
-        // scores into one FB01 cell.
+        // each with its own render and scores, sourced from GT's own
+        // observations (GT's segmentation, where the components are
+        // separate characters). A single FB01 cell has no GT data (the
+        // nolig font has no FB01), so it renders empty. Do NOT combine
+        // the component scores into one FB01 cell.
         let correct_cell_inner = {
             let has_lig = seq.iter().any(|&c| matches!(c, '\u{FB00}'..='\u{FB04}'));
             if has_lig && is_nolig_font(correct_fe, correct_font_name) {
@@ -2193,7 +1948,7 @@ fn build_observation_table(
                         // Components sit at consecutive crop indices starting
                         // at the ligature's crop index (ligature at crop C
                         // -> components at C, C+1, ...).
-                        let comp_ov = alt_obs_ref.iter().find(|ov| {
+                        let comp_ov = gt_obs_ref.iter().find(|ov| {
                             ov.seq.len() == 1 && ov.seq[0] == *comp
                                 && ov.crop_index == cv.crop_index + j
                         });
@@ -2291,12 +2046,8 @@ fn build_observation_table(
         _ => "not scored".into(),
     };
 
-    // The chosen font is CI candidate #1 from the appropriate path
-    let path_candidates = if crop_dir_name == "crops_alt" {
-        &entry.font_candidates_lig
-    } else {
-        &entry.font_candidates
-    };
+    // The chosen font is CI candidate #1 (font_candidates[0] is the winner).
+    let path_candidates = &entry.font_candidates;
     let chosen_rank_info = path_candidates
         .first()
         .map(|c| {

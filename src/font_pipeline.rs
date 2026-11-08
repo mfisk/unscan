@@ -61,9 +61,9 @@ pub struct ObsRankProbs {
 /// Build per-observation rank/prob/glyph/geo maps for one path's observations
 /// against the GT observations (no recompute — `identify_fonts` already
 /// computed best_prob, logit as glyph_score, and geo_ll for each path).
-/// Used for the winning path (observations + GT) and the alternate/losing
-/// path (observations_lig + GT), so the report's alternate-path ligature
-/// comparison table has the same data as the winning-path table.
+/// Used for the winning path (observations + GT) and for GT's own
+/// observations (gt_observations + GT, keyed by GT's own crop indices),
+/// so the report's per-char table has GT data on both segmentations.
 fn build_obs_rank_probs(
     observations: &[font_match::ObservationDetail],
     gt_observations: &[font_match::ObservationDetail],
@@ -154,9 +154,13 @@ pub struct LineMatch {
     pub text_color: (u8, u8, u8),
     pub font_scores: Vec<(String, Option<f32>)>,
     pub observations: Vec<font_match::ObservationDetail>,
-    pub font_scores_lig: Vec<(String, Option<f32>)>,
-    pub observations_lig: Vec<font_match::ObservationDetail>,
-    pub seg_winner: Option<String>,
+    /// GT font's own per-character observations, scored with GT's own
+    /// collapsed ligature set (so k is GT's own segmentation: collapsed
+    /// for lig GT, uncollapsed for nolig GT). The report reads GT's
+    /// per-char data on GT's own segmentation from these (via
+    /// gt_obs_rank_probs) for the nolig-cell components and the GT-geo
+    /// fallback — the role the alternate-path observations used to fill.
+    pub gt_observations: Vec<font_match::ObservationDetail>,
     /// Whether the winning segmentation used ligature-collapsed chars
     /// (U+FB00–U+FB04). Derived from the winning WordSeg chars at match time.
     /// This is the durable ligature signal: unlike ObservationDetail.ch, the
@@ -165,8 +169,9 @@ pub struct LineMatch {
     pub diag_seg_dir: Option<PathBuf>,
     /// Per-observation ranks/probs for the winner path.
     pub obs_rank_probs: ObsRankProbs,
-    /// Per-observation ranks/probs for the alt (losing) path.
-    pub alt_obs_rank_probs: ObsRankProbs,
+    /// Per-observation ranks/probs for GT's own observations, keyed by
+    /// GT's own crop indices (GT's segmentation, not the winner's).
+    pub gt_obs_rank_probs: ObsRankProbs,
     /// font tie-break candidates with per-candidate SSIM scores.
     pub tie_candidates: Vec<audit::TieCandidate>,
     /// When pflda OCR correction fires, the corrected word regions
@@ -389,15 +394,13 @@ pub fn match_lines(
                     text_color,
                     font_scores: Vec::new(),
                     observations: Vec::new(),
-                    font_scores_lig: Vec::new(),
-                    observations_lig: Vec::new(),
-                    seg_winner: None,
+                    gt_observations: Vec::new(),
                     // Fast path performs no segmentation; re-verification is
                     // skipped for these lines (fast_path_score is Some).
                     seg_used_ligatures: false,
                     diag_seg_dir: None,
                     obs_rank_probs: ObsRankProbs::default(),
-                    alt_obs_rank_probs: ObsRankProbs::default(),
+                    gt_obs_rank_probs: ObsRankProbs::default(),
                     tie_candidates: Vec::new(),
                     corrected_words: None,
                     fast_path: true,
@@ -436,9 +439,6 @@ pub fn match_lines(
         let mut observations: Vec<font_match::ObservationDetail>;
         let gt_observations: Vec<font_match::ObservationDetail>;
         let gt_per_char_geo_ll: Vec<f32>;
-        let font_scores_lig: Vec<(String, Option<f32>)>;
-        let observations_lig: Vec<font_match::ObservationDetail>;
-        let seg_winner: Option<String>;
         let diag_seg_dir: Option<PathBuf> = args
             .diag_seg_dir()
             .filter(|_| audit_line_filter.map_or(true, |f| f.contains(&li)))
@@ -584,12 +584,6 @@ pub fn match_lines(
             font_scores = scoring.scores.into_iter().map(|(k,s)| (k, Some(s))).collect();
             observations = scoring.observations;
             gt_observations = scoring.gt_observations;
-            font_scores_lig = Vec::new();
-            // Alternate-path observations: best font on the opposite
-            // lig/plain path from the winner (populated by identify_fonts).
-            // These become the report's obs_votes_lig / alternate-path table.
-            observations_lig = scoring.alt_observations;
-            seg_winner = None;
             // keep winning crops empty for now – filled after tie resolution
             // (winning_* computed below for reuse)
 
@@ -987,7 +981,11 @@ pub fn match_lines(
         // for the winning font path + GT path. Populate ObsRankProbs so the report's
         // per-char table has data.
         let obs_rank_probs = build_obs_rank_probs(&observations, &gt_observations);
-        let alt_obs_rank_probs = build_obs_rank_probs(&observations_lig, &gt_observations);
+        // GT's own ranks/probs, keyed by GT's own crop indices (GT's
+        // segmentation, not the winner's). The report reads GT's per-char
+        // data on GT's own segmentation from these for the nolig-cell
+        // components and the GT-geo fallback.
+        let gt_obs_rank_probs = build_obs_rank_probs(&gt_observations, &gt_observations);
 
         // Save crop PNGs and scan line image for ALL audited lines (not just
         // misses), so similarity-failure lines have crops in the report too.
@@ -1164,115 +1162,16 @@ pub fn match_lines(
             .flat_map(|ws| ws.chars.iter())
             .any(|c| crate::font_scan::is_ligature_char(*c));
 
-        // ── Ligature/plain two-path split (Mike Nov 6, 2026) ──
-        // The old dual-path scoring is gone — per-font collapse lives
-        // inside identify_fonts — so seg_winner / font_scores_lig were
-        // always None/empty and the report's Segmentation comparison
-        // block could never render. Derive both paths from the
-        // already-scored font list instead (no rescoring, no classifier
-        // change): a font is on the ligature path for this line iff its
-        // collapsed ligature set actually changes this line's text;
-        // otherwise it is on the plain path. The winning path is the
-        // overall winner's path; the losing path's candidates become
-        // font_scores_lig. font_scores narrows to the winning path only,
-        // matching the report's long-standing expectation
-        // ("font_candidates is always the winning path").
-        let (seg_winner, font_scores, font_scores_lig) = {
-            let line_chars: Vec<char> = line.text.chars().collect();
-            // Collapsible iff collapsing with every ligature allowed changes
-            // the length. (collapse_ligature_chars is private to segment.rs;
-            // the public for_allowed with all five ligature bits set — FB00
-            // through FB04 — is the same unconditional collapse.)
-            let collapsible =
-                crate::segment::collapse_ligature_chars_for_allowed(&line_chars, 0b11111).len()
-                    < line_chars.len();
-            if !collapsible || font_scores.is_empty() {
-                (seg_winner, font_scores, font_scores_lig)
-            } else {
-                let mut lig_path: Vec<(String, Option<f32>)> = Vec::new();
-                let mut plain_path: Vec<(String, Option<f32>)> = Vec::new();
-                for (k, s) in &font_scores {
-                    let on_lig_path = font_registry.by_key(k).map_or(false, |fe| {
-                        let m = fe.collapsed_lig_set();
-                        m != 0
-                            && crate::segment::collapse_ligature_chars_for_allowed(&line_chars, m)
-                                .len()
-                                < line_chars.len()
-                    });
-                    if on_lig_path {
-                        lig_path.push((k.clone(), *s));
-                    } else {
-                        plain_path.push((k.clone(), *s));
-                    }
-                }
-                if lig_path.is_empty() || plain_path.is_empty() {
-                    (seg_winner, font_scores, font_scores_lig)
-                } else {
-                    let winner_key = font_scores[0].0.as_str();
-                    let winner_on_lig = lig_path.iter().any(|(k, _)| k.as_str() == winner_key);
-                    if winner_on_lig {
-                        (Some("ligature".to_string()), lig_path, plain_path)
-                    } else {
-                        (Some("plain".to_string()), plain_path, lig_path)
-                    }
-                }
-            }
-        };
+        // No ligature/plain two-path split: the lig/nolig fontkeys already
+        // decide the ligature question (each variant is scored with its
+        // own collapsed segmentation), so there is no classifier-side
+        // alternate-path verdict. font_scores stays the full ranked list;
+        // the report finds GT in it directly. Both segmentations remain
+        // in the audit via word_seg_summaries (selected) and
+        // gt_word_seg_summaries (GT), which the report's scan-line
+        // overlays render side by side.
 
-        // ── Emit plain/ligature word segmentation crops for the report's
-        // Segmentation comparison block ──
-        // segment_line (the old writer of word_*/seg_plain + seg_lig) is
-        // dead code and the only seg_lig crops on disk are Aug-2 fossils
-        // in lines the current specimen no longer has. Emit the crops
-        // here, from the same segment_characters() the scorer uses, for
-        // words where the two paths actually differ: plain (original
-        // chars) vs ligature (collapsed per the lig-path font's set).
-        // Both word_crop.png (raw word) and final_overlay.png (split
-        // lines — the visible difference) are written; the report
-        // prefers the overlay.
-        if let (Some(ref ddir), Some(ref winner)) = (diag_seg_dir.as_ref(), seg_winner.as_ref()) {
-            let lig_mask = {
-                let lig_key = if winner.as_str() == "ligature" {
-                    font_scores.first().map(|(k, _)| k.as_str())
-                } else {
-                    font_scores_lig.first().map(|(k, _)| k.as_str())
-                };
-                lig_key
-                    .and_then(|k| font_registry.by_key(k))
-                    .map_or(0, |fe| fe.collapsed_lig_set())
-            };
-            if lig_mask != 0 {
-                for wi in &word_infos {
-                    let plain_len = wi.orig_chars.len();
-                    let lig_len = crate::segment::collapse_ligature_chars_for_allowed(
-                        &wi.orig_chars, lig_mask,
-                    )
-                    .len();
-                    if lig_len >= plain_len || plain_len == 0 {
-                        continue;
-                    }
-                    let slug = crate::seg_diag::sanitize_text(&wi.text);
-                    let wdir = ddir.join(format!("word_{:03}_{}", wi.source_idx, slug));
-                    for (sub, n) in [("seg_plain", plain_len), ("seg_lig", lig_len)] {
-                        let sdir = wdir.join(sub);
-                        let _ = std::fs::create_dir_all(&sdir);
-                        let _ = wi.img.save(sdir.join("word_crop.png"));
-                        let (_bounds, seams, summary) =
-                            crate::segment::segment_characters(&wi.img, n);
-                        crate::seg_diag::save_split_overlay_with_paths(
-                            &wi.img,
-                            &summary.ws_splits,
-                            &summary.seam_splits,
-                            &[],
-                            &seams,
-                            &sdir.join("final_overlay.png"),
-                        );
-                    }
-                }
-            }
-        }
-
-        LineMatch { font_result, text_color, font_scores, observations, font_scores_lig, observations_lig, seg_winner, seg_used_ligatures, diag_seg_dir, obs_rank_probs, alt_obs_rank_probs, tie_candidates: tie_candidates_audit, corrected_words, fast_path: false, fast_path_score: None, midpoint_em_px, gt_midpoint_em_px, word_seg_summaries, gt_word_seg_summaries, gt_per_char_geo_ll, ocr_corrections: ocr_correction_audit }
+        LineMatch { font_result, text_color, font_scores, observations, gt_observations, seg_used_ligatures, diag_seg_dir, obs_rank_probs, gt_obs_rank_probs, tie_candidates: tie_candidates_audit, corrected_words, fast_path: false, fast_path_score: None, midpoint_em_px, gt_midpoint_em_px, word_seg_summaries, gt_word_seg_summaries, gt_per_char_geo_ll, ocr_corrections: ocr_correction_audit }
     }).collect();
 
     let fp_hits = fast_path_hits.load(Ordering::Relaxed);
