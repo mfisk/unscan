@@ -215,12 +215,20 @@ impl Args {
         self.audit.is_some()
     }
 
-    /// Validate: require input and output (unless --test or non-scan mode).
+    /// Whether this invocation is a utility mode that takes no document:
+    /// it answers a query and exits instead of processing an input file.
+    /// New utility flags belong here, not as another early return in
+    /// validate() (Mike Nov 6, 2026: the exemption list was the kludge).
+    pub fn is_utility_mode(&self) -> bool {
+        !self.weight_explicit.is_empty()
+            || !self.resolve_fontkey.is_empty()
+            || self.export_catalog_json.is_some()
+    }
+
+    /// Validate: utility modes need neither input nor output; document
+    /// modes require input, and output unless --test.
     pub fn validate(&self) -> Result<(), String> {
-        if !self.weight_explicit.is_empty() {
-            return Ok(());
-        }
-        if !self.resolve_fontkey.is_empty() {
+        if self.is_utility_mode() {
             return Ok(());
         }
         if self.input.is_none() {
