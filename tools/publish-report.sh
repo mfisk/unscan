@@ -16,7 +16,7 @@ set -euo pipefail
 #   copy it whole; if OUT references assets/ but SRC doesn't, symlink/copy will be handled.
 SRC="${1:-test-docs/audit}"
 PREFIX="${2:-report}"
-TS="$(date +%Y%m%d-%H%M%S)"
+TS="$(TZ=America/New_York date +%Y%m%d-%H%M%S)ET"
 OUTBASE="${HOME}/workspace/unprint"
 # fallback if HOME not set
 if [ ! -d "$OUTBASE" ]; then OUTBASE="/home/hatch/workspace/unprint"; fi
