@@ -172,6 +172,17 @@ pub fn render_ngram(
 ) -> Option<(u64, GrayImage)> {
     let fk = fe.font_key_ref();
 
+    // Aggressive ligature use (Mike Nov 6, 2026): normalize the sequence
+    // for this font entry — expand any ligature characters to components,
+    // then collapse per the font's collapsed_lig_set(). "fi" renders as
+    // the single FB01 glyph for lig variants; nolig variants (allowed==0)
+    // render f, i separately, even when the input carries the combined
+    // U+FB01 character. Idempotent for already-normalized sequences.
+    // Cache lookup, overrides, render, and registration all use the
+    // normalized sequence (the actual rendered content).
+    let collapsed = normalize_seq_for_font(fe, seq);
+    let seq = &collapsed[..];
+
     // Cache read: check glyph_map for known hash, then image cache
     if let Some(hash) = glyph_map.hash_for_font(seq, &fk) {
         if let Some(img) = load_cached_ngram(seq, hash, params) {
@@ -201,6 +212,30 @@ pub fn render_ngram(
     let _ = atomic_save_png(&img, &path);
 
     Some((img_hash, img))
+}
+
+/// Normalize a character sequence for rendering with a font entry.
+/// Expands any ligature characters to their components, then collapses
+/// per the font's `collapsed_lig_set()` — so a lig font renders "fi" as
+/// the single U+FB01 glyph and a nolig font renders it as separate f, i
+/// glyphs, regardless of whether the input sequence carries the combined
+/// ligature character or the separate characters. Idempotent. This is
+/// what makes the renderer honor the explicit |lig / |nolig distinction:
+/// the image rendered for a (font, sequence) pair is always what that
+/// font actually renders for those characters.
+pub fn normalize_seq_for_font(fe: &crate::font_scan::FontEntry, seq: &[char]) -> Vec<char> {
+    normalize_seq_for_lig_mask(seq, fe.collapsed_lig_set())
+}
+
+/// Normalize a character sequence for rendering with a ligature mask
+/// (the font's `collapsed_lig_set()`). Same as `normalize_seq_for_font`
+/// but takes the mask directly, for render paths that don't hold the
+/// FontEntry (e.g. the full-line verify render, which shapes word text
+/// via HarfBuzz — the text must already carry the FB01 character, since
+/// HarfBuzz cannot invent a ligature the font has no GSUB rule for).
+pub fn normalize_seq_for_lig_mask(seq: &[char], allowed: u8) -> Vec<char> {
+    let expanded = crate::segment::expand_ligature_chars(seq);
+    crate::segment::collapse_ligature_chars_for_allowed(&expanded, allowed)
 }
 
 /// The actual rendering pipeline — no caching.

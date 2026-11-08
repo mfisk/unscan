@@ -2193,6 +2193,26 @@ pub fn collapse_ligature_chars_for_allowed(chars: &[char], allowed: u8) -> Vec<c
     out
 }
 
+/// Expand ligature characters back to their component characters.
+/// Inverse of `collapse_ligature_chars_for_allowed`: U+FB01 → ['f','i'],
+/// U+FB03 → ['f','f','i'], etc. Non-ligature chars pass through unchanged.
+/// Uses `LIGATURE_SEQUENCES` as the single source of truth for the mapping.
+/// Used by the renderer to normalize a sequence for a font: expand to
+/// components, then collapse per the font's allowed ligature set, so a
+/// nolig font renders "fi" as separate f, i glyphs even when the
+/// observation sequence carries the combined U+FB01 character.
+pub fn expand_ligature_chars(chars: &[char]) -> Vec<char> {
+    let mut out = Vec::with_capacity(chars.len());
+    for &c in chars {
+        if let Some((seq, _)) = LIGATURE_SEQUENCES.iter().find(|(_, lig)| *lig == c) {
+            out.extend_from_slice(seq);
+        } else {
+            out.push(c);
+        }
+    }
+    out
+}
+
 /// Ligature sequences: (char_sequence, unicode_ligature_char).
 /// Longer sequences first so ffi/ffl match before ff/fi/fl.
 pub(crate) const LIGATURE_SEQUENCES: &[(&[char], char)] = &[

@@ -258,6 +258,10 @@ pub fn match_lines(
 
         // ── Fast path: try dominant font via SSIM ────────────────
         if let (Some(fm), Some(ref fd)) = (dominant_font_candidate, &fast_path_font_data) {
+            // The dominant font arrives as a FontMatchResult (no
+            // FontEntry); resolve its lig set through the registry.
+            let fm_lig = font_registry.by_key(&fm.font_key)
+                .map(|fe| fe.collapsed_lig_set()).unwrap_or(0);
             let vr = verify::verify_text_region(
                 &norm_crop,
                 fd.as_slice(),
@@ -268,6 +272,7 @@ pub fn match_lines(
                 &fm.variant_tag,
                 fm.variations.as_deref(),
                 true,
+                fm_lig,
                 None,
                 Some(FAST_PATH_MIN_SSIM),
                 None,
@@ -553,15 +558,15 @@ pub fn match_lines(
                         let vr = verify::verify_text_region(
                             &norm_crop, &fd, &line.text, &line.words, line.x, line.y,
                             fe.glyph_overrides.as_deref(), &fe.variant_tag, fe.variations.as_deref(),
-                            true, tie_audit_dir.as_deref(), None, None, frac_width,
+                            true, fe.collapsed_lig_set(), tie_audit_dir.as_deref(), None, None, frac_width,
                         );
                         tie_sim_results.push((fe.font_key(), fe.family_name.clone(), vr.score));
                         // Highest SSIM wins. On an exact SSIM tie, the shared
                         // font-key preference decides (same as --resolve-fontkey
                         // and the fine-score sort) — it replaces the old
                         // prefer-empty-variant_tag rule, which disagreed with
-                        // the shared preference for non-GPOS fonts.
-                        let pref = crate::font_scan::font_key_preference_score(&fe.font_key(), fe.has_gpos);
+                        // the shared preference for kern-less fonts.
+                        let pref = crate::font_scan::font_key_preference_score(&fe.font_key(), fe.has_kern);
                         if best.as_ref().map_or(true, |(_, bs, _, _, _, _)| {
                             vr.score > *bs || (vr.score == *bs && pref > best_pref)
                         }) {

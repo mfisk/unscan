@@ -87,6 +87,7 @@ pub fn verify_text_region(
     variant_tag: &str,
     variations: Option<&[([u8; 4], f32)]>,
     allow_liga: bool,
+    allowed_lig: u8,
     audit_dir: Option<&std::path::Path>,
     bail_below: Option<f32>,
     override_em_px: Option<f32>,
@@ -127,7 +128,15 @@ pub fn verify_text_region(
                 } else { wr.width }
             } else { wr.width };
             WordPlacement {
-                text: wr.text.clone(),
+                // Normalize the word text for this font (Mike Nov 6, 2026):
+                // a lig font renders "fi" as the single U+FB01 glyph.
+                // HarfBuzz cannot invent that ligature (Trebuchet has no
+                // GSUB liga), so the text itself must carry the FB01
+                // character before shaping. A nolig font keeps f, i
+                // separate (allowed_lig == 0 → identity).
+                text: crate::char_render::normalize_seq_for_lig_mask(
+                    &wr.text.chars().collect::<Vec<char>>(), allowed_lig,
+                ).into_iter().collect(),
                 x_off,
                 y_off,
                 width: measured_w,
@@ -142,10 +151,15 @@ pub fn verify_text_region(
 
     // If fractional (subpixel) line width is provided, use it to compute
     // override_em_px directly, bypassing the per-word median.
+    // Normalize the full line text the same way as the word placements
+    // (lig font: "fi" → FB01; nolig: unchanged) for the width match.
+    let norm_text: String = crate::char_render::normalize_seq_for_lig_mask(
+        &text.chars().collect::<Vec<char>>(), allowed_lig,
+    ).into_iter().collect();
     let override_em_px = if let Some(fw) = frac_width {
         if fw.is_finite() && fw >= 4.0 && fw <= 5000.0 {
             if let Some(em) = crate::layout::width_matched_em_px_shaped(
-                font_data, text, fw, variant_tag, variations, allow_liga,
+                font_data, &norm_text, fw, variant_tag, variations, allow_liga,
             ) {
                 Some(em)
             } else {

@@ -70,6 +70,15 @@ pub fn build_ngram_glyph_map(
 
         let mut hashes = Vec::with_capacity(bigrams.len());
         for seq in bigrams {
+            // Aggressive ligature use (Mike Nov 6, 2026): when the key is not
+            // nolig, render "fi" as the single FB01 glyph, "ffi" as FB03,
+            // etc., using the font's collapsed_lig_set(). Nolig variants
+            // collapse to identity (allowed == 0) and render f, i separately.
+            // Registration uses the collapsed sequence (the actual rendered
+            // content), so the "fi" group holds only fonts that render it as
+            // two glyphs and the FB01 group holds the ligature renders.
+            let collapsed = crate::segment::collapse_ligature_chars_for_allowed(seq, fe.collapsed_lig_set());
+            let seq: &[char] = &collapsed;
             let gid_overrides: Vec<Option<unprint_fonts::ab_glyph::GlyphId>> = seq.iter().map(|c| {
                 overrides.and_then(|ovs| ovs.iter().find(|(ch, _)| *ch == *c).map(|(_, g)| unprint_fonts::ab_glyph::GlyphId(*g)))
             }).collect();
@@ -104,7 +113,7 @@ pub fn build_ngram_glyph_map(
                 } else {
                     let _ = std::fs::remove_file(&tmp);
                 }
-                hashes.push((seq.clone(), hash, fk.clone()));
+                hashes.push((seq.to_vec(), hash, fk.clone()));
             }
         }
         let done = progress.fetch_add(1, Ordering::Relaxed) + 1;
