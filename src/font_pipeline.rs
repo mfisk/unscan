@@ -632,14 +632,27 @@ pub fn match_lines(
                             None => continue,
                         };
                         let midpoint_em_px = crate::geometry_classifier::median_em_px_from_midpoints(font_key, &segs, &wib, geo_cache);
-                        // Fractional line width from subpixel ink bounds
+                        // Fractional line width from subpixel ink bounds, in LINE
+                        // coordinates. frac_left/frac_right are word-local
+                        // (0..word width), so add each word's x offset within
+                        // the line crop to get line coordinates. Without the
+                        // offset, min/max across words is roughly the widest
+                        // word's width (~194px on L3) instead of the line's
+                        // width (~1853px), and width_matched_em_px_shaped
+                        // computes an em ~10x too small — tie renders came out
+                        // 4px tall instead of ~40px.
                         let frac_width: Option<f32> = {
                             let mut min_l = f64::INFINITY;
                             let mut max_r = f64::NEG_INFINITY;
-                            for w in &wib {
+                            for (seg, w) in segs.iter().zip(wib.iter()) {
+                                let word_x = line.words.get(seg.source_word_idx)
+                                    .map(|tw| tw.x as f64)
+                                    .unwrap_or(0.0) - line.x as f64;
                                 for c in &w.chars {
-                                    if c.frac_left < min_l { min_l = c.frac_left; }
-                                    if c.frac_right > max_r { max_r = c.frac_right; }
+                                    let l = word_x + c.frac_left;
+                                    let r = word_x + c.frac_right;
+                                    if l < min_l { min_l = l; }
+                                    if r > max_r { max_r = r; }
                                 }
                             }
                             if max_r > min_l && min_l.is_finite() {
