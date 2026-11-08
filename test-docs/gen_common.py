@@ -227,7 +227,27 @@ def escape_html(text):
     return text.replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;").replace('"', "&quot;")
 
 
+def css_family_name(family):
+    """Sanitize a fontkey for use as a CSS font-family name.
+
+    A comma inside a quoted CSS family name breaks the @font-face match
+    through the WeasyPrint/Pango stack: Pango splits font descriptions on
+    commas, so the family never matches its @font-face rule and the
+    renderer falls back to the default sans (Noto Sans). Verified with a
+    minimal render: family 'OpenSans-400|nokern|nolig[wght=400,wdth=100]'
+    embedded Noto-Sans, while the same font under
+    'OpenSans-400_nokern_nolig_wght400_wdth100' embedded OpenSans.
+
+    The GT annotation is the verbatim fontkey and is untouched — this only
+    changes the CSS rendering name. It must be applied in BOTH the
+    @font-face rule (here) and the element style (callers), using this one
+    helper, so the two can never drift apart.
+    """
+    return family.replace(",", "_")
+
+
 def _font_face_rule(family, ttf_path, weight="400", style="normal"):
+    family = css_family_name(family)
     return (
         f"@font-face {{\n"
         f"  font-family: '{family}';\n"

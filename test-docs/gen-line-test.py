@@ -20,6 +20,7 @@ from gen_common import (
     resolve_expected_font,
     escape_html as _escape,
     build_font_face_css,
+    css_family_name,
     render_html_to_pdf,
     build_canonical_map_from_pdf,
 )
@@ -215,14 +216,37 @@ def main():
         # alphabet j/k split. Only isolate the final Matthew Carter line.
         if idx == len(lines) - 1 and len(lines) > 8:
             lines_html.append(LARGE_GAP)
+        # Derive kerning and ligatures from the resolved GT fontkey
+        # (canonical_name is the verbatim fontkey from --resolve-fontkey),
+        # mirroring gen-specimen.py's _kerning_css/_ligatures_css.
+        # The specimen must render exactly what the GT annotation says:
+        # kern keys render with kerning on, nokern keys with it off;
+        # lig keys render ligatures, nolig keys do not. Hardcoding either
+        # value makes the render mismatch the GT and penalizes the GT
+        # variant in the classifier (a kern GT scored against a nokern
+        # render, a nolig GT scored against a ligature render).
+        if 'nokern' in canonical_name:
+            kerning_css = 'font-kerning: none; '
+        else:
+            kerning_css = 'font-kerning: normal; '
+        # 'nolig' is checked first: 'lig' is a substring of 'nolig'.
+        if 'nolig' in canonical_name:
+            ligatures_css = 'font-variant-ligatures: none; '
+        elif '|lig' in canonical_name:
+            ligatures_css = 'font-variant-ligatures: normal; '
+        else:
+            raise RuntimeError(
+                f"Cannot determine font-variant-ligatures for '{canonical_name}': "
+                f"fontkey has neither |lig nor |nolig. Fix the catalog."
+            )
         lines_html.append(
-            f'<p style="font-family: \'{canonical_name}\'; '
+            f'<p style="font-family: \'{css_family_name(canonical_name)}\'; '
             f'font-weight: {css_weight}; font-style: {css_style}; '
             f'{variation_css}'
-            f'font-kerning: none; '
+            f'{kerning_css}'
             f'font-variant-caps: normal; '
             f'font-variant-numeric: lining-nums; '
-            f'font-variant-ligatures: normal; '
+            f'{ligatures_css}'
             f'font-feature-settings: "ss01" 0, "ss02" 0, "case" 0, "cpsp" 0, "dlig" 0; '
             f'font-size: {pt}pt; white-space: nowrap; margin:0; padding:0;">'
             f'{_escape(text)}</p>'
