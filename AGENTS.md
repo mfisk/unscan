@@ -25,6 +25,9 @@
 
 - **Always crop to ink bounds first.** Before segmenting, matching, or computing features on a word or character image, trim it down to just the ink. Raw word crops from Tesseract include adjacent lines, extra whitespace, and other garbage. Use `trim_whitespace()` or `normalize_to_ink_bounds()` before doing anything with the image.
 - **Always ask before committing.** Never auto-commit.
+- **Report ligatures (Mike Nov 6, 2026):** when showing characters in the report, always include ligature characters. If a character is part of a ligature (e.g. "fi" in a lig variant), the report must show the ligature glyph (U+FB01), not just the separate f and i glyphs.
+- **Report lig-vs-nolig comparison (Mike Nov 6, 2026):** when the report compares a lig font against a nolig font, show both renderings side by side — the nolig side as the two separate characters (f, i) as two glyphs, the lig side as the one combined ligature glyph (U+FB01) as a single glyph — so the difference is visible. Each side renders according to its own font key's lig/nolig state.
+- **Report lig/nolig shown in addition to top 6 (Mike Nov 6, 2026):** the lig-vs-nolig comparison display is shown IN ADDITION TO the top 6 deltas in the observation table, not instead of them. The B′ picker still shows the top 6 observations by |weight × (glyphD + GEO_WEIGHT × geoD)|, and the lig/nolig comparison rendering is an additional display alongside it.
 - **"Stop vibing shit"** — deliberate changes only, no speculative fixes.
 - **"Stop doing 1-off diagnostics and ONLY use the main code path."**
 - **"Focus on input quality, not fancier algorithms."** Fix images first.
