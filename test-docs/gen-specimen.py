@@ -1079,7 +1079,7 @@ def main():
     if unprint_bin:
         try:
             result = subprocess.run(
-                [unprint_bin, "--export-catalog-json", catalog_json, "-o", "/dev/null", "/dev/null"],
+                [unprint_bin, "--export-catalog-json", catalog_json],
                 capture_output=True, timeout=180)
             if result.returncode != 0:
                 raise RuntimeError(f"Catalog export failed: {result.stderr.decode()[:500]}")
@@ -1102,7 +1102,7 @@ def main():
     # This ensures the annotation matches the render for variable fonts.
     print("Building canonical map from PDF font names...")
     canonical_map = build_canonical_map_from_pdf(
-        str(out_pdf), all_font_files, catalog_json, font_entries, unprint_bin
+        str(out_pdf), all_font_files, font_entries=font_entries, unprint_bin=unprint_bin
     )
     print(f"  {len(canonical_map)} mappings built")
 

@@ -263,16 +263,11 @@ p {{
     gt_pdf = str(SCRIPT_DIR / "line-test-gt.pdf")
     render_html_to_pdf(html, gt_pdf, base_url=SCRIPT_DIR)
     print(f"wrote: {gt_pdf}")
-    # Export catalog for GT annotation via build_canonical_map_from_pdf.
-    # The map uses verbatim fontkeys from the catalog.
-    catalog_json = "/tmp/unprint-catalog.json"
-    try:
-        subprocess.run([unprint_bin, "--export-catalog-json", catalog_json],
-                     capture_output=True, timeout=120)
-    except Exception as e:
-        print(f"ERROR: Failed to export catalog: {e}", file=sys.stderr)
-        sys.exit(1)
-    canonical_map = build_canonical_map_from_pdf(gt_pdf, ttf_paths_for_map, catalog_json)
+    # Catalog entries for GT annotation, from the verbatim fontkeys already
+    # resolved above via --resolve-fontkey. No catalog dump needed: the
+    # script already knows every font it uses (Mike Nov 6, 2026).
+    catalog_by_path = {str(p): {'font_key': k, 'path': str(p)} for (k, p, _, _) in font_face_entries}
+    canonical_map = build_canonical_map_from_pdf(gt_pdf, ttf_paths_for_map, catalog_by_path, unprint_bin=unprint_bin)
     annotated, missing = annotate_canonical_names(gt_pdf, canonical_map)
     print(f"annotated {annotated} fonts, missing: {missing}")
     rast_pdf = str(SCRIPT_DIR / "line-test.pdf")
