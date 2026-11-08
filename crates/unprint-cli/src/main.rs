@@ -922,7 +922,7 @@ fn run(args: &cli::Args, classifier: &mut dyn classifier::Classifier) -> Result<
         font_pipeline::paragraph_font_grouping(&lines, &line_matches);
 
         // ── Word split: split wide whitespace using matched fonts ──
-        let split_indices: Vec<usize>;
+        let mut split_indices: Vec<usize>;
         {
             let line_fonts: Vec<Option<std::sync::Arc<Vec<u8>>>> = line_matches.iter()
                 .map(|lm| {
@@ -937,6 +937,13 @@ fn run(args: &cli::Args, classifier: &mut dyn classifier::Classifier) -> Result<
 
         // ── Pass 1b: Re-score only lines whose words were split ─────
         if !split_indices.is_empty() {
+            // split_wide_whitespace_words pushes line_idx once per split word,
+            // so a line split at two words appears twice. Swapping the same
+            // index twice with mem::swap restores the Pass 1 result (parity
+            // bug: L19 was swapped twice and kept the merged word). Swap each
+            // line exactly once.
+            split_indices.sort_unstable();
+            split_indices.dedup();
             let split_set: std::collections::HashSet<usize> = split_indices.iter().copied().collect();
             let (mut new_matches, _) = font_pipeline::match_lines(
             &lines, &gray_page, &rgba_page, page_img, page_num,
