@@ -3,7 +3,7 @@
 //! Moved from `src/bin/train.rs` into the main binary as a library module.
 //! Called via `unprint --train-lda`.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::io::{BufReader, BufWriter, Read, Write};
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicUsize, Ordering};
@@ -1093,8 +1093,31 @@ pub fn run_train(mut args: TrainArgs) {
     let mut cached_combos: Vec<(u32, usize, Vec<usize>)> = Vec::new();
     let mut incr_combos: Vec<IncrInfo> = Vec::new();
 
-    // Current per-seq glyph counts for increment comparison, in sequences order
+    // Catalog font keys, for deciding which glyph groups are still live.
+    // A glyph group is live iff at least one of its font keys is in the
+    // current catalog. Groups whose fonts have all left the catalog (or been
+    // renamed to a key that joined a different group) can never be rendered,
+    // so counting them as "expected" makes the validation conclude the cache
+    // is short by those groups on every run and re-attempt an incremental
+    // append that adds nothing. (Measured 2026-11-09: 207 such dead groups
+    // across the 106 sequences, all beyond the file's record prefix; every
+    // group with records in the file is live.)
+    let catalog_keys: HashSet<&str> = catalog.iter().map(|fe| fe.font_key_ref()).collect();
+
+    // Current per-seq glyph counts for increment comparison, in sequences order.
+    // Count only LIVE groups (at least one member font key in the current
+    // catalog). Dead groups have no records and can never gain any, so they
+    // must not inflate the expected record count.
     let current_counts_by_seq: Vec<usize> = sequences.iter()
+        .map(|seq| glyph_map.groups.get(seq).map(|gs| gs.iter()
+            .filter(|g| g.font_keys.iter().any(|k| catalog_keys.contains(k.as_str())))
+            .count()).unwrap_or(0))
+        .collect();
+
+    // Total per-seq glyph groups (live + dead), in sequences order. Glyph ids
+    // are dense indices into the map's group list, so the incremental loop's
+    // gid upper bound is the total count, not the live count.
+    let total_groups_by_seq: Vec<usize> = sequences.iter()
         .map(|seq| glyph_map.groups.get(seq).map(|gs| gs.len()).unwrap_or(0))
         .collect();
 
@@ -1135,20 +1158,33 @@ pub fn run_train(mut args: TrainArgs) {
                     .unwrap_or(old_counts);
                 let mut is_cached = true;
                 let mut needs_incr = false;
-                for (&cur_groups, &old_records) in current_counts_by_seq.iter().zip(old_counts.iter()) {
-                    // current_counts_by_seq holds glyph GROUP counts; old_counts holds
+                for ((&live_groups, &total_groups), &old_records) in current_counts_by_seq.iter()
+                    .zip(total_groups_by_seq.iter())
+                    .zip(old_counts.iter())
+                {
+                    // current_counts_by_seq holds LIVE glyph GROUP counts; old_counts holds
                     // RECORD counts from the file (one record per subpixel offset).
                     // Convert groups to expected records so the comparison is like-for-like.
                     // Comparing groups directly to records always concluded the cache
                     // had "shrunk" and forced a full rebuild on every run.
-                    let cur_records = cur_groups * SUBPIXEL_OFFSET_COUNT;
-                    if cur_records < old_records {
+                    // The shrink check uses TOTAL groups, not live groups: the glyph
+                    // map is append-only, so a file holding more records than the map
+                    // has groups means shrink/corruption. A live group that dies (its
+                    // fonts leave the catalog) after its records were written must NOT
+                    // trigger a full rebuild — its records are still valid training
+                    // data, they just belong to a font no longer in the catalog.
+                    // The incremental check uses LIVE groups only: dead groups have
+                    // no records and can never gain any, so they must not make the
+                    // cache look short.
+                    let live_records = live_groups * SUBPIXEL_OFFSET_COUNT;
+                    let total_records = total_groups * SUBPIXEL_OFFSET_COUNT;
+                    if total_records < old_records {
                         is_cached = false;
                         needs_incr = false;
-                        break; // cached file has more records than current groups need → shrink/corruption → full rebuild
-                    } else if cur_records > old_records {
+                        break; // cached file has more records than current groups → shrink/corruption → full rebuild
+                    } else if live_records > old_records {
                         is_cached = false;
-                        needs_incr = true; // cached file is missing records → new groups (or skipped renders)
+                        needs_incr = true; // cached file is missing records for live groups
                     }
                 }
                 if is_cached {
@@ -1402,7 +1438,7 @@ pub fn run_train(mut args: TrainArgs) {
                 // is the source of truth: 12-byte header + 256 bytes per record
                 // (4-byte glyph_id + 63 floats). A glyph render or feature
                 // computation can also fail, so the file may hold fewer than the
-                // expected (cur_groups - old_groups) * SUBPIXEL_OFFSET_COUNT new samples. The manifest and
+                // expected (live_groups - old_groups) * SUBPIXEL_OFFSET_COUNT new samples. The manifest and
                 // cached_combos must record what was actually written, otherwise
                 // the read phase over-reads and hits end of file.
                 let mut actual_counts: Vec<usize> = Vec::with_capacity(n_seqs);
@@ -1424,8 +1460,12 @@ pub fn run_train(mut args: TrainArgs) {
                     // concluded every gid was "old", so the incremental path never ran.)
                     let old_records = actual_counts[si];
                     let old_groups = old_records / SUBPIXEL_OFFSET_COUNT;
-                    let cur_groups = current_counts_by_seq[si];
-                    if cur_groups <= old_groups { continue; }
+                    // live_groups is the number of groups that must have records;
+                    // total_groups is the gid upper bound (glyph ids are dense
+                    // indices into the map's group list, live + dead).
+                    let live_groups = current_counts_by_seq[si];
+                    let total_groups = total_groups_by_seq[si];
+                    if live_groups <= old_groups { continue; }
                     let fpath = combo_path(&feat_dir, seq, info.ht, aa_name);
                     // Open existing file for append. File already has header.
                     let mut file = std::fs::OpenOptions::new()
@@ -1442,8 +1482,15 @@ pub fn run_train(mut args: TrainArgs) {
                             None => continue,
                         };
                         if gid < old_groups { continue; } // old gid, already in file
-                        if gid >= cur_groups { continue; } // should not happen
-                        let rep_font = &glyph_map.fonts_for_glyph(seq, gid)[0];
+                        if gid >= total_groups { continue; } // should not happen
+                        // Render each live group exactly once, via its first
+                        // member that is still in the catalog. The representative
+                        // is not necessarily member 0: a font rename leaves the
+                        // old key at index 0 and the new key later in the list,
+                        // and requiring index 0 would skip the group forever.
+                        let rep_font = glyph_map.fonts_for_glyph(seq, gid).iter()
+                            .find(|k| catalog_keys.contains(k.as_str()));
+                        let Some(rep_font) = rep_font else { continue; };
                         if rep_font != fk { continue; }
 
                         // Render this new glyph for this combo, at every subpixel
@@ -1482,7 +1529,7 @@ pub fn run_train(mut args: TrainArgs) {
                             }
                         }
                     }
-                    eprintln!("  h{} {} seq {} ({:?}): +{} new samples ({}→{} groups)", info.ht, aa_name, si, seq, new_samples, old_groups, cur_groups);
+                    eprintln!("  h{} {} seq {} ({:?}): +{} new samples ({}→{} live groups, {} total)", info.ht, aa_name, si, seq, new_samples, old_groups, live_groups, total_groups);
                     actual_counts[si] = old_records + new_samples;
                 }
                 // Update manifest for this combo to the ACTUAL new counts
