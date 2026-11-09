@@ -1186,17 +1186,6 @@ impl GeometryCache {
                 let y_pla = (s[1] + pf[1] + ps[1] + cs[1] + cpf[1] + cps[1]) as f64;
                 let x_adv_adj = (s[2] + pf[2] + ps[2] + cs[2] + cpf[2] + cps[2]) as f64;
                 let total_adv = adv + x_adv_adj;
-                if i == 0 {
-                    // Word-initial origin (Finding 7): align the first glyph's
-                    // ink left edge with the word bbox left edge (x=0). A glyph
-                    // with negative left side bearing (x0 < 0) extends left of
-                    // its origin; placing the origin at the bbox left edge puts
-                    // the first midpoint too far left by -x0. Offset the cursor
-                    // so the first ink left edge is at 0. This is a constant
-                    // shift of all predicted positions, so pitches (and scores)
-                    // are unchanged; it corrects the absolute positions.
-                    cursor = -(x0 + x_pla);
-                }
                 let cx = cursor + x_pla + (x0 + x1)*0.5;
                 let cy = y_pla + (y0 + y1)*0.5;
                 let y_min_a = y_pla + y0 as f64;
@@ -1280,17 +1269,6 @@ impl GeometryCache {
                 let y_pla = (s[1] + pf[1] + ps[1] + cs[1] + cpf[1] + cps[1]) as f64;
                 let x_adv_adj = (s[2] + pf[2] + ps[2] + cs[2] + cpf[2] + cps[2]) as f64;
                 let total_adv = adv + x_adv_adj;
-                if i == 0 {
-                    // Word-initial origin (Finding 7): align the first glyph's
-                    // ink left edge with the word bbox left edge (x=0). A glyph
-                    // with negative left side bearing (x0 < 0) extends left of
-                    // its origin; placing the origin at the bbox left edge puts
-                    // the first midpoint too far left by -x0. Offset the cursor
-                    // so the first ink left edge is at 0. This is a constant
-                    // shift of all predicted positions, so pitches (and scores)
-                    // are unchanged; it corrects the absolute positions.
-                    cursor = -(x0 + x_pla);
-                }
                 let cx = cursor + x_pla + (x0 + x1)*0.5;
                 let cy = y_pla + (y0 + y1)*0.5;
                 let y_min_a = y_pla + y0 as f64;
