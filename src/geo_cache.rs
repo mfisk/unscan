@@ -51,11 +51,7 @@ const BGEO_MAGIC: &[u8; 4] = b"BGEO";
 // v16 adds: pair_groups, case_pair_groups, single_groups, case_single_groups (BTree-free fast path)
 // plus sorted ClassDef Format2 ranges for binary search in class_get.
 // v17 adds: pair_first_present blob per font (num_glyphs bytes) built from Format1/Format2 coverage at cache build time.
-// v23 applies GPOS variation deltas from the ItemVariationStore (Finding 1):
-// variable-font instances now get their own kern (e.g. SourceSerif4 Italic
-// f→o −25 at opsz=10 instead of 0 at the default instance). v22 tables are
-// stale and must be rebuilt.
-const BGEO_VERSION: u32 = 24;
+const BGEO_VERSION: u32 = 22;
 
 // ---------- BE helpers for OT parsing ----------
 #[inline]
@@ -117,261 +113,6 @@ fn pack_vals_4<W: std::io::Write>(w: &mut W, vals: &[i16;4], vf: u16) -> std::io
     if vf & 0x0004 != 0 { w.write_all(&vals[2].to_le_bytes())?; }
     if vf & 0x0008 != 0 { w.write_all(&vals[3].to_le_bytes())?; }
     Ok(())
-}
-
-// ---------- Variation-aware GPOS values (Finding 1) ----------
-// In a variable font, a GPOS value record's device offsets point to
-// VariationIndex tables in the font's ItemVariationStore (OT spec), carried
-// by GDEF 1.3 or GPOS 1.1. The delta for (outer, inner) at the font's
-// normalized variation coordinates must be added to the base value. The
-// predictor used to skip those offsets, so e.g. SourceSerif4 Italic f→o
-// kern read 0 (the default-instance value, opsz=20) instead of −25 at
-// opsz=10, putting the L13 o pitch off by ~1.2 px.
-// Coordinates are normalized from fvar (piecewise by min/default/max) and
-// then passed through avar exactly once, matching HarfBuzz shaping. (Do not
-// use ttf-parser Face::set_variation per axis here: it re-maps all coords
-// through avar on every call, double-mapping earlier axes.) Any malformed
-// table fails the whole context to None, which keeps the old behaviour
-// (base values only) instead of applying a partial variation.
-struct VarDataSet {
-    /// Region index per delta in a row, in row order.
-    region_indexes: Vec<u16>,
-    item_count: u16,
-    /// Raw wordDeltaCount: low 15 bits are the count, high bit 0x8000 means long words.
-    word_delta_count_raw: u16,
-    /// Delta-set blob: item_count rows back to back.
-    deltas: Vec<u8>,
-}
-
-struct VarStoreCtx {
-    /// Normalized variation coordinates in fvar axis order, in [-1, 1].
-    coords: Vec<f32>,
-    /// regions[r][a] = (start, peak, end) as f32, per axis.
-    regions: Vec<Vec<(f32, f32, f32)>>,
-    var_data: Vec<VarDataSet>,
-}
-
-impl VarStoreCtx {
-    /// Build the context for a font instance, or None if the font has no
-    /// variations, no ItemVariationStore, or the tables are malformed.
-    fn from_tables(
-        gpos_data: Option<&[u8]>,
-        gdef_data: Option<&[u8]>,
-        face: &unprint_fonts::ttf_parser::Face,
-        variations: &[([u8; 4], f32)],
-    ) -> Option<Self> {
-        let (store_table, store_off) = Self::var_store_location(gpos_data, gdef_data)?;
-        let store = store_table.get(store_off..)?;
-        if be_u16(store, 0)? != 1 { return None; }
-        let region_list_off = be_u32(store, 2)? as usize;
-        let var_data_count = be_u16(store, 6)? as usize;
-        // Region list: axisCount u16, regionCount u16, then regionCount *
-        // axisCount * (start, peak, end) F2Dot14 triples.
-        let rl = store.get(region_list_off..)?;
-        let axis_count = be_u16(rl, 0)? as usize;
-        let region_count = be_u16(rl, 2)? as usize;
-        let mut regions = Vec::with_capacity(region_count);
-        let mut p = 4usize;
-        for _ in 0..region_count {
-            let mut axes = Vec::with_capacity(axis_count);
-            for _ in 0..axis_count {
-                let start = be_i16(rl, p)? as f32 / 16384.0; p += 2;
-                let peak = be_i16(rl, p)? as f32 / 16384.0; p += 2;
-                let end = be_i16(rl, p)? as f32 / 16384.0; p += 2;
-                axes.push((start, peak, end));
-            }
-            regions.push(axes);
-        }
-        // Variation data sets.
-        let mut var_data = Vec::with_capacity(var_data_count);
-        for i in 0..var_data_count {
-            let data_off = be_u32(store, 8 + i * 4)? as usize;
-            let vd = store.get(data_off..)?;
-            let item_count = be_u16(vd, 0)? as usize;
-            let word_delta_count_raw = be_u16(vd, 2)?;
-            let region_index_count = be_u16(vd, 4)? as usize;
-            let mut region_indexes = Vec::with_capacity(region_index_count);
-            for j in 0..region_index_count {
-                region_indexes.push(be_u16(vd, 6 + j * 2)?);
-            }
-            let long_words = word_delta_count_raw & 0x8000 != 0;
-            let word_count = (word_delta_count_raw & 0x7FFF) as usize;
-            let (word_size, small_size) = if long_words { (4, 2) } else { (2, 1) };
-            let row_size = word_count * word_size
-                + region_index_count.saturating_sub(word_count) * small_size;
-            let blob_off = 6 + region_index_count * 2;
-            let blob_len = item_count.checked_mul(row_size)?;
-            let blob_end = blob_off.checked_add(blob_len)?;
-            let deltas = vd.get(blob_off..blob_end)?.to_vec();
-            var_data.push(VarDataSet { region_indexes, item_count: item_count as u16, word_delta_count_raw, deltas });
-        }
-        let coords = Self::normalized_coords(face, variations)?;
-        Some(Self { coords, regions, var_data })
-    }
-
-    /// Locate the ItemVariationStore: GDEF 1.3 first (itemVarStoreOffset u32
-    /// at byte 14), else GPOS 1.1 (itemVarStoreOffset u32 at byte 14, after
-    /// featureVariationsOffset u32 at byte 10). Returns the table bytes and
-    /// the store offset within them.
-    fn var_store_location<'a>(gpos_data: Option<&'a [u8]>, gdef_data: Option<&'a [u8]>) -> Option<(&'a [u8], usize)> {
-        if let Some(g) = gdef_data {
-            if g.len() >= 18 && be_u16(g, 0) == Some(1) && be_u16(g, 2).unwrap_or(0) >= 3 {
-                if let Some(off) = be_u32(g, 14) {
-                    let off = off as usize;
-                    if off != 0 && off < g.len() { return Some((g, off)); }
-                }
-            }
-        }
-        if let Some(p) = gpos_data {
-            if p.len() >= 18 && be_u16(p, 0) == Some(1) && be_u16(p, 2).unwrap_or(0) >= 1 {
-                if let Some(off) = be_u32(p, 14) {
-                    let off = off as usize;
-                    if off != 0 && off < p.len() { return Some((p, off)); }
-                }
-            }
-        }
-        None
-    }
-
-    /// Normalized coordinates in fvar axis order, avar applied once.
-    /// Axes with no requested variation use the axis default (normalized 0).
-    fn normalized_coords(
-        face: &unprint_fonts::ttf_parser::Face,
-        variations: &[([u8; 4], f32)],
-    ) -> Option<Vec<f32>> {
-        let mut coords = Vec::new();
-        for axis in face.variation_axes() {
-            let tag = axis.tag.to_bytes();
-            let value = variations.iter()
-                .find(|(t, _)| *t == tag)
-                .map(|(_, v)| *v)
-                .unwrap_or(axis.def_value);
-            let normalized = if value == axis.def_value {
-                0.0
-            } else if value < axis.def_value {
-                let denom = axis.def_value - axis.min_value;
-                if denom == 0.0 { 0.0 } else { (value - axis.def_value) / denom }
-            } else {
-                let denom = axis.max_value - axis.def_value;
-                if denom == 0.0 { 0.0 } else { (value - axis.def_value) / denom }
-            };
-            coords.push(normalized.clamp(-1.0, 1.0));
-        }
-        // avar: absent means identity; present but malformed fails the
-        // whole context rather than applying a partial map.
-        if let Some(avar_data) = face.raw_face().table(unprint_fonts::ttf_parser::Tag::from_bytes(b"avar")) {
-            let maps = Self::parse_avar_maps(avar_data)?;
-            for (i, coord) in coords.iter_mut().enumerate() {
-                if let Some(map) = maps.get(i) {
-                    *coord = Self::map_avar(*coord, map);
-                }
-            }
-        }
-        Some(coords)
-    }
-
-    /// Parse the avar segment maps (fvar axis order). Each map is a list of
-    /// (from, to) F2Dot14 pairs, normally including (-1,-1) and (1,1).
-    fn parse_avar_maps(data: &[u8]) -> Option<Vec<Vec<(f32, f32)>>> {
-        if data.len() < 8 || be_u16(data, 0)? != 1 { return None; }
-        let axis_count = be_u16(data, 6)? as usize;
-        let mut maps = Vec::with_capacity(axis_count);
-        let mut p = 8usize;
-        for _ in 0..axis_count {
-            let count = be_u16(data, p)? as usize; p += 2;
-            if count == 0 { return None; }
-            let mut pairs = Vec::with_capacity(count);
-            for _ in 0..count {
-                let from = be_i16(data, p)? as f32 / 16384.0;
-                let to = be_i16(data, p + 2)? as f32 / 16384.0;
-                p += 4;
-                pairs.push((from, to));
-            }
-            maps.push(pairs);
-        }
-        Some(maps)
-    }
-
-    /// Piecewise-linear avar map, clamped at the ends.
-    fn map_avar(c: f32, pairs: &[(f32, f32)]) -> f32 {
-        if pairs.is_empty() { return c; }
-        if c <= pairs[0].0 { return pairs[0].1; }
-        if c >= pairs[pairs.len() - 1].0 { return pairs[pairs.len() - 1].1; }
-        for w in pairs.windows(2) {
-            let (f0, t0) = w[0];
-            let (f1, t1) = w[1];
-            if c >= f0 && c <= f1 {
-                if f1 == f0 { return t0; }
-                let t = (c - f0) / (f1 - f0);
-                return t0 + t * (t1 - t0);
-            }
-        }
-        c
-    }
-
-    /// Variation delta in font units for (outer, inner) at this instance's
-    /// coordinates, rounded to the nearest integer. Out-of-range indices
-    /// return 0, matching read-fonts ItemVariationStore::compute_delta.
-    fn delta(&self, outer: u16, inner: u16) -> i32 {
-        let Some(data) = self.var_data.get(outer as usize) else { return 0; };
-        if inner as usize >= data.item_count as usize { return 0; }
-        let long_words = data.word_delta_count_raw & 0x8000 != 0;
-        let word_count = (data.word_delta_count_raw & 0x7FFF) as usize;
-        let (word_size, small_size) = if long_words { (4, 2) } else { (2, 1) };
-        let row_size = word_count * word_size
-            + data.region_indexes.len().saturating_sub(word_count) * small_size;
-        let mut cursor = row_size * inner as usize;
-        let blob = &data.deltas;
-        let mut total = 0.0f32;
-        for (i, &region_index) in data.region_indexes.iter().enumerate() {
-            // Row layout: word_count words first (i32 if long, i16 if
-            // short), then smalls (i16 if long, i8 if short).
-            let v: i32 = if i < word_count {
-                if long_words {
-                    if cursor + 4 > blob.len() { return 0; }
-                    let v = i32::from_be_bytes([blob[cursor], blob[cursor + 1], blob[cursor + 2], blob[cursor + 3]]);
-                    cursor += 4; v
-                } else {
-                    if cursor + 2 > blob.len() { return 0; }
-                    let v = i16::from_be_bytes([blob[cursor], blob[cursor + 1]]) as i32;
-                    cursor += 2; v
-                }
-            } else if long_words {
-                if cursor + 2 > blob.len() { return 0; }
-                let v = i16::from_be_bytes([blob[cursor], blob[cursor + 1]]) as i32;
-                cursor += 2; v
-            } else {
-                if cursor + 1 > blob.len() { return 0; }
-                let v = blob[cursor] as i8 as i32;
-                cursor += 1; v
-            };
-            if v == 0 { continue; }
-            let Some(region) = self.regions.get(region_index as usize) else { continue; };
-            total += v as f32 * Self::region_scalar(region, &self.coords);
-        }
-        total.round() as i32
-    }
-
-    /// Scalar for one region at the instance's coordinates (OT spec, same
-    /// rules as read-fonts VariationRegion::compute_scalar).
-    fn region_scalar(region: &[(f32, f32, f32)], coords: &[f32]) -> f32 {
-        let mut scalar = 1.0f32;
-        for (i, &(start, peak, end)) in region.iter().enumerate() {
-            let coord = coords.get(i).copied().unwrap_or(0.0);
-            if start > peak || peak > end || peak == 0.0 || (start < 0.0 && end > 0.0) {
-                continue;
-            } else if coord < start || coord > end {
-                return 0.0;
-            } else if coord == peak {
-                continue;
-            } else if coord < peak {
-                scalar *= (coord - start) / (peak - start);
-            } else {
-                scalar *= (end - coord) / (end - peak);
-            }
-        }
-        scalar
-    }
 }
 
 fn file_meta_hash(path: &std::path::Path) -> u64 {
@@ -2077,16 +1818,7 @@ impl GeometryCache {
             let mut case_format2_tables: Vec<Format2TableOwned> = Vec::new();
 
             if let Some(gpos_data) = ttf_face.raw_face().table(unprint_fonts::ttf_parser::Tag::from_bytes(b"GPOS")) {
-                // Variation context (Finding 1): GPOS value records in a
-                // variable font carry variation deltas; without it the
-                // predictor reads kern at the default instance. Built only
-                // when the instance has variations; None keeps the old
-                // default-instance behaviour.
-                let var_ctx = fe.variations.as_ref().and_then(|vars| {
-                    let gdef_data = ttf_face.raw_face().table(unprint_fonts::ttf_parser::Tag::from_bytes(b"GDEF"));
-                    VarStoreCtx::from_tables(Some(gpos_data), gdef_data, &ttf_face, vars)
-                });
-                if let Some((s_tbls, f1_tbls, f2_tbls, cs_tbls, cf1_tbls, cf2_tbls)) = Self::parse_gpos_full(gpos_data, num_glyphs, var_ctx.as_ref()) {
+                if let Some((s_tbls, f1_tbls, f2_tbls, cs_tbls, cf1_tbls, cf2_tbls)) = Self::parse_gpos_full(gpos_data, num_glyphs) {
                     single_tables = s_tbls;
                     format1_tables = f1_tbls;
                     format2_tables = f2_tbls;
@@ -3165,7 +2897,7 @@ impl GeometryCache {
     // compatibility for tests - returns old kern-only view
     pub fn test_parse_gpos(data: &[u8], num_glyphs: usize) -> Option<(Vec<Format1Parse>, Vec<Format2Parse>, bool)> {
         // call new full parser, then convert to old structs for display
-        let (singles, f1_full, f2_full, _case_s, _case_f1, _case_f2) = Self::parse_gpos_full(data, num_glyphs, None)?;
+        let (singles, f1_full, f2_full, _case_s, _case_f1, _case_f2) = Self::parse_gpos_full(data, num_glyphs)?;
         // convert f1
         let mut f1_old = Vec::with_capacity(f1_full.len());
         for tbl in f1_full {
@@ -3200,8 +2932,8 @@ impl GeometryCache {
         Some((f1_old, f2_old, false))
     }
 
-    fn parse_gpos_full(data: &[u8], num_glyphs: usize, var_ctx: Option<&VarStoreCtx>) -> Option<(Vec<SingleTableOwned>, Vec<Format1TableOwned>, Vec<Format2TableOwned>, Vec<SingleTableOwned>, Vec<Format1TableOwned>, Vec<Format2TableOwned>)> {
-        Self::parse_gpos_inner(data, num_glyphs, var_ctx)
+    fn parse_gpos_full(data: &[u8], num_glyphs: usize) -> Option<(Vec<SingleTableOwned>, Vec<Format1TableOwned>, Vec<Format2TableOwned>, Vec<SingleTableOwned>, Vec<Format1TableOwned>, Vec<Format2TableOwned>)> {
+        Self::parse_gpos_inner(data, num_glyphs)
     }
 
     // old wrapper kept for internal callers that expected old signature - now maps to full
@@ -3209,7 +2941,7 @@ impl GeometryCache {
         None
     }
 
-    fn parse_gpos_inner(data: &[u8], num_glyphs: usize, var_ctx: Option<&VarStoreCtx>) -> Option<(Vec<SingleTableOwned>, Vec<Format1TableOwned>, Vec<Format2TableOwned>, Vec<SingleTableOwned>, Vec<Format1TableOwned>, Vec<Format2TableOwned>)> {
+    fn parse_gpos_inner(data: &[u8], num_glyphs: usize) -> Option<(Vec<SingleTableOwned>, Vec<Format1TableOwned>, Vec<Format2TableOwned>, Vec<SingleTableOwned>, Vec<Format1TableOwned>, Vec<Format2TableOwned>)> {
         if data.len() < 10 { return None; }
         let feature_list_off = be_u16(data, 6)? as usize;
         let lookup_list_off = be_u16(data, 8)? as usize;
@@ -3299,7 +3031,7 @@ impl GeometryCache {
                         let val_fmt_full = be_u16(data, inner_off+4)?;
                         let val_fmt = vf_mask(val_fmt_full);
                         let coverage = Self::parse_coverage(data, cov_off)?;
-                        let (xpl,ypl,xad,yad,_) = Self::parse_value_record(data, inner_off+6, inner_off, val_fmt_full, var_ctx)?;
+                        let (xpl,ypl,xad,yad,_) = Self::parse_value_record(data, inner_off+6, val_fmt_full)?;
                         let val = [xpl,ypl,xad,yad];
                         let entry = SingleTableOwned { coverage: coverage.clone(), value_format: val_fmt, values: vec![val; coverage.len()], is_single: true, lookup_id: li as u16, subtable_pos: si as u16 };
                         if is_case_only { case_single_tables.push(entry); } else { single_tables.push(entry); }
@@ -3315,7 +3047,7 @@ impl GeometryCache {
                         let val_size = Self::value_format_size(val_fmt_full);
                         for _ in 0..val_count {
                             if p + val_size > data.len() { break; }
-                            let (xpl,ypl,xad,yad,_) = Self::parse_value_record(data, p, inner_off, val_fmt_full, var_ctx)?;
+                            let (xpl,ypl,xad,yad,_) = Self::parse_value_record(data, p, val_fmt_full)?;
                             values.push([xpl,ypl,xad,yad]);
                             p += val_size;
                         }
@@ -3347,8 +3079,8 @@ impl GeometryCache {
                             for _ in 0..pair_val_count {
                                 if rp + rec_size > data.len() { break; }
                                 let second_gid = be_u16(data, rp)?;
-                                let (xpl1,ypl1,xad1,yad1,_) = Self::parse_value_record(data, rp+2, ps_off, val_fmt1_full, var_ctx)?;
-                                let (xpl2,ypl2,xad2,yad2,_) = Self::parse_value_record(data, rp+2+val1_size, ps_off, val_fmt2_full, var_ctx)?;
+                                let (xpl1,ypl1,xad1,yad1,_) = Self::parse_value_record(data, rp+2, val_fmt1_full)?;
+                                let (xpl2,ypl2,xad2,yad2,_) = Self::parse_value_record(data, rp+2+val1_size, val_fmt2_full)?;
                                 let v1 = [xpl1,ypl1,xad1,yad1];
                                 let v2 = [xpl2,ypl2,xad2,yad2];
                                 if v1!=[0,0,0,0] || v2!=[0,0,0,0] {
@@ -3391,8 +3123,8 @@ impl GeometryCache {
                         let mut p = inner_off + 16;
                         for _ in 0..c1_count*c2_count {
                             if p + rec_size > data.len() { break; }
-                            let (xpl1,ypl1,xad1,yad1,_) = Self::parse_value_record(data, p, inner_off, val_fmt1_full, var_ctx)?;
-                            let (xpl2,ypl2,xad2,yad2,_) = Self::parse_value_record(data, p+val1_size, inner_off, val_fmt2_full, var_ctx)?;
+                            let (xpl1,ypl1,xad1,yad1,_) = Self::parse_value_record(data, p, val_fmt1_full)?;
+                            let (xpl2,ypl2,xad2,yad2,_) = Self::parse_value_record(data, p+val1_size, val_fmt2_full)?;
                             matrix.push(([xpl1,ypl1,xad1,yad1],[xpl2,ypl2,xad2,yad2]));
                             p += rec_size;
                         }
@@ -3419,7 +3151,7 @@ impl GeometryCache {
     }
 
     #[allow(unused_assignments)]
-    fn parse_value_record(data: &[u8], off: usize, base_off: usize, fmt: u16, var_ctx: Option<&VarStoreCtx>) -> Option<(i16,i16,i16,i16,bool)> {
+    fn parse_value_record(data: &[u8], off: usize, fmt: u16) -> Option<(i16,i16,i16,i16,bool)> {
         let mut p = off;
         let mut xpl = 0i16; let mut ypl = 0i16; let mut xad = 0i16; let mut yad = 0i16;
         let mut has_dev = false;
@@ -3427,34 +3159,11 @@ impl GeometryCache {
         if fmt & 0x0002 != 0 { ypl = be_i16(data, p)?; p+=2; }
         if fmt & 0x0004 != 0 { xad = be_i16(data, p)?; p+=2; }
         if fmt & 0x0008 != 0 { yad = be_i16(data, p)?; p+=2; }
-        // Device offsets (bits 0x0010–0x0080) are relative to the start of
-        // the table that directly contains the value record — the subtable
-        // for SinglePos and PairPos Format 2, the PairSet for PairPos
-        // Format 1 — NOT the value record itself. HarfBuzz and fontTools
-        // resolve them against that container start; resolving against the
-        // value record reads a wrong VariationIndex and applies a wrong
-        // delta (e.g. SourceSerif4 f->o read (113,46)->0 instead of
-        // (188,1)->-25). `base_off` is that container start.
-        if fmt & 0x0010 != 0 { xpl = Self::apply_device_delta(data, p, base_off, xpl, var_ctx)?; has_dev = true; p+=2; }
-        if fmt & 0x0020 != 0 { ypl = Self::apply_device_delta(data, p, base_off, ypl, var_ctx)?; has_dev = true; p+=2; }
-        if fmt & 0x0040 != 0 { xad = Self::apply_device_delta(data, p, base_off, xad, var_ctx)?; has_dev = true; p+=2; }
-        if fmt & 0x0080 != 0 { yad = Self::apply_device_delta(data, p, base_off, yad, var_ctx)?; has_dev = true; p+=2; }
+        if fmt & 0x0010 != 0 { has_dev = true; p+=2; }
+        if fmt & 0x0020 != 0 { has_dev = true; p+=2; }
+        if fmt & 0x0040 != 0 { has_dev = true; p+=2; }
+        if fmt & 0x0080 != 0 { has_dev = true; p+=2; }
         Some((xpl,ypl,xad,yad,has_dev))
-    }
-
-    /// Resolve one device/variation offset at `p` (relative to the start
-    /// `base_off` of the table directly containing the value record) and
-    /// add its delta to `base`, saturating at i16.
-    /// With no variation context the offset is skipped, as before.
-    fn apply_device_delta(data: &[u8], p: usize, base_off: usize, base: i16, var_ctx: Option<&VarStoreCtx>) -> Option<i16> {
-        let dev_off = be_u16(data, p)? as usize;
-        let Some(ctx) = var_ctx else { return Some(base); };
-        if dev_off == 0 { return Some(base); }
-        let vi_off = base_off.checked_add(dev_off)?;
-        let outer = be_u16(data, vi_off)?;
-        let inner = be_u16(data, vi_off + 2)?;
-        let delta = ctx.delta(outer, inner);
-        Some((base as i32 + delta).clamp(i16::MIN as i32, i16::MAX as i32) as i16)
     }
 
     fn parse_coverage(data: &[u8], off: usize) -> Option<Vec<u16>> {
