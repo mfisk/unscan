@@ -81,9 +81,7 @@ def main():
     repo_root = SCRIPT_DIR.parent
     unprint_bin = None
     for bp in [
-        repo_root / "target" / "fastbuild" / "unprint",
         repo_root / "target" / "release" / "unprint",
-        repo_root / "target" / "fastbuild" / "unprint",
         repo_root / "target" / "debug" / "unprint",
     ]:
         if bp.exists():

@@ -3,7 +3,7 @@
 //! Moved from `src/bin/train.rs` into the main binary as a library module.
 //! Called via `unprint --train-lda`.
 
-use std::collections::{HashMap, HashSet};
+use std::collections::HashMap;
 use std::io::{BufReader, BufWriter, Read, Write};
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicUsize, Ordering};
@@ -628,51 +628,16 @@ pub fn subsample_eval(n: usize, max_eval: usize, seed: u64) -> Vec<usize> {
 const SUBPIXEL_STEPS: [f32; 4] = [0.0, 0.25, 0.5, 0.75];
 const SUBPIXEL_OFFSET_COUNT: usize = SUBPIXEL_STEPS.len() * SUBPIXEL_STEPS.len();
 
-pub fn run_train(mut args: TrainArgs) {
-    // Respect wrapper env first, otherwise cap to avoid OOM on 7.8GB no-swap.
-    // Previous version always forced 4 threads, ignoring RAYON_NUM_THREADS=1,
-    // which caused VSZ bloat when each thread held font data + PNG encoders.
-    let max_threads = std::env::var("RAYON_NUM_THREADS")
-        .ok()
-        .and_then(|s| s.parse::<usize>().ok())
-        .unwrap_or_else(|| {
-            std::thread::available_parallelism()
-                .map(|n| n.get())
-                .unwrap_or(2)
-                .min(4)
-        });
-    let _ = rayon::ThreadPoolBuilder::new()
-        .num_threads(max_threads)
-        .build_global();
-
-    if args.heights.is_empty() {
-        args.heights = vec![features::NORM_H];
-    }
-
-    // In --fast mode: alternating heights, single AA variant
-    let active_heights: Vec<u32> = if args.fast {
-        args.heights.iter().step_by(2).copied().collect()
-    } else {
-        args.heights.clone()
-    };
-    let aa_variants: Vec<AaVariant> = if args.fast {
-        vec![AaVariant::Native]
-    } else {
-        vec![AaVariant::Native, AaVariant::Blur05, AaVariant::Sharpen]
-    };
-
-    eprintln!("Heights: {:?}{}", active_heights, if args.fast { " (fast)" } else { "" });
-    eprintln!("AA variants: {}{}", aa_variants.len(), if args.fast { " (fast)" } else { "" });
-    eprintln!("Epochs: {}", args.epochs);
-    eprintln!("Learning rate: {}", args.lr);
-    eprintln!("Margin: {}", args.margin);
-
-    // ── 1. Scan fonts (base + vintage, matching runtime load_fonts) ──
+/// Scan the training catalog: base fonts plus vintage variants, sorted by
+/// font key — the same set runtime `load_fonts` produces. Shared by
+/// `run_train` and `load_geo_cache_for_training` so the geo cache is built
+/// for exactly the catalog training renders.
+fn scan_training_catalog(font_dir: &[PathBuf], max_fonts: usize) -> Vec<crate::font_scan::FontEntry> {
     // Runtime load_fonts adds vintage variants from msttcorefonts via
     // ensure_vintage_fonts. Training must include the same set, otherwise
     // catalog_hash (base only) != catalog.bin (base+vintage) and LDA
     // weights are considered stale forever → infinite retrain loop.
-    let font_dirs: Vec<PathBuf> = font_scan::default_font_dirs(&args.font_dir);
+    let font_dirs: Vec<PathBuf> = font_scan::default_font_dirs(font_dir);
 
     let mut catalog = font_scan::scan_fonts(&font_dirs, false);
 
@@ -719,16 +684,73 @@ pub fn run_train(mut args: TrainArgs) {
     }
     catalog.extend(vintage_entries);
 
-
     // Sort by font_key for deterministic font_id assignment, matching
     // FontRegistry::new() ordering so runtime and training agree.
     catalog.sort_by(|a, b| a.font_key().cmp(&b.font_key()));
     eprintln!("  {} font entries found (base {} + vintage {})", catalog.len(), base_count, catalog.len() - base_count);
 
-    if args.max_fonts > 0 && catalog.len() > args.max_fonts {
-        catalog.truncate(args.max_fonts);
-        eprintln!("  Limiting to {} fonts (--max-fonts)", args.max_fonts);
+    if max_fonts > 0 && catalog.len() > max_fonts {
+        catalog.truncate(max_fonts);
+        eprintln!("  Limiting to {} fonts (--max-fonts)", max_fonts);
     }
+    catalog
+}
+
+/// Load (or build) the geo cache for the training catalog (Finding 5).
+/// Used by the classifier retraining fallbacks, which have only a font
+/// directory — no registry and no geo cache — but must still pass a real
+/// provider to `run_train`. The cache file is shared with the runtime, so
+/// this reuses the runtime cache when the catalog hash matches.
+pub fn load_geo_cache_for_training(font_dir: &[PathBuf], quiet: bool) -> crate::geo_cache::GeometryCache {
+    let catalog = scan_training_catalog(font_dir, 0);
+    let registry = crate::font_scan::FontRegistry::new(catalog);
+    let font_cache = crate::font_cache::FontCache::new(crate::font_cache::DEFAULT_CAPACITY);
+    crate::geo_cache::GeometryCache::load_or_build(&registry, &font_cache, quiet)
+}
+
+pub fn run_train(mut args: TrainArgs, geo_cache: &crate::geo_cache::GeometryCache) {
+    // Respect wrapper env first, otherwise cap to avoid OOM on 7.8GB no-swap.
+    // Previous version always forced 4 threads, ignoring RAYON_NUM_THREADS=1,
+    // which caused VSZ bloat when each thread held font data + PNG encoders.
+    let max_threads = std::env::var("RAYON_NUM_THREADS")
+        .ok()
+        .and_then(|s| s.parse::<usize>().ok())
+        .unwrap_or_else(|| {
+            std::thread::available_parallelism()
+                .map(|n| n.get())
+                .unwrap_or(2)
+                .min(4)
+        });
+    let _ = rayon::ThreadPoolBuilder::new()
+        .num_threads(max_threads)
+        .build_global();
+
+    if args.heights.is_empty() {
+        args.heights = vec![features::NORM_H];
+    }
+
+    // In --fast mode: alternating heights, single AA variant
+    let active_heights: Vec<u32> = if args.fast {
+        args.heights.iter().step_by(2).copied().collect()
+    } else {
+        args.heights.clone()
+    };
+    let aa_variants: Vec<AaVariant> = if args.fast {
+        vec![AaVariant::Native]
+    } else {
+        vec![AaVariant::Native, AaVariant::Blur05, AaVariant::Sharpen]
+    };
+
+    eprintln!("Heights: {:?}{}", active_heights, if args.fast { " (fast)" } else { "" });
+    eprintln!("AA variants: {}{}", aa_variants.len(), if args.fast { " (fast)" } else { "" });
+    eprintln!("Epochs: {}", args.epochs);
+    eprintln!("Learning rate: {}", args.lr);
+    eprintln!("Margin: {}", args.margin);
+
+    // ── 1. Scan fonts (base + vintage, matching runtime load_fonts) ──
+    // Shared with load_geo_cache_for_training so the geo cache is built
+    // for exactly the catalog training renders.
+    let catalog = scan_training_catalog(&args.font_dir, args.max_fonts);
 
     // Single-char only — bigrams disabled per 2026-07-19, no bigram glyph building
     let sequences: Vec<Vec<char>> = features::supported_chars().iter().map(|&c| vec![c]).collect();
@@ -838,6 +860,16 @@ pub fn run_train(mut args: TrainArgs) {
 
         catalog.iter().for_each(|fe| {
             let fk = fe.font_key_ref().to_owned();
+            // GPOS pair kern (Finding 5): one provider per font. These
+            // renders are single-char (sequences are unigrams), so the
+            // provider is never consulted — but the render API requires one,
+            // and passing the real provider keeps it correct if bigrams are
+            // ever re-enabled.
+            let kern = geo_cache.kern_provider(&fk);
+            // Nokern variants render with zero kern (Finding 5): the
+            // provider also reports 0 for a nokern font, but disable_kern
+            // is the render API's own switch and must reflect the variant.
+            let disable_kern = fe.variant_tag.contains("nokern");
             let mut local_hashes: Vec<(usize, u64)> = Vec::with_capacity(sequences.len());
             let mut need_render: Vec<usize> = Vec::new();
 
@@ -901,7 +933,7 @@ pub fn run_train(mut args: TrainArgs) {
                             })
                         })
                         .collect();
-                    if let Some(img) = crate::char_render::render_ngram_fresh(&font, seq, &gid_overrides, &prewarm_params, false
+                    if let Some(img) = crate::char_render::render_ngram_fresh(&font, seq, &gid_overrides, &prewarm_params, disable_kern, &kern
                     ) {
                         let hash = crate::glyph_map::hash_image(&img);
                         let path = crate::char_render::ngram_cache_path(seq, hash, &prewarm_params);
@@ -1093,31 +1125,8 @@ pub fn run_train(mut args: TrainArgs) {
     let mut cached_combos: Vec<(u32, usize, Vec<usize>)> = Vec::new();
     let mut incr_combos: Vec<IncrInfo> = Vec::new();
 
-    // Catalog font keys, for deciding which glyph groups are still live.
-    // A glyph group is live iff at least one of its font keys is in the
-    // current catalog. Groups whose fonts have all left the catalog (or been
-    // renamed to a key that joined a different group) can never be rendered,
-    // so counting them as "expected" makes the validation conclude the cache
-    // is short by those groups on every run and re-attempt an incremental
-    // append that adds nothing. (Measured 2026-11-09: 207 such dead groups
-    // across the 106 sequences, all beyond the file's record prefix; every
-    // group with records in the file is live.)
-    let catalog_keys: HashSet<&str> = catalog.iter().map(|fe| fe.font_key_ref()).collect();
-
-    // Current per-seq glyph counts for increment comparison, in sequences order.
-    // Count only LIVE groups (at least one member font key in the current
-    // catalog). Dead groups have no records and can never gain any, so they
-    // must not inflate the expected record count.
+    // Current per-seq glyph counts for increment comparison, in sequences order
     let current_counts_by_seq: Vec<usize> = sequences.iter()
-        .map(|seq| glyph_map.groups.get(seq).map(|gs| gs.iter()
-            .filter(|g| g.font_keys.iter().any(|k| catalog_keys.contains(k.as_str())))
-            .count()).unwrap_or(0))
-        .collect();
-
-    // Total per-seq glyph groups (live + dead), in sequences order. Glyph ids
-    // are dense indices into the map's group list, so the incremental loop's
-    // gid upper bound is the total count, not the live count.
-    let total_groups_by_seq: Vec<usize> = sequences.iter()
         .map(|seq| glyph_map.groups.get(seq).map(|gs| gs.len()).unwrap_or(0))
         .collect();
 
@@ -1158,33 +1167,20 @@ pub fn run_train(mut args: TrainArgs) {
                     .unwrap_or(old_counts);
                 let mut is_cached = true;
                 let mut needs_incr = false;
-                for ((&live_groups, &total_groups), &old_records) in current_counts_by_seq.iter()
-                    .zip(total_groups_by_seq.iter())
-                    .zip(old_counts.iter())
-                {
-                    // current_counts_by_seq holds LIVE glyph GROUP counts; old_counts holds
+                for (&cur_groups, &old_records) in current_counts_by_seq.iter().zip(old_counts.iter()) {
+                    // current_counts_by_seq holds glyph GROUP counts; old_counts holds
                     // RECORD counts from the file (one record per subpixel offset).
                     // Convert groups to expected records so the comparison is like-for-like.
                     // Comparing groups directly to records always concluded the cache
                     // had "shrunk" and forced a full rebuild on every run.
-                    // The shrink check uses TOTAL groups, not live groups: the glyph
-                    // map is append-only, so a file holding more records than the map
-                    // has groups means shrink/corruption. A live group that dies (its
-                    // fonts leave the catalog) after its records were written must NOT
-                    // trigger a full rebuild — its records are still valid training
-                    // data, they just belong to a font no longer in the catalog.
-                    // The incremental check uses LIVE groups only: dead groups have
-                    // no records and can never gain any, so they must not make the
-                    // cache look short.
-                    let live_records = live_groups * SUBPIXEL_OFFSET_COUNT;
-                    let total_records = total_groups * SUBPIXEL_OFFSET_COUNT;
-                    if total_records < old_records {
+                    let cur_records = cur_groups * SUBPIXEL_OFFSET_COUNT;
+                    if cur_records < old_records {
                         is_cached = false;
                         needs_incr = false;
-                        break; // cached file has more records than current groups → shrink/corruption → full rebuild
-                    } else if live_records > old_records {
+                        break; // cached file has more records than current groups need → shrink/corruption → full rebuild
+                    } else if cur_records > old_records {
                         is_cached = false;
-                        needs_incr = true; // cached file is missing records for live groups
+                        needs_incr = true; // cached file is missing records → new groups (or skipped renders)
                     }
                 }
                 if is_cached {
@@ -1271,6 +1267,15 @@ pub fn run_train(mut args: TrainArgs) {
                 };
 
                 let fk = fe.font_key_ref().to_owned();
+                // GPOS pair kern (Finding 5): one provider per font. These
+                // renders are single-char (sequences are unigrams), so the
+                // provider is never consulted — but the render API requires
+                // one, and passing the real provider keeps it correct if
+                // bigrams are ever re-enabled.
+                let kern = geo_cache.kern_provider(&fk);
+                // Nokern variants render with zero kern (Finding 5): see
+                // the prewarm site above.
+                let disable_kern = fe.variant_tag.contains("nokern");
                 let overrides = fe.glyph_overrides.as_deref();
                 let mut samples = Vec::with_capacity(sequences.len() * needed_combos.len());
 
@@ -1319,7 +1324,7 @@ pub fn run_train(mut args: TrainArgs) {
                                         Some(img)
                                     } else {
                                         // Cache miss: render fresh and save to cache
-                                        let img = crate::char_render::render_ngram_fresh(&font, seq, &gid_overrides, &params, false)?;
+                                        let img = crate::char_render::render_ngram_fresh(&font, seq, &gid_overrides, &params, disable_kern, &kern)?;
                                         let path = crate::char_render::ngram_cache_path(seq, hash, &params);
                                         if let Some(parent) = path.parent() {
                                             let _ = std::fs::create_dir_all(parent);
@@ -1329,11 +1334,11 @@ pub fn run_train(mut args: TrainArgs) {
                                     }
                                 })
                                 .or_else(|| {
-                                    crate::char_render::render_ngram_fresh(&font, seq, &gid_overrides, &params, false
+                                    crate::char_render::render_ngram_fresh(&font, seq, &gid_overrides, &params, disable_kern, &kern
                     )
                                 })
                         } else {
-                            crate::char_render::render_ngram_fresh(&font, seq, &gid_overrides, &params, false
+                            crate::char_render::render_ngram_fresh(&font, seq, &gid_overrides, &params, disable_kern, &kern
                     )
                         };
                         let img = match img {
@@ -1438,7 +1443,7 @@ pub fn run_train(mut args: TrainArgs) {
                 // is the source of truth: 12-byte header + 256 bytes per record
                 // (4-byte glyph_id + 63 floats). A glyph render or feature
                 // computation can also fail, so the file may hold fewer than the
-                // expected (live_groups - old_groups) * SUBPIXEL_OFFSET_COUNT new samples. The manifest and
+                // expected (cur_groups - old_groups) * SUBPIXEL_OFFSET_COUNT new samples. The manifest and
                 // cached_combos must record what was actually written, otherwise
                 // the read phase over-reads and hits end of file.
                 let mut actual_counts: Vec<usize> = Vec::with_capacity(n_seqs);
@@ -1460,12 +1465,8 @@ pub fn run_train(mut args: TrainArgs) {
                     // concluded every gid was "old", so the incremental path never ran.)
                     let old_records = actual_counts[si];
                     let old_groups = old_records / SUBPIXEL_OFFSET_COUNT;
-                    // live_groups is the number of groups that must have records;
-                    // total_groups is the gid upper bound (glyph ids are dense
-                    // indices into the map's group list, live + dead).
-                    let live_groups = current_counts_by_seq[si];
-                    let total_groups = total_groups_by_seq[si];
-                    if live_groups <= old_groups { continue; }
+                    let cur_groups = current_counts_by_seq[si];
+                    if cur_groups <= old_groups { continue; }
                     let fpath = combo_path(&feat_dir, seq, info.ht, aa_name);
                     // Open existing file for append. File already has header.
                     let mut file = std::fs::OpenOptions::new()
@@ -1482,15 +1483,8 @@ pub fn run_train(mut args: TrainArgs) {
                             None => continue,
                         };
                         if gid < old_groups { continue; } // old gid, already in file
-                        if gid >= total_groups { continue; } // should not happen
-                        // Render each live group exactly once, via its first
-                        // member that is still in the catalog. The representative
-                        // is not necessarily member 0: a font rename leaves the
-                        // old key at index 0 and the new key later in the list,
-                        // and requiring index 0 would skip the group forever.
-                        let rep_font = glyph_map.fonts_for_glyph(seq, gid).iter()
-                            .find(|k| catalog_keys.contains(k.as_str()));
-                        let Some(rep_font) = rep_font else { continue; };
+                        if gid >= cur_groups { continue; } // should not happen
+                        let rep_font = &glyph_map.fonts_for_glyph(seq, gid)[0];
                         if rep_font != fk { continue; }
 
                         // Render this new glyph for this combo, at every subpixel
@@ -1501,6 +1495,15 @@ pub fn run_train(mut args: TrainArgs) {
                         // would re-trigger incremental and append the same groups again.
                         let font_data = match std::fs::read(&fe.path) { Ok(d)=>d, Err(_)=>continue };
                         let Some(font) = fe.font_ref_with_variations(&font_data) else { continue };
+                        // GPOS pair kern (Finding 5): one provider per font.
+                        // This render is single-char (sequences are unigrams),
+                        // so the provider is never consulted — but the render
+                        // API requires one, and passing the real provider
+                        // keeps it correct if bigrams are ever re-enabled.
+                        let kern = geo_cache.kern_provider(fk);
+                        // Nokern variants render with zero kern (Finding 5):
+                        // see the prewarm site above.
+                        let disable_kern = fe.variant_tag.contains("nokern");
                         let overrides = fe.glyph_overrides.as_deref();
                         let gid_overrides: Vec<Option<unprint_fonts::ab_glyph::GlyphId>> = seq.iter().map(|c| {
                             overrides.and_then(|ovs| ovs.iter().find(|(ch, _)| *ch == *c).map(|(_, g)| unprint_fonts::ab_glyph::GlyphId(*g)))
@@ -1512,7 +1515,7 @@ pub fn run_train(mut args: TrainArgs) {
                                 params.aa = all_aa[info.aa_idx];
                                 params.subpixel_dx = dx;
                                 params.subpixel_dy = dy;
-                                let img = crate::char_render::render_ngram_fresh(&font, seq, &gid_overrides, &params, false);
+                                let img = crate::char_render::render_ngram_fresh(&font, seq, &gid_overrides, &params, disable_kern, &kern);
                                 let img = match img { Some(i)=>i, None=>continue };
                                 let feats = match compute_features(&img, false) { Some(f)=>f, None=>continue };
                                 {
@@ -1529,7 +1532,7 @@ pub fn run_train(mut args: TrainArgs) {
                             }
                         }
                     }
-                    eprintln!("  h{} {} seq {} ({:?}): +{} new samples ({}→{} live groups, {} total)", info.ht, aa_name, si, seq, new_samples, old_groups, live_groups, total_groups);
+                    eprintln!("  h{} {} seq {} ({:?}): +{} new samples ({}→{} groups)", info.ht, aa_name, si, seq, new_samples, old_groups, cur_groups);
                     actual_counts[si] = old_records + new_samples;
                 }
                 // Update manifest for this combo to the ACTUAL new counts
