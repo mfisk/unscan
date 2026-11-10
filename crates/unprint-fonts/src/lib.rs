@@ -1,9 +1,12 @@
+pub mod kern;
 pub mod types;
 pub mod render;
 pub mod shape;
 pub mod scan;
 pub mod geom;
 pub mod verify;
+
+pub use kern::{KernProvider, NoKern};
 
 /// Re-export underlying font crates for use by main crate without direct dep,
 /// preserving single version and allowing hot inlinable functions to stay in main.

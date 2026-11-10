@@ -3,6 +3,7 @@ use std::sync::Arc;
 use ab_glyph::{Font, GlyphId as AbGlyphId, PxScale, ScaleFont, point};
 use image::{GrayImage, Luma};
 
+use crate::kern::KernProvider;
 use crate::types::{AaMode, RenderParams, RenderResult};
 
 #[derive(Clone)]
@@ -107,12 +108,17 @@ fn apply_aa(img: &GrayImage, mode: AaMode) -> GrayImage {
     }
 }
 
-// Internal: render one ngram given already parsed font
+// Internal: render one ngram given already parsed font.
+// `kern` is the REQUIRED GPOS pair-kern provider for this font (Finding 5):
+// the single source of pair kern for the render. There is no fallback to
+// the legacy `kern` table. A caller rendering a nokern variant passes
+// `NoKern`; every other caller passes the font's geo-cache provider.
 fn render_ngram_fresh_inner<F: Font>(
     font: &F,
     seq: &[char],
     gid_overrides: &[Option<AbGlyphId>],
     params: &RenderParams,
+    kern: &dyn KernProvider,
 ) -> Option<GrayImage> {
     if seq.is_empty() {
         return None;
@@ -157,7 +163,12 @@ fn render_ngram_fresh_inner<F: Font>(
     x_pos.push(0.0f32);
     for i in 1..gids.len() {
         let prev_x = x_pos[i - 1];
-        x_pos.push(prev_x + sf.h_advance(gids[i - 1]) + sf.kern(gids[i - 1], gids[i]));
+        // GPOS pair kern (Finding 5): the provider's font-unit kern scaled
+        // to px with the same factor ab_glyph uses for sf.kern()
+        // (scale.x / height_unscaled). Never the legacy kern table.
+        let kern_fu = kern.pair_kern_fu(gids[i - 1].0, gids[i].0);
+        let kern_px = kern_fu as f32 * scale.x / font.height_unscaled();
+        x_pos.push(prev_x + sf.h_advance(gids[i - 1]) + kern_px);
     }
 
     let mut outlines = Vec::with_capacity(gids.len());
@@ -210,11 +221,14 @@ fn render_ngram_fresh_inner<F: Font>(
 
 /// Public batch API - renders many ngrams for one font in a tight loop.
 /// Hot per-character work stays inside this crate for inlining.
+/// `kern` is the REQUIRED GPOS pair-kern provider for this font (Finding 5);
+/// pass `NoKern` for nokern variants.
 pub fn render_ngrams_batch(
     handle: &FontHandle,
     seqs: &[&[char]],
     overrides_per_seq: &[Option<&[(char, u16)]>],
     params: &RenderParams,
+    kern: &dyn KernProvider,
 ) -> Vec<Option<RenderResult>> {
     let font = match ab_glyph::FontRef::try_from_slice(handle.as_slice()) {
         Ok(f) => f,
@@ -228,7 +242,7 @@ pub fn render_ngrams_batch(
             ov.and_then(|map| map.iter().find(|(ch, _)| *ch == *c).map(|(_, gid)| AbGlyphId(*gid)))
         }).collect();
 
-        let img_opt = render_ngram_fresh_inner(&font, seq, &gid_overrides, params);
+        let img_opt = render_ngram_fresh_inner(&font, seq, &gid_overrides, params, kern);
         if let Some(img) = img_opt {
             let h = hash_image(&img);
             out.push(Some(RenderResult::new(img, h)));
@@ -245,10 +259,11 @@ pub fn render_ngram_single(
     seq: &[char],
     overrides: Option<&[(char, u16)]>,
     params: &RenderParams,
+    kern: &dyn KernProvider,
 ) -> Option<RenderResult> {
     let seqs = [seq];
     let ovs = [overrides];
-    let mut batch = render_ngrams_batch(handle, &seqs, &ovs, params);
+    let mut batch = render_ngrams_batch(handle, &seqs, &ovs, params, kern);
     batch.pop().flatten()
 }
 
@@ -258,10 +273,11 @@ pub fn render_ngram_from_bytes(
     seq: &[char],
     gid_overrides_u16: &[Option<u16>],
     params: &RenderParams,
+    kern: &dyn KernProvider,
 ) -> Option<GrayImage> {
     let font = ab_glyph::FontRef::try_from_slice(font_data).ok()?;
     let gid_overrides: Vec<Option<AbGlyphId>> = gid_overrides_u16.iter().map(|o| o.map(AbGlyphId)).collect();
-    render_ngram_fresh_inner(&font, seq, &gid_overrides, params)
+    render_ngram_fresh_inner(&font, seq, &gid_overrides, params, kern)
 }
 
 pub fn render_glyph_at_ink_height(

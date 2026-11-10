@@ -1744,6 +1744,13 @@ fn build_observation_table(
     _glyph_map: &NgramGlyphMap,
     crop_dir_name: &str,
 ) -> String {
+    // NOTE (Finding 5): the reference renders in this table pass NoKern.
+    // This is display-only image generation, and the report has no geo
+    // cache available (the generator is not modified to thread one). The
+    // renders are single-glyph or short-sequence reference images; the
+    // audit scores themselves are unaffected. Multi-char reference images
+    // therefore show the unkerned form. This is explicit, not a silent
+    // fallback to the legacy kern table.
     // Build fallback geo map from GT's own observations, on GT's own
     // segmentation. When the winner is ligature (contains ﬃ) and the GT
     // font lacks ligature support, GT's per_char_geo is None on the winner
@@ -1811,7 +1818,7 @@ fn build_observation_table(
                             .and_then(|ovs| ovs.iter().find(|(gc, _)| *gc == *c).map(|(_, g)| unprint_fonts::ab_glyph::GlyphId(*g)))
                     }).collect();
                     let _disable_kern = fe.variant_tag.contains("nokern");
-                    if let Some(img) = char_render::render_ngram_fresh(&font, &render_seq, &gid_overrides, &char_render::RenderParams::default(), _disable_kern) {
+                    if let Some(img) = char_render::render_ngram_fresh(&font, &render_seq, &gid_overrides, &char_render::RenderParams::default(), _disable_kern, &unprint_fonts::NoKern) {
                         correct_mid = ink_midpoint(&img);
                         correct_ref_uri = Some(img_to_b64_uri(&img));
                     }
@@ -1849,7 +1856,7 @@ fn build_observation_table(
                                 .and_then(|ovs| ovs.iter().find(|(gc, _)| *gc == *c).map(|(_, g)| unprint_fonts::ab_glyph::GlyphId(*g)))
                         }).collect();
                         let _disable_kern = fe.variant_tag.contains("nokern");
-                    if let Some(img) = char_render::render_ngram_fresh(&font, &render_seq, &gid_overrides, &char_render::RenderParams::default(), _disable_kern) {
+                    if let Some(img) = char_render::render_ngram_fresh(&font, &render_seq, &gid_overrides, &char_render::RenderParams::default(), _disable_kern, &unprint_fonts::NoKern) {
                             chosen_mid = ink_midpoint(&img);
                             chosen_ref_uri = Some(img_to_b64_uri(&img));
                         }
@@ -1969,7 +1976,9 @@ fn build_observation_table(
                                                 .and_then(|ovs| ovs.iter().find(|(gc, _)| *gc == *c).map(|(_, g)| unprint_fonts::ab_glyph::GlyphId(*g)))
                                         }).collect();
                                         let _disable_kern = fe.variant_tag.contains("nokern");
-                                        if let Some(img) = char_render::render_ngram_fresh(&font, &[*comp], &gid_overrides, &char_render::RenderParams::default(), _disable_kern) {
+                                        // Single-glyph render: kerning is undefined for one
+                                        // glyph (no pair), so NoKern is never consulted.
+                                        if let Some(img) = char_render::render_ngram_fresh(&font, &[*comp], &gid_overrides, &char_render::RenderParams::default(), _disable_kern, &unprint_fonts::NoKern) {
                                             comp_uri = Some(img_to_b64_uri(&img));
                                         }
                                     }

@@ -9,6 +9,7 @@
 // overlay preview and the final output.
 
 use unprint_fonts::ab_glyph::{point, Font, FontRef, GlyphId, PxScale, ScaleFont};
+use unprint_fonts::KernProvider;
 use image::{GrayImage, Luma};
 
 /// Reference height used for measuring advance widths before rescaling.
@@ -355,6 +356,10 @@ pub fn width_matched_em_px_shaped(
 /// If `canvas_w` is None, width is auto-sized from total advance + padding.
 ///
 /// Returns the rendered canvas (white background, black ink).
+/// `kern` is the REQUIRED GPOS pair-kern provider for this font (Finding 5):
+/// the single source of pair kern for the render. There is no fallback to
+/// the legacy `kern` table. This function has no variant info, so a caller
+/// rendering a nokern variant passes `NoKern`.
 pub fn render_word_ab_glyph(
     font: &FontRef,
     text: &str,
@@ -362,6 +367,7 @@ pub fn render_word_ab_glyph(
     canvas_w: Option<u32>,
     canvas_h: Option<u32>,
     resolve: impl Fn(&FontRef, char) -> GlyphId,
+    kern: &dyn KernProvider,
 ) -> Option<GrayImage> {
     if text.is_empty() || em_px < 1.0 {
         return None;
@@ -385,7 +391,9 @@ pub fn render_word_ab_glyph(
     for c in text.chars() {
         let gid = resolve(font, c);
         if let Some(p) = prev {
-            cx += sf.kern(p, gid);
+            // GPOS pair kern (Finding 5): provider font-unit kern scaled
+            // to px with the same factor ab_glyph uses for sf.kern().
+            cx += kern.pair_kern_fu(p.0, gid.0) as f32 * scale.x / font.height_unscaled();
         }
         let glyph = gid.with_scale_and_position(scale, point(cx, baseline));
         if let Some(og) = font.outline_glyph(glyph) {
@@ -411,7 +419,9 @@ pub fn render_word_ab_glyph(
     for c in text.chars() {
         let gid = resolve(font, c);
         if let Some(p) = prev {
-            cx += sf.kern(p, gid);
+            // GPOS pair kern (Finding 5): provider font-unit kern scaled
+            // to px with the same factor ab_glyph uses for sf.kern().
+            cx += kern.pair_kern_fu(p.0, gid.0) as f32 * scale.x / font.height_unscaled();
         }
         let glyph = gid.with_scale_and_position(scale, point(cx, baseline));
         if let Some(og) = font.outline_glyph(glyph) {

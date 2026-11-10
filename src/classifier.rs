@@ -3380,16 +3380,22 @@ where
 }
 
 fn train_lda(font_dir: &[std::path::PathBuf], render_params: &crate::char_render::RenderParams, output: &std::path::Path) {
+    // GPOS pair kern (Finding 5): this retraining fallback has only a font
+    // directory, so it loads the geo cache for the training catalog itself
+    // and passes it to run_train. No render path falls back to legacy kern.
+    let geo_cache = crate::train::load_geo_cache_for_training(font_dir, false);
     crate::train::run_train(crate::train::TrainArgs {
         output: output.to_path_buf(),
         font_dir: font_dir.to_vec(),
         render_params: render_params.clone(),
         lda: true,
         ..crate::train::TrainArgs::default()
-    });
+    }, &geo_cache);
 }
 
 fn train_fisher(font_dir: &[std::path::PathBuf], render_params: &crate::char_render::RenderParams, output: &std::path::Path) {
+    // GPOS pair kern (Finding 5): see train_lda.
+    let geo_cache = crate::train::load_geo_cache_for_training(font_dir, false);
     crate::train::run_train(crate::train::TrainArgs {
         output: output.to_path_buf(),
         font_dir: font_dir.to_vec(),
@@ -3397,10 +3403,12 @@ fn train_fisher(font_dir: &[std::path::PathBuf], render_params: &crate::char_ren
         fisher: true,
         lda: false,
         ..crate::train::TrainArgs::default()
-    });
+    }, &geo_cache);
 }
 
 fn train_mahalanobis(font_dir: &[std::path::PathBuf], render_params: &crate::char_render::RenderParams, output: &std::path::Path) {
+    // GPOS pair kern (Finding 5): see train_lda.
+    let geo_cache = crate::train::load_geo_cache_for_training(font_dir, false);
     crate::train::run_train(crate::train::TrainArgs {
         output: output.to_path_buf(),
         font_dir: font_dir.to_vec(),
@@ -3408,20 +3416,24 @@ fn train_mahalanobis(font_dir: &[std::path::PathBuf], render_params: &crate::cha
         mahalanobis: true,
         lda: false,
         ..crate::train::TrainArgs::default()
-    });
+    }, &geo_cache);
 }
 
 fn train_triplet(font_dir: &[std::path::PathBuf], render_params: &crate::char_render::RenderParams, output: &std::path::Path) {
+    // GPOS pair kern (Finding 5): see train_lda.
+    let geo_cache = crate::train::load_geo_cache_for_training(font_dir, false);
     crate::train::run_train(crate::train::TrainArgs {
         output: output.to_path_buf(),
         font_dir: font_dir.to_vec(),
         render_params: render_params.clone(),
         lda: false,
         ..crate::train::TrainArgs::default()
-    });
+    }, &geo_cache);
 }
 
 fn train_mlp(font_dir: &[std::path::PathBuf], render_params: &crate::char_render::RenderParams, output: &std::path::Path) {
+    // GPOS pair kern (Finding 5): see train_lda.
+    let geo_cache = crate::train::load_geo_cache_for_training(font_dir, false);
     crate::train::run_train(crate::train::TrainArgs {
         output: output.to_path_buf(),
         font_dir: font_dir.to_vec(),
@@ -3429,7 +3441,7 @@ fn train_mlp(font_dir: &[std::path::PathBuf], render_params: &crate::char_render
         mlp: true,
         lda: false,
         ..crate::train::TrainArgs::default()
-    });
+    }, &geo_cache);
 }
 
 /// Build a classifier by name.
@@ -3491,13 +3503,15 @@ pub fn build_classifier(
                     Err(e) => {
                         eprintln!("Glyph map stale or missing ({e}), retraining...");
                         let lda_path = default_lda_weights_path();
+                        // GPOS pair kern (Finding 5): see train_lda.
+                        let geo_cache = crate::train::load_geo_cache_for_training(font_dirs, false);
                         crate::train::run_train(crate::train::TrainArgs {
                             output: lda_path,
                             font_dir: font_dirs.to_vec(),
                             render_params: render_params.clone(),
                             lda: true,
                             ..crate::train::TrainArgs::default()
-                        });
+                        }, &geo_cache);
                         crate::glyph_map::NgramGlyphMap::load(&gmap_path)
                             .unwrap_or_else(|e2| {
                                 eprintln!("Retraining did not produce a valid glyph map ({e2})");
