@@ -44,15 +44,6 @@ pub struct PerCharGeo {
     pub pred_cy_rel: f64,
     pub v_err: f64,
     pub v_ll: f64,
-    /// Per-word scale (px per font unit) used to place the predictions:
-    /// center-span scale, or the height-ratio fallback when the span is
-    /// degenerate. Same for every char in the word. Recorded in the audit
-    /// (Finding 10) so per-line geometry can be re-derived from audit.json.
-    pub scale: f64,
-    /// Observed ink width of this character in word-image pixels
-    /// (frac_right - frac_left from the ink bounds). Recorded in the audit
-    /// (Finding 10).
-    pub ink_width: f64,
 }
 
 // First-principles expected error from sampling an infinitely precise vector font.
@@ -421,8 +412,6 @@ fn per_char_geo_cached_with_threshold(
                 pred_cy_rel,
                 v_err,
                 v_ll,
-                scale,
-                ink_width: bounds.width,
             });
             prev_obs_cx = Some(obs_cx);
             prev_pred_cx = Some(pred_cx);
@@ -593,8 +582,6 @@ fn per_char_geo_shaped_with_threshold(
                 pred_cy_rel,
                 v_err,
                 v_ll,
-                scale,
-                ink_width: bounds.width,
             });
         }
     }

@@ -421,18 +421,6 @@ fn build_audit_entry(
             gt_geo_v_err: rp.gt_geo_v_err.get(&d.crop_index).copied(),
             chosen_geo_ll: match (ch_h_ll, ch_v_ll) { (Some(h), Some(v)) => Some(h+v), (Some(h), None) => Some(h), (None, Some(v)) => Some(v), _ => None },
             gt_geo_ll: match (gt_h_ll, gt_v_ll) { (Some(h), Some(v)) => Some(h+v), (Some(h), None) => Some(h), (None, Some(v)) => Some(v), _ => None },
-            chosen_obs_cx: rp.chosen_obs_cx.get(&d.crop_index).copied(),
-            chosen_pred_cx: rp.chosen_pred_cx.get(&d.crop_index).copied(),
-            chosen_obs_pitch: rp.chosen_obs_pitch.get(&d.crop_index).copied(),
-            chosen_pred_pitch: rp.chosen_pred_pitch.get(&d.crop_index).copied(),
-            chosen_geo_scale: rp.chosen_geo_scale.get(&d.crop_index).copied(),
-            chosen_ink_width: rp.chosen_ink_width.get(&d.crop_index).copied(),
-            gt_obs_cx: rp.gt_obs_cx.get(&d.crop_index).copied(),
-            gt_pred_cx: rp.gt_pred_cx.get(&d.crop_index).copied(),
-            gt_obs_pitch: rp.gt_obs_pitch.get(&d.crop_index).copied(),
-            gt_pred_pitch: rp.gt_pred_pitch.get(&d.crop_index).copied(),
-            gt_geo_scale: rp.gt_geo_scale.get(&d.crop_index).copied(),
-            gt_ink_width: rp.gt_ink_width.get(&d.crop_index).copied(),
         }
     };
     // Use corrected text if OCR corrections were applied
@@ -1289,6 +1277,7 @@ fn run(args: &cli::Args, classifier: &mut dyn classifier::Classifier) -> Result<
                 page_idx,
                 &compare_path,
                 &font_cache,
+                &geo_cache,
             ) {
             }
         }
@@ -1309,7 +1298,7 @@ fn run(args: &cli::Args, classifier: &mut dyn classifier::Classifier) -> Result<
     // Optional smoothing pass: unify per-word font sizes within same-font runs.
     if args.smooth {
         for page in all_pages.iter_mut() {
-            smooth::smooth_font_sizes(&mut page.text_regions, page.dpi as f32, &font_cache);
+            smooth::smooth_font_sizes(&mut page.text_regions, page.dpi as f32, &font_cache, &geo_cache);
         }
     }
 
