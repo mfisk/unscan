@@ -35,14 +35,9 @@ fn ngram_feat_dir(seq_len: usize) -> PathBuf {
 /// params and grouping by content hash.  Analogous to the unigram GlyphMap
 /// build in train.rs.
 /// Add bigram entries to an existing glyph map and write the combined result.
-/// Build the bigram glyph map (hash -> font groups) for the ngram model.
-/// `geo_cache` is REQUIRED (Finding 5): bigram renders are multi-char, so
-/// they need the GPOS pair kern from the cache. The caller passes the
-/// runtime geo cache; there is no legacy-kern fallback.
 pub fn build_ngram_glyph_map(
     catalog: &[FontEntry],
     glyph_map: &mut NgramGlyphMap,
-    geo_cache: &crate::geo_cache::GeometryCache,
 ) -> () {
     let bigrams = features::supported_sequences(2);
     eprintln!("\nBuilding bigram glyph map ({} fonts × {} bigrams)...",
@@ -71,10 +66,6 @@ pub fn build_ngram_glyph_map(
         };
         let overrides = fe.glyph_overrides.as_deref();
         let fk = fe.font_key();
-        // GPOS pair kern (Finding 5): one provider per font, built from the
-        // geo cache. Bigrams are multi-char, so kern matters here.
-        let kern = geo_cache.kern_provider(&fk);
-        let disable_kern = fe.variant_tag.contains("nokern");
         let params = crate::char_render::RenderParams::default();
 
         let mut hashes = Vec::with_capacity(bigrams.len());
@@ -92,11 +83,36 @@ pub fn build_ngram_glyph_map(
                 overrides.and_then(|ovs| ovs.iter().find(|(ch, _)| *ch == *c).map(|(_, g)| unprint_fonts::ab_glyph::GlyphId(*g)))
             }).collect();
 
-            if let Some(img) = crate::char_render::render_ngram_fresh(&font, seq, &gid_overrides, &params, disable_kern, &kern
+            if let Some(img) = crate::char_render::render_ngram_fresh(&font, seq, &gid_overrides, &params, false
                     ) {
-                // No-PNG-cache training (train-nocache-pngs): hash the
-                // in-memory render for the glyph map; do not save the PNG.
                 let hash = crate::glyph_map::hash_image(&img);
+                // Write image cache — always atomic; heals partial files from killed runs.
+                // Must use explicit encoder: `img.save(.tmp)` fails when extension is `.tmp`.
+                let path = crate::char_render::ngram_cache_path(seq, hash, &params);
+                let tmp = crate::atomic_file::tmp_for(&path);
+                if let Some(parent) = tmp.parent() {
+                    let _ = std::fs::create_dir_all(parent);
+                }
+                let ok = (|| -> std::io::Result<()> {
+                    use std::fs::File;
+                    use std::io::BufWriter;
+                    use image::codecs::png::PngEncoder;
+                    use image::ImageEncoder;
+                    let f = File::create(&tmp)?;
+                    let mut w = BufWriter::new(f);
+                    let enc = PngEncoder::new(&mut w);
+                    enc.write_image(img.as_raw(), img.width(), img.height(), image::ExtendedColorType::L8)
+                        .map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e))?;
+                    use std::io::Write;
+                    w.flush()?;
+                    Ok(())
+                })()
+                .is_ok();
+                if ok {
+                    let _ = std::fs::rename(&tmp, &path);
+                } else {
+                    let _ = std::fs::remove_file(&tmp);
+                }
                 hashes.push((seq.to_vec(), hash, fk.clone()));
             }
         }
@@ -138,15 +154,10 @@ pub struct BigramSample {
 
 /// Generate bigram training features for all (font, bigram, height, aa) combos.
 /// Writes per-bigram feature files under the bigram feature directory.
-/// Generate bigram training data (features per bigram per font).
-/// `geo_cache` is REQUIRED (Finding 5): bigram renders are multi-char, so
-/// they need the GPOS pair kern from the cache. The caller passes the
-/// runtime geo cache; there is no legacy-kern fallback.
 pub fn generate_ngram_training_data(
     catalog: &[FontEntry],
     bgmap: &NgramGlyphMap,
     render_params: &crate::char_render::RenderParams,
-    geo_cache: &crate::geo_cache::GeometryCache,
 ) {
     let bigrams = features::supported_sequences(2);
     let all_aa = features::AaVariant::all();
@@ -199,10 +210,6 @@ pub fn generate_ngram_training_data(
             };
             let overrides = fe.glyph_overrides.as_deref();
             let fk = fe.font_key();
-            // GPOS pair kern (Finding 5): one provider per font, built from
-            // the geo cache. Bigrams are multi-char, so kern matters here.
-            let kern = geo_cache.kern_provider(&fk);
-            let disable_kern = fe.variant_tag.contains("nokern");
             let mut samples = Vec::new();
 
             for seq in bigrams {
@@ -235,7 +242,7 @@ pub fn generate_ngram_training_data(
                         params.aa = aa;
 
                         let img = match crate::char_render::render_ngram_fresh(
-                            &font, &[c1, c2], &gid_overrides, &params, disable_kern, &kern,
+                            &font, &[c1, c2], &gid_overrides, &params, false,
                         ) {
                             Some(img) => img,
                             None => continue,
@@ -671,6 +678,26 @@ fn power_iteration_eigenvectors(mat: &[f64], n: usize, k: usize) -> Vec<f64> {
 // Inference: sliding window ngram scoring
 // ---------------------------------------------------------------------------
 
+/// Score a font against a line's crops using sliding-window bigram
+/// classification, falling back to unigram when a bigram classifier doesn't
+/// exist for the pair.
+///
+/// `bigram_crops` are the combined pair images extracted from word-image
+/// Build per-character scoring windows for font identification.
+///
+/// Returns `(windows, position_map)` where `windows` are single characters
+/// and `position_map[i] = (seg_idx, char_pos)` for window `i`.
+
+pub fn build_scoring_windows<'a>(
+    word_segs: &'a [crate::segment::WordSeg],
+    _classifier: &'a dyn crate::classifier::Classifier,
+    _glyph_map: &'a crate::glyph_map::NgramGlyphMap,
+    crop_store: &'a mut Vec<GrayImage>,
+) -> (Vec<crate::font_match::ScoringWindow<'a>>, Vec<(usize, usize)>) {
+    let (windows, pos, _wib) = build_scoring_windows_with_geo(word_segs, crop_store);
+    (windows, pos)
+}
+
 /// Build scoring windows plus geometry measurements in a single scan per character.
 /// Trim to ink is called exactly once per character via `char_crop_and_metrics`,
 /// which does seam handling (whitening) in scan-crop creation and returns center
@@ -693,7 +720,7 @@ pub fn build_scoring_windows_with_geo<'a>(
     // Per-word geo, same order as word_segs, each inner Vec in char order
     let mut wib: Vec<WordGeoMeasurement> = Vec::with_capacity(word_segs.len());
     for _ in 0..word_segs.len() {
-        wib.push(WordGeoMeasurement { chars: std::sync::Arc::new(Vec::new()) });
+        wib.push(WordGeoMeasurement { chars: Vec::new() });
     }
 
     for (seg_idx, seg) in word_segs.iter().enumerate() {
@@ -751,7 +778,7 @@ pub fn build_scoring_windows_with_geo<'a>(
                 char_bounds.push(cb);
             }
         }
-        wib[seg_idx].chars = std::sync::Arc::new(char_bounds);
+        wib[seg_idx].chars = char_bounds;
     }
 
     crop_store.extend(temp_crops);

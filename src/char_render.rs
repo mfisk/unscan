@@ -1,7 +1,7 @@
-//! Unified n-gram rendering module.
+//! Unified n-gram rendering + caching module.
 //!
 //! All callers that need rendered font glyph images go through
-//! `render_ngram()` or the cache-free `render_ngram_fresh()`.
+//! `render_ngram()` or its convenience wrapper `render_ngram_default()`.
 //! Single characters are single-element sequences: `&['a']`.
 //!
 //! Pipeline (always this order):
@@ -9,17 +9,14 @@
 //! 2. `normalize_to_ink_bounds()` — find ink, crop with 1px pad, Lanczos3 resize to `height`
 //! 3. Apply AA variant
 //! 4. If `binarize_threshold` is Some(t): binarize
-//! 5. Hash the image; the hash is the glyph_id key in the glyph map.
+//! 5. Hash → cache as PNG under `~/.cache/unprint/chars/`
 //!
-//! Renders are always computed fresh in memory. Nothing in this module
-//! writes glyph PNGs. The hash-addressed PNG *load* (`load_cached_ngram`)
-//! remains only for `ZnccClassifier`, which reads pre-existing cached
-//! renders; no code path populates that cache anymore.
+//! Cache path: `chars/h{H}_s{S}/{aa}_{binarize}/{seq_dir}/{hash}.png`
+//! where `seq_dir` is `U+0061` for a single char or `U+0066_U+0069` for a bigram.
 
 use std::path::{Path, PathBuf};
 
 use unprint_fonts::ab_glyph::{Font, GlyphId, PxScale, ScaleFont, point};
-use unprint_fonts::KernProvider;
 use image::{GrayImage, Luma};
 
 /// Atomic PNG save: write to `.tmp` sibling then rename, so a SIGKILL never leaves a partial file.
@@ -136,11 +133,6 @@ pub fn ngram_cache_path(
 
 /// Load a cached ngram image by its content hash.
 /// Returns `None` if no cached image exists for this hash.
-///
-/// NOTE: nothing in the codebase writes these PNGs anymore (the glyph PNG
-/// cache was removed Nov 15, 2026). This load path remains only for
-/// `ZnccClassifier`, which reads pre-existing cached renders; on a cache
-/// without them it finds nothing.
 pub fn load_cached_ngram(
     seq: &[char],
     img_hash: u64,
@@ -155,7 +147,7 @@ pub fn load_cached_ngram(
 }
 
 /// Render an n-gram (one or more adjacent characters) through the canonical
-/// pipeline, always fresh in memory (no image cache).
+/// pipeline, with hash-addressed caching.
 ///
 /// All glyphs are rendered at the same em-size — the tallest glyph fills
 /// `params.height` and shorter glyphs appear proportionally smaller.
@@ -165,21 +157,18 @@ pub fn load_cached_ngram(
 /// Returns `None` if any glyph in the sequence is missing from the font.
 /// Returns `Some((hash, image))` — the content hash uniquely identifies
 /// the rendered image and is used as the glyph_id key.
-/// Render an n-gram for a font entry.
+/// Render an n-gram for a font entry, with full cache integration.
 ///
-/// Loads font bytes from the shared FontCache (F36), renders fresh, and
-/// registers the hash in the glyph map. Nothing is written to disk.
+/// 1. Check glyph_map for a known hash → try image cache → return on hit.
+/// 2. On miss: load font from fe.path, render, update glyph_map and image cache.
 ///
 /// The caller owns glyph-map publication; this function never writes the
 /// process-wide glyph-map cache implicitly.
-/// `kern` is the REQUIRED GPOS pair-kern provider for this font (Finding 5).
 pub fn render_ngram(
     fe: &crate::font_scan::FontEntry,
-    font_cache: &crate::font_cache::FontCache,
     seq: &[char],
     glyph_map: &mut glyph_map::NgramGlyphMap,
     params: &RenderParams,
-    kern: &dyn KernProvider,
 ) -> Option<(u64, GrayImage)> {
     let fk = fe.font_key_ref();
 
@@ -194,10 +183,15 @@ pub fn render_ngram(
     let collapsed = normalize_seq_for_font(fe, seq);
     let seq = &collapsed[..];
 
-    // Always render fresh: load font bytes from the shared FontCache (F36),
-    // render, register the hash in the glyph map. No image cache is read
-    // or written.
-    let font_data = font_cache.load(&fe.path).ok()?;
+    // Cache read: check glyph_map for known hash, then image cache
+    if let Some(hash) = glyph_map.hash_for_font(seq, &fk) {
+        if let Some(img) = load_cached_ngram(seq, hash, params) {
+            return Some((hash, img));
+        }
+    }
+
+    // Cache miss: load font, render, update caches
+    let font_data = std::fs::read(&fe.path).ok()?;
     let mut font = unprint_fonts::ab_glyph::FontRef::try_from_slice(&font_data).ok()?;
     fe.apply_variations(&mut font);
     let gid_overrides: Vec<Option<GlyphId>> = seq.iter().map(|c| {
@@ -206,11 +200,16 @@ pub fn render_ngram(
     }).collect();
 
     let disable_kern = fe.variant_tag.contains("nokern");
-    let img = render_ngram_fresh(&font, seq, &gid_overrides, params, disable_kern, kern)?;
+    let img = render_ngram_fresh(&font, seq, &gid_overrides, params, disable_kern)?;
     let img_hash = glyph_map::hash_image(&img);
 
     // Update glyph_map
     glyph_map.register(seq, &fk, img_hash);
+
+    // Write image cache — always atomic, and always overwrite on miss path
+    // to heal any previously partial/corrupt file (exists check alone would keep corrupt file).
+    let path = ngram_cache_path(seq, img_hash, params);
+    let _ = atomic_save_png(&img, &path);
 
     Some((img_hash, img))
 }
@@ -240,17 +239,12 @@ pub fn normalize_seq_for_lig_mask(seq: &[char], allowed: u8) -> Vec<char> {
 }
 
 /// The actual rendering pipeline — no caching.
-/// `kern` is the REQUIRED GPOS pair-kern provider for this font (Finding 5):
-/// the single source of pair kern for the render. There is no fallback to
-/// the legacy `kern` table. When `disable_kern` is set (nokern variants)
-/// the kern is 0 and the provider is not consulted.
 pub fn render_ngram_fresh<F: Font>(
     font: &F,
     seq: &[char],
     gid_overrides: &[Option<GlyphId>],
     params: &RenderParams,
     disable_kern: bool,
-    kern: &dyn KernProvider,
 ) -> Option<GrayImage> {
     if seq.is_empty() {
         return None;
@@ -301,15 +295,8 @@ pub fn render_ngram_fresh<F: Font>(
     x_pos.push(0.0f32);
     for i in 1..gids.len() {
         let prev_x = x_pos[i - 1];
-        // GPOS pair kern (Finding 5): the provider's font-unit kern scaled
-        // to px with the same factor ab_glyph uses for sf.kern()
-        // (scale.x / height_unscaled). Never the legacy kern table.
-        let kern_px = if disable_kern {
-            0.0
-        } else {
-            kern.pair_kern_fu(gids[i - 1].0, gids[i].0) as f32 * scale.x / font.height_unscaled()
-        };
-        x_pos.push(prev_x + sf.h_advance(gids[i - 1]) + kern_px);
+        let kern = if disable_kern { 0.0 } else { sf.kern(gids[i - 1], gids[i]) };
+        x_pos.push(prev_x + sf.h_advance(gids[i - 1]) + kern);
     }
 
     // Outline all glyphs and compute combined bounding box
@@ -475,10 +462,7 @@ pub fn render_ref_chars(json_str: &str) {
         if font.glyph_id(c).0 == 0 {
             continue;
         }
-        // Single-glyph renders: kerning is undefined for one glyph (no
-        // pair), so the provider is never consulted. NoKern is explicit
-        // here, not a fallback — this dump has no geo cache available.
-        if let Some(img) = render_ngram_fresh(&font, &[c], &[None], &RenderParams::default(), false, &unprint_fonts::NoKern) {
+        if let Some(img) = render_ngram_fresh(&font, &[c], &[None], &RenderParams::default(), false) {
             let fname = format!("U+{:04X}.png", c as u32);
             let final_path = out.join(&fname);
             let _ = atomic_save_png(&img, &final_path);

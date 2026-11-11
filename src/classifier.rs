@@ -2268,16 +2268,6 @@ impl LdaClassifier {
             }
             if font_indices.len() < ctx.min_fonts.max(2) { skipped += 1; continue; }
 
-            // Deterministic class order: std HashMap iteration is
-            // randomized per instance, so iterating font_indices /
-            // class_means directly makes the fit — and the weights file —
-            // differ between runs on identical inputs (float accumulation
-            // order, Jacobi eigenvector signs, RNG consumption order).
-            // Sort the glyph ids once and iterate that everywhere order
-            // matters, so training is reproducible.
-            let mut sorted_fids: Vec<u32> = font_indices.keys().copied().collect();
-            sorted_fids.sort_unstable();
-
             let n = samples.len();
 
             // Class means and global mean
@@ -2299,8 +2289,7 @@ impl LdaClassifier {
 
             // Within-class scatter Sw
             let mut sw = vec![0.0f64; FEAT_LEN * FEAT_LEN];
-            for &fid in &sorted_fids {
-                let indices = &font_indices[&fid];
+            for (&fid, indices) in &font_indices {
                 let cm = &class_means[&fid];
                 for &i in indices {
                     for a in 0..FEAT_LEN {
@@ -2349,8 +2338,7 @@ impl LdaClassifier {
             }
 
             // Whiten class means
-            let mut centroid_fids: Vec<u32> = class_means.keys().copied().collect();
-            centroid_fids.sort_unstable();
+            let centroid_fids: Vec<u32> = class_means.keys().copied().collect();
             let whitened_means: Vec<Vec<f64>> = centroid_fids.iter().map(|fid| {
                 let cm = &class_means[fid];
                 let mut centered = vec![0.0f64; FEAT_LEN];
@@ -2404,8 +2392,7 @@ impl LdaClassifier {
             let target_dist = 0.03f64;
             let mut within_dists: Vec<f64> = Vec::new();
             let mut rng_cal = SmallRng::seed_from_u64(si as u64 + 9999);
-            for &fid in &sorted_fids {
-                let indices = &font_indices[&fid];
+            for (&_fid, indices) in &font_indices {
                 if indices.len() < 2 { continue; }
                 let npairs = 5.min(indices.len() * (indices.len() - 1) / 2);
                 for _ in 0..npairs {
@@ -2544,10 +2531,7 @@ impl LdaClassifier {
         let mut model = NgramModel::new(ctx.catalog_hash);
         for (seq, actual_dim, proj, sigma, class_means, d95) in &lda_chars {
             let mut centroids: Vec<(u32, Vec<f32>)> = Vec::with_capacity(class_means.len());
-            let mut write_fids: Vec<u32> = class_means.keys().copied().collect();
-            write_fids.sort_unstable();
-            for &fid in &write_fids {
-                let mean = &class_means[&fid];
+            for (&fid, mean) in class_means {
                 let mut embedded = vec![0.0f32; *actual_dim];
                 for d in 0..*actual_dim {
                     for j in 0..FEAT_LEN {
@@ -3396,22 +3380,16 @@ where
 }
 
 fn train_lda(font_dir: &[std::path::PathBuf], render_params: &crate::char_render::RenderParams, output: &std::path::Path) {
-    // GPOS pair kern (Finding 5): this retraining fallback has only a font
-    // directory, so it loads the geo cache for the training catalog itself
-    // and passes it to run_train. No render path falls back to legacy kern.
-    let geo_cache = crate::train::load_geo_cache_for_training(font_dir, false);
     crate::train::run_train(crate::train::TrainArgs {
         output: output.to_path_buf(),
         font_dir: font_dir.to_vec(),
         render_params: render_params.clone(),
         lda: true,
         ..crate::train::TrainArgs::default()
-    }, &geo_cache);
+    });
 }
 
 fn train_fisher(font_dir: &[std::path::PathBuf], render_params: &crate::char_render::RenderParams, output: &std::path::Path) {
-    // GPOS pair kern (Finding 5): see train_lda.
-    let geo_cache = crate::train::load_geo_cache_for_training(font_dir, false);
     crate::train::run_train(crate::train::TrainArgs {
         output: output.to_path_buf(),
         font_dir: font_dir.to_vec(),
@@ -3419,12 +3397,10 @@ fn train_fisher(font_dir: &[std::path::PathBuf], render_params: &crate::char_ren
         fisher: true,
         lda: false,
         ..crate::train::TrainArgs::default()
-    }, &geo_cache);
+    });
 }
 
 fn train_mahalanobis(font_dir: &[std::path::PathBuf], render_params: &crate::char_render::RenderParams, output: &std::path::Path) {
-    // GPOS pair kern (Finding 5): see train_lda.
-    let geo_cache = crate::train::load_geo_cache_for_training(font_dir, false);
     crate::train::run_train(crate::train::TrainArgs {
         output: output.to_path_buf(),
         font_dir: font_dir.to_vec(),
@@ -3432,24 +3408,20 @@ fn train_mahalanobis(font_dir: &[std::path::PathBuf], render_params: &crate::cha
         mahalanobis: true,
         lda: false,
         ..crate::train::TrainArgs::default()
-    }, &geo_cache);
+    });
 }
 
 fn train_triplet(font_dir: &[std::path::PathBuf], render_params: &crate::char_render::RenderParams, output: &std::path::Path) {
-    // GPOS pair kern (Finding 5): see train_lda.
-    let geo_cache = crate::train::load_geo_cache_for_training(font_dir, false);
     crate::train::run_train(crate::train::TrainArgs {
         output: output.to_path_buf(),
         font_dir: font_dir.to_vec(),
         render_params: render_params.clone(),
         lda: false,
         ..crate::train::TrainArgs::default()
-    }, &geo_cache);
+    });
 }
 
 fn train_mlp(font_dir: &[std::path::PathBuf], render_params: &crate::char_render::RenderParams, output: &std::path::Path) {
-    // GPOS pair kern (Finding 5): see train_lda.
-    let geo_cache = crate::train::load_geo_cache_for_training(font_dir, false);
     crate::train::run_train(crate::train::TrainArgs {
         output: output.to_path_buf(),
         font_dir: font_dir.to_vec(),
@@ -3457,7 +3429,7 @@ fn train_mlp(font_dir: &[std::path::PathBuf], render_params: &crate::char_render
         mlp: true,
         lda: false,
         ..crate::train::TrainArgs::default()
-    }, &geo_cache);
+    });
 }
 
 /// Build a classifier by name.
@@ -3519,15 +3491,13 @@ pub fn build_classifier(
                     Err(e) => {
                         eprintln!("Glyph map stale or missing ({e}), retraining...");
                         let lda_path = default_lda_weights_path();
-                        // GPOS pair kern (Finding 5): see train_lda.
-                        let geo_cache = crate::train::load_geo_cache_for_training(font_dirs, false);
                         crate::train::run_train(crate::train::TrainArgs {
                             output: lda_path,
                             font_dir: font_dirs.to_vec(),
                             render_params: render_params.clone(),
                             lda: true,
                             ..crate::train::TrainArgs::default()
-                        }, &geo_cache);
+                        });
                         crate::glyph_map::NgramGlyphMap::load(&gmap_path)
                             .unwrap_or_else(|e2| {
                                 eprintln!("Retraining did not produce a valid glyph map ({e2})");

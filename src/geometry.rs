@@ -4,13 +4,43 @@
 //!
 //! Optimized: raw buffer access, no get_pixel, histogram Otsu without Vec alloc.
 
-use image::{GrayImage, RgbaImage};
+use image::{DynamicImage, GrayImage, RgbaImage};
 
 pub use unprint_geometry::{DetectedLine, DetectedFill, GeometryResult};
 
 // ---------------------------------------------------------------------------
 // Public API
 // ---------------------------------------------------------------------------
+
+/// Detect vectorisable geometry on `img`, ignoring pixels that fall inside
+/// any of the supplied `text_bboxes` (x, y, w, h).
+#[allow(dead_code)]
+pub fn detect_geometry(
+    img: &DynamicImage,
+    text_bboxes: &[(u32, u32, u32, u32)],
+    min_line_length_px: u32,
+) -> GeometryResult {
+    // Fast path reuse – same as page_cache but local to avoid extra dep.
+    let rgba = match img {
+        DynamicImage::ImageRgba8(r) => r.clone(),
+        DynamicImage::ImageRgb8(rgb) => {
+            let (w, h) = rgb.dimensions();
+            let mut out = Vec::with_capacity((w*h*4) as usize);
+            for c in rgb.as_raw().chunks_exact(3) { out.extend_from_slice(c); out.push(255); }
+            image::RgbaImage::from_raw(w, h, out).expect("rgba")
+        }
+        _ => img.to_rgba8(),
+    };
+    let gray = {
+        let (w, h) = rgba.dimensions();
+        let mut out = Vec::with_capacity((w*h) as usize);
+        for c in rgba.as_raw().chunks_exact(4) {
+            out.push(((c[0] as u32*2126 + c[1] as u32*7152 + c[2] as u32*722) / 10000) as u8);
+        }
+        image::GrayImage::from_raw(w, h, out).expect("gray")
+    };
+    detect_geometry_from_buffers(&gray, &rgba, text_bboxes, min_line_length_px)
+}
 
 pub fn detect_geometry_from_buffers(
     gray: &GrayImage,
@@ -362,4 +392,16 @@ fn detect_fills_from_rgba(
     }
 
     fills
+}
+
+// Backward compat wrapper that was previously used — now delegates to raw version.
+#[allow(dead_code)]
+fn detect_fills(
+    img: &DynamicImage,
+    text_mask: &[bool],
+    w: u32,
+    h: u32,
+) -> Vec<DetectedFill> {
+    let rgba = img.to_rgba8();
+    detect_fills_from_rgba(&rgba, text_mask, w, h)
 }

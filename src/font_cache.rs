@@ -78,6 +78,12 @@ impl FontCache {
         Ok(arc)
     }
 
+    /// Number of distinct fonts currently cached.
+    #[allow(dead_code)]
+    pub fn len(&self) -> usize {
+        self.inner.lock().unwrap().entries.len()
+    }
+
     /// Hit/miss stats for logging.
     pub fn stats(&self) -> (u64, u64) {
         let inner = self.inner.lock().unwrap();

@@ -237,7 +237,6 @@ fn format_char_detail(
     opp_h: Option<f32>,
     opp_v: Option<f32>,
     weight: Option<f32>,
-    h_overlap_correction_px: Option<f32>,
 ) -> String {
     let mut out = String::new();
     if let Some(pu) = prob_x_u {
@@ -279,9 +278,6 @@ fn format_char_detail(
                 out.push_str(&format!("h {h:.2}"));
             } else {
                 out.push_str(&format!("<span class='{cls}'>h {h:.2}</span>"));
-            }
-            if let Some(c) = h_overlap_correction_px {
-                out.push_str(&format!("<span class='overlap-graded' title='h_ll graded overlap downweight: overlap width {c:.2}px subtracted from |h_err| (clamped at 0, sign kept)'>†</span>"));
             }
         }
         if let Some(v) = v_ll {
@@ -335,15 +331,12 @@ fn find_font_in_catalog<'a>(
     gt_font_name: &str,
 ) -> Option<&'a FontEntry> {
     let gt_stripped = ground_truth::strip_subset_prefix_str(gt_font_name);
-    // Try full explicit key first (e.g. "SourceSerif4-400Italic|version=4.00|kern|nolig[wght=400,opsz=10]"),
+    // Try full explicit key first (e.g. "SourceSerif4-400Italic[wght=400,opsz=10]"),
     // then fall back to base PostScript name for backward compatibility.
-    // A bare name (no version specified) resolves to the latest version,
-    // then the shared variant preference. Variant entries carry
-    // "PSName|tag" so they won't collide with base "PSName".
-    font_catalog
-        .iter()
-        .find(|fe| fe.font_key() == gt_stripped)
-        .or_else(|| unprint::font_scan::best_entry_for_ps_name(font_catalog.iter(), &gt_stripped))
+    // Variant entries carry "PSName|tag" so they won't collide with base "PSName".
+    font_catalog.iter().find(|fe| {
+        fe.font_key() == gt_stripped || fe.postscript_name == gt_stripped
+    })
 }
 
 /// Try to find a font entry matching a CI candidate font_key.
@@ -598,14 +591,8 @@ impl FontDataCache {
 // ── Miss classification ─────────────────────────────────────────────────────
 
 #[derive(Clone)]
-pub struct ClassifiedEntry {
-    /// Index into the entries slice this classification was computed
-    /// from. The classification holds an index, not a borrow: enrich
-    /// mutates the entries, so a borrow cannot outlive the enrich call
-    /// (the borrow is what forced a second classification pass —
-    /// redundancy F32 residual). Consumers resolve the entry from the
-    /// entries slice passed alongside this Vec.
-    entry_index: usize,
+struct ClassifiedEntry<'a> {
+    entry: &'a AuditEntry,
     actual_font: Option<String>,
     kind: MissKind,
     /// Ground-truth effective font size in PDF points (if available).
@@ -635,27 +622,16 @@ impl MissKind {
     }
 }
 
-/// Classify each audit entry against ground truth (hit / major / minor /
-/// similarity failure / kept raster / no GT). Pure function of its inputs:
-/// the caller computes it once per run and shares the result with
-/// `enrich_audit_entries`, `compute_accuracy`, and `generate_report`
-/// (redundancy F32). The result is owned data — each entry holds the
-/// index of its audit entry, not a borrow — so the single classification
-/// can be computed before enrich mutates the entries: classification
-/// reads only bbox, page, decision, font_key_matched, and
-/// similarity_pass, none of which enrich writes (it writes miss_type,
-/// expected_font, gt_text, ocr_text, ocr_correct).
-pub fn classify_entries(
-    entries: &[AuditEntry],
+fn classify_entries<'a>(
+    entries: &'a [AuditEntry],
     gt: Option<&GroundTruth>,
     dpi: u32,
     font_catalog: &[FontEntry],
     _glyph_map: &NgramGlyphMap,
-) -> Vec<ClassifiedEntry> {
+) -> Vec<ClassifiedEntry<'a>> {
     entries
         .iter()
-        .enumerate()
-        .map(|(entry_index, e)| {
+        .map(|e| {
             let bbox_px = [
                 e.bbox.x as f32,
                 e.bbox.y as f32,
@@ -726,7 +702,7 @@ pub fn classify_entries(
                 };
 
                 ClassifiedEntry {
-                    entry_index,
+                    entry: e,
                     actual_font,
                     kind,
                     gt_font_size_pt,
@@ -741,7 +717,7 @@ pub fn classify_entries(
                     MissKind::Hit
                 };
                 ClassifiedEntry {
-                    entry_index,
+                    entry: e,
                     actual_font: None,
                     kind,
                     gt_font_size_pt: None,
@@ -754,21 +730,25 @@ pub fn classify_entries(
 /// Enrich audit entries with ground-truth classification fields
 /// (`miss_type` and `expected_font`).  Call this before writing
 /// the audit JSON so downstream tools never have to parse the HTML
-/// report. Takes the run's single precomputed classification (see
-/// `classify_entries`): the classification is 1:1 with `entries` by
-/// index, so enrich reads kind and expected font from it instead of
-/// classifying a second time (redundancy F32 residual).
+/// report.
 pub fn enrich_audit_entries(
     entries: &mut [AuditEntry],
-    classified: &[ClassifiedEntry],
     gt: Option<&GroundTruth>,
     dpi: u32,
+    font_catalog: &[FontEntry],
+    glyph_map: &NgramGlyphMap,
 ) {
-    debug_assert_eq!(entries.len(), classified.len(),
-        "classification must be 1:1 with entries");
-    for (e, ce) in entries.iter_mut().zip(classified) {
-        e.miss_type = Some(ce.kind.as_str().to_string());
-        e.expected_font = ce.actual_font.clone();
+    // classify_entries produces a 1:1 parallel vec.
+    let results: Vec<(String, Option<String>)> = {
+        let classified = classify_entries(entries, gt, dpi, font_catalog, glyph_map);
+        classified
+            .iter()
+            .map(|ce| (ce.kind.as_str().to_string(), ce.actual_font.clone()))
+            .collect()
+    };
+    for (e, (kind, expected)) in entries.iter_mut().zip(results) {
+        e.miss_type = Some(kind);
+        e.expected_font = expected;
 
         // Populate GT text and OCR text comparison
         if let Some(gt) = gt {
@@ -852,13 +832,13 @@ fn segs_same(a: &[unprint::audit::WordSegSummary], b: &[unprint::audit::WordSegS
 /// Returns (html_block, chosen_zncc, gt_zncc).
 fn build_miss_block(
     ce: &ClassifiedEntry,
-    entry: &AuditEntry,
     audit_root: &Path,
     font_catalog: &[FontEntry],
     glyph_map: &NgramGlyphMap,
     font_data_cache: &mut FontDataCache,
     dpi: u32,
 ) -> (String, Option<f32>, Option<f32>) {
+    let entry = ce.entry;
     let actual_font = ce.actual_font.as_deref().map(short_key).unwrap_or_else(|| "?".into());
     let matched = entry.font_matched.as_deref().map(short_key).unwrap_or_else(|| "?".into());
 
@@ -1448,12 +1428,8 @@ fn render_correct_font_comparison(
     // of clobbering them (same idiom as the tie-break tie_N/ subdirs).
     let correct_dir = dd.join("correct");
     let _ = std::fs::create_dir_all(&correct_dir);
-    // Single verify for this line: measure the widths here (F34).
-    let measured_widths = unprint::verify::measure_word_widths(
-        &scan_gray, &words, entry.bbox.x, entry.bbox.y,
-    );
     let vr = unprint::verify::verify_text_region(
-        &scan_gray, font_data, &fe.path, &entry.text, &words,
+        &scan_gray, font_data, &entry.text, &words,
         entry.bbox.x, entry.bbox.y,
         fe.glyph_overrides.as_ref().map(|v| v.as_slice()),
         &fe.variant_tag, fe.variations.as_deref(),
@@ -1462,7 +1438,6 @@ fn render_correct_font_comparison(
         Some(&correct_dir), None,
         gt_em,
         None,
-        &measured_widths,
     );
 
     // Reference the saved files by audit-root-relative path, exactly like the
@@ -1769,13 +1744,6 @@ fn build_observation_table(
     _glyph_map: &NgramGlyphMap,
     crop_dir_name: &str,
 ) -> String {
-    // NOTE (Finding 5): the reference renders in this table pass NoKern.
-    // This is display-only image generation, and the report has no geo
-    // cache available (the generator is not modified to thread one). The
-    // renders are single-glyph or short-sequence reference images; the
-    // audit scores themselves are unaffected. Multi-char reference images
-    // therefore show the unkerned form. This is explicit, not a silent
-    // fallback to the legacy kern table.
     // Build fallback geo map from GT's own observations, on GT's own
     // segmentation. When the winner is ligature (contains ﬃ) and the GT
     // font lacks ligature support, GT's per_char_geo is None on the winner
@@ -1785,8 +1753,8 @@ fn build_observation_table(
     // components below.
     use std::collections::HashMap as FbMap;
     let gt_obs_ref: &[unprint::audit::ObservationVote] = &entry.gt_obs_votes;
-    // Map seq string -> (h_ll, v_ll, h_err, v_err, glyph_score, rank, prob, h_overlap_correction)
-    let mut gt_fallback: FbMap<String, (Option<f32>, Option<f32>, Option<f32>, Option<f32>, Option<f32>, Option<usize>, Option<f32>, Option<f32>)> = FbMap::new();
+    // Map seq string -> (h_ll, v_ll, h_err, v_err, glyph_score, rank, prob)
+    let mut gt_fallback: FbMap<String, (Option<f32>, Option<f32>, Option<f32>, Option<f32>, Option<f32>, Option<usize>, Option<f32>)> = FbMap::new();
     for ov in gt_obs_ref {
         if ov.gt_geo_h_ll.is_some() || ov.gt_font_rank.is_some() {
             let key: String = ov.seq.iter().collect();
@@ -1794,7 +1762,6 @@ fn build_observation_table(
             gt_fallback.entry(key).or_insert((
                 ov.gt_geo_h_ll, ov.gt_geo_v_ll, ov.gt_geo_h_err, ov.gt_geo_v_err,
                 ov.gt_glyph_score, ov.gt_font_rank, ov.gt_font_prob,
-                ov.gt_geo_h_overlap_correction_px,
             ));
         }
     }
@@ -1844,7 +1811,7 @@ fn build_observation_table(
                             .and_then(|ovs| ovs.iter().find(|(gc, _)| *gc == *c).map(|(_, g)| unprint_fonts::ab_glyph::GlyphId(*g)))
                     }).collect();
                     let _disable_kern = fe.variant_tag.contains("nokern");
-                    if let Some(img) = char_render::render_ngram_fresh(&font, &render_seq, &gid_overrides, &char_render::RenderParams::default(), _disable_kern, &unprint_fonts::NoKern) {
+                    if let Some(img) = char_render::render_ngram_fresh(&font, &render_seq, &gid_overrides, &char_render::RenderParams::default(), _disable_kern) {
                         correct_mid = ink_midpoint(&img);
                         correct_ref_uri = Some(img_to_b64_uri(&img));
                     }
@@ -1882,7 +1849,7 @@ fn build_observation_table(
                                 .and_then(|ovs| ovs.iter().find(|(gc, _)| *gc == *c).map(|(_, g)| unprint_fonts::ab_glyph::GlyphId(*g)))
                         }).collect();
                         let _disable_kern = fe.variant_tag.contains("nokern");
-                    if let Some(img) = char_render::render_ngram_fresh(&font, &render_seq, &gid_overrides, &char_render::RenderParams::default(), _disable_kern, &unprint_fonts::NoKern) {
+                    if let Some(img) = char_render::render_ngram_fresh(&font, &render_seq, &gid_overrides, &char_render::RenderParams::default(), _disable_kern) {
                             chosen_mid = ink_midpoint(&img);
                             chosen_ref_uri = Some(img_to_b64_uri(&img));
                         }
@@ -1919,9 +1886,9 @@ fn build_observation_table(
             _ => ("", ""),
         };
 
-        let (gt_h, gt_v, gt_h_err, gt_v_err, gt_glyph, _gt_rank_f, gt_prob_f, gt_h_overlap_correction) = if cv.gt_geo_h_ll.is_none() || cv.gt_font_rank.is_none() {
+        let (gt_h, gt_v, gt_h_err, gt_v_err, gt_glyph, _gt_rank_f, gt_prob_f) = if cv.gt_geo_h_ll.is_none() || cv.gt_font_rank.is_none() {
             let seq_key: String = cv.seq.iter().collect();
-            if let Some((fh, fv, fhe, fve, fg, fr, fp, fz)) = gt_fallback.get(&seq_key) {
+            if let Some((fh, fv, fhe, fve, fg, fr, fp)) = gt_fallback.get(&seq_key) {
                 (
                     cv.gt_geo_h_ll.or(*fh),
                     cv.gt_geo_v_ll.or(*fv),
@@ -1930,28 +1897,25 @@ fn build_observation_table(
                     cv.gt_glyph_score.or(*fg),
                     cv.gt_font_rank.or(*fr),
                     cv.gt_font_prob.or(*fp),
-                    cv.gt_geo_h_overlap_correction_px.or(*fz),
                 )
             } else {
-                (cv.gt_geo_h_ll, cv.gt_geo_v_ll, cv.gt_geo_h_err, cv.gt_geo_v_err, cv.gt_glyph_score, cv.gt_font_rank, cv.gt_font_prob, cv.gt_geo_h_overlap_correction_px)
+                (cv.gt_geo_h_ll, cv.gt_geo_v_ll, cv.gt_geo_h_err, cv.gt_geo_v_err, cv.gt_glyph_score, cv.gt_font_rank, cv.gt_font_prob)
             }
         } else {
-            (cv.gt_geo_h_ll, cv.gt_geo_v_ll, cv.gt_geo_h_err, cv.gt_geo_v_err, cv.gt_glyph_score, cv.gt_font_rank, cv.gt_font_prob, cv.gt_geo_h_overlap_correction_px)
+            (cv.gt_geo_h_ll, cv.gt_geo_v_ll, cv.gt_geo_h_err, cv.gt_geo_v_err, cv.gt_glyph_score, cv.gt_font_rank, cv.gt_font_prob)
         };
         // For GT debugging: pass each side's opponent for per-dimension coloring
         let chosen_detail = format_char_detail(
             cv.chosen_prob, cv.chosen_glyph_score,
             cv.chosen_geo_h_ll, cv.chosen_geo_v_ll,
             cv.chosen_geo_h_err, cv.chosen_geo_v_err,
-            gt_glyph, gt_h, gt_v, Some(cv.weight),
-            cv.chosen_geo_h_overlap_correction_px
+            gt_glyph, gt_h, gt_v, Some(cv.weight)
         );
         let correct_detail = format_char_detail(
             gt_prob_f, gt_glyph,
             gt_h, gt_v,
             gt_h_err, gt_v_err,
-            cv.chosen_glyph_score, cv.chosen_geo_h_ll, cv.chosen_geo_v_ll, Some(cv.weight),
-            gt_h_overlap_correction
+            cv.chosen_glyph_score, cv.chosen_geo_h_ll, cv.chosen_geo_v_ll, Some(cv.weight)
         );
 
         let chosen_score_label = if !chosen_detail.is_empty() {
@@ -2005,9 +1969,7 @@ fn build_observation_table(
                                                 .and_then(|ovs| ovs.iter().find(|(gc, _)| *gc == *c).map(|(_, g)| unprint_fonts::ab_glyph::GlyphId(*g)))
                                         }).collect();
                                         let _disable_kern = fe.variant_tag.contains("nokern");
-                                        // Single-glyph render: kerning is undefined for one
-                                        // glyph (no pair), so NoKern is never consulted.
-                                        if let Some(img) = char_render::render_ngram_fresh(&font, &[*comp], &gid_overrides, &char_render::RenderParams::default(), _disable_kern, &unprint_fonts::NoKern) {
+                                        if let Some(img) = char_render::render_ngram_fresh(&font, &[*comp], &gid_overrides, &char_render::RenderParams::default(), _disable_kern) {
                                             comp_uri = Some(img_to_b64_uri(&img));
                                         }
                                     }
@@ -2018,8 +1980,7 @@ fn build_observation_table(
                                 ov.gt_font_prob, ov.gt_glyph_score,
                                 ov.gt_geo_h_ll, ov.gt_geo_v_ll,
                                 ov.gt_geo_h_err, ov.gt_geo_v_err,
-                                cv.chosen_glyph_score, cv.chosen_geo_h_ll, cv.chosen_geo_v_ll, Some(ov.weight),
-                                ov.gt_geo_h_overlap_correction_px
+                                cv.chosen_glyph_score, cv.chosen_geo_h_ll, cv.chosen_geo_v_ll, Some(ov.weight)
                             );
                             let comp_label = if !comp_detail.is_empty() {
                                 format!("<div class='sub'>{comp_detail}</div>")
@@ -2170,7 +2131,6 @@ img.ci {
 .prob-lose { background: #ffebee; border-left: 3px solid #ef5350; padding-left: 4px; }
 .dim-win { color: #2e7d32; font-weight: 700; }
 .dim-lose { color: #c62828; }
-.overlap-graded { color: #6a1b9a; font-weight: 700; }
 .prob-win .dim-win, .prob-lose .dim-lose { font-weight: 800; }
 .img-td.prob-win { outline: 2px solid #4caf50; outline-offset: -1px; }
 .img-td.prob-lose { outline: 1px solid #ef9a9a; }
@@ -2249,26 +2209,24 @@ pub struct AccuracyResult {
     pub ocr_wrong_hits: usize,
 }
 
-/// Compute accuracy counts from a precomputed entry classification (see
-/// `classify_entries`) without generating any HTML or audit I/O. Used by
-/// --test for fast scoring. The caller computes the classification once
-/// per run and shares it with `enrich_audit_entries` and
-/// `generate_report` (redundancy F32). `entries` is the slice the
-/// classification was computed from, 1:1 by index; it supplies the
-/// enriched OCR fields the classification itself does not hold.
+/// Compute accuracy without generating any HTML or audit I/O.
+/// Used by --test for fast scoring.
 pub fn compute_accuracy(
     entries: &[AuditEntry],
-    classified: &[ClassifiedEntry],
+    gt: Option<&GroundTruth>,
+    dpi: u32,
+    font_catalog: &[FontEntry],
+    glyph_map: &NgramGlyphMap,
 ) -> AccuracyResult {
-    debug_assert_eq!(entries.len(), classified.len(),
-        "classification must be 1:1 with entries");
+    let classified = classify_entries(entries, gt, dpi, font_catalog, glyph_map);
+
     let mut hits = 0usize;
     let mut major_misses = 0usize;
     let mut minor_misses = 0usize;
     let mut similarity_failures = 0usize;
     let mut kept_raster = 0usize;
 
-    for ce in classified {
+    for ce in &classified {
         match ce.kind {
             MissKind::Hit => hits += 1,
             MissKind::MajorMiss => major_misses += 1,
@@ -2294,9 +2252,9 @@ pub fn compute_accuracy(
         let mut c_hits = 0usize;
         let mut w_total = 0usize;
         let mut w_hits = 0usize;
-        for ce in classified {
+        for ce in &classified {
             let is_hit = matches!(ce.kind, MissKind::Hit | MissKind::MinorMiss);
-            match entries[ce.entry_index].ocr_correct {
+            match ce.entry.ocr_correct {
                 Some(true) => { c_total += 1; if is_hit { c_hits += 1; } },
                 Some(false) => { w_total += 1; if is_hit { w_hits += 1; } },
                 None => {},
@@ -2321,17 +2279,11 @@ pub fn compute_accuracy(
     }
 }
 
-/// Build the HTML report. Takes a precomputed entry classification (see
-/// `classify_entries`): the caller computes it once per run and shares it
-/// with `enrich_audit_entries` and `compute_accuracy` (redundancy F32).
-/// `entries` is the slice the classification was computed from, 1:1 by
-/// index; each classified entry resolves its audit entry through
-/// `entries[ce.entry_index]`.
 pub fn generate_report(
     report_path: &Path,
     audit_root: &Path,
     entries: &[AuditEntry],
-    classified: &[ClassifiedEntry],
+    gt: Option<&GroundTruth>,
     dpi: u32,
     font_catalog: &[FontEntry],
     glyph_map: &NgramGlyphMap,
@@ -2347,8 +2299,7 @@ pub fn generate_report(
     IMAGE_WRITER.with(|w| *w.borrow_mut() = Some(writer));
     AUDIT_ROOT_TL.with(|a| *a.borrow_mut() = Some(audit_root.to_path_buf()));
 
-    debug_assert_eq!(entries.len(), classified.len(),
-        "classification must be 1:1 with entries");
+    let classified = classify_entries(entries, gt, dpi, font_catalog, glyph_map);
 
     let mut hits: Vec<&ClassifiedEntry> = Vec::new();
     let mut major_misses: Vec<&ClassifiedEntry> = Vec::new();
@@ -2356,7 +2307,7 @@ pub fn generate_report(
     let mut similarity_failures: Vec<&ClassifiedEntry> = Vec::new();
     let mut kept_raster: Vec<&ClassifiedEntry> = Vec::new();
     let mut no_ground_truth: Vec<&ClassifiedEntry> = Vec::new();
-    for ce in classified {
+    for ce in &classified {
         match ce.kind {
             MissKind::Hit => hits.push(ce),
             MissKind::MajorMiss => major_misses.push(ce),
@@ -2370,10 +2321,10 @@ pub fn generate_report(
     // Collect ALL OCR-wrong entries (any miss kind) – these move to the very end.
     // Previously only Hit|MinorMiss were moved, leaving 303 Major+82 ZNCC with OCR WRONG at front.
     let mut ocr_misses: Vec<&ClassifiedEntry> = classified.iter()
-        .filter(|ce| entries[ce.entry_index].ocr_correct == Some(false))
+        .filter(|ce| ce.entry.ocr_correct == Some(false))
         .collect();
     ocr_misses.sort_by(|a, b| {
-        entries[a.entry_index].similarity_score.partial_cmp(&entries[b.entry_index].similarity_score).unwrap_or(std::cmp::Ordering::Equal)
+        a.entry.similarity_score.partial_cmp(&b.entry.similarity_score).unwrap_or(std::cmp::Ordering::Equal)
     });
 
     // Accuracy stats should be computed on the full set BEFORE we filter for display.
@@ -2392,89 +2343,76 @@ pub fn generate_report(
 
 
     // Filtered views for display – OCR-wrong entries are excluded here and shown only in final section.
-    let major_misses_display: Vec<&ClassifiedEntry> = major_misses.iter().filter(|ce| entries[ce.entry_index].ocr_correct != Some(false)).copied().collect();
-    let minor_misses_display: Vec<&ClassifiedEntry> = minor_misses.iter().filter(|ce| entries[ce.entry_index].ocr_correct != Some(false)).copied().collect();
-    let similarity_failures_display: Vec<&ClassifiedEntry> = similarity_failures.iter().filter(|ce| entries[ce.entry_index].ocr_correct != Some(false)).copied().collect();
-    let kept_raster_display: Vec<&ClassifiedEntry> = kept_raster.iter().filter(|ce| entries[ce.entry_index].ocr_correct != Some(false)).copied().collect();
-    let hits_display: Vec<&ClassifiedEntry> = hits.iter().filter(|ce| entries[ce.entry_index].ocr_correct != Some(false)).copied().collect();
+    let major_misses_display: Vec<&ClassifiedEntry> = major_misses.iter().filter(|ce| ce.entry.ocr_correct != Some(false)).copied().collect();
+    let minor_misses_display: Vec<&ClassifiedEntry> = minor_misses.iter().filter(|ce| ce.entry.ocr_correct != Some(false)).copied().collect();
+    let similarity_failures_display: Vec<&ClassifiedEntry> = similarity_failures.iter().filter(|ce| ce.entry.ocr_correct != Some(false)).copied().collect();
+    let kept_raster_display: Vec<&ClassifiedEntry> = kept_raster.iter().filter(|ce| ce.entry.ocr_correct != Some(false)).copied().collect();
+    let hits_display: Vec<&ClassifiedEntry> = hits.iter().filter(|ce| ce.entry.ocr_correct != Some(false)).copied().collect();
 
     // Sort each miss category by increasing ZNCC (worst visual matches first) – using filtered lists
     let mut major_misses_sorted = major_misses_display.clone();
     major_misses_sorted.sort_by(|a, b| {
-        entries[a.entry_index].similarity_score.partial_cmp(&entries[b.entry_index].similarity_score).unwrap_or(std::cmp::Ordering::Equal)
+        a.entry.similarity_score.partial_cmp(&b.entry.similarity_score).unwrap_or(std::cmp::Ordering::Equal)
     });
     let mut minor_misses_sorted = minor_misses_display.clone();
     minor_misses_sorted.sort_by(|a, b| {
-        entries[a.entry_index].similarity_score.partial_cmp(&entries[b.entry_index].similarity_score).unwrap_or(std::cmp::Ordering::Equal)
+        a.entry.similarity_score.partial_cmp(&b.entry.similarity_score).unwrap_or(std::cmp::Ordering::Equal)
     });
     let mut similarity_failures_sorted = similarity_failures_display.clone();
     similarity_failures_sorted.sort_by(|a, b| {
-        entries[a.entry_index].similarity_score.partial_cmp(&entries[b.entry_index].similarity_score).unwrap_or(std::cmp::Ordering::Equal)
+        a.entry.similarity_score.partial_cmp(&b.entry.similarity_score).unwrap_or(std::cmp::Ordering::Equal)
     });
     let mut kept_raster_sorted = kept_raster_display.clone();
     kept_raster_sorted.sort_by(|a, b| {
-        entries[a.entry_index].similarity_score.partial_cmp(&entries[b.entry_index].similarity_score).unwrap_or(std::cmp::Ordering::Equal)
+        a.entry.similarity_score.partial_cmp(&b.entry.similarity_score).unwrap_or(std::cmp::Ordering::Equal)
     });
     let mut hits_sorted = hits_display.clone();
     let mut no_gt_sorted = no_ground_truth.clone();
     if meta.report_all {
         hits_sorted.sort_by(|a, b| {
-            entries[a.entry_index].similarity_score.partial_cmp(&entries[b.entry_index].similarity_score).unwrap_or(std::cmp::Ordering::Equal)
+            a.entry.similarity_score.partial_cmp(&b.entry.similarity_score).unwrap_or(std::cmp::Ordering::Equal)
         });
         no_gt_sorted.sort_by(|a, b| {
-            entries[a.entry_index].similarity_score.partial_cmp(&entries[b.entry_index].similarity_score).unwrap_or(std::cmp::Ordering::Equal)
+            a.entry.similarity_score.partial_cmp(&b.entry.similarity_score).unwrap_or(std::cmp::Ordering::Equal)
         });
     }
 
     let mut font_data_cache = FontDataCache::new();
 
-    // F35: build each displayed entry's block once and reuse it. An entry
-    // appears in its kind section, in the OCR-miss section when OCR is
-    // wrong, and in All Lines when --report-all — and every
-    // build_miss_block re-verifies the GT font, so without this the same
-    // entry was verified up to 3 times. Entries shown in no section (hits
-    // and no-ground-truth lines with correct OCR, without --report-all)
-    // are not built, exactly as before.
-    let mut block_cache: HashMap<(usize, usize), String> = HashMap::new();
-    for ce in classified {
-        let shown = meta.report_all
-            || entries[ce.entry_index].ocr_correct == Some(false)
-            || !matches!(ce.kind, MissKind::Hit | MissKind::NoGroundTruth);
-        if shown {
-            let (html, _chosen_zncc, _gt_zncc) = build_miss_block(
-                ce, &entries[ce.entry_index], audit_root, font_catalog, glyph_map, &mut font_data_cache, dpi,
-            );
-            block_cache.insert((entries[ce.entry_index].page, entries[ce.entry_index].line_index), html);
-        }
-    }
-    // Look up a pre-built block for a displayed entry. Panics on a missing
-    // entry: the `shown` predicate above must cover every displayed set.
-    let block_for = |ce: &ClassifiedEntry| -> &str {
-        &block_cache[&(entries[ce.entry_index].page, entries[ce.entry_index].line_index)]
-    };
-
     // Build major miss blocks (OCR-wrong already filtered out)
     let mut major_miss_blocks = String::new();
     for ce in &major_misses_sorted {
-        major_miss_blocks.push_str(block_for(ce));
+        let (html, _chosen_zncc, _gt_zncc) = build_miss_block(
+            ce, audit_root, font_catalog, glyph_map, &mut font_data_cache, dpi,
+        );
+        major_miss_blocks.push_str(&html);
     }
 
     // Build minor miss blocks — OCR-miss already filtered
     let mut minor_miss_blocks = String::new();
     for ce in &minor_misses_sorted {
-        minor_miss_blocks.push_str(block_for(ce));
+        let (html, _chosen_zncc, _gt_zncc) = build_miss_block(
+            ce, audit_root, font_catalog, glyph_map, &mut font_data_cache, dpi,
+        );
+        minor_miss_blocks.push_str(&html);
     }
 
     // Build similarity failure blocks (OCR-wrong filtered out)
     let mut sim_fail_blocks = String::new();
     for ce in &similarity_failures_sorted {
-        sim_fail_blocks.push_str(block_for(ce));
+        let (html, _chosen_zncc, _gt_zncc) = build_miss_block(
+            ce, audit_root, font_catalog, glyph_map, &mut font_data_cache, dpi,
+        );
+        sim_fail_blocks.push_str(&html);
     }
 
     // Build kept-raster blocks (OCR-wrong filtered out)
     let mut raster_blocks = String::new();
     for ce in &kept_raster_sorted {
-        raster_blocks.push_str(block_for(ce));
+        let (html, _chosen_zncc, _gt_zncc) = build_miss_block(
+            ce, audit_root, font_catalog, glyph_map, &mut font_data_cache, dpi,
+        );
+        raster_blocks.push_str(&html);
     }
 
     // Build hits / no_ground_truth blocks when --report-all
@@ -2483,10 +2421,16 @@ pub fn generate_report(
     let mut no_gt_blocks = String::new();
     if meta.report_all {
         for ce in &hits_sorted {
-            hits_blocks.push_str(block_for(ce));
+            let (html, _chosen_zncc, _gt_zncc) = build_miss_block(
+                ce, audit_root, font_catalog, glyph_map, &mut font_data_cache, dpi,
+            );
+            hits_blocks.push_str(&html);
         }
         for ce in &no_gt_sorted {
-            no_gt_blocks.push_str(block_for(ce));
+            let (html, _chosen_zncc, _gt_zncc) = build_miss_block(
+                ce, audit_root, font_catalog, glyph_map, &mut font_data_cache, dpi,
+            );
+            no_gt_blocks.push_str(&html);
         }
     }
 
@@ -2494,7 +2438,10 @@ pub fn generate_report(
     // Use full miss block so font info is preserved even for major misses.
     let mut ocr_miss_blocks = String::new();
     for ce in &ocr_misses {
-        ocr_miss_blocks.push_str(block_for(ce));
+        let (html, _chosen_zncc, _gt_zncc) = build_miss_block(
+            ce, audit_root, font_catalog, glyph_map, &mut font_data_cache, dpi,
+        );
+        ocr_miss_blocks.push_str(&html);
     }
 
     let sim_fail_section = if !sim_fail_blocks.is_empty() {
@@ -2549,14 +2496,17 @@ pub fn generate_report(
     // Full unfiltered listing when --audit-all / --report-all
     // Shows every line in page/line order regardless of hit/miss.
     let (all_lines_section, report_title) = if meta.report_all {
-        let mut all_sorted = classified.to_vec();
+        let mut all_sorted = classified.clone();
         all_sorted.sort_by(|a, b| {
-            entries[a.entry_index].page.cmp(&entries[b.entry_index].page)
-                .then(entries[a.entry_index].line_index.cmp(&entries[b.entry_index].line_index))
+            a.entry.page.cmp(&b.entry.page)
+                .then(a.entry.line_index.cmp(&b.entry.line_index))
         });
         let mut blocks = String::new();
         for ce in &all_sorted {
-            blocks.push_str(block_for(ce));
+            let (html, _chosen_zncc, _gt_zncc) = build_miss_block(
+                ce, audit_root, font_catalog, glyph_map, &mut font_data_cache, dpi,
+            );
+            blocks.push_str(&html);
         }
         let section = format!(
             "<h2 style=\"margin-top:2em;\">All Lines ({} lines)</h2>{}",
@@ -2616,17 +2566,17 @@ pub fn generate_report(
         let mut zncc = 0usize;
         let mut major = 0usize;
         let mut mrne = 0usize;
-        for ce in classified {
+        for ce in &classified {
             if ce.actual_font.is_none() {
                 continue; // only GT lines
             }
             // ocr miss: ocr_correct == false (enriched in enrich_audit_entries)
-            if entries[ce.entry_index].ocr_correct == Some(false) {
+            if ce.entry.ocr_correct == Some(false) {
                 ocr += 1;
             }
             // zncc miss: similarity_pass == false regardless of ps_match
             // This is the independent ZNCC attribute, not the mutually-exclusive SimilarityFailure.
-            if entries[ce.entry_index].similarity_pass == Some(false) {
+            if ce.entry.similarity_pass == Some(false) {
                 zncc += 1;
             }
             match ce.kind {
@@ -2670,12 +2620,12 @@ pub fn generate_report(
         let mut total = 0usize;
         let mut p_true = 0usize;
         let mut p_false = 0usize;
-        for ce in classified {
-            let gt_text = match entries[ce.entry_index].gt_text.as_deref() {
+        for ce in &classified {
+            let gt_text = match ce.entry.gt_text.as_deref() {
                 Some(t) => t,
                 None => continue,
             };
-            let ocr_text = match entries[ce.entry_index].ocr_text.as_deref() {
+            let ocr_text = match ce.entry.ocr_text.as_deref() {
                 Some(t) => t,
                 None => continue,
             };
@@ -2683,7 +2633,7 @@ pub fn generate_report(
             let ocr_chars: Vec<char> = ocr_text.chars().filter(|c| !c.is_whitespace()).collect();
 
             // Corrected text from word_bboxes (same source as chosen font verify)
-            let corrected_text: String = entries[ce.entry_index].word_bboxes.iter()
+            let corrected_text: String = ce.entry.word_bboxes.iter()
                 .map(|wb| wb.text.as_str()).collect::<Vec<_>>().join(" ");
             let corrected_chars: Vec<char> = corrected_text.chars()
                 .filter(|c| !c.is_whitespace()).collect();
@@ -2812,10 +2762,6 @@ pub fn generate_report(
          <b>×u, higher = better</b>. Values below the threshold (default 6×u) are noise.\n\
          <b>ZNCC</b> (per-line) = zero-mean normalized cross-correlation between scanned line \
          and re-render; <b>-1–1, higher = more similar</b>.\n\
-         <b>†</b> after an h value means that pair's h_ll got the graded overlap \
-         downweighting (unreliable pitch: overlapping ink boxes + DP seam cut ink); \
-         hover for the overlap width in px subtracted from |h_err| \
-         (clamped at 0, sign kept, original sigma).\n\
          </div>\n\
          {all_lines_section}\n\
          <h2>Major Misses ({n_major})</h2>\n\
