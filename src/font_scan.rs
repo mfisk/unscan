@@ -812,56 +812,6 @@ pub fn default_font_dirs(extra: &[PathBuf]) -> Vec<PathBuf> {
     dirs
 }
 
-/// Find the MS Core Fonts directory from the environment — never a
-/// hardcoded user-specific path. First asks fontconfig (`fc-list`, the
-/// standard font-finding utility) where Times New Roman lives and takes
-/// that file's directory; if that fails, checks $MSTTCOREFONTS_DIR, then
-/// $HOME/.local/share/fonts/msttcorefonts, then the system
-/// /usr/share/fonts/truetype/msttcorefonts. Returns the first directory
-/// that contains times.ttf, or None if none is found (the caller handles
-/// the missing case — vintage generation is skipped, no crash).
-pub fn find_msttcorefonts_dir() -> Option<PathBuf> {
-    // fontconfig knows where the fonts are, whatever dir they were
-    // installed in. `fc-list "Times New Roman" file` prints one
-    // "<path>: " line per matching file.
-    if let Ok(out) = std::process::Command::new("fc-list")
-        .args(["Times New Roman", "file"])
-        .output()
-    {
-        if out.status.success() {
-            let text = String::from_utf8_lossy(&out.stdout);
-            for line in text.lines() {
-                let path = line.split(':').next().unwrap_or("").trim();
-                let p = PathBuf::from(path);
-                if p
-                    .file_name()
-                    .map(|n| n.eq_ignore_ascii_case("times.ttf"))
-                    .unwrap_or(false)
-                    && p.is_file()
-                {
-                    if let Some(dir) = p.parent() {
-                        return Some(dir.to_path_buf());
-                    }
-                }
-            }
-        }
-    }
-    let mut candidates: Vec<PathBuf> = Vec::new();
-    if let Ok(d) = std::env::var("MSTTCOREFONTS_DIR") {
-        candidates.push(PathBuf::from(d));
-    }
-    if let Ok(home) = std::env::var("HOME") {
-        candidates.push(PathBuf::from(home).join(".local/share/fonts/msttcorefonts"));
-    }
-    candidates.push(PathBuf::from("/usr/share/fonts/truetype/msttcorefonts"));
-    for dir in candidates {
-        if dir.join("times.ttf").is_file() {
-            return Some(dir);
-        }
-    }
-    None
-}
-
 
 // ---------------------------------------------------------------------------
 // Font scan cache (FSCN)
