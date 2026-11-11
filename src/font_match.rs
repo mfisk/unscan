@@ -86,35 +86,6 @@ pub struct ObservationDetail {
     pub geo_v_ll: Option<f32>,
     pub geo_h_err: Option<f32>,
     pub geo_v_err: Option<f32>,
-    // Absolute midpoint/pitch data (Finding 10) – recorded in the audit so
-    // per-line geometry can be re-derived from audit.json. obs_cx/pred_cx
-    // are word-image px; obs_pitch/pred_pitch are None for word-initial
-    // chars (no previous char); geo_scale is the per-word px-per-font-unit
-    // scale; ink_width is the observed ink width in word-image px.
-    pub obs_cx: Option<f32>,
-    pub pred_cx: Option<f32>,
-    pub obs_pitch: Option<f32>,
-    pub pred_pitch: Option<f32>,
-    pub geo_scale: Option<f32>,
-    pub ink_width: Option<f32>,
-}
-
-/// One cell of the dense per-font geometry grid (see `identify_fonts`).
-/// Carries the scoring LLs plus the absolute midpoint/pitch data that the
-/// audit records (Finding 10). `obs_pitch`/`pred_pitch` are None for
-/// word-initial chars.
-#[derive(Clone, Copy, Default)]
-struct GeoCell {
-    h_ll: f32,
-    v_ll: f32,
-    h_err: f32,
-    v_err: f32,
-    obs_cx: f32,
-    pred_cx: f32,
-    obs_pitch: Option<f32>,
-    pred_pitch: Option<f32>,
-    scale: f32,
-    ink_width: f32,
 }
 
 #[allow(dead_code)]
@@ -293,13 +264,6 @@ pub fn identify_fonts(
             geo_v_ll: f32,
             geo_h_err: f32,
             geo_v_err: f32,
-            // Absolute midpoint/pitch data for the audit (Finding 10).
-            obs_cx: f32,
-            pred_cx: f32,
-            obs_pitch: Option<f32>,
-            pred_pitch: Option<f32>,
-            geo_scale: f32,
-            ink_width: f32,
         }
         // We'll collect per-word wib and temps
         let mut temps_collect: Vec<Temp> = Vec::new();
@@ -348,12 +312,6 @@ pub fn identify_fonts(
                     geo_v_ll: 0.0,
                     geo_h_err: 0.0,
                     geo_v_err: 0.0,
-                    obs_cx: 0.0,
-                    pred_cx: 0.0,
-                    obs_pitch: None,
-                    pred_pitch: None,
-                    geo_scale: 0.0,
-                    ink_width: 0.0,
                 });
             }
             // Build WordSeg for geo
@@ -386,8 +344,8 @@ pub fn identify_fonts(
         let geo_opt = crate::geometry_classifier::per_char_geo_for_font(
             fk, &word_segs, &wib, font_cache, geo_cache, font_registry
         );
-        // dense grid: geo_grid[seg_idx][orig_idx] = Some(GeoCell) or None for missing
-        let mut geo_grid: Vec<Vec<Option<GeoCell>>> = builds.iter().map(|wb| vec![None; wb.collapsed.len()]).collect();
+        // dense grid: geo_grid[seg_idx][orig_idx] = Some((h_ll,v_ll,h_err,v_err)) or None for missing
+        let mut geo_grid: Vec<Vec<Option<(f32,f32,f32,f32)>>> = builds.iter().map(|wb| vec![None; wb.collapsed.len()]).collect();
         match &geo_opt {
             None => {
                 if do_prune && !is_ensure { pruned_count+=1; continue; }
@@ -404,18 +362,12 @@ pub fn identify_fonts(
                 // fill grid after prune check – same geos reused
                 for g in geos {
                     if g.seg_idx < geo_grid.len() && g.orig_idx < geo_grid[g.seg_idx].len() {
-                        geo_grid[g.seg_idx][g.orig_idx] = Some(GeoCell {
-                            h_ll: g.h_ll as f32,
-                            v_ll: g.v_ll as f32,
-                            h_err: g.h_err.unwrap_or(0.0) as f32,
-                            v_err: g.v_err as f32,
-                            obs_cx: g.obs_cx as f32,
-                            pred_cx: g.pred_cx as f32,
-                            obs_pitch: g.obs_pitch.map(|v| v as f32),
-                            pred_pitch: g.pred_pitch.map(|v| v as f32),
-                            scale: g.scale as f32,
-                            ink_width: g.ink_width as f32,
-                        });
+                        geo_grid[g.seg_idx][g.orig_idx] = Some((
+                            g.h_ll as f32,
+                            g.v_ll as f32,
+                            g.h_err.unwrap_or(0.0) as f32,
+                            g.v_err as f32,
+                        ));
                     }
                 }
             }
@@ -455,12 +407,11 @@ pub fn identify_fonts(
                     }
                 };
                 // Temp placeholder – classify below; pull geo from per-font dense grid (no hash)
-                let cell = if seg_idx < geo_grid.len() && pos < geo_grid[seg_idx].len() {
-                    geo_grid[seg_idx][pos].unwrap_or_default()
+                let (h_ll, v_ll, h_err, v_err) = if seg_idx < geo_grid.len() && pos < geo_grid[seg_idx].len() {
+                    geo_grid[seg_idx][pos].unwrap_or((0.0,0.0,0.0,0.0))
                 } else {
-                    GeoCell::default()
+                    (0.0,0.0,0.0,0.0)
                 };
-                let (h_ll, v_ll, h_err, v_err) = (cell.h_ll, cell.v_ll, cell.h_err, cell.v_err);
                 let mut t = Temp {
                     ch: c,
                     weight: 1.0,
@@ -474,12 +425,6 @@ pub fn identify_fonts(
                     geo_v_ll: v_ll,
                     geo_h_err: h_err,
                     geo_v_err: v_err,
-                    obs_cx: cell.obs_cx,
-                    pred_cx: cell.pred_cx,
-                    obs_pitch: cell.obs_pitch,
-                    pred_pitch: cell.pred_pitch,
-                    geo_scale: cell.scale,
-                    ink_width: cell.ink_width,
                 };
                 // Classify for ood + best_prob + nearest
                 let seq = [c];
@@ -576,12 +521,6 @@ pub fn identify_fonts(
                 geo_v_ll: Some(t.geo_v_ll),
                 geo_h_err: Some(t.geo_h_err),
                 geo_v_err: Some(t.geo_v_err),
-                obs_cx: Some(t.obs_cx),
-                pred_cx: Some(t.pred_cx),
-                obs_pitch: t.obs_pitch,
-                pred_pitch: t.pred_pitch,
-                geo_scale: Some(t.geo_scale),
-                ink_width: Some(t.ink_width),
             });
         }
 
