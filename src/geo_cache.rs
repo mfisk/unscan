@@ -32,6 +32,23 @@
 //!       class_def2: same
 //!       matrix: [class1_count*class2_count] * { val1[popcnt(vf1) i16], val2[popcnt(vf2) i16] }
 //!     }
+//!     [case tables, v16 groups, v20 pair_first_present, v20/v21 maps, v19 hash maps — see write_bin_from_owned]
+//!     v25 (Finding 2): GPOS LookupTypes 3-8 + GDEF classes
+//!       anchor encoding: (present u8, x i16, y i16) = 5 bytes; present=0 means NULL
+//!       n_cursive u16 | cursive: [n] * { cov_len u16, lookup_id u16, subtable_pos u16, coverage[u16], anchors[cov_len] * { entry(5B), exit(5B) } }
+//!       n_mark_base u16 | mark_base: [n] * { lookup_id u16, subtable_pos u16, mark_array, base_array }
+//!       n_mark_lig u16 | mark_lig: [n] * { lookup_id u16, subtable_pos u16, mark_array, lig_array }
+//!       n_mark_mark u16 | mark_mark: [n] * { lookup_id u16, subtable_pos u16, mark_array, mark2_array }
+//!         mark_array: { cov_len u16, coverage[u16], records[cov_len] * { class u16, anchor(5B) } }
+//!         base_array/mark2_array: { cov_len u16, coverage[u16], class_count u16, anchors[cov_len*class_count] (5B each) }
+//!         lig_array: { cov_len u16, coverage[u16], class_count u16, per glyph: comp_count u16, anchors[comp_count*class_count] (5B each) }
+//!       n_context u16 | context: [n] * { is_chained u8, lookup_id u16, subtable_pos u16, cov_len u16, coverage[u16],
+//!         bt_present u8, [bt classdef], in_present u8, [in classdef], la_present u8, [la classdef],
+//!         rules_count u16, rules * { bt_len u16, bt_items(3B each), in_len u16, in_items, la_len u16, la_items, rec_count u16, records(4B each) },
+//!         cov_count u16, coverages[cov_count] * { cov_len u16, glyphs[u16] } }
+//!         match item: (kind u8, val u16) = 3 bytes; kind 0=glyph, 1=class, 2=coverage (val=index into coverages)
+//!         classdef: { fmt u8, _pad u8, count u16, start u16, data... } (same as format2)
+//!       gdef: gdef_count u16 | gdef_classes[gdef_count] * { gid u16, class u16 }
 
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::path::{Path, PathBuf};
@@ -56,7 +73,11 @@ const BGEO_MAGIC: &[u8; 4] = b"BGEO";
 // variable-font instances now get their own kern (e.g. SourceSerif4 Italic
 // f→o −25 at opsz=10 instead of 0 at the default instance). v22 tables are
 // stale and must be rebuilt.
-const BGEO_VERSION: u32 = 24;
+// v25 adds GPOS LookupTypes 3-8 (CursivePos, MarkBasePos, MarkLigPos,
+// MarkMarkPos, ContextPos, ChainedContextPos) plus GDEF glyph classes
+// (Finding 2): the cached predictor now applies cursive, mark, and
+// contextual positioning like HarfBuzz. v24 tables are stale.
+const BGEO_VERSION: u32 = 26;
 
 // ---------- BE helpers for OT parsing ----------
 #[inline]
@@ -117,6 +138,124 @@ fn pack_vals_4<W: std::io::Write>(w: &mut W, vals: &[i16;4], vf: u16) -> std::io
     if vf & 0x0002 != 0 { w.write_all(&vals[1].to_le_bytes())?; }
     if vf & 0x0004 != 0 { w.write_all(&vals[2].to_le_bytes())?; }
     if vf & 0x0008 != 0 { w.write_all(&vals[3].to_le_bytes())?; }
+    Ok(())
+}
+
+// ---------- Finding 2 (v25): BGEO writer helpers for LookupTypes 3-8 ----------
+// Anchor encoding: (present u8, x i16, y i16) = 5 bytes.
+fn write_anchor<W: std::io::Write>(w: &mut W, a: &Option<AnchorOwned>) -> std::io::Result<()> {
+    match a {
+        Some(AnchorOwned { x, y }) => {
+            w.write_all(&[1u8])?;
+            w.write_all(&x.to_le_bytes())?;
+            w.write_all(&y.to_le_bytes())?;
+        }
+        None => {
+            w.write_all(&[0u8])?;
+            w.write_all(&0i16.to_le_bytes())?;
+            w.write_all(&0i16.to_le_bytes())?;
+        }
+    }
+    Ok(())
+}
+
+fn write_mark_array<W: std::io::Write>(w: &mut W, ma: &MarkArrayOwned) -> std::io::Result<()> {
+    w.write_all(&(ma.coverage.len() as u16).to_le_bytes())?;
+    for gid in &ma.coverage { w.write_all(&gid.to_le_bytes())?; }
+    for (i, class) in ma.classes.iter().enumerate() {
+        w.write_all(&class.to_le_bytes())?;
+        let a: &Option<AnchorOwned> = ma.anchors.get(i).unwrap_or(&None);
+        write_anchor(w, a)?;
+    }
+    Ok(())
+}
+
+fn write_anchor_array<W: std::io::Write>(w: &mut W, aa: &AnchorArrayOwned) -> std::io::Result<()> {
+    w.write_all(&(aa.coverage.len() as u16).to_le_bytes())?;
+    for gid in &aa.coverage { w.write_all(&gid.to_le_bytes())?; }
+    w.write_all(&aa.class_count.to_le_bytes())?;
+    for row in &aa.anchors {
+        for a in row {
+            write_anchor(w, a)?;
+        }
+    }
+    Ok(())
+}
+
+fn write_ligature_array<W: std::io::Write>(w: &mut W, la: &LigatureArrayOwned) -> std::io::Result<()> {
+    w.write_all(&(la.coverage.len() as u16).to_le_bytes())?;
+    for gid in &la.coverage { w.write_all(&gid.to_le_bytes())?; }
+    w.write_all(&la.class_count.to_le_bytes())?;
+    for lig in &la.ligatures {
+        w.write_all(&(lig.len() as u16).to_le_bytes())?;
+        for comp in lig {
+            for a in comp {
+                write_anchor(w, a)?;
+            }
+        }
+    }
+    Ok(())
+}
+
+/// Write a ClassDefOwned in the same layout as the Format2 writer:
+/// fmt u8, pad u8, count u16, start u16, then data.
+fn write_class_def_owned<W: std::io::Write>(w: &mut W, cd: &ClassDefOwned) -> std::io::Result<()> {
+    match cd {
+        ClassDefOwned::Format1 { start, classes } => {
+            w.write_all(&[1u8, 0])?;
+            w.write_all(&(classes.len() as u16).to_le_bytes())?;
+            w.write_all(&start.to_le_bytes())?;
+            for c in classes { w.write_all(&c.to_le_bytes())?; }
+        }
+        ClassDefOwned::Format2 { ranges } => {
+            w.write_all(&[2u8, 0])?;
+            w.write_all(&(ranges.len() as u16).to_le_bytes())?;
+            w.write_all(&[0, 0])?;
+            for (s, e, c) in ranges {
+                w.write_all(&s.to_le_bytes())?;
+                w.write_all(&e.to_le_bytes())?;
+                w.write_all(&c.to_le_bytes())?;
+            }
+        }
+    }
+    Ok(())
+}
+
+/// Write one context rule's match-item sequence. Coverage items are
+/// deduplicated into the table's coverages list; `cov_map` maps a coverage
+/// glyph list to its index in that list.
+fn write_match_items<W: std::io::Write>(
+    w: &mut W,
+    items: &[MatchItem],
+    covs: &mut Vec<Vec<u16>>,
+    cov_map: &mut std::collections::HashMap<Vec<u16>, u16>,
+) -> std::io::Result<()> {
+    w.write_all(&(items.len() as u16).to_le_bytes())?;
+    for item in items {
+        match item {
+            MatchItem::Glyph(g) => {
+                w.write_all(&[0u8])?;
+                w.write_all(&g.to_le_bytes())?;
+            }
+            MatchItem::Class(c) => {
+                w.write_all(&[1u8])?;
+                w.write_all(&c.to_le_bytes())?;
+            }
+            MatchItem::Coverage(glyphs) => {
+                let idx = match cov_map.get(glyphs) {
+                    Some(&i) => i,
+                    None => {
+                        let i = covs.len() as u16;
+                        covs.push(glyphs.clone());
+                        cov_map.insert(glyphs.clone(), i);
+                        i
+                    }
+                };
+                w.write_all(&[2u8])?;
+                w.write_all(&idx.to_le_bytes())?;
+            }
+        }
+    }
     Ok(())
 }
 
@@ -459,6 +598,125 @@ struct Format2TableOwned {
     subtable_pos: u16,
 }
 
+/// An anchor point in font units (GPOS Anchor Format 1).
+/// Format 2 (anchor point index) is resolved to x/y at cache-build time
+/// from the glyph outline; Format 3 (device) uses its base x/y (device
+/// tables are ppem-dependent and do not apply to font-unit prediction).
+#[derive(Clone, Debug, PartialEq, Copy)]
+struct AnchorOwned { x: i16, y: i16 }
+
+/// MarkArray: per mark glyph, its mark class and anchor.
+#[derive(Clone, Debug, PartialEq)]
+struct MarkArrayOwned {
+    coverage: Vec<u16>,
+    classes: Vec<u16>, // mark class per coverage glyph
+    anchors: Vec<Option<AnchorOwned>>, // anchor per coverage glyph (None = NULL anchor)
+}
+
+/// BaseArray / Mark2Array: per base (or mark) glyph, one anchor per mark class.
+#[derive(Clone, Debug, PartialEq)]
+struct AnchorArrayOwned {
+    coverage: Vec<u16>,
+    class_count: u16,
+    // anchors[coverage_idx][class] — None = NULL anchor
+    anchors: Vec<Vec<Option<AnchorOwned>>>,
+}
+
+/// LigatureArray: per ligature glyph, per component, per mark class anchors.
+#[derive(Clone, Debug, PartialEq)]
+struct LigatureArrayOwned {
+    coverage: Vec<u16>,
+    class_count: u16,
+    // ligatures[coverage_idx] = per-component anchors; components[comp][class]
+    ligatures: Vec<Vec<Vec<Option<AnchorOwned>>>>,
+}
+
+/// CursivePos (type 3): per glyph, entry and exit anchors.
+#[derive(Clone, Debug, PartialEq)]
+struct CursiveTableOwned {
+    coverage: Vec<u16>,
+    entry: Vec<Option<AnchorOwned>>,
+    exit: Vec<Option<AnchorOwned>>,
+    lookup_id: u16,
+    subtable_pos: u16,
+}
+
+/// MarkBasePos (type 4).
+#[derive(Clone, Debug, PartialEq)]
+struct MarkBaseTableOwned {
+    mark_array: MarkArrayOwned,
+    base_array: AnchorArrayOwned,
+    lookup_id: u16,
+    subtable_pos: u16,
+}
+
+/// MarkLigPos (type 5).
+#[derive(Clone, Debug, PartialEq)]
+struct MarkLigTableOwned {
+    mark_array: MarkArrayOwned,
+    lig_array: LigatureArrayOwned,
+    lookup_id: u16,
+    subtable_pos: u16,
+}
+
+/// MarkMarkPos (type 6).
+#[derive(Clone, Debug, PartialEq)]
+struct MarkMarkTableOwned {
+    mark_array: MarkArrayOwned,
+    mark2_array: AnchorArrayOwned,
+    lookup_id: u16,
+    subtable_pos: u16,
+}
+
+/// A single match item in a context rule sequence.
+#[derive(Clone, Debug, PartialEq)]
+enum MatchItem {
+    Glyph(u16),
+    Class(u16),
+    Coverage(Vec<u16>), // sorted glyph list
+}
+
+/// One context/chained-context rule.
+#[derive(Clone, Debug, PartialEq)]
+struct ContextRuleOwned {
+    backtrack: Vec<MatchItem>,
+    input: Vec<MatchItem>,
+    lookahead: Vec<MatchItem>,
+    // (input sequence index, nested lookup index)
+    records: Vec<(u16, u16)>,
+}
+
+/// ContextPos (type 7) / ChainedContextPos (type 8).
+/// All three formats are normalized into `rules`. Class defs are only
+/// present for Format 2 (one per sequence kind); Format 1 uses Glyph items
+/// and Format 3 uses Coverage items.
+#[derive(Clone, Debug, PartialEq)]
+struct ContextTableOwned {
+    is_chained: bool,
+    coverage: Vec<u16>, // first-input-glyph coverage (Format 1/2); empty for Format 3
+    backtrack_class_def: Option<ClassDefOwned>,
+    input_class_def: Option<ClassDefOwned>,
+    lookahead_class_def: Option<ClassDefOwned>,
+    rules: Vec<ContextRuleOwned>,
+    lookup_id: u16,
+    subtable_pos: u16,
+}
+
+/// All GPOS tables parsed from one font (Finding 2: includes LookupTypes 3-8).
+struct GposParsed {
+    single_tables: Vec<SingleTableOwned>,
+    format1_tables: Vec<Format1TableOwned>,
+    format2_tables: Vec<Format2TableOwned>,
+    case_single_tables: Vec<SingleTableOwned>,
+    case_format1_tables: Vec<Format1TableOwned>,
+    case_format2_tables: Vec<Format2TableOwned>,
+    cursive_tables: Vec<CursiveTableOwned>,
+    mark_base_tables: Vec<MarkBaseTableOwned>,
+    mark_lig_tables: Vec<MarkLigTableOwned>,
+    mark_mark_tables: Vec<MarkMarkTableOwned>,
+    context_tables: Vec<ContextTableOwned>,
+}
+
 #[derive(Clone, Debug, PartialEq)]
 struct OwnedFont {
     file_hash: u64,
@@ -472,6 +730,15 @@ struct OwnedFont {
     case_single_tables: Vec<SingleTableOwned>,
     case_format1_tables: Vec<Format1TableOwned>,
     case_format2_tables: Vec<Format2TableOwned>,
+    // Finding 2: GPOS LookupTypes 3-8 (cursive, mark, context).
+    cursive_tables: Vec<CursiveTableOwned>,
+    mark_base_tables: Vec<MarkBaseTableOwned>,
+    mark_lig_tables: Vec<MarkLigTableOwned>,
+    mark_mark_tables: Vec<MarkMarkTableOwned>,
+    context_tables: Vec<ContextTableOwned>, // both type 7 and type 8 (is_chained flag)
+    // GDEF glyph classes: sorted (gid, class) for glyphs with non-zero class.
+    // class: 1=base, 2=ligature, 3=mark, 4=component.
+    gdef_classes: Vec<(u16, u16)>,
 }
 
 // ---------- Mmap index (runtime) ----------
@@ -559,6 +826,103 @@ struct SingleGroupIndex {
     entries: Vec<SingleEntryIndex>, // sorted by pos
 }
 
+// ---------- Finding 2: GPOS LookupTypes 3-8 mmap indices ----------
+// Anchor encoding in the mmap: (present u8, x i16, y i16) = 5 bytes.
+// present=0 means NULL anchor (x/y ignored).
+
+#[derive(Debug, Clone)]
+struct CursiveIndex {
+    coverage_off: usize,
+    coverage_len: usize,
+    // anchors_off: [coverage_len] * { entry(5B), exit(5B) } = 10 bytes each
+    anchors_off: usize,
+    lookup_id: u16,
+    subtable_pos: u16,
+}
+
+#[derive(Debug, Clone)]
+struct MarkArrayIndex {
+    coverage_off: usize,
+    coverage_len: usize,
+    // records_off: [coverage_len] * { class u16, anchor(5B) } = 7 bytes each
+    records_off: usize,
+}
+
+#[derive(Debug, Clone)]
+struct AnchorArrayIndex {
+    coverage_off: usize,
+    coverage_len: usize,
+    class_count: usize,
+    // anchors_off: [coverage_len * class_count] anchors (5 bytes each)
+    anchors_off: usize,
+}
+
+#[derive(Debug, Clone)]
+struct LigatureArrayIndex {
+    coverage_off: usize,
+    coverage_len: usize,
+    class_count: usize,
+    // lig_data_off: per coverage glyph: comp_count u16, then
+    // comp_count*class_count anchors (5 bytes each). Walk from the start.
+    lig_data_off: usize,
+    lig_data_len: usize,
+}
+
+#[derive(Debug, Clone)]
+struct MarkBaseIndex {
+    mark_array: MarkArrayIndex,
+    base_array: AnchorArrayIndex,
+    lookup_id: u16,
+    subtable_pos: u16,
+}
+
+#[derive(Debug, Clone)]
+struct MarkLigIndex {
+    mark_array: MarkArrayIndex,
+    lig_array: LigatureArrayIndex,
+    lookup_id: u16,
+    subtable_pos: u16,
+}
+
+#[derive(Debug, Clone)]
+struct MarkMarkIndex {
+    mark_array: MarkArrayIndex,
+    mark2_array: AnchorArrayIndex,
+    lookup_id: u16,
+    subtable_pos: u16,
+}
+
+// Context rule match item encoding: (kind u8, val u16) = 3 bytes.
+// kind: 0=glyph (val=gid), 1=class (val=class), 2=coverage (val=index into
+// the table's coverages list).
+#[derive(Debug, Clone)]
+struct ContextRuleIndex {
+    backtrack_off: usize, backtrack_len: usize,
+    input_off: usize, input_len: usize,
+    lookahead_off: usize, lookahead_len: usize,
+    records_off: usize, records_len: usize,
+}
+
+#[derive(Debug, Clone)]
+struct ContextTableIndex {
+    is_chained: bool,
+    coverage_off: usize,
+    coverage_len: usize,
+    backtrack_class_def: Option<ClassDefIndex>,
+    input_class_def: Option<ClassDefIndex>,
+    lookahead_class_def: Option<ClassDefIndex>,
+    rules: Vec<ContextRuleIndex>,
+    // coverages_off: flat region of coverage entries; each entry is
+    // (cov_len u16, glyphs[u16; cov_len]). cov_offsets holds [cov_count]
+    // u32 byte offsets (relative to coverages_off) of each coverage entry.
+    // (Owned in memory; the file stores only the flat region.)
+    coverages_off: usize,
+    cov_offsets: Vec<u32>,
+    cov_count: usize,
+    lookup_id: u16,
+    subtable_pos: u16,
+}
+
 // Helper for lookup-aware pair resolution: reference to either Format1 or Format2 subtable within a lookup.
 enum PairSubtableRef<'a> {
     F1(&'a Format1Index),
@@ -585,6 +949,14 @@ struct FontMmapIndex {
     single_groups: Vec<SingleGroupIndex>,
     case_single_groups: Vec<SingleGroupIndex>,
     pair_first_present_off: usize, // v18: offset in mmap of num_glyphs bytes, 1 if gid has any pair kern (always present)
+    // Finding 2 (v25): GPOS LookupTypes 3-8 + GDEF classes.
+    cursive_tables: Vec<CursiveIndex>,
+    mark_base_tables: Vec<MarkBaseIndex>,
+    mark_lig_tables: Vec<MarkLigIndex>,
+    mark_mark_tables: Vec<MarkMarkIndex>,
+    context_tables: Vec<ContextTableIndex>,
+    gdef_classes_off: usize, // [gdef_count] * { gid u16, class u16 } = 4 bytes each
+    gdef_classes_len: usize,
 }
 
 // ---------- Backward compat parse structs for test_gpos ----------
@@ -1023,6 +1395,461 @@ impl GeometryCache {
         res
     }
 
+    // ── Finding 2: GPOS LookupTypes 3-8 application ──
+    // These methods apply cursive, mark, and contextual positioning in the
+    // cached predictor so it matches HarfBuzz (the shaped path).
+
+    /// Read an anchor from the mmap at `off`. Returns Some((x, y)) in font
+    /// units when the anchor is present, None when NULL or out of bounds.
+    /// Anchor encoding: (present u8, x i16, y i16) = 5 bytes.
+    fn anchor_at(&self, off: usize) -> Option<(i16, i16)> {
+        let d = self.data();
+        if off + 5 > d.len() { return None; }
+        if d[off] == 0 { return None; }
+        let x = le_i16_at(d, off + 1);
+        let y = le_i16_at(d, off + 3);
+        Some((x, y))
+    }
+
+    /// GDEF glyph class for `gid` (1=base, 2=ligature, 3=mark, 4=component;
+    /// 0 = unclassified). Binary search over the sorted gdef_classes list.
+    fn gdef_class(&self, f: &FontMmapIndex, gid: u16) -> u16 {
+        let d = self.data();
+        let off = f.gdef_classes_off;
+        let n = f.gdef_classes_len;
+        let mut lo = 0usize;
+        let mut hi = n;
+        while lo < hi {
+            let mid = (lo + hi) / 2;
+            let o = off + mid * 4;
+            if o + 4 > d.len() { break; }
+            let g = le_u16_at(d, o);
+            if g < gid { lo = mid + 1; }
+            else if g > gid { hi = mid; }
+            else { return le_u16_at(d, o + 2); }
+        }
+        0
+    }
+
+    /// SinglePos value for one glyph from a specific lookup (Finding 2:
+    /// context nested lookups). First matching subtable of that lookup wins.
+    fn single_adjustment_for_lookup(&self, f: &FontMmapIndex, gid: u16, lookup_id: u16) -> [i32;4] {
+        let d = self.data();
+        let mut acc = [0i32;4];
+        let group = match f.single_groups.iter().find(|g| g.lookup_id == lookup_id) {
+            Some(g) => g,
+            None => return acc,
+        };
+        for entry in &group.entries {
+            let tbl = &f.single_tables[entry.idx as usize];
+            let idx_opt = if tbl.coverage_map_off != 0 {
+                let fast = self.coverage_index_fast(tbl.coverage_map_off, tbl.coverage_map_is_u8, gid);
+                match fast {
+                    Some(i) => Some(if tbl.is_single { 0 } else { i }),
+                    None => {
+                        if tbl.is_single {
+                            if self.coverage_contains(tbl.coverage_off, tbl.coverage_len, gid).is_none() { continue; }
+                            Some(0usize)
+                        } else {
+                            continue;
+                        }
+                    }
+                }
+            } else if tbl.is_single {
+                if self.coverage_contains(tbl.coverage_off, tbl.coverage_len, gid).is_none() { continue; }
+                Some(0usize)
+            } else {
+                self.coverage_contains(tbl.coverage_off, tbl.coverage_len, gid)
+            };
+            let idx = match idx_opt { Some(i) => i, None => continue };
+            let vf = tbl.value_format;
+            let sz = tbl.stride;
+            let off = tbl.values_off + idx * sz * 2;
+            if off + sz * 2 > d.len() { continue; }
+            let mut p = off;
+            if vf & 0x0001 != 0 { acc[0] += le_i16_at(d, p) as i32; p += 2; }
+            if vf & 0x0002 != 0 { acc[1] += le_i16_at(d, p) as i32; p += 2; }
+            if vf & 0x0004 != 0 { acc[2] += le_i16_at(d, p) as i32; p += 2; }
+            if vf & 0x0008 != 0 { acc[3] += le_i16_at(d, p) as i32; }
+            break; // first matching subtable per lookup wins
+        }
+        acc
+    }
+
+    /// PairPos values for one adjacent pair from a specific lookup
+    /// (Finding 2: context nested lookups). First matching subtable wins.
+    /// Straightforward lookup (no hash-map fast path); nested PairPos is
+    /// rare (16 refs in the whole catalog scan).
+    fn pair_adjustment_for_lookup(&self, f: &FontMmapIndex, gid1: u16, gid2: u16, lookup_id: u16) -> ([i32;4], [i32;4]) {
+        let d = self.data();
+        let mut v1_acc = [0i32;4];
+        let mut v2_acc = [0i32;4];
+        let group = match f.pair_groups.iter().find(|g| g.lookup_id == lookup_id) {
+            Some(g) => g,
+            None => return (v1_acc, v2_acc),
+        };
+        for entry in &group.entries {
+            if entry.is_f2 {
+                let tbl = &f.format2_tables[entry.idx as usize];
+                let cov_idx = match self.coverage_contains(tbl.coverage_off, tbl.coverage_len, gid1) {
+                    Some(i) => i,
+                    None => continue,
+                };
+                let _ = cov_idx;
+                let c1 = self.class_get(&tbl.class1_def, gid1);
+                let c2 = self.class_get(&tbl.class2_def, gid2);
+                if c1 >= tbl.class1_count || c2 >= tbl.class2_count { continue; }
+                let rec = c1 * tbl.class2_count + c2;
+                let sz = tbl.sz1 + tbl.sz2;
+                let off = tbl.matrix_off + rec * sz * 2;
+                if off + sz * 2 > d.len() { continue; }
+                let mut p = off;
+                let vf1 = tbl.val_fmt1;
+                if vf1 & 0x0001 != 0 { v1_acc[0] += le_i16_at(d, p) as i32; p += 2; }
+                if vf1 & 0x0002 != 0 { v1_acc[1] += le_i16_at(d, p) as i32; p += 2; }
+                if vf1 & 0x0004 != 0 { v1_acc[2] += le_i16_at(d, p) as i32; p += 2; }
+                if vf1 & 0x0008 != 0 { v1_acc[3] += le_i16_at(d, p) as i32; p += 2; }
+                let vf2 = tbl.val_fmt2;
+                if vf2 & 0x0001 != 0 { v2_acc[0] += le_i16_at(d, p) as i32; p += 2; }
+                if vf2 & 0x0002 != 0 { v2_acc[1] += le_i16_at(d, p) as i32; p += 2; }
+                if vf2 & 0x0004 != 0 { v2_acc[2] += le_i16_at(d, p) as i32; p += 2; }
+                if vf2 & 0x0008 != 0 { v2_acc[3] += le_i16_at(d, p) as i32; }
+                break;
+            } else {
+                let tbl = &f.format1_tables[entry.idx as usize];
+                let cov_idx = match self.coverage_contains(tbl.coverage_off, tbl.coverage_len, gid1) {
+                    Some(i) => i,
+                    None => continue,
+                };
+                let ps = &tbl.pair_sets[cov_idx];
+                let rec_size = 2 + tbl.sz1 * 2 + tbl.sz2 * 2;
+                // Linear scan (pair sets for nested lookups are small).
+                let mut found_off: Option<usize> = None;
+                for i in 0..ps.pair_count {
+                    let off = ps.pairs_off + i * rec_size;
+                    if off + 2 > d.len() { break; }
+                    if le_u16_at(d, off) == gid2 { found_off = Some(off); break; }
+                }
+                let off = match found_off { Some(o) => o, None => continue };
+                let mut p = off + 2;
+                let vf1 = tbl.val_fmt1;
+                if vf1 & 0x0001 != 0 { v1_acc[0] += le_i16_at(d, p) as i32; p += 2; }
+                if vf1 & 0x0002 != 0 { v1_acc[1] += le_i16_at(d, p) as i32; p += 2; }
+                if vf1 & 0x0004 != 0 { v1_acc[2] += le_i16_at(d, p) as i32; p += 2; }
+                if vf1 & 0x0008 != 0 { v1_acc[3] += le_i16_at(d, p) as i32; p += 2; }
+                let vf2 = tbl.val_fmt2;
+                if vf2 & 0x0001 != 0 { v2_acc[0] += le_i16_at(d, p) as i32; p += 2; }
+                if vf2 & 0x0002 != 0 { v2_acc[1] += le_i16_at(d, p) as i32; p += 2; }
+                if vf2 & 0x0004 != 0 { v2_acc[2] += le_i16_at(d, p) as i32; p += 2; }
+                if vf2 & 0x0008 != 0 { v2_acc[3] += le_i16_at(d, p) as i32; }
+                break;
+            }
+        }
+        (v1_acc, v2_acc)
+    }
+
+    /// Read one context match item's glyph list (for Coverage items) from
+    /// the mmap. Returns the glyph list for coverage index `cov_idx`.
+    fn context_coverage_glyphs(&self, tbl: &ContextTableIndex, cov_idx: u16) -> Vec<u16> {
+        let d = self.data();
+        let idx = cov_idx as usize;
+        if idx >= tbl.cov_offsets.len() { return Vec::new(); }
+        let off = tbl.coverages_off + tbl.cov_offsets[idx] as usize;
+        if off + 2 > d.len() { return Vec::new(); }
+        let len = le_u16_at(d, off) as usize;
+        let mut out = Vec::with_capacity(len);
+        for i in 0..len {
+            let o = off + 2 + i * 2;
+            if o + 2 > d.len() { break; }
+            out.push(le_u16_at(d, o));
+        }
+        out
+    }
+
+    /// Evaluate all ContextPos/ChainedContextPos tables against the glyph
+    /// sequence and return the nested SinglePos/PairPos adjustments to fold
+    /// into (singles, pair_firsts, pair_seconds). Tables are evaluated in
+    /// lookup order (their stored order). At each position, the first
+    /// matching rule wins (HarfBuzz applies the first matching rule per
+    /// lookup at each position); scanning then advances by one glyph.
+    fn context_adjustments(&self, f: &FontMmapIndex, gids: &[u16]) -> (Vec<[i32;4]>, Vec<[i32;4]>, Vec<[i32;4]>) {
+        let n = gids.len();
+        let mut singles = vec![[0i32;4]; n];
+        let mut pair_firsts = vec![[0i32;4]; n];
+        let mut pair_seconds = vec![[0i32;4]; n];
+        if n == 0 || f.context_tables.is_empty() { return (singles, pair_firsts, pair_seconds); }
+        for tbl in &f.context_tables {
+            for i in 0..n {
+                // Try each rule; first match wins for this lookup at this pos.
+                let mut matched: Option<&ContextRuleIndex> = None;
+                for rule in &tbl.rules {
+                    if !self.context_rule_matches(tbl, rule, gids, i) { continue; }
+                    matched = Some(rule);
+                    break;
+                }
+                let rule = match matched { Some(r) => r, None => continue };
+                // Apply nested lookups to the input positions.
+                let d = self.data();
+                for r in 0..rule.records_len {
+                    let o = rule.records_off + r * 4;
+                    if o + 4 > d.len() { continue; }
+                    let seq_idx = le_u16_at(d, o) as usize;
+                    let lk_idx = le_u16_at(d, o + 2);
+                    let pos = i + seq_idx;
+                    if pos >= n { continue; }
+                    // Nested SinglePos applies to glyph at pos; nested
+                    // PairPos applies to (pos, pos+1).
+                    let s = self.single_adjustment_for_lookup(f, gids[pos], lk_idx);
+                    for k in 0..4 { singles[pos][k] += s[k]; }
+                    if pos + 1 < n {
+                        let (v1, v2) = self.pair_adjustment_for_lookup(f, gids[pos], gids[pos + 1], lk_idx);
+                        for k in 0..4 {
+                            pair_firsts[pos][k] += v1[k];
+                            pair_seconds[pos + 1][k] += v2[k];
+                        }
+                    }
+                }
+            }
+        }
+        (singles, pair_firsts, pair_seconds)
+    }
+
+    /// Test whether a context rule matches at input position `i`.
+    /// Backtrack items match glyphs before `i` (in reverse order: the
+    /// first backtrack item is the glyph immediately before `i`).
+    /// Input items match starting at `i`. Lookahead items match after
+    /// the input sequence.
+    fn context_rule_matches(&self, tbl: &ContextTableIndex, rule: &ContextRuleIndex, gids: &[u16], i: usize) -> bool {
+        let n = gids.len();
+        // Input must fit.
+        if i + rule.input_len > n { return false; }
+        // Backtrack must fit (items before i).
+        if rule.backtrack_len > i { return false; }
+        // Lookahead must fit.
+        if i + rule.input_len + rule.lookahead_len > n { return false; }
+        // Backtrack: item 0 is the glyph immediately before i, item 1 is
+        // two before, etc. (OT backtrack sequences are stored in reverse
+        // order relative to the glyph sequence).
+        for b in 0..rule.backtrack_len {
+            let pos = i - 1 - b;
+            if !self.context_item_matches_at(tbl, rule.backtrack_off, rule.backtrack_len, b, gids, pos, &tbl.backtrack_class_def) {
+                return false;
+            }
+        }
+        // Input.
+        for k in 0..rule.input_len {
+            if !self.context_item_matches_at(tbl, rule.input_off, rule.input_len, k, gids, i + k, &tbl.input_class_def) {
+                return false;
+            }
+        }
+        // Lookahead.
+        for k in 0..rule.lookahead_len {
+            if !self.context_item_matches_at(tbl, rule.lookahead_off, rule.lookahead_len, k, gids, i + rule.input_len + k, &tbl.lookahead_class_def) {
+                return false;
+            }
+        }
+        true
+    }
+
+    /// Test one match item (at index `item_idx` in a sequence stored at
+    /// `seq_off` with `seq_len` items) against the glyph at `glyph_pos`.
+    fn context_item_matches_at(&self, tbl: &ContextTableIndex, seq_off: usize, seq_len: usize, item_idx: usize, gids: &[u16], glyph_pos: usize, class_def: &Option<ClassDefIndex>) -> bool {
+        let d = self.data();
+        if item_idx >= seq_len { return false; }
+        let o = seq_off + item_idx * 3;
+        if o + 3 > d.len() { return false; }
+        let kind = d[o];
+        let val = le_u16_at(d, o + 1);
+        let gid = match gids.get(glyph_pos) { Some(&g) => g, None => return false };
+        match kind {
+            0 => gid == val,
+            1 => {
+                let cd = match class_def { Some(c) => c, None => return false };
+                self.class_get(cd, gid) as u16 == val
+            }
+            2 => {
+                let glyphs = self.context_coverage_glyphs(tbl, val);
+                glyphs.binary_search(&gid).is_ok()
+            }
+            _ => false,
+        }
+    }
+
+    /// Apply mark (types 4/5/6) and cursive (type 3) positioning to the
+    /// predicted positions (Finding 2). `out` holds (cx, cy, y_min, y_max)
+    /// per glyph in font units (before center-span scaling); `bboxes` holds
+    /// (x0, x1, y0, y1) per glyph. Tables are applied in lookup order
+    /// (by lookup_id, then subtable_pos), matching HarfBuzz. Each
+    /// application sets the glyph's absolute anchor-aligned position, so a
+    /// later lookup targeting the same glyph wins.
+    ///
+    /// Anchor alignment (absolute): a mark's new center is
+    ///   base_anchor - mark_anchor + bbox_center,
+    /// where base_anchor is the base glyph's anchor in absolute font-unit
+    /// coordinates (from its adjusted center). The mark's own prior
+    /// placement cancels out, so SinglePos adjustments on the mark do not
+    /// disturb the alignment. Same for cursive: a glyph's new center is
+    ///   prev_exit_anchor - entry_anchor + bbox_center.
+    fn apply_mark_cursive(&self, f: &FontMmapIndex, gids: &[u16], bboxes: &[(f64, f64, f64, f64)], out: &mut [(f64, f64, f64, f64)]) {
+        let n = gids.len();
+        if n == 0 { return; }
+        // Merge all mark/cursive tables into lookup order.
+        #[derive(Clone, Copy)]
+        enum MC<'a> {
+            Cursive(&'a CursiveIndex),
+            MarkBase(&'a MarkBaseIndex),
+            MarkLig(&'a MarkLigIndex),
+            MarkMark(&'a MarkMarkIndex),
+        }
+        let mut ordered: Vec<(u16, u16, MC)> = Vec::new();
+        for t in &f.cursive_tables { ordered.push((t.lookup_id, t.subtable_pos, MC::Cursive(t))); }
+        for t in &f.mark_base_tables { ordered.push((t.lookup_id, t.subtable_pos, MC::MarkBase(t))); }
+        for t in &f.mark_lig_tables { ordered.push((t.lookup_id, t.subtable_pos, MC::MarkLig(t))); }
+        for t in &f.mark_mark_tables { ordered.push((t.lookup_id, t.subtable_pos, MC::MarkMark(t))); }
+        if ordered.is_empty() { return; }
+        ordered.sort_by_key(|(lid, pos, _)| (*lid, *pos));
+
+        // Absolute anchor of glyph j (its anchor at `anchor` in font units).
+        // Computed from its adjusted center: anchor = center - bbox_center + anchor.
+        let anchor_abs = |out: &[(f64, f64, f64, f64)], bboxes: &[(f64, f64, f64, f64)], j: usize, anchor: (i16, i16)| -> (f64, f64) {
+            let (cx, cy, _, _) = out[j];
+            let (x0, x1, y0, y1) = bboxes[j];
+            (cx - (x0 + x1) * 0.5 + anchor.0 as f64, cy - (y0 + y1) * 0.5 + anchor.1 as f64)
+        };
+
+        for (_, _, tbl) in ordered {
+            match tbl {
+                MC::Cursive(t) => {
+                    for i in 0..n.saturating_sub(1) {
+                        let idx_prev = match self.coverage_contains(t.coverage_off, t.coverage_len, gids[i]) { Some(x) => x, None => continue };
+                        let idx_cur = match self.coverage_contains(t.coverage_off, t.coverage_len, gids[i + 1]) { Some(x) => x, None => continue };
+                        let exit = self.anchor_at(t.anchors_off + idx_prev * 10 + 5);
+                        let entry = self.anchor_at(t.anchors_off + idx_cur * 10);
+                        let (Some(ex), Some(en)) = (exit, entry) else { continue };
+                        let (ax, ay) = anchor_abs(out, bboxes, i, ex);
+                        let (x0, x1, y0, y1) = bboxes[i + 1];
+                        let new_cx = ax - en.0 as f64 + (x0 + x1) * 0.5;
+                        let new_cy = ay - en.1 as f64 + (y0 + y1) * 0.5;
+                        let (_, _, oy_min, oy_max) = out[i + 1];
+                        let dy = new_cy - out[i + 1].1;
+                        out[i + 1] = (new_cx, new_cy, oy_min + dy, oy_max + dy);
+                    }
+                }
+                MC::MarkBase(t) => {
+                    for i in 0..n {
+                        let rec_idx = match self.coverage_contains(t.mark_array.coverage_off, t.mark_array.coverage_len, gids[i]) { Some(x) => x, None => continue };
+                        // Mark record: class u16, anchor (5B) at records_off + rec_idx*7.
+                        let d = self.data();
+                        let ro = t.mark_array.records_off + rec_idx * 7;
+                        if ro + 7 > d.len() { continue; }
+                        let class = le_u16_at(d, ro);
+                        let mark_anchor = self.anchor_at(ro + 2);
+                        let Some(ma) = mark_anchor else { continue };
+                        // Base = nearest preceding glyph with GDEF class 1
+                        // (base). Skip intervening marks (class 3).
+                        let mut j: Option<usize> = None;
+                        for k in (0..i).rev() {
+                            let c = self.gdef_class(f, gids[k]);
+                            if c == 3 { continue; }
+                            if c == 1 { j = Some(k); }
+                            break;
+                        }
+                        let j = match j { Some(x) => x, None => continue };
+                        // Base anchor for this mark class.
+                        let bidx = match self.coverage_contains(t.base_array.coverage_off, t.base_array.coverage_len, gids[j]) { Some(x) => x, None => continue };
+                        let cc = t.base_array.class_count;
+                        if (class as usize) >= cc { continue; }
+                        let base_anchor = self.anchor_at(t.base_array.anchors_off + (bidx * cc + class as usize) * 5);
+                        let Some(ba) = base_anchor else { continue };
+                        let (ax, ay) = anchor_abs(out, bboxes, j, ba);
+                        let (x0, x1, y0, y1) = bboxes[i];
+                        let new_cx = ax - ma.0 as f64 + (x0 + x1) * 0.5;
+                        let new_cy = ay - ma.1 as f64 + (y0 + y1) * 0.5;
+                        let (_, _, oy_min, oy_max) = out[i];
+                        let dy = new_cy - out[i].1;
+                        out[i] = (new_cx, new_cy, oy_min + dy, oy_max + dy);
+                    }
+                }
+                MC::MarkLig(t) => {
+                    for i in 0..n {
+                        let rec_idx = match self.coverage_contains(t.mark_array.coverage_off, t.mark_array.coverage_len, gids[i]) { Some(x) => x, None => continue };
+                        let d = self.data();
+                        let ro = t.mark_array.records_off + rec_idx * 7;
+                        if ro + 7 > d.len() { continue; }
+                        let class = le_u16_at(d, ro);
+                        let mark_anchor = self.anchor_at(ro + 2);
+                        let Some(ma) = mark_anchor else { continue };
+                        // Ligature = nearest preceding glyph with GDEF class 2.
+                        let mut j: Option<usize> = None;
+                        for k in (0..i).rev() {
+                            let c = self.gdef_class(f, gids[k]);
+                            if c == 3 { continue; }
+                            if c == 2 { j = Some(k); }
+                            break;
+                        }
+                        let j = match j { Some(x) => x, None => continue };
+                        // Ligature anchors: component 0 (the cached
+                        // predictor has no GSUB component mapping, so the
+                        // first component's anchors are used).
+                        let lig_idx = match self.coverage_contains(t.lig_array.coverage_off, t.lig_array.coverage_len, gids[j]) { Some(x) => x, None => continue };
+                        let cc = t.lig_array.class_count;
+                        if (class as usize) >= cc { continue; }
+                        // Walk lig_data to lig_idx's block: each block is
+                        // comp_count u16 then comp_count*cc anchors (5B).
+                        let mut p = t.lig_array.lig_data_off;
+                        let mut found: Option<usize> = None;
+                        for g in 0..=lig_idx {
+                            if p + 2 > d.len() { break; }
+                            let comp_count = le_u16_at(d, p) as usize;
+                            if g == lig_idx { found = Some(p + 2); break; }
+                            p += 2 + comp_count * cc * 5;
+                        }
+                        let block = match found { Some(b) => b, None => continue };
+                        // Component 0, class `class`: anchor at block + class*5.
+                        let lig_anchor = self.anchor_at(block + (class as usize) * 5);
+                        let Some(la) = lig_anchor else { continue };
+                        let (ax, ay) = anchor_abs(out, bboxes, j, la);
+                        let (x0, x1, y0, y1) = bboxes[i];
+                        let new_cx = ax - ma.0 as f64 + (x0 + x1) * 0.5;
+                        let new_cy = ay - ma.1 as f64 + (y0 + y1) * 0.5;
+                        let (_, _, oy_min, oy_max) = out[i];
+                        let dy = new_cy - out[i].1;
+                        out[i] = (new_cx, new_cy, oy_min + dy, oy_max + dy);
+                    }
+                }
+                MC::MarkMark(t) => {
+                    for i in 0..n {
+                        let rec_idx = match self.coverage_contains(t.mark_array.coverage_off, t.mark_array.coverage_len, gids[i]) { Some(x) => x, None => continue };
+                        let d = self.data();
+                        let ro = t.mark_array.records_off + rec_idx * 7;
+                        if ro + 7 > d.len() { continue; }
+                        let class = le_u16_at(d, ro);
+                        let mark_anchor = self.anchor_at(ro + 2);
+                        let Some(ma) = mark_anchor else { continue };
+                        // Mark2 = nearest preceding glyph with GDEF class 3.
+                        let mut j: Option<usize> = None;
+                        for k in (0..i).rev() {
+                            if self.gdef_class(f, gids[k]) == 3 { j = Some(k); break; }
+                        }
+                        let j = match j { Some(x) => x, None => continue };
+                        let bidx = match self.coverage_contains(t.mark2_array.coverage_off, t.mark2_array.coverage_len, gids[j]) { Some(x) => x, None => continue };
+                        let cc = t.mark2_array.class_count;
+                        if (class as usize) >= cc { continue; }
+                        let mark2_anchor = self.anchor_at(t.mark2_array.anchors_off + (bidx * cc + class as usize) * 5);
+                        let Some(m2a) = mark2_anchor else { continue };
+                        let (ax, ay) = anchor_abs(out, bboxes, j, m2a);
+                        let (x0, x1, y0, y1) = bboxes[i];
+                        let new_cx = ax - ma.0 as f64 + (x0 + x1) * 0.5;
+                        let new_cy = ay - ma.1 as f64 + (y0 + y1) * 0.5;
+                        let (_, _, oy_min, oy_max) = out[i];
+                        let dy = new_cy - out[i].1;
+                        out[i] = (new_cx, new_cy, oy_min + dy, oy_max + dy);
+                    }
+                }
+            }
+        }
+    }
+
     // ── v15 case/cpsp conditional application ──
     // OpenType `case` : shifts punctuation/symbols to align with caps when the run is all caps / caps+figures / punct between caps.
     // `cpsp` (capital spacing) is similar: extra spacing for all-caps runs.
@@ -1406,6 +2233,10 @@ impl GeometryCache {
             });
             return Some(empty);
         }
+        // Finding 2: context (types 7/8) nested SinglePos/PairPos, evaluated
+        // once here and folded into both paths' accumulators below.
+        let gids_u16: Vec<u16> = gids.iter().map(|g| g.unwrap()).collect();
+        let (ctx_singles, ctx_pair_firsts, ctx_pair_seconds) = self.context_adjustments(f, &gids_u16);
         // early case detection to avoid case Vec allocs for 99% path
         let apply_case = Self::is_all_caps_context(chars) && Self::is_allcaps_variant(font_key);
 
@@ -1469,11 +2300,21 @@ impl GeometryCache {
                     }
                 }
             }
+            // Finding 2: fold context (types 7/8) nested adjustments in.
+            for i in 0..n {
+                for k in 0..4 {
+                    singles[i][k] += ctx_singles[i][k];
+                    pair_firsts[i][k] += ctx_pair_firsts[i][k];
+                    pair_seconds[i][k] += ctx_pair_seconds[i][k];
+                }
+            }
             let mut out = Vec::with_capacity(n);
+            let mut bboxes: Vec<(f64,f64,f64,f64)> = Vec::with_capacity(n);
             let mut cursor = 0.0f64;
             for i in 0..n {
                 let gid = gids[i].unwrap() as usize;
                 let (adv, x0, x1, y0, y1) = self.glyph_metrics(f, gid)?;
+                bboxes.push((x0, x1, y0, y1));
                 let s = singles[i];
                 let pf = pair_firsts[i];
                 let ps = pair_seconds[i];
@@ -1502,6 +2343,8 @@ impl GeometryCache {
                 out.push((cx,cy,y_min_a,y_max_a));
                 cursor += total_adv;
             }
+            // Finding 2: mark (types 4/5/6) and cursive (type 3) positioning.
+            self.apply_mark_cursive(f, &gids_u16, &bboxes, &mut out);
             PRED_CACHE.with(|c| {
                 let mut m = c.borrow_mut();
                 if m.len() > 2048 { m.clear(); }
@@ -1563,11 +2406,21 @@ impl GeometryCache {
                     }
                 }
             }
+            // Finding 2: fold context (types 7/8) nested adjustments in.
+            for i in 0..n {
+                for k in 0..4 {
+                    singles[i][k] += ctx_singles[i][k];
+                    pair_firsts[i][k] += ctx_pair_firsts[i][k];
+                    pair_seconds[i][k] += ctx_pair_seconds[i][k];
+                }
+            }
             let mut out = Vec::with_capacity(n);
+            let mut bboxes: Vec<(f64,f64,f64,f64)> = Vec::with_capacity(n);
             let mut cursor = 0.0f64;
             for i in 0..n {
                 let gid = gids[i].unwrap() as usize;
                 let (adv, x0, x1, y0, y1) = self.glyph_metrics(f, gid)?;
+                bboxes.push((x0, x1, y0, y1));
                 let s = singles[i];
                 let pf = pair_firsts[i];
                 let ps = pair_seconds[i];
@@ -1596,6 +2449,8 @@ impl GeometryCache {
                 out.push((cx,cy,y_min_a,y_max_a));
                 cursor += total_adv;
             }
+            // Finding 2: mark (types 4/5/6) and cursive (type 3) positioning.
+            self.apply_mark_cursive(f, &gids_u16, &bboxes, &mut out);
             PRED_CACHE.with(|c| {
                 let mut m = c.borrow_mut();
                 if m.len() > 2048 { m.clear(); }
@@ -1929,6 +2784,184 @@ impl GeometryCache {
             });
         }
 
+        // ── Finding 2 (v25): GPOS LookupTypes 3-8 + GDEF classes ──
+        let read_coverage = |off: usize, len: usize| -> Vec<u16> {
+            let mut cov = Vec::with_capacity(len);
+            for i in 0..len {
+                let o = off + i * 2;
+                if o + 2 > d.len() { break; }
+                cov.push(le_u16_at(d, o));
+            }
+            cov
+        };
+        let read_class_def_owned = |cd: &ClassDefIndex| -> ClassDefOwned {
+            match cd {
+                ClassDefIndex::Format1 { start, count, classes_off } => {
+                    let mut classes = Vec::with_capacity(*count);
+                    for i in 0..*count {
+                        let o = *classes_off + i * 2;
+                        if o + 2 > d.len() { break; }
+                        classes.push(le_u16_at(d, o));
+                    }
+                    ClassDefOwned::Format1 { start: *start, classes }
+                }
+                ClassDefIndex::Format2 { count, ranges_off } => {
+                    let mut ranges = Vec::with_capacity(*count);
+                    for i in 0..*count {
+                        let o = *ranges_off + i * 6;
+                        if o + 6 > d.len() { break; }
+                        ranges.push((le_u16_at(d, o), le_u16_at(d, o + 2), le_u16_at(d, o + 4)));
+                    }
+                    ClassDefOwned::Format2 { ranges }
+                }
+            }
+        };
+        let mut cursive_tables = Vec::with_capacity(findex.cursive_tables.len());
+        for tbl in &findex.cursive_tables {
+            let coverage = read_coverage(tbl.coverage_off, tbl.coverage_len);
+            let mut entry = Vec::with_capacity(tbl.coverage_len);
+            let mut exit = Vec::with_capacity(tbl.coverage_len);
+            for i in 0..tbl.coverage_len {
+                entry.push(self.anchor_at(tbl.anchors_off + i * 10).map(|(x, y)| AnchorOwned { x, y }));
+                exit.push(self.anchor_at(tbl.anchors_off + i * 10 + 5).map(|(x, y)| AnchorOwned { x, y }));
+            }
+            cursive_tables.push(CursiveTableOwned { coverage, entry, exit, lookup_id: tbl.lookup_id, subtable_pos: tbl.subtable_pos });
+        }
+        let read_mark_array = |ma: &MarkArrayIndex| -> MarkArrayOwned {
+            let coverage = read_coverage(ma.coverage_off, ma.coverage_len);
+            let mut classes = Vec::with_capacity(ma.coverage_len);
+            let mut anchors = Vec::with_capacity(ma.coverage_len);
+            for i in 0..ma.coverage_len {
+                let ro = ma.records_off + i * 7;
+                if ro + 7 > d.len() { break; }
+                classes.push(le_u16_at(d, ro));
+                anchors.push(self.anchor_at(ro + 2).map(|(x, y)| AnchorOwned { x, y }));
+            }
+            MarkArrayOwned { coverage, classes, anchors }
+        };
+        let read_anchor_array = |aa: &AnchorArrayIndex| -> AnchorArrayOwned {
+            let coverage = read_coverage(aa.coverage_off, aa.coverage_len);
+            let mut anchors = Vec::with_capacity(aa.coverage_len);
+            for i in 0..aa.coverage_len {
+                let mut row = Vec::with_capacity(aa.class_count);
+                for j in 0..aa.class_count {
+                    row.push(self.anchor_at(aa.anchors_off + (i * aa.class_count + j) * 5).map(|(x, y)| AnchorOwned { x, y }));
+                }
+                anchors.push(row);
+            }
+            AnchorArrayOwned { coverage, class_count: aa.class_count as u16, anchors }
+        };
+        let read_ligature_array = |la: &LigatureArrayIndex| -> LigatureArrayOwned {
+            let coverage = read_coverage(la.coverage_off, la.coverage_len);
+            let mut ligatures = Vec::with_capacity(la.coverage_len);
+            let mut p = la.lig_data_off;
+            for _ in 0..la.coverage_len {
+                if p + 2 > d.len() { break; }
+                let comp_count = le_u16_at(d, p) as usize;
+                p += 2;
+                let mut comps = Vec::with_capacity(comp_count);
+                for _ in 0..comp_count {
+                    let mut row = Vec::with_capacity(la.class_count);
+                    for _ in 0..la.class_count {
+                        row.push(self.anchor_at(p).map(|(x, y)| AnchorOwned { x, y }));
+                        p += 5;
+                    }
+                    comps.push(row);
+                }
+                ligatures.push(comps);
+            }
+            LigatureArrayOwned { coverage, class_count: la.class_count as u16, ligatures }
+        };
+        let mut mark_base_tables = Vec::with_capacity(findex.mark_base_tables.len());
+        for tbl in &findex.mark_base_tables {
+            mark_base_tables.push(MarkBaseTableOwned {
+                mark_array: read_mark_array(&tbl.mark_array),
+                base_array: read_anchor_array(&tbl.base_array),
+                lookup_id: tbl.lookup_id,
+                subtable_pos: tbl.subtable_pos,
+            });
+        }
+        let mut mark_lig_tables = Vec::with_capacity(findex.mark_lig_tables.len());
+        for tbl in &findex.mark_lig_tables {
+            mark_lig_tables.push(MarkLigTableOwned {
+                mark_array: read_mark_array(&tbl.mark_array),
+                lig_array: read_ligature_array(&tbl.lig_array),
+                lookup_id: tbl.lookup_id,
+                subtable_pos: tbl.subtable_pos,
+            });
+        }
+        let mut mark_mark_tables = Vec::with_capacity(findex.mark_mark_tables.len());
+        for tbl in &findex.mark_mark_tables {
+            mark_mark_tables.push(MarkMarkTableOwned {
+                mark_array: read_mark_array(&tbl.mark_array),
+                mark2_array: read_anchor_array(&tbl.mark2_array),
+                lookup_id: tbl.lookup_id,
+                subtable_pos: tbl.subtable_pos,
+            });
+        }
+        let mut context_tables = Vec::with_capacity(findex.context_tables.len());
+        for tbl in &findex.context_tables {
+            let coverage = read_coverage(tbl.coverage_off, tbl.coverage_len);
+            let bt_cd = tbl.backtrack_class_def.as_ref().map(|c| read_class_def_owned(c));
+            let in_cd = tbl.input_class_def.as_ref().map(|c| read_class_def_owned(c));
+            let la_cd = tbl.lookahead_class_def.as_ref().map(|c| read_class_def_owned(c));
+            let mut covs: Vec<Vec<u16>> = Vec::with_capacity(tbl.cov_count);
+            for &coff in &tbl.cov_offsets {
+                let o = tbl.coverages_off + coff as usize;
+                if o + 2 > d.len() { break; }
+                let len = le_u16_at(d, o) as usize;
+                covs.push(read_coverage(o + 2, len));
+            }
+            let mut rules = Vec::with_capacity(tbl.rules.len());
+            for rule in &tbl.rules {
+                let read_items = |off: usize, len: usize| -> Vec<MatchItem> {
+                    let mut items = Vec::with_capacity(len);
+                    for i in 0..len {
+                        let o = off + i * 3;
+                        if o + 3 > d.len() { break; }
+                        let kind = d[o];
+                        let val = le_u16_at(d, o + 1);
+                        match kind {
+                            0 => items.push(MatchItem::Glyph(val)),
+                            1 => items.push(MatchItem::Class(val)),
+                            2 => {
+                                let glyphs = covs.get(val as usize).cloned().unwrap_or_default();
+                                items.push(MatchItem::Coverage(glyphs));
+                            }
+                            _ => {}
+                        }
+                    }
+                    items
+                };
+                let backtrack = read_items(rule.backtrack_off, rule.backtrack_len);
+                let input = read_items(rule.input_off, rule.input_len);
+                let lookahead = read_items(rule.lookahead_off, rule.lookahead_len);
+                let mut records = Vec::with_capacity(rule.records_len);
+                for r in 0..rule.records_len {
+                    let o = rule.records_off + r * 4;
+                    if o + 4 > d.len() { break; }
+                    records.push((le_u16_at(d, o), le_u16_at(d, o + 2)));
+                }
+                rules.push(ContextRuleOwned { backtrack, input, lookahead, records });
+            }
+            context_tables.push(ContextTableOwned {
+                is_chained: tbl.is_chained,
+                coverage,
+                backtrack_class_def: bt_cd,
+                input_class_def: in_cd,
+                lookahead_class_def: la_cd,
+                rules,
+                lookup_id: tbl.lookup_id,
+                subtable_pos: tbl.subtable_pos,
+            });
+        }
+        let mut gdef_classes = Vec::with_capacity(findex.gdef_classes_len);
+        for i in 0..findex.gdef_classes_len {
+            let o = findex.gdef_classes_off + i * 4;
+            if o + 4 > d.len() { break; }
+            gdef_classes.push((le_u16_at(d, o), le_u16_at(d, o + 2)));
+        }
+
         OwnedFont {
             file_hash: findex.file_hash,
             units_per_em: findex.upem,
@@ -1941,6 +2974,12 @@ impl GeometryCache {
             case_single_tables,
             case_format1_tables,
             case_format2_tables,
+            cursive_tables,
+            mark_base_tables,
+            mark_lig_tables,
+            mark_mark_tables,
+            context_tables,
+            gdef_classes,
         }
     }
 
@@ -2013,6 +3052,12 @@ impl GeometryCache {
                         case_single_tables: old.case_single_tables.clone(),
                         case_format1_tables: old.case_format1_tables.clone(),
                         case_format2_tables: old.case_format2_tables.clone(),
+                        cursive_tables: old.cursive_tables.clone(),
+                        mark_base_tables: old.mark_base_tables.clone(),
+                        mark_lig_tables: old.mark_lig_tables.clone(),
+                        mark_mark_tables: old.mark_mark_tables.clone(),
+                        context_tables: old.context_tables.clone(),
+                        gdef_classes: old.gdef_classes.clone(),
                     });
                     n_reused += 1;
                     continue;
@@ -2114,6 +3159,18 @@ impl GeometryCache {
             let mut case_single_tables: Vec<SingleTableOwned> = Vec::new();
             let mut case_format1_tables: Vec<Format1TableOwned> = Vec::new();
             let mut case_format2_tables: Vec<Format2TableOwned> = Vec::new();
+            // Finding 2: GPOS LookupTypes 3-8.
+            let mut cursive_tables: Vec<CursiveTableOwned> = Vec::new();
+            let mut mark_base_tables: Vec<MarkBaseTableOwned> = Vec::new();
+            let mut mark_lig_tables: Vec<MarkLigTableOwned> = Vec::new();
+            let mut mark_mark_tables: Vec<MarkMarkTableOwned> = Vec::new();
+            let mut context_tables: Vec<ContextTableOwned> = Vec::new();
+            // Finding 2: GDEF glyph classes (1=base, 2=ligature, 3=mark, 4=component).
+            // Only non-zero classes are stored, sorted by gid.
+            let mut gdef_classes: Vec<(u16, u16)> = Vec::new();
+            if let Some(gdef_data) = ttf_face.raw_face().table(unprint_fonts::ttf_parser::Tag::from_bytes(b"GDEF")) {
+                gdef_classes = Self::parse_gdef_classes(gdef_data, num_glyphs);
+            }
 
             if let Some(gpos_data) = ttf_face.raw_face().table(unprint_fonts::ttf_parser::Tag::from_bytes(b"GPOS")) {
                 // Variation context (Finding 1): GPOS value records in a
@@ -2125,13 +3182,18 @@ impl GeometryCache {
                     let gdef_data = ttf_face.raw_face().table(unprint_fonts::ttf_parser::Tag::from_bytes(b"GDEF"));
                     VarStoreCtx::from_tables(Some(gpos_data), gdef_data, &ttf_face, vars)
                 });
-                if let Some((s_tbls, f1_tbls, f2_tbls, cs_tbls, cf1_tbls, cf2_tbls)) = Self::parse_gpos_full(gpos_data, num_glyphs, var_ctx.as_ref()) {
-                    single_tables = s_tbls;
-                    format1_tables = f1_tbls;
-                    format2_tables = f2_tbls;
-                    case_single_tables = cs_tbls;
-                    case_format1_tables = cf1_tbls;
-                    case_format2_tables = cf2_tbls;
+                if let Some(parsed) = Self::parse_gpos_full(gpos_data, num_glyphs, var_ctx.as_ref()) {
+                    single_tables = parsed.single_tables;
+                    format1_tables = parsed.format1_tables;
+                    format2_tables = parsed.format2_tables;
+                    case_single_tables = parsed.case_single_tables;
+                    case_format1_tables = parsed.case_format1_tables;
+                    case_format2_tables = parsed.case_format2_tables;
+                    cursive_tables = parsed.cursive_tables;
+                    mark_base_tables = parsed.mark_base_tables;
+                    mark_lig_tables = parsed.mark_lig_tables;
+                    mark_mark_tables = parsed.mark_mark_tables;
+                    context_tables = parsed.context_tables;
                 }
             }
 
@@ -2169,7 +3231,7 @@ impl GeometryCache {
             }
 
             let fk_clone = font_key.clone();
-            owned_fonts.insert(font_key, OwnedFont { file_hash: fhash, units_per_em: upem, num_glyphs, glyphs, cmap, single_tables, format1_tables, format2_tables, case_single_tables, case_format1_tables, case_format2_tables });
+            owned_fonts.insert(font_key, OwnedFont { file_hash: fhash, units_per_em: upem, num_glyphs, glyphs, cmap, single_tables, format1_tables, format2_tables, case_single_tables, case_format1_tables, case_format2_tables, cursive_tables, mark_base_tables, mark_lig_tables, mark_mark_tables, context_tables, gdef_classes });
             n_built+=1;
             if !quiet && (n_built == 1 || n_built % 500 == 0 || n_built == total_to_build) {
                 let elapsed = t_build_start.elapsed().as_secs_f64();
@@ -2720,6 +3782,108 @@ impl GeometryCache {
                         }
                     }
                 }
+                // ── v25 (Finding 2): GPOS LookupTypes 3-8 + GDEF classes ──
+                // cursive tables
+                w.write_all(&(of.cursive_tables.len() as u16).to_le_bytes())?;
+                for tbl in &of.cursive_tables {
+                    w.write_all(&(tbl.coverage.len() as u16).to_le_bytes())?;
+                    w.write_all(&tbl.lookup_id.to_le_bytes())?;
+                    w.write_all(&tbl.subtable_pos.to_le_bytes())?;
+                    for gid in &tbl.coverage { w.write_all(&gid.to_le_bytes())?; }
+                    for i in 0..tbl.coverage.len() {
+                        let e: &Option<AnchorOwned> = tbl.entry.get(i).unwrap_or(&None);
+                        let x: &Option<AnchorOwned> = tbl.exit.get(i).unwrap_or(&None);
+                        write_anchor(&mut w, e)?;
+                        write_anchor(&mut w, x)?;
+                    }
+                }
+                // mark-base tables
+                w.write_all(&(of.mark_base_tables.len() as u16).to_le_bytes())?;
+                for tbl in &of.mark_base_tables {
+                    w.write_all(&tbl.lookup_id.to_le_bytes())?;
+                    w.write_all(&tbl.subtable_pos.to_le_bytes())?;
+                    write_mark_array(&mut w, &tbl.mark_array)?;
+                    write_anchor_array(&mut w, &tbl.base_array)?;
+                }
+                // mark-lig tables
+                w.write_all(&(of.mark_lig_tables.len() as u16).to_le_bytes())?;
+                for tbl in &of.mark_lig_tables {
+                    w.write_all(&tbl.lookup_id.to_le_bytes())?;
+                    w.write_all(&tbl.subtable_pos.to_le_bytes())?;
+                    write_mark_array(&mut w, &tbl.mark_array)?;
+                    write_ligature_array(&mut w, &tbl.lig_array)?;
+                }
+                // mark-mark tables
+                w.write_all(&(of.mark_mark_tables.len() as u16).to_le_bytes())?;
+                for tbl in &of.mark_mark_tables {
+                    w.write_all(&tbl.lookup_id.to_le_bytes())?;
+                    w.write_all(&tbl.subtable_pos.to_le_bytes())?;
+                    write_mark_array(&mut w, &tbl.mark_array)?;
+                    write_anchor_array(&mut w, &tbl.mark2_array)?;
+                }
+                // context tables (types 7 and 8)
+                w.write_all(&(of.context_tables.len() as u16).to_le_bytes())?;
+                for tbl in &of.context_tables {
+                    w.write_all(&[if tbl.is_chained { 1u8 } else { 0u8 }])?;
+                    w.write_all(&tbl.lookup_id.to_le_bytes())?;
+                    w.write_all(&tbl.subtable_pos.to_le_bytes())?;
+                    w.write_all(&(tbl.coverage.len() as u16).to_le_bytes())?;
+                    for gid in &tbl.coverage { w.write_all(&gid.to_le_bytes())?; }
+                    // class defs (Format 2 only; absent for Format 1/3)
+                    match &tbl.backtrack_class_def {
+                        Some(cd) => { w.write_all(&[1u8])?; write_class_def_owned(&mut w, cd)?; }
+                        None => { w.write_all(&[0u8])?; }
+                    }
+                    match &tbl.input_class_def {
+                        Some(cd) => { w.write_all(&[1u8])?; write_class_def_owned(&mut w, cd)?; }
+                        None => { w.write_all(&[0u8])?; }
+                    }
+                    match &tbl.lookahead_class_def {
+                        Some(cd) => { w.write_all(&[1u8])?; write_class_def_owned(&mut w, cd)?; }
+                        None => { w.write_all(&[0u8])?; }
+                    }
+                    // Deduplicated coverage lists for MatchItem::Coverage.
+                    let mut covs: Vec<Vec<u16>> = Vec::new();
+                    let mut cov_map: std::collections::HashMap<Vec<u16>, u16> = std::collections::HashMap::new();
+                    // First pass: collect coverages (write_match_items dedupes
+                    // on the fly, but the coverages section must come after
+                    // the rules, so pre-collect here).
+                    for rule in &tbl.rules {
+                        for seq in [&rule.backtrack, &rule.input, &rule.lookahead] {
+                            for item in seq {
+                                if let MatchItem::Coverage(glyphs) = item {
+                                    if !cov_map.contains_key(glyphs) {
+                                        let i = covs.len() as u16;
+                                        covs.push(glyphs.clone());
+                                        cov_map.insert(glyphs.clone(), i);
+                                    }
+                                }
+                            }
+                        }
+                    }
+                    w.write_all(&(tbl.rules.len() as u16).to_le_bytes())?;
+                    for rule in &tbl.rules {
+                        write_match_items(&mut w, &rule.backtrack, &mut covs, &mut cov_map)?;
+                        write_match_items(&mut w, &rule.input, &mut covs, &mut cov_map)?;
+                        write_match_items(&mut w, &rule.lookahead, &mut covs, &mut cov_map)?;
+                        w.write_all(&(rule.records.len() as u16).to_le_bytes())?;
+                        for (seq_idx, lk_idx) in &rule.records {
+                            w.write_all(&seq_idx.to_le_bytes())?;
+                            w.write_all(&lk_idx.to_le_bytes())?;
+                        }
+                    }
+                    w.write_all(&(covs.len() as u16).to_le_bytes())?;
+                    for glyphs in &covs {
+                        w.write_all(&(glyphs.len() as u16).to_le_bytes())?;
+                        for gid in glyphs { w.write_all(&gid.to_le_bytes())?; }
+                    }
+                }
+                // GDEF glyph classes (sorted (gid, class), non-zero only)
+                w.write_all(&(of.gdef_classes.len() as u16).to_le_bytes())?;
+                for (gid, class) in &of.gdef_classes {
+                    w.write_all(&gid.to_le_bytes())?;
+                    w.write_all(&class.to_le_bytes())?;
+                }
             }
         }
         w.flush()?; drop(w); std::fs::rename(&tmp, path)?; Ok(())
@@ -2771,6 +3935,13 @@ impl GeometryCache {
                     single_groups: cloned.single_groups.clone(),
                     case_single_groups: cloned.case_single_groups.clone(),
                     pair_first_present_off: cloned.pair_first_present_off,
+                    cursive_tables: cloned.cursive_tables.clone(),
+                    mark_base_tables: cloned.mark_base_tables.clone(),
+                    mark_lig_tables: cloned.mark_lig_tables.clone(),
+                    mark_mark_tables: cloned.mark_mark_tables.clone(),
+                    context_tables: cloned.context_tables.clone(),
+                    gdef_classes_off: cloned.gdef_classes_off,
+                    gdef_classes_len: cloned.gdef_classes_len,
                 });
                 // need to push same clone into ordered for future alias chaining
                 ordered.push(ordered[target].clone());
@@ -3194,7 +4365,207 @@ impl GeometryCache {
                 }
             }
 
-            let idx = FontMmapIndex { file_hash, upem, num_glyphs, glyphs_off, cmap_off, cmap_len, single_tables, format1_tables: f1_tables, format2_tables: f2_tables, case_single_tables, case_format1_tables: case_f1_tables, case_format2_tables: case_f2_tables, pair_groups, case_pair_groups, single_groups, case_single_groups, pair_first_present_off };
+            // ── v25 (Finding 2): GPOS LookupTypes 3-8 + GDEF classes ──
+            // Helper: read a ClassDefIndex (same layout as the Format2 writer).
+            fn read_class_def_index(data: &[u8], pos: &mut usize) -> Result<ClassDefIndex, String> {
+                if *pos + 2 > data.len() { return Err("trunc v25 classdef fmt".into()); }
+                let fmt = data[*pos]; *pos += 2;
+                if *pos + 2 > data.len() { return Err("trunc v25 classdef cnt".into()); }
+                let cnt = u16::from_le_bytes(data[*pos..*pos+2].try_into().unwrap()) as usize; *pos += 2;
+                if *pos + 2 > data.len() { return Err("trunc v25 classdef start".into()); }
+                let start = u16::from_le_bytes(data[*pos..*pos+2].try_into().unwrap()); *pos += 2;
+                if fmt == 1 {
+                    let classes_off = *pos;
+                    if *pos + cnt * 2 > data.len() { return Err("trunc v25 classdef classes".into()); }
+                    *pos += cnt * 2;
+                    Ok(ClassDefIndex::Format1 { start, count: cnt, classes_off })
+                } else {
+                    let ranges_off = *pos;
+                    if *pos + cnt * 6 > data.len() { return Err("trunc v25 classdef ranges".into()); }
+                    *pos += cnt * 6;
+                    Ok(ClassDefIndex::Format2 { count: cnt, ranges_off })
+                }
+            }
+            // Helper: read a MarkArrayIndex.
+            fn read_mark_array_index(data: &[u8], pos: &mut usize) -> Result<MarkArrayIndex, String> {
+                if *pos + 2 > data.len() { return Err("trunc v25 mark_array cov_len".into()); }
+                let cov_len = u16::from_le_bytes(data[*pos..*pos+2].try_into().unwrap()) as usize; *pos += 2;
+                let coverage_off = *pos;
+                if *pos + cov_len * 2 > data.len() { return Err("trunc v25 mark_array coverage".into()); }
+                *pos += cov_len * 2;
+                let records_off = *pos;
+                // Each record: class u16 + anchor(5B) = 7 bytes.
+                if *pos + cov_len * 7 > data.len() { return Err("trunc v25 mark_array records".into()); }
+                *pos += cov_len * 7;
+                Ok(MarkArrayIndex { coverage_off, coverage_len: cov_len, records_off })
+            }
+            // Helper: read an AnchorArrayIndex (BaseArray / Mark2Array).
+            fn read_anchor_array_index(data: &[u8], pos: &mut usize) -> Result<AnchorArrayIndex, String> {
+                if *pos + 2 > data.len() { return Err("trunc v25 anchor_array cov_len".into()); }
+                let cov_len = u16::from_le_bytes(data[*pos..*pos+2].try_into().unwrap()) as usize; *pos += 2;
+                let coverage_off = *pos;
+                if *pos + cov_len * 2 > data.len() { return Err("trunc v25 anchor_array coverage".into()); }
+                *pos += cov_len * 2;
+                if *pos + 2 > data.len() { return Err("trunc v25 anchor_array class_count".into()); }
+                let class_count = u16::from_le_bytes(data[*pos..*pos+2].try_into().unwrap()) as usize; *pos += 2;
+                let anchors_off = *pos;
+                if *pos + cov_len * class_count * 5 > data.len() { return Err("trunc v25 anchor_array anchors".into()); }
+                *pos += cov_len * class_count * 5;
+                Ok(AnchorArrayIndex { coverage_off, coverage_len: cov_len, class_count, anchors_off })
+            }
+            // Cursive tables.
+            if pos + 2 > data.len() { return Err("trunc v25 n_cursive".into()); }
+            let n_cursive = u16::from_le_bytes(data[pos..pos+2].try_into().unwrap()) as usize; pos += 2;
+            let mut cursive_tables = Vec::with_capacity(n_cursive);
+            for _ in 0..n_cursive {
+                if pos + 6 > data.len() { return Err("trunc v25 cursive hdr".into()); }
+                let cov_len = u16::from_le_bytes(data[pos..pos+2].try_into().unwrap()) as usize; pos += 2;
+                let lookup_id = u16::from_le_bytes(data[pos..pos+2].try_into().unwrap()); pos += 2;
+                let subtable_pos = u16::from_le_bytes(data[pos..pos+2].try_into().unwrap()); pos += 2;
+                let coverage_off = pos;
+                if pos + cov_len * 2 > data.len() { return Err("trunc v25 cursive coverage".into()); }
+                pos += cov_len * 2;
+                let anchors_off = pos;
+                if pos + cov_len * 10 > data.len() { return Err("trunc v25 cursive anchors".into()); }
+                pos += cov_len * 10;
+                cursive_tables.push(CursiveIndex { coverage_off, coverage_len: cov_len, anchors_off, lookup_id, subtable_pos });
+            }
+            // MarkBase tables.
+            if pos + 2 > data.len() { return Err("trunc v25 n_mark_base".into()); }
+            let n_mark_base = u16::from_le_bytes(data[pos..pos+2].try_into().unwrap()) as usize; pos += 2;
+            let mut mark_base_tables = Vec::with_capacity(n_mark_base);
+            for _ in 0..n_mark_base {
+                if pos + 4 > data.len() { return Err("trunc v25 mark_base hdr".into()); }
+                let lookup_id = u16::from_le_bytes(data[pos..pos+2].try_into().unwrap()); pos += 2;
+                let subtable_pos = u16::from_le_bytes(data[pos..pos+2].try_into().unwrap()); pos += 2;
+                let mark_array = read_mark_array_index(data, &mut pos)?;
+                let base_array = read_anchor_array_index(data, &mut pos)?;
+                mark_base_tables.push(MarkBaseIndex { mark_array, base_array, lookup_id, subtable_pos });
+            }
+            // MarkLig tables.
+            if pos + 2 > data.len() { return Err("trunc v25 n_mark_lig".into()); }
+            let n_mark_lig = u16::from_le_bytes(data[pos..pos+2].try_into().unwrap()) as usize; pos += 2;
+            let mut mark_lig_tables = Vec::with_capacity(n_mark_lig);
+            for _ in 0..n_mark_lig {
+                if pos + 4 > data.len() { return Err("trunc v25 mark_lig hdr".into()); }
+                let lookup_id = u16::from_le_bytes(data[pos..pos+2].try_into().unwrap()); pos += 2;
+                let subtable_pos = u16::from_le_bytes(data[pos..pos+2].try_into().unwrap()); pos += 2;
+                let mark_array = read_mark_array_index(data, &mut pos)?;
+                // LigatureArray: coverage_len, coverage, class_count, then per
+                // glyph: comp_count u16, anchors[comp_count*class_count] (5B).
+                if pos + 2 > data.len() { return Err("trunc v25 lig_array cov_len".into()); }
+                let cov_len = u16::from_le_bytes(data[pos..pos+2].try_into().unwrap()) as usize; pos += 2;
+                let coverage_off = pos;
+                if pos + cov_len * 2 > data.len() { return Err("trunc v25 lig_array coverage".into()); }
+                pos += cov_len * 2;
+                if pos + 2 > data.len() { return Err("trunc v25 lig_array class_count".into()); }
+                let class_count = u16::from_le_bytes(data[pos..pos+2].try_into().unwrap()) as usize; pos += 2;
+                let lig_data_off = pos;
+                let mut lig_len = 0usize;
+                for _ in 0..cov_len {
+                    if pos + 2 > data.len() { return Err("trunc v25 lig comp_count".into()); }
+                    let comp_count = u16::from_le_bytes(data[pos..pos+2].try_into().unwrap()) as usize; pos += 2;
+                    lig_len += 2;
+                    if pos + comp_count * class_count * 5 > data.len() { return Err("trunc v25 lig anchors".into()); }
+                    pos += comp_count * class_count * 5;
+                    lig_len += comp_count * class_count * 5;
+                }
+                mark_lig_tables.push(MarkLigIndex {
+                    mark_array,
+                    lig_array: LigatureArrayIndex { coverage_off, coverage_len: cov_len, class_count, lig_data_off, lig_data_len: lig_len },
+                    lookup_id, subtable_pos,
+                });
+            }
+            // MarkMark tables.
+            if pos + 2 > data.len() { return Err("trunc v25 n_mark_mark".into()); }
+            let n_mark_mark = u16::from_le_bytes(data[pos..pos+2].try_into().unwrap()) as usize; pos += 2;
+            let mut mark_mark_tables = Vec::with_capacity(n_mark_mark);
+            for _ in 0..n_mark_mark {
+                if pos + 4 > data.len() { return Err("trunc v25 mark_mark hdr".into()); }
+                let lookup_id = u16::from_le_bytes(data[pos..pos+2].try_into().unwrap()); pos += 2;
+                let subtable_pos = u16::from_le_bytes(data[pos..pos+2].try_into().unwrap()); pos += 2;
+                let mark_array = read_mark_array_index(data, &mut pos)?;
+                let mark2_array = read_anchor_array_index(data, &mut pos)?;
+                mark_mark_tables.push(MarkMarkIndex { mark_array, mark2_array, lookup_id, subtable_pos });
+            }
+            // Context tables (types 7 and 8).
+            if pos + 2 > data.len() { return Err("trunc v25 n_context".into()); }
+            let n_context = u16::from_le_bytes(data[pos..pos+2].try_into().unwrap()) as usize; pos += 2;
+            let mut context_tables = Vec::with_capacity(n_context);
+            for _ in 0..n_context {
+                if pos + 7 > data.len() { return Err("trunc v25 context hdr".into()); }
+                let is_chained = data[pos] != 0; pos += 1;
+                let lookup_id = u16::from_le_bytes(data[pos..pos+2].try_into().unwrap()); pos += 2;
+                let subtable_pos = u16::from_le_bytes(data[pos..pos+2].try_into().unwrap()); pos += 2;
+                let cov_len = u16::from_le_bytes(data[pos..pos+2].try_into().unwrap()) as usize; pos += 2;
+                let coverage_off = pos;
+                if pos + cov_len * 2 > data.len() { return Err("trunc v25 context coverage".into()); }
+                pos += cov_len * 2;
+                // Class defs (each: present u8, then classdef if present).
+                let mut bt_cd = None;
+                let mut in_cd = None;
+                let mut la_cd = None;
+                if pos + 1 > data.len() { return Err("trunc v25 context bt_cd flag".into()); }
+                if data[pos] != 0 { pos += 1; bt_cd = Some(read_class_def_index(data, &mut pos)?); } else { pos += 1; }
+                if pos + 1 > data.len() { return Err("trunc v25 context in_cd flag".into()); }
+                if data[pos] != 0 { pos += 1; in_cd = Some(read_class_def_index(data, &mut pos)?); } else { pos += 1; }
+                if pos + 1 > data.len() { return Err("trunc v25 context la_cd flag".into()); }
+                if data[pos] != 0 { pos += 1; la_cd = Some(read_class_def_index(data, &mut pos)?); } else { pos += 1; }
+                if pos + 2 > data.len() { return Err("trunc v25 context rules count".into()); }
+                let n_rules = u16::from_le_bytes(data[pos..pos+2].try_into().unwrap()) as usize; pos += 2;
+                let mut rules = Vec::with_capacity(n_rules);
+                for _ in 0..n_rules {
+                    let read_items = |data: &[u8], pos: &mut usize| -> Result<(usize, usize), String> {
+                        if *pos + 2 > data.len() { return Err("trunc v25 rule items len".into()); }
+                        let n = u16::from_le_bytes(data[*pos..*pos+2].try_into().unwrap()) as usize; *pos += 2;
+                        let off = *pos;
+                        if *pos + n * 3 > data.len() { return Err("trunc v25 rule items".into()); }
+                        *pos += n * 3;
+                        Ok((off, n))
+                    };
+                    let (bt_off, bt_len) = read_items(data, &mut pos)?;
+                    let (in_off, in_len) = read_items(data, &mut pos)?;
+                    let (la_off, la_len) = read_items(data, &mut pos)?;
+                    if pos + 2 > data.len() { return Err("trunc v25 rule records len".into()); }
+                    let rec_len = u16::from_le_bytes(data[pos..pos+2].try_into().unwrap()) as usize; pos += 2;
+                    let records_off = pos;
+                    if pos + rec_len * 4 > data.len() { return Err("trunc v25 rule records".into()); }
+                    pos += rec_len * 4;
+                    rules.push(ContextRuleIndex {
+                        backtrack_off: bt_off, backtrack_len: bt_len,
+                        input_off: in_off, input_len: in_len,
+                        lookahead_off: la_off, lookahead_len: la_len,
+                        records_off, records_len: rec_len,
+                    });
+                }
+                if pos + 2 > data.len() { return Err("trunc v25 context cov count".into()); }
+                let cov_count = u16::from_le_bytes(data[pos..pos+2].try_into().unwrap()) as usize; pos += 2;
+                let coverages_off = pos;
+                let mut cov_offsets = Vec::with_capacity(cov_count);
+                for _ in 0..cov_count {
+                    cov_offsets.push((pos - coverages_off) as u32);
+                    if pos + 2 > data.len() { return Err("trunc v25 context cov len".into()); }
+                    let clen = u16::from_le_bytes(data[pos..pos+2].try_into().unwrap()) as usize; pos += 2;
+                    if pos + clen * 2 > data.len() { return Err("trunc v25 context cov glyphs".into()); }
+                    pos += clen * 2;
+                }
+                // Store the per-coverage offsets in memory (the file holds
+                // only the flat coverages region).
+                context_tables.push(ContextTableIndex {
+                    is_chained, coverage_off, coverage_len: cov_len,
+                    backtrack_class_def: bt_cd, input_class_def: in_cd, lookahead_class_def: la_cd,
+                    rules, coverages_off, cov_offsets, cov_count,
+                    lookup_id, subtable_pos,
+                });
+            }
+            // GDEF glyph classes.
+            if pos + 2 > data.len() { return Err("trunc v25 gdef count".into()); }
+            let gdef_len = u16::from_le_bytes(data[pos..pos+2].try_into().unwrap()) as usize; pos += 2;
+            let gdef_classes_off = pos;
+            if pos + gdef_len * 4 > data.len() { return Err("trunc v25 gdef classes".into()); }
+            pos += gdef_len * 4;
+
+            let idx = FontMmapIndex { file_hash, upem, num_glyphs, glyphs_off, cmap_off, cmap_len, single_tables, format1_tables: f1_tables, format2_tables: f2_tables, case_single_tables, case_format1_tables: case_f1_tables, case_format2_tables: case_f2_tables, pair_groups, case_pair_groups, single_groups, case_single_groups, pair_first_present_off, cursive_tables, mark_base_tables, mark_lig_tables, mark_mark_tables, context_tables, gdef_classes_off, gdef_classes_len: gdef_len };
             fonts.insert(font_key, idx.clone());
             ordered.push(idx);
         }
@@ -3204,7 +4575,10 @@ impl GeometryCache {
     // compatibility for tests - returns old kern-only view
     pub fn test_parse_gpos(data: &[u8], num_glyphs: usize) -> Option<(Vec<Format1Parse>, Vec<Format2Parse>, bool)> {
         // call new full parser, then convert to old structs for display
-        let (singles, f1_full, f2_full, _case_s, _case_f1, _case_f2) = Self::parse_gpos_full(data, num_glyphs, None)?;
+        let parsed = Self::parse_gpos_full(data, num_glyphs, None)?;
+        let f1_full = parsed.format1_tables;
+        let f2_full = parsed.format2_tables;
+        let _ = parsed.single_tables;
         // convert f1
         let mut f1_old = Vec::with_capacity(f1_full.len());
         for tbl in f1_full {
@@ -3235,11 +4609,10 @@ impl GeometryCache {
             };
             f2_old.push(Format2Parse { coverage: tbl.coverage, class_def1: cd1, class_def2: cd2, class1_count: tbl.class1_count, class2_count: tbl.class2_count, matrix });
         }
-        let _ = singles; // unused in old view
         Some((f1_old, f2_old, false))
     }
 
-    fn parse_gpos_full(data: &[u8], num_glyphs: usize, var_ctx: Option<&VarStoreCtx>) -> Option<(Vec<SingleTableOwned>, Vec<Format1TableOwned>, Vec<Format2TableOwned>, Vec<SingleTableOwned>, Vec<Format1TableOwned>, Vec<Format2TableOwned>)> {
+    fn parse_gpos_full(data: &[u8], num_glyphs: usize, var_ctx: Option<&VarStoreCtx>) -> Option<GposParsed> {
         Self::parse_gpos_inner(data, num_glyphs, var_ctx)
     }
 
@@ -3248,7 +4621,7 @@ impl GeometryCache {
         None
     }
 
-    fn parse_gpos_inner(data: &[u8], num_glyphs: usize, var_ctx: Option<&VarStoreCtx>) -> Option<(Vec<SingleTableOwned>, Vec<Format1TableOwned>, Vec<Format2TableOwned>, Vec<SingleTableOwned>, Vec<Format1TableOwned>, Vec<Format2TableOwned>)> {
+    fn parse_gpos_inner(data: &[u8], num_glyphs: usize, var_ctx: Option<&VarStoreCtx>) -> Option<GposParsed> {
         if data.len() < 10 { return None; }
         let feature_list_off = be_u16(data, 6)? as usize;
         let lookup_list_off = be_u16(data, 8)? as usize;
@@ -3292,6 +4665,14 @@ impl GeometryCache {
         // Split lookups that are *only* in case/cpsp and not shared with a default feature.
         // Shared lookups stay in default (they are needed without case). Pure case/cpsp go to conditional tables.
         let case_only_lookups: std::collections::HashSet<usize> = case_lookups.difference(&kern_lookups).cloned().collect();
+        // Orphan lookups: referenced by NO feature at all. HarfBuzz only
+        // applies lookups reachable from the FeatureList, so an orphan is
+        // never applied by the shaper. The cached predictor used to apply
+        // them unconditionally (e.g. NotoSansDevanagari SinglePos lookup 23,
+        // anusvara XPlacement -39, referenced by no feature — it shifted the
+        // anusvara 39fu left of HarfBuzz's position in कां). Skip orphans
+        // entirely: they go into neither the default nor the case tables.
+        let referenced_lookups: std::collections::HashSet<usize> = case_lookups.union(&kern_lookups).cloned().collect();
 
         let lookup_count = be_u16(data, lookup_list_off)? as usize;
         let mut single_tables = Vec::new();
@@ -3300,14 +4681,25 @@ impl GeometryCache {
         let mut case_single_tables: Vec<SingleTableOwned> = Vec::new();
         let mut case_f1_tables: Vec<Format1TableOwned> = Vec::new();
         let mut case_f2_tables: Vec<Format2TableOwned> = Vec::new();
+        // Finding 2: GPOS LookupTypes 3-8 (cursive, mark, context).
+        let mut cursive_tables = Vec::new();
+        let mut mark_base_tables = Vec::new();
+        let mut mark_lig_tables = Vec::new();
+        let mut mark_mark_tables = Vec::new();
+        let mut context_tables = Vec::new();
         for li in 0..lookup_count {
+            // Orphan lookup (referenced by no feature): HarfBuzz never
+            // applies it. Skip it entirely.
+            if !referenced_lookups.contains(&li) { continue; }
             let is_case_only = case_only_lookups.contains(&li);
             let off_pos = lookup_list_off + 2 + li*2;
             let lookup_off = be_u16(data, off_pos)? as usize + lookup_list_off;
             if lookup_off + 6 > data.len() { continue; }
             let lookup_type = be_u16(data, lookup_off)?;
-            // Allow 1=Single, 2=Pair, 9=ExtensionPos (which wraps 1 or 2)
-            if lookup_type != 1 && lookup_type != 2 && lookup_type != 9 { continue; }
+            // Allow 1=Single, 2=Pair, 3=Cursive, 4=MarkBase, 5=MarkLig,
+            // 6=MarkMark, 7=Context, 8=ChainedContext, 9=ExtensionPos
+            // (which wraps any of 1-8).
+            if lookup_type < 1 || lookup_type > 9 { continue; }
             let subtable_count = be_u16(data, lookup_off+4)? as usize;
             for si in 0..subtable_count {
                 let sub_off_pos = lookup_off + 6 + si*2;
@@ -3326,7 +4718,7 @@ impl GeometryCache {
                     inner_type = ext_lookup_type;
                     inner_off = sub_off + ext_offset;
                     if inner_off + 2 > data.len() { continue; }
-                    if inner_type != 1 && inner_type != 2 { continue; }
+                    if inner_type < 1 || inner_type > 8 { continue; }
                 }
                 if inner_type == 1 {
                     // SinglePos
@@ -3438,10 +4830,535 @@ impl GeometryCache {
                         let entry = Format2TableOwned { coverage, class_def1: cd1_owned, class_def2: cd2_owned, class1_count: c1_count, class2_count: c2_count, val_fmt1, val_fmt2, matrix, lookup_id: li as u16, subtable_pos: si as u16 };
                         if is_case_only { case_f2_tables.push(entry); } else { f2_tables.push(entry); }
                     }
+                } else if inner_type == 3 {
+                    // CursivePos (Finding 2).
+                    if let Some(tbl) = Self::parse_cursive(data, inner_off, li as u16, si as u16) {
+                        cursive_tables.push(tbl);
+                    }
+                } else if inner_type == 4 {
+                    // MarkBasePos (Finding 2).
+                    if let Some(tbl) = Self::parse_mark_base(data, inner_off, li as u16, si as u16) {
+                        mark_base_tables.push(tbl);
+                    }
+                } else if inner_type == 5 {
+                    // MarkLigPos (Finding 2).
+                    if let Some(tbl) = Self::parse_mark_lig(data, inner_off, li as u16, si as u16) {
+                        mark_lig_tables.push(tbl);
+                    }
+                } else if inner_type == 6 {
+                    // MarkMarkPos (Finding 2).
+                    if let Some(tbl) = Self::parse_mark_mark(data, inner_off, li as u16, si as u16) {
+                        mark_mark_tables.push(tbl);
+                    }
+                } else if inner_type == 7 || inner_type == 8 {
+                    // ContextPos / ChainedContextPos (Finding 2).
+                    if let Some(tbl) = Self::parse_context(data, inner_off, inner_type == 8, li as u16, si as u16) {
+                        context_tables.push(tbl);
+                    }
                 }
             }
         }
-        Some((single_tables, f1_tables, f2_tables, case_single_tables, case_f1_tables, case_f2_tables))
+        Some(GposParsed {
+            single_tables, format1_tables: f1_tables, format2_tables: f2_tables,
+            case_single_tables, case_format1_tables: case_f1_tables, case_format2_tables: case_f2_tables,
+            cursive_tables, mark_base_tables, mark_lig_tables, mark_mark_tables, context_tables,
+        })
+    }
+
+    // ---- Finding 2: GPOS LookupTypes 3-8 parsing ----
+
+    /// Parse a GPOS Anchor table at `off`. Formats 1, 2, 3 all carry
+    /// XCoordinate/YCoordinate at the same offsets; Format 2's anchor
+    /// point and Format 3's device tables are ignored (font-unit
+    /// prediction is unhinted; the base x/y are the anchor position).
+    fn parse_anchor(data: &[u8], off: usize) -> Option<AnchorOwned> {
+        if off == 0 || off + 6 > data.len() { return None; }
+        let fmt = be_u16(data, off)?;
+        if fmt != 1 && fmt != 2 && fmt != 3 { return None; }
+        let x = be_i16(data, off + 2)?;
+        let y = be_i16(data, off + 4)?;
+        Some(AnchorOwned { x, y })
+    }
+
+    /// Parse a MarkArray at `off`.
+    fn parse_mark_array(data: &[u8], off: usize) -> Option<MarkArrayOwned> {
+        if off + 2 > data.len() { return None; }
+        let count = be_u16(data, off)? as usize;
+        if off + 2 + count * 4 > data.len() { return None; }
+        let mut classes = Vec::with_capacity(count);
+        let mut anchors = Vec::with_capacity(count);
+        for i in 0..count {
+            let rec = off + 2 + i * 4;
+            let class = be_u16(data, rec)?;
+            let anchor_off = be_u16(data, rec + 2)? as usize;
+            classes.push(class);
+            if anchor_off == 0 {
+                anchors.push(None);
+            } else {
+                anchors.push(Self::parse_anchor(data, off + anchor_off));
+            }
+        }
+        // Coverage is supplied by the caller (the subtable's MarkCoverage).
+        Some(MarkArrayOwned { coverage: Vec::new(), classes, anchors })
+    }
+
+    /// Parse a BaseArray / Mark2Array at `off` with `class_count` classes.
+    fn parse_anchor_array(data: &[u8], off: usize, class_count: u16) -> Option<AnchorArrayOwned> {
+        if off + 2 > data.len() { return None; }
+        let count = be_u16(data, off)? as usize;
+        let cc = class_count as usize;
+        if off + 2 + count * cc * 2 > data.len() { return None; }
+        let mut anchors = Vec::with_capacity(count);
+        for i in 0..count {
+            let mut row = Vec::with_capacity(cc);
+            for j in 0..cc {
+                let a_off = be_u16(data, off + 2 + (i * cc + j) * 2)? as usize;
+                if a_off == 0 {
+                    row.push(None);
+                } else {
+                    row.push(Self::parse_anchor(data, off + a_off));
+                }
+            }
+            anchors.push(row);
+        }
+        Some(AnchorArrayOwned { coverage: Vec::new(), class_count, anchors })
+    }
+
+    /// Parse a LigatureArray at `off` with `class_count` classes.
+    fn parse_ligature_array(data: &[u8], off: usize, class_count: u16) -> Option<LigatureArrayOwned> {
+        if off + 2 > data.len() { return None; }
+        let count = be_u16(data, off)? as usize;
+        if off + 2 + count * 2 > data.len() { return None; }
+        let cc = class_count as usize;
+        let mut ligatures = Vec::with_capacity(count);
+        for i in 0..count {
+            let attach_off = be_u16(data, off + 2 + i * 2)? as usize;
+            if attach_off == 0 {
+                ligatures.push(Vec::new());
+                continue;
+            }
+            let la = off + attach_off;
+            if la + 2 > data.len() { return None; }
+            let comp_count = be_u16(data, la)? as usize;
+            if la + 2 + comp_count * cc * 2 > data.len() { return None; }
+            let mut comps = Vec::with_capacity(comp_count);
+            for c in 0..comp_count {
+                let mut row = Vec::with_capacity(cc);
+                for j in 0..cc {
+                    let a_off = be_u16(data, la + 2 + (c * cc + j) * 2)? as usize;
+                    if a_off == 0 {
+                        row.push(None);
+                    } else {
+                        row.push(Self::parse_anchor(data, la + a_off));
+                    }
+                }
+                comps.push(row);
+            }
+            ligatures.push(comps);
+        }
+        Some(LigatureArrayOwned { coverage: Vec::new(), class_count, ligatures })
+    }
+
+    /// Parse a CursivePos subtable (type 3, Format 1 only).
+    fn parse_cursive(data: &[u8], off: usize, lookup_id: u16, subtable_pos: u16) -> Option<CursiveTableOwned> {
+        if off + 6 > data.len() { return None; }
+        let fmt = be_u16(data, off)?;
+        if fmt != 1 { return None; }
+        let cov_off = be_u16(data, off + 2)? as usize + off;
+        let coverage = Self::parse_coverage(data, cov_off)?;
+        let count = be_u16(data, off + 4)? as usize;
+        if off + 6 + count * 4 > data.len() { return None; }
+        let mut entry = Vec::with_capacity(count);
+        let mut exit = Vec::with_capacity(count);
+        for i in 0..count {
+            let rec = off + 6 + i * 4;
+            let entry_off = be_u16(data, rec)? as usize;
+            let exit_off = be_u16(data, rec + 2)? as usize;
+            entry.push(if entry_off == 0 { None } else { Self::parse_anchor(data, off + entry_off) });
+            exit.push(if exit_off == 0 { None } else { Self::parse_anchor(data, off + exit_off) });
+        }
+        Some(CursiveTableOwned { coverage, entry, exit, lookup_id, subtable_pos })
+    }
+
+    /// Parse a MarkBasePos subtable (type 4, Format 1 only).
+    fn parse_mark_base(data: &[u8], off: usize, lookup_id: u16, subtable_pos: u16) -> Option<MarkBaseTableOwned> {
+        if off + 12 > data.len() { return None; }
+        let fmt = be_u16(data, off)?;
+        if fmt != 1 { return None; }
+        let mark_cov_off = be_u16(data, off + 2)? as usize + off;
+        let base_cov_off = be_u16(data, off + 4)? as usize + off;
+        let class_count = be_u16(data, off + 6)?;
+        let mark_arr_off = be_u16(data, off + 8)? as usize + off;
+        let base_arr_off = be_u16(data, off + 10)? as usize + off;
+        let mark_cov = Self::parse_coverage(data, mark_cov_off)?;
+        let base_cov = Self::parse_coverage(data, base_cov_off)?;
+        let mut mark_array = Self::parse_mark_array(data, mark_arr_off)?;
+        let mut base_array = Self::parse_anchor_array(data, base_arr_off, class_count)?;
+        mark_array.coverage = mark_cov;
+        base_array.coverage = base_cov;
+        Some(MarkBaseTableOwned { mark_array, base_array, lookup_id, subtable_pos })
+    }
+
+    /// Parse a MarkLigPos subtable (type 5, Format 1 only).
+    fn parse_mark_lig(data: &[u8], off: usize, lookup_id: u16, subtable_pos: u16) -> Option<MarkLigTableOwned> {
+        if off + 12 > data.len() { return None; }
+        let fmt = be_u16(data, off)?;
+        if fmt != 1 { return None; }
+        let mark_cov_off = be_u16(data, off + 2)? as usize + off;
+        let lig_cov_off = be_u16(data, off + 4)? as usize + off;
+        let class_count = be_u16(data, off + 6)?;
+        let mark_arr_off = be_u16(data, off + 8)? as usize + off;
+        let lig_arr_off = be_u16(data, off + 10)? as usize + off;
+        let mark_cov = Self::parse_coverage(data, mark_cov_off)?;
+        let lig_cov = Self::parse_coverage(data, lig_cov_off)?;
+        let mut mark_array = Self::parse_mark_array(data, mark_arr_off)?;
+        let mut lig_array = Self::parse_ligature_array(data, lig_arr_off, class_count)?;
+        mark_array.coverage = mark_cov;
+        lig_array.coverage = lig_cov;
+        Some(MarkLigTableOwned { mark_array, lig_array, lookup_id, subtable_pos })
+    }
+
+    /// Parse a MarkMarkPos subtable (type 6, Format 1 only).
+    fn parse_mark_mark(data: &[u8], off: usize, lookup_id: u16, subtable_pos: u16) -> Option<MarkMarkTableOwned> {
+        if off + 12 > data.len() { return None; }
+        let fmt = be_u16(data, off)?;
+        if fmt != 1 { return None; }
+        let mark1_cov_off = be_u16(data, off + 2)? as usize + off;
+        let mark2_cov_off = be_u16(data, off + 4)? as usize + off;
+        let class_count = be_u16(data, off + 6)?;
+        let mark1_arr_off = be_u16(data, off + 8)? as usize + off;
+        let mark2_arr_off = be_u16(data, off + 10)? as usize + off;
+        let mark1_cov = Self::parse_coverage(data, mark1_cov_off)?;
+        let mark2_cov = Self::parse_coverage(data, mark2_cov_off)?;
+        let mut mark_array = Self::parse_mark_array(data, mark1_arr_off)?;
+        let mut mark2_array = Self::parse_anchor_array(data, mark2_arr_off, class_count)?;
+        mark_array.coverage = mark1_cov;
+        mark2_array.coverage = mark2_cov;
+        Some(MarkMarkTableOwned { mark_array, mark2_array, lookup_id, subtable_pos })
+    }
+
+    /// Read `count` big-endian u16 values starting at `off`.
+    fn read_u16_seq(data: &[u8], off: usize, count: usize) -> Option<Vec<u16>> {
+        if off + count * 2 > data.len() { return None; }
+        let mut v = Vec::with_capacity(count);
+        for i in 0..count {
+            v.push(be_u16(data, off + i * 2)?);
+        }
+        Some(v)
+    }
+
+    /// Parse a ContextPos (type 7) or ChainedContextPos (type 8) subtable.
+    /// All three formats are normalized into ContextRuleOwned rules.
+    fn parse_context(data: &[u8], off: usize, is_chained: bool, lookup_id: u16, subtable_pos: u16) -> Option<ContextTableOwned> {
+        if off + 2 > data.len() { return None; }
+        let fmt = be_u16(data, off)?;
+        match (is_chained, fmt) {
+            (false, 1) => Self::parse_context_fmt1(data, off, false, lookup_id, subtable_pos),
+            (false, 2) => Self::parse_context_fmt2(data, off, false, lookup_id, subtable_pos),
+            (false, 3) => Self::parse_context_fmt3(data, off, false, lookup_id, subtable_pos),
+            (true, 1) => Self::parse_context_fmt1(data, off, true, lookup_id, subtable_pos),
+            (true, 2) => Self::parse_context_fmt2(data, off, true, lookup_id, subtable_pos),
+            (true, 3) => Self::parse_context_fmt3(data, off, true, lookup_id, subtable_pos),
+            _ => None,
+        }
+    }
+
+    /// Context/Chained Format 1 (glyph-based rule sets).
+    fn parse_context_fmt1(data: &[u8], off: usize, is_chained: bool, lookup_id: u16, subtable_pos: u16) -> Option<ContextTableOwned> {
+        if off + 6 > data.len() { return None; }
+        let cov_off = be_u16(data, off + 2)? as usize + off;
+        let coverage = Self::parse_coverage(data, cov_off)?;
+        let set_count = be_u16(data, off + 4)? as usize;
+        if off + 6 + set_count * 2 > data.len() { return None; }
+        let mut rules = Vec::new();
+        for si in 0..set_count {
+            let set_off_rel = be_u16(data, off + 6 + si * 2)? as usize;
+            if set_off_rel == 0 { continue; }
+            let set_off = off + set_off_rel;
+            if set_off + 2 > data.len() { continue; }
+            let rule_count = be_u16(data, set_off)? as usize;
+            if set_off + 2 + rule_count * 2 > data.len() { continue; }
+            // The first input glyph is the coverage glyph selecting this set.
+            let first_glyph = *coverage.get(si)?;
+            for ri in 0..rule_count {
+                let rule_off_rel = be_u16(data, set_off + 2 + ri * 2)? as usize;
+                let rule_off = set_off + rule_off_rel;
+                let rule = Self::parse_context_rule_glyph(data, rule_off, is_chained, first_glyph)?;
+                rules.push(rule);
+            }
+        }
+        Some(ContextTableOwned {
+            is_chained, coverage,
+            backtrack_class_def: None, input_class_def: None, lookahead_class_def: None,
+            rules, lookup_id, subtable_pos,
+        })
+    }
+
+    /// Parse one glyph-based context rule (Format 1). `first_glyph` is the
+    /// coverage glyph selecting the rule set (the first input glyph).
+    fn parse_context_rule_glyph(data: &[u8], off: usize, is_chained: bool, first_glyph: u16) -> Option<ContextRuleOwned> {
+        let mut p = off;
+        let (backtrack, input, lookahead) = if is_chained {
+            // Chained Format 1: BacktrackGlyphCount, Backtrack[], InputGlyphCount, Input[], LookAheadGlyphCount, LookAhead[]
+            if p + 2 > data.len() { return None; }
+            let bt_count = be_u16(data, p)? as usize; p += 2;
+            let bt = Self::read_u16_seq(data, p, bt_count)?; p += bt_count * 2;
+            if p + 2 > data.len() { return None; }
+            let in_count = be_u16(data, p)? as usize; p += 2;
+            // Input includes the first glyph; the array holds the rest.
+            if in_count == 0 { return None; }
+            let rest = Self::read_u16_seq(data, p, in_count - 1)?; p += (in_count - 1) * 2;
+            if p + 2 > data.len() { return None; }
+            let la_count = be_u16(data, p)? as usize; p += 2;
+            let la = Self::read_u16_seq(data, p, la_count)?; p += la_count * 2;
+            let backtrack = bt.into_iter().map(MatchItem::Glyph).collect();
+            let mut input = vec![MatchItem::Glyph(first_glyph)];
+            input.extend(rest.into_iter().map(MatchItem::Glyph));
+            let lookahead = la.into_iter().map(MatchItem::Glyph).collect();
+            (backtrack, input, lookahead)
+        } else {
+            // Context Format 1: GlyphCount, BacktrackGlyphCount, Backtrack[], InputGlyphCount, Input[], LookAheadGlyphCount, LookAhead[]
+            if p + 2 > data.len() { return None; }
+            let _glyph_count = be_u16(data, p)? as usize; p += 2;
+            if p + 2 > data.len() { return None; }
+            let bt_count = be_u16(data, p)? as usize; p += 2;
+            let bt = Self::read_u16_seq(data, p, bt_count)?; p += bt_count * 2;
+            if p + 2 > data.len() { return None; }
+            let in_count = be_u16(data, p)? as usize; p += 2;
+            let rest = Self::read_u16_seq(data, p, in_count)?; p += in_count * 2;
+            if p + 2 > data.len() { return None; }
+            let la_count = be_u16(data, p)? as usize; p += 2;
+            let la = Self::read_u16_seq(data, p, la_count)?; p += la_count * 2;
+            let backtrack = bt.into_iter().map(MatchItem::Glyph).collect();
+            let mut input = vec![MatchItem::Glyph(first_glyph)];
+            input.extend(rest.into_iter().map(MatchItem::Glyph));
+            let lookahead = la.into_iter().map(MatchItem::Glyph).collect();
+            (backtrack, input, lookahead)
+        };
+        if p + 2 > data.len() { return None; }
+        let pos_count = be_u16(data, p)? as usize; p += 2;
+        if p + pos_count * 4 > data.len() { return None; }
+        let mut records = Vec::with_capacity(pos_count);
+        for i in 0..pos_count {
+            let seq_idx = be_u16(data, p + i * 4)?;
+            let lk_idx = be_u16(data, p + i * 4 + 2)?;
+            records.push((seq_idx, lk_idx));
+        }
+        Some(ContextRuleOwned { backtrack, input, lookahead, records })
+    }
+
+    /// Context/Chained Format 2 (class-based rule sets).
+    fn parse_context_fmt2(data: &[u8], off: usize, is_chained: bool, lookup_id: u16, subtable_pos: u16) -> Option<ContextTableOwned> {
+        let (coverage, bt_cd, in_cd, la_cd, set_count, sets_off) = if is_chained {
+            // Chained Format 2: Coverage, BacktrackClassDef, InputClassDef, LookAheadClassDef, ChainPosClassSetCount, offsets
+            if off + 14 > data.len() { return None; }
+            let cov_off = be_u16(data, off + 2)? as usize + off;
+            let bt_cd_off = be_u16(data, off + 4)? as usize + off;
+            let in_cd_off = be_u16(data, off + 6)? as usize + off;
+            let la_cd_off = be_u16(data, off + 8)? as usize + off;
+            let coverage = Self::parse_coverage(data, cov_off)?;
+            let bt_cd = Self::parse_class_def(data, bt_cd_off, 0)?;
+            let in_cd = Self::parse_class_def(data, in_cd_off, 0)?;
+            let la_cd = Self::parse_class_def(data, la_cd_off, 0)?;
+            let set_count = be_u16(data, off + 10)? as usize;
+            (coverage, Some(bt_cd), Some(in_cd), Some(la_cd), set_count, off + 12)
+        } else {
+            // Context Format 2: Coverage, PosClassDef, PosClassSetCount, offsets.
+            // A single class def serves backtrack, input, and lookahead.
+            if off + 8 > data.len() { return None; }
+            let cov_off = be_u16(data, off + 2)? as usize + off;
+            let cd_off = be_u16(data, off + 4)? as usize + off;
+            let coverage = Self::parse_coverage(data, cov_off)?;
+            let cd = Self::parse_class_def(data, cd_off, 0)?;
+            let set_count = be_u16(data, off + 6)? as usize;
+            (coverage, Some(cd.clone()), Some(cd.clone()), Some(cd), set_count, off + 8)
+        };
+        if sets_off + set_count * 2 > data.len() { return None; }
+        let (bt_cd_o, in_cd_o, la_cd_o) = (bt_cd, in_cd, la_cd);
+        let mut rules = Vec::new();
+        for si in 0..set_count {
+            let set_off_rel = be_u16(data, sets_off + si * 2)? as usize;
+            if set_off_rel == 0 { continue; }
+            let set_off = off + set_off_rel;
+            if set_off + 2 > data.len() { continue; }
+            let rule_count = be_u16(data, set_off)? as usize;
+            if set_off + 2 + rule_count * 2 > data.len() { continue; }
+            // The first input item is the class selecting this set.
+            let first_class = si as u16;
+            for ri in 0..rule_count {
+                let rule_off_rel = be_u16(data, set_off + 2 + ri * 2)? as usize;
+                let rule_off = set_off + rule_off_rel;
+                let rule = Self::parse_context_rule_class(data, rule_off, is_chained, first_class)?;
+                rules.push(rule);
+            }
+        }
+        Some(ContextTableOwned {
+            is_chained, coverage,
+            backtrack_class_def: bt_cd_o.map(|c| match c {
+                ClassDefParse::Format1 { start, classes } => ClassDefOwned::Format1 { start, classes },
+                ClassDefParse::Format2 { ranges } => ClassDefOwned::Format2 { ranges },
+            }),
+            input_class_def: in_cd_o.map(|c| match c {
+                ClassDefParse::Format1 { start, classes } => ClassDefOwned::Format1 { start, classes },
+                ClassDefParse::Format2 { ranges } => ClassDefOwned::Format2 { ranges },
+            }),
+            lookahead_class_def: la_cd_o.map(|c| match c {
+                ClassDefParse::Format1 { start, classes } => ClassDefOwned::Format1 { start, classes },
+                ClassDefParse::Format2 { ranges } => ClassDefOwned::Format2 { ranges },
+            }),
+            rules, lookup_id, subtable_pos,
+        })
+    }
+
+    /// Parse one class-based context rule (Format 2). `first_class` is the
+    /// class selecting the rule set (the first input item's class).
+    fn parse_context_rule_class(data: &[u8], off: usize, is_chained: bool, first_class: u16) -> Option<ContextRuleOwned> {
+        let mut p = off;
+        let (backtrack, input, lookahead) = if is_chained {
+            if p + 2 > data.len() { return None; }
+            let bt_count = be_u16(data, p)? as usize; p += 2;
+            let bt = Self::read_u16_seq(data, p, bt_count)?; p += bt_count * 2;
+            if p + 2 > data.len() { return None; }
+            let in_count = be_u16(data, p)? as usize; p += 2;
+            if in_count == 0 { return None; }
+            let rest = Self::read_u16_seq(data, p, in_count - 1)?; p += (in_count - 1) * 2;
+            if p + 2 > data.len() { return None; }
+            let la_count = be_u16(data, p)? as usize; p += 2;
+            let la = Self::read_u16_seq(data, p, la_count)?; p += la_count * 2;
+            let backtrack = bt.into_iter().map(MatchItem::Class).collect();
+            let mut input = vec![MatchItem::Class(first_class)];
+            input.extend(rest.into_iter().map(MatchItem::Class));
+            let lookahead = la.into_iter().map(MatchItem::Class).collect();
+            (backtrack, input, lookahead)
+        } else {
+            if p + 2 > data.len() { return None; }
+            let _glyph_count = be_u16(data, p)? as usize; p += 2;
+            if p + 2 > data.len() { return None; }
+            let bt_count = be_u16(data, p)? as usize; p += 2;
+            let bt = Self::read_u16_seq(data, p, bt_count)?; p += bt_count * 2;
+            if p + 2 > data.len() { return None; }
+            let in_count = be_u16(data, p)? as usize; p += 2;
+            let rest = Self::read_u16_seq(data, p, in_count)?; p += in_count * 2;
+            if p + 2 > data.len() { return None; }
+            let la_count = be_u16(data, p)? as usize; p += 2;
+            let la = Self::read_u16_seq(data, p, la_count)?; p += la_count * 2;
+            let backtrack = bt.into_iter().map(MatchItem::Class).collect();
+            let mut input = vec![MatchItem::Class(first_class)];
+            input.extend(rest.into_iter().map(MatchItem::Class));
+            let lookahead = la.into_iter().map(MatchItem::Class).collect();
+            (backtrack, input, lookahead)
+        };
+        if p + 2 > data.len() { return None; }
+        let pos_count = be_u16(data, p)? as usize; p += 2;
+        if p + pos_count * 4 > data.len() { return None; }
+        let mut records = Vec::with_capacity(pos_count);
+        for i in 0..pos_count {
+            let seq_idx = be_u16(data, p + i * 4)?;
+            let lk_idx = be_u16(data, p + i * 4 + 2)?;
+            records.push((seq_idx, lk_idx));
+        }
+        Some(ContextRuleOwned { backtrack, input, lookahead, records })
+    }
+
+    /// Context/Chained Format 3 (coverage-based rules).
+    fn parse_context_fmt3(data: &[u8], off: usize, is_chained: bool, lookup_id: u16, subtable_pos: u16) -> Option<ContextTableOwned> {
+        let mut p = off;
+        let (backtrack, input, lookahead, records) = if is_chained {
+            // Chained Format 3: BacktrackGlyphCount, BacktrackCoverageOffsets[],
+            // InputGlyphCount, InputCoverageOffsets[], LookAheadGlyphCount,
+            // LookAheadCoverageOffsets[], PosCount, PosLookupRecords[]
+            if p + 2 > data.len() { return None; }
+            let bt_count = be_u16(data, p)? as usize; p += 2;
+            let bt_offs = Self::read_u16_seq(data, p, bt_count)?; p += bt_count * 2;
+            if p + 2 > data.len() { return None; }
+            let in_count = be_u16(data, p)? as usize; p += 2;
+            let in_offs = Self::read_u16_seq(data, p, in_count)?; p += in_count * 2;
+            if p + 2 > data.len() { return None; }
+            let la_count = be_u16(data, p)? as usize; p += 2;
+            let la_offs = Self::read_u16_seq(data, p, la_count)?; p += la_count * 2;
+            let mut backtrack = Vec::with_capacity(bt_count);
+            for o in bt_offs { backtrack.push(MatchItem::Coverage(Self::parse_coverage(data, off + o as usize)?)); }
+            let mut input = Vec::with_capacity(in_count);
+            for o in in_offs { input.push(MatchItem::Coverage(Self::parse_coverage(data, off + o as usize)?)); }
+            let mut lookahead = Vec::with_capacity(la_count);
+            for o in la_offs { lookahead.push(MatchItem::Coverage(Self::parse_coverage(data, off + o as usize)?)); }
+            if p + 2 > data.len() { return None; }
+            let pos_count = be_u16(data, p)? as usize; p += 2;
+            if p + pos_count * 4 > data.len() { return None; }
+            let mut records = Vec::with_capacity(pos_count);
+            for i in 0..pos_count {
+                records.push((be_u16(data, p + i * 4)?, be_u16(data, p + i * 4 + 2)?));
+            }
+            (backtrack, input, lookahead, records)
+        } else {
+            // Context Format 3: GlyphCount, PosCount, CoverageOffsets[], PosLookupRecords[]
+            // (input sequence only; no backtrack/lookahead).
+            if p + 4 > data.len() { return None; }
+            let glyph_count = be_u16(data, p)? as usize; p += 2;
+            let pos_count = be_u16(data, p)? as usize; p += 2;
+            let cov_offs = Self::read_u16_seq(data, p, glyph_count)?; p += glyph_count * 2;
+            let mut input = Vec::with_capacity(glyph_count);
+            for o in cov_offs { input.push(MatchItem::Coverage(Self::parse_coverage(data, off + o as usize)?)); }
+            if p + pos_count * 4 > data.len() { return None; }
+            let mut records = Vec::with_capacity(pos_count);
+            for i in 0..pos_count {
+                records.push((be_u16(data, p + i * 4)?, be_u16(data, p + i * 4 + 2)?));
+            }
+            (Vec::new(), input, Vec::new(), records)
+        };
+        Some(ContextTableOwned {
+            is_chained, coverage: Vec::new(),
+            backtrack_class_def: None, input_class_def: None, lookahead_class_def: None,
+            rules: vec![ContextRuleOwned { backtrack, input, lookahead, records }],
+            lookup_id, subtable_pos,
+        })
+    }
+
+    /// Parse the GDEF GlyphClassDef into a sorted (gid, class) list of
+    /// non-zero classes. class: 1=base, 2=ligature, 3=mark, 4=component.
+    fn parse_gdef_classes(data: &[u8], num_glyphs: usize) -> Vec<(u16, u16)> {
+        // GDEF header: majorVersion(2), minorVersion(2), glyphClassDefOffset(2)
+        if data.len() < 6 { return Vec::new(); }
+        let cd_off = match be_u16(data, 4) {
+            Some(o) => o as usize,
+            None => return Vec::new(),
+        };
+        if cd_off == 0 { return Vec::new(); }
+        let cd = match Self::parse_class_def(data, cd_off, 0) {
+            Some(c) => c,
+            None => return Vec::new(),
+        };
+        let mut out = Vec::new();
+        for gid in 0..num_glyphs as u16 {
+            let class = Self::class_def_parse_get(&cd, gid);
+            if class != 0 {
+                out.push((gid, class));
+            }
+        }
+        out
+    }
+
+    /// Look up a glyph's class in a parsed (owned) ClassDef.
+    fn class_def_parse_get(cd: &ClassDefParse, gid: u16) -> u16 {
+        match cd {
+            ClassDefParse::Format1 { start, classes } => {
+                let idx = gid as i32 - *start as i32;
+                if idx < 0 || idx as usize >= classes.len() { 0 } else { classes[idx as usize] }
+            }
+            ClassDefParse::Format2 { ranges } => {
+                // Ranges are sorted by start (parse_class_def_with_raw sorts).
+                let mut lo = 0usize;
+                let mut hi = ranges.len();
+                while lo < hi {
+                    let mid = (lo + hi) / 2;
+                    let (s, e, c) = ranges[mid];
+                    if gid < s { hi = mid; }
+                    else if gid > e { lo = mid + 1; }
+                    else { return c; }
+                }
+                0
+            }
+        }
     }
 
     fn value_format_size(fmt: u16) -> usize {
