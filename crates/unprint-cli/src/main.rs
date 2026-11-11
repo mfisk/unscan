@@ -1277,7 +1277,6 @@ fn run(args: &cli::Args, classifier: &mut dyn classifier::Classifier) -> Result<
                 page_idx,
                 &compare_path,
                 &font_cache,
-                &geo_cache,
             ) {
             }
         }
@@ -1298,7 +1297,7 @@ fn run(args: &cli::Args, classifier: &mut dyn classifier::Classifier) -> Result<
     // Optional smoothing pass: unify per-word font sizes within same-font runs.
     if args.smooth {
         for page in all_pages.iter_mut() {
-            smooth::smooth_font_sizes(&mut page.text_regions, page.dpi as f32, &font_cache, &geo_cache);
+            smooth::smooth_font_sizes(&mut page.text_regions, page.dpi as f32, &font_cache);
         }
     }
 
