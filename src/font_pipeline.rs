@@ -500,15 +500,9 @@ pub fn match_lines(
         };
 
         // Helper to build per-font WordSegs + wib for any font entry (used for tie and winner recompute)
-        let build_for_font = |fe: &crate::font_scan::FontEntry, infos: &[font_match::WordImgInfo], gt_segmentation: bool| -> Option<(Vec<crate::segment::WordSeg>, Vec<crate::geometry_classifier::WordGeoMeasurement>, Vec<image::GrayImage>, Vec<(usize,usize)>)> {
-            // GT segmentation uses the GT ligature mask (Finding 9):
-            // collapse a pair when the render would produce fused ink —
-            // either the variant is lig, or the separate glyphs overlap so
-            // even a nolig render fuses the ink. A nolig GT font whose
-            // separate glyphs do not overlap renders separate ink and must
-            // not be collapsed. Candidate/winner segs keep
-            // collapsed_lig_set().
-            let allowed = if gt_segmentation { fe.gt_ligature_mask() } else { fe.collapsed_lig_set() };
+        let build_for_font = |fe: &crate::font_scan::FontEntry, infos: &[font_match::WordImgInfo]| -> Option<(Vec<crate::segment::WordSeg>, Vec<crate::geometry_classifier::WordGeoMeasurement>, Vec<image::GrayImage>, Vec<(usize,usize)>)> {
+            // collapsed_lig_set() returns 0 for nolig variants (cached by fontkey).
+            let allowed = fe.collapsed_lig_set();
             let mut segs: Vec<crate::segment::WordSeg> = Vec::with_capacity(infos.len());
             for wi in infos {
                 let collapsed = crate::segment::collapse_ligature_chars_for_allowed(&wi.orig_chars, allowed);
@@ -627,7 +621,7 @@ pub fn match_lines(
                             let _ = std::fs::create_dir_all(&p);
                             p
                         });
-                        let (segs, wib, _crops, _pmap) = match build_for_font(fe, &word_infos, false) {
+                        let (segs, wib, _crops, _pmap) = match build_for_font(fe, &word_infos) {
                             Some(v) => v,
                             None => continue,
                         };
@@ -713,7 +707,7 @@ pub fn match_lines(
                     let font_key = &tied[0];
                     let fe_opt = font_registry.by_key(font_key);
                     if let Some(fe) = fe_opt {
-                        if let Some((segs, wib, crops, pmap)) = build_for_font(fe, &word_infos, false) {
+                        if let Some((segs, wib, crops, pmap)) = build_for_font(fe, &word_infos) {
                             winning_segs = segs;
                             winning_wib = wib;
                             winning_crops_vec = crops;
@@ -1045,7 +1039,7 @@ pub fn match_lines(
         // for ligature fonts (e.g. Office k=4 vs k=5).  No extra compute beyond build_for_font.
         let (gt_segs_opt, gt_wib_opt, gt_crops_opt) = if let Some(ref gfk) = gt_font_key {
             if let Some(gt_fe) = font_registry.by_key(gfk) {
-                if let Some((s, w, c, _pm)) = build_for_font(gt_fe, &word_infos, true) {
+                if let Some((s, w, c, _pm)) = build_for_font(gt_fe, &word_infos) {
                     (Some(s), Some(w), Some(c))
                 } else { (None, None, None) }
             } else { (None, None, None) }

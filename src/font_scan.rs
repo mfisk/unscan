@@ -68,32 +68,6 @@ fn lig_set_cache() -> &'static RwLock<HashMap<String, LigMask>> {
     LIG_SET_CACHE.get_or_init(|| RwLock::new(HashMap::new()))
 }
 
-/// Cache of variant-independent ligature support masks per font path.
-/// The support mask depends only on the font file (GSUB + glyph ink), not
-/// on the variant tag, so it is keyed by path. Used for GT segmentation
-/// (Finding 9): the GT font's segmentation must match the image, and the
-/// image's ligature-ness is a property of the font's rendering, not of the
-/// variant tag.
-static LIG_SUPPORT_CACHE: OnceLock<RwLock<HashMap<PathBuf, LigMask>>> = OnceLock::new();
-
-fn lig_support_cache() -> &'static RwLock<HashMap<PathBuf, LigMask>> {
-    LIG_SUPPORT_CACHE.get_or_init(|| RwLock::new(HashMap::new()))
-}
-
-/// Cache of variant-independent ligature overlap masks per font path.
-/// The overlap mask records, for each FB00–FB04 pair, whether the separate
-/// component glyphs overlap when placed adjacently (default instance), so a
-/// nolig render of the font still produces fused ink for that pair. Used
-/// for GT segmentation (Finding 9 refinement): a nolig GT font whose
-/// separate f/i do not overlap renders separate ink, and collapsing it
-/// corrupts the GT geometry and similarity (BAP 622: five "Lining
-/// figures" digit lines regressed). Keyed by path.
-static LIG_OVERLAP_CACHE: OnceLock<RwLock<HashMap<PathBuf, LigMask>>> = OnceLock::new();
-
-fn lig_overlap_cache() -> &'static RwLock<HashMap<PathBuf, LigMask>> {
-    LIG_OVERLAP_CACHE.get_or_init(|| RwLock::new(HashMap::new()))
-}
-
 // Thread-local ShapePlan cache for lig probe — mirrors
 // crates/unprint-fonts/src/shape.rs which caches 8.3% leaf
 // find_language_feature. Keyed by (font_data_ptr, features_hash).
@@ -406,131 +380,7 @@ impl FontEntry {
                 return *cached;
             }
         }
-        let mask = self.ligature_support_mask();
-        // Insert final filtered set into global cache (keyed by fontkey).
-        {
-            let mut guard = lig_set_cache().write().unwrap();
-            guard.insert(fk, mask);
-        }
-        mask
-    }
 
-    /// Set of ligature unicode codepoints (FB00–FB04) this font truly
-    /// collapses as one contiguous ink blob, IGNORING the variant tag.
-    ///
-    /// This is the same GSUB + glyph-ink computation as
-    /// `collapsed_lig_set`, but without the nolig early-return. The support
-    /// mask is a property of the font file, not of the variant: a font that
-    /// has a fused f_i ligature glyph renders fused "fi" ink whenever its
-    /// liga feature fires, whatever the variant key says.
-    ///
-    /// Used for GT segmentation (Finding 9): the GT font's segmentation must
-    /// match the image, and the image's ligature-ness is a property of the
-    /// font's rendering, not of the variant tag. A nolig GT key on a line
-    /// whose render used ligatures would otherwise force an 8-way split of a
-    /// fused "fi", cutting solid ink and giving the correct font a
-    /// catastrophic geometry penalty (p1 l19 "figures:": GT 'i' h_err
-    /// -4.9 px, h_ll -39.08, ~50 points against the correct font).
-    /// Cached by font path (variant-independent).
-    pub fn ligature_support_mask(&self) -> LigMask {
-        let path_key = self.path.clone();
-        {
-            let guard = lig_support_cache().read().unwrap();
-            if let Some(cached) = guard.get(&path_key) {
-                return *cached;
-            }
-        }
-        let mask = self.compute_ligature_support_mask();
-        {
-            let mut guard = lig_support_cache().write().unwrap();
-            guard.insert(path_key, mask);
-        }
-        mask
-    }
-
-    /// Set of ligature codepoints (FB00–FB04) whose separate component
-    /// glyphs overlap when placed adjacently (default instance), so a nolig
-    /// render of this font still produces fused ink for that pair.
-    /// E.g. EB Garamond's f (xMax 420) and i (xMin 24, after f advance
-    /// 318) overlap by 78 font units, so even a nolig render fuses "fi".
-    /// Most fonts have a clear gap between f and i, so their nolig render
-    /// has separate ink and must NOT be collapsed in GT segmentation.
-    /// Cached by font path (variant-independent).
-    pub fn ligature_overlap_mask(&self) -> LigMask {
-        let path_key = self.path.clone();
-        {
-            let guard = lig_overlap_cache().read().unwrap();
-            if let Some(cached) = guard.get(&path_key) {
-                return *cached;
-            }
-        }
-        let mask = self.compute_ligature_overlap_mask();
-        {
-            let mut guard = lig_overlap_cache().write().unwrap();
-            guard.insert(path_key, mask);
-        }
-        mask
-    }
-
-    /// Core overlap computation: for each FB00–FB04 pair, check whether any
-    /// adjacent pair of component glyphs overlaps (first glyph's ink right
-    /// edge past the second glyph's ink left edge when placed at the first
-    /// glyph's advance). Default-instance metrics; kern is ignored (the raw
-    /// glyph overlap dominates the fused-vs-separate determination).
-    fn compute_ligature_overlap_mask(&self) -> LigMask {
-        let mut mask: LigMask = 0;
-        let data = match std::fs::read(&self.path) {
-            Ok(d) => d,
-            Err(_) => return 0,
-        };
-        let face = match unprint_fonts::ttf_parser::Face::parse(&data, 0) {
-            Ok(f) => f,
-            Err(_) => return 0,
-        };
-        // (ligature char, component chars in order).
-        const PAIRS: &[(char, &[char])] = &[
-            ('\u{FB00}', &['f', 'f']),
-            ('\u{FB01}', &['f', 'i']),
-            ('\u{FB02}', &['f', 'l']),
-            ('\u{FB03}', &['f', 'f', 'i']),
-            ('\u{FB04}', &['f', 'f', 'l']),
-        ];
-        for &(lig, comps) in PAIRS {
-            let Some(b) = lig_bit(lig) else { continue };
-            let mut overlaps = false;
-            for w in comps.windows(2) {
-                let (a, c) = (w[0], w[1]);
-                let (Some(ga), Some(gc)) = (face.glyph_index(a), face.glyph_index(c)) else { continue };
-                if ga.0 == 0 || gc.0 == 0 { continue; }
-                let adv_a = face.glyph_hor_advance(ga).unwrap_or(0) as i32;
-                let (Some(bb_a), Some(bb_c)) = (face.glyph_bounding_box(ga), face.glyph_bounding_box(gc)) else { continue };
-                // First glyph's ink right edge vs second glyph's ink left
-                // edge when the second glyph starts at the first's advance.
-                if (bb_a.x_max as i32) - (adv_a + bb_c.x_min as i32) > 0 {
-                    overlaps = true;
-                    break;
-                }
-            }
-            if overlaps {
-                mask |= 1u8 << b;
-            }
-        }
-        mask
-    }
-
-    /// Ligature mask for GT segmentation (Finding 9): collapse a pair when
-    /// the render would produce fused ink — either the variant is lig
-    /// (`collapsed_lig_set` covers it) or the separate glyphs overlap so
-    /// even a nolig render fuses the ink. A nolig GT font whose separate
-    /// glyphs do not overlap renders separate ink and must not be collapsed.
-    pub fn gt_ligature_mask(&self) -> LigMask {
-        self.collapsed_lig_set() | (self.ligature_support_mask() & self.ligature_overlap_mask())
-    }
-
-    /// Core ligature-support computation: glyph_overrides + cmap + GSUB
-    /// shaping, filtered by the glyph-ink gutter check. No variant-tag
-    /// gate. See `collapsed_lig_set` for the filter semantics.
-    fn compute_ligature_support_mask(&self) -> LigMask {
         let mut mask: LigMask = 0;
         // Fast path: anything already known from glyph_overrides.
         if let Some(ref ov) = self.glyph_overrides {
@@ -609,6 +459,11 @@ impl FontEntry {
             }
         }
 
+        // Insert final filtered set into global cache (keyed by fontkey).
+        {
+            let mut guard = lig_set_cache().write().unwrap();
+            guard.insert(fk, mask);
+        }
         mask
     }
 
