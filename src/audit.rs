@@ -241,6 +241,35 @@ pub struct ObservationVote {
     pub chosen_geo_ll: Option<f32>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub gt_geo_ll: Option<f32>,
+    // ── Absolute midpoint/pitch data (Finding 10) ──────────────────
+    // Observed and predicted character midpoints (word-image px), pitches
+    // (px; None for word-initial chars, which have no previous char),
+    // per-word scale (px per font unit), and observed ink width (px).
+    // Recorded so per-line geometry can be re-derived from audit.json.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub chosen_obs_cx: Option<f32>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub chosen_pred_cx: Option<f32>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub chosen_obs_pitch: Option<f32>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub chosen_pred_pitch: Option<f32>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub chosen_geo_scale: Option<f32>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub chosen_ink_width: Option<f32>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub gt_obs_cx: Option<f32>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub gt_pred_cx: Option<f32>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub gt_obs_pitch: Option<f32>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub gt_pred_pitch: Option<f32>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub gt_geo_scale: Option<f32>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub gt_ink_width: Option<f32>,
 }
 
 #[derive(Debug, Serialize, Clone)]
