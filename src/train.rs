@@ -628,16 +628,51 @@ pub fn subsample_eval(n: usize, max_eval: usize, seed: u64) -> Vec<usize> {
 const SUBPIXEL_STEPS: [f32; 4] = [0.0, 0.25, 0.5, 0.75];
 const SUBPIXEL_OFFSET_COUNT: usize = SUBPIXEL_STEPS.len() * SUBPIXEL_STEPS.len();
 
-/// Scan the training catalog: base fonts plus vintage variants, sorted by
-/// font key — the same set runtime `load_fonts` produces. Shared by
-/// `run_train` and `load_geo_cache_for_training` so the geo cache is built
-/// for exactly the catalog training renders.
-fn scan_training_catalog(font_dir: &[PathBuf], max_fonts: usize) -> Vec<crate::font_scan::FontEntry> {
+pub fn run_train(mut args: TrainArgs) {
+    // Respect wrapper env first, otherwise cap to avoid OOM on 7.8GB no-swap.
+    // Previous version always forced 4 threads, ignoring RAYON_NUM_THREADS=1,
+    // which caused VSZ bloat when each thread held font data + PNG encoders.
+    let max_threads = std::env::var("RAYON_NUM_THREADS")
+        .ok()
+        .and_then(|s| s.parse::<usize>().ok())
+        .unwrap_or_else(|| {
+            std::thread::available_parallelism()
+                .map(|n| n.get())
+                .unwrap_or(2)
+                .min(4)
+        });
+    let _ = rayon::ThreadPoolBuilder::new()
+        .num_threads(max_threads)
+        .build_global();
+
+    if args.heights.is_empty() {
+        args.heights = vec![features::NORM_H];
+    }
+
+    // In --fast mode: alternating heights, single AA variant
+    let active_heights: Vec<u32> = if args.fast {
+        args.heights.iter().step_by(2).copied().collect()
+    } else {
+        args.heights.clone()
+    };
+    let aa_variants: Vec<AaVariant> = if args.fast {
+        vec![AaVariant::Native]
+    } else {
+        vec![AaVariant::Native, AaVariant::Blur05, AaVariant::Sharpen]
+    };
+
+    eprintln!("Heights: {:?}{}", active_heights, if args.fast { " (fast)" } else { "" });
+    eprintln!("AA variants: {}{}", aa_variants.len(), if args.fast { " (fast)" } else { "" });
+    eprintln!("Epochs: {}", args.epochs);
+    eprintln!("Learning rate: {}", args.lr);
+    eprintln!("Margin: {}", args.margin);
+
+    // ── 1. Scan fonts (base + vintage, matching runtime load_fonts) ──
     // Runtime load_fonts adds vintage variants from msttcorefonts via
     // ensure_vintage_fonts. Training must include the same set, otherwise
     // catalog_hash (base only) != catalog.bin (base+vintage) and LDA
     // weights are considered stale forever → infinite retrain loop.
-    let font_dirs: Vec<PathBuf> = font_scan::default_font_dirs(font_dir);
+    let font_dirs: Vec<PathBuf> = font_scan::default_font_dirs(&args.font_dir);
 
     let mut catalog = font_scan::scan_fonts(&font_dirs, false);
 
@@ -684,73 +719,16 @@ fn scan_training_catalog(font_dir: &[PathBuf], max_fonts: usize) -> Vec<crate::f
     }
     catalog.extend(vintage_entries);
 
+
     // Sort by font_key for deterministic font_id assignment, matching
     // FontRegistry::new() ordering so runtime and training agree.
     catalog.sort_by(|a, b| a.font_key().cmp(&b.font_key()));
     eprintln!("  {} font entries found (base {} + vintage {})", catalog.len(), base_count, catalog.len() - base_count);
 
-    if max_fonts > 0 && catalog.len() > max_fonts {
-        catalog.truncate(max_fonts);
-        eprintln!("  Limiting to {} fonts (--max-fonts)", max_fonts);
+    if args.max_fonts > 0 && catalog.len() > args.max_fonts {
+        catalog.truncate(args.max_fonts);
+        eprintln!("  Limiting to {} fonts (--max-fonts)", args.max_fonts);
     }
-    catalog
-}
-
-/// Load (or build) the geo cache for the training catalog (Finding 5).
-/// Used by the classifier retraining fallbacks, which have only a font
-/// directory — no registry and no geo cache — but must still pass a real
-/// provider to `run_train`. The cache file is shared with the runtime, so
-/// this reuses the runtime cache when the catalog hash matches.
-pub fn load_geo_cache_for_training(font_dir: &[PathBuf], quiet: bool) -> crate::geo_cache::GeometryCache {
-    let catalog = scan_training_catalog(font_dir, 0);
-    let registry = crate::font_scan::FontRegistry::new(catalog);
-    let font_cache = crate::font_cache::FontCache::new(crate::font_cache::DEFAULT_CAPACITY);
-    crate::geo_cache::GeometryCache::load_or_build(&registry, &font_cache, quiet)
-}
-
-pub fn run_train(mut args: TrainArgs, geo_cache: &crate::geo_cache::GeometryCache) {
-    // Respect wrapper env first, otherwise cap to avoid OOM on 7.8GB no-swap.
-    // Previous version always forced 4 threads, ignoring RAYON_NUM_THREADS=1,
-    // which caused VSZ bloat when each thread held font data + PNG encoders.
-    let max_threads = std::env::var("RAYON_NUM_THREADS")
-        .ok()
-        .and_then(|s| s.parse::<usize>().ok())
-        .unwrap_or_else(|| {
-            std::thread::available_parallelism()
-                .map(|n| n.get())
-                .unwrap_or(2)
-                .min(4)
-        });
-    let _ = rayon::ThreadPoolBuilder::new()
-        .num_threads(max_threads)
-        .build_global();
-
-    if args.heights.is_empty() {
-        args.heights = vec![features::NORM_H];
-    }
-
-    // In --fast mode: alternating heights, single AA variant
-    let active_heights: Vec<u32> = if args.fast {
-        args.heights.iter().step_by(2).copied().collect()
-    } else {
-        args.heights.clone()
-    };
-    let aa_variants: Vec<AaVariant> = if args.fast {
-        vec![AaVariant::Native]
-    } else {
-        vec![AaVariant::Native, AaVariant::Blur05, AaVariant::Sharpen]
-    };
-
-    eprintln!("Heights: {:?}{}", active_heights, if args.fast { " (fast)" } else { "" });
-    eprintln!("AA variants: {}{}", aa_variants.len(), if args.fast { " (fast)" } else { "" });
-    eprintln!("Epochs: {}", args.epochs);
-    eprintln!("Learning rate: {}", args.lr);
-    eprintln!("Margin: {}", args.margin);
-
-    // ── 1. Scan fonts (base + vintage, matching runtime load_fonts) ──
-    // Shared with load_geo_cache_for_training so the geo cache is built
-    // for exactly the catalog training renders.
-    let catalog = scan_training_catalog(&args.font_dir, args.max_fonts);
 
     // Single-char only — bigrams disabled per 2026-07-19, no bigram glyph building
     let sequences: Vec<Vec<char>> = features::supported_chars().iter().map(|&c| vec![c]).collect();
@@ -860,16 +838,6 @@ pub fn run_train(mut args: TrainArgs, geo_cache: &crate::geo_cache::GeometryCach
 
         catalog.iter().for_each(|fe| {
             let fk = fe.font_key_ref().to_owned();
-            // GPOS pair kern (Finding 5): one provider per font. These
-            // renders are single-char (sequences are unigrams), so the
-            // provider is never consulted — but the render API requires one,
-            // and passing the real provider keeps it correct if bigrams are
-            // ever re-enabled.
-            let kern = geo_cache.kern_provider(&fk);
-            // Nokern variants render with zero kern (Finding 5): the
-            // provider also reports 0 for a nokern font, but disable_kern
-            // is the render API's own switch and must reflect the variant.
-            let disable_kern = fe.variant_tag.contains("nokern");
             let mut local_hashes: Vec<(usize, u64)> = Vec::with_capacity(sequences.len());
             let mut need_render: Vec<usize> = Vec::new();
 
@@ -933,7 +901,7 @@ pub fn run_train(mut args: TrainArgs, geo_cache: &crate::geo_cache::GeometryCach
                             })
                         })
                         .collect();
-                    if let Some(img) = crate::char_render::render_ngram_fresh(&font, seq, &gid_overrides, &prewarm_params, disable_kern, &kern
+                    if let Some(img) = crate::char_render::render_ngram_fresh(&font, seq, &gid_overrides, &prewarm_params, false
                     ) {
                         let hash = crate::glyph_map::hash_image(&img);
                         let path = crate::char_render::ngram_cache_path(seq, hash, &prewarm_params);
@@ -1267,15 +1235,6 @@ pub fn run_train(mut args: TrainArgs, geo_cache: &crate::geo_cache::GeometryCach
                 };
 
                 let fk = fe.font_key_ref().to_owned();
-                // GPOS pair kern (Finding 5): one provider per font. These
-                // renders are single-char (sequences are unigrams), so the
-                // provider is never consulted — but the render API requires
-                // one, and passing the real provider keeps it correct if
-                // bigrams are ever re-enabled.
-                let kern = geo_cache.kern_provider(&fk);
-                // Nokern variants render with zero kern (Finding 5): see
-                // the prewarm site above.
-                let disable_kern = fe.variant_tag.contains("nokern");
                 let overrides = fe.glyph_overrides.as_deref();
                 let mut samples = Vec::with_capacity(sequences.len() * needed_combos.len());
 
@@ -1324,7 +1283,7 @@ pub fn run_train(mut args: TrainArgs, geo_cache: &crate::geo_cache::GeometryCach
                                         Some(img)
                                     } else {
                                         // Cache miss: render fresh and save to cache
-                                        let img = crate::char_render::render_ngram_fresh(&font, seq, &gid_overrides, &params, disable_kern, &kern)?;
+                                        let img = crate::char_render::render_ngram_fresh(&font, seq, &gid_overrides, &params, false)?;
                                         let path = crate::char_render::ngram_cache_path(seq, hash, &params);
                                         if let Some(parent) = path.parent() {
                                             let _ = std::fs::create_dir_all(parent);
@@ -1334,11 +1293,11 @@ pub fn run_train(mut args: TrainArgs, geo_cache: &crate::geo_cache::GeometryCach
                                     }
                                 })
                                 .or_else(|| {
-                                    crate::char_render::render_ngram_fresh(&font, seq, &gid_overrides, &params, disable_kern, &kern
+                                    crate::char_render::render_ngram_fresh(&font, seq, &gid_overrides, &params, false
                     )
                                 })
                         } else {
-                            crate::char_render::render_ngram_fresh(&font, seq, &gid_overrides, &params, disable_kern, &kern
+                            crate::char_render::render_ngram_fresh(&font, seq, &gid_overrides, &params, false
                     )
                         };
                         let img = match img {
@@ -1495,15 +1454,6 @@ pub fn run_train(mut args: TrainArgs, geo_cache: &crate::geo_cache::GeometryCach
                         // would re-trigger incremental and append the same groups again.
                         let font_data = match std::fs::read(&fe.path) { Ok(d)=>d, Err(_)=>continue };
                         let Some(font) = fe.font_ref_with_variations(&font_data) else { continue };
-                        // GPOS pair kern (Finding 5): one provider per font.
-                        // This render is single-char (sequences are unigrams),
-                        // so the provider is never consulted — but the render
-                        // API requires one, and passing the real provider
-                        // keeps it correct if bigrams are ever re-enabled.
-                        let kern = geo_cache.kern_provider(fk);
-                        // Nokern variants render with zero kern (Finding 5):
-                        // see the prewarm site above.
-                        let disable_kern = fe.variant_tag.contains("nokern");
                         let overrides = fe.glyph_overrides.as_deref();
                         let gid_overrides: Vec<Option<unprint_fonts::ab_glyph::GlyphId>> = seq.iter().map(|c| {
                             overrides.and_then(|ovs| ovs.iter().find(|(ch, _)| *ch == *c).map(|(_, g)| unprint_fonts::ab_glyph::GlyphId(*g)))
@@ -1515,7 +1465,7 @@ pub fn run_train(mut args: TrainArgs, geo_cache: &crate::geo_cache::GeometryCach
                                 params.aa = all_aa[info.aa_idx];
                                 params.subpixel_dx = dx;
                                 params.subpixel_dy = dy;
-                                let img = crate::char_render::render_ngram_fresh(&font, seq, &gid_overrides, &params, disable_kern, &kern);
+                                let img = crate::char_render::render_ngram_fresh(&font, seq, &gid_overrides, &params, false);
                                 let img = match img { Some(i)=>i, None=>continue };
                                 let feats = match compute_features(&img, false) { Some(f)=>f, None=>continue };
                                 {
