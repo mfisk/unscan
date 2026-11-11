@@ -531,6 +531,20 @@ fn run(args: &cli::Args, classifier: &mut dyn classifier::Classifier) -> Result<
         return Err(ScanTextError::NoFonts);
     }
 
+    // ── 1b''. Shared font cache for all post-index font access ──────
+    // Moved before the glyph-map block (Finding 5): the geo cache must
+    // exist before the training fallback below, whose renders need a
+    // GPOS pair-kern provider. Previously both were created after the
+    // incremental block; the load is unconditional in run(), so moving it
+    // earlier changes ordering, not work.
+    let font_cache = font_cache::FontCache::new(font_cache::DEFAULT_CAPACITY);
+    if !args.quiet { eprintln!("[timing] font_cache new {:.2}s", run_start.elapsed().as_secs_f64()); }
+
+    // ── 1c''. Geometry cache for GPOS kerning + ligature-aware positioning ──
+    let t_geo = std::time::Instant::now();
+    let geo_cache = unprint::geo_cache::GeometryCache::load_or_build(&font_registry, &font_cache, args.quiet);
+    if !args.quiet { eprintln!("[timing] geo_cache load_or_build {:.2}s (total {:.2}s)", t_geo.elapsed().as_secs_f64(), run_start.elapsed().as_secs_f64()); }
+
     // Load glyph map (glyph dedup groups).  If missing or stale, retrain
     // the LDA classifier (which rebuilds the glyph map as a side effect).
     let gmap_path = glyph_map::NgramGlyphMap::default_path();
@@ -547,7 +561,7 @@ fn run(args: &cli::Args, classifier: &mut dyn classifier::Classifier) -> Result<
                 render_params: args.render_params(),
                 lda: true,
                 ..train::TrainArgs::default()
-            });
+            }, &geo_cache);
             glyph_map::NgramGlyphMap::load(&gmap_path)
                 .unwrap_or_else(|e2| {
                     eprintln!("Error: retraining did not produce a valid glyph map ({e2})");
@@ -669,6 +683,13 @@ fn run(args: &cli::Args, classifier: &mut dyn classifier::Classifier) -> Result<
                     None => continue,
                 };
 
+                // GPOS pair kern (Finding 5): one provider per font. These
+                // sequences are single-char, so the provider is never
+                // consulted — but the render API requires one, and passing
+                // the real provider keeps it correct if bigrams are ever
+                // re-enabled.
+                let kern = geo_cache.kern_provider(font_key);
+
                 // Load font data
                 let font_data = match std::fs::read(&fe.path) {
                     Ok(d) => d,
@@ -687,7 +708,7 @@ fn run(args: &cli::Args, classifier: &mut dyn classifier::Classifier) -> Result<
                         overrides.and_then(|ovs| ovs.iter().find(|(ch, _)| *ch == *c).map(|(_, g)| unprint_fonts::ab_glyph::GlyphId(*g)))
                     }).collect();
 
-                    let img = match char_render::render_ngram_fresh(&font, seq, &gid_overrides, &render_params, fe.variant_tag.contains("nokern")) {
+                    let img = match char_render::render_ngram_fresh(&font, seq, &gid_overrides, &render_params, fe.variant_tag.contains("nokern"), &kern) {
                         Some(img) => img,
                         None => continue,
                     };
@@ -772,14 +793,8 @@ fn run(args: &cli::Args, classifier: &mut dyn classifier::Classifier) -> Result<
     );
     if !args.quiet { eprintln!("[timing] rtd from_registry {:.2}s (total {:.2}s) -> {}", t_rtd.elapsed().as_secs_f64(), run_start.elapsed().as_secs_f64(), if rtd.is_some() { "Some" } else { "None" }); }
 
-    // ── 1b''. Shared font cache for all post-index font access ──────
-    let font_cache = font_cache::FontCache::new(font_cache::DEFAULT_CAPACITY);
-    if !args.quiet { eprintln!("[timing] font_cache new {:.2}s", run_start.elapsed().as_secs_f64()); }
-
-    // ── 1c''. Geometry cache for GPOS kerning + ligature-aware positioning ──
-    let t_geo = std::time::Instant::now();
-    let geo_cache = unprint::geo_cache::GeometryCache::load_or_build(&font_registry, &font_cache, args.quiet);
-    if !args.quiet { eprintln!("[timing] geo_cache load_or_build {:.2}s (total {:.2}s)", t_geo.elapsed().as_secs_f64(), run_start.elapsed().as_secs_f64()); }
+    // (font_cache and geo_cache are created before the glyph-map block
+    // above, so the training fallback can use the geo cache.)
 
     // ── 2. Load input pages (with raster cache) ──────────────────────
     let cache_dir = page_cache::cache_key(input, args.dpi)
