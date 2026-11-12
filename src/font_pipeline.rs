@@ -61,6 +61,20 @@ pub struct ObsRankProbs {
     // subtracted from |h_err|.
     pub chosen_geo_h_overlap_correction: HashMap<usize, f32>,
     pub gt_geo_h_overlap_correction: HashMap<usize, f32>,
+    // Absolute midpoint/pitch data per observation (Finding 10) – recorded
+    // in the audit so per-line geometry can be re-derived from audit.json.
+    pub chosen_obs_cx: HashMap<usize, f32>,
+    pub chosen_pred_cx: HashMap<usize, f32>,
+    pub chosen_obs_pitch: HashMap<usize, f32>,
+    pub chosen_pred_pitch: HashMap<usize, f32>,
+    pub chosen_geo_scale: HashMap<usize, f32>,
+    pub chosen_ink_width: HashMap<usize, f32>,
+    pub gt_obs_cx: HashMap<usize, f32>,
+    pub gt_pred_cx: HashMap<usize, f32>,
+    pub gt_obs_pitch: HashMap<usize, f32>,
+    pub gt_pred_pitch: HashMap<usize, f32>,
+    pub gt_geo_scale: HashMap<usize, f32>,
+    pub gt_ink_width: HashMap<usize, f32>,
 }
 
 /// Build per-observation rank/prob/glyph/geo maps for one path's observations
@@ -86,6 +100,12 @@ fn build_obs_rank_probs(
         if let Some(he) = obs.geo_h_err { rp.chosen_geo_h_err.insert(obs.crop_index, he); }
         if let Some(ve) = obs.geo_v_err { rp.chosen_geo_v_err.insert(obs.crop_index, ve); }
         if let Some(u) = obs.geo_h_overlap_correction_px { rp.chosen_geo_h_overlap_correction.insert(obs.crop_index, u); }
+        if let Some(v) = obs.obs_cx { rp.chosen_obs_cx.insert(obs.crop_index, v); }
+        if let Some(v) = obs.pred_cx { rp.chosen_pred_cx.insert(obs.crop_index, v); }
+        if let Some(v) = obs.obs_pitch { rp.chosen_obs_pitch.insert(obs.crop_index, v); }
+        if let Some(v) = obs.pred_pitch { rp.chosen_pred_pitch.insert(obs.crop_index, v); }
+        if let Some(v) = obs.geo_scale { rp.chosen_geo_scale.insert(obs.crop_index, v); }
+        if let Some(v) = obs.ink_width { rp.chosen_ink_width.insert(obs.crop_index, v); }
     }
     // GT side – from scoring.gt_observations (ensure font)
     // When window counts differ (ligature difference, e.g. Office 4 vs 5 glyphs),
@@ -103,6 +123,12 @@ fn build_obs_rank_probs(
             if let Some(he) = obs.geo_h_err { rp.gt_geo_h_err.insert(obs.crop_index, he); }
             if let Some(ve) = obs.geo_v_err { rp.gt_geo_v_err.insert(obs.crop_index, ve); }
             if let Some(u) = obs.geo_h_overlap_correction_px { rp.gt_geo_h_overlap_correction.insert(obs.crop_index, u); }
+            if let Some(v) = obs.obs_cx { rp.gt_obs_cx.insert(obs.crop_index, v); }
+            if let Some(v) = obs.pred_cx { rp.gt_pred_cx.insert(obs.crop_index, v); }
+            if let Some(v) = obs.obs_pitch { rp.gt_obs_pitch.insert(obs.crop_index, v); }
+            if let Some(v) = obs.pred_pitch { rp.gt_pred_pitch.insert(obs.crop_index, v); }
+            if let Some(v) = obs.geo_scale { rp.gt_geo_scale.insert(obs.crop_index, v); }
+            if let Some(v) = obs.ink_width { rp.gt_ink_width.insert(obs.crop_index, v); }
         }
     } else {
         // Differing k – align by glyph identity, not ordinal.
@@ -125,6 +151,12 @@ fn build_obs_rank_probs(
                 if let Some(he) = go.geo_h_err { rp.gt_geo_h_err.insert(wo.crop_index, he); }
                 if let Some(ve) = go.geo_v_err { rp.gt_geo_v_err.insert(wo.crop_index, ve); }
                 if let Some(u) = go.geo_h_overlap_correction_px { rp.gt_geo_h_overlap_correction.insert(wo.crop_index, u); }
+                if let Some(v) = go.obs_cx { rp.gt_obs_cx.insert(wo.crop_index, v); }
+                if let Some(v) = go.pred_cx { rp.gt_pred_cx.insert(wo.crop_index, v); }
+                if let Some(v) = go.obs_pitch { rp.gt_obs_pitch.insert(wo.crop_index, v); }
+                if let Some(v) = go.pred_pitch { rp.gt_pred_pitch.insert(wo.crop_index, v); }
+                if let Some(v) = go.geo_scale { rp.gt_geo_scale.insert(wo.crop_index, v); }
+                if let Some(v) = go.ink_width { rp.gt_ink_width.insert(wo.crop_index, v); }
                 gi += 1;
             } else {
                 // Look ahead for same char – skip GT extras (e.g. f, fi before c).
@@ -146,6 +178,12 @@ fn build_obs_rank_probs(
                     if let Some(he) = go.geo_h_err { rp.gt_geo_h_err.insert(wo.crop_index, he); }
                     if let Some(ve) = go.geo_v_err { rp.gt_geo_v_err.insert(wo.crop_index, ve); }
                     if let Some(u) = go.geo_h_overlap_correction_px { rp.gt_geo_h_overlap_correction.insert(wo.crop_index, u); }
+                    if let Some(v) = go.obs_cx { rp.gt_obs_cx.insert(wo.crop_index, v); }
+                    if let Some(v) = go.pred_cx { rp.gt_pred_cx.insert(wo.crop_index, v); }
+                    if let Some(v) = go.obs_pitch { rp.gt_obs_pitch.insert(wo.crop_index, v); }
+                    if let Some(v) = go.pred_pitch { rp.gt_pred_pitch.insert(wo.crop_index, v); }
+                    if let Some(v) = go.geo_scale { rp.gt_geo_scale.insert(wo.crop_index, v); }
+                    if let Some(v) = go.ink_width { rp.gt_ink_width.insert(wo.crop_index, v); }
                     gi = fidx + 1;
                 } else {
                     // No GT counterpart (e.g. winner ffi not supported by GT Caladea) – leave —.
@@ -1108,6 +1146,12 @@ pub fn match_lines(
                             geo_h_err: None,
                             geo_v_err: None,
                             geo_h_overlap_correction_px: None,
+                            obs_cx: None,
+                            pred_cx: None,
+                            obs_pitch: None,
+                            pred_pitch: None,
+                            geo_scale: None,
+                            ink_width: None,
                         });
                         idx += 1;
                     }
