@@ -18,14 +18,20 @@ const REF_H: f32 = 100.0;
 /// Compute the font em-height in pixels such that the advance width of `text`
 /// equals `target_width_px`.  Returns `None` when the font has zero advance
 /// for the given text (e.g. missing glyphs).
-pub fn width_matched_em_px<F: Font>(font: &F, text: &str, target_width_px: f32, overrides: Option<&[(char, u16)]>) -> Option<f32> {
+///
+/// `kern` is the REQUIRED GPOS pair-kern provider for this font (Finding 6):
+/// the single source of pair kern, matching `render_word_ab_glyph`. The
+/// legacy `kern` table (what `ab_glyph`'s `sf.kern()` reads) is empty for
+/// GPOS-only fonts, so using it here underestimates the advance and the
+/// em size. There is no fallback to the legacy table.
+pub fn width_matched_em_px<F: Font>(font: &F, text: &str, target_width_px: f32, overrides: Option<&[(char, u16)]>, kern: &dyn KernProvider) -> Option<f32> {
     let sf_ref = font.as_scaled(PxScale::from(REF_H));
     let mut adv = 0.0f32;
     let mut prev: Option<unprint_fonts::ab_glyph::GlyphId> = None;
     for c in text.chars() {
         let gid = crate::char_render::resolve_glyph(font, c, overrides);
         if let Some(p) = prev {
-            adv += sf_ref.kern(p, gid);
+            adv += kern.pair_kern_fu(p.0, gid.0) as f32 * REF_H / font.height_unscaled();
         }
         adv += sf_ref.h_advance(gid);
         prev = Some(gid);
