@@ -373,6 +373,29 @@ if ! [ -s "$TW/PrestigeElite-Regular.ttf" ]; then
 fi
 
 # ---------------------------------------------------------------------------
+# URW Base 35 (PostScript Level 2 core fonts, OTF)
+# ---------------------------------------------------------------------------
+# Real vintage PostScript fonts (Nimbus Roman = Times clone, Nimbus Sans =
+# Helvetica clone, etc.) in OTF format, downloaded directly from the
+# ArtifexSoftware/urw-base35-fonts release. The OTF files carry the full
+# authentic kern data (Nimbus Roman Regular: 3845 GPOS PairPos pairs,
+# matching the AFM's 3845 KPX entries). Used by the t66 vintage test.
+# Direct download per Mike (Oct 31, 2026): "Don't use apt for the fonts."
+URW="$FONTS/urw-base35"
+URW_VER="20200910"
+URW_URL="https://github.com/ArtifexSoftware/urw-base35-fonts/archive/refs/tags/${URW_VER}.tar.gz"
+if ! [ -s "$URW/NimbusRoman-Regular.otf" ]; then
+  [[ -d "$URW" ]] || mkdir -p "$URW"
+  echo "  urw-base35 $URW_VER"
+  curl -fsSL -o /tmp/urw-base35.tar.gz "$URW_URL" || echo "  WARN: urw-base35 download"
+  if [[ -s /tmp/urw-base35.tar.gz ]]; then
+    tar xzf /tmp/urw-base35.tar.gz -C /tmp "urw-base35-fonts-${URW_VER}/fonts/" || echo "  WARN: urw-base35 extract"
+    cp /tmp/urw-base35-fonts-${URW_VER}/fonts/*.otf "$URW/" 2>/dev/null || echo "  WARN: urw-base35 copy"
+    rm -rf /tmp/urw-base35.tar.gz "/tmp/urw-base35-fonts-${URW_VER}"
+  fi
+fi
+
+# ---------------------------------------------------------------------------
 # Google Fonts (direct upstream downloads from FONTS_TO_INSTALL)
 # ---------------------------------------------------------------------------
 for entry in "${FONTS_TO_INSTALL[@]}"; do
