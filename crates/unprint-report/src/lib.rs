@@ -237,7 +237,6 @@ fn format_char_detail(
     opp_h: Option<f32>,
     opp_v: Option<f32>,
     weight: Option<f32>,
-    h_overlap_correction_px: Option<f32>,
 ) -> String {
     let mut out = String::new();
     if let Some(pu) = prob_x_u {
@@ -279,9 +278,6 @@ fn format_char_detail(
                 out.push_str(&format!("h {h:.2}"));
             } else {
                 out.push_str(&format!("<span class='{cls}'>h {h:.2}</span>"));
-            }
-            if let Some(c) = h_overlap_correction_px {
-                out.push_str(&format!("<span class='overlap-graded' title='h_ll graded overlap downweight: overlap width {c:.2}px subtracted from |h_err| (clamped at 0, sign kept)'>†</span>"));
             }
         }
         if let Some(v) = v_ll {
@@ -1748,13 +1744,6 @@ fn build_observation_table(
     _glyph_map: &NgramGlyphMap,
     crop_dir_name: &str,
 ) -> String {
-    // NOTE (Finding 5): the reference renders in this table pass NoKern.
-    // This is display-only image generation, and the report has no geo
-    // cache available (the generator is not modified to thread one). The
-    // renders are single-glyph or short-sequence reference images; the
-    // audit scores themselves are unaffected. Multi-char reference images
-    // therefore show the unkerned form. This is explicit, not a silent
-    // fallback to the legacy kern table.
     // Build fallback geo map from GT's own observations, on GT's own
     // segmentation. When the winner is ligature (contains ﬃ) and the GT
     // font lacks ligature support, GT's per_char_geo is None on the winner
@@ -1764,8 +1753,8 @@ fn build_observation_table(
     // components below.
     use std::collections::HashMap as FbMap;
     let gt_obs_ref: &[unprint::audit::ObservationVote] = &entry.gt_obs_votes;
-    // Map seq string -> (h_ll, v_ll, h_err, v_err, glyph_score, rank, prob, h_overlap_correction)
-    let mut gt_fallback: FbMap<String, (Option<f32>, Option<f32>, Option<f32>, Option<f32>, Option<f32>, Option<usize>, Option<f32>, Option<f32>)> = FbMap::new();
+    // Map seq string -> (h_ll, v_ll, h_err, v_err, glyph_score, rank, prob)
+    let mut gt_fallback: FbMap<String, (Option<f32>, Option<f32>, Option<f32>, Option<f32>, Option<f32>, Option<usize>, Option<f32>)> = FbMap::new();
     for ov in gt_obs_ref {
         if ov.gt_geo_h_ll.is_some() || ov.gt_font_rank.is_some() {
             let key: String = ov.seq.iter().collect();
@@ -1773,7 +1762,6 @@ fn build_observation_table(
             gt_fallback.entry(key).or_insert((
                 ov.gt_geo_h_ll, ov.gt_geo_v_ll, ov.gt_geo_h_err, ov.gt_geo_v_err,
                 ov.gt_glyph_score, ov.gt_font_rank, ov.gt_font_prob,
-                ov.gt_geo_h_overlap_correction_px,
             ));
         }
     }
@@ -1823,7 +1811,7 @@ fn build_observation_table(
                             .and_then(|ovs| ovs.iter().find(|(gc, _)| *gc == *c).map(|(_, g)| unprint_fonts::ab_glyph::GlyphId(*g)))
                     }).collect();
                     let _disable_kern = fe.variant_tag.contains("nokern");
-                    if let Some(img) = char_render::render_ngram_fresh(&font, &render_seq, &gid_overrides, &char_render::RenderParams::default(), _disable_kern, &unprint_fonts::NoKern) {
+                    if let Some(img) = char_render::render_ngram_fresh(&font, &render_seq, &gid_overrides, &char_render::RenderParams::default(), _disable_kern) {
                         correct_mid = ink_midpoint(&img);
                         correct_ref_uri = Some(img_to_b64_uri(&img));
                     }
@@ -1861,7 +1849,7 @@ fn build_observation_table(
                                 .and_then(|ovs| ovs.iter().find(|(gc, _)| *gc == *c).map(|(_, g)| unprint_fonts::ab_glyph::GlyphId(*g)))
                         }).collect();
                         let _disable_kern = fe.variant_tag.contains("nokern");
-                    if let Some(img) = char_render::render_ngram_fresh(&font, &render_seq, &gid_overrides, &char_render::RenderParams::default(), _disable_kern, &unprint_fonts::NoKern) {
+                    if let Some(img) = char_render::render_ngram_fresh(&font, &render_seq, &gid_overrides, &char_render::RenderParams::default(), _disable_kern) {
                             chosen_mid = ink_midpoint(&img);
                             chosen_ref_uri = Some(img_to_b64_uri(&img));
                         }
@@ -1898,9 +1886,9 @@ fn build_observation_table(
             _ => ("", ""),
         };
 
-        let (gt_h, gt_v, gt_h_err, gt_v_err, gt_glyph, _gt_rank_f, gt_prob_f, gt_h_overlap_correction) = if cv.gt_geo_h_ll.is_none() || cv.gt_font_rank.is_none() {
+        let (gt_h, gt_v, gt_h_err, gt_v_err, gt_glyph, _gt_rank_f, gt_prob_f) = if cv.gt_geo_h_ll.is_none() || cv.gt_font_rank.is_none() {
             let seq_key: String = cv.seq.iter().collect();
-            if let Some((fh, fv, fhe, fve, fg, fr, fp, fz)) = gt_fallback.get(&seq_key) {
+            if let Some((fh, fv, fhe, fve, fg, fr, fp)) = gt_fallback.get(&seq_key) {
                 (
                     cv.gt_geo_h_ll.or(*fh),
                     cv.gt_geo_v_ll.or(*fv),
@@ -1909,28 +1897,25 @@ fn build_observation_table(
                     cv.gt_glyph_score.or(*fg),
                     cv.gt_font_rank.or(*fr),
                     cv.gt_font_prob.or(*fp),
-                    cv.gt_geo_h_overlap_correction_px.or(*fz),
                 )
             } else {
-                (cv.gt_geo_h_ll, cv.gt_geo_v_ll, cv.gt_geo_h_err, cv.gt_geo_v_err, cv.gt_glyph_score, cv.gt_font_rank, cv.gt_font_prob, cv.gt_geo_h_overlap_correction_px)
+                (cv.gt_geo_h_ll, cv.gt_geo_v_ll, cv.gt_geo_h_err, cv.gt_geo_v_err, cv.gt_glyph_score, cv.gt_font_rank, cv.gt_font_prob)
             }
         } else {
-            (cv.gt_geo_h_ll, cv.gt_geo_v_ll, cv.gt_geo_h_err, cv.gt_geo_v_err, cv.gt_glyph_score, cv.gt_font_rank, cv.gt_font_prob, cv.gt_geo_h_overlap_correction_px)
+            (cv.gt_geo_h_ll, cv.gt_geo_v_ll, cv.gt_geo_h_err, cv.gt_geo_v_err, cv.gt_glyph_score, cv.gt_font_rank, cv.gt_font_prob)
         };
         // For GT debugging: pass each side's opponent for per-dimension coloring
         let chosen_detail = format_char_detail(
             cv.chosen_prob, cv.chosen_glyph_score,
             cv.chosen_geo_h_ll, cv.chosen_geo_v_ll,
             cv.chosen_geo_h_err, cv.chosen_geo_v_err,
-            gt_glyph, gt_h, gt_v, Some(cv.weight),
-            cv.chosen_geo_h_overlap_correction_px
+            gt_glyph, gt_h, gt_v, Some(cv.weight)
         );
         let correct_detail = format_char_detail(
             gt_prob_f, gt_glyph,
             gt_h, gt_v,
             gt_h_err, gt_v_err,
-            cv.chosen_glyph_score, cv.chosen_geo_h_ll, cv.chosen_geo_v_ll, Some(cv.weight),
-            gt_h_overlap_correction
+            cv.chosen_glyph_score, cv.chosen_geo_h_ll, cv.chosen_geo_v_ll, Some(cv.weight)
         );
 
         let chosen_score_label = if !chosen_detail.is_empty() {
@@ -1984,9 +1969,7 @@ fn build_observation_table(
                                                 .and_then(|ovs| ovs.iter().find(|(gc, _)| *gc == *c).map(|(_, g)| unprint_fonts::ab_glyph::GlyphId(*g)))
                                         }).collect();
                                         let _disable_kern = fe.variant_tag.contains("nokern");
-                                        // Single-glyph render: kerning is undefined for one
-                                        // glyph (no pair), so NoKern is never consulted.
-                                        if let Some(img) = char_render::render_ngram_fresh(&font, &[*comp], &gid_overrides, &char_render::RenderParams::default(), _disable_kern, &unprint_fonts::NoKern) {
+                                        if let Some(img) = char_render::render_ngram_fresh(&font, &[*comp], &gid_overrides, &char_render::RenderParams::default(), _disable_kern) {
                                             comp_uri = Some(img_to_b64_uri(&img));
                                         }
                                     }
@@ -1997,8 +1980,7 @@ fn build_observation_table(
                                 ov.gt_font_prob, ov.gt_glyph_score,
                                 ov.gt_geo_h_ll, ov.gt_geo_v_ll,
                                 ov.gt_geo_h_err, ov.gt_geo_v_err,
-                                cv.chosen_glyph_score, cv.chosen_geo_h_ll, cv.chosen_geo_v_ll, Some(ov.weight),
-                                ov.gt_geo_h_overlap_correction_px
+                                cv.chosen_glyph_score, cv.chosen_geo_h_ll, cv.chosen_geo_v_ll, Some(ov.weight)
                             );
                             let comp_label = if !comp_detail.is_empty() {
                                 format!("<div class='sub'>{comp_detail}</div>")
@@ -2149,7 +2131,6 @@ img.ci {
 .prob-lose { background: #ffebee; border-left: 3px solid #ef5350; padding-left: 4px; }
 .dim-win { color: #2e7d32; font-weight: 700; }
 .dim-lose { color: #c62828; }
-.overlap-graded { color: #6a1b9a; font-weight: 700; }
 .prob-win .dim-win, .prob-lose .dim-lose { font-weight: 800; }
 .img-td.prob-win { outline: 2px solid #4caf50; outline-offset: -1px; }
 .img-td.prob-lose { outline: 1px solid #ef9a9a; }
@@ -2781,10 +2762,6 @@ pub fn generate_report(
          <b>×u, higher = better</b>. Values below the threshold (default 6×u) are noise.\n\
          <b>ZNCC</b> (per-line) = zero-mean normalized cross-correlation between scanned line \
          and re-render; <b>-1–1, higher = more similar</b>.\n\
-         <b>†</b> after an h value means that pair's h_ll got the graded overlap \
-         downweighting (unreliable pitch: overlapping ink boxes + DP seam cut ink); \
-         hover for the overlap width in px subtracted from |h_err| \
-         (clamped at 0, sign kept, original sigma).\n\
          </div>\n\
          {all_lines_section}\n\
          <h2>Major Misses ({n_major})</h2>\n\
