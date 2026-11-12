@@ -1183,6 +1183,7 @@ mod tests {
             opsz_range: None,
             has_gpos: false,
             has_kern: false,
+            font_version: "1.00".to_string(),
         };
         let p1 = vintage_cache_path(&fe, Era::PostScript);
         let p2 = vintage_cache_path(&fe, Era::PostScript);

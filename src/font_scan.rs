@@ -257,6 +257,16 @@ pub struct FontEntry {
     /// (GPOS presence alone does not imply kerning — legacy `kern` tables
     /// kern in rendering too.) Serialized in the scan cache (v18+).
     pub has_kern: bool,
+    /// Font version from the `head` table `fontRevision` field, formatted
+    /// as "major.minor" (e.g. "2.50"). Captured during the scan while the
+    /// font file bytes are available; cannot be re-derived later because
+    /// `data` is dropped after the scan. Part of the font key
+    /// (`|version=X`): two files with the same PostScript name but
+    /// different versions (e.g. Win31 Times v2.50 vs modern Times v2.82)
+    /// are different fonts and must not collide. Identical files share
+    /// a version, so they share a key and dedup naturally. Serialized
+    /// in the scan cache (v20+).
+    pub font_version: String,
 }
 
 impl FontEntry {
@@ -289,8 +299,25 @@ impl FontEntry {
         variant_tag: &str,
         vintage_era: Option<&str>,
         variations: &Variations,
+        font_version: &str,
     ) -> String {
-        let mut k = Self::append_variant_tag(postscript_name.to_owned(), variant_tag);
+        // The font version (|version=X, from the head table fontRevision)
+        // goes immediately after the PostScript name, before any variant
+        // tags: it identifies WHICH font file this is (e.g. Win31 Times
+        // v2.50 vs modern Times v2.82 share a PostScript name but are
+        // different fonts). OT variant entries pass "PS|tag" as the name,
+        // so insert before the first '|' to keep the version adjacent to
+        // the bare PostScript name. An empty version (tombstones) omits
+        // the tag.
+        let mut k = postscript_name.to_owned();
+        if !font_version.is_empty() {
+            let tag = format!("|version={font_version}");
+            match k.find('|') {
+                Some(idx) => k.insert_str(idx, &tag),
+                None => k.push_str(&tag),
+            }
+        }
+        let mut k = Self::append_variant_tag(k, variant_tag);
         if let Some(vars) = variations {
             if !vars.is_empty() {
                 k.push('[');
@@ -341,6 +368,7 @@ impl FontEntry {
             &self.variant_tag,
             self.vintage_era.as_deref(),
             &self.variations,
+            &self.font_version,
         );
     }
 
@@ -990,8 +1018,8 @@ pub fn default_font_dirs(extra: &[PathBuf]) -> Vec<PathBuf> {
 //     typographic_family_len: u32 le + [u8; typographic_family_len]
 
 const FSCN_MAGIC: &[u8; 4] = b"FSCN";
-// v19: lig/nolig explicit in variant_tag (|lig on ligature-enabled entries).
-const FSCN_VERSION: u32 = 19;
+// v20: font_version field (|version=X in font keys) + content-based identity.
+const FSCN_VERSION: u32 = 20;
 
 pub(crate) fn scan_cache_path() -> PathBuf {
     crate::cache::paths::font_scan_bin()
@@ -1193,6 +1221,9 @@ fn write_scan_cache(path: &Path, entries: &[FontEntry]) -> std::io::Result<()> {
 
         // has_kern - v18+
         w.write_all(&[e.has_kern as u8])?;
+
+        // font_version - v20+
+        write_str(&mut w, &e.font_version)?;
     }
 
     w.flush()?;
@@ -1319,6 +1350,9 @@ fn read_scan_cache(path: &Path, quiet: bool) -> Option<Vec<FontEntry>> {
         // has_kern - v18+
         let has_kern = read_u8(&mut r)? != 0;
 
+        // font_version - v20+
+        let font_version = read_str(&mut r)?;
+
         entries.push(FontEntry {
             path: path_buf,
             family_name,
@@ -1336,6 +1370,7 @@ fn read_scan_cache(path: &Path, quiet: bool) -> Option<Vec<FontEntry>> {
                     &variant_tag,
                     vintage_era.as_deref(),
                     &variations,
+                    &font_version,
                 )
             },
             glyph_overrides,
@@ -1345,6 +1380,7 @@ fn read_scan_cache(path: &Path, quiet: bool) -> Option<Vec<FontEntry>> {
             opsz_range,
             has_gpos,
             has_kern,
+            font_version,
         });
     }
 
@@ -1437,8 +1473,14 @@ pub fn scan_fonts(dirs: &[PathBuf], quiet: bool) -> Vec<FontEntry> {
     let current_set: std::collections::HashSet<&PathBuf> = current_paths.iter().collect();
     let cached_set: std::collections::HashSet<&PathBuf> = cached_by_path.keys().collect();
 
-    let added: Vec<&PathBuf> = current_set.difference(&cached_set).copied().collect();
-    let removed: Vec<&PathBuf> = cached_set.difference(&current_set).copied().collect();
+    // Sort: HashSet difference order is non-deterministic, and the dedup
+    // below keeps the FIRST entry per font_key. Without sorting, which
+    // copy of a duplicated font survives varies run to run, so
+    // --resolve-fontkey intermittently fails for the dropped path.
+    let mut added: Vec<&PathBuf> = current_set.difference(&cached_set).copied().collect();
+    added.sort();
+    let mut removed: Vec<&PathBuf> = cached_set.difference(&current_set).copied().collect();
+    removed.sort();
     let cache_changed = !added.is_empty() || !removed.is_empty();
 
     if !cache_changed {
@@ -1592,6 +1634,7 @@ pub fn scan_fonts(dirs: &[PathBuf], quiet: bool) -> Vec<FontEntry> {
                             &var_tag,
                             None,
                             &default_variations,
+                            &fe.font_version,
                         ),
                         glyph_overrides: Some(combined),
                         variations: default_variations.clone(),
@@ -1600,6 +1643,7 @@ pub fn scan_fonts(dirs: &[PathBuf], quiet: bool) -> Vec<FontEntry> {
                         opsz_range,
                         has_gpos: fe.has_gpos,
                         has_kern: fe.has_kern,
+                        font_version: fe.font_version.clone(),
                     };
                     fonts.push(var_entry);
                 }
@@ -1636,6 +1680,7 @@ pub fn scan_fonts(dirs: &[PathBuf], quiet: bool) -> Vec<FontEntry> {
                                 &allcaps_tag,
                                 None,
                                 &default_variations,
+                                &fe.font_version,
                             ),
                             glyph_overrides: if combined_lig.is_empty() { None } else { Some(combined_lig) },
                             variations: default_variations.clone(),
@@ -1644,6 +1689,7 @@ pub fn scan_fonts(dirs: &[PathBuf], quiet: bool) -> Vec<FontEntry> {
                             opsz_range,
                             has_gpos: fe.has_gpos,
                             has_kern: fe.has_kern,
+                            font_version: fe.font_version.clone(),
                         };
                         fonts.push(allcaps_entry);
                     }
@@ -1694,6 +1740,7 @@ pub fn scan_fonts(dirs: &[PathBuf], quiet: bool) -> Vec<FontEntry> {
                             &var_tag,
                             None,
                             &var_variations,
+                            &fe.font_version,
                         ),
                         glyph_overrides: None,
                         variations: var_variations,
@@ -1702,6 +1749,7 @@ pub fn scan_fonts(dirs: &[PathBuf], quiet: bool) -> Vec<FontEntry> {
                         opsz_range,
                         has_gpos: fe.has_gpos,
                         has_kern: fe.has_kern,
+                        font_version: fe.font_version.clone(),
                     };
                     // Add ligature overrides to weight-instance entry
                     if !ligatures.is_empty() {
@@ -1806,6 +1854,7 @@ pub fn scan_fonts(dirs: &[PathBuf], quiet: bool) -> Vec<FontEntry> {
                                     &variant_tag,
                                     None,
                                     variations,
+                                    &fe.font_version,
                                 ),
                                 glyph_overrides: fe.glyph_overrides.clone(),
                                 variations: variations.clone(),
@@ -1814,6 +1863,7 @@ pub fn scan_fonts(dirs: &[PathBuf], quiet: bool) -> Vec<FontEntry> {
                                 opsz_range,
                                 has_gpos: fe.has_gpos,
                                 has_kern: fe.has_kern,
+                                font_version: fe.font_version.clone(),
                             };
                             fonts.push(entry);
                         }
@@ -1847,6 +1897,7 @@ pub fn scan_fonts(dirs: &[PathBuf], quiet: bool) -> Vec<FontEntry> {
                     opsz_range: None,
                     has_gpos: false,
                     has_kern: false,
+                    font_version: String::new(),
                 });
             }
         }
@@ -2532,6 +2583,37 @@ pub fn font_key_preference_score(font_key: &str, has_kern: bool) -> i32 {
     s
 }
 
+/// Font version from the `head` table `fontRevision` field, formatted
+/// as "major.minor" with two decimals (e.g. "2.50"). `fontRevision` is a
+/// 16.16 fixed-point at offset 4 of the `head` table (after the 4-byte
+/// table version). Returns an empty string if the font has no parseable
+/// `head` table. Two-decimal rounding matches the conventional display
+/// (fontTools reports the same values); versions finer than 0.01 (rare
+/// in practice) round to the nearest hundredth.
+fn font_revision(data: &[u8]) -> String {
+    let face = match unprint_fonts::ttf_parser::Face::parse(data, 0) {
+        Ok(f) => f,
+        Err(_) => return String::new(),
+    };
+    let head_tag = unprint_fonts::ttf_parser::Tag::from_bytes(b"head");
+    let Some(head) = face.raw_face().table(head_tag) else {
+        return String::new();
+    };
+    if head.len() < 8 {
+        return String::new();
+    }
+    let raw = u32::from_be_bytes([head[4], head[5], head[6], head[7]]);
+    let major = raw >> 16;
+    let frac = (raw & 0xFFFF) as f64 / 65536.0;
+    let minor = (frac * 100.0).round() as u32;
+    if minor >= 100 {
+        // Fractional part rounds up to the next major (e.g. 2.9999 -> 3.00).
+        format!("{}.00", major + 1)
+    } else {
+        format!("{}.{:02}", major, minor)
+    }
+}
+
 fn font_has_kern_feature(data: &[u8]) -> bool {
     let face = match unprint_fonts::ttf_parser::Face::parse(data, 0) {
         Ok(f) => f,
@@ -2968,6 +3050,9 @@ pub fn load_font_entry(path: &Path, aliases: &HashMap<String, Alias>) -> Option<
     // font-key preference's kern/nokern signal. Same lifetime constraint
     // as has_gpos: computed here, stored on the entry, serialized.
     let has_kern = font_has_kern_feature(&data);
+    // Font version, captured while the bytes are available — part of the
+    // font key (|version=X). Same lifetime constraint as has_gpos/has_kern.
+    let font_version = font_revision(&data);
     let meta = read_font_metadata(&data);
     let raw_ps_name = meta.nid6_postscript;
     let os2_weight = meta.weight_class;
@@ -2984,7 +3069,13 @@ pub fn load_font_entry(path: &Path, aliases: &HashMap<String, Alias>) -> Option<
     // Try alias table first (exact match on lowercase stem)
     if let Some(alias) = aliases.get(&stem_lower) {
         let class = classify(alias.family);
-        let font_key_cache = postscript_name.clone();
+        let font_key_cache = FontEntry::compute_font_key_full(
+            &postscript_name,
+            "",
+            None,
+            &None,
+            &font_version,
+        );
         return Some(FontEntry {
             path: path.to_path_buf(),
             family_name: alias.family.to_string(),
@@ -3004,6 +3095,7 @@ pub fn load_font_entry(path: &Path, aliases: &HashMap<String, Alias>) -> Option<
             opsz_range: None,
             has_gpos,
             has_kern,
+            font_version: font_version.clone(),
         });
     }
 
@@ -3026,7 +3118,13 @@ pub fn load_font_entry(path: &Path, aliases: &HashMap<String, Alias>) -> Option<
         || stem_lower.ends_with("it");
     let class = classify(&family_name);
 
-    let font_key_cache = postscript_name.clone();
+    let font_key_cache = FontEntry::compute_font_key_full(
+        &postscript_name,
+        "",
+        None,
+        &None,
+        &font_version,
+    );
     Some(FontEntry {
         path: path.to_path_buf(),
         family_name,
@@ -3046,6 +3144,7 @@ pub fn load_font_entry(path: &Path, aliases: &HashMap<String, Alias>) -> Option<
         opsz_range: None,
         has_gpos,
         has_kern,
+        font_version,
     })
 }
 
@@ -3089,6 +3188,7 @@ mod catalog_hash_tests {
             "",
             None,
             &variations,
+            "1.00",
         );
         FontEntry {
             path: PathBuf::from("/font.ttf"),
@@ -3109,6 +3209,7 @@ mod catalog_hash_tests {
             opsz_range: None,
             has_gpos: false,
             has_kern: false,
+            font_version: "1.00".to_string(),
         }
     }
 
@@ -3134,6 +3235,7 @@ mod catalog_hash_tests {
             opsz_range: None,
             has_gpos: false,
             has_kern: false,
+            font_version: "1.00".to_string(),
         };
         // Test fixture: arbitrary variation coordinates (opsz value is not
         // significant here; detect_default_variations now uses the font's
@@ -3142,7 +3244,7 @@ mod catalog_hash_tests {
         base.assign_default_variations(Some(defaults.clone()));
 
         assert_eq!(base.variations, Some(defaults));
-        assert_eq!(base.font_key_ref(), "Test-400[wght=400,opsz=10]");
+        assert_eq!(base.font_key_ref(), "Test-400|version=1.00[wght=400,opsz=10]");
     }
 
     #[test]
@@ -3151,7 +3253,7 @@ mod catalog_hash_tests {
         let duplicate = entry(None, None);
         let deduped = dedup_font_entries_by_key(vec![first, duplicate], true);
         assert_eq!(deduped.len(), 1);
-        assert_eq!(deduped[0].font_key_ref(), "Test-400");
+        assert_eq!(deduped[0].font_key_ref(), "Test-400|version=1.00");
     }
 
     #[test]
