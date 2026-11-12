@@ -549,7 +549,7 @@ fn render_words_ab_glyph(
 
     let mut all_em: Vec<f32> = words.iter()
         .filter(|w| !w.text.is_empty() && w.width >= 1)
-        .filter_map(|w| crate::layout::width_matched_em_px(&font, &w.text, w.width as f32, overrides))
+        .filter_map(|w| crate::layout::width_matched_em_px(&font, &w.text, w.width as f32, overrides, &unprint_fonts::NoKern))
         .collect();
     if all_em.is_empty() {
         return Some(canvas);

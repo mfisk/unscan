@@ -14,6 +14,7 @@ pub fn generate_comparison(
     page_idx: usize,
     output_dir: &Path,
     font_cache: &crate::font_cache::FontCache,
+    geo_cache: &crate::geo_cache::GeometryCache,
 ) -> std::io::Result<()> {
     std::fs::create_dir_all(output_dir)?;
 
@@ -56,6 +57,10 @@ pub fn generate_comparison(
             Ok(d) => d,
             Err(_) => continue,
         };
+        // GPOS pair kern (Finding 6): the render uses the geo-cache
+        // provider, the same kern source as the geometry predictor and
+        // the ngram renders — not ab_glyph's legacy kern table.
+        let kern = geo_cache.kern_provider(&fm.font_key);
         let rendered_crop = render_font_crop(
             &font_data_loaded,
             &pt.words,
@@ -63,6 +68,7 @@ pub fn generate_comparison(
             crop_w, crop_h,
             &pt.text,
             fm.glyph_overrides.as_deref(),
+            &kern,
         );
 
         // ── Scale both to target width ───────────────────────────
@@ -238,6 +244,7 @@ fn render_font_crop(
     canvas_h: u32,
     line_text: &str,
     overrides: Option<&[(char, u16)]>,
+    kern: &dyn unprint_fonts::KernProvider,
 ) -> GrayImage {
     let mut canvas = GrayImage::from_pixel(canvas_w, canvas_h, Luma([255u8]));
     // Raw-buffer hoist: min-blend glyph draws previously used canvas.get_pixel/put_pixel per coverage sample.
@@ -262,6 +269,7 @@ fn render_font_crop(
                 &word.text,
                 word.width,
                 overrides,
+                kern,
             ) {
                 Some(v) => v,
                 None => continue,
@@ -286,7 +294,9 @@ fn render_font_crop(
             for c in word.text.chars() {
                 let gid = crate::char_render::resolve_glyph(&font, c, overrides);
                 if let Some(p) = prev {
-                    cx += sf.kern(p, gid);
+                    // GPOS pair kern (Finding 6): provider, not ab_glyph's
+                    // legacy kern table (empty for GPOS-only fonts).
+                    cx += kern.pair_kern_fu(p.0, gid.0) as f32 * word_scale.x / font.height_unscaled();
                 }
                 let glyph = gid.with_scale_and_position(
                     word_scale,
@@ -324,6 +334,7 @@ fn render_font_crop(
             line_text,
             (line_x + (canvas_w - 8)) as f32 - line_x as f32,
             overrides,
+            kern,
         ) {
             Some(v) => v,
             None => return canvas,
@@ -341,7 +352,9 @@ fn render_font_crop(
         for c in line_text.chars() {
             let gid = crate::char_render::resolve_glyph(&font, c, overrides);
             if let Some(p) = prev {
-                cx += sf.kern(p, gid);
+                // GPOS pair kern (Finding 6): provider, not ab_glyph's
+                // legacy kern table (empty for GPOS-only fonts).
+                cx += kern.pair_kern_fu(p.0, gid.0) as f32 * scale.x / font.height_unscaled();
             }
             let glyph = gid.with_scale_and_position(scale, point(cx, baseline));
             if let Some(og) = font.outline_glyph(glyph) {
