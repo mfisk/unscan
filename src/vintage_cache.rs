@@ -14,18 +14,63 @@
 //!   - If birth year <= era.start_year => font existed at that era, so we generate variant
 //!   - Cache path = `~/.cache/unprint/vintage-fonts/<sanitized>-<era>-<hash>.ttf`
 //!   - If cached file exists and is newer than base, reuse; else regenerate
-//!   - Currently stubbed as copy + log (safe to ship); TODO: replace with write-fonts transform
 //!
-//! Future write-fonts transforms (TODO markers below):
-//!   PostScript: strip GPOS, keep kern fmt0 only, limit to ~300 pairs (1985)
-//!   TrueType: empty kern/GPOS (Word 6 default kerning off) (1990)
-//!   Word6: kern fmt0 only, coarse quantization (1993)
-//!   OpenType: GPOS class kerning limited (1996)
-//!   Pdf14: full GPOS + ToUnicode (2001)
-//!   InDesignCS: optical kerning simulation (outline distance + jitter) (2003)
-//!   Docx: Calibri-style class kerning, 1289 pairs quantize (2007)
-//!   HarfBuzz: HarfBuzz-shaped, mark offsets, over-segmented TJ <50 merge (2013)
-//!   Variable: gvar/avar tracking via Tc vs variation (2020)
+//! Implemented transforms (`transform_font`, read-fonts 0.1 + write-fonts 0.3
+//! FontBuilder, `kern` format 0 manipulated at the byte level):
+//!   PostScript: strip GPOS, kern fmt0 only, limited to the 300 largest-|value|
+//!     pairs. The 300 limit is a hardcoded truncation in this transform, NOT a
+//!     measured AFM property: real AFM files carry ~3800 kern pairs
+//!     (NimbusRoman-Regular.afm declares 3845 KPX entries). Kern source is the
+//!     font's own kern fmt0 table when present, else pairs derived from GPOS
+//!     PairPos (XAdvance), composed first-match-wins within each lookup (as a
+//!     shaper applies subtables). (1985)
+//!   TrueType: empty kern and GPOS (Word 6 default kerning off). (1990)
+//!   Word6: kern fmt0 only, values quantized to multiples of 5, zero-valued pairs
+//!     dropped. Same kern source as PostScript. A GPOS-derived source can expand
+//!     past the format-0 capacity (10920 pairs), so it is truncated to that
+//!     capacity (largest |value| first) — a hard format constraint. (1993)
+//!   OpenType: strip kern, keep GPOS as-is. The module docs mention "GPOS class
+//!     kerning limited" but give no concrete limit, so no limiting is applied. (1996)
+//!   Pdf14 / Docx / HarfBuzz / Variable: return original bytes unchanged
+//!     (modern, full GPOS). (2001 / 2007 / 2013 / 2020)
+//!   InDesignCS: DEFERRED — optical kerning simulation (outline distance + jitter)
+//!     needs its own pipeline (see DEFAULT_ERAS, which omits it per Mike). Returns
+//!     original bytes unchanged. (2003)
+//!
+//! Recreation methods (Mike Nov 12, 2026): a vintage state is recreated one
+//! of three ways, and the t66 specimen states which method each section uses:
+//!   Clone: use a real clone font as-is, with no byte modification. The URW
+//!     Base 35 fonts (Nimbus Roman, Nimbus Mono PS, ...) are metric-compatible
+//!     clones of the Adobe PostScript core fonts — NOT the original Adobe fonts
+//!     — downloaded as real OTF from the URW Base 35 release (20200910,
+//!     ArtifexSoftware/urw-base35-fonts). Their standard catalog font keys are
+//!     the expected keys in t66.
+//!   Reconstructing: modify a real font's tables to match a historical state
+//!     (this module's transforms: PostScript truncates the kern table,
+//!     TrueType/OpenType strip tables). Currently UNUSED by t66: the dedup
+//!     rule (below) shows these transforms produce variants identical to
+//!     catalog variants, so generating them adds nothing.
+//!   Quantizing: the Word6 transform — quantize kern values to multiples of 5
+//!     (Word 6.0 behavior), drop zero-valued pairs, truncate to the format-0
+//!     capacity (10920 pairs). This is a real historical behavior no real font
+//!     exhibits, which is why Word6 is the one synthetic variant t66 still
+//!     uses (key `|vintage=word6`).
+//!
+//! Upstream redundancy (Mike Nov 12, 2026): a vintage variant is NOT generated
+//! when it would be identical to a variant already in the catalog. The check
+//! (`era_redundant`) runs before the transform, from the base font's tables:
+//! TrueType, OpenType, and the unchanged-byte eras (Pdf14/Docx/HarfBuzz/
+//! Variable/InDesignCS) are never generated — TrueType empties kern and GPOS
+//! (= nokern); OpenType strips kern and keeps GPOS, but GPOS and legacy kern
+//! are mutually exclusive per font (the geo cache reads legacy kern only when
+//! all GPOS tables are empty), so it duplicates the kern variant when GPOS
+//! kern exists and the nokern variant when it does not; the unchanged-byte
+//! eras return the base font itself. PostScript generates only when the kern
+//! source has >300 pairs or the font has GPOS kern; Word6 only when some kern
+//! value is not a multiple of 5, or the font has GPOS kern, or the pair count
+//! exceeds 10920. For Times New Roman (867 kern pairs, no GPOS) only
+//! PostScript and Word6 generate; TrueType and OpenType are skipped as
+//! nokern duplicates.
 //!
 //! Naming: readable slugs like `word6`, `postscript`, `harfbuzz`.
 //! Old cache files using year-suffixed names like `ps1985`, `word6_1993` will be orphaned
@@ -46,7 +91,9 @@ use crate::font_scan::FontEntry;
 /// Variant names are readable (word6, postscript) — years are kept in start_year/end_year for gating.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub enum Era {
-    /// PostScript Level 1 (1985-1989) — AFM KPX ~300 pairs, screen≠print
+    /// PostScript Level 1 (1985-1989) — kern-table-only (AFM-style), screen≠print.
+    /// Real AFM files carry ~3800 kern pairs; the 300-pair truncation in the
+    /// PostScript transform is hardcoded, not an AFM property (see module docs).
     PostScript,
     /// TrueType vs Type1 war (1990-1994) — Word kerning checkbox off by default
     TrueType,
@@ -125,7 +172,7 @@ impl Era {
 
     pub fn description(&self) -> &'static str {
         match self {
-            Era::PostScript => "PostScript Level 1 (1985) — AFM KPX ~300 pairs, screen!=print, WYSINOTWYF",
+            Era::PostScript => "PostScript Level 1 (1985) — kern-table-only (AFM-style), screen!=print, WYSINOTWYF",
             Era::TrueType => "TrueType vs Type1 war (1990) — Word6 kerning checkbox off by default",
             Era::Word6 => "Word 6.0 / WordPerfect 5.1 (1993) — proportional table, Quark 3.3 editable 1/200em",
             Era::OpenType => "OpenType 1.0 (1996) — GSUB/GPOS, pdfTeX, class kerning 10k combos",
@@ -704,7 +751,7 @@ fn cache_valid(cache_path: &Path, base_path: &Path) -> bool {
     cache_mtime >= base_mtime
 }
 
-/// Real vintage transforms using read-fonts 0.1 + write-fonts 0.3 FontBuilder.
+/// Vintage era transform using read-fonts 0.1 + write-fonts 0.3 FontBuilder.
 ///
 /// Caching is handled by `ensure_vintage_fonts` — this function only transforms bytes.
 ///
@@ -713,15 +760,35 @@ fn cache_valid(cache_path: &Path, base_path: &Path) -> bool {
 /// write-fonts table builders which don't yet exist for `kern` in 0.3. We manipulate
 /// `kern` at the byte level (format 0) which is stable since 1985.
 ///
-/// - PostScript: strip GPOS, keep kern fmt0 only, limit to ~300 pairs
+/// Maximum pairs a kern format 0 subtable can hold: the subtable length is a u16,
+/// so 14 + n*6 <= 65535, i.e. n <= 10920. This is a hard format constraint, not a
+/// heuristic. Word6 truncates to this capacity (largest |value| first) when a
+/// GPOS-derived kern source expands past it — GPOS class kern can expand to
+/// ~10^5 glyph pairs (SourceSerif4 Italic: ~124k excl. class 0, ~363k incl.),
+/// far past what format 0 can store.
+const KERN_FORMAT0_MAX_PAIRS: usize = (u16::MAX as usize - 14) / 6;
+
+/// Kern source for eras that need a kern fmt0 table (PostScript, Word6): the font's
+/// own kern format 0 subtable when present, else pairs derived from GPOS PairPos
+/// XAdvance (`gpos_kern_pairs`). A font with neither source has no kerning to keep,
+/// so the output has no kern table — that is correct, not a fallback.
+///
+/// - PostScript: strip GPOS, keep kern fmt0 only, limit to the 300 largest-|value| pairs
 /// - TrueType: empty kern + GPOS
-/// - Word6: keep kern fmt0 only, quantize to multiples of 5
-/// - OpenType: strip kern, keep GPOS
+/// - Word6: keep kern fmt0 only, quantize values to multiples of 5, drop zero-valued pairs,
+///   truncate to the format-0 capacity (10920 pairs, largest |value| first) when needed
+/// - OpenType: strip kern, keep GPOS as-is (no concrete class-kerning limit is specified)
 /// - Pdf14/Docx/HarfBuzz/Variable: return original (modern, full GPOS)
+/// - InDesignCS: DEFERRED (optical kerning simulation needs its own pipeline);
+///   returns original bytes unchanged, like the modern eras.
 ///
 /// For OTF/CFF fonts (sfnt version 'OTTO'), we patch the built font's first 4 bytes
 /// to preserve 'OTTO', because FontBuilder hardcodes 0x00010000.
-fn transform_font_stub(base_bytes: &[u8], era: Era, _family: &str) -> Result<Vec<u8>, String> {
+///
+/// Errors are returned loudly (no silent fallback to original bytes) when the kern
+/// source cannot be parsed or the rebuilt font fails to parse, so a broken vintage
+/// variant is never cached.
+fn transform_font(base_bytes: &[u8], era: Era, _family: &str) -> Result<Vec<u8>, String> {
     // Modern eras: no transform needed — preserve gvar/avar/CFF2/ToUnicode etc.
     match era {
         Era::Pdf14 | Era::InDesignCS | Era::Docx | Era::HarfBuzz | Era::Variable => {
@@ -750,86 +817,99 @@ fn transform_font_stub(base_bytes: &[u8], era: Era, _family: &str) -> Result<Vec
     // Helpers for Tag constants
     let tag_gpos = Tag::new(b"GPOS");
     let tag_kern = Tag::new(b"kern");
-    let tag_gdef = Tag::new(b"GDEF");
 
     // Build filtered/rebuilt table list
     let mut out_tables: Vec<(Tag, Vec<u8>)> = Vec::with_capacity(orig_tables.len());
 
     // Pre-parse kern if needed
     let kern_entry = orig_tables.iter().find(|(t, _)| *t == tag_kern).map(|(_, d)| d.clone());
+    let gpos_entry = orig_tables.iter().find(|(t, _)| *t == tag_gpos).map(|(_, d)| d.clone());
+    let n_glyphs = num_glyphs(&font_ref);
 
-    let (new_kern, drop_kern, drop_gpos) = match era {
+    // Resolve the kern source for eras that need a kern fmt0 table (PostScript, Word6).
+    // Preference: the font's own kern format 0 subtable. Fallback: GPOS PairPos XAdvance.
+    let kern_src = resolve_kern_source(kern_entry.as_deref(), gpos_entry.as_deref(), n_glyphs);
+
+    let (new_kern, drop_kern, drop_gpos, keep_orig_kern) = match era {
         Era::PostScript => {
-            // Keep kern (truncated), drop GPOS, keep GDEF for safety (some buggy GPOS-less fonts need it)
-            let rebuilt = if let Some(kdata) = &kern_entry {
-                rebuild_kern_truncate(kdata, 300)
-            } else {
-                None
-            };
-            // If we have kern, use rebuilt if Some, else keep original truncated attempt; if None, no kern in output
-            if kern_entry.is_some() && rebuilt.is_none() {
-                // parsing failed: keep original kern but still strip GPOS; if original >300, try naive truncate fallback
-                // naive fallback: attempt to truncate by reusing original data but we keep it as-is to avoid corruption
-                (None, false, true) // keep original kern as-is, drop GPOS
-            } else {
-                (rebuilt, false, true)
+            // Keep kern (truncated to the 300 largest-|value| pairs), drop GPOS.
+            match kern_src {
+                KernSource::Pairs(pairs, coverage) => {
+                    let truncated = truncate_pairs(pairs, 300);
+                    match build_kern_table(&truncated, coverage) {
+                        Some(t) => (Some(t), false, true, false),
+                        None => return Err("kern table too large for format 0".to_string()),
+                    }
+                }
+                KernSource::KeepOriginal => (None, false, true, true),
+                KernSource::None => (None, false, true, false),
             }
         }
         Era::TrueType => {
             // Empty kern and GPOS — Word 6 checkbox off
-            (None, true, true)
+            (None, true, true, false)
         }
         Era::Word6 => {
-            // Quantize kern to 1/200em, strip GPOS
-            let rebuilt = if let Some(kdata) = &kern_entry {
-                rebuild_kern_quantize(kdata)
-            } else {
-                None
-            };
-            if kern_entry.is_some() && rebuilt.is_none() {
-                (None, false, true) // keep original if rebuild fails
-            } else {
-                (rebuilt, false, true)
+            // Quantize kern to 1/200em (multiples of 5), strip GPOS. A GPOS-derived
+            // source can expand past the format-0 capacity (~124k pairs for
+            // SourceSerif4 Italic), so truncate to the capacity (largest |value|
+            // first) — a hard format constraint, not a heuristic limit.
+            match kern_src {
+                KernSource::Pairs(pairs, coverage) => {
+                    let quantized = quantize_pairs(pairs);
+                    if quantized.is_empty() {
+                        // Every value quantized to zero: no kern table.
+                        (None, false, true, false)
+                    } else {
+                        let truncated = truncate_pairs(quantized, KERN_FORMAT0_MAX_PAIRS);
+                        match build_kern_table(&truncated, coverage) {
+                            Some(t) => (Some(t), false, true, false),
+                            None => return Err("kern table too large for format 0".to_string()),
+                        }
+                    }
+                }
+                KernSource::KeepOriginal => (None, false, true, true),
+                KernSource::None => (None, false, true, false),
             }
         }
         Era::OpenType => {
             // OT 1.0: GPOS class kerning, kern stripped
-            (None, true, false)
+            (None, true, false, false)
         }
-        _ => (None, false, false), // unreachable due to early return
+        _ => (None, false, false, false), // unreachable due to early return
     };
 
-    // PostScript also historically had no GPOS; ensure GDEF not required but keep it to avoid breaking other tables
-    // The spec says drop GPOS completely; we do that via drop_gpos.
-
+    let mut saw_kern = false;
     for (tag, data) in orig_tables {
         if tag == tag_gpos && drop_gpos {
             continue;
         }
         if tag == tag_kern {
+            saw_kern = true;
             if drop_kern {
+                continue;
+            }
+            if keep_orig_kern {
+                // Kern table is not format 0; keep its bytes as-is (warned at resolve time).
+                out_tables.push((tag, data));
                 continue;
             }
             if let Some(ref new_data) = new_kern {
                 out_tables.push((tag, new_data.clone()));
                 continue;
-            } else {
-                // keep original (or keep original if rebuild was None but we decided to keep)
-                out_tables.push((tag, data));
-                continue;
             }
-        }
-        // For PostScript we could also drop GDEF if it references GPOS, but keep for safety
-        // Requirement says strip GPOS only, so leave GDEF.
-        if era == Era::PostScript && tag == tag_gdef {
-            // optional: keep GDEF — it doesn't hurt for 1985 emulation, and dropping can break some fonts
-            out_tables.push((tag, data));
+            // No kern table for this era (no kerning source, or all pairs quantized to zero).
             continue;
         }
         out_tables.push((tag, data));
     }
-
-    // If era expects a kern but original had none, that's fine — no kern = no kerning (acceptable for PostScript fallback)
+    // The kern source may be GPOS-derived for a font that had no kern table at all;
+    // in that case the rebuilt table must be added explicitly.
+    if let Some(ref new_data) = new_kern {
+        if !saw_kern {
+            out_tables.push((tag_kern, new_data.clone()));
+        }
+    }
 
     // Rebuild font
     let mut builder = FontBuilder::default();
@@ -844,16 +924,549 @@ fn transform_font_stub(base_bytes: &[u8], era: Era, _family: &str) -> Result<Vec
         out[0..4].copy_from_slice(&OTTO.to_be_bytes());
     }
 
-    // Validate output parses
+    // Validate output parses. A rebuilt font that does not parse is a bug in the
+    // transform — return an error loudly so the caller never caches a broken variant.
     if FontRef::new(&out).is_err() {
-        // Fallback: if our build broke somehow, return original for safety (or error for old eras)
-        // For old eras we still want to surface error to caller so they don't cache broken font,
-        // but to keep pipeline moving we warn and return original.
-        eprintln!("[vintage] warning: rebuilt {} font failed to parse, falling back to original bytes", era.name());
-        return Ok(base_bytes.to_vec());
+        return Err(format!("rebuilt {} font failed to parse", era.name()));
     }
 
     Ok(out)
+}
+
+/// Number of glyphs in the font, from the maxp table (numGlyphs is a u16 at offset 4).
+/// Returns 0 if maxp is missing or malformed; callers treat 0 as "unknown" and skip
+/// class-kern expansion that needs it.
+fn num_glyphs(font_ref: &FontRef) -> usize {
+    let Some(data) = font_ref.table_data(Tag::new(b"maxp")) else {
+        return 0;
+    };
+    let b = data.as_ref();
+    if b.len() < 6 {
+        return 0;
+    }
+    u16::from_be_bytes([b[4], b[5]]) as usize
+}
+
+/// Coverage value for a horizontal kern format 0 subtable (format 0, horizontal).
+const KERN_COVERAGE_HORIZONTAL: u16 = 0x0001;
+
+/// How an era that needs a kern fmt0 table obtains its pairs.
+enum KernSource {
+    /// (pairs, coverage) to build a fresh kern fmt0 table from. Pairs are sorted
+    /// by (left, right) and contain no zero values.
+    Pairs(Vec<(u16, u16, i16)>, u16),
+    /// A kern table exists but is not format 0; keep its bytes as-is (warned at resolve time).
+    KeepOriginal,
+    /// No kerning source; the output has no kern table.
+    None,
+}
+
+/// Resolve the kern source for PostScript/Word6: the font's own kern format 0
+/// subtable first, else pairs derived from GPOS PairPos XAdvance. A font with
+/// neither source has no kerning, so `KernSource::None` is correct — not a fallback.
+fn resolve_kern_source(
+    kern_entry: Option<&[u8]>,
+    gpos_entry: Option<&[u8]>,
+    num_glyphs: usize,
+) -> KernSource {
+    if let Some(kdata) = kern_entry {
+        if let Some((coverage, pairs)) = parse_kern_format0(kdata) {
+            return KernSource::Pairs(pairs, coverage);
+        }
+        // Not a format 0 subtable (e.g. format 2) — try GPOS before giving up.
+        if let Some(pairs) = gpos_entry.and_then(|g| gpos_kern_pairs(g, num_glyphs)) {
+            if !pairs.is_empty() {
+                return KernSource::Pairs(pairs, KERN_COVERAGE_HORIZONTAL);
+            }
+        }
+        eprintln!("[vintage] warning: kern table is not format 0 and no GPOS kern pairs found; keeping original kern table as-is");
+        return KernSource::KeepOriginal;
+    }
+    if let Some(pairs) = gpos_entry.and_then(|g| gpos_kern_pairs(g, num_glyphs)) {
+        if !pairs.is_empty() {
+            return KernSource::Pairs(pairs, KERN_COVERAGE_HORIZONTAL);
+        }
+    }
+    KernSource::None
+}
+
+/// Keep the `limit` largest-|value| pairs (the pairs that actually move spacing),
+/// re-sorted by (left, right) as a kern format 0 table requires. Deterministic:
+/// ties on |value| break by (left, right). The 300-pair limit used by the
+/// PostScript transform is a hardcoded truncation, NOT a measured AFM property:
+/// real AFM files carry ~3800 kern pairs (NimbusRoman-Regular.afm declares 3845).
+fn truncate_pairs(mut pairs: Vec<(u16, u16, i16)>, limit: usize) -> Vec<(u16, u16, i16)> {
+    if pairs.len() <= limit {
+        pairs.sort_unstable();
+        return pairs;
+    }
+    pairs.sort_unstable_by(|a, b| {
+        b.2.unsigned_abs()
+            .cmp(&a.2.unsigned_abs())
+            .then_with(|| a.0.cmp(&b.0))
+            .then_with(|| a.1.cmp(&b.1))
+    });
+    pairs.truncate(limit);
+    pairs.sort_unstable();
+    pairs
+}
+
+/// Quantize kern values to multiples of 5 (Word6 / Quark 1/200em) and drop pairs
+/// whose value quantizes to zero — a zero pair does not change spacing and only
+/// wastes table space.
+fn quantize_pairs(pairs: Vec<(u16, u16, i16)>) -> Vec<(u16, u16, i16)> {
+    pairs
+        .into_iter()
+        .map(|(l, r, v)| {
+            let q = ((v as f32 / 5.0).round() * 5.0) as i32;
+            let clamped = q.clamp(i16::MIN as i32, i16::MAX as i32) as i16;
+            (l, r, clamped)
+        })
+        .filter(|&(_, _, v)| v != 0)
+        .collect()
+}
+
+// ---------------------------------------------------------------------------
+// GPOS -> kern extraction (byte level, modeled on geo_cache::parse_gpos_inner)
+// ---------------------------------------------------------------------------
+
+/// Bounds-checked big-endian readers for the GPOS byte parser below.
+fn gbu16(data: &[u8], off: usize) -> Option<u16> {
+    data.get(off..off + 2)
+        .map(|b| u16::from_be_bytes([b[0], b[1]]))
+}
+fn gbi16(data: &[u8], off: usize) -> Option<i16> {
+    gbu16(data, off).map(|v| v as i16)
+}
+fn gbu32(data: &[u8], off: usize) -> Option<u32> {
+    data.get(off..off + 4)
+        .map(|b| u32::from_be_bytes([b[0], b[1], b[2], b[3]]))
+}
+
+/// Size in bytes of a ValueRecord with the given ValueFormat bitmask.
+fn gpos_value_format_size(fmt: u16) -> usize {
+    let mut sz = 0usize;
+    for bit in [0x0001u16, 0x0002, 0x0004, 0x0008, 0x0010, 0x0020, 0x0040, 0x0080] {
+        if fmt & bit != 0 {
+            sz += 2;
+        }
+    }
+    sz
+}
+
+/// XAdvance field of a ValueRecord at `off` with the given ValueFormat, or 0 if
+/// the format has no XAdvance (bit 0x0004). Device-table offsets are skipped (2 bytes).
+fn gpos_value_xadvance(data: &[u8], off: usize, fmt: u16) -> Option<i16> {
+    let mut p = off;
+    let mut xad = 0i16;
+    // Field order: XPlacement, YPlacement, XAdvance, YAdvance, then 4 device offsets.
+    if fmt & 0x0001 != 0 {
+        p += 2;
+    }
+    if fmt & 0x0002 != 0 {
+        p += 2;
+    }
+    if fmt & 0x0004 != 0 {
+        xad = gbi16(data, p)?;
+        p += 2;
+    }
+    // Remaining fields (YAdvance + device offsets) do not affect XAdvance; no need to read them.
+    let _ = p;
+    Some(xad)
+}
+
+/// Parse a Coverage table at `off`. Format 1 is an explicit glyph list; format 2 is
+/// a list of (start, end) ranges. Returns glyph IDs sorted and deduped.
+fn gpos_parse_coverage(data: &[u8], off: usize) -> Option<Vec<u16>> {
+    let fmt = gbu16(data, off)?;
+    if fmt == 1 {
+        let count = gbu16(data, off + 2)? as usize;
+        let mut v = Vec::with_capacity(count);
+        for i in 0..count {
+            v.push(gbu16(data, off + 4 + i * 2)?);
+        }
+        Some(v)
+    } else if fmt == 2 {
+        let range_count = gbu16(data, off + 2)? as usize;
+        let mut v = Vec::new();
+        for i in 0..range_count {
+            let base = off + 4 + i * 6;
+            let start = gbu16(data, base)?;
+            let end = gbu16(data, base + 2)?;
+            for gid in start..=end {
+                v.push(gid);
+            }
+        }
+        v.sort_unstable();
+        v.dedup();
+        Some(v)
+    } else {
+        None
+    }
+}
+
+/// Parse a ClassDef table at `off` into a class-per-glyph array of length `num_glyphs`
+/// (glyphs not listed are class 0). Format 1 is startGlyphID + class values;
+/// format 2 is a list of (start, end, class) ranges.
+fn gpos_parse_class_def(data: &[u8], off: usize, num_glyphs: usize) -> Option<Vec<u16>> {
+    let fmt = gbu16(data, off)?;
+    let mut classes = vec![0u16; num_glyphs];
+    if fmt == 1 {
+        let start = gbu16(data, off + 2)? as usize;
+        let count = gbu16(data, off + 4)? as usize;
+        for i in 0..count {
+            let gid = start + i;
+            if gid >= num_glyphs {
+                break;
+            }
+            classes[gid] = gbu16(data, off + 6 + i * 2)?;
+        }
+        Some(classes)
+    } else if fmt == 2 {
+        let range_count = gbu16(data, off + 2)? as usize;
+        for i in 0..range_count {
+            let base = off + 4 + i * 6;
+            let start = gbu16(data, base)? as usize;
+            let end = gbu16(data, base + 2)? as usize;
+            let cls = gbu16(data, base + 4)?;
+            for gid in start..=end {
+                if gid < num_glyphs {
+                    classes[gid] = cls;
+                }
+            }
+        }
+        Some(classes)
+    } else {
+        None
+    }
+}
+
+/// Extract effective XAdvance kerning pairs from a GPOS table (raw bytes).
+///
+/// Only PairPos (LookupType 2, including ExtensionPos LookupType 9 wrapping a
+/// PairPos) contributes: kern = ValueRecord1.XAdvance + ValueRecord2.XAdvance,
+/// the same convention the geometry predictor uses. SinglePos, mark, cursive and
+/// contextual lookups do not produce pair kerning and are ignored; XPlacement is
+/// not representable in a kern table and is ignored.
+///
+/// Feature gating follows the geometry predictor: lookups referenced only by the
+/// `case`/`cpsp` features are excluded; lookups referenced by any other feature
+/// (kern, mark, ...) are kept. A lookup shared between `case` and a default
+/// feature stays in the default set.
+///
+/// Class pairs (Format 2) are expanded to glyph pairs. Within one lookup, subtables
+/// are alternatives: the first subtable whose coverage contains the first glyph
+/// claims it (first-match-wins, as a shaper applies it). When the same (left, right)
+/// pair appears in more than one lookup, the later lookup wins (HashMap insert).
+/// Zero values are dropped. The result is sorted by (left, right).
+///
+/// Returns None if the GPOS data is malformed (caller falls back to the kern table
+/// or to no kerning); returns Some(vec) — possibly empty — when parsing succeeds.
+fn gpos_kern_pairs(gpos_data: &[u8], num_glyphs: usize) -> Option<Vec<(u16, u16, i16)>> {
+    if gpos_data.len() < 10 {
+        return None;
+    }
+    let feature_list_off = gbu16(gpos_data, 6)? as usize;
+    let lookup_list_off = gbu16(gpos_data, 8)? as usize;
+    if lookup_list_off + 2 > gpos_data.len() {
+        return None;
+    }
+
+    // FeatureList: split lookups into case/cpsp-only vs default-eligible.
+    let mut case_lookups: std::collections::HashSet<usize> = std::collections::HashSet::new();
+    let mut default_lookups: std::collections::HashSet<usize> = std::collections::HashSet::new();
+    if feature_list_off + 2 <= gpos_data.len() {
+        if let Some(feature_count) = gbu16(gpos_data, feature_list_off) {
+            let fc = feature_count as usize;
+            for fi in 0..fc {
+                let rec_off = feature_list_off + 2 + fi * 6;
+                if rec_off + 6 > gpos_data.len() {
+                    continue;
+                }
+                let tag = std::str::from_utf8(&gpos_data[rec_off..rec_off + 4]).unwrap_or("");
+                let feat_off = gbu16(gpos_data, rec_off + 4)? as usize + feature_list_off;
+                if feat_off + 4 > gpos_data.len() {
+                    continue;
+                }
+                let lookup_count = gbu16(gpos_data, feat_off + 2)? as usize;
+                for li in 0..lookup_count {
+                    let pos = feat_off + 4 + li * 2;
+                    if pos + 2 > gpos_data.len() {
+                        break;
+                    }
+                    if let Some(lid) = gbu16(gpos_data, pos) {
+                        let lid = lid as usize;
+                        if tag == "case" || tag == "cpsp" {
+                            case_lookups.insert(lid);
+                        } else {
+                            default_lookups.insert(lid);
+                        }
+                    }
+                }
+            }
+        }
+    }
+    let case_only: std::collections::HashSet<usize> = case_lookups
+        .difference(&default_lookups)
+        .cloned()
+        .collect();
+
+    let lookup_count = gbu16(gpos_data, lookup_list_off)? as usize;
+    let mut pairs: std::collections::HashMap<(u16, u16), i16> = std::collections::HashMap::new();
+
+    for li in 0..lookup_count {
+        if case_only.contains(&li) {
+            continue;
+        }
+        let off_pos = lookup_list_off + 2 + li * 2;
+        let Some(lookup_off) = gbu16(gpos_data, off_pos).map(|o| o as usize + lookup_list_off)
+        else {
+            continue;
+        };
+        if lookup_off + 6 > gpos_data.len() {
+            continue;
+        }
+        let Some(lookup_type) = gbu16(gpos_data, lookup_off) else {
+            continue;
+        };
+        if lookup_type != 2 && lookup_type != 9 {
+            continue;
+        }
+        // Within one lookup, subtables are alternatives: the FIRST subtable whose
+        // coverage contains a first glyph claims that glyph, and later subtables
+        // in the same lookup must not override it (OpenType first-match-wins;
+        // HarfBuzz applies the first matching subtable). A last-wins dedupe here
+        // is wrong: for SourceSerif4 Italic it collapses the kern set to ~7.6k
+        // pairs, while first-wins gives the shaper's ~109.5k. Claiming is by
+        // coverage membership, not by nonzero value — a subtable claims a glyph
+        // even when its kern value for that glyph is zero.
+        let mut claimed: std::collections::HashSet<u16> = std::collections::HashSet::new();
+        let Some(subtable_count) = gbu16(gpos_data, lookup_off + 4).map(|v| v as usize) else {
+            continue;
+        };
+        for si in 0..subtable_count {
+            let sub_off_pos = lookup_off + 6 + si * 2;
+            let Some(sub_off) = gbu16(gpos_data, sub_off_pos).map(|o| o as usize + lookup_off)
+            else {
+                continue;
+            };
+            if sub_off + 2 > gpos_data.len() {
+                continue;
+            }
+            // Unwrap ExtensionPos (Format 1, ExtensionLookupType 2 = PairPos).
+            let mut inner_off = sub_off;
+            if lookup_type == 9 {
+                if sub_off + 8 > gpos_data.len() {
+                    continue;
+                }
+                let Some(ext_fmt) = gbu16(gpos_data, sub_off) else {
+                    continue;
+                };
+                if ext_fmt != 1 {
+                    continue;
+                }
+                let Some(ext_type) = gbu16(gpos_data, sub_off + 2) else {
+                    continue;
+                };
+                if ext_type != 2 {
+                    continue;
+                }
+                let Some(ext_offset) = gbu32(gpos_data, sub_off + 4).map(|o| o as usize) else {
+                    continue;
+                };
+                inner_off = sub_off + ext_offset;
+                if inner_off + 2 > gpos_data.len() {
+                    continue;
+                }
+            }
+            let Some(fmt) = gbu16(gpos_data, inner_off) else {
+                continue;
+            };
+            if fmt == 1 {
+                // PairPos Format 1: coverage + pair sets of (second_gid, value1, value2).
+                if inner_off + 10 > gpos_data.len() {
+                    continue;
+                }
+                let Some(cov_off) =
+                    gbu16(gpos_data, inner_off + 2).map(|o| o as usize + inner_off)
+                else {
+                    continue;
+                };
+                let Some(val_fmt1) = gbu16(gpos_data, inner_off + 4) else {
+                    continue;
+                };
+                let Some(val_fmt2) = gbu16(gpos_data, inner_off + 6) else {
+                    continue;
+                };
+                let Some(pair_set_count) =
+                    gbu16(gpos_data, inner_off + 8).map(|v| v as usize)
+                else {
+                    continue;
+                };
+                let Some(coverage) = gpos_parse_coverage(gpos_data, cov_off) else {
+                    continue;
+                };
+                let val1_size = gpos_value_format_size(val_fmt1);
+                let val2_size = gpos_value_format_size(val_fmt2);
+                let rec_size = 2 + val1_size + val2_size;
+                for psi in 0..pair_set_count {
+                    let Some(first_gid) = coverage.get(psi).copied() else {
+                        continue;
+                    };
+                    // First-match-wins: skip first glyphs already claimed by an
+                    // earlier subtable in this lookup. Claim on coverage
+                    // membership, even if this PairSet yields no nonzero pairs.
+                    if !claimed.insert(first_gid) {
+                        continue;
+                    }
+                    let ps_off_pos = inner_off + 10 + psi * 2;
+                    let Some(ps_off) =
+                        gbu16(gpos_data, ps_off_pos).map(|o| o as usize + inner_off)
+                    else {
+                        continue;
+                    };
+                    if ps_off + 2 > gpos_data.len() {
+                        continue;
+                    }
+                    let Some(pair_val_count) = gbu16(gpos_data, ps_off).map(|v| v as usize)
+                    else {
+                        continue;
+                    };
+                    let mut rp = ps_off + 2;
+                    for _ in 0..pair_val_count {
+                        if rp + rec_size > gpos_data.len() {
+                            break;
+                        }
+                        let Some(second_gid) = gbu16(gpos_data, rp) else {
+                            break;
+                        };
+                        let Some(v1) = gpos_value_xadvance(gpos_data, rp + 2, val_fmt1) else {
+                            break;
+                        };
+                        let Some(v2) =
+                            gpos_value_xadvance(gpos_data, rp + 2 + val1_size, val_fmt2)
+                        else {
+                            break;
+                        };
+                        let kern = (v1 as i32 + v2 as i32)
+                            .clamp(i16::MIN as i32, i16::MAX as i32)
+                            as i16;
+                        if kern != 0 {
+                            pairs.insert((first_gid, second_gid), kern);
+                        }
+                        rp += rec_size;
+                    }
+                }
+            } else if fmt == 2 {
+                // PairPos Format 2: coverage + class defs + class matrix.
+                if num_glyphs == 0 {
+                    continue;
+                }
+                if inner_off + 16 > gpos_data.len() {
+                    continue;
+                }
+                let Some(cov_off) =
+                    gbu16(gpos_data, inner_off + 2).map(|o| o as usize + inner_off)
+                else {
+                    continue;
+                };
+                let Some(val_fmt1) = gbu16(gpos_data, inner_off + 4) else {
+                    continue;
+                };
+                let Some(val_fmt2) = gbu16(gpos_data, inner_off + 6) else {
+                    continue;
+                };
+                let Some(cd1_off) =
+                    gbu16(gpos_data, inner_off + 8).map(|o| o as usize + inner_off)
+                else {
+                    continue;
+                };
+                let Some(cd2_off) =
+                    gbu16(gpos_data, inner_off + 10).map(|o| o as usize + inner_off)
+                else {
+                    continue;
+                };
+                let Some(c1_count) = gbu16(gpos_data, inner_off + 12).map(|v| v as usize)
+                else {
+                    continue;
+                };
+                let Some(c2_count) = gbu16(gpos_data, inner_off + 14).map(|v| v as usize)
+                else {
+                    continue;
+                };
+                let Some(coverage) = gpos_parse_coverage(gpos_data, cov_off) else {
+                    continue;
+                };
+                let Some(class1) = gpos_parse_class_def(gpos_data, cd1_off, num_glyphs) else {
+                    continue;
+                };
+                let Some(class2) = gpos_parse_class_def(gpos_data, cd2_off, num_glyphs) else {
+                    continue;
+                };
+                // First-match-wins: this subtable claims every first glyph in its
+                // coverage that no earlier subtable in this lookup claimed. Only
+                // newly claimed glyphs get pairs from this subtable.
+                let mut new_g1: std::collections::HashSet<u16> =
+                    std::collections::HashSet::new();
+                for &g1 in coverage.iter() {
+                    if claimed.insert(g1) {
+                        new_g1.insert(g1);
+                    }
+                }
+                // Invert ClassDef2 into class -> glyphs.
+                let mut class2_glyphs: Vec<Vec<u16>> = vec![Vec::new(); c2_count];
+                for (gid, &cls) in class2.iter().enumerate() {
+                    let cls = cls as usize;
+                    if cls < c2_count {
+                        class2_glyphs[cls].push(gid as u16);
+                    }
+                }
+                let val1_size = gpos_value_format_size(val_fmt1);
+                let val2_size = gpos_value_format_size(val_fmt2);
+                let rec_size = val1_size + val2_size;
+                let mut p = inner_off + 16;
+                // Read the matrix row-major: [class1][class2].
+                for cl1 in 0..c1_count {
+                    for cl2 in 0..c2_count {
+                        if p + rec_size > gpos_data.len() {
+                            break;
+                        }
+                        let Some(v1) = gpos_value_xadvance(gpos_data, p, val_fmt1) else {
+                            break;
+                        };
+                        let Some(v2) = gpos_value_xadvance(gpos_data, p + val1_size, val_fmt2)
+                        else {
+                            break;
+                        };
+                        let kern = (v1 as i32 + v2 as i32)
+                            .clamp(i16::MIN as i32, i16::MAX as i32)
+                            as i16;
+                        if kern != 0 {
+                            for &g1 in coverage.iter() {
+                                if !new_g1.contains(&g1) {
+                                    continue;
+                                }
+                                if (g1 as usize) < num_glyphs && class1[g1 as usize] as usize == cl1
+                                {
+                                    for &g2 in &class2_glyphs[cl2] {
+                                        pairs.insert((g1, g2), kern);
+                                    }
+                                }
+                            }
+                        }
+                        p += rec_size;
+                    }
+                }
+            }
+        }
+    }
+
+    let mut out: Vec<(u16, u16, i16)> = pairs
+        .into_iter()
+        .map(|((l, r), v)| (l, r, v))
+        .collect();
+    out.sort_unstable();
+    Some(out)
 }
 
 /// Parse kern format 0 subtable and return (coverage, pairs)
@@ -902,8 +1515,15 @@ fn parse_kern_format0(data: &[u8]) -> Option<(u16, Vec<(u16, u16, i16)>)> {
     Some((coverage, pairs))
 }
 
-fn build_kern_table(pairs: &[(u16, u16, i16)], coverage: u16) -> Vec<u8> {
+/// Build a kern format 0 table (version 0, one subtable) from sorted (left, right, value)
+/// pairs. Returns None if the pair count cannot fit in a u16 subtable length
+/// (14 + n*6 bytes must fit in u16, so n <= KERN_FORMAT0_MAX_PAIRS).
+fn build_kern_table(pairs: &[(u16, u16, i16)], coverage: u16) -> Option<Vec<u8>> {
     let n = pairs.len();
+    // subtable length is u16: 14 + n*6 <= 65535
+    if n > KERN_FORMAT0_MAX_PAIRS {
+        return None;
+    }
     let (search_range, entry_selector, range_shift) = if n == 0 {
         (0u16, 0u16, 0u16)
     } else {
@@ -913,7 +1533,7 @@ fn build_kern_table(pairs: &[(u16, u16, i16)], coverage: u16) -> Vec<u8> {
             pow2 *= 2;
         }
         let sr = (pow2 * 6) as u16;
-        let es = (pow2 as f64).log2() as u16; // floor log2(pow2)
+        let es = pow2.trailing_zeros() as u16; // log2(pow2), exact integer math
         let rs = (n * 6 - pow2 * 6) as u16;
         (sr, es, rs)
     };
@@ -935,27 +1555,160 @@ fn build_kern_table(pairs: &[(u16, u16, i16)], coverage: u16) -> Vec<u8> {
         out.extend_from_slice(&v.to_be_bytes());
     }
     debug_assert_eq!(out.len(), total_len);
-    out
+    Some(out)
 }
 
 fn rebuild_kern_truncate(orig: &[u8], limit: usize) -> Option<Vec<u8>> {
     let (coverage, pairs) = parse_kern_format0(orig)?;
-    let truncated: Vec<_> = pairs.into_iter().take(limit).collect();
-    Some(build_kern_table(&truncated, coverage))
+    let truncated = truncate_pairs(pairs, limit);
+    build_kern_table(&truncated, coverage)
 }
 
 fn rebuild_kern_quantize(orig: &[u8]) -> Option<Vec<u8>> {
     let (coverage, pairs) = parse_kern_format0(orig)?;
-    let quantized: Vec<(u16, u16, i16)> = pairs
-        .into_iter()
-        .map(|(l, r, v)| {
-            let q = ((v as f32 / 5.0).round() * 5.0) as i32;
-            // clamp to i16 range
-            let clamped = q.clamp(i16::MIN as i32, i16::MAX as i32) as i16;
-            (l, r, clamped)
-        })
-        .collect();
-    Some(build_kern_table(&quantized, coverage))
+    let quantized = quantize_pairs(pairs);
+    build_kern_table(&quantized, coverage)
+}
+
+/// Kerning facts about a base font, parsed once per font for the upstream
+/// redundancy check (`era_redundant`). The kern source resolution mirrors
+/// `resolve_kern_source`'s preference (own kern fmt0 first, else
+/// GPOS-derived pairs) but gathers facts instead of building a table, so
+/// the check runs before any transform is attempted.
+struct BaseKernFacts {
+    /// Number of pairs in the resolved kern source (own kern fmt0, else
+    /// GPOS-derived). None when there is no kern source, or when the kern
+    /// table is present but not format 0 (`kern_keep_original`).
+    kern_src_pair_count: Option<usize>,
+    /// Whether any resolved kern-source value is not a multiple of 5
+    /// (i.e. Word6 quantization would change it).
+    kern_src_has_non_mult5: bool,
+    /// The kern table exists but is not format 0, so the transform keeps
+    /// its bytes as-is (no truncation, no quantization).
+    kern_keep_original: bool,
+    /// The base font has GPOS kern (at least one non-zero PairPos pair).
+    has_gpos_kern: bool,
+}
+
+/// Parse a base font's kerning facts from its bytes. Returns None when the
+/// font does not parse (the caller then treats the era as not redundant and
+/// lets `transform_font` fail loudly, as before).
+fn base_kern_facts(base_bytes: &[u8]) -> Option<BaseKernFacts> {
+    let font_ref = FontRef::new(base_bytes).ok()?;
+    let tag_kern = Tag::new(b"kern");
+    let tag_gpos = Tag::new(b"GPOS");
+    let kern_entry = font_ref
+        .table_data(tag_kern)
+        .map(|d| d.as_ref().to_vec());
+    let gpos_entry = font_ref
+        .table_data(tag_gpos)
+        .map(|d| d.as_ref().to_vec());
+    let n_glyphs = num_glyphs(&font_ref);
+
+    // GPOS kern: at least one non-zero PairPos pair (a zero pair moves no spacing).
+    let gpos_pairs = gpos_entry
+        .as_deref()
+        .and_then(|g| gpos_kern_pairs(g, n_glyphs))
+        .unwrap_or_default();
+    let has_gpos_kern = gpos_pairs.iter().any(|(_, _, v)| *v != 0);
+
+    // Legacy kern fmt0 pairs (first subtable, as the transform reads it).
+    let kern_fmt0 = kern_entry
+        .as_deref()
+        .and_then(parse_kern_format0);
+
+    // Resolved kern source, mirroring resolve_kern_source's preference.
+    let (kern_src_pair_count, kern_src_has_non_mult5, kern_keep_original) =
+        if let Some((_, pairs)) = kern_fmt0 {
+            let has_non_mult5 = pairs.iter().any(|(_, _, v)| v % 5 != 0);
+            (Some(pairs.len()), has_non_mult5, false)
+        } else if !gpos_pairs.is_empty() {
+            let has_non_mult5 = gpos_pairs.iter().any(|(_, _, v)| v % 5 != 0);
+            (Some(gpos_pairs.len()), has_non_mult5, false)
+        } else if kern_entry.is_some() {
+            // Kern table exists but is not format 0; the transform keeps it as-is.
+            (None, false, true)
+        } else {
+            (None, false, false)
+        };
+
+    Some(BaseKernFacts {
+        kern_src_pair_count,
+        kern_src_has_non_mult5,
+        kern_keep_original,
+        has_gpos_kern,
+    })
+}
+
+/// Whether the (font, era) vintage variant would be redundant with a variant
+/// already in the catalog, so it must not be generated (Mike Nov 12, 2026:
+/// "We don't need to make vintage fonts that are identical to variants we
+/// already put in the catalog — like no kern"). Checked UPSTREAM from the
+/// base font's tables and the era transform's definition, before calling
+/// the transform — the variant is never generated and then inspected.
+///
+/// - TrueType: always redundant — it empties kern and GPOS, so the result
+///   has no kerning, which is exactly the nokern catalog variant.
+/// - OpenType: always redundant — it strips kern and keeps GPOS, but GPOS
+///   and legacy kern are mutually exclusive per font: the geo cache reads
+///   the legacy kern table only when all GPOS tables are empty
+///   (geo_cache.rs cache-build path), so the pipeline never applies both.
+///   For a font with GPOS kern, the catalog kern variant already applies
+///   GPOS only (the kern table is ignored), so the OpenType variant is
+///   identical to it. For a font without GPOS kern, stripping kern leaves
+///   no kerning, so the OpenType variant is identical to nokern.
+/// - Pdf14 / Docx / HarfBuzz / Variable / InDesignCS: always redundant —
+///   they return the base bytes unchanged, so the variant is identical to
+///   the catalog's kern (or nokern) variant for that font.
+/// - PostScript: redundant unless the kern source has more than 300 pairs
+///   or the font has GPOS kern. With <=300 pairs and no GPOS kern, the
+///   truncation and the GPOS strip are both no-ops, so the result is the
+///   catalog kern variant.
+/// - Word6: redundant unless some kern value is not a multiple of 5, or
+///   the font has GPOS kern, or the pair count exceeds 10920. Otherwise
+///   quantization, the GPOS strip, and the truncation are all no-ops.
+fn era_redundant(era: Era, facts: &BaseKernFacts) -> bool {
+    match era {
+        Era::TrueType | Era::OpenType => true,
+        Era::Pdf14 | Era::InDesignCS | Era::Docx | Era::HarfBuzz | Era::Variable => true,
+        Era::PostScript => {
+            // GPOS kern present: stripping GPOS changes the font.
+            if facts.has_gpos_kern {
+                return false;
+            }
+            // Non-fmt0 kern kept as-is and no GPOS to strip: the result is
+            // the base font itself, i.e. the catalog kern variant.
+            if facts.kern_keep_original {
+                return true;
+            }
+            match facts.kern_src_pair_count {
+                // <=300 pairs: truncation is a no-op, GPOS strip is a
+                // no-op (no GPOS kern), so the result is the catalog kern
+                // variant. No kern source at all: no kerning, i.e. nokern.
+                Some(n) => n <= 300,
+                None => true,
+            }
+        }
+        Era::Word6 => {
+            // GPOS kern present: stripping GPOS changes the font.
+            if facts.has_gpos_kern {
+                return false;
+            }
+            // Non-fmt0 kern kept as-is and no GPOS to strip: the result is
+            // the base font itself, i.e. the catalog kern variant.
+            if facts.kern_keep_original {
+                return true;
+            }
+            match facts.kern_src_pair_count {
+                // All values already multiples of 5 and the pair count fits
+                // the format-0 capacity: quantization, the GPOS strip, and
+                // the truncation are all no-ops. No kern source at all: no
+                // kerning, i.e. nokern.
+                Some(n) => !facts.kern_src_has_non_mult5 && n <= KERN_FORMAT0_MAX_PAIRS,
+                None => true,
+            }
+        }
+    }
 }
 
 /// Ensure vintage fonts exist for given base fonts and eras.
@@ -996,6 +1749,7 @@ pub fn ensure_vintage_fonts(base_fonts: &[FontEntry], eras: &[Era]) -> Vec<PathB
     let mut skipped_unknown = 0usize;
     let mut skipped_too_new = 0usize;
     let mut skipped_not_shipped = 0usize;
+    let mut skipped_redundant = 0usize;
     let mut reused = 0usize;
     let mut created = 0usize;
 
@@ -1038,6 +1792,20 @@ pub fn ensure_vintage_fonts(base_fonts: &[FontEntry], eras: &[Era]) -> Vec<PathB
             }
         };
 
+        // Read the base font once per font (not once per era): the upstream
+        // redundancy check needs its tables, and generation reuses the bytes.
+        let base_bytes = match std::fs::read(&base.path) {
+            Ok(b) => b,
+            Err(e) => {
+                eprintln!("[vintage] warning: could not read base {}: {e}", base.path.display());
+                continue;
+            }
+        };
+        // Kerning facts for the upstream redundancy check. None when the
+        // font does not parse — then no era is skipped as redundant and
+        // transform_font fails loudly per era, as before.
+        let kern_facts = base_kern_facts(&base_bytes);
+
         for &era in eras {
             // 1) Historical existence
             if !era_exists_for_font(birth, era.start_year()) {
@@ -1049,6 +1817,16 @@ pub fn ensure_vintage_fonts(base_fonts: &[FontEntry], eras: &[Era]) -> Vec<PathB
                 skipped_not_shipped += 1;
                 continue;
             }
+            // 3) Upstream redundancy — do not create a vintage variant
+            // identical to a catalog variant (Mike Nov 12). Checked from
+            // the base font's tables before generating, and before reusing
+            // a stale cache file, so redundant variants are never loaded.
+            if let Some(facts) = &kern_facts {
+                if era_redundant(era, facts) {
+                    skipped_redundant += 1;
+                    continue;
+                }
+            }
 
             let cache_path = vintage_cache_path(base, era);
             if cache_valid(&cache_path, &base.path) {
@@ -1057,16 +1835,8 @@ pub fn ensure_vintage_fonts(base_fonts: &[FontEntry], eras: &[Era]) -> Vec<PathB
                 continue;
             }
 
-            // Need to generate
-            let base_bytes = match std::fs::read(&base.path) {
-                Ok(b) => b,
-                Err(e) => {
-                    eprintln!("[vintage] warning: could not read base {}: {e}", base.path.display());
-                    continue;
-                }
-            };
-
-            match transform_font_stub(&base_bytes, era, &base.family_name) {
+            // Need to generate (base_bytes read once above, reused here).
+            match transform_font(&base_bytes, era, &base.family_name) {
                 Ok(out_bytes) => {
                     let tmp = crate::atomic_file::tmp_for(&cache_path);
                     match std::fs::write(&tmp, &out_bytes) {
@@ -1093,8 +1863,8 @@ pub fn ensure_vintage_fonts(base_fonts: &[FontEntry], eras: &[Era]) -> Vec<PathB
         }
     }
 
-    eprintln!("[vintage] summary: created={} reused={} skipped_unknown={} skipped_too_new={} skipped_not_shipped={} total_cached={} scanned_bases={} (deduped from {})",
-        created, reused, skipped_unknown, skipped_too_new, skipped_not_shipped, generated.len(), base_fonts_deduped.len(), base_fonts.len());
+    eprintln!("[vintage] summary: created={} reused={} skipped_unknown={} skipped_too_new={} skipped_not_shipped={} skipped_redundant={} total_cached={} scanned_bases={} (deduped from {})",
+        created, reused, skipped_unknown, skipped_too_new, skipped_not_shipped, skipped_redundant, generated.len(), base_fonts_deduped.len(), base_fonts.len());
 
     generated
 }
@@ -1186,7 +1956,8 @@ mod tests {
         };
         let p1 = vintage_cache_path(&fe, Era::PostScript);
         let p2 = vintage_cache_path(&fe, Era::PostScript);
-        assert!(p1.to_string_lossy().contains("dejavusans"));
+        // sanitize_family("DejaVu Sans") is "dejavu_sans" (space -> '_').
+        assert!(p1.to_string_lossy().contains("dejavu_sans"));
         assert!(p1.to_string_lossy().contains("postscript"));
         assert_eq!(p1.parent(), p2.parent());
     }
@@ -1221,7 +1992,7 @@ mod tests {
     #[test]
     fn test_kern_roundtrip() {
         let pairs = vec![(10u16, 20u16, -15i16), (30, 40, 25), (50, 60, 0)];
-        let data = build_kern_table(&pairs, 0x0001);
+        let data = build_kern_table(&pairs, 0x0001).expect("build kern table");
         let parsed = parse_kern_format0(&data).expect("parse should succeed");
         assert_eq!(parsed.0, 0x0001);
         assert_eq!(parsed.1.len(), 3);
@@ -1232,7 +2003,7 @@ mod tests {
     #[test]
     fn test_kern_truncate() {
         let pairs: Vec<(u16, u16, i16)> = (0..500).map(|i| (i, i + 1, (i as i16 % 100) - 50)).collect();
-        let orig = build_kern_table(&pairs, 1);
+        let orig = build_kern_table(&pairs, 1).expect("build kern table");
         let truncated = rebuild_kern_truncate(&orig, 300).expect("truncate");
         let parsed = parse_kern_format0(&truncated).unwrap();
         assert_eq!(parsed.1.len(), 300);
@@ -1241,7 +2012,7 @@ mod tests {
     #[test]
     fn test_kern_quantize() {
         let pairs = vec![(1, 2, 7), (3, 4, -7), (5, 6, 12), (7, 8, -12)];
-        let orig = build_kern_table(&pairs, 1);
+        let orig = build_kern_table(&pairs, 1).expect("build kern table");
         let q = rebuild_kern_quantize(&orig).unwrap();
         let parsed = parse_kern_format0(&q).unwrap();
         assert_eq!(parsed.1[0].2 % 5, 0);
@@ -1253,6 +2024,111 @@ mod tests {
         assert_eq!(parsed.1[1].2, -5);
         assert_eq!(parsed.1[2].2, 10);
         assert_eq!(parsed.1[3].2, -10);
+    }
+
+    /// Path of a GPOS-only font (no `kern` table) for the GPOS-derived kern tests.
+    /// SourceSerif4 Italic keeps its kerning in GPOS (ExtensionPos-wrapped class kern).
+    fn gpos_only_font_bytes() -> Option<Vec<u8>> {
+        let candidates = [
+            "/home/hatch/.local/share/fonts/ofl/sourceserif4/SourceSerif4-Italic[opsz,wght].ttf",
+            "/home/hatch/.local/share/fonts/ofl/ebgaramond/EBGaramond-Regular.ttf",
+        ];
+        for p in candidates {
+            if let Ok(b) = std::fs::read(p) {
+                return Some(b);
+            }
+        }
+        None
+    }
+
+    #[test]
+    fn test_gpos_kern_pairs_source_serif() {
+        // SourceSerif4 Italic is GPOS-only (no kern table); its kern lives in
+        // ExtensionPos-wrapped PairPos Format 1 + Format 2 (class kern). Ground
+        // truth from fontTools with first-match-wins subtable composition at the
+        // default instance: 109,502 nonzero pairs, max |value| 180.
+        // NOTE: f(33)->o(42) is -25 only at the wght=400/opsz=10 instance; the
+        // extractor reads the raw file (default instance, opsz=20), where f->o
+        // is 0, so it is correctly absent. a(28)->U(22) is -20 at the default
+        // instance and is used as the spot check instead.
+        let path = "/home/hatch/.local/share/fonts/ofl/sourceserif4/SourceSerif4-Italic[opsz,wght].ttf";
+        let Ok(base) = std::fs::read(path) else {
+            return; // skip test in CI without this font
+        };
+        let font_ref = read_fonts::FontRef::new(&base).expect("base parses");
+        let gpos_data = font_ref
+            .table_data(read_fonts::types::Tag::new(b"GPOS"))
+            .expect("GPOS present")
+            .as_ref()
+            .to_vec();
+        let n = num_glyphs(&font_ref);
+        assert!(n > 0, "num_glyphs from maxp");
+        let pairs = gpos_kern_pairs(&gpos_data, n).expect("GPOS parses");
+        // Substantial kern data extracted (fontTools first-wins: 109,502 pairs).
+        assert!(pairs.len() > 1000, "expected >1000 GPOS kern pairs, got {}", pairs.len());
+        // Sorted by (left, right) and unique.
+        let mut sorted = pairs.clone();
+        sorted.sort_unstable();
+        sorted.dedup();
+        assert_eq!(pairs.len(), sorted.len(), "pairs must be sorted and unique");
+        assert!(pairs.windows(2).all(|w| w[0] < w[1]), "pairs must be sorted");
+        // a(28) -> U(22) is a real kern pair with value -20 at the default instance.
+        let au = pairs.iter().find(|&&(l, r, _)| l == 28 && r == 22);
+        assert!(au.is_some(), "a->U kern pair must be present");
+        assert_eq!(au.unwrap().2, -20, "a->U kern value must be -20");
+        // No zero values anywhere.
+        assert!(pairs.iter().all(|&(_, _, v)| v != 0), "no zero-valued pairs");
+    }
+
+    #[test]
+    fn test_postscript_gpos_derived_kern() {
+        // A GPOS-only font must still get a kern fmt0 table under PostScript,
+        // derived from GPOS, limited to 300 pairs, with GPOS stripped.
+        let Some(base) = gpos_only_font_bytes() else {
+            return; // skip test in CI without a GPOS-only font
+        };
+        let out = transform_font(&base, Era::PostScript, "TestFamily").expect("transform");
+        let out_ref = read_fonts::FontRef::new(&out).expect("output parses");
+        assert!(
+            out_ref
+                .table_data(read_fonts::types::Tag::new(b"GPOS"))
+                .is_none(),
+            "GPOS must be stripped for PostScript"
+        );
+        let kern_data = out_ref
+            .table_data(read_fonts::types::Tag::new(b"kern"))
+            .expect("PostScript output must have a kern table derived from GPOS");
+        let (_coverage, pairs) =
+            parse_kern_format0(kern_data.as_ref()).expect("kern must be format 0");
+        assert!(!pairs.is_empty(), "kern table must not be empty");
+        assert!(pairs.len() <= 300, "kern limited to 300 pairs, got {}", pairs.len());
+    }
+
+    #[test]
+    fn test_word6_gpos_derived_kern_quantized() {
+        // A GPOS-only font must still get a kern fmt0 table under Word6,
+        // derived from GPOS, values quantized to multiples of 5, GPOS stripped.
+        let Some(base) = gpos_only_font_bytes() else {
+            return; // skip test in CI without a GPOS-only font
+        };
+        let out = transform_font(&base, Era::Word6, "TestFamily").expect("transform");
+        let out_ref = read_fonts::FontRef::new(&out).expect("output parses");
+        assert!(
+            out_ref
+                .table_data(read_fonts::types::Tag::new(b"GPOS"))
+                .is_none(),
+            "GPOS must be stripped for Word6"
+        );
+        let kern_data = out_ref
+            .table_data(read_fonts::types::Tag::new(b"kern"))
+            .expect("Word6 output must have a kern table derived from GPOS");
+        let (_coverage, pairs) =
+            parse_kern_format0(kern_data.as_ref()).expect("kern must be format 0");
+        assert!(!pairs.is_empty(), "kern table must not be empty");
+        assert!(
+            pairs.iter().all(|&(_, _, v)| v % 5 == 0),
+            "all Word6 kern values must be multiples of 5"
+        );
     }
 
     #[test]
@@ -1278,7 +2154,7 @@ mod tests {
         assert!(read_fonts::FontRef::new(&base).is_ok());
 
         for era in [Era::PostScript, Era::TrueType, Era::Word6, Era::OpenType, Era::Pdf14, Era::Docx, Era::HarfBuzz, Era::Variable] {
-            let out = transform_font_stub(&base, era, "TestFamily").expect("transform should not error");
+            let out = transform_font(&base, era, "TestFamily").expect("transform should not error");
             assert!(read_fonts::FontRef::new(&out).is_ok(), "era {:?} output should parse", era);
             // Check GPOS stripping for eras that should strip
             let orig_ref = read_fonts::FontRef::new(&base).unwrap();
@@ -1289,6 +2165,39 @@ mod tests {
                 Era::PostScript | Era::TrueType | Era::Word6 => {
                     // GPOS must be stripped
                     assert!(!has_gpos_out, "GPOS should be stripped for {:?}", era);
+                    match era {
+                        Era::PostScript => {
+                            // Kern kept, truncated to 300 pairs (DejaVu has 2727).
+                            let kern_data = out_ref
+                                .table_data(read_fonts::types::Tag::new(b"kern"))
+                                .expect("PostScript output must have a kern table");
+                            let (_, pairs) = parse_kern_format0(kern_data.as_ref())
+                                .expect("kern must be format 0");
+                            assert!(!pairs.is_empty(), "kern table must not be empty");
+                            assert!(pairs.len() <= 300, "kern limited to 300 pairs");
+                        }
+                        Era::Word6 => {
+                            // Kern kept, quantized to multiples of 5.
+                            let kern_data = out_ref
+                                .table_data(read_fonts::types::Tag::new(b"kern"))
+                                .expect("Word6 output must have a kern table");
+                            let (_, pairs) = parse_kern_format0(kern_data.as_ref())
+                                .expect("kern must be format 0");
+                            assert!(!pairs.is_empty(), "kern table must not be empty");
+                            assert!(
+                                pairs.iter().all(|&(_, _, v)| v % 5 == 0),
+                                "all Word6 kern values must be multiples of 5"
+                            );
+                        }
+                        Era::TrueType => {
+                            // Kern stripped (covered again below; kept for clarity).
+                            let has_kern_out = out_ref
+                                .table_data(read_fonts::types::Tag::new(b"kern"))
+                                .is_some();
+                            assert!(!has_kern_out, "kern should be stripped for TrueType");
+                        }
+                        _ => unreachable!(),
+                    }
                 }
                 Era::OpenType => {
                     // kern stripped, GPOS kept if orig had it

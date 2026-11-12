@@ -1,7 +1,9 @@
 //! Dump verbatim vintage font keys for Times New Roman (specimen generation utility).
 //!
 //! Generates the vintage variants of `times.ttf` via `ensure_vintage_fonts`
-//! (PostScript, TrueType, Word6, OpenType) and writes
+//! (PostScript, Word6 — the only eras that produce variants distinct from the
+//! catalog for Times New Roman; TrueType and OpenType are skipped upstream as
+//! redundant with the nokern catalog variant, Mike Nov 12, 2026) and writes
 //! `test-docs/vintage-times-keys.json` with `{era: {path, font_key}}`.
 //!
 //! The keys are verbatim catalog keys, produced by the same code path as
@@ -38,7 +40,7 @@ fn dump_vintage_times_keys() {
         .iter()
         .find(|b| b.path.file_name().map(|n| n == "times.ttf").unwrap_or(false))
         .unwrap_or_else(|| panic!("times.ttf not found in {}", mstt_dir.display()));
-    let eras = [Era::PostScript, Era::TrueType, Era::Word6, Era::OpenType];
+    let eras = [Era::PostScript, Era::Word6];
     let _paths = vintage_cache::ensure_vintage_fonts(std::slice::from_ref(times), &eras);
     let aliases = font_scan::build_alias_table();
     let mut out: BTreeMap<String, serde_json::Value> = BTreeMap::new();
