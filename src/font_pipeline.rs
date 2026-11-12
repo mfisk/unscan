@@ -56,6 +56,11 @@ pub struct ObsRankProbs {
     pub gt_geo_v_ll: HashMap<usize, f32>,
     pub gt_geo_h_err: HashMap<usize, f32>,
     pub gt_geo_v_err: HashMap<usize, f32>,
+    // Crop indices whose h_ll got the graded overlap downweight
+    // (unreliable pitch), mapped to the likely overlap error (px)
+    // subtracted from |h_err|.
+    pub chosen_geo_h_overlap_correction: HashMap<usize, f32>,
+    pub gt_geo_h_overlap_correction: HashMap<usize, f32>,
 }
 
 /// Build per-observation rank/prob/glyph/geo maps for one path's observations
@@ -80,6 +85,7 @@ fn build_obs_rank_probs(
         if let Some(v) = obs.geo_v_ll { rp.chosen_geo_v_ll.insert(obs.crop_index, v); }
         if let Some(he) = obs.geo_h_err { rp.chosen_geo_h_err.insert(obs.crop_index, he); }
         if let Some(ve) = obs.geo_v_err { rp.chosen_geo_v_err.insert(obs.crop_index, ve); }
+        if let Some(u) = obs.geo_h_overlap_correction_px { rp.chosen_geo_h_overlap_correction.insert(obs.crop_index, u); }
     }
     // GT side – from scoring.gt_observations (ensure font)
     // When window counts differ (ligature difference, e.g. Office 4 vs 5 glyphs),
@@ -96,6 +102,7 @@ fn build_obs_rank_probs(
             if let Some(v) = obs.geo_v_ll { rp.gt_geo_v_ll.insert(obs.crop_index, v); }
             if let Some(he) = obs.geo_h_err { rp.gt_geo_h_err.insert(obs.crop_index, he); }
             if let Some(ve) = obs.geo_v_err { rp.gt_geo_v_err.insert(obs.crop_index, ve); }
+            if let Some(u) = obs.geo_h_overlap_correction_px { rp.gt_geo_h_overlap_correction.insert(obs.crop_index, u); }
         }
     } else {
         // Differing k – align by glyph identity, not ordinal.
@@ -117,6 +124,7 @@ fn build_obs_rank_probs(
                 if let Some(v) = go.geo_v_ll { rp.gt_geo_v_ll.insert(wo.crop_index, v); }
                 if let Some(he) = go.geo_h_err { rp.gt_geo_h_err.insert(wo.crop_index, he); }
                 if let Some(ve) = go.geo_v_err { rp.gt_geo_v_err.insert(wo.crop_index, ve); }
+                if let Some(u) = go.geo_h_overlap_correction_px { rp.gt_geo_h_overlap_correction.insert(wo.crop_index, u); }
                 gi += 1;
             } else {
                 // Look ahead for same char – skip GT extras (e.g. f, fi before c).
@@ -137,6 +145,7 @@ fn build_obs_rank_probs(
                     if let Some(v) = go.geo_v_ll { rp.gt_geo_v_ll.insert(wo.crop_index, v); }
                     if let Some(he) = go.geo_h_err { rp.gt_geo_h_err.insert(wo.crop_index, he); }
                     if let Some(ve) = go.geo_v_err { rp.gt_geo_v_err.insert(wo.crop_index, ve); }
+                    if let Some(u) = go.geo_h_overlap_correction_px { rp.gt_geo_h_overlap_correction.insert(wo.crop_index, u); }
                     gi = fidx + 1;
                 } else {
                     // No GT counterpart (e.g. winner ffi not supported by GT Caladea) – leave —.
@@ -454,7 +463,7 @@ pub fn match_lines(
                 p
             });
         // Segment line (lazy crop data) (before font matching block so they're available after)
-        let _word_placements: Vec<crate::verify::WordPlacement> = line.words.iter()
+        let word_placements: Vec<crate::verify::WordPlacement> = line.words.iter()
             .map(|w| crate::verify::WordPlacement {
                 text: w.text.clone(),
                 x_off: w.x,
@@ -463,8 +472,23 @@ pub fn match_lines(
                 height: w.height,
             })
             .collect();
-        // Per-font pipeline: segmentation now happens inside identify_fonts,
-        // so we don't pre-segment here with segment_line.
+        // Diagnostic-only segmentation: write the seam diagnostics
+        // (word_crop.png, seg_plain/summary.json, seg_lig/...) for this
+        // line. Scoring uses identify_fonts' own per-font segmentation;
+        // this pass exists solely so the lob audit carries the seam data
+        // the seam viz reads. Restores the pre-a92d0bb behaviour:
+        // segment_line was the only caller that wrote these files, and
+        // a92d0bb (2026-08-11) removed the call, orphaning the writes.
+        // Gated on diag_seg_dir so non-audit runs pay nothing.
+        if diag_seg_dir.is_some() {
+            let word_height = line.words.iter().map(|w| w.height).max().unwrap_or(0);
+            let _diag_crops = crate::segment::segment_line(
+                gray_page, &word_placements, word_height,
+                diag_seg_dir.as_deref(),
+                &args.render_params(),
+            );
+        }
+        // Per-font pipeline: segmentation now happens inside identify_fonts.
         // ── Per-font ligature handling: build word image infos for inside identify_fonts ──
         use std::sync::Arc;
         // Build filtered word infos (replicates segment_line filtering but without segmentation)
@@ -1083,6 +1107,7 @@ pub fn match_lines(
                             geo_v_ll: None,
                             geo_h_err: None,
                             geo_v_err: None,
+                            geo_h_overlap_correction_px: None,
                         });
                         idx += 1;
                     }

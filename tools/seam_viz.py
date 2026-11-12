@@ -440,6 +440,22 @@ if __name__ == '__main__':
                   f"(page {match_entry['page']}, line {match_entry['line_index']})", file=sys.stderr)
             sys.exit(1)
 
+        # Candidate seams recorded by the segmenter (tied-run alternatives
+        # like col 25) live in seg_plain/summary.json, written by the
+        # diagnostic pass from its own traced DP paths. They are real
+        # recorded data, not the audit's (identify_fonts) seam_paths.
+        # Merge them in for columns the audit does not already have;
+        # audit data wins on conflict.
+        summary = find_seg_summary(seg_plain_dir)
+        for k, v in summary.get('seam_paths', {}).items():
+            col = int(k)
+            if col not in seam_paths:
+                seam_paths[col] = v
+        for k, v in summary.get('seam_costs', {}).items():
+            col = int(k)
+            if col not in seam_costs:
+                seam_costs[col] = v
+
     img = Image.open(crop_path)
     arr = np.array(img)
     if arr.ndim == 3:

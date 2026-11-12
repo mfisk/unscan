@@ -389,6 +389,8 @@ fn build_audit_entry(
         let ch_v_ll = rp.chosen_geo_v_ll.get(&d.crop_index).copied();
         let gt_h_ll = rp.gt_geo_h_ll.get(&d.crop_index).copied();
         let gt_v_ll = rp.gt_geo_v_ll.get(&d.crop_index).copied();
+        let ch_h_overlap_correction = rp.chosen_geo_h_overlap_correction.get(&d.crop_index).copied();
+        let gt_h_overlap_correction = rp.gt_geo_h_overlap_correction.get(&d.crop_index).copied();
         ObservationVote {
             seq: vec![d.ch],
             weight: d.weight,
@@ -410,12 +412,14 @@ fn build_audit_entry(
             gt_font_prob: rp.gt_probs.get(&d.crop_index).copied().map(|p| p * n_glyphs),
             obs_stats: d.obs_stats.clone(),
             chosen_geo_h_ll: ch_h_ll,
+            chosen_geo_h_overlap_correction_px: ch_h_overlap_correction,
             chosen_geo_v_ll: ch_v_ll,
             chosen_glyph_score: rp.chosen_glyph_scores.get(&d.crop_index).copied(),
             gt_glyph_score: rp.gt_glyph_scores.get(&d.crop_index).copied(),
             chosen_geo_h_err: rp.chosen_geo_h_err.get(&d.crop_index).copied(),
             chosen_geo_v_err: rp.chosen_geo_v_err.get(&d.crop_index).copied(),
             gt_geo_h_ll: gt_h_ll,
+            gt_geo_h_overlap_correction_px: gt_h_overlap_correction,
             gt_geo_v_ll: gt_v_ll,
             gt_geo_h_err: rp.gt_geo_h_err.get(&d.crop_index).copied(),
             gt_geo_v_err: rp.gt_geo_v_err.get(&d.crop_index).copied(),

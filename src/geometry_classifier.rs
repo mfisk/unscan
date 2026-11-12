@@ -40,6 +40,12 @@ pub struct PerCharGeo {
     pub pred_pitch: Option<f64>,
     pub h_err: Option<f64>,
     pub h_ll: f64,
+    /// Graded overlap downweight applied to this pair's h_ll, if any:
+    /// Some(c) where c (px) is the full ink-overlap width subtracted from
+    /// |h_err|. None when the pair was scored with the plain h_ll. None
+    /// for word-initial chars (h_ll is 0.0 by construction) and for the
+    /// shaped path, which does not apply the overlap downweight.
+    pub h_ll_overlap_correction_px: Option<f64>,
     pub obs_cy_rel: f64,
     pub pred_cy_rel: f64,
     pub v_err: f64,
@@ -288,6 +294,34 @@ pub fn measure_char_ink_bounds(
     WordGeoMeasurement { chars: result }
 }
 
+/// Overlap-for-measurement threshold (px): a clean zero-ink column between two
+/// adjacent glyphs needs an ink gap above this. INK_THRESH=240 means a pixel
+/// counts as ink above 15/255 coverage, so each glyph edge's thresholded ink
+/// extends 0.5 - 15/255 = 0.4412 px beyond its outline; two facing edges need
+/// 2 * 0.4412 = 0.8824 px. Below that, antialiasing bridges the gap and any
+/// seam must cut ink. Derived from crate::INK_THRESH, not a magic constant.
+const OVERLAP_GAP_PX: f64 = 2.0 * (0.5 - (255.0 - crate::INK_THRESH as f64) / 255.0);
+
+/// Ink gate: a DP seam counts as cutting through ink when the darkest pixel
+/// on its path reaches 0.4 of the word's Max ink (p95 ink darkness,
+/// `SeamCost.max_ink`). The dp_cost > 0 test it replaces is wrong: dp_cost
+/// includes the horizontal-movement penalty, so a seam moving diagonally
+/// through white space has dp_cost > 0 with no ink.
+///
+/// Measured on the lob line-2 word: seams that cut only light fringe or
+/// white space have a path max darkness of at most 0.20 x max_ink (38-50 of
+/// 255); seams that cut genuine overlap ink reach 0.45-0.67 x max_ink
+/// (114-241), and the darkest seam-path pixel in the word tops out at
+/// 0.945 x max_ink (241 of 255). The DP seam is a minimum-cost path, so it
+/// routes around the darkest pixels when it can — that is why even
+/// genuine-overlap seams top out below max_ink on the path. At 0.4, the
+/// gate passes all eight L2 pairs at 0.447-0.945 x max_ink, including
+/// Y|Z at 0.447. (Mike Nov 9: set gate at 0.4 of max.)
+/// max_ink is the word's p95 darkness, not an absolute darkness, so the
+/// gate adapts to the document's ink level (contrast normalisation stretches
+/// solid ink to ~255, so max_ink is ~255 for normal text).
+const MAX_INK_FRAC: f64 = 0.4;
+
 /// Cached path: use GeometryCache predictions (fast, Unicode, keeps both GPOS Pair formats native).
 /// If `prune_threshold` is Some(t), we do vertical-first short-circuit:
 /// `h_ll <= 0` always, so `h_ll+v_ll <= v_ll`. If any `v_ll < t`, the sum will be `< t`
@@ -338,9 +372,11 @@ fn per_char_geo_cached_with_threshold(
             continue;
         }
         // Perf slice 3: avoid two intermediate Vec allocs (preds_fu, preds) per word per font.
-        // preds_fu_ext is Vec<(cx,cy,y_min,y_max)> in font units. Scale from font units → px
-        // is center-span (unbiased). We compute scale via shared helper
-        // `geometry_scale::center_span_scale` — single source of truth for midpoint scaling.
+        // preds_fu_ext is Vec<(cx,cy,y_min,y_max,x_min,x_max)> in font units, where
+        // x_min/x_max are the placed ink extents (cursor includes advances + kern).
+        // Scale from font units → px is center-span (unbiased). We compute scale via
+        // shared helper `geometry_scale::center_span_scale` — single source of truth
+        // for midpoint scaling.
         let scale = if word_bounds.len() >= 2 {
             let obs_first = word_bounds.first().unwrap().cx;
             let obs_last = word_bounds.last().unwrap().cx;
@@ -350,13 +386,13 @@ fn per_char_geo_cached_with_threshold(
                 .unwrap_or_else(|| {
                     // fallback to height ratio if span degenerate (should be rare)
                     let obs_h = word_bounds.iter().map(|b| b.height).fold(0.0_f64, f64::max).max(1.0);
-                    let pred_h = preds_fu_ext.iter().map(|(_,_,y_min,y_max)| (y_max - y_min).abs()).fold(0.0_f64, f64::max).max(1.0);
+                    let pred_h = preds_fu_ext.iter().map(|(_,_,y_min,y_max,_,_)| (y_max - y_min).abs()).fold(0.0_f64, f64::max).max(1.0);
                     obs_h / pred_h.max(1.0)
                 })
         } else {
             // single char: fall back to height ratio (h_err is None anyway)
             let obs_h = word_bounds[0].height.max(1.0);
-            let (_,_, y_min, y_max) = preds_fu_ext[0];
+            let (_,_, y_min, y_max, _, _) = preds_fu_ext[0];
             let pred_h = (y_max - y_min).abs().max(1.0);
             obs_h / pred_h.max(1.0)
         };
@@ -365,14 +401,17 @@ fn per_char_geo_cached_with_threshold(
         let obs_word_cy = word_bounds.iter().map(|b| b.cy).sum::<f64>() / word_bounds.len() as f64;
         // pred_word_cy = mean(pred_cy) where pred_cy = cy_fu * -scale
         let pred_word_cy = {
-            let sum: f64 = preds_fu_ext.iter().map(|(_, cy, _, _)| cy * -scale).sum();
+            let sum: f64 = preds_fu_ext.iter().map(|(_, cy, _, _, _, _)| cy * -scale).sum();
             sum / preds_fu_ext.len() as f64
         };
 
         // Second pass: emit PerCharGeo without allocating preds Vec. Keep prev_pred_cx for pitch.
+        // Boundaries align with chars iff [0, split1, ..., w] has n+1 entries; otherwise
+        // a split column cannot be attributed to a pair and the conjunction is skipped.
+        let boundaries_aligned = ws.boundaries.len() == ws.chars.len() + 1;
         let mut prev_obs_cx: Option<f64> = None;
         let mut prev_pred_cx: Option<f64> = None;
-        for (orig_idx, (bounds, (cx_fu, cy_fu, _, _))) in word_bounds.iter().zip(preds_fu_ext.iter()).enumerate() {
+        for (orig_idx, (bounds, (cx_fu, cy_fu, _, _, x_min_fu, _))) in word_bounds.iter().zip(preds_fu_ext.iter()).enumerate() {
             let pred_cx = cx_fu * scale;
             let pred_cy = cy_fu * -scale;
             let obs_cx = bounds.cx;
@@ -383,16 +422,75 @@ fn per_char_geo_cached_with_threshold(
             let v_err = obs_cy_rel - pred_cy_rel;
             let v_ll = quantized_ll(v_err, SIGMA_CENTER_PX, quant_half_width_center_px());
 
-            let (obs_pitch, pred_pitch, h_err, h_ll) = if orig_idx == 0 {
-                (None, None, None, 0.0)
+            let (obs_pitch, pred_pitch, h_err, h_ll, h_ll_overlap_correction) = if orig_idx == 0 {
+                (None, None, None, 0.0, None)
             } else {
                 let prev_cx = prev_obs_cx.unwrap();
                 let ppcx = prev_pred_cx.unwrap();
                 let obs_pitch_val = obs_cx - prev_cx;
                 let pred_pitch_val = pred_cx - ppcx;
                 let h_err_val = obs_pitch_val - pred_pitch_val;
-                let h_ll_val = quantized_ll(h_err_val, SIGMA_PITCH_PX, quant_half_width_pitch_px());
-                (Some(obs_pitch_val), Some(pred_pitch_val), Some(h_err_val), h_ll_val)
+                let mut h_ll_val = quantized_ll(h_err_val, SIGMA_PITCH_PX, quant_half_width_pitch_px());
+                let mut h_ll_overlap_correction: Option<f64> = None;
+                // Graded overlap downweight (replaces binary zeroing):
+                // when the font's ink boxes overlap (gap < OVERLAP_GAP_PX,
+                // so antialiasing bridges it) AND the segment cut through
+                // Max ink (DP seam whose darkest pixel reaches the word's
+                // Max ink itself; a VP split has no seam_costs entry), the measured pitch carries a
+                // systematic error from the overlap. Estimate that error
+                // and subtract most of it from the error magnitude, keeping
+                // the sign and clamping at zero; score the corrected error
+                // with the ORIGINAL sigma (no sigma widening).
+                //
+                // Derivation of the overlap error. obs cx is the midpoint
+                // of the (subpixel) ink bounds. When a seam cuts through
+                // the overlap, the left glyph's right ink bound and the
+                // right glyph's left ink bound are both truncated to the
+                // seam column s, so the observed pitch is (R1 - L0)/2 — s
+                // cancels, the pitch across a seam is invariant to the
+                // seam's position. The true pitch is
+                // (R0 + R1 - L0 - L1)/2, so the truncation shifts the
+                // measured pitch by (L1 - R0)/2 = w/2, where w is the
+                // ink-overlap width. The correction is 1.0 plus the
+                // non-negative outline overlap, max(-gap_px, 0): the
+                // overlap itself, plus a 1 px floor. (Mike Nov 9.)
+                //
+                // The correction subtracts the FULL overlap width w, not
+                // w/2 and not w/4. The error IS the overlap, and it can
+                // exceed the nominal w/2 shift: when the seam has two
+                // serifs on one side and none on the other, the ink
+                // gradient pushes the seam toward the empty side, and a
+                // complete run-on leaves no clean gap at all. The shift
+                // is systematic, not uniform, so there is no expected-
+                // value halving. (Mike Nov 9: use w.)
+                //
+                // Magnitude-aware: a small error within the correction
+                // is forgiven (corrected to ~0); a large genuine mismatch
+                // keeps most of its penalty. The correction is at least
+                // 1.0 whenever the gate fires. v_ll is untouched — this
+                // is horizontal only.
+                if boundaries_aligned {
+                    let prev_x_max_fu = preds_fu_ext[orig_idx - 1].5;
+                    let gap_px = (x_min_fu - prev_x_max_fu) * scale;
+                    let split_col = ws.boundaries[orig_idx];
+                    // Ink gate: the seam counts as cutting ink only when
+                    // its darkest pixel reaches 0.4 of the word's Max ink.
+                    // dp_cost > 0 is NOT the test — dp_cost includes the
+                    // horizontal-movement penalty, so a diagonal through
+                    // white space has dp_cost > 0 with no ink. A VP split
+                    // has no seam_costs entry, so it never passes the gate.
+                    let has_ink = ws.seam_costs.get(&split_col).map_or(false, |sc| {
+                        sc.max_darkness as f64 >= MAX_INK_FRAC * sc.max_ink as f64
+                    });
+                    if gap_px < OVERLAP_GAP_PX && has_ink {
+                        let overlap_px = 1.0 + (-gap_px).max(0.0);
+                        h_ll_overlap_correction = Some(overlap_px);
+                        let corrected_magnitude = (h_err_val.abs() - overlap_px).max(0.0);
+                        let corrected_err = h_err_val.signum() * corrected_magnitude;
+                        h_ll_val = quantized_ll(corrected_err, SIGMA_PITCH_PX, quant_half_width_pitch_px());
+                    }
+                }
+                (Some(obs_pitch_val), Some(pred_pitch_val), Some(h_err_val), h_ll_val, h_ll_overlap_correction)
             };
 
             result.push(PerCharGeo {
@@ -408,6 +506,7 @@ fn per_char_geo_cached_with_threshold(
                 pred_pitch,
                 h_err,
                 h_ll,
+                h_ll_overlap_correction_px: h_ll_overlap_correction,
                 obs_cy_rel,
                 pred_cy_rel,
                 v_err,
@@ -578,6 +677,8 @@ fn per_char_geo_shaped_with_threshold(
                 pred_pitch,
                 h_err,
                 h_ll,
+                // Shaped path does not apply the conjunction downweighting.
+                h_ll_overlap_correction_px: None,
                 obs_cy_rel,
                 pred_cy_rel,
                 v_err,
