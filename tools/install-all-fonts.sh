@@ -396,6 +396,30 @@ if ! [ -s "$URW/NimbusRoman-Regular.otf" ]; then
 fi
 
 # ---------------------------------------------------------------------------
+# Windows 3.11 fonts (Win31-era TrueType, version 2.50)
+# ---------------------------------------------------------------------------
+# Real Windows 3.1-era TrueType fonts from the Internet Archive Windows 3.11
+# stock installation (win3_stock / win311-stock.zip). These are the genuine
+# early-1990s Monotype/Microsoft fonts: TIMES.TTF v2.50 has 113 kern pairs
+# (vs 867 in the modern v2.82), ARIAL.TTF v2.50 has 105 pairs, COUR.TTF has
+# 0 pairs (monospace). Used by the t66 vintage test as the real Win31 variant
+# (replacing the unsourced quantized-kern assumption — the real Win31
+# distinction is pair-count, not quantized values).
+# (c) Monotype Corporation / Microsoft — NOT freely redistributable.
+# Downloaded at install time only; never committed to the repo.
+WIN31="$FONTS/win31"
+WIN31_URL="https://archive.org/download/win3_stock/win311-stock.zip"
+if ! [ -s "$WIN31/TIMES.TTF" ]; then
+  [[ -d "$WIN31" ]] || mkdir -p "$WIN31"
+  echo "  win31 2.50"
+  curl -fsSL -o /tmp/win311-stock.zip "$WIN31_URL" || echo "  WARN: win31 download"
+  if [[ -s /tmp/win311-stock.zip ]]; then
+    unzip -j -o /tmp/win311-stock.zip "WINDOWS/SYSTEM/TIMES.TTF" "WINDOWS/SYSTEM/ARIAL.TTF" "WINDOWS/SYSTEM/COUR.TTF" -d "$WIN31/" || echo "  WARN: win31 extract"
+    rm -f /tmp/win311-stock.zip
+  fi
+fi
+
+# ---------------------------------------------------------------------------
 # Google Fonts (direct upstream downloads from FONTS_TO_INSTALL)
 # ---------------------------------------------------------------------------
 for entry in "${FONTS_TO_INSTALL[@]}"; do

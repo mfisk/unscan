@@ -1690,7 +1690,7 @@ impl GeometryCache {
     /// placement cancels out, so SinglePos adjustments on the mark do not
     /// disturb the alignment. Same for cursive: a glyph's new center is
     ///   prev_exit_anchor - entry_anchor + bbox_center.
-    fn apply_mark_cursive(&self, f: &FontMmapIndex, gids: &[u16], bboxes: &[(f64, f64, f64, f64)], out: &mut [(f64, f64, f64, f64, f64, f64)]) {
+    fn apply_mark_cursive(&self, f: &FontMmapIndex, gids: &[u16], bboxes: &[(f64, f64, f64, f64)], out: &mut [(f64, f64, f64, f64)]) {
         let n = gids.len();
         if n == 0 { return; }
         // Merge all mark/cursive tables into lookup order.
@@ -1711,8 +1711,8 @@ impl GeometryCache {
 
         // Absolute anchor of glyph j (its anchor at `anchor` in font units).
         // Computed from its adjusted center: anchor = center - bbox_center + anchor.
-        let anchor_abs = |out: &[(f64, f64, f64, f64, f64, f64)], bboxes: &[(f64, f64, f64, f64)], j: usize, anchor: (i16, i16)| -> (f64, f64) {
-            let (cx, cy, _, _, _, _) = out[j];
+        let anchor_abs = |out: &[(f64, f64, f64, f64)], bboxes: &[(f64, f64, f64, f64)], j: usize, anchor: (i16, i16)| -> (f64, f64) {
+            let (cx, cy, _, _) = out[j];
             let (x0, x1, y0, y1) = bboxes[j];
             (cx - (x0 + x1) * 0.5 + anchor.0 as f64, cy - (y0 + y1) * 0.5 + anchor.1 as f64)
         };
@@ -1730,10 +1730,9 @@ impl GeometryCache {
                         let (x0, x1, y0, y1) = bboxes[i + 1];
                         let new_cx = ax - en.0 as f64 + (x0 + x1) * 0.5;
                         let new_cy = ay - en.1 as f64 + (y0 + y1) * 0.5;
-                        let (_, _, oy_min, oy_max, ox_min, ox_max) = out[i + 1];
-                        let dx = new_cx - out[i + 1].0;
+                        let (_, _, oy_min, oy_max) = out[i + 1];
                         let dy = new_cy - out[i + 1].1;
-                        out[i + 1] = (new_cx, new_cy, oy_min + dy, oy_max + dy, ox_min + dx, ox_max + dx);
+                        out[i + 1] = (new_cx, new_cy, oy_min + dy, oy_max + dy);
                     }
                 }
                 MC::MarkBase(t) => {
@@ -1766,10 +1765,9 @@ impl GeometryCache {
                         let (x0, x1, y0, y1) = bboxes[i];
                         let new_cx = ax - ma.0 as f64 + (x0 + x1) * 0.5;
                         let new_cy = ay - ma.1 as f64 + (y0 + y1) * 0.5;
-                        let (_, _, oy_min, oy_max, ox_min, ox_max) = out[i];
-                        let dx = new_cx - out[i].0;
+                        let (_, _, oy_min, oy_max) = out[i];
                         let dy = new_cy - out[i].1;
-                        out[i] = (new_cx, new_cy, oy_min + dy, oy_max + dy, ox_min + dx, ox_max + dx);
+                        out[i] = (new_cx, new_cy, oy_min + dy, oy_max + dy);
                     }
                 }
                 MC::MarkLig(t) => {
@@ -1814,10 +1812,9 @@ impl GeometryCache {
                         let (x0, x1, y0, y1) = bboxes[i];
                         let new_cx = ax - ma.0 as f64 + (x0 + x1) * 0.5;
                         let new_cy = ay - ma.1 as f64 + (y0 + y1) * 0.5;
-                        let (_, _, oy_min, oy_max, ox_min, ox_max) = out[i];
-                        let dx = new_cx - out[i].0;
+                        let (_, _, oy_min, oy_max) = out[i];
                         let dy = new_cy - out[i].1;
-                        out[i] = (new_cx, new_cy, oy_min + dy, oy_max + dy, ox_min + dx, ox_max + dx);
+                        out[i] = (new_cx, new_cy, oy_min + dy, oy_max + dy);
                     }
                 }
                 MC::MarkMark(t) => {
@@ -1844,10 +1841,9 @@ impl GeometryCache {
                         let (x0, x1, y0, y1) = bboxes[i];
                         let new_cx = ax - ma.0 as f64 + (x0 + x1) * 0.5;
                         let new_cy = ay - ma.1 as f64 + (y0 + y1) * 0.5;
-                        let (_, _, oy_min, oy_max, ox_min, ox_max) = out[i];
-                        let dx = new_cx - out[i].0;
+                        let (_, _, oy_min, oy_max) = out[i];
                         let dy = new_cy - out[i].1;
-                        out[i] = (new_cx, new_cy, oy_min + dy, oy_max + dy, ox_min + dx, ox_max + dx);
+                        out[i] = (new_cx, new_cy, oy_min + dy, oy_max + dy);
                     }
                 }
             }
