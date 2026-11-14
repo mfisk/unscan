@@ -80,17 +80,24 @@ fn main() {
         std::process::exit(0);
     }
 
-    // ── resolve-fontkey: path -> verbatim catalog font_key ────────────
+    // ── resolve-fontkey: path/key/name -> verbatim catalog font_key ───
     // Per Mike Nov 3: Python must use verbatim strings from the catalog,
     // not construct fontkeys. This is the single source of truth.
+    // Each argument resolves in order: an exact font file path (the
+    // file's best variant — the version is fixed by the file); an exact
+    // font key (a specified version is honored exactly); a bare
+    // PostScript name (no version specified → latest version, then the
+    // shared variant preference). Names match exactly, no fuzzy matching.
     if !args.resolve_fontkey.is_empty() {
         let font_dirs = font_scan::default_font_dirs(&args.font_dir);
         let catalog = font_scan::scan_fonts(&font_dirs, args.quiet);
         // Build path -> best entry map. Shared preference with the
         // classifier tiebreakers (font_scan::font_key_preference_score):
-        // prefer kern for fonts with kerning data, nokern otherwise; nolig;
-        // then opsz=10; OT-feature variants and non-default weight
-        // instances (-10 each) never win the default pick.
+        // highest version first (a no-op here — entries sharing one path
+        // share one file and one version), then kern for fonts with
+        // kerning data, nokern otherwise; nolig; then opsz=10;
+        // OT-feature variants and non-default weight instances (-10 each)
+        // never win the default pick.
         // The entry's stored has_kern flag is the source of truth — the
         // scan drops font bytes, so parsing fe.data here always fails.
         use std::collections::HashMap;
@@ -102,7 +109,7 @@ fn main() {
             let should_replace = match existing {
                 None => true,
                 Some(existing_fe) => {
-                    // Higher preference score wins.
+                    // Higher preference wins.
                     font_scan::font_key_preference_score(&fe.font_key(), fe.has_kern)
                         > font_scan::font_key_preference_score(&existing_fe.font_key(), existing_fe.has_kern)
                 }
@@ -111,15 +118,24 @@ fn main() {
                 path_to_entry.insert(path, fe);
             }
         }
-        for path_str in &args.resolve_fontkey {
-            let path = PathBuf::from(path_str);
-            match path_to_entry.get(&path) {
-                Some(fe) => println!("{}", fe.font_key()),
-                None => {
-                    eprintln!("No catalog entry for path {:?}", path_str);
-                    std::process::exit(1);
-                }
+        for arg in &args.resolve_fontkey {
+            let path = PathBuf::from(arg);
+            if let Some(fe) = path_to_entry.get(&path) {
+                println!("{}", fe.font_key());
+                continue;
             }
+            // Exact font key (version specified) — honored exactly.
+            if let Some(fe) = catalog.iter().find(|fe| fe.font_key() == *arg) {
+                println!("{}", fe.font_key());
+                continue;
+            }
+            // Bare PostScript name (no version specified) — latest version.
+            if let Some(fe) = font_scan::best_entry_for_ps_name(catalog.iter(), arg) {
+                println!("{}", fe.font_key());
+                continue;
+            }
+            eprintln!("No catalog entry for path, font key, or PostScript name {:?}", arg);
+            std::process::exit(1);
         }
         std::process::exit(0);
     }

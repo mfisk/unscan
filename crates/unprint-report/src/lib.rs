@@ -335,12 +335,15 @@ fn find_font_in_catalog<'a>(
     gt_font_name: &str,
 ) -> Option<&'a FontEntry> {
     let gt_stripped = ground_truth::strip_subset_prefix_str(gt_font_name);
-    // Try full explicit key first (e.g. "SourceSerif4-400Italic[wght=400,opsz=10]"),
+    // Try full explicit key first (e.g. "SourceSerif4-400Italic|version=4.00|kern|nolig[wght=400,opsz=10]"),
     // then fall back to base PostScript name for backward compatibility.
-    // Variant entries carry "PSName|tag" so they won't collide with base "PSName".
-    font_catalog.iter().find(|fe| {
-        fe.font_key() == gt_stripped || fe.postscript_name == gt_stripped
-    })
+    // A bare name (no version specified) resolves to the latest version,
+    // then the shared variant preference. Variant entries carry
+    // "PSName|tag" so they won't collide with base "PSName".
+    font_catalog
+        .iter()
+        .find(|fe| fe.font_key() == gt_stripped)
+        .or_else(|| unprint::font_scan::best_entry_for_ps_name(font_catalog.iter(), &gt_stripped))
 }
 
 /// Try to find a font entry matching a CI candidate font_key.
