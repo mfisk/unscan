@@ -25,10 +25,6 @@
 //!     PairPos (XAdvance), composed first-match-wins within each lookup (as a
 //!     shaper applies subtables). (1985)
 //!   TrueType: empty kern and GPOS (Word 6 default kerning off). (1990)
-//!   Word6: kern fmt0 only, values quantized to multiples of 5, zero-valued pairs
-//!     dropped. Same kern source as PostScript. A GPOS-derived source can expand
-//!     past the format-0 capacity (10920 pairs), so it is truncated to that
-//!     capacity (largest |value| first) — a hard format constraint. (1993)
 //!   OpenType: strip kern, keep GPOS as-is. The module docs mention "GPOS class
 //!     kerning limited" but give no concrete limit, so no limiting is applied. (1996)
 //!   Pdf14 / Docx / HarfBuzz / Variable: return original bytes unchanged
@@ -50,11 +46,12 @@
 //!     TrueType/OpenType strip tables). Currently UNUSED by t66: the dedup
 //!     rule (below) shows these transforms produce variants identical to
 //!     catalog variants, so generating them adds nothing.
-//!   Quantizing: the Word6 transform — quantize kern values to multiples of 5
-//!     (Word 6.0 behavior), drop zero-valued pairs, truncate to the format-0
-//!     capacity (10920 pairs). This is a real historical behavior no real font
-//!     exhibits, which is why Word6 is the one synthetic variant t66 still
-//!     uses (key `|vintage=word6`).
+//!   Quantizing: REMOVED (Nov 12, 2026). The Word6 transform quantized kern
+//!     values to multiples of 5, but no primary source documents Word 6.0
+//!     doing this — the real Win31 kern data (113 pairs for Times, values
+//!     verbatim) contradicts it. The quantized variant was replaced by the
+//!     real Win31 fonts (see the t66 specimen), downloaded via the install
+//!     script. Do not re-add a quantization transform without a cited source.
 //!
 //! Upstream redundancy (Mike Nov 12, 2026): a vintage variant is NOT generated
 //! when it would be identical to a variant already in the catalog. The check
@@ -66,14 +63,12 @@
 //! all GPOS tables are empty), so it duplicates the kern variant when GPOS
 //! kern exists and the nokern variant when it does not; the unchanged-byte
 //! eras return the base font itself. PostScript generates only when the kern
-//! source has >300 pairs or the font has GPOS kern; Word6 only when some kern
-//! value is not a multiple of 5, or the font has GPOS kern, or the pair count
-//! exceeds 10920. For Times New Roman (867 kern pairs, no GPOS) only
-//! PostScript and Word6 generate; TrueType and OpenType are skipped as
-//! nokern duplicates.
+//! source has >300 pairs or the font has GPOS kern. For Times New Roman (867
+//! kern pairs, no GPOS) only PostScript generates; TrueType and OpenType are
+//! skipped as nokern duplicates.
 //!
-//! Naming: readable slugs like `word6`, `postscript`, `harfbuzz`.
-//! Old cache files using year-suffixed names like `ps1985`, `word6_1993` will be orphaned
+//! Naming: readable slugs like `postscript`, `truetype`, `harfbuzz`.
+//! Old cache files using year-suffixed names like `ps1985` will be orphaned
 //! on upgrade — intentional migration to readable names. Delete old `*.ttf` in vintage dir
 //! if you need to reclaim space.
 
@@ -88,7 +83,7 @@ use crate::font_history::{era_exists_for_font, font_birth_year};
 use crate::font_scan::FontEntry;
 
 /// Era definition — historical typesetting engine generations (last 40 years).
-/// Variant names are readable (word6, postscript) — years are kept in start_year/end_year for gating.
+/// Variant names are readable (postscript, truetype) — years are kept in start_year/end_year for gating.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub enum Era {
     /// PostScript Level 1 (1985-1989) — kern-table-only (AFM-style), screen≠print.
@@ -97,8 +92,6 @@ pub enum Era {
     PostScript,
     /// TrueType vs Type1 war (1990-1994) — Word kerning checkbox off by default
     TrueType,
-    /// Word 6.0 / WordPerfect 5.1 era (1993-1995) — proportional table, Quark 1/200em quant
-    Word6,
     /// OpenType 1.0, Core Web Fonts, pdfTeX (1996-1999)
     OpenType,
     /// PDF 1.4, Office 2000/XP (2001-2003) — ToUnicode, early ClearType draft
@@ -127,12 +120,11 @@ pub struct EraDef {
 
 impl Era {
     /// Human-readable slug without year — used in cache file names and variant tags.
-    /// e.g. "word6", "postscript", "harfbuzz"
+    /// e.g. "postscript", "truetype", "harfbuzz"
     pub fn name(&self) -> &'static str {
         match self {
             Era::PostScript => "postscript",
             Era::TrueType => "truetype",
-            Era::Word6 => "word6",
             Era::OpenType => "opentype",
             Era::Pdf14 => "pdf14",
             Era::InDesignCS => "indesign_cs",
@@ -146,7 +138,6 @@ impl Era {
         match self {
             Era::PostScript => 1985,
             Era::TrueType => 1990,
-            Era::Word6 => 1993,
             Era::OpenType => 1996,
             Era::Pdf14 => 2001,
             Era::InDesignCS => 2003,
@@ -160,7 +151,6 @@ impl Era {
         match self {
             Era::PostScript => 1989,
             Era::TrueType => 1994,
-            Era::Word6 => 1995,
             Era::OpenType => 1999,
             Era::Pdf14 => 2003,
             Era::InDesignCS => 2008,
@@ -174,7 +164,6 @@ impl Era {
         match self {
             Era::PostScript => "PostScript Level 1 (1985) — kern-table-only (AFM-style), screen!=print, WYSINOTWYF",
             Era::TrueType => "TrueType vs Type1 war (1990) — Word6 kerning checkbox off by default",
-            Era::Word6 => "Word 6.0 / WordPerfect 5.1 (1993) — proportional table, Quark 3.3 editable 1/200em",
             Era::OpenType => "OpenType 1.0 (1996) — GSUB/GPOS, pdfTeX, class kerning 10k combos",
             Era::Pdf14 => "PDF 1.4 (2001) — ToUnicode, Calibri draft, early ClearType",
             Era::InDesignCS => "InDesign CS (2003) — optical kerning (outline distance), metrics vs optical",
@@ -190,7 +179,6 @@ impl Era {
         match self {
             Era::PostScript => SHIPPED_POSTSCRIPT,
             Era::TrueType => SHIPPED_TRUETYPE,
-            Era::Word6 => SHIPPED_WORD6,
             Era::OpenType => SHIPPED_OPENTYPE,
             Era::Pdf14 => SHIPPED_PDF14,
             Era::InDesignCS => SHIPPED_INDESIGN_CS,
@@ -216,7 +204,6 @@ impl Era {
 pub const ALL_ERAS: &[Era] = &[
     Era::PostScript,
     Era::TrueType,
-    Era::Word6,
     Era::OpenType,
     Era::Pdf14,
     Era::InDesignCS,
@@ -226,14 +213,13 @@ pub const ALL_ERAS: &[Era] = &[
 ];
 
 /// Minimal set used by default to keep cache size reasonable.
-/// Covers biggest spacing deltas: AFM-only, Quark quant, modern class kern.
-/// Readable names: postscript (1985 AFM), word6 (1993 quant), docx (2007 ClearType)
+/// Covers biggest spacing deltas: AFM-only, kern-off, modern class kern.
+/// Readable names: postscript (1985 AFM), truetype (1990), docx (2007 ClearType)
 /// Active set used by `main.rs` by default: all eras except InDesignCS (optical kerning).
 /// Leave out InDesignCS for now per Mike — its outline-distance model needs its own pipeline.
 pub const DEFAULT_ERAS: &[Era] = &[
     Era::PostScript, // AFM-only, no GPOS
     Era::TrueType,   // Word 6 kerning-off default
-    Era::Word6,      // Quark / WordPerfect quantization — THE user example
     Era::OpenType,   // GPOS class 64
     Era::Pdf14,      // full GPOS + ToUnicode
     // Era::InDesignCS omitted intentionally — optical kerning simulation deferred
@@ -290,50 +276,6 @@ const SHIPPED_TRUETYPE: &[&str] = &[
     "times",
     "times-roman",
     // Free stand-ins (build locally, no redistribution) – canonicalized to core families
-    "nimbus sans",
-    "nimbus roman",
-    "nimbus mono",
-    "tex gyre",
-    "tex gyre heros",
-    "tex gyre termes",
-    "tex gyre cursor",
-    "latin modern",
-    "computer modern",
-    "liberation sans",
-    "liberation serif",
-    "liberation mono",
-    "arimo",
-    "tinos",
-    "cousine",
-];
-
-/// Word 6.0 (1993) / WordPerfect 5.1 (1989 DOS) era.
-/// Word 6 for Windows shipped NO new TrueType fonts beyond Windows 3.1 core.
-/// TrueType Font Pack (Lucida Sans Typewriter etc) was optional retail, not baseline.
-/// So SHIPPED = same as TrueType strict core + free clones for local build.
-///
-/// THIS IS THE CANONICAL EXAMPLE USER ASKED FOR: Word only had certain fonts regardless of when they were made.
-/// Hardcode from ~/workspace/goals/co-build-unprint-ocr/files/word6-shipped-fonts.md:
-///
-/// WORD6_SHIPPED = ["arial","courier new","times new roman","symbol","wingdings"]
-/// WORD6_FILES = 14 files ARIAL.TTF, COUR.TTF, TIMES.TTF, SYMBOL.TTF, WINGDING.TTF etc 03-10-92
-const SHIPPED_WORD6: &[&str] = &[
-    // Strict core (5 families) — ground truth KB Q89652
-    "arial",
-    "courier new",
-    "times new roman",
-    "symbol",
-    "wingdings",
-    // Raster legacy
-    "ms sans serif",
-    "ms serif",
-    // ATM PS base if present
-    "courier",
-    "helvetica",
-    "times",
-    "times-roman",
-    "symbol",
-    // Free stand-ins via HISTORICAL_CLONE_MAP canonicalization — buildable locally
     "nimbus sans",
     "nimbus roman",
     "nimbus mono",
@@ -731,8 +673,8 @@ fn hash_base_era(base: &FontEntry, era: Era) -> u64 {
 }
 
 /// Full cache path for a given base font and era.
-/// New naming uses readable slugs: e.g. `arial-word6-a1b2c3...ttf` not `arial-word6_1993-...`
-/// Old files with year-suffixed slugs (`ps1985`, `word6_1993`) or path-hashed names are orphaned intentionally;
+/// New naming uses readable slugs: e.g. `arial-postscript-a1b2c3...ttf` not `arial-ps1985-...`
+/// Old files with year-suffixed slugs (`ps1985`) or path-hashed names are orphaned intentionally;
 /// they will be left on disk and ignored after dedup, and can be GC'd separately.
 pub fn vintage_cache_path(base: &FontEntry, era: Era) -> PathBuf {
     let dir = vintage_cache_dir();
@@ -762,21 +704,18 @@ fn cache_valid(cache_path: &Path, base_path: &Path) -> bool {
 ///
 /// Maximum pairs a kern format 0 subtable can hold: the subtable length is a u16,
 /// so 14 + n*6 <= 65535, i.e. n <= 10920. This is a hard format constraint, not a
-/// heuristic. Word6 truncates to this capacity (largest |value| first) when a
-/// GPOS-derived kern source expands past it — GPOS class kern can expand to
-/// ~10^5 glyph pairs (SourceSerif4 Italic: ~124k excl. class 0, ~363k incl.),
-/// far past what format 0 can store.
+/// heuristic. A GPOS-derived kern source can expand past this capacity —
+/// GPOS class kern can expand to ~10^5 glyph pairs (SourceSerif4 Italic:
+/// ~124k excl. class 0, ~363k incl.), far past what format 0 can store.
 const KERN_FORMAT0_MAX_PAIRS: usize = (u16::MAX as usize - 14) / 6;
 
-/// Kern source for eras that need a kern fmt0 table (PostScript, Word6): the font's
+/// Kern source for eras that need a kern fmt0 table (PostScript): the font's
 /// own kern format 0 subtable when present, else pairs derived from GPOS PairPos
 /// XAdvance (`gpos_kern_pairs`). A font with neither source has no kerning to keep,
 /// so the output has no kern table — that is correct, not a fallback.
 ///
 /// - PostScript: strip GPOS, keep kern fmt0 only, limit to the 300 largest-|value| pairs
 /// - TrueType: empty kern + GPOS
-/// - Word6: keep kern fmt0 only, quantize values to multiples of 5, drop zero-valued pairs,
-///   truncate to the format-0 capacity (10920 pairs, largest |value| first) when needed
 /// - OpenType: strip kern, keep GPOS as-is (no concrete class-kerning limit is specified)
 /// - Pdf14/Docx/HarfBuzz/Variable: return original (modern, full GPOS)
 /// - InDesignCS: DEFERRED (optical kerning simulation needs its own pipeline);
@@ -826,7 +765,7 @@ fn transform_font(base_bytes: &[u8], era: Era, _family: &str) -> Result<Vec<u8>,
     let gpos_entry = orig_tables.iter().find(|(t, _)| *t == tag_gpos).map(|(_, d)| d.clone());
     let n_glyphs = num_glyphs(&font_ref);
 
-    // Resolve the kern source for eras that need a kern fmt0 table (PostScript, Word6).
+    // Resolve the kern source for eras that need a kern fmt0 table (PostScript).
     // Preference: the font's own kern format 0 subtable. Fallback: GPOS PairPos XAdvance.
     let kern_src = resolve_kern_source(kern_entry.as_deref(), gpos_entry.as_deref(), n_glyphs);
 
@@ -848,29 +787,6 @@ fn transform_font(base_bytes: &[u8], era: Era, _family: &str) -> Result<Vec<u8>,
         Era::TrueType => {
             // Empty kern and GPOS — Word 6 checkbox off
             (None, true, true, false)
-        }
-        Era::Word6 => {
-            // Quantize kern to 1/200em (multiples of 5), strip GPOS. A GPOS-derived
-            // source can expand past the format-0 capacity (~124k pairs for
-            // SourceSerif4 Italic), so truncate to the capacity (largest |value|
-            // first) — a hard format constraint, not a heuristic limit.
-            match kern_src {
-                KernSource::Pairs(pairs, coverage) => {
-                    let quantized = quantize_pairs(pairs);
-                    if quantized.is_empty() {
-                        // Every value quantized to zero: no kern table.
-                        (None, false, true, false)
-                    } else {
-                        let truncated = truncate_pairs(quantized, KERN_FORMAT0_MAX_PAIRS);
-                        match build_kern_table(&truncated, coverage) {
-                            Some(t) => (Some(t), false, true, false),
-                            None => return Err("kern table too large for format 0".to_string()),
-                        }
-                    }
-                }
-                KernSource::KeepOriginal => (None, false, true, true),
-                KernSource::None => (None, false, true, false),
-            }
         }
         Era::OpenType => {
             // OT 1.0: GPOS class kerning, kern stripped
@@ -898,7 +814,7 @@ fn transform_font(base_bytes: &[u8], era: Era, _family: &str) -> Result<Vec<u8>,
                 out_tables.push((tag, new_data.clone()));
                 continue;
             }
-            // No kern table for this era (no kerning source, or all pairs quantized to zero).
+            // No kern table for this era (no kerning source).
             continue;
         }
         out_tables.push((tag, data));
@@ -961,7 +877,7 @@ enum KernSource {
     None,
 }
 
-/// Resolve the kern source for PostScript/Word6: the font's own kern format 0
+/// Resolve the kern source for PostScript: the font's own kern format 0
 /// subtable first, else pairs derived from GPOS PairPos XAdvance. A font with
 /// neither source has no kerning, so `KernSource::None` is correct — not a fallback.
 fn resolve_kern_source(
@@ -1009,21 +925,6 @@ fn truncate_pairs(mut pairs: Vec<(u16, u16, i16)>, limit: usize) -> Vec<(u16, u1
     pairs.truncate(limit);
     pairs.sort_unstable();
     pairs
-}
-
-/// Quantize kern values to multiples of 5 (Word6 / Quark 1/200em) and drop pairs
-/// whose value quantizes to zero — a zero pair does not change spacing and only
-/// wastes table space.
-fn quantize_pairs(pairs: Vec<(u16, u16, i16)>) -> Vec<(u16, u16, i16)> {
-    pairs
-        .into_iter()
-        .map(|(l, r, v)| {
-            let q = ((v as f32 / 5.0).round() * 5.0) as i32;
-            let clamped = q.clamp(i16::MIN as i32, i16::MAX as i32) as i16;
-            (l, r, clamped)
-        })
-        .filter(|&(_, _, v)| v != 0)
-        .collect()
 }
 
 // ---------------------------------------------------------------------------
@@ -1564,12 +1465,6 @@ fn rebuild_kern_truncate(orig: &[u8], limit: usize) -> Option<Vec<u8>> {
     build_kern_table(&truncated, coverage)
 }
 
-fn rebuild_kern_quantize(orig: &[u8]) -> Option<Vec<u8>> {
-    let (coverage, pairs) = parse_kern_format0(orig)?;
-    let quantized = quantize_pairs(pairs);
-    build_kern_table(&quantized, coverage)
-}
-
 /// Kerning facts about a base font, parsed once per font for the upstream
 /// redundancy check (`era_redundant`). The kern source resolution mirrors
 /// `resolve_kern_source`'s preference (own kern fmt0 first, else
@@ -1580,11 +1475,8 @@ struct BaseKernFacts {
     /// GPOS-derived). None when there is no kern source, or when the kern
     /// table is present but not format 0 (`kern_keep_original`).
     kern_src_pair_count: Option<usize>,
-    /// Whether any resolved kern-source value is not a multiple of 5
-    /// (i.e. Word6 quantization would change it).
-    kern_src_has_non_mult5: bool,
     /// The kern table exists but is not format 0, so the transform keeps
-    /// its bytes as-is (no truncation, no quantization).
+    /// its bytes as-is (no truncation).
     kern_keep_original: bool,
     /// The base font has GPOS kern (at least one non-zero PairPos pair).
     has_gpos_kern: bool,
@@ -1618,23 +1510,20 @@ fn base_kern_facts(base_bytes: &[u8]) -> Option<BaseKernFacts> {
         .and_then(parse_kern_format0);
 
     // Resolved kern source, mirroring resolve_kern_source's preference.
-    let (kern_src_pair_count, kern_src_has_non_mult5, kern_keep_original) =
+    let (kern_src_pair_count, kern_keep_original) =
         if let Some((_, pairs)) = kern_fmt0 {
-            let has_non_mult5 = pairs.iter().any(|(_, _, v)| v % 5 != 0);
-            (Some(pairs.len()), has_non_mult5, false)
+            (Some(pairs.len()), false)
         } else if !gpos_pairs.is_empty() {
-            let has_non_mult5 = gpos_pairs.iter().any(|(_, _, v)| v % 5 != 0);
-            (Some(gpos_pairs.len()), has_non_mult5, false)
+            (Some(gpos_pairs.len()), false)
         } else if kern_entry.is_some() {
             // Kern table exists but is not format 0; the transform keeps it as-is.
-            (None, false, true)
+            (None, true)
         } else {
-            (None, false, false)
+            (None, false)
         };
 
     Some(BaseKernFacts {
         kern_src_pair_count,
-        kern_src_has_non_mult5,
         kern_keep_original,
         has_gpos_kern,
     })
@@ -1664,9 +1553,6 @@ fn base_kern_facts(base_bytes: &[u8]) -> Option<BaseKernFacts> {
 ///   or the font has GPOS kern. With <=300 pairs and no GPOS kern, the
 ///   truncation and the GPOS strip are both no-ops, so the result is the
 ///   catalog kern variant.
-/// - Word6: redundant unless some kern value is not a multiple of 5, or
-///   the font has GPOS kern, or the pair count exceeds 10920. Otherwise
-///   quantization, the GPOS strip, and the truncation are all no-ops.
 fn era_redundant(era: Era, facts: &BaseKernFacts) -> bool {
     match era {
         Era::TrueType | Era::OpenType => true,
@@ -1686,25 +1572,6 @@ fn era_redundant(era: Era, facts: &BaseKernFacts) -> bool {
                 // no-op (no GPOS kern), so the result is the catalog kern
                 // variant. No kern source at all: no kerning, i.e. nokern.
                 Some(n) => n <= 300,
-                None => true,
-            }
-        }
-        Era::Word6 => {
-            // GPOS kern present: stripping GPOS changes the font.
-            if facts.has_gpos_kern {
-                return false;
-            }
-            // Non-fmt0 kern kept as-is and no GPOS to strip: the result is
-            // the base font itself, i.e. the catalog kern variant.
-            if facts.kern_keep_original {
-                return true;
-            }
-            match facts.kern_src_pair_count {
-                // All values already multiples of 5 and the pair count fits
-                // the format-0 capacity: quantization, the GPOS strip, and
-                // the truncation are all no-ops. No kern source at all: no
-                // kerning, i.e. nokern.
-                Some(n) => !facts.kern_src_has_non_mult5 && n <= KERN_FORMAT0_MAX_PAIRS,
                 None => true,
             }
         }
@@ -1893,7 +1760,7 @@ pub fn scan_vintage_uncached() -> Vec<FontEntry> {
         if let Some(era_str) = detected {
             fe.vintage_era = Some(era_str.to_string());
             // scan_fonts_uncached used file stem to derive family_name, which for
-            // "liberationsans-word6-abc.ttf" would become "liberationsans word6 abc" – wrong.
+            // "liberationsans-postscript-abc.ttf" would become "liberationsans postscript abc" – wrong.
             // Since we copied base bytes, the font's internal typographic_family / postscript_name
             // are still the base's. Use typographic_family as authoritative family when available.
             if !fe.typographic_family.is_empty() {
@@ -1953,6 +1820,7 @@ mod tests {
             opsz_range: None,
             has_gpos: false,
             has_kern: false,
+            font_version: "1.00".to_string(),
         };
         let p1 = vintage_cache_path(&fe, Era::PostScript);
         let p2 = vintage_cache_path(&fe, Era::PostScript);
@@ -1964,7 +1832,6 @@ mod tests {
 
     #[test]
     fn test_names_readable() {
-        assert_eq!(Era::Word6.name(), "word6");
         assert_eq!(Era::PostScript.name(), "postscript");
         assert_eq!(Era::TrueType.name(), "truetype");
         assert_eq!(Era::OpenType.name(), "opentype");
@@ -1974,16 +1841,15 @@ mod tests {
         assert_eq!(Era::HarfBuzz.name(), "harfbuzz");
         assert_eq!(Era::Variable.name(), "variable");
         // years still accessible for gating
-        assert_eq!(Era::Word6.start_year(), 1993);
         assert_eq!(Era::PostScript.start_year(), 1985);
         assert_eq!(Era::Docx.start_year(), 2007);
     }
 
     #[test]
     fn test_shipping_respects_readable_names() {
-        // Word6 should contain arial etc, NOT calibri
-        assert!(was_shipped_with("Arial", Era::Word6));
-        assert!(!was_shipped_with("Calibri", Era::Word6));
+        // TrueType should contain arial etc, NOT calibri
+        assert!(was_shipped_with("Arial", Era::TrueType));
+        assert!(!was_shipped_with("Calibri", Era::TrueType));
         assert!(was_shipped_with("Calibri", Era::Docx));
         assert!(!was_shipped_with("Comic Sans MS", Era::PostScript));
         assert!(was_shipped_with("Comic Sans MS", Era::OpenType));
@@ -2007,23 +1873,6 @@ mod tests {
         let truncated = rebuild_kern_truncate(&orig, 300).expect("truncate");
         let parsed = parse_kern_format0(&truncated).unwrap();
         assert_eq!(parsed.1.len(), 300);
-    }
-
-    #[test]
-    fn test_kern_quantize() {
-        let pairs = vec![(1, 2, 7), (3, 4, -7), (5, 6, 12), (7, 8, -12)];
-        let orig = build_kern_table(&pairs, 1).expect("build kern table");
-        let q = rebuild_kern_quantize(&orig).unwrap();
-        let parsed = parse_kern_format0(&q).unwrap();
-        assert_eq!(parsed.1[0].2 % 5, 0);
-        assert_eq!(parsed.1[1].2 % 5, 0);
-        assert_eq!(parsed.1[2].2 % 5, 0);
-        assert_eq!(parsed.1[3].2 % 5, 0);
-        // 7 -> 5, -7 -> -5, 12 -> 10, -12 -> -10
-        assert_eq!(parsed.1[0].2, 5);
-        assert_eq!(parsed.1[1].2, -5);
-        assert_eq!(parsed.1[2].2, 10);
-        assert_eq!(parsed.1[3].2, -10);
     }
 
     /// Path of a GPOS-only font (no `kern` table) for the GPOS-derived kern tests.
@@ -2105,33 +1954,6 @@ mod tests {
     }
 
     #[test]
-    fn test_word6_gpos_derived_kern_quantized() {
-        // A GPOS-only font must still get a kern fmt0 table under Word6,
-        // derived from GPOS, values quantized to multiples of 5, GPOS stripped.
-        let Some(base) = gpos_only_font_bytes() else {
-            return; // skip test in CI without a GPOS-only font
-        };
-        let out = transform_font(&base, Era::Word6, "TestFamily").expect("transform");
-        let out_ref = read_fonts::FontRef::new(&out).expect("output parses");
-        assert!(
-            out_ref
-                .table_data(read_fonts::types::Tag::new(b"GPOS"))
-                .is_none(),
-            "GPOS must be stripped for Word6"
-        );
-        let kern_data = out_ref
-            .table_data(read_fonts::types::Tag::new(b"kern"))
-            .expect("Word6 output must have a kern table derived from GPOS");
-        let (_coverage, pairs) =
-            parse_kern_format0(kern_data.as_ref()).expect("kern must be format 0");
-        assert!(!pairs.is_empty(), "kern table must not be empty");
-        assert!(
-            pairs.iter().all(|&(_, _, v)| v % 5 == 0),
-            "all Word6 kern values must be multiples of 5"
-        );
-    }
-
-    #[test]
     fn test_transform_valid_ttf() {
         // Use a real system font if available, otherwise skip gracefully
         let candidates = [
@@ -2153,7 +1975,7 @@ mod tests {
         // Validate base parses
         assert!(read_fonts::FontRef::new(&base).is_ok());
 
-        for era in [Era::PostScript, Era::TrueType, Era::Word6, Era::OpenType, Era::Pdf14, Era::Docx, Era::HarfBuzz, Era::Variable] {
+        for era in [Era::PostScript, Era::TrueType, Era::OpenType, Era::Pdf14, Era::Docx, Era::HarfBuzz, Era::Variable] {
             let out = transform_font(&base, era, "TestFamily").expect("transform should not error");
             assert!(read_fonts::FontRef::new(&out).is_ok(), "era {:?} output should parse", era);
             // Check GPOS stripping for eras that should strip
@@ -2162,7 +1984,7 @@ mod tests {
             let has_gpos_orig = orig_ref.table_data(read_fonts::types::Tag::new(b"GPOS")).is_some();
             let has_gpos_out = out_ref.table_data(read_fonts::types::Tag::new(b"GPOS")).is_some();
             match era {
-                Era::PostScript | Era::TrueType | Era::Word6 => {
+                Era::PostScript | Era::TrueType => {
                     // GPOS must be stripped
                     assert!(!has_gpos_out, "GPOS should be stripped for {:?}", era);
                     match era {
@@ -2175,19 +1997,6 @@ mod tests {
                                 .expect("kern must be format 0");
                             assert!(!pairs.is_empty(), "kern table must not be empty");
                             assert!(pairs.len() <= 300, "kern limited to 300 pairs");
-                        }
-                        Era::Word6 => {
-                            // Kern kept, quantized to multiples of 5.
-                            let kern_data = out_ref
-                                .table_data(read_fonts::types::Tag::new(b"kern"))
-                                .expect("Word6 output must have a kern table");
-                            let (_, pairs) = parse_kern_format0(kern_data.as_ref())
-                                .expect("kern must be format 0");
-                            assert!(!pairs.is_empty(), "kern table must not be empty");
-                            assert!(
-                                pairs.iter().all(|&(_, _, v)| v % 5 == 0),
-                                "all Word6 kern values must be multiples of 5"
-                            );
                         }
                         Era::TrueType => {
                             // Kern stripped (covered again below; kept for clarity).
