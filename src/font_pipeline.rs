@@ -56,6 +56,25 @@ pub struct ObsRankProbs {
     pub gt_geo_v_ll: HashMap<usize, f32>,
     pub gt_geo_h_err: HashMap<usize, f32>,
     pub gt_geo_v_err: HashMap<usize, f32>,
+    // Crop indices whose h_ll got the graded overlap downweight
+    // (unreliable pitch), mapped to the likely overlap error (px)
+    // subtracted from |h_err|.
+    pub chosen_geo_h_overlap_correction: HashMap<usize, f32>,
+    pub gt_geo_h_overlap_correction: HashMap<usize, f32>,
+    // Absolute midpoint/pitch data per observation (Finding 10) – recorded
+    // in the audit so per-line geometry can be re-derived from audit.json.
+    pub chosen_obs_cx: HashMap<usize, f32>,
+    pub chosen_pred_cx: HashMap<usize, f32>,
+    pub chosen_obs_pitch: HashMap<usize, f32>,
+    pub chosen_pred_pitch: HashMap<usize, f32>,
+    pub chosen_geo_scale: HashMap<usize, f32>,
+    pub chosen_ink_width: HashMap<usize, f32>,
+    pub gt_obs_cx: HashMap<usize, f32>,
+    pub gt_pred_cx: HashMap<usize, f32>,
+    pub gt_obs_pitch: HashMap<usize, f32>,
+    pub gt_pred_pitch: HashMap<usize, f32>,
+    pub gt_geo_scale: HashMap<usize, f32>,
+    pub gt_ink_width: HashMap<usize, f32>,
 }
 
 /// Build per-observation rank/prob/glyph/geo maps for one path's observations
@@ -80,6 +99,13 @@ fn build_obs_rank_probs(
         if let Some(v) = obs.geo_v_ll { rp.chosen_geo_v_ll.insert(obs.crop_index, v); }
         if let Some(he) = obs.geo_h_err { rp.chosen_geo_h_err.insert(obs.crop_index, he); }
         if let Some(ve) = obs.geo_v_err { rp.chosen_geo_v_err.insert(obs.crop_index, ve); }
+        if let Some(u) = obs.geo_h_overlap_correction_px { rp.chosen_geo_h_overlap_correction.insert(obs.crop_index, u); }
+        if let Some(v) = obs.obs_cx { rp.chosen_obs_cx.insert(obs.crop_index, v); }
+        if let Some(v) = obs.pred_cx { rp.chosen_pred_cx.insert(obs.crop_index, v); }
+        if let Some(v) = obs.obs_pitch { rp.chosen_obs_pitch.insert(obs.crop_index, v); }
+        if let Some(v) = obs.pred_pitch { rp.chosen_pred_pitch.insert(obs.crop_index, v); }
+        if let Some(v) = obs.geo_scale { rp.chosen_geo_scale.insert(obs.crop_index, v); }
+        if let Some(v) = obs.ink_width { rp.chosen_ink_width.insert(obs.crop_index, v); }
     }
     // GT side – from scoring.gt_observations (ensure font)
     // When window counts differ (ligature difference, e.g. Office 4 vs 5 glyphs),
@@ -96,6 +122,13 @@ fn build_obs_rank_probs(
             if let Some(v) = obs.geo_v_ll { rp.gt_geo_v_ll.insert(obs.crop_index, v); }
             if let Some(he) = obs.geo_h_err { rp.gt_geo_h_err.insert(obs.crop_index, he); }
             if let Some(ve) = obs.geo_v_err { rp.gt_geo_v_err.insert(obs.crop_index, ve); }
+            if let Some(u) = obs.geo_h_overlap_correction_px { rp.gt_geo_h_overlap_correction.insert(obs.crop_index, u); }
+            if let Some(v) = obs.obs_cx { rp.gt_obs_cx.insert(obs.crop_index, v); }
+            if let Some(v) = obs.pred_cx { rp.gt_pred_cx.insert(obs.crop_index, v); }
+            if let Some(v) = obs.obs_pitch { rp.gt_obs_pitch.insert(obs.crop_index, v); }
+            if let Some(v) = obs.pred_pitch { rp.gt_pred_pitch.insert(obs.crop_index, v); }
+            if let Some(v) = obs.geo_scale { rp.gt_geo_scale.insert(obs.crop_index, v); }
+            if let Some(v) = obs.ink_width { rp.gt_ink_width.insert(obs.crop_index, v); }
         }
     } else {
         // Differing k – align by glyph identity, not ordinal.
@@ -117,6 +150,13 @@ fn build_obs_rank_probs(
                 if let Some(v) = go.geo_v_ll { rp.gt_geo_v_ll.insert(wo.crop_index, v); }
                 if let Some(he) = go.geo_h_err { rp.gt_geo_h_err.insert(wo.crop_index, he); }
                 if let Some(ve) = go.geo_v_err { rp.gt_geo_v_err.insert(wo.crop_index, ve); }
+                if let Some(u) = go.geo_h_overlap_correction_px { rp.gt_geo_h_overlap_correction.insert(wo.crop_index, u); }
+                if let Some(v) = go.obs_cx { rp.gt_obs_cx.insert(wo.crop_index, v); }
+                if let Some(v) = go.pred_cx { rp.gt_pred_cx.insert(wo.crop_index, v); }
+                if let Some(v) = go.obs_pitch { rp.gt_obs_pitch.insert(wo.crop_index, v); }
+                if let Some(v) = go.pred_pitch { rp.gt_pred_pitch.insert(wo.crop_index, v); }
+                if let Some(v) = go.geo_scale { rp.gt_geo_scale.insert(wo.crop_index, v); }
+                if let Some(v) = go.ink_width { rp.gt_ink_width.insert(wo.crop_index, v); }
                 gi += 1;
             } else {
                 // Look ahead for same char – skip GT extras (e.g. f, fi before c).
@@ -137,6 +177,13 @@ fn build_obs_rank_probs(
                     if let Some(v) = go.geo_v_ll { rp.gt_geo_v_ll.insert(wo.crop_index, v); }
                     if let Some(he) = go.geo_h_err { rp.gt_geo_h_err.insert(wo.crop_index, he); }
                     if let Some(ve) = go.geo_v_err { rp.gt_geo_v_err.insert(wo.crop_index, ve); }
+                    if let Some(u) = go.geo_h_overlap_correction_px { rp.gt_geo_h_overlap_correction.insert(wo.crop_index, u); }
+                    if let Some(v) = go.obs_cx { rp.gt_obs_cx.insert(wo.crop_index, v); }
+                    if let Some(v) = go.pred_cx { rp.gt_pred_cx.insert(wo.crop_index, v); }
+                    if let Some(v) = go.obs_pitch { rp.gt_obs_pitch.insert(wo.crop_index, v); }
+                    if let Some(v) = go.pred_pitch { rp.gt_pred_pitch.insert(wo.crop_index, v); }
+                    if let Some(v) = go.geo_scale { rp.gt_geo_scale.insert(wo.crop_index, v); }
+                    if let Some(v) = go.ink_width { rp.gt_ink_width.insert(wo.crop_index, v); }
                     gi = fidx + 1;
                 } else {
                     // No GT counterpart (e.g. winner ffi not supported by GT Caladea) – leave —.
@@ -454,7 +501,7 @@ pub fn match_lines(
                 p
             });
         // Segment line (lazy crop data) (before font matching block so they're available after)
-        let _word_placements: Vec<crate::verify::WordPlacement> = line.words.iter()
+        let word_placements: Vec<crate::verify::WordPlacement> = line.words.iter()
             .map(|w| crate::verify::WordPlacement {
                 text: w.text.clone(),
                 x_off: w.x,
@@ -463,8 +510,23 @@ pub fn match_lines(
                 height: w.height,
             })
             .collect();
-        // Per-font pipeline: segmentation now happens inside identify_fonts,
-        // so we don't pre-segment here with segment_line.
+        // Diagnostic-only segmentation: write the seam diagnostics
+        // (word_crop.png, seg_plain/summary.json, seg_lig/...) for this
+        // line. Scoring uses identify_fonts' own per-font segmentation;
+        // this pass exists solely so the lob audit carries the seam data
+        // the seam viz reads. Restores the pre-a92d0bb behaviour:
+        // segment_line was the only caller that wrote these files, and
+        // a92d0bb (2026-08-11) removed the call, orphaning the writes.
+        // Gated on diag_seg_dir so non-audit runs pay nothing.
+        if diag_seg_dir.is_some() {
+            let word_height = line.words.iter().map(|w| w.height).max().unwrap_or(0);
+            let _diag_crops = crate::segment::segment_line(
+                gray_page, &word_placements, word_height,
+                diag_seg_dir.as_deref(),
+                &args.render_params(),
+            );
+        }
+        // Per-font pipeline: segmentation now happens inside identify_fonts.
         // ── Per-font ligature handling: build word image infos for inside identify_fonts ──
         use std::sync::Arc;
         // Build filtered word infos (replicates segment_line filtering but without segmentation)
@@ -500,9 +562,15 @@ pub fn match_lines(
         };
 
         // Helper to build per-font WordSegs + wib for any font entry (used for tie and winner recompute)
-        let build_for_font = |fe: &crate::font_scan::FontEntry, infos: &[font_match::WordImgInfo]| -> Option<(Vec<crate::segment::WordSeg>, Vec<crate::geometry_classifier::WordGeoMeasurement>, Vec<image::GrayImage>, Vec<(usize,usize)>)> {
-            // collapsed_lig_set() returns 0 for nolig variants (cached by fontkey).
-            let allowed = fe.collapsed_lig_set();
+        let build_for_font = |fe: &crate::font_scan::FontEntry, infos: &[font_match::WordImgInfo], gt_segmentation: bool| -> Option<(Vec<crate::segment::WordSeg>, Vec<crate::geometry_classifier::WordGeoMeasurement>, Vec<image::GrayImage>, Vec<(usize,usize)>)> {
+            // GT segmentation uses the GT ligature mask (Finding 9):
+            // collapse a pair when the render would produce fused ink —
+            // either the variant is lig, or the separate glyphs overlap so
+            // even a nolig render fuses the ink. A nolig GT font whose
+            // separate glyphs do not overlap renders separate ink and must
+            // not be collapsed. Candidate/winner segs keep
+            // collapsed_lig_set().
+            let allowed = if gt_segmentation { fe.gt_ligature_mask() } else { fe.collapsed_lig_set() };
             let mut segs: Vec<crate::segment::WordSeg> = Vec::with_capacity(infos.len());
             for wi in infos {
                 let collapsed = crate::segment::collapse_ligature_chars_for_allowed(&wi.orig_chars, allowed);
@@ -621,7 +689,7 @@ pub fn match_lines(
                             let _ = std::fs::create_dir_all(&p);
                             p
                         });
-                        let (segs, wib, _crops, _pmap) = match build_for_font(fe, &word_infos) {
+                        let (segs, wib, _crops, _pmap) = match build_for_font(fe, &word_infos, false) {
                             Some(v) => v,
                             None => continue,
                         };
@@ -707,7 +775,7 @@ pub fn match_lines(
                     let font_key = &tied[0];
                     let fe_opt = font_registry.by_key(font_key);
                     if let Some(fe) = fe_opt {
-                        if let Some((segs, wib, crops, pmap)) = build_for_font(fe, &word_infos) {
+                        if let Some((segs, wib, crops, pmap)) = build_for_font(fe, &word_infos, false) {
                             winning_segs = segs;
                             winning_wib = wib;
                             winning_crops_vec = crops;
@@ -1039,7 +1107,7 @@ pub fn match_lines(
         // for ligature fonts (e.g. Office k=4 vs k=5).  No extra compute beyond build_for_font.
         let (gt_segs_opt, gt_wib_opt, gt_crops_opt) = if let Some(ref gfk) = gt_font_key {
             if let Some(gt_fe) = font_registry.by_key(gfk) {
-                if let Some((s, w, c, _pm)) = build_for_font(gt_fe, &word_infos) {
+                if let Some((s, w, c, _pm)) = build_for_font(gt_fe, &word_infos, true) {
                     (Some(s), Some(w), Some(c))
                 } else { (None, None, None) }
             } else { (None, None, None) }
@@ -1083,6 +1151,13 @@ pub fn match_lines(
                             geo_v_ll: None,
                             geo_h_err: None,
                             geo_v_err: None,
+                            geo_h_overlap_correction_px: None,
+                            obs_cx: None,
+                            pred_cx: None,
+                            obs_pitch: None,
+                            pred_pitch: None,
+                            geo_scale: None,
+                            ink_width: None,
                         });
                         idx += 1;
                     }

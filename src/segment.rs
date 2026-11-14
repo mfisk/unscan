@@ -409,6 +409,19 @@ fn segment_characters_inner(
             }).sum()
         };
 
+        // Word-level max ink (p95 of raw darkness): reused ink_values from darkness scan above.
+        // select_nth avoids full sort O(n log n). Computed before trace_candidate_costs
+        // so the closure can capture it for SeamCost.max_ink.
+        let max_ink = if ink_values.is_empty() {
+            255.0
+        } else {
+            let p95_idx = (ink_values.len() as f64 * 0.95) as usize;
+            let p95_idx = p95_idx.min(ink_values.len() - 1);
+            // select_nth_unstable_by is O(n) vs sort O(n log n) – ~22k pixels per word
+            ink_values.select_nth_unstable_by(p95_idx, |a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
+            ink_values[p95_idx].max(1.0) // avoid division by zero
+        };
+
         // Factor: trace all candidate seam paths and record their costs.
         // Energy is now flat &[f32]; trace_path_through ignores it but keep param for compat.
         // Perf: sort cands in-place to avoid to_vec() clone (cands is small Vec, but called many times).
@@ -428,6 +441,12 @@ fn segment_characters_inner(
                 let sp = seg_pen(seg_start, seg_end, (p_min + p_max) / 2, cost);
                 let hm = path.windows(2).filter(|w| w[0][0] == w[1][0]).count() as f32;
                 let id = ink_disc(&path);
+                // Max ink darkness along the path (flat darkness array, idx = r*w + c).
+                let max_dark = path.iter().map(|p| {
+                    let r = p[0] as usize;
+                    let c = p[1] as usize;
+                    darkness[r * w_us + c]
+                }).fold(0.0f32, f32::max);
                 paths.push((col, SeamCost {
                     dp_cost: cost - pw - hm * h_cost,
                     seam_width_penalty: pw,
@@ -435,20 +454,10 @@ fn segment_characters_inner(
                     horizontal_cost: hm * h_cost,
                     ink_discount: id,
                     total: cost + sp,
+                    max_darkness: max_dark,
+                    max_ink,
                 }, path));
             }
-        };
-
-        // Word-level max ink (p95 of raw darkness): reused ink_values from darkness scan above.
-        // select_nth avoids full sort O(n log n).
-        let max_ink = if ink_values.is_empty() {
-            255.0
-        } else {
-            let p95_idx = (ink_values.len() as f64 * 0.95) as usize;
-            let p95_idx = p95_idx.min(ink_values.len() - 1);
-            // select_nth_unstable_by is O(n) vs sort O(n log n) – ~22k pixels per word
-            ink_values.select_nth_unstable_by(p95_idx, |a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
-            ink_values[p95_idx].max(1.0) // avoid division by zero
         };
 
         // Min-heap entry: (cost, split_col, seg_start, seg_end).
@@ -507,12 +516,16 @@ fn segment_characters_inner(
         for &(seg_start, seg_end) in &initial_segs {
             if seg_end > seg_start + 2 {
                 let sid = next_seg_id; next_seg_id += 1;
-                let (mut cands, dp) = candidate_seams(&energy, w_us, seg_start, seg_end, h, None, None, max_ink, &row_ink);
+                let (mut cands, mut diag_cands, dp) = candidate_seams(&energy, w_us, seg_start, seg_end, h, None, None, max_ink, &row_ink);
                 for (col, cost) in &cands {
                     heap.push(SeamEntry { cost: *cost + segment_penalty(seg_start, seg_end, *col, *cost), col: *col, seg_start, seg_end, seg_id: sid });
                 }
                 if audit_mode {
                     trace_candidate_costs(&mut cands, &dp, seg_start, seg_end, &energy, &row_ink,
+                        &segment_penalty, &ink_discount_for_path, seam_params().horizontal_cost, &mut candidate_paths);
+                    // Trace the tied-run alternatives too, so the audit
+                    // records the columns the DP rated equally good.
+                    trace_candidate_costs(&mut diag_cands, &dp, seg_start, seg_end, &energy, &row_ink,
                         &segment_penalty, &ink_discount_for_path, seam_params().horizontal_cost, &mut candidate_paths);
                 }
                 seg_bounds.insert(sid, SegBounds { left_path: None, right_path: None });
@@ -556,7 +569,7 @@ fn segment_characters_inner(
                         let parent_bounds = seg_bounds.get(&entry.seg_id);
                         let lp = parent_bounds.and_then(|b| b.left_path.clone());
                         let rp = parent_bounds.and_then(|b| b.right_path.clone());
-                        let (cands, dp) = candidate_seams(&energy, w_us, entry.seg_start, new_end, h, lp.as_ref().map(|a| a.as_slice()), rp.as_ref().map(|a| a.as_slice()), max_ink, &row_ink);
+                        let (cands, _diag_cands, dp) = candidate_seams(&energy, w_us, entry.seg_start, new_end, h, lp.as_ref().map(|a| a.as_slice()), rp.as_ref().map(|a| a.as_slice()), max_ink, &row_ink);
                         for (col, cost) in &cands {
                             heap.push(SeamEntry { cost: *cost + segment_penalty(entry.seg_start, new_end, *col, *cost), col: *col, seg_start: entry.seg_start, seg_end: new_end, seg_id: sid });
                         }
@@ -575,7 +588,7 @@ fn segment_characters_inner(
                         let parent_bounds = seg_bounds.get(&entry.seg_id);
                         let lp = parent_bounds.and_then(|b| b.left_path.clone());
                         let rp = parent_bounds.and_then(|b| b.right_path.clone());
-                        let (cands, dp) = candidate_seams(&energy, w_us, new_start, entry.seg_end, h, lp.as_ref().map(|a| a.as_slice()), rp.as_ref().map(|a| a.as_slice()), max_ink, &row_ink);
+                        let (cands, _diag_cands, dp) = candidate_seams(&energy, w_us, new_start, entry.seg_end, h, lp.as_ref().map(|a| a.as_slice()), rp.as_ref().map(|a| a.as_slice()), max_ink, &row_ink);
                         for (col, cost) in &cands {
                             heap.push(SeamEntry { cost: *cost + segment_penalty(new_start, entry.seg_end, *col, *cost), col: *col, seg_start: new_start, seg_end: entry.seg_end, seg_id: sid });
                         }
@@ -653,10 +666,14 @@ fn segment_characters_inner(
             // Perf: compute min/max/h_moves/id from &path directly, single pass, no iterator clone or map lookup
             let mut path_min_col = u32::MAX;
             let mut path_max_col = 0u32;
+            let mut max_dark = 0.0f32;
             for p in &path {
                 let c = p[1];
                 if c < path_min_col { path_min_col = c; }
                 if c > path_max_col { path_max_col = c; }
+                // Max ink darkness along the path (flat darkness array, idx = r*w + c).
+                let d = darkness[p[0] as usize * w_us + p[1] as usize];
+                if d > max_dark { max_dark = d; }
             }
             if path_min_col == u32::MAX {
                 path_min_col = final_col;
@@ -675,6 +692,8 @@ fn segment_characters_inner(
                 horizontal_cost: h_moves * seam_params().horizontal_cost,
                 ink_discount: id,
                 total: entry.cost,
+                max_darkness: max_dark,
+                max_ink,
             });
 
             // Capture parent's diagonal bounds and DP before removing (Arc clone = cheap).
@@ -716,7 +735,7 @@ fn segment_characters_inner(
                     let sid = next_seg_id; next_seg_id += 1;
                     let lp = parent_lp.clone();
                     let rp: Option<std::sync::Arc<Vec<[u32; 2]>>> = Some(std::sync::Arc::clone(&arc_path));
-                    let (mut cands, dp) = if let Some(ref pdp) = parent_dp_cloned {
+                    let (mut cands, mut diag_cands, dp) = if let Some(ref pdp) = parent_dp_cloned {
                         candidate_seams_child(pdp, pdp.seg_start, &energy, w_us, child_left_start, child_left_end, h, lp.as_ref().map(|a| a.as_slice()), rp.as_ref().map(|a| a.as_slice()), max_ink, &row_ink)
                     } else {
                         candidate_seams(&energy, w_us, child_left_start, child_left_end, h, lp.as_ref().map(|a| a.as_slice()), rp.as_ref().map(|a| a.as_slice()), max_ink, &row_ink)
@@ -726,6 +745,8 @@ fn segment_characters_inner(
                     }
                     if audit_mode {
                         trace_candidate_costs(&mut cands, &dp, child_left_start, child_left_end, &energy, &row_ink,
+                            &segment_penalty, &ink_discount_for_path, seam_params().horizontal_cost, &mut candidate_paths);
+                        trace_candidate_costs(&mut diag_cands, &dp, child_left_start, child_left_end, &energy, &row_ink,
                             &segment_penalty, &ink_discount_for_path, seam_params().horizontal_cost, &mut candidate_paths);
                     }
                     seg_bounds.insert(sid, SegBounds { left_path: lp, right_path: rp });
@@ -739,7 +760,7 @@ fn segment_characters_inner(
                     let sid = next_seg_id; next_seg_id += 1;
                     let lp: Option<std::sync::Arc<Vec<[u32; 2]>>> = Some(std::sync::Arc::clone(&arc_path));
                     let rp = parent_rp.clone();
-                    let (mut cands, dp) = if let Some(ref pdp) = parent_dp_cloned {
+                    let (mut cands, mut diag_cands, dp) = if let Some(ref pdp) = parent_dp_cloned {
                         candidate_seams_child(pdp, pdp.seg_start, &energy, w_us, child_right_start, child_right_end, h, lp.as_ref().map(|a| a.as_slice()), rp.as_ref().map(|a| a.as_slice()), max_ink, &row_ink)
                     } else {
                         candidate_seams(&energy, w_us, child_right_start, child_right_end, h, lp.as_ref().map(|a| a.as_slice()), rp.as_ref().map(|a| a.as_slice()), max_ink, &row_ink)
@@ -749,6 +770,8 @@ fn segment_characters_inner(
                     }
                     if audit_mode {
                         trace_candidate_costs(&mut cands, &dp, child_right_start, child_right_end, &energy, &row_ink,
+                            &segment_penalty, &ink_discount_for_path, seam_params().horizontal_cost, &mut candidate_paths);
+                        trace_candidate_costs(&mut diag_cands, &dp, child_right_start, child_right_end, &energy, &row_ink,
                             &segment_penalty, &ink_discount_for_path, seam_params().horizontal_cost, &mut candidate_paths);
                     }
                     seg_bounds.insert(sid, SegBounds { left_path: lp, right_path: rp });
@@ -805,12 +828,34 @@ fn segment_characters_inner(
     bounds.push(w);
     bounds.dedup();
 
-    // Diag: dump final overlay
-    if let (Some(ddir), Some(_wtext)) = (diag_dir, word_text) {
+    // Diag: dump final overlay + seam summary JSON (the viz reads this).
+    if let (Some(ddir), Some(wtext)) = (diag_dir, word_text) {
         crate::seg_diag::save_split_overlay_with_paths(img, &vp_splits, &seam_splits, &[], &seam_paths, &ddir.join("final_overlay.png"));
 
         // NOTE: char crops are saved by extract_chars_from_boundaries
         // (the actual CI code path), not here — so diag shows exact CI inputs.
+
+        // Seam summary for the viz: the recorded seam paths and costs,
+        // including tied-run candidates the DP rated equally good but did
+        // not choose (e.g. col 25 tied with chosen col 24). Written from
+        // the segmenter's own traced paths and costs — no reconstruction.
+        // The viz reads seam_paths/seam_costs from here for columns that
+        // are not in the audit's (identify_fonts) seam_paths.
+        let n_segs_sum = bounds.len().saturating_sub(1);
+        let summary = serde_json::json!({
+            "word_text": wtext,
+            "image_w": w,
+            "image_h": h,
+            "n_chars_expected": n_chars,
+            "n_segments_produced": n_segs_sum,
+            "ws_splits": &vp_splits,
+            "seam_splits": &seam_splits,
+            "final_boundaries": &bounds,
+            "seam_paths": &seam_paths,
+            "seam_costs": &seam_costs,
+            "mismatch": n_segs_sum != n_chars,
+        });
+        let _ = std::fs::write(ddir.join("summary.json"), serde_json::to_string_pretty(&summary).unwrap_or_default());
     }
 
     let n_segs = bounds.len().saturating_sub(1) as u32;
@@ -930,6 +975,14 @@ impl SeamDp {
 }
 
 #[allow(unused_assignments)]
+/// Returns (candidates, diag_candidates, dp).
+/// `candidates` are the local-minimum representatives that go on the
+/// greedy heap. `diag_candidates` are the non-representative members of
+/// a tied local-minimum run — columns the DP rated exactly as good as
+/// the representative, but that the local-minimum rule collapses to one
+/// column for the heap. They never go on the heap (so split decisions
+/// are unchanged); they are traced in audit mode so the audit records
+/// the tied alternatives (e.g. col 25 tied with chosen col 24).
 fn candidate_seams(
     energy: &[f32],
     img_w: usize, // word image width, for flat indexing r*img_w + col
@@ -940,11 +993,11 @@ fn candidate_seams(
     right_path: Option<&[[u32; 2]]>,  // pixels with col >= right bound are masked
     max_ink: f32,                     // p95 ink darkness — scales entry penalty
     row_ink: &[f32],                  // per-row ink fractions for scoring
-) -> (Vec<(u32, f32)>, SeamDp) {
+) -> (Vec<(u32, f32)>, Vec<(u32, f32)>, SeamDp) {
     let seg_w = (seg_end - seg_start) as usize;
     if seg_w < 3 || h < 1 {
         let dp = SeamDp { pred_fwd: Vec::new(), pred_rev: Vec::new(), cost_fwd: Vec::new(), cost_rev: Vec::new(), seg_start, seg_w: 0, h };
-        return (Vec::new(), dp);
+        return (Vec::new(), Vec::new(), dp);
     }
     let base = seg_start as usize;
     let mid_r = (h / 2) as usize;
@@ -1273,6 +1326,13 @@ fn candidate_seams(
     // infinite cost, so an edge candidate is a local minimum if the first
     // interior neighbor is higher.
     let mut candidates: Vec<(u32, f32)> = Vec::new();
+    // Diagnostic candidates: the non-representative members of a tied
+    // local-minimum run. The DP rates these columns exactly as good as
+    // the representative, but the local-minimum rule keeps only one for
+    // the heap. Record them so the audit can show the tied alternatives
+    // (e.g. col 25 tied with chosen col 24) instead of discarding them.
+    // They never go on the heap, so the greedy split decisions are unchanged.
+    let mut diag_candidates: Vec<(u32, f32)> = Vec::new();
     let n = dp_candidates.len();
     if n > 0 {
         let mut i = 0;
@@ -1292,6 +1352,11 @@ fn candidate_seams(
             if left_higher && right_higher {
                 let mid_idx = (run_start + i - 1) / 2;
                 candidates.push(dp_candidates[mid_idx]);
+                for j in run_start..i {
+                    if j != mid_idx {
+                        diag_candidates.push(dp_candidates[j]);
+                    }
+                }
             }
         }
     }
@@ -1321,7 +1386,7 @@ fn candidate_seams(
     });
 
     let dp = SeamDp { pred_fwd, pred_rev, cost_fwd, cost_rev, seg_start, seg_w, h };
-    (candidates, dp)
+    (candidates, diag_candidates, dp)
 }
 
 /// Incremental DP child reuse: given parent SeamDp (with costs), trim-copy to child
@@ -1341,12 +1406,12 @@ fn candidate_seams_child(
     right_path: Option<&[[u32; 2]]>,
     max_ink: f32,
     row_ink: &[f32],
-) -> (Vec<(u32, f32)>, SeamDp) {
+) -> (Vec<(u32, f32)>, Vec<(u32, f32)>, SeamDp) {
     let seg_w = (child_end - child_start) as usize;
     let h_us = h as usize;
     if seg_w < 3 || h_us < 1 {
         let dp = SeamDp { pred_fwd: Vec::new(), pred_rev: Vec::new(), cost_fwd: Vec::new(), cost_rev: Vec::new(), seg_start: child_start, seg_w: 0, h };
-        return (Vec::new(), dp);
+        return (Vec::new(), Vec::new(), dp);
     }
     let base = child_start as usize;
     let parent_w = parent.seg_w;
@@ -1827,6 +1892,9 @@ fn candidate_seams_child(
         dp_candidates.push((child_start + c as u32, combined));
     }
     let mut candidates: Vec<(u32, f32)> = Vec::new();
+    // Diagnostic candidates: the non-representative members of a tied
+    // local-minimum run (see candidate_seams). Never on the heap.
+    let mut diag_candidates: Vec<(u32, f32)> = Vec::new();
     let n = dp_candidates.len();
     if n > 0 {
         let mut i = 0;
@@ -1839,11 +1907,16 @@ fn candidate_seams_child(
             if left_higher && right_higher {
                 let mid_idx = (run_start + i - 1) / 2;
                 candidates.push(dp_candidates[mid_idx]);
+                for j in run_start..i {
+                    if j != mid_idx {
+                        diag_candidates.push(dp_candidates[j]);
+                    }
+                }
             }
         }
     }
     let dp = SeamDp { pred_fwd, pred_rev, cost_fwd, cost_rev, seg_start: child_start, seg_w, h };
-    (candidates, dp)
+    (candidates, diag_candidates, dp)
 }
 
 fn uniform_boundaries(width: u32, n: usize) -> Vec<u32> {
@@ -1865,6 +1938,15 @@ pub struct SeamCost {
     pub horizontal_cost: f32,
     pub ink_discount: f32,
     pub total: f32,
+    /// Maximum raw darkness (0-255) along the seam path. The Max-ink gate
+    /// (geometry_classifier.rs) compares this to max_ink: a seam only counts
+    /// as cutting ink when it passes through a pixel at a substantial
+    /// fraction of max_ink, not merely when dp_cost > 0 (which also counts
+    /// the horizontal-movement penalty of a diagonal through white space).
+    pub max_darkness: f32,
+    /// Word-level solid-ink level (p95 of raw darkness in the word image).
+    /// Normalised scale for max_darkness.
+    pub max_ink: f32,
 }
 
 /// Segmentation summary for a single word — returned from segmentation

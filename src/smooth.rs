@@ -15,7 +15,10 @@ use crate::pdf_out::PlacedText;
 /// median of the survivors into `word.smoothed_em_px`.
 ///
 /// The PDF renderer will prefer `smoothed_em_px` over recalculating per-word.
-pub fn smooth_font_sizes(entries: &mut [PlacedText], dpi: f32, font_cache: &crate::font_cache::FontCache) {
+///
+/// `geo_cache` supplies the GPOS pair-kern provider (Finding 6) so the
+/// per-word em_px uses the same kern as the geometry predictor.
+pub fn smooth_font_sizes(entries: &mut [PlacedText], dpi: f32, font_cache: &crate::font_cache::FontCache, geo_cache: &crate::geo_cache::GeometryCache) {
     if entries.is_empty() {
         return;
     }
@@ -45,13 +48,13 @@ pub fn smooth_font_sizes(entries: &mut [PlacedText], dpi: f32, font_cache: &crat
         }
 
         // Process this run: [run_start .. run_end)
-        smooth_run(&mut entries[run_start..run_end], dpi, font_cache);
+        smooth_run(&mut entries[run_start..run_end], dpi, font_cache, geo_cache);
         run_start = run_end;
     }
 }
 
 /// Smooth a single run of entries that all share the same font file.
-fn smooth_run(run: &mut [PlacedText], dpi: f32, font_cache: &crate::font_cache::FontCache) {
+fn smooth_run(run: &mut [PlacedText], dpi: f32, font_cache: &crate::font_cache::FontCache, geo_cache: &crate::geo_cache::GeometryCache) {
     if run.is_empty() {
         return;
     }
@@ -69,6 +72,13 @@ fn smooth_run(run: &mut [PlacedText], dpi: f32, font_cache: &crate::font_cache::
         Err(_) => return,
     };
     let overrides = overrides_owned.as_deref();
+    // GPOS pair kern (Finding 6): the geo-cache provider for this run's
+    // font, so per-word em_px uses the same kern as the geometry predictor.
+    let font_key = match run[0].font_match {
+        Some(ref fm) => fm.font_key.clone(),
+        None => return,
+    };
+    let kern = geo_cache.kern_provider(&font_key);
 
     // Collect all per-word em_px values across the run.
     let mut all_em_px: Vec<f32> = Vec::new();
@@ -77,7 +87,7 @@ fn smooth_run(run: &mut [PlacedText], dpi: f32, font_cache: &crate::font_cache::
             if word.text.is_empty() || word.width < 1.0 {
                 continue;
             }
-            if let Some(em) = layout::width_matched_em_px(&font, &word.text, word.width, overrides) {
+            if let Some(em) = layout::width_matched_em_px(&font, &word.text, word.width, overrides, &kern) {
                 all_em_px.push(em);
             }
         }
@@ -121,7 +131,7 @@ fn smooth_run(run: &mut [PlacedText], dpi: f32, font_cache: &crate::font_cache::
             }
             // Only smooth if this word's natural em_px is within the reasonable
             // range (i.e. was not itself a hard outlier worth keeping).
-            if let Some(em) = layout::width_matched_em_px(&font, &word.text, word.width, overrides) {
+            if let Some(em) = layout::width_matched_em_px(&font, &word.text, word.width, overrides, &kern) {
                 if (em - mean).abs() <= one_pt_px {
                     word.smoothed_em_px = Some(median);
                 }

@@ -23,7 +23,6 @@ pub struct WordSegSummary {
     pub ws_splits: Vec<u32>,
     pub seam_splits: Vec<u32>,
     pub seam_paths: Arc<HashMap<u32, Vec<[u32; 2]>>>,
-    #[serde(skip_serializing)]
     pub seam_costs: Arc<HashMap<u32, crate::segment::SeamCost>>,
 }
 
@@ -222,6 +221,11 @@ pub struct ObservationVote {
     // ── Geo scores ───────────────────────────────────────────────
     #[serde(skip_serializing_if = "Option::is_none")]
     pub chosen_geo_h_ll: Option<f32>,
+    /// Likely overlap error (px) subtracted from |h_err| for the graded
+    /// downweight applied to this pair's h_ll. Present only when the
+    /// overlap downweight fired.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub chosen_geo_h_overlap_correction_px: Option<f32>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub chosen_geo_v_ll: Option<f32>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -230,6 +234,11 @@ pub struct ObservationVote {
     pub chosen_geo_v_err: Option<f32>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub gt_geo_h_ll: Option<f32>,
+    /// Likely overlap error (px) subtracted from |h_err| for the graded
+    /// downweight applied to this pair's h_ll. Present only when the
+    /// overlap downweight fired.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub gt_geo_h_overlap_correction_px: Option<f32>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub gt_geo_v_ll: Option<f32>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -241,6 +250,35 @@ pub struct ObservationVote {
     pub chosen_geo_ll: Option<f32>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub gt_geo_ll: Option<f32>,
+    // ── Absolute midpoint/pitch data (Finding 10) ──────────────────
+    // Observed and predicted character midpoints (word-image px), pitches
+    // (px; None for word-initial chars, which have no previous char),
+    // per-word scale (px per font unit), and observed ink width (px).
+    // Recorded so per-line geometry can be re-derived from audit.json.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub chosen_obs_cx: Option<f32>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub chosen_pred_cx: Option<f32>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub chosen_obs_pitch: Option<f32>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub chosen_pred_pitch: Option<f32>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub chosen_geo_scale: Option<f32>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub chosen_ink_width: Option<f32>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub gt_obs_cx: Option<f32>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub gt_pred_cx: Option<f32>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub gt_obs_pitch: Option<f32>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub gt_pred_pitch: Option<f32>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub gt_geo_scale: Option<f32>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub gt_ink_width: Option<f32>,
 }
 
 #[derive(Debug, Serialize, Clone)]
