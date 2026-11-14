@@ -59,7 +59,7 @@ Recreation lines (one per variant, stated in the header):
   URW fonts: clone — the real URW font is a metric-compatible clone of
     the historical font (Nimbus Roman -> Times New Roman, Nimbus Mono PS
     -> Courier), used as a stand-in for the historical font; real OTF
-    from the URW Base 35 release (20200910). No modification.
+    from the URW Base 35 release (20200910).
 
 Usage:
   python3 test-docs/gen-vintage-specimen.py
@@ -231,7 +231,7 @@ def main():
         recreation = (
             f"clone — URW {family} is a metric-compatible clone of {original}, "
             "used as a stand-in for the historical font. "
-            f"Real OTF, URW Base 35 ({URW_RELEASE}). No modification."
+            f"Real OTF, URW Base 35 ({URW_RELEASE})."
         )
         print(f"{slug}: {font_key} (kern={'on' if kern_on else 'off'}, lig={'on' if lig_on else 'off'}; {kern_desc}; {outline_fmt})")
         sections.append((slug, display_name, str(otf_path), font_key, weight, style, kern_on, lig_on, ERA_LABEL, kern_desc, outline_fmt, recreation))
