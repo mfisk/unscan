@@ -28,10 +28,12 @@ from pdf_font_annotate import annotate_canonical_names
 from rasterize import rasterize
 
 # ---------------------------------------------------------------------------
-# Hardcoded 11-line test — page-break isolation for Tesseract LSTM reset
+# Hardcoded 14-line test — page-break isolation for Tesseract LSTM reset
 # p1: 8 lines (L01-L08), p2: 2 lines (LibreBaskerville + PTSerif italic fox with numbers),
 # p3: 1 line (Matthew Carter) isolated to avoid bbox shift.
 # Matches t59 + extensions requested: LibreBaskerville lower, PTSerif italic numbers.
+# Nimbus-400Italic AVAST line added Nov 14, 2026: t66 p1 l25, a segmentation-error
+# case (kern variant loses to nokern on the same text).
 # ---------------------------------------------------------------------------
 HARDCODED = [
     ("LibreBodoni-400", "abcdefghijklmnopqrstuvwxyz."),
@@ -46,6 +48,7 @@ HARDCODED = [
     ("SourceSerif4-400It", "Font: Originally for IBM Executive typewriters — 12 characters per inch"),
     ("Georgia-400", "Matthew Carter created Georgia in 1993."),
     ("Arial-ItalicMT-400Italic", "Italic: The quick brown fox jumps over 1,234,567,890"),
+    ("Nimbus-400Italic", "AVAST! WAYWARD YOUTH TO YONDER VALLEY, AWAY AT DAWN. Ryan Tries."),
     ("SourceSerif4-400It", "Font: fonts.google.com/specimen/Jost — OFL, Owen Earl"),
 ]
 
