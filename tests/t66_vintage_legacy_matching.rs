@@ -1,27 +1,30 @@
-//! Vintage legacy matching — real PostScript-era fonts plus Word6 quantized kern.
+//! Vintage legacy matching — real PostScript-era fonts.
 //!
 //! Runs unprint with --audit and --test against the vintage specimen
 //! (`test-docs/vintage-specimen-gt.pdf` + `-rasterized.pdf`): the same
-//! 3-line passage rendered once per variant, all 5 variants on ONE page,
-//! one section per variant, 15 scored lines total. The same text in every
+//! 3-line passage rendered once per variant, all 4 variants on ONE page,
+//! one section per variant, 12 scored lines total. The same text in every
 //! variant makes the comparison apples-to-apples: only the font/variant
 //! varies, not the text.
 //!
 //! Each section is self-documenting: a header at the top states the font
-//! name and variant, the era, how that vintage is recreated (clone,
-//! reconstructing, or quantizing), and the key characteristics (kern pair
-//! count, kerning mechanism, outline format). The header lines are NOT
-//! scored — they are rendered in DejaVu Sans and annotated with the
-//! sentinel canonical "HEADER-NO-SCORE", and this test skips audit
-//! entries whose expected font is the sentinel.
+//! name and variant, the era, how that vintage is recreated (clone),
+//! and the key characteristics (kern pair count, kerning mechanism,
+//! outline format). The header lines are NOT scored — they are rendered
+//! in DejaVu Sans and annotated with the DejaVu Sans key, and this test
+//! scores only audit entries whose expected font is one of the 4 test
+//! variant keys, skipping everything else. The headers carry a REAL font
+//! key, not a sentinel: the pipeline aborts in --test mode when a GT
+//! font annotation does not resolve to a registry entry.
 //!
-//! Sections 1-4 are REAL vintage fonts — the URW Base 35 OTF fonts
+//! All 4 sections are REAL vintage fonts — the URW Base 35 OTF fonts
 //! (PostScript Level 2 core font set, 1991) — with STANDARD catalog font
 //! keys (Mike Nov 12, 2026: use real fonts, not synthetic reconstructions).
-//! Section 5 is the Word6 synthetic variant (Times New Roman, kern
-//! quantized to multiples of 5): the one era that still needs synthetic
-//! generation because no real font exhibits quantized kern, so no standard
-//! font key represents it (Mike Nov 12, 2026 correction).
+//! A Windows 3.1 Times variant (TIMES.TTF v2.50) was removed Nov 13,
+//! 2026: on Latin text it ties EXACTLY with the modern Times v2.82
+//! (the Win31 kern table is a strict subset with identical values; the
+//! extra v2.82 pairs are Greek/Cyrillic only), so it is not distinct
+//! from a modern font and does not belong in this test.
 //!
 //! Variants are identified by their expected font key (from the audit's
 //! `expected_font`), not by page or line position — all sections share
@@ -30,7 +33,7 @@
 //!
 //! Thresholds (stated, conservative):
 //!   MIN_CORRECT_FONT_RATE = 1.0 — every scored line must pick its
-//!     expected font (15/15). The expected font IS the correct answer;
+//!     expected font (12/12). The expected font IS the correct answer;
 //!     there is no partial credit for picking a lookalike.
 //!   MIN_ZNCC_AVG = 0.92 — same as t65, computed over the scored lines
 //!     only (header lines excluded). The correct render should score at
@@ -51,26 +54,23 @@ mod common;
 use common::{test_doc, ensure_index};
 
 /// Minimum acceptable fraction of scored lines picking the expected font.
-/// 15/15 — the expected font is the correct answer for each scored line.
+/// 12/12 — the expected font is the correct answer for each scored line.
 const MIN_CORRECT_FONT_RATE: f64 = 1.0;
 
 /// Minimum acceptable mean ZNCC similarity (same as t65), over scored lines only.
 const MIN_ZNCC_AVG: f64 = 0.92;
 
-/// Sentinel canonical marking header lines as unscored (must match the
-/// generator's HEADER_SENTINEL in test-docs/gen-vintage-specimen.py).
-const HEADER_SENTINEL: &str = "HEADER-NO-SCORE";
-
-/// Expected font key -> (font display name, era label), for reporting only.
-/// The pass/fail decision compares picked vs expected (both from the
-/// audit), never against this table. Keys are the verbatim catalog keys
-/// (--resolve-fontkey for the URW fonts, vintage_key_dump for Word6).
-const KEY_TO_VARIANT: [(&str, &str, &str); 5] = [
-    ("Nimbus-400|kern|nolig", "Times New Roman Regular (URW clone: Nimbus Roman Regular)", "PostScript Level 2 (1991)"),
-    ("Nimbus-700|kern|nolig", "Times New Roman Bold (URW clone: Nimbus Roman Bold)", "PostScript Level 2 (1991)"),
-    ("Nimbus-400Italic|kern|nolig", "Times New Roman Italic (URW clone: Nimbus Roman Italic)", "PostScript Level 2 (1991)"),
-    ("NimbusMonoPS-400|nokern|nolig", "Courier Regular (URW clone: Nimbus Mono PS Regular)", "PostScript Level 2 (1991)"),
-    ("TimesNewRomanPSMT-400|vintage=word6", "Times New Roman Word6", "Word 6.0 (1993)"),
+/// Expected font key -> (font display name, era label). The test scores
+/// only audit entries whose expected font is in this table; every other
+/// entry (the header lines, rendered in DejaVu Sans) is skipped. The
+/// pass/fail decision compares picked vs expected (both from the audit).
+/// Keys are the verbatim catalog keys (--resolve-fontkey for every test
+/// font).
+const KEY_TO_VARIANT: [(&str, &str, &str); 4] = [
+    ("Nimbus-400|version=1.00|kern|nolig", "Times New Roman Regular (URW clone: Nimbus Roman Regular)", "PostScript Level 2 (1991)"),
+    ("Nimbus-700|version=1.00|kern|nolig", "Times New Roman Bold (URW clone: Nimbus Roman Bold)", "PostScript Level 2 (1991)"),
+    ("Nimbus-400Italic|version=1.00|kern|nolig", "Times New Roman Italic (URW clone: Nimbus Roman Italic)", "PostScript Level 2 (1991)"),
+    ("NimbusMonoPS-400|version=1.00|nokern|nolig", "Courier Regular (URW clone: Nimbus Mono PS Regular)", "PostScript Level 2 (1991)"),
 ];
 
 #[test]
@@ -94,10 +94,15 @@ fn vintage_legacy_matching() {
         .as_array()
         .expect("audit.json has no text_entries array");
 
-    // Score only the repeated test-text lines. Header lines (expected font
-    // is the HEADER-NO-SCORE sentinel) are skipped — they document the
-    // variant, they are not test lines. Metrics are computed over the
-    // scored lines only; r.compared / r.zncc_avg include the headers.
+    // Score only the repeated test-text lines. An entry is scored iff its
+    // expected font is one of the 4 test variant keys; everything else
+    // (the header lines, rendered in DejaVu Sans) is skipped — the headers
+    // document the variant, they are not test lines. The assert_eq!(scored,
+    // 12) below guards against a test line being skipped by mistake:
+    // if a test line's expected font failed to match the table, scored
+    // would come up short and the test would fail loudly. Metrics are
+    // computed over the scored lines only; r.compared / r.zncc_avg
+    // include the headers.
     let mut correct = 0usize;
     let mut scored = 0usize;
     let mut skipped_headers = 0usize;
@@ -106,7 +111,7 @@ fn vintage_legacy_matching() {
     let mut wrong: Vec<String> = Vec::new();
     for e in entries {
         let expected = e["expected_font"].as_str().unwrap_or("").to_string();
-        if expected == HEADER_SENTINEL {
+        if !KEY_TO_VARIANT.iter().any(|(k, _, _)| *k == expected) {
             skipped_headers += 1;
             continue;
         }
@@ -167,8 +172,8 @@ fn vintage_legacy_matching() {
     );
     eprintln!("  Miss report: {}", r.report_path.display());
 
-    assert_eq!(scored, 15,
-        "Vintage specimen should score 15 lines (5 variants x 3 lines), got {} — see {}",
+    assert_eq!(scored, 12,
+        "Vintage specimen should score 12 lines (4 variants x 3 lines), got {} — see {}",
         scored, r.report_path.display());
     assert!(
         wrong.is_empty(),
