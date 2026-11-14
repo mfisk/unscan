@@ -7,6 +7,12 @@
 //! variant makes the comparison apples-to-apples: only the font/variant
 //! varies, not the text.
 //!
+//! The test is self-contained: the specimen PDFs are git-ignored build
+//! products, and the test regenerates them via
+//! `test-docs/gen-vintage-specimen.py` (using the same unprint binary
+//! the harness resolved) when either is missing, so it works from a
+//! clean checkout.
+//!
 //! Each section is self-documenting: a header at the top states the font
 //! name and variant, the era, how that vintage is recreated (clone),
 //! and the key characteristics (kern pair count, kerning mechanism,
@@ -51,7 +57,7 @@
 
 mod common;
 
-use common::{test_doc, ensure_index};
+use common::{test_doc, ensure_index, ensure_vintage_specimen};
 
 /// Minimum acceptable fraction of scored lines picking the expected font.
 /// 12/12 — the expected font is the correct answer for each scored line.
@@ -76,6 +82,9 @@ const KEY_TO_VARIANT: [(&str, &str, &str); 4] = [
 #[test]
 fn vintage_legacy_matching() {
     ensure_index();
+    // Self-contained: regenerate the (git-ignored) specimen PDFs when
+    // either is missing, so the test works from a clean checkout.
+    ensure_vintage_specimen();
 
     let vector = test_doc("vintage-specimen-gt.pdf");
     let raster = test_doc("vintage-specimen-rasterized.pdf");

@@ -62,11 +62,16 @@ Recreation lines (one per variant, stated in the header):
     from the URW Base 35 release (20200910).
 
 Usage:
-  python3 test-docs/gen-vintage-specimen.py
+  python3 test-docs/gen-vintage-specimen.py [--unprint-bin PATH]
 Outputs:
   test-docs/vintage-specimen-gt.pdf      (single page, GT-annotated)
   test-docs/vintage-specimen-rasterized.pdf
   test-docs/vintage-font-keys.json       (resolved keys, for the record)
+
+--unprint-bin selects the unprint binary used for --resolve-fontkey
+(the t66 test passes the same binary the test harness resolved, so the
+specimen's keys and the audit use one binary). Without it, the script
+finds target/{fastbuild,release,debug}/unprint under the repo root.
 """
 
 import json
@@ -206,7 +211,19 @@ def font_characteristics(font_path):
 
 
 def main():
-    unprint_bin = find_unprint_bin()
+    import argparse
+    parser = argparse.ArgumentParser(description="Generate the vintage specimen.")
+    parser.add_argument("--unprint-bin", default=None,
+                        help="unprint binary for --resolve-fontkey "
+                             "(default: target/{fastbuild,release,debug}/unprint)")
+    args = parser.parse_args()
+    if args.unprint_bin:
+        unprint_bin = args.unprint_bin
+        if not Path(unprint_bin).exists():
+            print(f"ERROR: --unprint-bin not found: {unprint_bin}", file=sys.stderr)
+            sys.exit(1)
+    else:
+        unprint_bin = find_unprint_bin()
     print(f"unprint: {unprint_bin}")
     if not Path(HEADER_FONT_PATH).exists():
         print(f"ERROR: header font missing: {HEADER_FONT_PATH}", file=sys.stderr)
