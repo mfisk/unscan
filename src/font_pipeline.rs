@@ -572,15 +572,35 @@ pub fn match_lines(
         // segment_line was the only caller that wrote these files, and
         // a92d0bb (2026-08-11) removed the call, orphaning the writes.
         // Gated on diag_seg_dir so non-audit runs pay nothing.
-        if diag_seg_dir.is_some() {
+        let diag_crops = if diag_seg_dir.is_some() {
             let word_height = line.words.iter().map(|w| w.height).max().unwrap_or(0);
-            let _diag_crops = crate::segment::segment_line(
+            Some(crate::segment::segment_line(
                 gray_page, &word_placements, word_height,
                 diag_seg_dir.as_deref(),
                 &args.render_params(),
                 &mut seg_cache,
-            );
-        }
+            ))
+        } else {
+            None
+        };
+        // (F10) Index the diag pass's word crops by source word so
+        // word_infos reuses them instead of re-cropping + re-normalizing
+        // the same bbox. The diag pass crops the identical bbox with the
+        // identical pure function, so a reused crop is bit-identical to
+        // a fresh one. Words the diag filter skipped (its iteration
+        // order differs from word_infos') fall back to a fresh crop
+        // below; non-audit runs have no diag pass at all. Consuming the
+        // LineCrops drops the diag WordSeg shells (their seam data lives
+        // in the seg cache); only the image Arcs are kept.
+        let diag_crop_by_word: std::collections::HashMap<usize, std::sync::Arc<image::GrayImage>> =
+            match diag_crops {
+                Some(crops) => crops
+                    .word_segs
+                    .into_iter()
+                    .map(|s| (s.source_word_idx, s.word_img))
+                    .collect(),
+                None => std::collections::HashMap::new(),
+            };
         // Per-font pipeline: segmentation now happens inside identify_fonts.
         // ── Per-font ligature handling: build word image infos for inside identify_fonts ──
         use std::sync::Arc;
@@ -607,11 +627,20 @@ pub fn match_lines(
                 let need_any = if audit_all { true } else { chars_supported.iter().any(|c| char_counts.get(c).copied().unwrap_or(0) < 2) };
                 if !audit_all && chars_supported.len() > 2 && !need_any { continue; }
                 for &c in &chars_supported { if audit_all || crate::features::is_supported(c) { *char_counts.entry(c).or_insert(0) += 1; } }
-                let word_img = image::imageops::crop_imm(gray_page, wx, wy, cw, ch).to_image();
-                let word_img = crate::features::contrast_normalize_char(word_img);
+                // (F10) Reuse the diag pass's crop for this word when it
+                // has one; otherwise crop + normalize fresh (same bbox,
+                // same pure function, so the result is identical either
+                // way).
+                let word_img: Arc<image::GrayImage> = match diag_crop_by_word.get(&orig_idx) {
+                    Some(img) => img.clone(),
+                    None => {
+                        let word_img = image::imageops::crop_imm(gray_page, wx, wy, cw, ch).to_image();
+                        Arc::new(crate::features::contrast_normalize_char(word_img))
+                    }
+                };
                 let all_chars: Vec<char> = w.text.chars().collect();
                 if all_chars.is_empty() { continue; }
-                infos.push(font_match::WordImgInfo::new(Arc::new(word_img), all_chars, orig_idx, w.text.clone()));
+                infos.push(font_match::WordImgInfo::new(word_img, all_chars, orig_idx, w.text.clone()));
             }
             infos
         };
