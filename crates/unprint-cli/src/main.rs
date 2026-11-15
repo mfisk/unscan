@@ -1069,6 +1069,7 @@ fn run(args: &cli::Args, classifier: &mut dyn classifier::Classifier) -> Result<
                         let vr = verify::verify_text_region(
                             &norm_crop,
                             fd.as_slice(),
+                            &fm.font_path,
                             &line.text,
                             verify_words,
                             line.x, line.y,
