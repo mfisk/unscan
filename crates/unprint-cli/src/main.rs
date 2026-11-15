@@ -915,28 +915,7 @@ fn run(args: &cli::Args, classifier: &mut dyn classifier::Classifier) -> Result<
         let mut lines = prepared.lines;
         let gray_page = prepared.gray;
         // Fast RGBA reuse – avoid image 0.25 generic CicpRgb::cast_pixels_by_layout 8.7% leaf.
-        // Same fast path as page_cache::fast_rgba8_from_dynamic but inline for bin crate visibility.
-        let rgba_page = match page_img {
-            image::DynamicImage::ImageRgba8(rgba) => rgba.clone(),
-            image::DynamicImage::ImageRgb8(rgb) => {
-                let (w, h) = rgb.dimensions();
-                let raw = rgb.as_raw();
-                let mut out = Vec::with_capacity((w * h * 4) as usize);
-                for chunk in raw.chunks_exact(3) {
-                    out.extend_from_slice(chunk);
-                    out.push(255);
-                }
-                image::RgbaImage::from_raw(w, h, out).expect("rgba size")
-            }
-            image::DynamicImage::ImageLuma8(luma) => {
-                let (w, h) = luma.dimensions();
-                let raw = luma.as_raw();
-                let mut out = Vec::with_capacity((w * h * 4) as usize);
-                for &v in raw { out.extend_from_slice(&[v, v, v, 255]); }
-                image::RgbaImage::from_raw(w, h, out).expect("rgba size")
-            }
-            _ => page_img.to_rgba8(),
-        };
+        let rgba_page = page_cache::fast_rgba8_from_dynamic(&page_img);
         let bg_color = prepared.bg_color;
         let ink_thresh = prepared.ink_thresh;
 
