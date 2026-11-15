@@ -1047,6 +1047,10 @@ pub fn run_train(mut args: TrainArgs, geo_cache: &crate::geo_cache::GeometryCach
     let _all_heights: &[u32] = &args.heights;
     let all_aa: &[AaVariant] = AaVariant::all();
 
+    /// Build a stable codepoint-based key for a character sequence.
+    fn seq_key(seq: &[char]) -> String {
+        seq.iter().map(|c| format!("{:04X}", *c as u32)).collect::<Vec<_>>().join("_")
+    }
     fn combo_path(feat_dir: &std::path::Path, seq: &[char], ht: u32, aa_name: &str) -> std::path::PathBuf {
         feat_dir.join(format!("{}_h{}_{}.bin", seq_key(seq), ht, aa_name))
     }
