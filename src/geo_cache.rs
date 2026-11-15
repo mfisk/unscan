@@ -2146,32 +2146,6 @@ impl GeometryCache {
         v1[2] + v2[2]
     }
 
-    /// GPOS pair kern for rendering (Finding 5): `gid1`'s XAdvance
-    /// adjustment plus `gid2`'s XPlacement adjustment, in font units — the
-    /// scalar added to `gid1`'s advance when followed by `gid2`. This is the
-    /// same quantity the geometry predictor folds into the inter-glyph pitch
-    /// (`v1[2]` via the first glyph's advance adjustment, `v2[0]` via the
-    /// second glyph's placement). It differs from `kern_for_gids` (which
-    /// sums both glyphs' XAdvance adjustments for the predictor's
-    /// per-glyph advance accumulation) because a renderer spaces origins,
-    /// not advances. Returns 0 when the font is not in the cache, when the
-    /// pair has no kern, or when the font key is a nokern variant — the
-    /// geometry predictor skips pair kern for nokern keys (below), and the
-    /// render kern must agree with it, so a nokern variant's renders use
-    /// zero kern.
-    pub fn pair_kern_fu(&self, font_key: &str, gid1: u16, gid2: u16) -> i32 {
-        if font_key.contains("nokern") {
-            return 0;
-        }
-        match self.fonts.get(font_key) {
-            Some(f) => {
-                let (v1, v2) = self.pair_adjustment_full(f, gid1, gid2);
-                v1[2] + v2[0]
-            }
-            None => 0,
-        }
-    }
-
     /// A `KernProvider` bound to one font in this cache, for rendering
     /// (Finding 5). Resolves the font index once; per-pair lookups then
     /// need no map lookup. When the font key is not in the cache the
