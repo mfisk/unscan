@@ -939,17 +939,35 @@ fn run(args: &cli::Args, classifier: &mut dyn classifier::Classifier) -> Result<
         let mut pg_vec = 0u32;
         let mut pg_raster = 0u32;
 
-        // ── Pass 1: Match all lines ──────────────────────────────────
-        let (mut line_matches, fp_hits) = font_pipeline::match_lines(
+        // Stale diag dirs are cleaned once here, before any pass writes new ones.
+        font_pipeline::clean_stale_diag_dirs(args, &lines, page_num, None);
+
+        // ── Pass 1: fast path only — dominant font render + ZNCC ────
+        // Pass 1 performs no segmentation and no font matching.
+        let (fast_results, fp_hits) = font_pipeline::match_lines_fast_path(
+            &lines, &gray_page, &rgba_page,
+            &font_registry, &font_cache,
+            dominant_font_candidate.as_ref(),
+        );
+
+        // ── Full pipeline: segmentation → font search → font match ──
+        // Scores only the lines that missed the fast path; the merge below
+        // keeps the fast-path result wherever one exists.
+        let missed: std::collections::HashSet<usize> = fast_results.iter().enumerate()
+            .filter_map(|(li, r)| if r.is_none() { Some(li) } else { None })
+            .collect();
+        let full_results = font_pipeline::match_lines(
             &lines, &gray_page, &rgba_page, page_img, page_num,
             &font_registry, &font_cache, &geo_cache, classifier,
             &glyph_map,
             ground_truth.as_ref(),
-            dominant_font_candidate.as_ref(),
             args,
-            None,
+            Some(&missed),
             rtd.as_ref(),
         );
+        let mut line_matches: Vec<font_pipeline::LineMatch> = fast_results.into_iter().zip(full_results)
+            .map(|(fast, full)| fast.unwrap_or(full))
+            .collect();
 
         // Update dominant font candidate for next page
         if let Some(new_dom) = font_pipeline::update_dominant_font(&line_matches) {
@@ -986,12 +1004,12 @@ fn run(args: &cli::Args, classifier: &mut dyn classifier::Classifier) -> Result<
             split_indices.sort_unstable();
             split_indices.dedup();
             let split_set: std::collections::HashSet<usize> = split_indices.iter().copied().collect();
-            let (mut new_matches, _) = font_pipeline::match_lines(
-            &lines, &gray_page, &rgba_page, page_img, page_num,
+            font_pipeline::clean_stale_diag_dirs(args, &lines, page_num, Some(&split_set));
+            let mut new_matches = font_pipeline::match_lines(
+                &lines, &gray_page, &rgba_page, page_img, page_num,
                 &font_registry, &font_cache, &geo_cache, classifier,
                 &glyph_map,
                 ground_truth.as_ref(),
-                None,  // No fast path — re-score fully with new word splits
                 args,
                 Some(&split_set),
                 rtd.as_ref(),
