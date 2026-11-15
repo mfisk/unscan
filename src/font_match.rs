@@ -241,7 +241,7 @@ pub fn identify_fonts(
             // get or create cache entry for this word k
             let cache = &mut seg_caches[wi_idx];
             if !cache.contains_key(&k) {
-                let (b, s, sum) = segment_characters(&wi.img, k);
+                let (b, s, sum) = segment_characters(&wi.img, k, &wi.text);
                 let crop_h = wi.img.height();
                 let mut char_crops: Vec<Option<(Arc<GrayImage>,u32,u32,u32,u32,f64,f64)>> = Vec::with_capacity(k);
                 for i in 0..k {
@@ -659,19 +659,20 @@ pub fn identify_fonts(
     }
 
     // Tiebreak on identical fine scores with the shared font-key preference
-    // (same as --resolve-fontkey: kerned font → kern, kern-less → nokern;
-    // nolig; opsz=10; OT-feature variants and non-default weight
-    // instances -10). Font-key order is the final deterministic fallback.
+    // (same as --resolve-fontkey: highest version first, then kerned
+    // font → kern, kern-less → nokern; nolig; opsz=10; OT-feature
+    // variants and non-default weight instances -10). Font-key order is
+    // the final deterministic fallback.
     // Preferences are precomputed once — the comparator must stay cheap.
     // Owned String keys: borrowing scored's keys would conflict with the
     // mutable sort below.
-    let prefs: std::collections::HashMap<String, i32> = scored
+    let prefs: std::collections::HashMap<String, (u32, i32)> = scored
         .iter()
         .map(|(k, _)| {
             let p = font_registry
                 .by_key(k)
                 .map(|fe| crate::font_scan::font_key_preference_score(k, fe.has_kern))
-                .unwrap_or(0);
+                .unwrap_or((0, 0));
             (k.clone(), p)
         })
         .collect();

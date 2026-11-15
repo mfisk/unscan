@@ -576,7 +576,7 @@ pub fn match_lines(
                 let collapsed = crate::segment::collapse_ligature_chars_for_allowed(&wi.orig_chars, allowed);
                 let k = collapsed.len();
                 if k == 0 { continue; }
-                let (bounds, seams, summary) = crate::segment::segment_characters(&wi.img, k);
+                let (bounds, seams, summary) = crate::segment::segment_characters(&wi.img, k, &wi.text);
                 segs.push(crate::segment::WordSeg {
                     source_word_idx: wi.source_idx,
                     word_img: wi.img.clone(),
@@ -613,12 +613,18 @@ pub fn match_lines(
                                (line.y + line.height) as f32];
                 let gt_font_name = gt.lookup_font(page_num, &bbox_px, args.dpi)?;
                 let gt_ps = ground_truth::strip_subset_prefix_str(gt_font_name);
-                // Match against full explicit key (with bracketed variations)
-                // as well as base postscript_name, since GT annotations now
-                // carry the full form (e.g., "SourceSerif4-400Italic[wght=400,opsz=10]").
-                let found = font_registry.iter()
-                    .find(|fe| fe.postscript_name == gt_ps || fe.font_key() == gt_ps)
-                    .map(|fe| fe.font_key());
+                // Exact font-key match first: GT annotations carry the full
+                // verbatim key (e.g. "SourceSerif4-400Italic|version=4.00|kern|nolig[wght=400,opsz=10]"),
+                // and a specified version is honored exactly. Otherwise a
+                // bare PostScript name (no version specified) resolves to
+                // the latest version, then the shared variant preference —
+                // the first registry entry in scan order is arbitrary with
+                // respect to version.
+                let found = font_registry.by_key(&gt_ps).map(|fe| fe.font_key())
+                    .or_else(|| {
+                        crate::font_scan::best_entry_for_ps_name(font_registry.iter(), &gt_ps)
+                            .map(|fe| fe.font_key())
+                    });
                 if found.is_none() {
                     // GT lookup failed in test mode — this is a bug, not a skip.
                     // The GT annotation refers to a font not in the registry.
@@ -671,8 +677,9 @@ pub fn match_lines(
                 if tied.len() >= 2 {
                     let mut best: Option<(font_match::FontMatchResult, f32, Vec<crate::segment::WordSeg>, Vec<crate::geometry_classifier::WordGeoMeasurement>, Vec<image::GrayImage>, Vec<(usize,usize)>)> = None;
                     // Shared font-key preference of the current best (same as
-                    // --resolve-fontkey). Breaks exact SSIM ties.
-                    let mut best_pref: i32 = i32::MIN;
+                    // --resolve-fontkey: highest version first, then variant
+                    // preference). Breaks exact SSIM ties.
+                    let mut best_pref: (u32, i32) = (0, i32::MIN);
                     let mut tie_sim_results: Vec<(String,String,f32)> = Vec::new();
                     let mut ti = 0usize;
                     for font_key in tied.iter() {

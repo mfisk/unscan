@@ -69,6 +69,7 @@ FAMILIES = {
     "SpecialElite": "Special Elite",
     # System / MS Core Fonts
     "TimesNewRoman": "Times New Roman",
+    "Nimbus": "Nimbus Roman",  # URW Base 35 clone of Times (NimbusRoman-*.otf)
     "CourierNew": "Courier New",
     "NimbusSans": "Arial",
     "Arial": "Arial",

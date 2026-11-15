@@ -118,8 +118,18 @@ const MIN_SYMBOL_FRAC: f32 = 0.07;
 /// a darker pixel — directly encoding "stay in whitespace, don't wander
 /// into ink."  Both children of every accepted seam split must contain
 /// meaningful ink (`min_ink_for_symbol`).
-pub fn segment_characters(img: &GrayImage, n_chars: usize) -> (Vec<u32>, HashMap<u32, Vec<[u32; 2]>>, SegSummary) {
-    segment_characters_inner(img, n_chars, None, None)
+/// Whether a word gets the narrow-trailing-punctuation exemption in
+/// `segment_penalty`: true only when the word ends with `.` `,` `:` or
+/// `;`. Single source of truth — every segmentation call passes the word
+/// text, so the exemption applies uniformly (the scoring pass used to
+/// pass None and lose it, flipping e.g. VALLEY,'s pick from col 125 to
+/// col 52).
+pub fn trailing_narrow_punct(word_text: &str) -> bool {
+    matches!(word_text.as_bytes().last(), Some(b'.' | b',' | b':' | b';'))
+}
+
+pub fn segment_characters(img: &GrayImage, n_chars: usize, word_text: &str) -> (Vec<u32>, HashMap<u32, Vec<[u32; 2]>>, SegSummary) {
+    segment_characters_inner(img, n_chars, None, word_text)
 }
 
 /// Same as `segment_characters` but dumps per-pass diagnostics when `diag_dir` is Some.
@@ -129,14 +139,14 @@ pub fn segment_characters_diag(
     diag_dir: &std::path::Path,
     word_text: &str,
 ) -> (Vec<u32>, HashMap<u32, Vec<[u32; 2]>>, SegSummary) {
-    segment_characters_inner(img, n_chars, Some(diag_dir), Some(word_text))
+    segment_characters_inner(img, n_chars, Some(diag_dir), word_text)
 }
 
 fn segment_characters_inner(
     img: &GrayImage,
     n_chars: usize,
     diag_dir: Option<&std::path::Path>,
-    word_text: Option<&str>,
+    word_text: &str,
 ) -> (Vec<u32>, HashMap<u32, Vec<[u32; 2]>>, SegSummary) {
     let (w, h) = img.dimensions();
     if n_chars <= 1 {
@@ -272,7 +282,7 @@ fn segment_characters_inner(
     let vp_splits = splits.clone();
 
     // Diag: dump VP passes
-    if let (Some(ddir), Some(_wtext)) = (diag_dir, word_text) {
+    if let Some(ddir) = diag_dir {
         let _ = std::fs::create_dir_all(ddir);
         let _ = img.save(ddir.join("word_crop.png"));
 
@@ -283,9 +293,7 @@ fn segment_characters_inner(
     // (10 * avg_char_width / min_child_width)^2, applied additively to seam cost.
     // Penalizes based on the smallest segment CREATED by the split,
     // so splitting near the edge costs more than splitting in the middle.
-    let trailing_narrow_punct = word_text.map_or(false, |t| {
-        matches!(t.as_bytes().last(), Some(b'.' | b',' | b':' | b';'))
-    });
+    let exempt_trailing_punct = trailing_narrow_punct(word_text);
     let segment_penalty = |seg_start: u32, seg_end: u32, col: u32, cost: f32| -> f32 {
         if cost < 1.0 { return 0.0; }
         let left = (col - seg_start) as f32;
@@ -293,7 +301,7 @@ fn segment_characters_inner(
         let mut min_child = left.min(right);
         if min_child <= 0.0 { return f32::MAX; }
         // Don't penalize narrow trailing punctuation (. , : ;)
-        if trailing_narrow_punct && right < left && seg_end == w {
+        if exempt_trailing_punct && right < left && seg_end == w {
             min_child = left;
         }
         let p = 10.0 * avg_char_width / min_child;
@@ -829,7 +837,7 @@ fn segment_characters_inner(
     bounds.dedup();
 
     // Diag: dump final overlay + seam summary JSON (the viz reads this).
-    if let (Some(ddir), Some(wtext)) = (diag_dir, word_text) {
+    if let Some(ddir) = diag_dir {
         crate::seg_diag::save_split_overlay_with_paths(img, &vp_splits, &seam_splits, &[], &seam_paths, &ddir.join("final_overlay.png"));
 
         // NOTE: char crops are saved by extract_chars_from_boundaries
@@ -843,7 +851,7 @@ fn segment_characters_inner(
         // are not in the audit's (identify_fonts) seam_paths.
         let n_segs_sum = bounds.len().saturating_sub(1);
         let summary = serde_json::json!({
-            "word_text": wtext,
+            "word_text": word_text,
             "image_w": w,
             "image_h": h,
             "n_chars_expected": n_chars,
@@ -2088,7 +2096,7 @@ pub fn segment_line(
             let pdir = wdir.join("seg_plain");
             segment_characters_diag(&word_img, all_chars.len(), &pdir, &word.text)
         } else {
-            segment_characters(&word_img, all_chars.len())
+            segment_characters(&word_img, all_chars.len(), &word.text)
         };
 
         // Destructure summary to allow moves instead of clones
@@ -2144,7 +2152,7 @@ pub fn segment_line(
                 let ldir = wdir.join("seg_lig");
                 segment_characters_diag(&word_img_arc, lig_chars.len(), &ldir, &word.text)
             } else {
-                segment_characters(&word_img_arc, lig_chars.len())
+                segment_characters(&word_img_arc, lig_chars.len(), &word.text)
             };
 
             lig_word_segs.push(WordSeg {
