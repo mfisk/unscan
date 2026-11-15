@@ -664,7 +664,7 @@ pub fn split_wide_whitespace_words(
 
             // Crop the word image and run CI segmentation to get per-char boundaries
             let word_img = image::imageops::crop_imm(gray, wx, wy, ww, wh).to_image();
-            let (boundaries, _seams, _seg_summary) = crate::segment::segment_characters(&word_img, n_chars);
+            let (boundaries, _seams, _seg_summary) = crate::segment::segment_characters(&word_img, n_chars, &word.text);
 
             // boundaries: [0, b1, b2, ..., ww] — n_chars+1 entries
             // Character i occupies columns [boundaries[i] .. boundaries[i+1])
