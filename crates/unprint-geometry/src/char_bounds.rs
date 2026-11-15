@@ -88,7 +88,7 @@ pub fn measure_char_ink_bounds(
     let (w, h) = word_img.dimensions();
     let n_chars = chars.len();
     if n_chars == 0 {
-        return WordGeoMeasurement { chars: Vec::new() };
+        return WordGeoMeasurement { chars: std::sync::Arc::new(Vec::new()) };
     }
     let owned_uniform: Vec<u32> = (0..=n_chars)
         .map(|i| ((i as f32 * w as f32 / n_chars as f32).round() as u32).min(w))
@@ -363,7 +363,7 @@ pub fn measure_char_ink_bounds(
         };
         result.push(cb);
     }
-    WordGeoMeasurement { chars: result }
+    WordGeoMeasurement { chars: std::sync::Arc::new(result) }
 }
 
 /// Batch version: measures many words at once.

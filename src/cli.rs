@@ -119,13 +119,17 @@ pub struct Args {
     #[arg(long, value_name = "PS:WEIGHT", help_heading = "Classifier")]
     pub weight_explicit: Vec<String>,
 
-    /// Resolve a font file path to its verbatim catalog font_key.
-    /// Pass one or more font file paths. Prints the exact font_key
-    /// from the catalog (including |nokern, [wght=...], etc.) to stdout
-    /// and exits. This is the single source of truth for fontkeys —
-    /// Python must use this instead of constructing keys manually.
-    /// Per Mike Nov 3: Python should use verbatim strings from the catalog.
-    #[arg(long, value_name = "PATH", help_heading = "Classifier")]
+    /// Resolve a font file path, exact font key, or bare PostScript name
+    /// to its verbatim catalog font_key. Pass one or more arguments.
+    /// Prints the exact font_key from the catalog (including |nokern,
+    /// [wght=...], etc.) to stdout and exits. A path resolves to the
+    /// file's best variant; an exact key is honored as-is; a bare
+    /// PostScript name resolves to the latest version, then the shared
+    /// variant preference. This is the single source of truth for
+    /// fontkeys — Python must use this instead of constructing keys
+    /// manually. Per Mike Nov 3: Python should use verbatim strings
+    /// from the catalog.
+    #[arg(long, value_name = "PATH|KEY|NAME", help_heading = "Classifier")]
     pub resolve_fontkey: Vec<String>,
 
     /// Export the font catalog as JSON to the given path and exit.

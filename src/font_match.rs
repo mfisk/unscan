@@ -14,7 +14,7 @@ use std::sync::Arc;
 use std::collections::HashMap;
 use image::GrayImage;
 use crate::classifier::{self, ObsStats};
-use crate::segment::{WordSeg, SegSummary, collapse_ligature_chars_for_allowed, segment_characters, char_crop_and_metrics};
+use crate::segment::{WordSeg, SegSummary, collapse_ligature_chars_for_allowed, char_crop_and_metrics};
 use crate::geometry_classifier::{CharInkBounds, WordGeoMeasurement};
 
 static GEO_WEIGHT: std::sync::LazyLock<f32> = std::sync::LazyLock::new(|| {
@@ -137,12 +137,69 @@ pub struct FontIdResult {
 
 struct SegCacheEntry {
     bounds: Vec<u32>,
-    seams: HashMap<u32, Vec<[u32; 2]>>,
-    summary: SegSummary,
+    // Arc so the per-font WordBuild clones the Arc instead of the whole
+    // seam-paths map (redundancy F3); built once per (word, k).
+    seams: std::sync::Arc<HashMap<u32, Vec<[u32; 2]>>>,
+    // Arc for the same reason (redundancy F3): the per-font WordBuild
+    // used to clone the whole summary, including its seam_costs map.
+    summary: std::sync::Arc<SegSummary>,
     // per-char crop+metrics for this k, length = k – Arc<Vec> to make per-font clone cheap (was Vec clone 3.1%)
     char_crops: std::sync::Arc<Vec<Option<(Arc<GrayImage>, u32, u32, u32, u32, f64, f64)>>>,
     // font-independent precomputed features for each char crop – hoisted out of per-font loop, Arc to avoid Vec<Option<CropFeatures>> clone 3.1%
     pre_features: std::sync::Arc<Vec<Option<crate::features::CropFeatures>>>,
+    // Char ink bounds, a pure function of the cached crops + boundaries —
+    // hoisted out of the per-font loop (redundancy F4), Arc to avoid the
+    // per-font Vec rebuild.
+    char_bounds: std::sync::Arc<Vec<CharInkBounds>>,
+}
+
+/// Font-independent classifier results for one char crop, computed once per
+/// (word, collapsed char sequence, position) and reused for every font.
+/// `classify` and `raw_logits` take only the char and its precomputed features,
+/// so their outputs are identical for every font — recomputing them per font
+/// was ~60% of profiled time. NOTE: this is keyed by the collapsed char
+/// sequence, NOT by k: two fonts can share k while collapsing different
+/// ligature pairs (e.g. "ff" vs "fl" in "affluent"), which puts different
+/// chars at the same position and changes the classifier inputs.
+struct HoistedClassify {
+    /// Top-3 picks from `classify` (glyph id, probability).
+    picks: Vec<(usize, f32)>,
+    /// OOD confidence weight, taken right after the `classify` call.
+    ood: f32,
+    /// Per-observation classifier stats, taken right after the `classify`
+    /// call (Some only when UNPRINT_OBS_STATS=1). Capturing per char fixes
+    /// the old attribution, where the thread-local held the LAST temp's
+    /// stats and the first observation took them.
+    obs_stats: Option<ObsStats>,
+    /// Raw logits from `raw_logits` (glyph id, logit), in model order.
+    logits: Vec<(usize, f32)>,
+    /// Softmax normalizers over `logits`: (max logit, sum of exps), computed
+    /// with the exact same operations as the old per-font code. None when
+    /// `logits` is empty (cannot score).
+    logit_stats: Option<(f32, f32)>,
+}
+
+impl HoistedClassify {
+    /// (logit, prob) for one glyph id, bit-identical to the old per-font
+    /// softmax code: prob = exp(logit - max) / sum_exp, or 1/n when
+    /// sum_exp is degenerate. None when the glyph is absent or logits empty.
+    fn logit_prob_for(&self, gid: usize) -> Option<(f32, f32)> {
+        let (max_logit, sum_exp) = self.logit_stats?;
+        let mut logit_for_gid: Option<f32> = None;
+        for (gid2, logit) in &self.logits {
+            if *gid2 == gid {
+                logit_for_gid = Some(*logit);
+                break;
+            }
+        }
+        let logit = logit_for_gid?;
+        let prob = if sum_exp < 1e-30 {
+            1.0 / self.logits.len() as f32
+        } else {
+            (logit - max_logit).exp() / sum_exp
+        };
+        Some((logit, prob))
+    }
 }
 
 pub fn identify_fonts(
@@ -156,6 +213,7 @@ pub fn identify_fonts(
     font_registry: &crate::font_scan::FontRegistry,
     font_cache: &crate::font_cache::FontCache,
     geo_cache: &crate::geo_cache::GeometryCache,
+    seg_cache: &mut crate::segment::SegmentCache,
 ) -> FontIdResult {
     if word_infos.is_empty() {
         return FontIdResult { scores: Vec::new(), observations: Vec::new(), gt_observations: Vec::new(), path_score: f32::MIN, gt_per_char_geo_ll: Vec::new() };
@@ -163,6 +221,18 @@ pub fn identify_fonts(
 
     let mut seg_caches: Vec<HashMap<usize, SegCacheEntry>> =
         (0..word_infos.len()).map(|_| HashMap::new()).collect();
+
+    // Hoisted classifier results per word, keyed by the collapsed char
+    // sequence (see HoistedClassify: same k can hold different chars).
+    let mut classify_caches: Vec<HashMap<Vec<char>, std::sync::Arc<Vec<Option<HoistedClassify>>>>> =
+        (0..word_infos.len()).map(|_| HashMap::new()).collect();
+
+    // Hoisted median crop area per ligature-collapse mask (F5). The scored
+    // crops' area multiset is a pure function of the line's words and the
+    // font's lig mask, so the median is shared by every font with the same
+    // mask. Deliberately NOT reset on the pass-1 fallback: the inputs
+    // (word_infos, lig mask) are identical in both passes.
+    let mut median_area_cache: HashMap<u8, f32> = HashMap::new();
 
     let mut ensure_set: FxHashSet<&str> = FxHashSet::default();
     for &fk in ensure_font_keys { ensure_set.insert(fk); }
@@ -201,8 +271,15 @@ pub fn identify_fonts(
             best_path_score = f32::MIN;
             best_score = f32::MIN;
             pruned_count = 0;
-            // Reset seg caches for clean second pass
-            seg_caches = (0..word_infos.len()).map(|_| HashMap::new()).collect();
+            // (F6) Deliberately do NOT reset seg_caches / classify_caches
+            // on the fallback: both hold pure functions of (word image,
+            // k / collapsed chars), identical in both passes — the
+            // segmentation comes from the shared per-line SegmentCache
+            // (never reset), the char crops + features derive from it,
+            // and the classifier reads are deterministic. Resetting only
+            // forced a full re-segmentation + re-crop + re-features +
+            // re-classify on the second pass. Same precedent as
+            // median_area_cache above, which is also not reset.
         }
         let mut non_ensure_survivors: usize = 0;
         let mut total_survivors: usize = 0;
@@ -223,9 +300,13 @@ pub fn identify_fonts(
             collapsed: Vec<char>,
             bounds: Vec<u32>,
             seams: Arc<HashMap<u32, Vec<[u32;2]>>>,
-            summary: SegSummary,
+            summary: std::sync::Arc<SegSummary>,
             char_crops: std::sync::Arc<Vec<Option<(Arc<GrayImage>, u32,u32,u32,u32,f64,f64)>>>, // Arc<Vec> makes per-font clone Arc::clone cheap (was Vec<Option> 3.1%)
             pre_features: std::sync::Arc<Vec<Option<crate::features::CropFeatures>>>,
+            // Char ink bounds, hoisted once per (word, k) (redundancy F4).
+            char_bounds: std::sync::Arc<Vec<CharInkBounds>>,
+            // Hoisted classifier results for this word's collapsed chars (F1) – Arc clone cheap.
+            classify: std::sync::Arc<Vec<Option<HoistedClassify>>>,
             crop_h: u32,
             word_img: Arc<GrayImage>,
             word_text: String,
@@ -241,7 +322,16 @@ pub fn identify_fonts(
             // get or create cache entry for this word k
             let cache = &mut seg_caches[wi_idx];
             if !cache.contains_key(&k) {
-                let (b, s, sum) = segment_characters(&wi.img, k);
+                // Shared per-line cache: segment_line (diag) and
+                // build_for_font (winner rebuild) segment this same
+                // (image, k) — compute it once per line. The local entry
+                // still caches the derived char crops + precomputed
+                // features, which are font-independent but expensive to
+                // rebuild per font.
+                let cached = seg_cache.get_or_compute(&wi.img, k, &wi.text);
+                let b = cached.bounds.clone();
+                let s = cached.seams.clone();
+                let sum = cached.summary.clone();
                 let crop_h = wi.img.height();
                 let mut char_crops: Vec<Option<(Arc<GrayImage>,u32,u32,u32,u32,f64,f64)>> = Vec::with_capacity(k);
                 for i in 0..k {
@@ -258,17 +348,87 @@ pub fn identify_fonts(
                         pre_features.push(None);
                     }
                 }
-                cache.insert(k, SegCacheEntry { bounds: b, seams: s, summary: sum, char_crops: std::sync::Arc::new(char_crops), pre_features: std::sync::Arc::new(pre_features) });
+                // Hoist (F4): char ink bounds are a pure function of the
+                // cached crops + boundaries, identical for every font —
+                // compute once per (word, k). Verbatim the old per-font
+                // loop below, with char_crops/b/crop_h in place of
+                // wb.char_crops/wb.bounds/wb.crop_h.
+                let mut char_bounds: Vec<CharInkBounds> = Vec::with_capacity(k);
+                for pos in 0..k {
+                    if pos >= char_crops.len() {
+                        let (b_l, b_r) = if pos+1 < b.len() { (b[pos], b[pos+1]) } else { (0, crop_h) };
+                        let cx = (b_l as f64 + b_r as f64)*0.5;
+                        let cy = crop_h as f64 *0.5;
+                        char_bounds.push(CharInkBounds { cx, cy, width: b_r.saturating_sub(b_l) as f64, height: crop_h as f64, x_min: b_l, x_max: b_r, y_min: 0, y_max: crop_h, frac_left: b_l as f64, frac_right: b_r as f64 });
+                        continue;
+                    }
+                    if let Some((ref _norm, x_min, x_max, y_min, y_max, cx, cy)) = char_crops[pos] {
+                        char_bounds.push(CharInkBounds { cx, cy, width: (x_max - x_min +1) as f64, height: (y_max - y_min +1) as f64, x_min, x_max, y_min, y_max, frac_left: x_min as f64, frac_right: x_max as f64 +1.0 });
+                    } else {
+                        let (b_l, b_r) = if pos+1 < b.len() { (b[pos], b[pos+1]) } else { (0, crop_h) };
+                        let cx = (b_l as f64 + b_r as f64)*0.5;
+                        let cy = crop_h as f64 *0.5;
+                        char_bounds.push(CharInkBounds { cx, cy, width: b_r.saturating_sub(b_l) as f64, height: crop_h as f64, x_min: b_l, x_max: b_r, y_min: 0, y_max: crop_h, frac_left: b_l as f64, frac_right: b_r as f64 });
+                    }
+                }
+                cache.insert(k, SegCacheEntry { bounds: b, seams: std::sync::Arc::new(s), summary: std::sync::Arc::new(sum), char_crops: std::sync::Arc::new(char_crops), pre_features: std::sync::Arc::new(pre_features), char_bounds: std::sync::Arc::new(char_bounds) });
             }
             let ent = cache.get(&k).unwrap();
-            // Clone needed data for WordBuild (bounds clone cheap, seams Arc clone cheap, char_crops/pre_features now Arc clone cheap)
+            // Hoist classifier results (F1): classify + raw_logits depend only
+            // on (collapsed char, precomputed features), so compute once per
+            // distinct collapsed sequence and reuse for every font. The
+            // thread-local side channels are taken immediately after the
+            // classify call, so each char's ood/obs_stats attach to that char.
+            let cc_cache = &mut classify_caches[wi_idx];
+            if !cc_cache.contains_key(&collapsed) {
+                let mut hoisted: Vec<Option<HoistedClassify>> = Vec::with_capacity(k);
+                for (pos, &c) in collapsed.iter().enumerate() {
+                    // Same feature fallback as the temps loop: recompute from
+                    // the crop when the cached features are missing.
+                    let feat_opt: Option<crate::features::CropFeatures> = match &ent.pre_features[pos] {
+                        Some(f) => Some(f.clone()),
+                        None => match &ent.char_crops[pos] {
+                            Some((ref norm, _, _, _, _, _, _)) => crate::features::compute_features(norm, false),
+                            None => None,
+                        },
+                    };
+                    let h = feat_opt.map(|feat| {
+                        let seq = [c];
+                        let picks = classifier.classify(&seq, &feat, 3);
+                        let ood = classifier::take_ood_weight();
+                        let obs_stats = classifier::take_obs_stats();
+                        let logits = classifier.raw_logits(&seq, &feat);
+                        // Same max/sum operations, same order, as the old
+                        // per-font softmax code, so per-glyph probs are
+                        // bit-identical.
+                        let logit_stats = if logits.is_empty() {
+                            None
+                        } else {
+                            let mut max_logit = f32::NEG_INFINITY;
+                            for (_, l) in &logits { if *l > max_logit { max_logit = *l; } }
+                            let exps: Vec<f32> = logits.iter().map(|(_, l)| (*l - max_logit).exp()).collect();
+                            let sum_exp: f32 = exps.iter().sum();
+                            Some((max_logit, sum_exp))
+                        };
+                        HoistedClassify { picks, ood, obs_stats, logits, logit_stats }
+                    });
+                    hoisted.push(h);
+                }
+                cc_cache.insert(collapsed.clone(), std::sync::Arc::new(hoisted));
+            }
+            let classify = std::sync::Arc::clone(cc_cache.get(&collapsed).unwrap());
+            // Clone needed data for WordBuild (bounds clone is a small
+            // Vec of k+1 u32s; seams/summary are Arc clones — the HashMap
+            // clones they replaced were the F3 finding).
             builds.push(WordBuild {
                 collapsed,
                 bounds: ent.bounds.clone(),
-                seams: Arc::new(ent.seams.clone()),
-                summary: ent.summary.clone(),
+                seams: std::sync::Arc::clone(&ent.seams),
+                summary: std::sync::Arc::clone(&ent.summary),
                 char_crops: std::sync::Arc::clone(&ent.char_crops),
                 pre_features: std::sync::Arc::clone(&ent.pre_features),
+                char_bounds: std::sync::Arc::clone(&ent.char_bounds),
+                classify,
                 crop_h: wi.img.height(),
                 word_img: wi.img.clone(),
                 word_text: wi.text.clone(),
@@ -291,6 +451,9 @@ pub fn identify_fonts(
             weight: f32,
             area_px: f32,
             ood: f32,
+            // Per-observation classifier stats, captured with the hoisted
+            // classify call (Some only when UNPRINT_OBS_STATS=1).
+            obs_stats: Option<ObsStats>,
             best_prob: f32,
             nearest: Vec<(usize,f32)>,
             logit: Option<f32>,
@@ -308,61 +471,23 @@ pub fn identify_fonts(
             geo_scale: f32,
             ink_width: f32,
         }
-        // We'll collect per-word wib and temps
-        let mut temps_collect: Vec<Temp> = Vec::new();
+        // We'll collect per-word wib, and count the supported chars
+        // (F2: the old temps_collect Vec built one Temp per char only
+        // for its .len(), used as scoring_temps capacity below — the
+        // pushed structs were never read. A count is all it ever was.)
+        let mut n_temps: usize = 0;
 
         for (_seg_idx, wb) in builds.iter().enumerate() {
-            let mut char_bounds: Vec<CharInkBounds> = Vec::with_capacity(wb.collapsed.len());
-            for (pos, _) in wb.collapsed.iter().enumerate() {
-                if pos >= wb.char_crops.len() {
-                    // fallback
-                    let (b_l, b_r) = if pos+1 < wb.bounds.len() { (wb.bounds[pos], wb.bounds[pos+1]) } else { (0,wb.crop_h) };
-                    let cx = (b_l as f64 + b_r as f64)*0.5;
-                    let cy = wb.crop_h as f64 *0.5;
-                    let cb = CharInkBounds { cx, cy, width: b_r.saturating_sub(b_l) as f64, height: wb.crop_h as f64, x_min: b_l, x_max: b_r, y_min: 0, y_max: wb.crop_h, frac_left: b_l as f64, frac_right: b_r as f64 };
-                    char_bounds.push(cb);
-                    continue;
-                }
-                if let Some((ref _norm, x_min, x_max, y_min, y_max, cx, cy)) = wb.char_crops[pos] {
-                    let cb = CharInkBounds { cx, cy, width: (x_max - x_min +1) as f64, height: (y_max - y_min +1) as f64, x_min, x_max, y_min, y_max, frac_left: x_min as f64, frac_right: x_max as f64 +1.0 };
-                    char_bounds.push(cb);
-                } else {
-                    let (b_l, b_r) = if pos+1 < wb.bounds.len() { (wb.bounds[pos], wb.bounds[pos+1]) } else { (0,wb.crop_h) };
-                    let cx = (b_l as f64 + b_r as f64)*0.5;
-                    let cy = wb.crop_h as f64 *0.5;
-                    let cb = CharInkBounds { cx, cy, width: b_r.saturating_sub(b_l) as f64, height: wb.crop_h as f64, x_min: b_l, x_max: b_r, y_min:0, y_max: wb.crop_h, frac_left: b_l as f64, frac_right: b_r as f64 };
-                    char_bounds.push(cb);
-                }
-            }
-            wib.push(WordGeoMeasurement { chars: char_bounds });
+            // F4: char ink bounds are hoisted once per (word, k) in the
+            // cache build above — the per-font rebuild here was identical
+            // for every font. Arc-clone only.
+            wib.push(WordGeoMeasurement { chars: std::sync::Arc::clone(&wb.char_bounds) });
 
-            // For scoring, we will handle after wib built? Need temps now but wib already has cx
-            // Actually temps need only crops, not wib
             for &c in wb.collapsed.iter() {
                 if !crate::features::is_supported(c) { continue; }
                 // Count only if crop exists – will filter later
                 // (pos check done in scoring_temps)
-                temps_collect.push(Temp {
-                    ch: c,
-                    weight: 1.0,
-                    area_px: 0.0,
-                    ood: 1.0,
-                    best_prob: 0.0,
-                    nearest: Vec::new(),
-                    logit: None,
-                    prob: None,
-                    geo_h_ll: 0.0,
-                    geo_v_ll: 0.0,
-                    geo_h_err: 0.0,
-                    geo_v_err: 0.0,
-                    geo_h_overlap_correction_px: None,
-                    obs_cx: 0.0,
-                    pred_cx: 0.0,
-                    obs_pitch: None,
-                    pred_pitch: None,
-                    geo_scale: 0.0,
-                    ink_width: 0.0,
-                });
+                n_temps += 1;
             }
             // Build WordSeg for geo
             let seg = WordSeg {
@@ -371,7 +496,7 @@ pub fn identify_fonts(
                 chars: wb.collapsed.clone(),
                 boundaries: wb.bounds.clone(),
                 seam_paths: wb.seams.clone(),
-                seam_costs: Arc::new(wb.summary.seam_costs.clone()),
+                seam_costs: std::sync::Arc::clone(&wb.summary.seam_costs),
                 crop_h: wb.crop_h,
                 word_text: wb.word_text.clone(),
                 image_w: wb.summary.image_w,
@@ -432,15 +557,10 @@ pub fn identify_fonts(
         if !is_ensure { non_ensure_survivors += 1; };
         total_survivors += 1;
 
-        // Now compute features and logits for scoring temps
-        // Need to map temps to actual crops: we have to retrieve norm images from builds
-        // Build a flat list of crops corresponding to temps order is same as temps_collect order
-        // We have temps_collect built in order of word_segs traversal, same as we need
-        // But we still need features: compute_features on each cached norm image
-
-        // Rebuild temps with features: we need to iterate again over builds to get norm images and match temps order
-
-        let mut scoring_temps: Vec<Temp> = Vec::with_capacity(temps_collect.len());
+        // Now compute features and logits for scoring temps:
+        // iterate builds again to get the norm images, in the same
+        // order, and build the temps with features.
+        let mut scoring_temps: Vec<Temp> = Vec::with_capacity(n_temps);
         for (seg_idx, wb) in builds.iter().enumerate() {
             for (pos, &c) in wb.collapsed.iter().enumerate() {
                 if !crate::features::is_supported(c) { continue; }
@@ -450,19 +570,6 @@ pub fn identify_fonts(
                 // area from bbox (font-independent, cheap)
                 let (_ref_norm, _x_min,_x_max,_y_min,_y_max,_cx,_cy) = crop_opt.as_ref().unwrap();
                 let area_px = ((_x_max - _x_min + 1) * (_y_max - _y_min + 1)) as f32;
-                // Hoisted: reuse precomputed features (font-independent) – avoids 2743× recompute
-                let feat = match &wb.pre_features[pos] {
-                    Some(f) => f.clone(),
-                    None => {
-                        // fallback recompute if not cached (should be rare)
-                        if let Some((ref norm, _,_,_,_,_,_)) = wb.char_crops[pos] {
-                            match crate::features::compute_features(norm, false) {
-                                Some(f) => f,
-                                None => continue,
-                            }
-                        } else { continue }
-                    }
-                };
                 // Temp placeholder – classify below; pull geo from per-font dense grid (no hash)
                 let cell = if seg_idx < geo_grid.len() && pos < geo_grid[seg_idx].len() {
                     geo_grid[seg_idx][pos].unwrap_or_default()
@@ -475,6 +582,7 @@ pub fn identify_fonts(
                     weight: 1.0,
                     area_px,
                     ood: 1.0,
+                    obs_stats: None,
                     best_prob: 0.0,
                     nearest: Vec::new(),
                     logit: None,
@@ -491,39 +599,74 @@ pub fn identify_fonts(
                     geo_scale: cell.scale,
                     ink_width: cell.ink_width,
                 };
-                // Classify for ood + best_prob + nearest
+                // Classify for ood + best_prob + nearest. Hoisted (F1): reuse
+                // the per-(word, collapsed) classifier results computed when
+                // the cache entry was built; fall back to live calls only
+                // when no hoisted result exists (feature computation failed).
                 let seq = [c];
-                let picks = classifier.classify(&seq, &feat, 3);
-                let ood = classifier::take_ood_weight();
-                t.ood = ood;
-                let best_prob = picks.iter().map(|(_,p)| *p).fold(0.0f32, f32::max);
-                t.best_prob = best_prob;
-                t.nearest = picks.iter().take(3).map(|&(id,p)| (id,p)).collect();
-                // Logit for this font's glyph
-                if let Some(gid) = glyph_map.glyph_id_for_font(&seq, fk) {
-                    let logits = classifier.raw_logits(&seq, &feat);
-                    if logits.is_empty() {
-                        // cannot score
-                    } else {
-                        let mut max_logit = f32::NEG_INFINITY;
-                        for (_, l) in &logits { if *l > max_logit { max_logit = *l; } }
-                        let exps: Vec<f32> = logits.iter().map(|(_, l)| (*l - max_logit).exp()).collect();
-                        let sum_exp: f32 = exps.iter().sum();
-                        let mut logit_for_gid: Option<f32> = None;
-                        let mut prob_for_gid: Option<f32> = None;
-                        for (i, (gid2, logit)) in logits.iter().enumerate() {
-                            if *gid2 == gid {
-                                logit_for_gid = Some(*logit);
-                                if sum_exp < 1e-30 {
-                                    prob_for_gid = Some(1.0 / exps.len() as f32);
-                                } else {
-                                    prob_for_gid = Some(exps[i] / sum_exp);
-                                }
-                                break;
+                match wb.classify.get(pos).and_then(|o| o.as_ref()) {
+                    Some(hc) => {
+                        t.ood = hc.ood;
+                        t.obs_stats = hc.obs_stats.clone();
+                        let best_prob = hc.picks.iter().map(|(_,p)| *p).fold(0.0f32, f32::max);
+                        t.best_prob = best_prob;
+                        t.nearest = hc.picks.iter().take(3).map(|&(id,p)| (id,p)).collect();
+                        // Logit for this font's glyph
+                        if let Some(gid) = glyph_map.glyph_id_for_font(&seq, fk) {
+                            if let Some((logit, prob)) = hc.logit_prob_for(gid) {
+                                t.logit = Some(logit);
+                                t.prob = Some(prob);
                             }
                         }
-                        t.logit = logit_for_gid;
-                        t.prob = prob_for_gid;
+                    }
+                    None => {
+                        // Hoisted: reuse precomputed features (font-independent) – avoids 2743× recompute
+                        let feat = match &wb.pre_features[pos] {
+                            Some(f) => f.clone(),
+                            None => {
+                                // fallback recompute if not cached (should be rare)
+                                if let Some((ref norm, _,_,_,_,_,_)) = wb.char_crops[pos] {
+                                    match crate::features::compute_features(norm, false) {
+                                        Some(f) => f,
+                                        None => continue,
+                                    }
+                                } else { continue }
+                            }
+                        };
+                        let picks = classifier.classify(&seq, &feat, 3);
+                        let ood = classifier::take_ood_weight();
+                        t.ood = ood;
+                        t.obs_stats = classifier::take_obs_stats();
+                        let best_prob = picks.iter().map(|(_,p)| *p).fold(0.0f32, f32::max);
+                        t.best_prob = best_prob;
+                        t.nearest = picks.iter().take(3).map(|&(id,p)| (id,p)).collect();
+                        // Logit for this font's glyph
+                        if let Some(gid) = glyph_map.glyph_id_for_font(&seq, fk) {
+                            let logits = classifier.raw_logits(&seq, &feat);
+                            if logits.is_empty() {
+                                // cannot score
+                            } else {
+                                let mut max_logit = f32::NEG_INFINITY;
+                                for (_, l) in &logits { if *l > max_logit { max_logit = *l; } }
+                                let exps: Vec<f32> = logits.iter().map(|(_, l)| (*l - max_logit).exp()).collect();
+                                let sum_exp: f32 = exps.iter().sum();
+                                let mut logit_for_gid: Option<f32> = None;
+                                let mut prob_for_gid: Option<f32> = None;
+                                for (i, (gid2, logit)) in logits.iter().enumerate() {
+                                    if *gid2 == gid {
+                                        logit_for_gid = Some(*logit);
+                                        if sum_exp < 1e-30 {
+                                            prob_for_gid = Some(1.0 / exps.len() as f32);
+                                        } else {
+                                            prob_for_gid = Some(exps[i] / sum_exp);
+                                        }
+                                        break;
+                                    }
+                                }
+                                t.logit = logit_for_gid;
+                                t.prob = prob_for_gid;
+                            }
+                        }
                     }
                 }
                 scoring_temps.push(t);
@@ -535,9 +678,17 @@ pub fn identify_fonts(
         // Median ink-bbox pixel area across this line's scored crops; small
         // punctuation upscaled to the canonical cell gets downweighted by
         // area/median so its (noisy) glyph evidence counts less.
-        let mut areas: Vec<f32> = scoring_temps.iter().map(|t| t.area_px).collect();
-        areas.sort_by(|a,b| a.partial_cmp(b).unwrap());
-        let median_area = if areas.is_empty() { 1.0 } else { areas[areas.len()/2].max(1.0) };
+        // Hoisted (F5): the area multiset depends only on the line's words
+        // and the font's ligature-collapse mask — the crops depend only on
+        // the per-word segment count k, and the collapsed sequences depend
+        // only on `allowed` — so fonts sharing a mask share the median.
+        // (Not once per line: lig vs nolig fonts collapse differently, so
+        // their temp multisets — and medians — genuinely differ.)
+        let median_area = *median_area_cache.entry(allowed).or_insert_with(|| {
+            let mut areas: Vec<f32> = scoring_temps.iter().map(|t| t.area_px).collect();
+            areas.sort_by(|a, b| a.partial_cmp(b).unwrap());
+            if areas.is_empty() { 1.0 } else { areas[areas.len() / 2].max(1.0) }
+        });
         for t in scoring_temps.iter_mut() {
             t.weight = t.area_px / median_area;
         }
@@ -579,7 +730,10 @@ pub fn identify_fonts(
                 pflda_top_p: None,
                 pflda_ocr_p: None,
                 pflda_replaced: false,
-                obs_stats: classifier::take_obs_stats(),
+                // Per-char stats captured with the hoisted classify call (F1).
+                // The old code took the thread-local here, which held the
+                // LAST temp's stats — misattributed to the first observation.
+                obs_stats: t.obs_stats.clone(),
                 glyph_score: Some(logit),
                 prob: Some(prob),
                 geo_h_ll: Some(t.geo_h_ll),
@@ -659,19 +813,20 @@ pub fn identify_fonts(
     }
 
     // Tiebreak on identical fine scores with the shared font-key preference
-    // (same as --resolve-fontkey: kerned font → kern, kern-less → nokern;
-    // nolig; opsz=10; OT-feature variants and non-default weight
-    // instances -10). Font-key order is the final deterministic fallback.
+    // (same as --resolve-fontkey: highest version first, then kerned
+    // font → kern, kern-less → nokern; nolig; opsz=10; OT-feature
+    // variants and non-default weight instances -10). Font-key order is
+    // the final deterministic fallback.
     // Preferences are precomputed once — the comparator must stay cheap.
     // Owned String keys: borrowing scored's keys would conflict with the
     // mutable sort below.
-    let prefs: std::collections::HashMap<String, i32> = scored
+    let prefs: std::collections::HashMap<String, (u32, i32)> = scored
         .iter()
         .map(|(k, _)| {
             let p = font_registry
                 .by_key(k)
                 .map(|fe| crate::font_scan::font_key_preference_score(k, fe.has_kern))
-                .unwrap_or(0);
+                .unwrap_or((0, 0));
             (k.clone(), p)
         })
         .collect();
