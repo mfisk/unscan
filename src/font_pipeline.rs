@@ -3,7 +3,6 @@
 //! - [`LineMatch`]: per-line font matching result
 //! - [`match_lines`]: Pass 1 — parallel font matching with SSIM fast path
 //! - [`update_dominant_font`]: dominant font candidate update after Pass 1
-//! - [`paragraph_font_grouping`]: Pass 1.5 — paragraph-level font grouping
 //!
 //! Rule-out via infinite penalty: if a font does not contain a character that
 //! appears in the string, `per_char_geo` returns `None` (cmap miss). The
@@ -1381,46 +1380,6 @@ pub fn update_dominant_font(line_matches: &[LineMatch]) -> Option<font_match::Fo
                 .cloned())
     } else {
         None
-    }
-}
-
-/// Pass 1.5: paragraph-level font grouping.
-///
-/// Finds the dominant body font: most common font among matched lines at the
-/// most common font size (±1pt tolerance). Currently diagnostic-only.
-pub fn paragraph_font_grouping(lines: &[TextLine], line_matches: &[LineMatch]) {
-    // Collect (font_size_bucket) frequencies
-    let mut size_freq: HashMap<i32, u32> = HashMap::new();
-    for (i, lm) in line_matches.iter().enumerate() {
-        if lm.font_result.is_some() {
-            let bucket = lines[i].font_size_pt.round() as i32;
-            *size_freq.entry(bucket).or_default() += 1;
-        }
-    }
-    // Find most common size bucket
-    let body_size = size_freq.iter()
-        .max_by_key(|(_, &v)| v)
-        .map(|(&k, _)| k);
-
-    if let Some(body_size) = body_size {
-        // Count fonts at body size (±1pt)
-        let mut font_freq: HashMap<String, (u32, PathBuf)> = HashMap::new();
-        for (i, lm) in line_matches.iter().enumerate() {
-            let sz = lines[i].font_size_pt.round() as i32;
-            if (sz - body_size).abs() <= 1 {
-                if let Some(ref fm) = lm.font_result {
-                    let entry = font_freq.entry(fm.font_name.clone())
-                        .or_insert_with(|| (0, fm.font_path.clone()));
-                    entry.0 += 1;
-                }
-            }
-        }
-        // Find majority font
-        if let Some((_majority_name, (_majority_count, _majority_path))) = font_freq.iter()
-            .max_by_key(|(_, (count, _))| *count)
-        {
-            let _total_body: u32 = font_freq.values().map(|(c, _)| c).sum();
-        }
     }
 }
 

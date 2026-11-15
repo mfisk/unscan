@@ -946,9 +946,6 @@ fn run(args: &cli::Args, classifier: &mut dyn classifier::Classifier) -> Result<
         if scored_lines > 0 {
         }
 
-        // ── Pass 1.5: Paragraph-level font grouping ─────────────────
-        font_pipeline::paragraph_font_grouping(&lines, &line_matches);
-
         // ── Word split: split wide whitespace using matched fonts ──
         let mut split_indices: Vec<usize>;
         {
