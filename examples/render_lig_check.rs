@@ -45,8 +45,9 @@ fn main() {
     // Path A: render_ngram (collapses via collapsed_lig_set()).
     let mut gmap = NgramGlyphMap::new(0);
     let params = RenderParams::default();
+    let font_cache = unprint::font_cache::FontCache::new(unprint::font_cache::DEFAULT_CAPACITY);
     let mut render_a = |fe: &font_scan::FontEntry, seq: &[char], tag: &str| -> (u64, u32, u32) {
-        let (hash, img) = render_ngram(fe, seq, &mut gmap, &params, &unprint_fonts::NoKern)
+        let (hash, img) = render_ngram(fe, &font_cache, seq, &mut gmap, &params, &unprint_fonts::NoKern)
             .unwrap_or_else(|| panic!("render_ngram failed for {} {:?}", fe.font_key(), seq));
         let p = format!("/tmp/ligcheck_a_{}.png", tag);
         img.save(&p).unwrap();

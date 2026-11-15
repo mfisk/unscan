@@ -655,7 +655,8 @@ fn run(args: &cli::Args, classifier: &mut dyn classifier::Classifier) -> Result<
                     continue;
                 }
                 let Some(fe) = font_registry.by_key(font_key) else { continue };
-                let Ok(font_data) = std::fs::read(&fe.path) else { continue };
+                // Font bytes from the shared FontCache (F36).
+                let Ok(font_data) = font_cache.load(&fe.path) else { continue };
                 let Ok(face) = unprint_fonts::ttf_parser::Face::parse(&font_data, 0) else { continue };
                 // Require at least one Latin letter (a-z) to avoid NotoColorEmoji (which has only digits 0-9)
                 // NotoColorEmoji has 0-9 but no letters -> would pass 'any supported char' and then hang indexing 11M CBDT
@@ -722,8 +723,8 @@ fn run(args: &cli::Args, classifier: &mut dyn classifier::Classifier) -> Result<
                 // re-enabled.
                 let kern = geo_cache.kern_provider(font_key);
 
-                // Load font data
-                let font_data = match std::fs::read(&fe.path) {
+                // Load font data from the shared FontCache (F36).
+                let font_data = match font_cache.load(&fe.path) {
                     Ok(d) => d,
                     Err(_) => continue,
                 };
