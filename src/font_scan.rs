@@ -51,13 +51,6 @@ fn lig_bit(c: char) -> Option<u8> {
         _ => None,
     }
 }
-#[inline]
-#[allow(dead_code)]
-fn lig_contains(mask: LigMask, c: char) -> bool {
-    if let Some(b) = lig_bit(c) {
-        (mask & (1u8 << b)) != 0
-    } else { false }
-}
 
 /// Cache of final collapsed lig sets per font path — eliminates 33.9%
 /// inclusive hot path (font_match.rs:138, font_pipeline.rs:381) which
@@ -638,12 +631,6 @@ impl FontEntry {
         }
 
         mask
-    }
-
-    /// Back-compat shim: old name kept for any missed call sites.
-    #[allow(dead_code)]
-    pub fn allowed_lig_set(&self) -> LigMask {
-        self.collapsed_lig_set()
     }
 
     /// Count interior 100% top-to-bottom white vertical gutters inside the glyph

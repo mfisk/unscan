@@ -123,9 +123,6 @@ struct GeoCell {
     ink_width: f32,
 }
 
-#[allow(dead_code)]
-const MIN_NGRAM_PROB: f32 = 0.001;
-
 #[derive(Debug)]
 pub struct FontIdResult {
     pub scores: Vec<(String, f32)>,

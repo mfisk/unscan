@@ -4,27 +4,6 @@
 use image::GrayImage;
 use crate::text::TextLine;
 
-/// Fractional ink edges from a max-darkness profile — the ONE canonical
-/// subpixel edge measurement (linear darkness fractions, no gamma, always on).
-/// `dark[i]` is the max darkness (255 - pixel value) of column/row `i`;
-/// `min_dark` is the minimum darkness for an index to count as ink. Callers
-/// pass 255 - ink threshold, +1 so the bound matches `< threshold` exactly
-/// (darkness >= 256 - threshold ⇔ pixel < threshold); the char path passes
-/// 255 - INK_THRESH = 15 directly, so near-threshold antialiased edge pixels
-/// count as ink there. Returns (frac_left, frac_right) in pixel-edge
-/// coordinates: index `i` spans [i, i+1]. Each edge is shifted inward by the
-/// edge index's darkness as a fraction of the profile's darkest index, so a
-/// half-dark edge contributes half its pixel width. Returns None when no
-/// index reaches `min_dark`.
-pub fn frac_edges_from_profile(dark: &[u8], min_dark: u16) -> Option<(f64, f64)> {
-    let first = dark.iter().position(|&d| d as u16 >= min_dark)?;
-    let last = dark.iter().rposition(|&d| d as u16 >= min_dark)?;
-    let d_max = dark.iter().max().copied().unwrap_or(0) as f64;
-    let f_first = if d_max > 0.0 { dark[first] as f64 / d_max } else { 1.0 };
-    let f_last = if d_max > 0.0 { dark[last] as f64 / d_max } else { 1.0 };
-    Some((first as f64 + (1.0 - f_first), last as f64 + f_last))
-}
-
 fn walk_ink_edge(
     gray: &GrayImage,
     start: u32,

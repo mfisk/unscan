@@ -972,7 +972,6 @@ pub struct GeometryCache {
     #[allow(dead_code)]
     mmap: memmap2::Mmap,
     fonts: HashMap<String, FontMmapIndex>,
-    _cache_path: PathBuf,
     /// Glyph override maps for OT variants (smcp, onum, ss01, ss02).
     /// Maps font_key -> (char -> overridden glyph ID).
     /// Populated in-memory from FontRegistry; not serialized in mmap.
@@ -3228,7 +3227,7 @@ impl GeometryCache {
 
         let elapsed = t_build_start.elapsed().as_secs_f64();
         if !quiet { eprintln!("[geo-cache] Built Font geometry cache in {:.1}s ({} total, {} reused, {} built, GPOS full incl singles, Unicode both formats)", elapsed, n_total, n_reused, n_built); }
-        let tmp_cache = Self { mmap: memmap2::MmapOptions::new().len(0).map_anon().unwrap().make_read_only().unwrap(), fonts: HashMap::new(), _cache_path: cache_path.clone(), glyph_overrides: HashMap::new() };
+        let tmp_cache = Self { mmap: memmap2::MmapOptions::new().len(0).map_anon().unwrap().make_read_only().unwrap(), fonts: HashMap::new(), glyph_overrides: HashMap::new() };
         if let Err(e) = tmp_cache.write_bin_from_owned(&cache_path, catalog_hash, &owned_fonts) {
             eprintln!("warning: failed to write geo cache to {}: {e}", cache_path.display());
         } else {
@@ -3243,7 +3242,7 @@ impl GeometryCache {
             Err(e) => {
                 eprintln!("failed to reload just-written cache: {e}, returning empty");
                 let empty_mmap = memmap2::MmapOptions::new().len(0).map_anon().unwrap().make_read_only().unwrap();
-                Self { mmap: empty_mmap, fonts: HashMap::new(), _cache_path: cache_path, glyph_overrides: HashMap::new() }
+                Self { mmap: empty_mmap, fonts: HashMap::new(), glyph_overrides: HashMap::new() }
             }
         }
     }
@@ -4553,7 +4552,7 @@ impl GeometryCache {
             fonts.insert(font_key, idx.clone());
             ordered.push(idx);
         }
-        Ok((Self { mmap, fonts, _cache_path: path.to_path_buf(), glyph_overrides: HashMap::new() }, catalog_hash))
+        Ok((Self { mmap, fonts, glyph_overrides: HashMap::new() }, catalog_hash))
     }
 
     // compatibility for tests - returns old kern-only view
