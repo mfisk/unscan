@@ -1078,7 +1078,17 @@ impl GroundTruth {
     /// `matched_ps` should be the PostScript name of the chosen font.
     /// Returns true if it's a hit (correct match), false if it's a miss.
     pub fn is_hit(&self, page: usize, bbox_px: &[f32; 4], dpi: u32, matched_ps: &str) -> bool {
-        match self.lookup_font(page, bbox_px, dpi) {
+        Self::is_hit_with_font(self.lookup_font(page, bbox_px, dpi), matched_ps)
+    }
+
+    /// Check whether a matched font is correct, given the ground-truth
+    /// font name already looked up for this position (F17: callers that
+    /// already ran `lookup_font` for the same bbox pass the name here
+    /// instead of running the span search a second time).
+    /// `matched_ps` should be the PostScript name of the chosen font.
+    /// Returns true if it's a hit (correct match), false if it's a miss.
+    pub fn is_hit_with_font(gt_font_name: Option<&str>, matched_ps: &str) -> bool {
+        match gt_font_name {
             Some(actual) => {
                 // After canonicalize_names(), span font names are already
                 // canonical (weight-explicit).  Exact equality is correct.
