@@ -14,7 +14,7 @@ use std::sync::Arc;
 use std::collections::HashMap;
 use image::GrayImage;
 use crate::classifier::{self, ObsStats};
-use crate::segment::{WordSeg, SegSummary, collapse_ligature_chars_for_allowed, char_crop_and_metrics};
+use crate::segment::{WordSeg, SegSummary, collapse_ligature_chars_for_allowed, segment_characters, char_crop_and_metrics};
 use crate::geometry_classifier::{CharInkBounds, WordGeoMeasurement};
 
 static GEO_WEIGHT: std::sync::LazyLock<f32> = std::sync::LazyLock::new(|| {
@@ -145,55 +145,6 @@ struct SegCacheEntry {
     pre_features: std::sync::Arc<Vec<Option<crate::features::CropFeatures>>>,
 }
 
-/// Font-independent classifier results for one char crop, computed once per
-/// (word, collapsed char sequence, position) and reused for every font.
-/// `classify` and `raw_logits` take only the char and its precomputed features,
-/// so their outputs are identical for every font — recomputing them per font
-/// was ~60% of profiled time. NOTE: this is keyed by the collapsed char
-/// sequence, NOT by k: two fonts can share k while collapsing different
-/// ligature pairs (e.g. "ff" vs "fl" in "affluent"), which puts different
-/// chars at the same position and changes the classifier inputs.
-struct HoistedClassify {
-    /// Top-3 picks from `classify` (glyph id, probability).
-    picks: Vec<(usize, f32)>,
-    /// OOD confidence weight, taken right after the `classify` call.
-    ood: f32,
-    /// Per-observation classifier stats, taken right after the `classify`
-    /// call (Some only when UNPRINT_OBS_STATS=1). Capturing per char fixes
-    /// the old attribution, where the thread-local held the LAST temp's
-    /// stats and the first observation took them.
-    obs_stats: Option<ObsStats>,
-    /// Raw logits from `raw_logits` (glyph id, logit), in model order.
-    logits: Vec<(usize, f32)>,
-    /// Softmax normalizers over `logits`: (max logit, sum of exps), computed
-    /// with the exact same operations as the old per-font code. None when
-    /// `logits` is empty (cannot score).
-    logit_stats: Option<(f32, f32)>,
-}
-
-impl HoistedClassify {
-    /// (logit, prob) for one glyph id, bit-identical to the old per-font
-    /// softmax code: prob = exp(logit - max) / sum_exp, or 1/n when
-    /// sum_exp is degenerate. None when the glyph is absent or logits empty.
-    fn logit_prob_for(&self, gid: usize) -> Option<(f32, f32)> {
-        let (max_logit, sum_exp) = self.logit_stats?;
-        let mut logit_for_gid: Option<f32> = None;
-        for (gid2, logit) in &self.logits {
-            if *gid2 == gid {
-                logit_for_gid = Some(*logit);
-                break;
-            }
-        }
-        let logit = logit_for_gid?;
-        let prob = if sum_exp < 1e-30 {
-            1.0 / self.logits.len() as f32
-        } else {
-            (logit - max_logit).exp() / sum_exp
-        };
-        Some((logit, prob))
-    }
-}
-
 pub fn identify_fonts(
     word_infos: &[WordImgInfo],
     classifier: &dyn crate::classifier::Classifier,
@@ -205,18 +156,12 @@ pub fn identify_fonts(
     font_registry: &crate::font_scan::FontRegistry,
     font_cache: &crate::font_cache::FontCache,
     geo_cache: &crate::geo_cache::GeometryCache,
-    seg_cache: &mut crate::segment::SegmentCache,
 ) -> FontIdResult {
     if word_infos.is_empty() {
         return FontIdResult { scores: Vec::new(), observations: Vec::new(), gt_observations: Vec::new(), path_score: f32::MIN, gt_per_char_geo_ll: Vec::new() };
     }
 
     let mut seg_caches: Vec<HashMap<usize, SegCacheEntry>> =
-        (0..word_infos.len()).map(|_| HashMap::new()).collect();
-
-    // Hoisted classifier results per word, keyed by the collapsed char
-    // sequence (see HoistedClassify: same k can hold different chars).
-    let mut classify_caches: Vec<HashMap<Vec<char>, std::sync::Arc<Vec<Option<HoistedClassify>>>>> =
         (0..word_infos.len()).map(|_| HashMap::new()).collect();
 
     let mut ensure_set: FxHashSet<&str> = FxHashSet::default();
@@ -258,7 +203,6 @@ pub fn identify_fonts(
             pruned_count = 0;
             // Reset seg caches for clean second pass
             seg_caches = (0..word_infos.len()).map(|_| HashMap::new()).collect();
-            classify_caches = (0..word_infos.len()).map(|_| HashMap::new()).collect();
         }
         let mut non_ensure_survivors: usize = 0;
         let mut total_survivors: usize = 0;
@@ -282,8 +226,6 @@ pub fn identify_fonts(
             summary: SegSummary,
             char_crops: std::sync::Arc<Vec<Option<(Arc<GrayImage>, u32,u32,u32,u32,f64,f64)>>>, // Arc<Vec> makes per-font clone Arc::clone cheap (was Vec<Option> 3.1%)
             pre_features: std::sync::Arc<Vec<Option<crate::features::CropFeatures>>>,
-            // Hoisted classifier results for this word's collapsed chars (F1) – Arc clone cheap.
-            classify: std::sync::Arc<Vec<Option<HoistedClassify>>>,
             crop_h: u32,
             word_img: Arc<GrayImage>,
             word_text: String,
@@ -299,16 +241,7 @@ pub fn identify_fonts(
             // get or create cache entry for this word k
             let cache = &mut seg_caches[wi_idx];
             if !cache.contains_key(&k) {
-                // Shared per-line cache: segment_line (diag) and
-                // build_for_font (winner rebuild) segment this same
-                // (image, k) — compute it once per line. The local entry
-                // still caches the derived char crops + precomputed
-                // features, which are font-independent but expensive to
-                // rebuild per font.
-                let cached = seg_cache.get_or_compute(&wi.img, k, &wi.text);
-                let b = cached.bounds.clone();
-                let s = cached.seams.clone();
-                let sum = cached.summary.clone();
+                let (b, s, sum) = segment_characters(&wi.img, k, &wi.text);
                 let crop_h = wi.img.height();
                 let mut char_crops: Vec<Option<(Arc<GrayImage>,u32,u32,u32,u32,f64,f64)>> = Vec::with_capacity(k);
                 for i in 0..k {
@@ -328,49 +261,6 @@ pub fn identify_fonts(
                 cache.insert(k, SegCacheEntry { bounds: b, seams: s, summary: sum, char_crops: std::sync::Arc::new(char_crops), pre_features: std::sync::Arc::new(pre_features) });
             }
             let ent = cache.get(&k).unwrap();
-            // Hoist classifier results (F1): classify + raw_logits depend only
-            // on (collapsed char, precomputed features), so compute once per
-            // distinct collapsed sequence and reuse for every font. The
-            // thread-local side channels are taken immediately after the
-            // classify call, so each char's ood/obs_stats attach to that char.
-            let cc_cache = &mut classify_caches[wi_idx];
-            if !cc_cache.contains_key(&collapsed) {
-                let mut hoisted: Vec<Option<HoistedClassify>> = Vec::with_capacity(k);
-                for (pos, &c) in collapsed.iter().enumerate() {
-                    // Same feature fallback as the temps loop: recompute from
-                    // the crop when the cached features are missing.
-                    let feat_opt: Option<crate::features::CropFeatures> = match &ent.pre_features[pos] {
-                        Some(f) => Some(f.clone()),
-                        None => match &ent.char_crops[pos] {
-                            Some((ref norm, _, _, _, _, _, _)) => crate::features::compute_features(norm, false),
-                            None => None,
-                        },
-                    };
-                    let h = feat_opt.map(|feat| {
-                        let seq = [c];
-                        let picks = classifier.classify(&seq, &feat, 3);
-                        let ood = classifier::take_ood_weight();
-                        let obs_stats = classifier::take_obs_stats();
-                        let logits = classifier.raw_logits(&seq, &feat);
-                        // Same max/sum operations, same order, as the old
-                        // per-font softmax code, so per-glyph probs are
-                        // bit-identical.
-                        let logit_stats = if logits.is_empty() {
-                            None
-                        } else {
-                            let mut max_logit = f32::NEG_INFINITY;
-                            for (_, l) in &logits { if *l > max_logit { max_logit = *l; } }
-                            let exps: Vec<f32> = logits.iter().map(|(_, l)| (*l - max_logit).exp()).collect();
-                            let sum_exp: f32 = exps.iter().sum();
-                            Some((max_logit, sum_exp))
-                        };
-                        HoistedClassify { picks, ood, obs_stats, logits, logit_stats }
-                    });
-                    hoisted.push(h);
-                }
-                cc_cache.insert(collapsed.clone(), std::sync::Arc::new(hoisted));
-            }
-            let classify = std::sync::Arc::clone(cc_cache.get(&collapsed).unwrap());
             // Clone needed data for WordBuild (bounds clone cheap, seams Arc clone cheap, char_crops/pre_features now Arc clone cheap)
             builds.push(WordBuild {
                 collapsed,
@@ -379,7 +269,6 @@ pub fn identify_fonts(
                 summary: ent.summary.clone(),
                 char_crops: std::sync::Arc::clone(&ent.char_crops),
                 pre_features: std::sync::Arc::clone(&ent.pre_features),
-                classify,
                 crop_h: wi.img.height(),
                 word_img: wi.img.clone(),
                 word_text: wi.text.clone(),
@@ -402,9 +291,6 @@ pub fn identify_fonts(
             weight: f32,
             area_px: f32,
             ood: f32,
-            // Per-observation classifier stats, captured with the hoisted
-            // classify call (Some only when UNPRINT_OBS_STATS=1).
-            obs_stats: Option<ObsStats>,
             best_prob: f32,
             nearest: Vec<(usize,f32)>,
             logit: Option<f32>,
@@ -461,7 +347,6 @@ pub fn identify_fonts(
                     weight: 1.0,
                     area_px: 0.0,
                     ood: 1.0,
-                    obs_stats: None,
                     best_prob: 0.0,
                     nearest: Vec::new(),
                     logit: None,
@@ -565,6 +450,19 @@ pub fn identify_fonts(
                 // area from bbox (font-independent, cheap)
                 let (_ref_norm, _x_min,_x_max,_y_min,_y_max,_cx,_cy) = crop_opt.as_ref().unwrap();
                 let area_px = ((_x_max - _x_min + 1) * (_y_max - _y_min + 1)) as f32;
+                // Hoisted: reuse precomputed features (font-independent) – avoids 2743× recompute
+                let feat = match &wb.pre_features[pos] {
+                    Some(f) => f.clone(),
+                    None => {
+                        // fallback recompute if not cached (should be rare)
+                        if let Some((ref norm, _,_,_,_,_,_)) = wb.char_crops[pos] {
+                            match crate::features::compute_features(norm, false) {
+                                Some(f) => f,
+                                None => continue,
+                            }
+                        } else { continue }
+                    }
+                };
                 // Temp placeholder – classify below; pull geo from per-font dense grid (no hash)
                 let cell = if seg_idx < geo_grid.len() && pos < geo_grid[seg_idx].len() {
                     geo_grid[seg_idx][pos].unwrap_or_default()
@@ -577,7 +475,6 @@ pub fn identify_fonts(
                     weight: 1.0,
                     area_px,
                     ood: 1.0,
-                    obs_stats: None,
                     best_prob: 0.0,
                     nearest: Vec::new(),
                     logit: None,
@@ -594,74 +491,39 @@ pub fn identify_fonts(
                     geo_scale: cell.scale,
                     ink_width: cell.ink_width,
                 };
-                // Classify for ood + best_prob + nearest. Hoisted (F1): reuse
-                // the per-(word, collapsed) classifier results computed when
-                // the cache entry was built; fall back to live calls only
-                // when no hoisted result exists (feature computation failed).
+                // Classify for ood + best_prob + nearest
                 let seq = [c];
-                match wb.classify.get(pos).and_then(|o| o.as_ref()) {
-                    Some(hc) => {
-                        t.ood = hc.ood;
-                        t.obs_stats = hc.obs_stats.clone();
-                        let best_prob = hc.picks.iter().map(|(_,p)| *p).fold(0.0f32, f32::max);
-                        t.best_prob = best_prob;
-                        t.nearest = hc.picks.iter().take(3).map(|&(id,p)| (id,p)).collect();
-                        // Logit for this font's glyph
-                        if let Some(gid) = glyph_map.glyph_id_for_font(&seq, fk) {
-                            if let Some((logit, prob)) = hc.logit_prob_for(gid) {
-                                t.logit = Some(logit);
-                                t.prob = Some(prob);
-                            }
-                        }
-                    }
-                    None => {
-                        // Hoisted: reuse precomputed features (font-independent) – avoids 2743× recompute
-                        let feat = match &wb.pre_features[pos] {
-                            Some(f) => f.clone(),
-                            None => {
-                                // fallback recompute if not cached (should be rare)
-                                if let Some((ref norm, _,_,_,_,_,_)) = wb.char_crops[pos] {
-                                    match crate::features::compute_features(norm, false) {
-                                        Some(f) => f,
-                                        None => continue,
-                                    }
-                                } else { continue }
-                            }
-                        };
-                        let picks = classifier.classify(&seq, &feat, 3);
-                        let ood = classifier::take_ood_weight();
-                        t.ood = ood;
-                        t.obs_stats = classifier::take_obs_stats();
-                        let best_prob = picks.iter().map(|(_,p)| *p).fold(0.0f32, f32::max);
-                        t.best_prob = best_prob;
-                        t.nearest = picks.iter().take(3).map(|&(id,p)| (id,p)).collect();
-                        // Logit for this font's glyph
-                        if let Some(gid) = glyph_map.glyph_id_for_font(&seq, fk) {
-                            let logits = classifier.raw_logits(&seq, &feat);
-                            if logits.is_empty() {
-                                // cannot score
-                            } else {
-                                let mut max_logit = f32::NEG_INFINITY;
-                                for (_, l) in &logits { if *l > max_logit { max_logit = *l; } }
-                                let exps: Vec<f32> = logits.iter().map(|(_, l)| (*l - max_logit).exp()).collect();
-                                let sum_exp: f32 = exps.iter().sum();
-                                let mut logit_for_gid: Option<f32> = None;
-                                let mut prob_for_gid: Option<f32> = None;
-                                for (i, (gid2, logit)) in logits.iter().enumerate() {
-                                    if *gid2 == gid {
-                                        logit_for_gid = Some(*logit);
-                                        if sum_exp < 1e-30 {
-                                            prob_for_gid = Some(1.0 / exps.len() as f32);
-                                        } else {
-                                            prob_for_gid = Some(exps[i] / sum_exp);
-                                        }
-                                        break;
-                                    }
+                let picks = classifier.classify(&seq, &feat, 3);
+                let ood = classifier::take_ood_weight();
+                t.ood = ood;
+                let best_prob = picks.iter().map(|(_,p)| *p).fold(0.0f32, f32::max);
+                t.best_prob = best_prob;
+                t.nearest = picks.iter().take(3).map(|&(id,p)| (id,p)).collect();
+                // Logit for this font's glyph
+                if let Some(gid) = glyph_map.glyph_id_for_font(&seq, fk) {
+                    let logits = classifier.raw_logits(&seq, &feat);
+                    if logits.is_empty() {
+                        // cannot score
+                    } else {
+                        let mut max_logit = f32::NEG_INFINITY;
+                        for (_, l) in &logits { if *l > max_logit { max_logit = *l; } }
+                        let exps: Vec<f32> = logits.iter().map(|(_, l)| (*l - max_logit).exp()).collect();
+                        let sum_exp: f32 = exps.iter().sum();
+                        let mut logit_for_gid: Option<f32> = None;
+                        let mut prob_for_gid: Option<f32> = None;
+                        for (i, (gid2, logit)) in logits.iter().enumerate() {
+                            if *gid2 == gid {
+                                logit_for_gid = Some(*logit);
+                                if sum_exp < 1e-30 {
+                                    prob_for_gid = Some(1.0 / exps.len() as f32);
+                                } else {
+                                    prob_for_gid = Some(exps[i] / sum_exp);
                                 }
-                                t.logit = logit_for_gid;
-                                t.prob = prob_for_gid;
+                                break;
                             }
                         }
+                        t.logit = logit_for_gid;
+                        t.prob = prob_for_gid;
                     }
                 }
                 scoring_temps.push(t);
@@ -717,10 +579,7 @@ pub fn identify_fonts(
                 pflda_top_p: None,
                 pflda_ocr_p: None,
                 pflda_replaced: false,
-                // Per-char stats captured with the hoisted classify call (F1).
-                // The old code took the thread-local here, which held the
-                // LAST temp's stats — misattributed to the first observation.
-                obs_stats: t.obs_stats.clone(),
+                obs_stats: classifier::take_obs_stats(),
                 glyph_score: Some(logit),
                 prob: Some(prob),
                 geo_h_ll: Some(t.geo_h_ll),
