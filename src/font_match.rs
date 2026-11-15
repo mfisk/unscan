@@ -241,7 +241,7 @@ pub fn identify_fonts(
             // get or create cache entry for this word k
             let cache = &mut seg_caches[wi_idx];
             if !cache.contains_key(&k) {
-                let (b, s, sum) = segment_characters(&wi.img, k);
+                let (b, s, sum) = segment_characters(&wi.img, k, &wi.text);
                 let crop_h = wi.img.height();
                 let mut char_crops: Vec<Option<(Arc<GrayImage>,u32,u32,u32,u32,f64,f64)>> = Vec::with_capacity(k);
                 for i in 0..k {
