@@ -10,7 +10,7 @@ use std::collections::HashMap;
 use std::sync::OnceLock;
 use std::cell::RefCell;
 
-use crate::features::{contrast_normalize_char, normalize_to_ink_bounds, NORM_H};
+use crate::features::{audit_all_chars_enabled, contrast_normalize_char, is_supported, normalize_to_ink_bounds, NORM_H};
 
 // Thread-local reuse for candidate_seams forward+reverse DP buffers (perf wins)
 thread_local! {
@@ -2199,15 +2199,43 @@ pub fn segment_line(
     // Crop whole words (reliable bboxes from Tesseract) and split them
     // into individual characters using VP + seam carving.
 
-    // Every word is segmented: the old character-coverage filter (drop a
-    // word whose chars had all been seen twice) predates geometry scoring,
-    // where letter pairs matter, so no word is dropped.
+    let mut sorted: Vec<(usize, &WordPlacement)> = words
+        .iter()
+        .enumerate()
+        .filter(|(_, w)| w.width > 0)
+        .collect();
+    sorted.sort_by(|(_, a), (_, b)| b.text.chars().count().cmp(&a.text.chars().count()));
+
+    let mut char_counts: HashMap<char, usize> = HashMap::new();
     let mut word_segs: Vec<WordSeg> = Vec::new();
     let mut lig_word_segs: Vec<WordSeg> = Vec::new();
     let mut any_ligatures = false;
     let mut words_with_ligatures: Vec<bool> = vec![false; words.len()];
 
-    for (orig_idx, word) in words.iter().enumerate().filter(|(_, w)| w.width > 0) {
+    for (_word_idx, &(orig_idx, word)) in sorted.iter().enumerate() {
+        let audit_all = audit_all_chars_enabled();
+        let chars_in_word: Vec<char> = if audit_all {
+            word.text.chars().collect()
+        } else {
+            word.text.chars().filter(|c| is_supported(*c)).collect()
+        };
+        // Include 2-letter words, only exclude single-letter (and empty) unless audit-all requested
+        if !audit_all && chars_in_word.len() <= 1 {
+            continue;
+        }
+
+        let need_any = if audit_all {
+            true
+        } else {
+            chars_in_word.iter().any(|c| {
+                char_counts.get(c).copied().unwrap_or(0) < 2
+            })
+        };
+        // For 2-letter words, always keep them for geometry even if chars already seen
+        if !audit_all && chars_in_word.len() > 2 && !need_any {
+            continue;
+        }
+
         let wx = word.x_off;
         let wy = word.y_off;
         let ww = word.width;
@@ -2271,6 +2299,13 @@ pub fn segment_line(
             seam_splits: plain_seam_splits,
             seam_costs: plain_seam_costs,
         } = seg_summary_plain;
+
+        // Update char counts (for the word-skip optimisation)
+        for &c in &all_chars {
+            if audit_all || is_supported(c) {
+                *char_counts.entry(c).or_insert(0) += 1;
+            }
+        }
 
         if has_ligatures {
             // Both plain and lig share same GrayImage — Arc clone cheap, zero GrayImage copy
