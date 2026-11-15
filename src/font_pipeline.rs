@@ -758,7 +758,11 @@ pub fn match_lines(
                             Some(v) => v,
                             None => continue,
                         };
-                        let midpoint_em_px = crate::geometry_classifier::median_em_px_from_midpoints(font_key, &segs, &wib, geo_cache);
+                        // (F8: the tie-block midpoint_em_px computation was
+                        // deleted — its value was never read; the LineMatch
+                        // binding below recomputes it for the winner. The
+                        // geo predictor it called is memo-backed and pure,
+                        // so skipping the call changes no value.)
                         // Fractional line width from subpixel ink bounds, in LINE
                         // coordinates. frac_left/frac_right are word-local
                         // (0..word width), so add each word's x offset within
