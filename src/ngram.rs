@@ -94,34 +94,9 @@ pub fn build_ngram_glyph_map(
 
             if let Some(img) = crate::char_render::render_ngram_fresh(&font, seq, &gid_overrides, &params, disable_kern, &kern
                     ) {
+                // No-PNG-cache training (train-nocache-pngs): hash the
+                // in-memory render for the glyph map; do not save the PNG.
                 let hash = crate::glyph_map::hash_image(&img);
-                // Write image cache — always atomic; heals partial files from killed runs.
-                // Must use explicit encoder: `img.save(.tmp)` fails when extension is `.tmp`.
-                let path = crate::char_render::ngram_cache_path(seq, hash, &params);
-                let tmp = crate::atomic_file::tmp_for(&path);
-                if let Some(parent) = tmp.parent() {
-                    let _ = std::fs::create_dir_all(parent);
-                }
-                let ok = (|| -> std::io::Result<()> {
-                    use std::fs::File;
-                    use std::io::BufWriter;
-                    use image::codecs::png::PngEncoder;
-                    use image::ImageEncoder;
-                    let f = File::create(&tmp)?;
-                    let mut w = BufWriter::new(f);
-                    let enc = PngEncoder::new(&mut w);
-                    enc.write_image(img.as_raw(), img.width(), img.height(), image::ExtendedColorType::L8)
-                        .map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e))?;
-                    use std::io::Write;
-                    w.flush()?;
-                    Ok(())
-                })()
-                .is_ok();
-                if ok {
-                    let _ = std::fs::rename(&tmp, &path);
-                } else {
-                    let _ = std::fs::remove_file(&tmp);
-                }
                 hashes.push((seq.to_vec(), hash, fk.clone()));
             }
         }
