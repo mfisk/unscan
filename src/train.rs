@@ -708,45 +708,6 @@ pub fn load_geo_cache_for_training(font_dir: &[PathBuf], quiet: bool) -> crate::
     crate::geo_cache::GeometryCache::load_or_build(&registry, &font_cache, quiet)
 }
 
-/// Validate a per-combo feature-manifest header, returning the sequence
-/// count when the manifest is usable. Shared by `run_train` (which decides
-/// full vs incremental rebuilds) and `RuntimeTrainingData::from_registry`
-/// (which decides whether the runtime OCR-correction data is available):
-/// both read the same feature files, so both must apply the same validity
-/// rules. A single source of truth here — the two call sites previously
-/// checked different header formats, which left RTD permanently dormant
-/// after the v2 writer dropped the `fonts=` tag.
-fn parse_manifest_header(header: &str, n_seqs_expected: usize) -> Option<usize> {
-    let h = header.trim();
-    // Manifests are tagged with the ink threshold their features were
-    // extracted at; a threshold change invalidates the cache and forces
-    // feature regeneration so training and scoring never mix thresholds.
-    let th_tag = format!("th={}", crate::INK_THRESH);
-    if !h.split_whitespace().any(|t| t == th_tag) {
-        return None;
-    }
-    // New format: "seqs=106" or "v2 seqs=106"
-    if let Some(rest) = h.strip_prefix("seqs=") {
-        return rest.parse::<usize>().ok().filter(|&n| n==n_seqs_expected);
-    }
-    if h.starts_with("v2 ") {
-        if let Some(rest) = h.strip_prefix("v2 ") {
-            if let Some(s) = rest.strip_prefix("seqs=") {
-                return s.parse::<usize>().ok().filter(|&n| n==n_seqs_expected);
-            }
-        }
-    }
-    // Old format: "fonts=2743 seqs=106" — accept if seqs matches, ignore fonts
-    if h.contains("seqs=") {
-        for part in h.split_whitespace() {
-            if let Some(s) = part.strip_prefix("seqs=") {
-                if let Ok(n) = s.parse::<usize>() { if n==n_seqs_expected { return Some(n); } }
-            }
-        }
-    }
-    None
-}
-
 pub fn run_train(mut args: TrainArgs, geo_cache: &crate::geo_cache::GeometryCache) {
     // Respect wrapper env first, otherwise cap to avoid OOM on 7.8GB no-swap.
     // Previous version always forced 4 threads, ignoring RAYON_NUM_THREADS=1,
@@ -1058,6 +1019,36 @@ pub fn run_train(mut args: TrainArgs, geo_cache: &crate::geo_cache::GeometryCach
     }
     fn manifest_combo_path(feat_dir: &std::path::Path, ht: u32, aa_name: &str) -> std::path::PathBuf {
         feat_dir.join(format!("manifest_h{}_{}.txt", ht, aa_name))
+    }
+    fn parse_manifest_header(header: &str, n_seqs_expected: usize) -> Option<usize> {
+        let h = header.trim();
+        // Manifests are tagged with the ink threshold their features were
+        // extracted at; a threshold change invalidates the cache and forces
+        // feature regeneration so training and scoring never mix thresholds.
+        let th_tag = format!("th={}", crate::INK_THRESH);
+        if !h.split_whitespace().any(|t| t == th_tag) {
+            return None;
+        }
+        // New format: "seqs=106" or "v2 seqs=106"
+        if let Some(rest) = h.strip_prefix("seqs=") {
+            return rest.parse::<usize>().ok().filter(|&n| n==n_seqs_expected);
+        }
+        if h.starts_with("v2 ") {
+            if let Some(rest) = h.strip_prefix("v2 ") {
+                if let Some(s) = rest.strip_prefix("seqs=") {
+                    return s.parse::<usize>().ok().filter(|&n| n==n_seqs_expected);
+                }
+            }
+        }
+        // Old format: "fonts=2743 seqs=106" — accept if seqs matches, ignore fonts
+        if h.contains("seqs=") {
+            for part in h.split_whitespace() {
+                if let Some(s) = part.strip_prefix("seqs=") {
+                    if let Ok(n) = s.parse::<usize>() { if n==n_seqs_expected { return Some(n); } }
+                }
+            }
+        }
+        None
     }
     // Load manifest counts if it exists and header seqs matches.
     // Returns None if missing or malformed. Does NOT check font count or mtime
@@ -2017,11 +2008,8 @@ impl RuntimeTrainingData {
                 if let Ok(content) = std::fs::read_to_string(&mpath) {
                     let mut lines = content.lines();
                     if let Some(header) = lines.next() {
-                        // Same header validity as run_train: the v2 writer
-                        // emits `th=240 seqs=106`; requiring the old
-                        // `fonts={N} seqs=106` format here left RTD
-                        // permanently dormant (no cached combos → None).
-                        if parse_manifest_header(header, n_seqs).is_some() {
+                        let expected = format!("fonts={} seqs={}", catalog.len(), n_seqs);
+                        if header.trim() == expected {
                             let counts: Vec<usize> = lines
                                 .filter_map(|l| l.trim().parse::<usize>().ok())
                                 .collect();

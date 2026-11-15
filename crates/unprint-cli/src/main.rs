@@ -605,13 +605,10 @@ fn run(args: &cli::Args, classifier: &mut dyn classifier::Classifier) -> Result<
 
     // ── Incremental update: detect new fonts and add to index ──────
     // Compare cached font_meta (glyph_map) against installed fonts.
-    // New fonts are indexed and added; removed fonts are kept.
+    // New fonts are indexed and added; removed fonts are pruned from the
+    // map (perf 4.7) — their keys are dropped from every group, and groups
+    // left empty stay as placeholders so glyph_ids never shift.
     {
-        // Fast path: if catalog hash matches, no new fonts (common warm case)
-        // Use mtime+size for fast check (per Mike) - catalog_hash is hash of sorted font_keys
-        if font_registry.catalog_hash() == glyph_map.catalog_hash {
-            if !args.quiet { eprintln!("[incremental] No new fonts (catalog hash match)"); }
-        } else {
         use std::collections::HashSet;
         let installed_keys: HashSet<String> = font_registry.entries().iter()
             .map(|e| e.font_key())
@@ -620,16 +617,35 @@ fn run(args: &cli::Args, classifier: &mut dyn classifier::Classifier) -> Result<
         let cached_keys = glyph_map.cached_font_keys();
         if !args.quiet { eprintln!("[timing] incremental cached_keys {:.2}s", t_cached_keys.elapsed().as_secs_f64()); }
 
+        // Prune removed fonts from the glyph map. This runs on every
+        // invocation, independent of the catalog-hash fast path below: the
+        // hash only covers installed fonts, so a hash match does not mean
+        // the map is free of removed keys. Pruning never shifts glyph_ids
+        // (empty groups are kept), so the already-loaded classifier and
+        // the feature files stay valid.
+        let removed_keys: Vec<String> = cached_keys.difference(&installed_keys).cloned().collect();
+        if !removed_keys.is_empty() {
+            let removed_set: HashSet<String> = removed_keys.iter().cloned().collect();
+            let t_prune = std::time::Instant::now();
+            let (keys_removed, groups_emptied) = glyph_map.prune_fonts(&removed_set);
+            if keys_removed > 0 {
+                if let Err(e) = glyph_map.write_bin(&gmap_path) {
+                    eprintln!("warning: failed to write pruned glyph map: {e}");
+                }
+            }
+            if !args.quiet { eprintln!("[incremental] Pruned {} removed fonts ({} keys, {} groups emptied) in {:.2}s", removed_keys.len(), keys_removed, groups_emptied, t_prune.elapsed().as_secs_f64()); }
+        }
+
+        // Fast path: if catalog hash matches, no new fonts (common warm case)
+        // Use mtime+size for fast check (per Mike) - catalog_hash is hash of sorted font_keys
+        if font_registry.catalog_hash() == glyph_map.catalog_hash {
+            if !args.quiet { eprintln!("[incremental] No new fonts (catalog hash match)"); }
+        } else {
         if !args.quiet { eprintln!("[incremental] installed={} cached={} (glyph_map has {} unique fonts)", installed_keys.len(), cached_keys.len(), cached_keys.len()); }
 
         let t_diff = std::time::Instant::now();
         let mut new_keys: Vec<String> = installed_keys.difference(&cached_keys).cloned().collect();
-        let removed_keys: Vec<String> = cached_keys.difference(&installed_keys).cloned().collect();
         if !args.quiet { eprintln!("[timing] incremental diff {:.2}s (new={} removed={})", t_diff.elapsed().as_secs_f64(), new_keys.len(), removed_keys.len()); }
-
-        if !removed_keys.is_empty() {
-            if !args.quiet { eprintln!("[incremental] Keeping {} removed fonts (trained data still valid for classification)", removed_keys.len()); }
-        }
 
         // Filter out non-Latin fonts that cannot render any supported_chars
         // (NotoSansBamum, NotoSansGothic, NotoSerifLao etc. = 5898-5660 = 238).
