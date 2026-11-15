@@ -471,8 +471,11 @@ pub fn identify_fonts(
             geo_scale: f32,
             ink_width: f32,
         }
-        // We'll collect per-word wib and temps
-        let mut temps_collect: Vec<Temp> = Vec::new();
+        // We'll collect per-word wib, and count the supported chars
+        // (F2: the old temps_collect Vec built one Temp per char only
+        // for its .len(), used as scoring_temps capacity below — the
+        // pushed structs were never read. A count is all it ever was.)
+        let mut n_temps: usize = 0;
 
         for (_seg_idx, wb) in builds.iter().enumerate() {
             // F4: char ink bounds are hoisted once per (word, k) in the
@@ -480,34 +483,11 @@ pub fn identify_fonts(
             // for every font. Arc-clone only.
             wib.push(WordGeoMeasurement { chars: std::sync::Arc::clone(&wb.char_bounds) });
 
-            // For scoring, we will handle after wib built? Need temps now but wib already has cx
-            // Actually temps need only crops, not wib
             for &c in wb.collapsed.iter() {
                 if !crate::features::is_supported(c) { continue; }
                 // Count only if crop exists – will filter later
                 // (pos check done in scoring_temps)
-                temps_collect.push(Temp {
-                    ch: c,
-                    weight: 1.0,
-                    area_px: 0.0,
-                    ood: 1.0,
-                    obs_stats: None,
-                    best_prob: 0.0,
-                    nearest: Vec::new(),
-                    logit: None,
-                    prob: None,
-                    geo_h_ll: 0.0,
-                    geo_v_ll: 0.0,
-                    geo_h_err: 0.0,
-                    geo_v_err: 0.0,
-                    geo_h_overlap_correction_px: None,
-                    obs_cx: 0.0,
-                    pred_cx: 0.0,
-                    obs_pitch: None,
-                    pred_pitch: None,
-                    geo_scale: 0.0,
-                    ink_width: 0.0,
-                });
+                n_temps += 1;
             }
             // Build WordSeg for geo
             let seg = WordSeg {
@@ -577,15 +557,10 @@ pub fn identify_fonts(
         if !is_ensure { non_ensure_survivors += 1; };
         total_survivors += 1;
 
-        // Now compute features and logits for scoring temps
-        // Need to map temps to actual crops: we have to retrieve norm images from builds
-        // Build a flat list of crops corresponding to temps order is same as temps_collect order
-        // We have temps_collect built in order of word_segs traversal, same as we need
-        // But we still need features: compute_features on each cached norm image
-
-        // Rebuild temps with features: we need to iterate again over builds to get norm images and match temps order
-
-        let mut scoring_temps: Vec<Temp> = Vec::with_capacity(temps_collect.len());
+        // Now compute features and logits for scoring temps:
+        // iterate builds again to get the norm images, in the same
+        // order, and build the temps with features.
+        let mut scoring_temps: Vec<Temp> = Vec::with_capacity(n_temps);
         for (seg_idx, wb) in builds.iter().enumerate() {
             for (pos, &c) in wb.collapsed.iter().enumerate() {
                 if !crate::features::is_supported(c) { continue; }
