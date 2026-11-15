@@ -598,7 +598,7 @@ impl FontDataCache {
 // ── Miss classification ─────────────────────────────────────────────────────
 
 #[derive(Clone)]
-struct ClassifiedEntry<'a> {
+pub struct ClassifiedEntry<'a> {
     entry: &'a AuditEntry,
     actual_font: Option<String>,
     kind: MissKind,
@@ -629,7 +629,14 @@ impl MissKind {
     }
 }
 
-fn classify_entries<'a>(
+/// Classify each audit entry against ground truth (hit / major / minor /
+/// similarity failure / kept raster / no GT). Pure function of its inputs:
+/// the caller computes it once per run and shares the result with
+/// `compute_accuracy` and `generate_report` (redundancy F32) instead of
+/// each recomputing it. (`enrich_audit_entries` still classifies
+/// internally: the classification borrows the entries, and enrich
+/// mutates them, so the two cannot share one Vec.)
+pub fn classify_entries<'a>(
     entries: &'a [AuditEntry],
     gt: Option<&GroundTruth>,
     dpi: u32,
@@ -2231,24 +2238,20 @@ pub struct AccuracyResult {
     pub ocr_wrong_hits: usize,
 }
 
-/// Compute accuracy without generating any HTML or audit I/O.
-/// Used by --test for fast scoring.
+/// Compute accuracy counts from a precomputed entry classification (see
+/// `classify_entries`) without generating any HTML or audit I/O. Used by
+/// --test for fast scoring. The caller computes the classification once
+/// per run and shares it with `generate_report` (redundancy F32).
 pub fn compute_accuracy(
-    entries: &[AuditEntry],
-    gt: Option<&GroundTruth>,
-    dpi: u32,
-    font_catalog: &[FontEntry],
-    glyph_map: &NgramGlyphMap,
+    classified: &[ClassifiedEntry],
 ) -> AccuracyResult {
-    let classified = classify_entries(entries, gt, dpi, font_catalog, glyph_map);
-
     let mut hits = 0usize;
     let mut major_misses = 0usize;
     let mut minor_misses = 0usize;
     let mut similarity_failures = 0usize;
     let mut kept_raster = 0usize;
 
-    for ce in &classified {
+    for ce in classified {
         match ce.kind {
             MissKind::Hit => hits += 1,
             MissKind::MajorMiss => major_misses += 1,
@@ -2274,7 +2277,7 @@ pub fn compute_accuracy(
         let mut c_hits = 0usize;
         let mut w_total = 0usize;
         let mut w_hits = 0usize;
-        for ce in &classified {
+        for ce in classified {
             let is_hit = matches!(ce.kind, MissKind::Hit | MissKind::MinorMiss);
             match ce.entry.ocr_correct {
                 Some(true) => { c_total += 1; if is_hit { c_hits += 1; } },
@@ -2301,11 +2304,14 @@ pub fn compute_accuracy(
     }
 }
 
+/// Build the HTML report. Takes a precomputed entry classification (see
+/// `classify_entries`): the caller computes it once per run and shares it
+/// with `compute_accuracy` (redundancy F32).
 pub fn generate_report(
     report_path: &Path,
     audit_root: &Path,
     entries: &[AuditEntry],
-    gt: Option<&GroundTruth>,
+    classified: &[ClassifiedEntry],
     dpi: u32,
     font_catalog: &[FontEntry],
     glyph_map: &NgramGlyphMap,
@@ -2321,15 +2327,13 @@ pub fn generate_report(
     IMAGE_WRITER.with(|w| *w.borrow_mut() = Some(writer));
     AUDIT_ROOT_TL.with(|a| *a.borrow_mut() = Some(audit_root.to_path_buf()));
 
-    let classified = classify_entries(entries, gt, dpi, font_catalog, glyph_map);
-
     let mut hits: Vec<&ClassifiedEntry> = Vec::new();
     let mut major_misses: Vec<&ClassifiedEntry> = Vec::new();
     let mut minor_misses: Vec<&ClassifiedEntry> = Vec::new();
     let mut similarity_failures: Vec<&ClassifiedEntry> = Vec::new();
     let mut kept_raster: Vec<&ClassifiedEntry> = Vec::new();
     let mut no_ground_truth: Vec<&ClassifiedEntry> = Vec::new();
-    for ce in &classified {
+    for ce in classified {
         match ce.kind {
             MissKind::Hit => hits.push(ce),
             MissKind::MajorMiss => major_misses.push(ce),
@@ -2518,7 +2522,7 @@ pub fn generate_report(
     // Full unfiltered listing when --audit-all / --report-all
     // Shows every line in page/line order regardless of hit/miss.
     let (all_lines_section, report_title) = if meta.report_all {
-        let mut all_sorted = classified.clone();
+        let mut all_sorted = classified.to_vec();
         all_sorted.sort_by(|a, b| {
             a.entry.page.cmp(&b.entry.page)
                 .then(a.entry.line_index.cmp(&b.entry.line_index))
@@ -2588,7 +2592,7 @@ pub fn generate_report(
         let mut zncc = 0usize;
         let mut major = 0usize;
         let mut mrne = 0usize;
-        for ce in &classified {
+        for ce in classified {
             if ce.actual_font.is_none() {
                 continue; // only GT lines
             }
@@ -2642,7 +2646,7 @@ pub fn generate_report(
         let mut total = 0usize;
         let mut p_true = 0usize;
         let mut p_false = 0usize;
-        for ce in &classified {
+        for ce in classified {
             let gt_text = match ce.entry.gt_text.as_deref() {
                 Some(t) => t,
                 None => continue,
