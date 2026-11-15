@@ -564,10 +564,9 @@ pub fn match_lines(
         // crops with the same k; each distinct (image, k, exemption)
         // triple is computed once. Threaded explicitly — never a global
         // — so parallel lines never share state. The GT and tie-break
-        // rebuilds share this cache too (finding F12): they segment
-        // the same word_infos images with the same k and the same
-        // trailing-punctuation exemption state, so a shared entry is
-        // the same computation.
+        // rebuilds deliberately use a fresh throwaway cache (see their
+        // call sites): sharing there is a separate decision pending
+        // Mike's review of the redundancy survey (finding F12).
         let mut seg_cache = crate::segment::SegmentCache::new();
         // Diagnostic-only segmentation: write the seam diagnostics
         // (word_crop.png, seg_plain/summary.json, seg_lig/...) for this
@@ -794,11 +793,13 @@ pub fn match_lines(
                             let _ = std::fs::create_dir_all(&p);
                             p
                         });
-                        // Shared per-line cache (finding F12): the
-                        // tie-break rebuilds segment the same word
-                        // crops with the same k and exemption state
-                        // as scoring, so they reuse its entries.
-                        let (segs, wib, _crops, _pmap) = match build_for_font(fe, &word_infos, false, &mut seg_cache) {
+                        // Deliberately unshared: the tie-break rebuilds
+                        // segment into a fresh throwaway cache. Sharing
+                        // the per-line cache here is a separate decision
+                        // pending Mike's review of the redundancy survey
+                        // (finding F12) — each tied font segments fresh,
+                        // exactly as before this change.
+                        let (segs, wib, _crops, _pmap) = match build_for_font(fe, &word_infos, false, &mut crate::segment::SegmentCache::new()) {
                             Some(v) => v,
                             None => continue,
                         };
@@ -1195,12 +1196,12 @@ pub fn match_lines(
         // ── GT font segmentation / crops – always emit even on misses ──
         // Build GT segs using same per-word word_infos + GT collapsed_lig_set, so k differs correctly
         // for ligature fonts (e.g. Office k=4 vs k=5).  No extra compute beyond build_for_font.
-        // Shared per-line cache (finding F12): the GT rebuild
-        // segments the same word crops as scoring; k differs only
-        // through the ligature mask, and k is part of the cache key.
+        // Deliberately unshared (see the tie-break site above): the GT
+        // rebuild segments into a fresh throwaway cache, exactly as
+        // before this change, pending Mike's decision on finding F12.
         let (gt_segs_opt, gt_wib_opt, gt_crops_opt) = if let Some(ref gfk) = gt_font_key {
             if let Some(gt_fe) = font_registry.by_key(gfk) {
-                if let Some((s, w, c, _pm)) = build_for_font(gt_fe, &word_infos, true, &mut seg_cache) {
+                if let Some((s, w, c, _pm)) = build_for_font(gt_fe, &word_infos, true, &mut crate::segment::SegmentCache::new()) {
                     (Some(s), Some(w), Some(c))
                 } else { (None, None, None) }
             } else { (None, None, None) }
