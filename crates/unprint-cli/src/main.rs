@@ -605,10 +605,13 @@ fn run(args: &cli::Args, classifier: &mut dyn classifier::Classifier) -> Result<
 
     // ── Incremental update: detect new fonts and add to index ──────
     // Compare cached font_meta (glyph_map) against installed fonts.
-    // New fonts are indexed and added; removed fonts are pruned from the
-    // map (perf 4.7) — their keys are dropped from every group, and groups
-    // left empty stay as placeholders so glyph_ids never shift.
+    // New fonts are indexed and added; removed fonts are kept.
     {
+        // Fast path: if catalog hash matches, no new fonts (common warm case)
+        // Use mtime+size for fast check (per Mike) - catalog_hash is hash of sorted font_keys
+        if font_registry.catalog_hash() == glyph_map.catalog_hash {
+            if !args.quiet { eprintln!("[incremental] No new fonts (catalog hash match)"); }
+        } else {
         use std::collections::HashSet;
         let installed_keys: HashSet<String> = font_registry.entries().iter()
             .map(|e| e.font_key())
@@ -617,35 +620,16 @@ fn run(args: &cli::Args, classifier: &mut dyn classifier::Classifier) -> Result<
         let cached_keys = glyph_map.cached_font_keys();
         if !args.quiet { eprintln!("[timing] incremental cached_keys {:.2}s", t_cached_keys.elapsed().as_secs_f64()); }
 
-        // Prune removed fonts from the glyph map. This runs on every
-        // invocation, independent of the catalog-hash fast path below: the
-        // hash only covers installed fonts, so a hash match does not mean
-        // the map is free of removed keys. Pruning never shifts glyph_ids
-        // (empty groups are kept), so the already-loaded classifier and
-        // the feature files stay valid.
-        let removed_keys: Vec<String> = cached_keys.difference(&installed_keys).cloned().collect();
-        if !removed_keys.is_empty() {
-            let removed_set: HashSet<String> = removed_keys.iter().cloned().collect();
-            let t_prune = std::time::Instant::now();
-            let (keys_removed, groups_emptied) = glyph_map.prune_fonts(&removed_set);
-            if keys_removed > 0 {
-                if let Err(e) = glyph_map.write_bin(&gmap_path) {
-                    eprintln!("warning: failed to write pruned glyph map: {e}");
-                }
-            }
-            if !args.quiet { eprintln!("[incremental] Pruned {} removed fonts ({} keys, {} groups emptied) in {:.2}s", removed_keys.len(), keys_removed, groups_emptied, t_prune.elapsed().as_secs_f64()); }
-        }
-
-        // Fast path: if catalog hash matches, no new fonts (common warm case)
-        // Use mtime+size for fast check (per Mike) - catalog_hash is hash of sorted font_keys
-        if font_registry.catalog_hash() == glyph_map.catalog_hash {
-            if !args.quiet { eprintln!("[incremental] No new fonts (catalog hash match)"); }
-        } else {
         if !args.quiet { eprintln!("[incremental] installed={} cached={} (glyph_map has {} unique fonts)", installed_keys.len(), cached_keys.len(), cached_keys.len()); }
 
         let t_diff = std::time::Instant::now();
         let mut new_keys: Vec<String> = installed_keys.difference(&cached_keys).cloned().collect();
+        let removed_keys: Vec<String> = cached_keys.difference(&installed_keys).cloned().collect();
         if !args.quiet { eprintln!("[timing] incremental diff {:.2}s (new={} removed={})", t_diff.elapsed().as_secs_f64(), new_keys.len(), removed_keys.len()); }
+
+        if !removed_keys.is_empty() {
+            if !args.quiet { eprintln!("[incremental] Keeping {} removed fonts (trained data still valid for classification)", removed_keys.len()); }
+        }
 
         // Filter out non-Latin fonts that cannot render any supported_chars
         // (NotoSansBamum, NotoSansGothic, NotoSerifLao etc. = 5898-5660 = 238).
@@ -939,17 +923,35 @@ fn run(args: &cli::Args, classifier: &mut dyn classifier::Classifier) -> Result<
         let mut pg_vec = 0u32;
         let mut pg_raster = 0u32;
 
-        // ── Pass 1: Match all lines ──────────────────────────────────
-        let (mut line_matches, fp_hits) = font_pipeline::match_lines(
+        // Stale diag dirs are cleaned once here, before any pass writes new ones.
+        font_pipeline::clean_stale_diag_dirs(args, &lines, page_num, None);
+
+        // ── Pass 1: fast path only — dominant font render + ZNCC ────
+        // Pass 1 performs no segmentation and no font matching.
+        let (fast_results, fp_hits) = font_pipeline::match_lines_fast_path(
+            &lines, &gray_page, &rgba_page,
+            &font_registry, &font_cache,
+            dominant_font_candidate.as_ref(),
+        );
+
+        // ── Full pipeline: segmentation → font search → font match ──
+        // Scores only the lines that missed the fast path; the merge below
+        // keeps the fast-path result wherever one exists.
+        let missed: std::collections::HashSet<usize> = fast_results.iter().enumerate()
+            .filter_map(|(li, r)| if r.is_none() { Some(li) } else { None })
+            .collect();
+        let full_results = font_pipeline::match_lines(
             &lines, &gray_page, &rgba_page, page_img, page_num,
             &font_registry, &font_cache, &geo_cache, classifier,
             &glyph_map,
             ground_truth.as_ref(),
-            dominant_font_candidate.as_ref(),
             args,
-            None,
+            Some(&missed),
             rtd.as_ref(),
         );
+        let mut line_matches: Vec<font_pipeline::LineMatch> = fast_results.into_iter().zip(full_results)
+            .map(|(fast, full)| fast.unwrap_or(full))
+            .collect();
 
         // Update dominant font candidate for next page
         if let Some(new_dom) = font_pipeline::update_dominant_font(&line_matches) {
@@ -986,12 +988,12 @@ fn run(args: &cli::Args, classifier: &mut dyn classifier::Classifier) -> Result<
             split_indices.sort_unstable();
             split_indices.dedup();
             let split_set: std::collections::HashSet<usize> = split_indices.iter().copied().collect();
-            let (mut new_matches, _) = font_pipeline::match_lines(
-            &lines, &gray_page, &rgba_page, page_img, page_num,
+            font_pipeline::clean_stale_diag_dirs(args, &lines, page_num, Some(&split_set));
+            let mut new_matches = font_pipeline::match_lines(
+                &lines, &gray_page, &rgba_page, page_img, page_num,
                 &font_registry, &font_cache, &geo_cache, classifier,
                 &glyph_map,
                 ground_truth.as_ref(),
-                None,  // No fast path — re-score fully with new word splits
                 args,
                 Some(&split_set),
                 rtd.as_ref(),
