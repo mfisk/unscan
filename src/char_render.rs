@@ -161,15 +161,13 @@ pub fn load_cached_ngram(
 /// Render an n-gram for a font entry, with full cache integration.
 ///
 /// 1. Check glyph_map for a known hash → try image cache → return on hit.
-/// 2. On miss: load font bytes from the shared FontCache (F36), render,
-///    update glyph_map and image cache.
+/// 2. On miss: load font from fe.path, render, update glyph_map and image cache.
 ///
 /// The caller owns glyph-map publication; this function never writes the
 /// process-wide glyph-map cache implicitly.
 /// `kern` is the REQUIRED GPOS pair-kern provider for this font (Finding 5).
 pub fn render_ngram(
     fe: &crate::font_scan::FontEntry,
-    font_cache: &crate::font_cache::FontCache,
     seq: &[char],
     glyph_map: &mut glyph_map::NgramGlyphMap,
     params: &RenderParams,
@@ -195,9 +193,8 @@ pub fn render_ngram(
         }
     }
 
-    // Cache miss: load font bytes from the shared FontCache (F36),
-    // render, update caches.
-    let font_data = font_cache.load(&fe.path).ok()?;
+    // Cache miss: load font, render, update caches
+    let font_data = std::fs::read(&fe.path).ok()?;
     let mut font = unprint_fonts::ab_glyph::FontRef::try_from_slice(&font_data).ok()?;
     fe.apply_variations(&mut font);
     let gid_overrides: Vec<Option<GlyphId>> = seq.iter().map(|c| {

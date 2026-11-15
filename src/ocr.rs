@@ -37,7 +37,7 @@ use image::{DynamicImage, GrayImage};
 use std::process::Command;
 
 pub use unprint_geometry::text::{RawWordBBox, TextLine, TextRegion};
-pub use unprint_geometry::word::{expand_words_to_ink, fix_overlapping_words_by_ink, ink_horizontal_extent, ink_vertical_extent, refine_words_batch, trim_words_to_ink};
+pub use unprint_geometry::word::{expand_words_to_ink, fix_overlapping_words_by_ink, frac_edges_from_profile, ink_horizontal_extent, ink_vertical_extent, refine_words_batch, trim_words_to_ink};
 pub use unprint_geometry::INK_THRESHOLD;
 
 /// Capture a raw-bbox snapshot into each line's `raw_words` field.
@@ -664,7 +664,7 @@ pub fn split_wide_whitespace_words(
 
             // Crop the word image and run CI segmentation to get per-char boundaries
             let word_img = image::imageops::crop_imm(gray, wx, wy, ww, wh).to_image();
-            let (boundaries, _seams, _seg_summary) = crate::segment::segment_characters(&word_img, n_chars, &word.text);
+            let (boundaries, _seams, _seg_summary) = crate::segment::segment_characters(&word_img, n_chars);
 
             // boundaries: [0, b1, b2, ..., ww] — n_chars+1 entries
             // Character i occupies columns [boundaries[i] .. boundaries[i+1])

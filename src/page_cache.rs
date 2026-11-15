@@ -579,7 +579,7 @@ pub struct PreparedPage {
     pub ink_thresh: u8,
 }
 
-pub fn fast_rgba8_from_dynamic(img: &DynamicImage) -> image::RgbaImage {
+pub(crate) fn fast_rgba8_from_dynamic(img: &DynamicImage) -> image::RgbaImage {
     // Avoid image crate's generic CicpRgb::cast_pixels_by_layout (8.7% exclusive leaf).
     // Fast path single scan over raw buffers.
     match img {

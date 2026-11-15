@@ -738,7 +738,7 @@ pub fn build_scoring_windows_with_geo<'a>(
     // Per-word geo, same order as word_segs, each inner Vec in char order
     let mut wib: Vec<WordGeoMeasurement> = Vec::with_capacity(word_segs.len());
     for _ in 0..word_segs.len() {
-        wib.push(WordGeoMeasurement { chars: std::sync::Arc::new(Vec::new()) });
+        wib.push(WordGeoMeasurement { chars: Vec::new() });
     }
 
     for (seg_idx, seg) in word_segs.iter().enumerate() {
@@ -796,7 +796,7 @@ pub fn build_scoring_windows_with_geo<'a>(
                 char_bounds.push(cb);
             }
         }
-        wib[seg_idx].chars = std::sync::Arc::new(char_bounds);
+        wib[seg_idx].chars = char_bounds;
     }
 
     crop_store.extend(temp_crops);

@@ -118,19 +118,8 @@ const MIN_SYMBOL_FRAC: f32 = 0.07;
 /// a darker pixel — directly encoding "stay in whitespace, don't wander
 /// into ink."  Both children of every accepted seam split must contain
 /// meaningful ink (`min_ink_for_symbol`).
-/// Whether a word gets the narrow-trailing-punctuation exemption in
-/// `segment_penalty`: true only when the word ends with `.` `,` `:` or
-/// `;`. Single source of truth — every segmentation call passes the word
-/// text, so the exemption applies uniformly (the scoring pass used to
-/// pass None and lose it, flipping e.g. VALLEY,'s pick from col 125 to
-/// col 52).
-pub fn trailing_narrow_punct(word_text: &str) -> bool {
-    matches!(word_text.as_bytes().last(), Some(b'.' | b',' | b':' | b';'))
-}
-
-pub fn segment_characters(img: &GrayImage, n_chars: usize, word_text: &str) -> (Vec<u32>, HashMap<u32, Vec<[u32; 2]>>, SegSummary) {
-    let outcome = segment_characters_inner(img, n_chars, word_text, false);
-    (outcome.bounds, outcome.seams, outcome.summary)
+pub fn segment_characters(img: &GrayImage, n_chars: usize) -> (Vec<u32>, HashMap<u32, Vec<[u32; 2]>>, SegSummary) {
+    segment_characters_inner(img, n_chars, None, None)
 }
 
 /// Same as `segment_characters` but dumps per-pass diagnostics when `diag_dir` is Some.
@@ -140,263 +129,33 @@ pub fn segment_characters_diag(
     diag_dir: &std::path::Path,
     word_text: &str,
 ) -> (Vec<u32>, HashMap<u32, Vec<[u32; 2]>>, SegSummary) {
-    let outcome = segment_characters_inner(img, n_chars, word_text, true);
-    if outcome.full_path {
-        write_seg_diag(img, word_text, &outcome, diag_dir);
-    }
-    (outcome.bounds, outcome.seams, outcome.summary)
-}
-
-/// Diag segmentation through the per-line cache: returns the chosen
-/// (bounds, seams, summary) triple and writes the diag files
-/// (word_crop.png, seam_overlay.png, final_overlay.png, summary.json)
-/// into `diag_dir` from the merged (chosen + traced) maps. On a cache
-/// hit with traced data this writes files without recomputing; on a miss
-/// (or an untraced entry) it computes with tracing once and upgrades the
-/// entry. Words from the early-return paths write no files, exactly as
-/// `segment_characters_diag`.
-pub fn segment_diag_cached(
-    cache: &mut SegmentCache,
-    img: &GrayImage,
-    n_chars: usize,
-    diag_dir: &std::path::Path,
-    word_text: &str,
-) -> (Vec<u32>, HashMap<u32, Vec<[u32; 2]>>, SegSummary) {
-    let entry = cache.get_or_compute_traced(img, n_chars, word_text);
-    if entry.full_path {
-        write_seg_diag(img, word_text, entry, diag_dir);
-    }
-    (entry.bounds.clone(), entry.seams.clone(), entry.summary.clone())
-}
-
-/// Full result of segmenting one word crop: the chosen segmentation plus,
-/// when computed with tracing, the extra candidate seam paths the viz
-/// reads. This is what the per-line `SegmentCache` stores, so a word crop
-/// is never segmented twice with the same k.
-#[derive(Debug, Clone)]
-pub struct CachedSegmentation {
-    /// Chosen split boundaries: [0, split1, ..., w].
-    pub bounds: Vec<u32>,
-    /// Chosen seam paths only (one per chosen split, keyed by column).
-    pub seams: HashMap<u32, Vec<[u32; 2]>>,
-    /// Summary with chosen-only seam costs (what scoring records).
-    pub summary: SegSummary,
-    /// Extra traced candidate paths/costs for the viz, sorted by total
-    /// cost ascending. Some only when computed with tracing (diag pass);
-    /// None for scoring-populated entries and for the early-return words
-    /// below, which have no candidates to trace.
-    pub traced: Option<Vec<(u32, SeamCost, Vec<[u32; 2]>)>>,
-    /// False for the n_chars<=1 / tiny-crop early returns, which write
-    /// no diag files.
-    pub full_path: bool,
-}
-
-/// Key for a cached segmentation. The exemption state is part of the key:
-/// exempt and non-exempt segmentations of the same image and k are
-/// different computations and must never share an entry. (Since the
-/// exemption is now uniform across callers, the flag is the same for
-/// every entry in practice — it stays in the key so the cache remains
-/// correct if a caller ever passes different text for the same pixels.)
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
-pub struct SegCacheKey {
-    img_hash: u64,
-    w: u32,
-    h: u32,
-    k: usize,
-    trailing_punct: bool,
-}
-
-/// Per-line cache of segmentation results: never re-segment the same word
-/// crop twice with the same k. Created fresh per line in font_pipeline
-/// and threaded explicitly through segment_line, identify_fonts and
-/// build_for_font — never a global, so parallel lines (rayon par_iter)
-/// never share state.
-#[derive(Debug, Default)]
-pub struct SegmentCache {
-    map: HashMap<SegCacheKey, CachedSegmentation>,
-}
-
-impl SegmentCache {
-    pub fn new() -> Self {
-        Self::default()
-    }
-
-    fn key(img: &GrayImage, k: usize, word_text: &str) -> SegCacheKey {
-        SegCacheKey {
-            img_hash: hash_gray_image(img),
-            w: img.width(),
-            h: img.height(),
-            k,
-            trailing_punct: trailing_narrow_punct(word_text),
-        }
-    }
-
-    /// Return the segmentation for (img, k, word_text), computing and
-    /// caching it on a miss. Scoring path: no tracing, so the entry's
-    /// `traced` is None and the returned seams/summary are chosen-only,
-    /// bit-identical to a fresh `segment_characters` call.
-    /// The returned reference borrows the cache; callers clone what they keep.
-    pub fn get_or_compute(
-        &mut self,
-        img: &GrayImage,
-        k: usize,
-        word_text: &str,
-    ) -> &CachedSegmentation {
-        let key = Self::key(img, k, word_text);
-        if !self.map.contains_key(&key) {
-            let outcome = segment_characters_inner(img, k, word_text, false);
-            self.map.insert(key, outcome);
-        }
-        self.map.get(&key).unwrap()
-    }
-
-    /// Diag path: return the segmentation, computing with tracing on a
-    /// miss, or upgrading a scoring-populated entry (traced None,
-    /// full_path true) by recomputing with tracing. Early-return entries
-    /// (full_path false) are returned as-is — they have no candidates to
-    /// trace and write no diag files. The chosen data is never recomputed
-    /// on upgrade: tracing does not affect the greedy choices, so the
-    /// stored bounds/seams/summary are already the traced run's.
-    pub fn get_or_compute_traced(
-        &mut self,
-        img: &GrayImage,
-        k: usize,
-        word_text: &str,
-    ) -> &CachedSegmentation {
-        let key = Self::key(img, k, word_text);
-        let needs_trace = match self.map.get(&key) {
-            None => true,
-            Some(e) => e.full_path && e.traced.is_none(),
-        };
-        if needs_trace {
-            let outcome = segment_characters_inner(img, k, word_text, true);
-            match self.map.get_mut(&key) {
-                Some(e) => {
-                    e.traced = outcome.traced;
-                }
-                None => {
-                    self.map.insert(key, outcome);
-                }
-            }
-        }
-        self.map.get(&key).unwrap()
-    }
-}
-
-/// Content hash of a word image (pixels only; dimensions ride in the key).
-fn hash_gray_image(img: &GrayImage) -> u64 {
-    use std::hash::Hasher;
-    let mut hasher = rustc_hash::FxHasher::default();
-    hasher.write(img.as_raw());
-    hasher.finish()
-}
-
-/// Merge the chosen seam maps with the traced candidates (chosen wins on
-/// conflict, UNPRINT_EXTRA_SEAMS limit applied) — the maps the viz reads.
-fn merged_seam_maps(entry: &CachedSegmentation) -> (HashMap<u32, Vec<[u32; 2]>>, HashMap<u32, SeamCost>) {
-    let mut paths = entry.seams.clone();
-    // Owned copy: the traced candidates below are merged into it, so the
-    // shared Arc map cannot be reused directly.
-    let mut costs = (*entry.summary.seam_costs).clone();
-    if let Some(traced) = &entry.traced {
-        let extra_limit: Option<usize> = match std::env::var("UNPRINT_EXTRA_SEAMS").ok().as_deref() {
-            Some("all") | Some("ALL") => None,
-            Some(n) => n.parse().ok(),
-            None => Some(10),
-        };
-        let mut added = 0usize;
-        for (col, sc, path) in traced {
-            if let Some(limit) = extra_limit {
-                if added >= limit { break; }
-            }
-            if paths.contains_key(col) { continue; }
-            paths.insert(*col, path.clone());
-            costs.insert(*col, sc.clone());
-            added += 1;
-        }
-    }
-    (paths, costs)
-}
-
-/// Write the per-word diag files (word_crop.png, seam_overlay.png,
-/// final_overlay.png, summary.json) from a traced segmentation. The
-/// summary carries the merged (chosen + traced) seam maps — the viz reads
-/// seam_paths/seam_costs from here for columns that are not in the
-/// audit's (scoring) seam_paths. Called by `segment_characters_diag`
-/// and by `segment_diag_cached`; the computation itself never writes
-/// files, so a cached entry can serve the viz without recomputing.
-fn write_seg_diag(
-    img: &GrayImage,
-    word_text: &str,
-    entry: &CachedSegmentation,
-    ddir: &std::path::Path,
-) {
-    let _ = std::fs::create_dir_all(ddir);
-    let _ = img.save(ddir.join("word_crop.png"));
-    let (merged_paths, merged_costs) = merged_seam_maps(entry);
-    let summary = &entry.summary;
-    crate::seg_diag::save_split_overlay_with_paths(img, &summary.ws_splits, &summary.seam_splits, &[], &merged_paths, &ddir.join("seam_overlay.png"));
-    crate::seg_diag::save_split_overlay_with_paths(img, &summary.ws_splits, &summary.seam_splits, &[], &merged_paths, &ddir.join("final_overlay.png"));
-
-    // Seam summary for the viz: the recorded seam paths and costs,
-    // including tied-run candidates the DP rated equally good but did
-    // not choose (e.g. col 25 tied with chosen col 24). Written from
-    // the segmenter's own traced paths and costs — no reconstruction.
-    // The viz reads seam_paths/seam_costs from here for columns that
-    // are not in the audit's (identify_fonts) seam_paths.
-    let n_segs_sum = entry.bounds.len().saturating_sub(1);
-    let json = serde_json::json!({
-        "word_text": word_text,
-        "image_w": summary.image_w,
-        "image_h": summary.image_h,
-        "n_chars_expected": summary.n_chars_expected,
-        "n_segments_produced": n_segs_sum,
-        "ws_splits": &summary.ws_splits,
-        "seam_splits": &summary.seam_splits,
-        "final_boundaries": &entry.bounds,
-        "seam_paths": &merged_paths,
-        "seam_costs": &merged_costs,
-        "mismatch": n_segs_sum != summary.n_chars_expected as usize,
-    });
-    let _ = std::fs::write(ddir.join("summary.json"), serde_json::to_string_pretty(&json).unwrap_or_default());
+    segment_characters_inner(img, n_chars, Some(diag_dir), Some(word_text))
 }
 
 fn segment_characters_inner(
     img: &GrayImage,
     n_chars: usize,
-    word_text: &str,
-    trace: bool,
-) -> CachedSegmentation {
+    diag_dir: Option<&std::path::Path>,
+    word_text: Option<&str>,
+) -> (Vec<u32>, HashMap<u32, Vec<[u32; 2]>>, SegSummary) {
     let (w, h) = img.dimensions();
     if n_chars <= 1 {
-        return CachedSegmentation {
-            bounds: vec![0, w],
-            seams: HashMap::new(),
-            summary: SegSummary {
-                image_w: w, image_h: h, n_chars_expected: n_chars as u32,
-                n_segments_produced: 1, mismatch: n_chars != 1,
-                ws_splits: Vec::new(), seam_splits: Vec::new(),
-                seam_costs: Arc::new(HashMap::new()),
-            },
-            traced: None,
-            full_path: false,
-        };
+        return (vec![0, w], HashMap::new(), SegSummary {
+            image_w: w, image_h: h, n_chars_expected: n_chars as u32,
+            n_segments_produced: 1, mismatch: n_chars != 1,
+            ws_splits: Vec::new(), seam_splits: Vec::new(),
+            seam_costs: HashMap::new(),
+        });
     }
     if w < 2 || h < 2 {
         let bounds = uniform_boundaries(w, n_chars);
         let n_segs = bounds.len().saturating_sub(1) as u32;
-        return CachedSegmentation {
-            bounds,
-            seams: HashMap::new(),
-            summary: SegSummary {
-                image_w: w, image_h: h, n_chars_expected: n_chars as u32,
-                n_segments_produced: n_segs, mismatch: n_segs != n_chars as u32,
-                ws_splits: Vec::new(), seam_splits: Vec::new(),
-                seam_costs: Arc::new(HashMap::new()),
-            },
-            traced: None,
-            full_path: false,
-        };
+        return (bounds, HashMap::new(), SegSummary {
+            image_w: w, image_h: h, n_chars_expected: n_chars as u32,
+            n_segments_produced: n_segs, mismatch: n_segs != n_chars as u32,
+            ws_splits: Vec::new(), seam_splits: Vec::new(),
+            seam_costs: HashMap::new(),
+        });
     }
 
     let need = n_chars - 1; // number of splits needed
@@ -512,12 +271,21 @@ fn segment_characters_inner(
 
     let vp_splits = splits.clone();
 
+    // Diag: dump VP passes
+    if let (Some(ddir), Some(_wtext)) = (diag_dir, word_text) {
+        let _ = std::fs::create_dir_all(ddir);
+        let _ = img.save(ddir.join("word_crop.png"));
+
+    }
+
     // Segment-size penalty: discourages splits that create a segment
     // narrower than the expected character width.
     // (10 * avg_char_width / min_child_width)^2, applied additively to seam cost.
     // Penalizes based on the smallest segment CREATED by the split,
     // so splitting near the edge costs more than splitting in the middle.
-    let exempt_trailing_punct = trailing_narrow_punct(word_text);
+    let trailing_narrow_punct = word_text.map_or(false, |t| {
+        matches!(t.as_bytes().last(), Some(b'.' | b',' | b':' | b';'))
+    });
     let segment_penalty = |seg_start: u32, seg_end: u32, col: u32, cost: f32| -> f32 {
         if cost < 1.0 { return 0.0; }
         let left = (col - seg_start) as f32;
@@ -525,7 +293,7 @@ fn segment_characters_inner(
         let mut min_child = left.min(right);
         if min_child <= 0.0 { return f32::MAX; }
         // Don't penalize narrow trailing punctuation (. , : ;)
-        if exempt_trailing_punct && right < left && seg_end == w {
+        if trailing_narrow_punct && right < left && seg_end == w {
             min_child = left;
         }
         let p = 10.0 * avg_char_width / min_child;
@@ -542,16 +310,12 @@ fn segment_characters_inner(
     // so we have them before DPs are consumed. Keyed by (col, cost_bits) to
     // avoid overwriting when same col appears in different segments.
     let mut candidate_paths: Vec<(u32, SeamCost, Vec<[u32; 2]>)> = Vec::new();  // (col, SeamCost, path)
-    // Traced candidates for the viz, sorted cheapest first. Collected only
-    // when tracing (diag pass); scoring leaves this None. Stored on the
-    // outcome so the diag writer can merge them without recomputing.
-    let mut traced: Option<Vec<(u32, SeamCost, Vec<[u32; 2]>)>> = None;
     // Seam instrumentation: capture seed candidates and greedy-loop events
     // for the audit summary JSON.
     if splits.len() < need {
         use std::cmp::Ordering;
         use std::collections::BinaryHeap;
-        let audit_mode = trace;
+        let audit_mode = diag_dir.is_some();
 
         // Ink-based energy for seam carving.  Each pixel's base cost is
         // its darkness (0 for white, 255 for black).  The DP adds an
@@ -1016,14 +780,25 @@ fn segment_characters_inner(
             }
         }
 
-        // Traced candidates for the viz, sorted cheapest first. They are
-        // NOT merged into seam_paths/seam_costs here: scoring records
-        // chosen-only costs, and the diag writer merges them (with the
-        // UNPRINT_EXTRA_SEAMS limit) when writing summary.json.
-        // Only collected when tracing (diag pass).
+        // After greedy loop: merge unused candidate paths into seam_paths
+        // for diagnostics. Only needed when auditing (win 2). Skip when audit_mode false.
         if audit_mode {
+            let extra_limit: Option<usize> = match std::env::var("UNPRINT_EXTRA_SEAMS").ok().as_deref() {
+                Some("all") | Some("ALL") => None,
+                Some(n) => n.parse().ok(),
+                None => Some(10),
+            };
             candidate_paths.sort_by(|a, b| a.1.total.partial_cmp(&b.1.total).unwrap_or(std::cmp::Ordering::Equal));
-            traced = Some(candidate_paths);
+            let mut added = 0usize;
+            for (col, sc, path) in candidate_paths {
+                if let Some(limit) = extra_limit {
+                    if added >= limit { break; }
+                }
+                if seam_paths.contains_key(&col) { continue; }
+                seam_paths.insert(col, path);
+                seam_costs.insert(col, sc);
+                added += 1;
+            }
         }
 
         // Return TLS arenas (keep capacity for next word)
@@ -1037,6 +812,11 @@ fn segment_characters_inner(
     if w == 492 && n_chars == 10 {
     }
 
+    // Diag: dump seam pass
+    if let Some(ddir) = diag_dir {
+        crate::seg_diag::save_split_overlay_with_paths(img, &vp_splits, &seam_splits, &[], &seam_paths, &ddir.join("seam_overlay.png"));
+    }
+
     // Build final boundaries: [0, split1, split2, ..., w]
     let mut bounds = Vec::with_capacity(n_chars + 1);
     bounds.push(0);
@@ -1048,6 +828,36 @@ fn segment_characters_inner(
     bounds.push(w);
     bounds.dedup();
 
+    // Diag: dump final overlay + seam summary JSON (the viz reads this).
+    if let (Some(ddir), Some(wtext)) = (diag_dir, word_text) {
+        crate::seg_diag::save_split_overlay_with_paths(img, &vp_splits, &seam_splits, &[], &seam_paths, &ddir.join("final_overlay.png"));
+
+        // NOTE: char crops are saved by extract_chars_from_boundaries
+        // (the actual CI code path), not here — so diag shows exact CI inputs.
+
+        // Seam summary for the viz: the recorded seam paths and costs,
+        // including tied-run candidates the DP rated equally good but did
+        // not choose (e.g. col 25 tied with chosen col 24). Written from
+        // the segmenter's own traced paths and costs — no reconstruction.
+        // The viz reads seam_paths/seam_costs from here for columns that
+        // are not in the audit's (identify_fonts) seam_paths.
+        let n_segs_sum = bounds.len().saturating_sub(1);
+        let summary = serde_json::json!({
+            "word_text": wtext,
+            "image_w": w,
+            "image_h": h,
+            "n_chars_expected": n_chars,
+            "n_segments_produced": n_segs_sum,
+            "ws_splits": &vp_splits,
+            "seam_splits": &seam_splits,
+            "final_boundaries": &bounds,
+            "seam_paths": &seam_paths,
+            "seam_costs": &seam_costs,
+            "mismatch": n_segs_sum != n_chars,
+        });
+        let _ = std::fs::write(ddir.join("summary.json"), serde_json::to_string_pretty(&summary).unwrap_or_default());
+    }
+
     let n_segs = bounds.len().saturating_sub(1) as u32;
     let seg_summary = SegSummary {
         image_w: w,
@@ -1057,20 +867,10 @@ fn segment_characters_inner(
         mismatch: n_segs != n_chars as u32,
         ws_splits: vp_splits.clone(),
         seam_splits: seam_splits.clone(),
-        seam_costs: Arc::new(seam_costs),
+        seam_costs: seam_costs,
     };
 
-    // The computation never writes files: the diag writer
-    // (`write_seg_diag`) merges the traced candidates and writes the
-    // overlays + summary.json from the returned outcome, so a cached
-    // entry can serve the viz without recomputing.
-    CachedSegmentation {
-        bounds,
-        seams: seam_paths,
-        summary: seg_summary,
-        traced,
-        full_path: true,
-    }
+    (bounds, seam_paths, seg_summary)
 }
 
 /// Exhaustive (col, cost) candidates via dual-DP: for every interior column
@@ -2160,10 +1960,7 @@ pub struct SegSummary {
     pub mismatch: bool,
     pub ws_splits: Vec<u32>,
     pub seam_splits: Vec<u32>,
-    // Arc so the per-font WordSeg/WordBuild constructions clone the Arc
-    // instead of the whole map (redundancy F3): the map is built once per
-    // (word, k) and read-only after.
-    pub seam_costs: Arc<HashMap<u32, SeamCost>>,
+    pub seam_costs: HashMap<u32, SeamCost>,
 }
 
 /// Per-word segmentation data retained for lazy bigram cropping.
@@ -2201,7 +1998,6 @@ pub fn segment_line(
     word_height: u32,
     diag_seg_dir: Option<&std::path::Path>,
     render_params: &crate::char_render::RenderParams,
-    seg_cache: &mut SegmentCache,
 ) -> LineCrops {
     let _ = render_params; // reserved for scan-side binarize
     if words.is_empty() || word_height == 0 {
@@ -2288,16 +2084,11 @@ pub fn segment_line(
         });
 
         // ── Path A: plain segmentation (OCR chars as-is) ────────────
-        // Through the per-line cache: the same (image, k) is segmented
-        // again by identify_fonts and the winner rebuild, so compute it
-        // once. With a diag dir the cached entry also serves the viz
-        // (traced candidates + summary.json) without recomputing.
         let (bounds_plain, seams_plain, seg_summary_plain) = if let Some(ref wdir) = word_diag_dir {
             let pdir = wdir.join("seg_plain");
-            segment_diag_cached(seg_cache, &word_img, all_chars.len(), &pdir, &word.text)
+            segment_characters_diag(&word_img, all_chars.len(), &pdir, &word.text)
         } else {
-            let e = seg_cache.get_or_compute(&word_img, all_chars.len(), &word.text);
-            (e.bounds.clone(), e.seams.clone(), e.summary.clone())
+            segment_characters(&word_img, all_chars.len())
         };
 
         // Destructure summary to allow moves instead of clones
@@ -2328,7 +2119,7 @@ pub fn segment_line(
                 chars: all_chars,
                 boundaries: bounds_plain,
                 seam_paths: Arc::new(seams_plain),
-                seam_costs: plain_seam_costs,
+                seam_costs: Arc::new(plain_seam_costs),
                 crop_h: word_h,
                 word_text: word.text.clone(),
                 image_w: plain_image_w,
@@ -2351,10 +2142,9 @@ pub fn segment_line(
             // ── Path B: ligature segmentation (reduced n_chars) ─────
             let (bounds_lig, seams_lig, seg_summary_lig) = if let Some(ref wdir) = word_diag_dir {
                 let ldir = wdir.join("seg_lig");
-                segment_diag_cached(seg_cache, &word_img_arc, lig_chars.len(), &ldir, &word.text)
+                segment_characters_diag(&word_img_arc, lig_chars.len(), &ldir, &word.text)
             } else {
-                let e = seg_cache.get_or_compute(&word_img_arc, lig_chars.len(), &word.text);
-                (e.bounds.clone(), e.seams.clone(), e.summary.clone())
+                segment_characters(&word_img_arc, lig_chars.len())
             };
 
             lig_word_segs.push(WordSeg {
@@ -2363,7 +2153,7 @@ pub fn segment_line(
                 chars: lig_chars,
                 boundaries: bounds_lig,
                 seam_paths: Arc::new(seams_lig),
-                seam_costs: seg_summary_lig.seam_costs,
+                seam_costs: Arc::new(seg_summary_lig.seam_costs),
                 crop_h: word_h,
                 word_text: word.text.clone(),
                 image_w: seg_summary_lig.image_w,
@@ -2382,7 +2172,7 @@ pub fn segment_line(
                 chars: all_chars,
                 boundaries: bounds_plain,
                 seam_paths: Arc::new(seams_plain),
-                seam_costs: plain_seam_costs,
+                seam_costs: Arc::new(plain_seam_costs),
                 crop_h: word_h,
                 word_text: word.text.clone(),
                 image_w: plain_image_w,
@@ -2534,29 +2324,28 @@ pub(crate) const LIGATURE_SEQUENCES: &[(&[char], char)] = &[
 /// it returns false are skipped entirely (no crop, no resize).
 /// Crop a single character from a word image at position `i`.
 /// Returns `None` if the region is too narrow or contains no ink.
-/// Shared seam-masked crop for `crop_ngram` and `char_crop_and_metrics`.
-///
-/// Expanded bounds include winding seam excursions (pre-1cfca57 `crop_ngram`
-/// behavior), clamped and ordered to avoid 5px h_err -> -690 ll; each row is
-/// then whitened outside the seam limits with darkest-adjacent ownership.
-/// Returns the whitened crop plus its left bound x0, or None when the span
-/// is empty or narrower than `min_width`.
-///
-/// The two callers keep their own tails on purpose: `crop_ngram` normalizes
-/// with INK_THRESH (240) to match training-time trimming, while
-/// `char_crop_and_metrics` trims with THRESH 200 and returns metrics, so the
-/// two normalized crops genuinely differ (F14 probe on real lob words:
-/// 149/454 chars) and must not be merged into one function.
-fn seam_masked_crop(
+/// Crop `n` adjacent characters starting at position `i` from a word image.
+/// Spans boundaries[i] to boundaries[i+n], with seam masking at the
+/// outer edges.  Returns `None` if the region is too narrow or has no ink.
+pub fn crop_ngram(
     word_img: &GrayImage,
-    b_left: u32,
-    b_right: u32,
-    left_seam: Option<&Vec<[u32; 2]>>,
-    right_seam: Option<&Vec<[u32; 2]>>,
+    i: usize,
+    n: usize,
+    boundaries: &[u32],
+    seam_paths: &HashMap<u32, Vec<[u32; 2]>>,
     crop_h: u32,
-    min_width: u32,
-) -> Option<(GrayImage, u32)> {
+) -> Option<GrayImage> {
     let (ww, _) = word_img.dimensions();
+
+    if i + n >= boundaries.len() {
+        return None;
+    }
+
+    let b_left = boundaries[i];
+    let b_right = boundaries[i + n];
+
+    let left_seam = seam_paths.get(&b_left);
+    let right_seam = seam_paths.get(&b_right);
 
     // Expanded bounds to include winding seam excursions (pre-1cfca57 crop_ngram behavior),
     // but with clamped, ordered limits to avoid 5px h_err -> -690 ll.
@@ -2572,7 +2361,127 @@ fn seam_masked_crop(
         b_right
     }.min(ww);
 
-    if x1 <= x0 || (x1 - x0) < min_width {
+    if x1 <= x0 || (x1 - x0) < 2 * (n as u32) {
+        return None;
+    }
+
+    let mut crop = image::imageops::crop_imm(word_img, x0, 0, x1 - x0, crop_h).to_image();
+
+    let crop_w = x1 - x0;
+    {
+        let cw_us = crop_w as usize;
+        let ch_us = crop_h as usize;
+        let raw = crop.as_mut();
+        let stride = cw_us;
+        for y in 0..ch_us {
+            let base = y * stride;
+            // Per-row limits – handles 1-3 px horizontal moves, darkest-adjacent ownership
+            let mut left_limit = x0;
+            let mut right_limit = x1;
+            if let Some(sp) = left_seam {
+                let cols: Vec<u32> = sp.iter().filter(|p| p[0] == y as u32).map(|p| p[1]).collect();
+                if !cols.is_empty() {
+                    let s_min = *cols.iter().min().unwrap();
+                    let s_max = *cols.iter().max().unwrap();
+                    let left_adj = if s_min > 0 {
+                        word_img.get_pixel(s_min - 1, y as u32).0[0]
+                    } else {
+                        255
+                    };
+                    let right_adj = if s_max + 1 < ww {
+                        word_img.get_pixel(s_max + 1, y as u32).0[0]
+                    } else {
+                        255
+                    };
+                    let assign_to_left = left_adj <= right_adj;
+                    left_limit = if assign_to_left {
+                        (s_max + 1).max(x0).min(x1)
+                    } else {
+                        s_min.max(x0).min(x1)
+                    };
+                }
+            }
+            if let Some(sp) = right_seam {
+                let cols: Vec<u32> = sp.iter().filter(|p| p[0] == y as u32).map(|p| p[1]).collect();
+                if !cols.is_empty() {
+                    let s_min = *cols.iter().min().unwrap();
+                    let s_max = *cols.iter().max().unwrap();
+                    let left_adj = if s_min > 0 {
+                        word_img.get_pixel(s_min - 1, y as u32).0[0]
+                    } else {
+                        255
+                    };
+                    let right_adj = if s_max + 1 < ww {
+                        word_img.get_pixel(s_max + 1, y as u32).0[0]
+                    } else {
+                        255
+                    };
+                    let assign_to_left = left_adj <= right_adj;
+                    let r = if assign_to_left {
+                        s_max + 1
+                    } else {
+                        s_min
+                    };
+                    right_limit = r.max(x0).min(x1).max(left_limit);
+                }
+            }
+            if left_limit >= x1 || right_limit <= x0 {
+                raw[base..base + cw_us].fill(255);
+                continue;
+            }
+            let l = (left_limit - x0) as usize;
+            let r = (right_limit - x0) as usize;
+            if l > 0 {
+                raw[base..base + l.min(cw_us)].fill(255);
+            }
+            if r < cw_us {
+                raw[base + r..base + cw_us].fill(255);
+            }
+        }
+    }
+
+    normalize_to_ink_bounds(&crop, NORM_H)
+}
+
+/// Crop a character and return its normalized image plus ink metrics in word coordinates.
+/// Scan crop does seam handling (whitening outside winding divider); trim itself
+/// finds ink bounds and returns center in caller's (word) coordinate system.
+/// This is the single source of truth for both recognition crop and geometry midpoint,
+/// so trim is called exactly once per character.
+pub fn char_crop_and_metrics(
+    word_img: &GrayImage,
+    i: usize,
+    boundaries: &[u32],
+    seam_paths: &HashMap<u32, Vec<[u32; 2]>>,
+    crop_h: u32,
+) -> Option<(GrayImage, u32, u32, u32, u32, f64, f64)> {
+    let (ww, _) = word_img.dimensions();
+    if i + 1 >= boundaries.len() {
+        return None;
+    }
+    let b_left = boundaries[i];
+    let b_right = boundaries[i + 1];
+    let left_seam = seam_paths.get(&b_left);
+    let right_seam = seam_paths.get(&b_right);
+
+    // Restore original clamped bounds: use nominal b_left/b_right, not expanded
+    // seam excursions. Expanded bounds shift cx for narrow glyphs (v,w,x,l,n) and
+    // Single source crop: expanded bounds to include winding seam excursions
+    // (avoids clipping ffi etc), but with clamped, ordered seam limits to avoid
+    // 5px h_err -> -690 ll. This merges pre-1cfca57 measure_char_ink_bounds (clamped)
+    // with pre-1cfca57 crop_ngram (expanded) into one correct implementation.
+    let x0 = if let Some(sp) = left_seam {
+        sp.iter().map(|p| p[1]).min().unwrap_or(b_left).min(b_left)
+    } else {
+        b_left
+    }.min(ww);
+    let x1 = if let Some(sp) = right_seam {
+        sp.iter().map(|p| p[1]).max().unwrap_or(b_right).max(b_right).saturating_add(1)
+    } else {
+        b_right
+    }.min(ww);
+
+    if x1 <= x0 || (x1 - x0) < 2 {
         return None;
     }
 
@@ -2653,69 +2562,6 @@ fn seam_masked_crop(
         }
     }
 
-    Some((crop, x0))
-}
-
-/// Crop `n` adjacent characters starting at position `i` from a word image.
-/// Spans boundaries[i] to boundaries[i+n], with seam masking at the
-/// outer edges.  Returns `None` if the region is too narrow or has no ink.
-pub fn crop_ngram(
-    word_img: &GrayImage,
-    i: usize,
-    n: usize,
-    boundaries: &[u32],
-    seam_paths: &HashMap<u32, Vec<[u32; 2]>>,
-    crop_h: u32,
-) -> Option<GrayImage> {
-    if i + n >= boundaries.len() {
-        return None;
-    }
-
-    let b_left = boundaries[i];
-    let b_right = boundaries[i + n];
-
-    let left_seam = seam_paths.get(&b_left);
-    let right_seam = seam_paths.get(&b_right);
-
-    let (crop, _) = seam_masked_crop(
-        word_img,
-        b_left,
-        b_right,
-        left_seam,
-        right_seam,
-        crop_h,
-        2 * (n as u32),
-    )?;
-
-    normalize_to_ink_bounds(&crop, NORM_H)
-}
-
-/// Crop a character and return its normalized image plus ink metrics in word coordinates.
-/// Scan crop does seam handling (whitening outside winding divider); trim itself
-/// finds ink bounds and returns center in caller's (word) coordinate system.
-/// This is the single source of truth for both recognition crop and geometry midpoint,
-/// so trim is called exactly once per character.
-pub fn char_crop_and_metrics(
-    word_img: &GrayImage,
-    i: usize,
-    boundaries: &[u32],
-    seam_paths: &HashMap<u32, Vec<[u32; 2]>>,
-    crop_h: u32,
-) -> Option<(GrayImage, u32, u32, u32, u32, f64, f64)> {
-    if i + 1 >= boundaries.len() {
-        return None;
-    }
-    let b_left = boundaries[i];
-    let b_right = boundaries[i + 1];
-    let left_seam = seam_paths.get(&b_left);
-    let right_seam = seam_paths.get(&b_right);
-
-    // Bounds + seam masking shared with crop_ngram (see seam_masked_crop);
-    // the trim below keeps this function's own THRESH 200.
-    let (crop, x0) = seam_masked_crop(
-        word_img, b_left, b_right, left_seam, right_seam, crop_h, 2,
-    )?;
-
     // Trim to ink — single scan, raw buffer, no get_pixel.
     const THRESH: u8 = 200;
     let (cw, ch) = crop.dimensions();
@@ -2729,10 +2575,19 @@ pub fn char_crop_and_metrics(
     let mut max_x = 0u32;
     let mut min_y = ch;
     let mut max_y = 0u32;
+    // Subpixel geometry: per-column and per-row max darkness (255 - pixel),
+    // for fractional edge computation. Tracked in the same single scan;
+    // white gives 0 and never affects the max.
+    let mut col_dark = vec![0u8; cw_us];
+    let mut row_dark = vec![0u8; ch_us];
     for y in 0..ch_us {
         let base = y * cw_us;
         for x in 0..cw_us {
-            if raw_crop[base + x] < THRESH {
+            let pixel = raw_crop[base + x];
+            let darkness = 255u8.saturating_sub(pixel);
+            if darkness > col_dark[x] { col_dark[x] = darkness; }
+            if darkness > row_dark[y] { row_dark[y] = darkness; }
+            if pixel < THRESH {
                 let xu = x as u32;
                 let yu = y as u32;
                 if xu < min_x { min_x = xu; }
@@ -2751,8 +2606,31 @@ pub fn char_crop_and_metrics(
     let x_max_abs = x0 + max_x;
     let y_min_abs = min_y;
     let y_max_abs = max_y;
-    let cx = (x_min_abs as f64 + x_max_abs as f64) * 0.5;
-    let cy = (y_min_abs as f64 + y_max_abs as f64) * 0.5;
+
+    // Subpixel edges via the canonical helper (same formula as before, now
+    // shared with the word-level extents): edge-column darkness as a fraction
+    // of the character's darkest column/row. A half-dark edge column
+    // contributes only half its pixel width, so the edge sits at
+    // x_min + (1 - f) / x_max + f instead of at the integer column.
+    // Fractional bounds use INK_THRESH (240), the crate-wide ink threshold,
+    // so near-threshold antialiased edge pixels (e.g. value 215) count as ink
+    // here even though the THRESH=200 integer bounds used for the recognition
+    // crop drop them. The fractions are relative to the character's own
+    // darkest column/row, so grey ink (whose solid interior is not pure
+    // black) still gets correct relative coverage. Integer ink exists at
+    // THRESH=200 (darkness > 55), so a column/row at INK_THRESH darkness
+    // (>= 15) always exists; the fallbacks are unreachable.
+    let ink_min_dark = 255u16 - crate::INK_THRESH as u16;
+    let (fl, fr) = crate::ocr::frac_edges_from_profile(&col_dark, ink_min_dark)
+        .unwrap_or((min_x as f64, max_x as f64 + 1.0));
+    let (ft, fb) = crate::ocr::frac_edges_from_profile(&row_dark, ink_min_dark)
+        .unwrap_or((min_y as f64, max_y as f64 + 1.0));
+    let frac_left = x0 as f64 + fl;
+    let frac_right = x0 as f64 + fr;
+    let frac_top = ft;
+    let frac_bottom = fb;
+    let cx = (frac_left + frac_right) * 0.5;
+    let cy = (frac_top + frac_bottom) * 0.5;
 
     // Build normalized image from the same ink bounds (no second scan) - raw blit.
     let ink_w = max_x - min_x + 1;
