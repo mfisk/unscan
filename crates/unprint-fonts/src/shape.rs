@@ -57,21 +57,6 @@ fn get_face_cached(handle: &FaceHandle) -> Option<rustybuzz::Face<'_>> {
     Some(face)
 }
 
-pub type Features = Vec<rustybuzz::Feature>;
-
-pub fn ot_features_for_variant(variant_tag: &str) -> Features {
-    if variant_tag.is_empty() {
-        return Vec::new();
-    }
-    let mut tag_bytes = [0u8; 4];
-    let src = variant_tag.as_bytes();
-    for i in 0..4.min(src.len()) {
-        tag_bytes[i] = src[i];
-    }
-    let tag = rustybuzz::ttf_parser::Tag::from_bytes(&tag_bytes);
-    vec![rustybuzz::Feature::new(tag, 1, ..)]
-}
-
 // Thread-local cache of ShapePlan by (font_data_ptr, combined_hash)
 // Nightly profiling 2026-08-16: find_language_feature 377 samples 8.3% leaf,
 // hb_ot_shape_plan_t::new 2.2% inclusive, collapsed_lig_set inclusive 33.9%
@@ -131,22 +116,6 @@ fn get_plan_cached(
         c.borrow_mut().insert(key, plan.clone());
     });
     plan
-}
-
-pub fn shape_words(
-    face_handle: &FaceHandle,
-    words: &[&str],
-    features: &[rustybuzz::Feature],
-) -> Vec<Option<ShapedWord>> {
-    let face = match get_face_cached(face_handle) {
-        Some(f) => f,
-        None => return vec![None; words.len()],
-    };
-    let data_ptr = face_handle.as_ptr_usize();
-    words
-        .iter()
-        .map(|text| shape_word_inner(&face, data_ptr, features, text))
-        .collect()
 }
 
 pub fn shape_word(
@@ -253,21 +222,4 @@ fn shape_word_inner(
         glyphs,
         total_advance: total,
     })
-}
-
-pub fn compute_em_px_batch(
-    font_data: &[u8],
-    sample_text: &str,
-    features: &[rustybuzz::Feature],
-) -> Option<f32> {
-    let face = rustybuzz::Face::from_slice(font_data, 0)?;
-    let mut buf = rustybuzz::UnicodeBuffer::new();
-    buf.push_str(sample_text);
-    let out = rustybuzz::shape(&face, features, buf);
-    let positions = out.glyph_positions();
-    if positions.is_empty() {
-        return None;
-    }
-    let total_adv: i32 = positions.iter().map(|p| p.x_advance).sum();
-    Some(total_adv as f32 / 64.0 / sample_text.chars().count() as f32)
 }
