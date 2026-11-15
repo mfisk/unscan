@@ -591,10 +591,11 @@ pub fn match_lines(
         // word_infos reuses them instead of re-cropping + re-normalizing
         // the same bbox. The diag pass crops the identical bbox with the
         // identical pure function, so a reused crop is bit-identical to
-        // a fresh one. Words the diag pass did not cover fall back to a
-        // fresh crop below; non-audit runs have no diag pass at all.
-        // Consuming the LineCrops drops the diag WordSeg shells (their
-        // seam data lives in the seg cache); only the image Arcs are kept.
+        // a fresh one. Words the diag filter skipped (its iteration
+        // order differs from word_infos') fall back to a fresh crop
+        // below; non-audit runs have no diag pass at all. Consuming the
+        // LineCrops drops the diag WordSeg shells (their seam data lives
+        // in the seg cache); only the image Arcs are kept.
         let diag_crop_by_word: std::collections::HashMap<usize, std::sync::Arc<image::GrayImage>> =
             match diag_crops {
                 Some(crops) => crops
@@ -607,15 +608,15 @@ pub fn match_lines(
         // Per-font pipeline: segmentation now happens inside identify_fonts.
         // ── Per-font ligature handling: build word image infos for inside identify_fonts ──
         use std::sync::Arc;
-        // Build word infos for every word on the line. No word is dropped:
-        // the old character-coverage filter (drop a word whose chars had
-        // all been seen twice) predates geometry scoring, where letter
-        // pairs matter, so every word's observations are scored.
+        // Build filtered word infos (replicates segment_line filtering but without segmentation)
         let word_infos: Vec<font_match::WordImgInfo> = {
             let pw = gray_page.width();
             let ph = gray_page.height();
+            let audit_all = crate::features::audit_all_chars_enabled();
+            let mut char_counts: std::collections::HashMap<char, usize> = std::collections::HashMap::new();
             let mut sorted: Vec<(usize, &crate::ocr::TextRegion)> = line.words.iter().enumerate().collect();
             // Sort left-to-right by x-position for correct character ordering.
+            // (Was: sort by char count descending, which reversed word order and broke geometry.)
             sorted.sort_by(|a,b| a.1.x.cmp(&b.1.x));
             let mut infos = Vec::new();
             for (orig_idx, w) in sorted {
@@ -625,6 +626,11 @@ pub fn match_lines(
                 let cw = ww.min(pw - wx);
                 let ch = wh.min(ph - wy);
                 if cw < 2 || ch < 2 { continue; }
+                let chars_supported: Vec<char> = if audit_all { w.text.chars().collect() } else { w.text.chars().filter(|c| crate::features::is_supported(*c)).collect() };
+                if !audit_all && chars_supported.len() <= 1 { continue; }
+                let need_any = if audit_all { true } else { chars_supported.iter().any(|c| char_counts.get(c).copied().unwrap_or(0) < 2) };
+                if !audit_all && chars_supported.len() > 2 && !need_any { continue; }
+                for &c in &chars_supported { if audit_all || crate::features::is_supported(c) { *char_counts.entry(c).or_insert(0) += 1; } }
                 // (F10) Reuse the diag pass's crop for this word when it
                 // has one; otherwise crop + normalize fresh (same bbox,
                 // same pure function, so the result is identical either
@@ -803,44 +809,21 @@ pub fn match_lines(
                             Some(v) => v,
                             None => continue,
                         };
-                        // (F8: the tie-block midpoint_em_px computation was
-                        // deleted — its value was never read; the LineMatch
-                        // binding below recomputes it for the winner. The
-                        // geo predictor it called is memo-backed and pure,
-                        // so skipping the call changes no value.)
-                        // Fractional line width from subpixel ink bounds, in LINE
-                        // coordinates. frac_left/frac_right are word-local
-                        // (0..word width), so add each word's x offset within
-                        // the line crop to get line coordinates. Without the
-                        // offset, min/max across words is roughly the widest
-                        // word's width (~194px on L3) instead of the line's
-                        // width (~1853px), and width_matched_em_px_shaped
-                        // computes an em ~10x too small — tie renders came out
-                        // 4px tall instead of ~40px.
-                        let frac_width: Option<f32> = {
-                            let mut min_l = f64::INFINITY;
-                            let mut max_r = f64::NEG_INFINITY;
-                            for (seg, w) in segs.iter().zip(wib.iter()) {
-                                let word_x = line.words.get(seg.source_word_idx)
-                                    .map(|tw| tw.x as f64)
-                                    .unwrap_or(0.0) - line.x as f64;
-                                for c in w.chars.iter() {
-                                    let l = word_x + c.frac_left;
-                                    let r = word_x + c.frac_right;
-                                    if l < min_l { min_l = l; }
-                                    if r > max_r { max_r = r; }
-                                }
-                            }
-                            if max_r > min_l && min_l.is_finite() {
-                                Some((max_r - min_l) as f32)
-                            } else {
-                                None
-                            }
-                        };
+                        // Render each tied font at its own midpoint-derived
+                        // em (observed vs predicted midpoint spans), the
+                        // same basis Pass 2a uses — not the full-line
+                        // width-fitted em, which fits the scan's scale and
+                        // inflates ZNCC. None falls back to the per-word
+                        // width-matched median as before. frac_width stays
+                        // None: a Some value would replace this override
+                        // with a width-derived em (verify.rs).
+                        let mid_em = crate::geometry_classifier::median_em_px_from_midpoints(
+                            font_key, &segs, &wib, geo_cache,
+                        );
                         let vr = verify::verify_text_region(
                             &norm_crop, &fd, &fe.path, &line.text, &line.words, line.x, line.y,
                             fe.glyph_overrides.as_deref(), &fe.variant_tag, fe.variations.as_deref(),
-                            true, fe.collapsed_lig_set(), tie_audit_dir.as_deref(), None, None, frac_width,
+                            true, fe.collapsed_lig_set(), tie_audit_dir.as_deref(), None, mid_em, None,
                         );
                         tie_sim_results.push((fe.font_key(), fe.family_name.clone(), vr.score));
                         // Highest SSIM wins. On an exact SSIM tie, the shared
