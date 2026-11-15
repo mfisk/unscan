@@ -2405,40 +2405,53 @@ pub fn generate_report(
 
     let mut font_data_cache = FontDataCache::new();
 
+    // F35: build each displayed entry's block once and reuse it. An entry
+    // appears in its kind section, in the OCR-miss section when OCR is
+    // wrong, and in All Lines when --report-all — and every
+    // build_miss_block re-verifies the GT font, so without this the same
+    // entry was verified up to 3 times. Entries shown in no section (hits
+    // and no-ground-truth lines with correct OCR, without --report-all)
+    // are not built, exactly as before.
+    let mut block_cache: HashMap<(usize, usize), String> = HashMap::new();
+    for ce in classified {
+        let shown = meta.report_all
+            || ce.entry.ocr_correct == Some(false)
+            || !matches!(ce.kind, MissKind::Hit | MissKind::NoGroundTruth);
+        if shown {
+            let (html, _chosen_zncc, _gt_zncc) = build_miss_block(
+                ce, audit_root, font_catalog, glyph_map, &mut font_data_cache, dpi,
+            );
+            block_cache.insert((ce.entry.page, ce.entry.line_index), html);
+        }
+    }
+    // Look up a pre-built block for a displayed entry. Panics on a missing
+    // entry: the `shown` predicate above must cover every displayed set.
+    let block_for = |ce: &ClassifiedEntry| -> &str {
+        &block_cache[&(ce.entry.page, ce.entry.line_index)]
+    };
+
     // Build major miss blocks (OCR-wrong already filtered out)
     let mut major_miss_blocks = String::new();
     for ce in &major_misses_sorted {
-        let (html, _chosen_zncc, _gt_zncc) = build_miss_block(
-            ce, audit_root, font_catalog, glyph_map, &mut font_data_cache, dpi,
-        );
-        major_miss_blocks.push_str(&html);
+        major_miss_blocks.push_str(block_for(ce));
     }
 
     // Build minor miss blocks — OCR-miss already filtered
     let mut minor_miss_blocks = String::new();
     for ce in &minor_misses_sorted {
-        let (html, _chosen_zncc, _gt_zncc) = build_miss_block(
-            ce, audit_root, font_catalog, glyph_map, &mut font_data_cache, dpi,
-        );
-        minor_miss_blocks.push_str(&html);
+        minor_miss_blocks.push_str(block_for(ce));
     }
 
     // Build similarity failure blocks (OCR-wrong filtered out)
     let mut sim_fail_blocks = String::new();
     for ce in &similarity_failures_sorted {
-        let (html, _chosen_zncc, _gt_zncc) = build_miss_block(
-            ce, audit_root, font_catalog, glyph_map, &mut font_data_cache, dpi,
-        );
-        sim_fail_blocks.push_str(&html);
+        sim_fail_blocks.push_str(block_for(ce));
     }
 
     // Build kept-raster blocks (OCR-wrong filtered out)
     let mut raster_blocks = String::new();
     for ce in &kept_raster_sorted {
-        let (html, _chosen_zncc, _gt_zncc) = build_miss_block(
-            ce, audit_root, font_catalog, glyph_map, &mut font_data_cache, dpi,
-        );
-        raster_blocks.push_str(&html);
+        raster_blocks.push_str(block_for(ce));
     }
 
     // Build hits / no_ground_truth blocks when --report-all
@@ -2447,16 +2460,10 @@ pub fn generate_report(
     let mut no_gt_blocks = String::new();
     if meta.report_all {
         for ce in &hits_sorted {
-            let (html, _chosen_zncc, _gt_zncc) = build_miss_block(
-                ce, audit_root, font_catalog, glyph_map, &mut font_data_cache, dpi,
-            );
-            hits_blocks.push_str(&html);
+            hits_blocks.push_str(block_for(ce));
         }
         for ce in &no_gt_sorted {
-            let (html, _chosen_zncc, _gt_zncc) = build_miss_block(
-                ce, audit_root, font_catalog, glyph_map, &mut font_data_cache, dpi,
-            );
-            no_gt_blocks.push_str(&html);
+            no_gt_blocks.push_str(block_for(ce));
         }
     }
 
@@ -2464,10 +2471,7 @@ pub fn generate_report(
     // Use full miss block so font info is preserved even for major misses.
     let mut ocr_miss_blocks = String::new();
     for ce in &ocr_misses {
-        let (html, _chosen_zncc, _gt_zncc) = build_miss_block(
-            ce, audit_root, font_catalog, glyph_map, &mut font_data_cache, dpi,
-        );
-        ocr_miss_blocks.push_str(&html);
+        ocr_miss_blocks.push_str(block_for(ce));
     }
 
     let sim_fail_section = if !sim_fail_blocks.is_empty() {
@@ -2529,10 +2533,7 @@ pub fn generate_report(
         });
         let mut blocks = String::new();
         for ce in &all_sorted {
-            let (html, _chosen_zncc, _gt_zncc) = build_miss_block(
-                ce, audit_root, font_catalog, glyph_map, &mut font_data_cache, dpi,
-            );
-            blocks.push_str(&html);
+            blocks.push_str(block_for(ce));
         }
         let section = format!(
             "<h2 style=\"margin-top:2em;\">All Lines ({} lines)</h2>{}",
