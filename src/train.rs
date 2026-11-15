@@ -874,22 +874,14 @@ pub fn run_train(mut args: TrainArgs, geo_cache: &crate::geo_cache::GeometryCach
             let mut need_render: Vec<usize> = Vec::new();
 
             for (si, seq) in sequences.iter().enumerate() {
+                // No-PNG-cache training (train-nocache-pngs): reuse the old
+                // glyph map's hash directly. Renders are deterministic, so the
+                // hash is valid without the PNG existence check main uses to
+                // validate it. No PNG is read here.
                 if let Some(old) = old_gmap.as_ref() {
                     if let Some(hash) = old.hash_for_font(seq, &fk) {
-                        let path = crate::char_render::ngram_cache_path(seq, hash, &prewarm_params);
-                        // Atomic-safe reuse check: exists + non-trivial size.
-                        // A SIGKILL during previous img.save could leave a 0-byte or truncated file.
-                        // Such files would still `exists()` but fail to decode; treat as miss.
-                        if path.exists() {
-                            if let Ok(md) = std::fs::metadata(&path) {
-                                if md.len() > 64 {
-                                    local_hashes.push((si, hash));
-                                    continue;
-                                }
-                            }
-                            // Corrupt/partial file detected — delete so fresh render heals it.
-                            let _ = std::fs::remove_file(&path);
-                        }
+                        local_hashes.push((si, hash));
+                        continue;
                     }
                 }
                 need_render.push(si);
@@ -935,34 +927,9 @@ pub fn run_train(mut args: TrainArgs, geo_cache: &crate::geo_cache::GeometryCach
                         .collect();
                     if let Some(img) = crate::char_render::render_ngram_fresh(&font, seq, &gid_overrides, &prewarm_params, disable_kern, &kern
                     ) {
+                        // No-PNG-cache training (train-nocache-pngs): hash the
+                        // in-memory render for the glyph map; do not save the PNG.
                         let hash = crate::glyph_map::hash_image(&img);
-                        let path = crate::char_render::ngram_cache_path(seq, hash, &prewarm_params);
-                        // Always atomic write to heal any prior partial file; rename is atomic.
-                        // Explicit encoder needed — `.tmp` breaks `image::save` format detection.
-                        let tmp = crate::atomic_file::tmp_for(&path);
-                        if let Some(parent) = tmp.parent() {
-                            let _ = std::fs::create_dir_all(parent);
-                        }
-                        let ok = (|| -> std::io::Result<()> {
-                            use std::fs::File;
-                            use std::io::BufWriter;
-                            use image::codecs::png::PngEncoder;
-                            use image::ImageEncoder;
-                            let f = File::create(&tmp)?;
-                            let mut w = BufWriter::new(f);
-                            let enc = PngEncoder::new(&mut w);
-                            enc.write_image(img.as_raw(), img.width(), img.height(), image::ExtendedColorType::L8)
-                                .map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e))?;
-                            use std::io::Write;
-                            w.flush()?;
-                            Ok(())
-                        })()
-                        .is_ok();
-                        if ok {
-                            let _ = std::fs::rename(&tmp, &path);
-                        } else {
-                            let _ = std::fs::remove_file(&tmp);
-                        }
                         local_hashes.push((si, hash));
                         rendered += 1;
                     }
@@ -1019,7 +986,7 @@ pub fn run_train(mut args: TrainArgs, geo_cache: &crate::geo_cache::GeometryCach
             total_deduped
         );
         eprintln!(
-            "  Pre-warm reused {} cached PNGs and rendered {} missing glyphs",
+            "  Pre-warm reused {} glyph-map hashes and rendered {} missing glyphs",
             prewarm_reused.load(Ordering::Relaxed),
             prewarm_rendered.load(Ordering::Relaxed)
         );
@@ -1343,36 +1310,11 @@ pub fn run_train(mut args: TrainArgs, geo_cache: &crate::geo_cache::GeometryCach
                         params.aa = all_aa[aa_idx_all];
                         params.subpixel_dx = dx;
                         params.subpixel_dy = dy;
-                        let matches_prewarm_params = params.height == prewarm_params.height
-                            && params.render_scale == prewarm_params.render_scale
-                            && params.aa == prewarm_params.aa
-                            && params.binarize_threshold == prewarm_params.binarize_threshold;
-                        let img = if matches_prewarm_params {
-                            glyph_map
-                                .hash_for_font(seq, &fk)
-                                .and_then(|hash| {
-                                    // Try cache first
-                                    if let Some(img) = crate::char_render::load_cached_ngram(seq, hash, &params) {
-                                        Some(img)
-                                    } else {
-                                        // Cache miss: render fresh and save to cache
-                                        let img = crate::char_render::render_ngram_fresh(&font, seq, &gid_overrides, &params, disable_kern, &kern)?;
-                                        let path = crate::char_render::ngram_cache_path(seq, hash, &params);
-                                        if let Some(parent) = path.parent() {
-                                            let _ = std::fs::create_dir_all(parent);
-                                        }
-                                        let _ = img.save(&path);
-                                        Some(img)
-                                    }
-                                })
-                                .or_else(|| {
-                                    crate::char_render::render_ngram_fresh(&font, seq, &gid_overrides, &params, disable_kern, &kern
-                    )
-                                })
-                        } else {
-                            crate::char_render::render_ngram_fresh(&font, seq, &gid_overrides, &params, disable_kern, &kern
-                    )
-                        };
+                        // No-PNG-cache training (train-nocache-pngs): always render
+                        // fresh in memory and compute features directly. No cache
+                        // load, no PNG save. Renders are deterministic, so the
+                        // features are identical to the cached path's.
+                        let img = crate::char_render::render_ngram_fresh(&font, seq, &gid_overrides, &params, disable_kern, &kern);
                         let img = match img {
                             Some(img) => img,
                             None => continue,
