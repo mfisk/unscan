@@ -506,7 +506,7 @@ fn build_audit_entry(
 fn write_audit_report(
     audit_root: &std::path::Path,
     entries: &[AuditEntry],
-    ground_truth: Option<&ground_truth::GroundTruth>,
+    classified: &[report::ClassifiedEntry],
     dpi: u32,
     font_entries: &[font_scan::FontEntry],
     glyph_map: &glyph_map::NgramGlyphMap,
@@ -526,7 +526,7 @@ fn write_audit_report(
         &report_path,
         audit_root,
         entries,
-        ground_truth,
+        classified,
         dpi,
         font_entries,
         glyph_map,
@@ -1385,16 +1385,21 @@ fn run(args: &cli::Args, classifier: &mut dyn classifier::Classifier) -> Result<
         font_registry.entries(),
         &glyph_map,
     );
+    // (F32) Classify the entries once and share the result with
+    // compute_accuracy and the HTML report, instead of each recomputing
+    // it. Enrich classified internally above (it mutates the entries, so
+    // it cannot share this Vec); this is the run's second and last pass.
+    let classified = report::classify_entries(
+        &audit.text_entries,
+        ground_truth.as_ref(),
+        args.dpi,
+        font_registry.entries(),
+        &glyph_map,
+    );
 
     if test_mode {
         // ── Test mode: compute accuracy, print JSON to stdout ────────
-        let acc = report::compute_accuracy(
-            &audit.text_entries,
-            ground_truth.as_ref(),
-            args.dpi,
-            font_registry.entries(),
-            &glyph_map,
-        );
+        let acc = report::compute_accuracy(&classified);
         // JSON output to stdout
         let zncc_avg: f64 = {
             let vals: Vec<f64> = audit.text_entries.iter()
@@ -1427,7 +1432,7 @@ fn run(args: &cli::Args, classifier: &mut dyn classifier::Classifier) -> Result<
             } else {
             }
             write_audit_report(
-                audit_root, &audit.text_entries, ground_truth.as_ref(),
+                audit_root, &audit.text_entries, &classified,
                 args.dpi, font_registry.entries(), &glyph_map, args, run_start.elapsed(),
             );
         }
@@ -1446,7 +1451,7 @@ fn run(args: &cli::Args, classifier: &mut dyn classifier::Classifier) -> Result<
     // ── 5b. HTML miss report ─────────────────────────────────────────
     if let Some(ref audit_root) = args.audit {
         write_audit_report(
-            audit_root, &audit.text_entries, ground_truth.as_ref(),
+            audit_root, &audit.text_entries, &classified,
             args.dpi, font_registry.entries(), &glyph_map, args, run_start.elapsed(),
         );
     }
