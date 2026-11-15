@@ -157,47 +157,6 @@ impl NgramGlyphMap {
         }
     }
 
-    /// Remove font keys that are no longer installed from every group.
-    ///
-    /// Groups that lose all their font keys are KEPT as empty placeholders:
-    /// glyph_ids are dense per-sequence indices into the group list, and the
-    /// feature files + LDA weights are keyed by glyph_id, so dropping a group
-    /// would shift every later gid and invalidate the training data. An empty
-    /// group is revivable: if the font is reinstalled, `register` finds the
-    /// group by hash and re-adds the key under its original gid, and the
-    /// group's feature records + classifier centroid become valid again.
-    ///
-    /// Every `fonts_for_glyph` consumer is safe for empty groups: the
-    /// training loops reach a group only via a font key it contains (so the
-    /// group is non-empty), and the remaining callers use `.first()` /
-    /// `.find()` with a fallback. Returns (keys_removed, groups_emptied),
-    /// where groups_emptied counts only groups that lost their last key in
-    /// this call.
-    pub fn prune_fonts(&mut self, removed: &HashSet<String>) -> (usize, usize) {
-        if removed.is_empty() {
-            return (0, 0);
-        }
-        let mut keys_removed = 0usize;
-        let mut groups_emptied = 0usize;
-        for groups in self.groups.values_mut() {
-            for group in groups.iter_mut() {
-                let before = group.font_keys.len();
-                if before == 0 {
-                    continue;
-                }
-                group.font_keys.retain(|k| !removed.contains(k));
-                keys_removed += before - group.font_keys.len();
-                if group.font_keys.is_empty() {
-                    groups_emptied += 1;
-                }
-            }
-        }
-        if keys_removed > 0 {
-            self.rebuild_lookup();
-        }
-        (keys_removed, groups_emptied)
-    }
-
     /// Register a rendered glyph: associate a font_key with an image hash
     /// for a given sequence. If the hash matches an existing group, the
     /// font_key is added to that group. Otherwise a new group is created.
