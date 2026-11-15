@@ -544,15 +544,6 @@ pub fn match_lines(
                 height: w.height,
             })
             .collect();
-        // Per-line segmentation cache: segment_line (diag),
-        // identify_fonts and the winner rebuild segment the same word
-        // crops with the same k; each distinct (image, k, exemption)
-        // triple is computed once. Threaded explicitly — never a global
-        // — so parallel lines never share state. The GT and tie-break
-        // rebuilds deliberately use a fresh throwaway cache (see their
-        // call sites): sharing there is a separate decision pending
-        // Mike's review of the redundancy survey (finding F12).
-        let mut seg_cache = crate::segment::SegmentCache::new();
         // Diagnostic-only segmentation: write the seam diagnostics
         // (word_crop.png, seg_plain/summary.json, seg_lig/...) for this
         // line. Scoring uses identify_fonts' own per-font segmentation;
@@ -567,7 +558,6 @@ pub fn match_lines(
                 gray_page, &word_placements, word_height,
                 diag_seg_dir.as_deref(),
                 &args.render_params(),
-                &mut seg_cache,
             );
         }
         // Per-font pipeline: segmentation now happens inside identify_fonts.
@@ -606,7 +596,7 @@ pub fn match_lines(
         };
 
         // Helper to build per-font WordSegs + wib for any font entry (used for tie and winner recompute)
-        let build_for_font = |fe: &crate::font_scan::FontEntry, infos: &[font_match::WordImgInfo], gt_segmentation: bool, seg_cache: &mut crate::segment::SegmentCache| -> Option<(Vec<crate::segment::WordSeg>, Vec<crate::geometry_classifier::WordGeoMeasurement>, Vec<image::GrayImage>, Vec<(usize,usize)>)> {
+        let build_for_font = |fe: &crate::font_scan::FontEntry, infos: &[font_match::WordImgInfo], gt_segmentation: bool| -> Option<(Vec<crate::segment::WordSeg>, Vec<crate::geometry_classifier::WordGeoMeasurement>, Vec<image::GrayImage>, Vec<(usize,usize)>)> {
             // GT segmentation uses the GT ligature mask (Finding 9):
             // collapse a pair when the render would produce fused ink —
             // either the variant is lig, or the separate glyphs overlap so
@@ -620,19 +610,14 @@ pub fn match_lines(
                 let collapsed = crate::segment::collapse_ligature_chars_for_allowed(&wi.orig_chars, allowed);
                 let k = collapsed.len();
                 if k == 0 { continue; }
-                // Shared per-line cache: identify_fonts already segmented
-                // this (image, k) for scoring; the diag pass did too.
-                // The entry is chosen-only, bit-identical to a fresh
-                // `segment_characters` call.
-                let cached = seg_cache.get_or_compute(&wi.img, k, &wi.text);
-                let (bounds, seams, summary) = (cached.bounds.clone(), cached.seams.clone(), cached.summary.clone());
+                let (bounds, seams, summary) = crate::segment::segment_characters(&wi.img, k, &wi.text);
                 segs.push(crate::segment::WordSeg {
                     source_word_idx: wi.source_idx,
                     word_img: wi.img.clone(),
                     chars: collapsed,
                     boundaries: bounds,
                     seam_paths: Arc::new(seams),
-                    seam_costs: Arc::new(summary.seam_costs.clone()),
+                    seam_costs: summary.seam_costs.clone(),
                     crop_h: wi.img.height(),
                     word_text: wi.text.clone(),
                     image_w: summary.image_w,
@@ -689,8 +674,7 @@ pub fn match_lines(
             });
             let ensure_keys: Vec<&str> = gt_font_key.as_deref().into_iter().collect();
 
-            // ── Score: per-font collapse + segmentation via the shared
-            // per-line seg_cache (identify_fonts) ──
+            // ── Score: per-font collapse + segmentation cached inside identify_fonts ──
             let scoring = font_match::identify_fonts(
                 &word_infos,
                 classifier,
@@ -702,7 +686,6 @@ pub fn match_lines(
                 font_registry,
                 font_cache,
                 geo_cache,
-                &mut seg_cache,
             );
 
             gt_per_char_geo_ll = scoring.gt_per_char_geo_ll;
@@ -747,13 +730,7 @@ pub fn match_lines(
                             let _ = std::fs::create_dir_all(&p);
                             p
                         });
-                        // Deliberately unshared: the tie-break rebuilds
-                        // segment into a fresh throwaway cache. Sharing
-                        // the per-line cache here is a separate decision
-                        // pending Mike's review of the redundancy survey
-                        // (finding F12) — each tied font segments fresh,
-                        // exactly as before this change.
-                        let (segs, wib, _crops, _pmap) = match build_for_font(fe, &word_infos, false, &mut crate::segment::SegmentCache::new()) {
+                        let (segs, wib, _crops, _pmap) = match build_for_font(fe, &word_infos, false) {
                             Some(v) => v,
                             None => continue,
                         };
@@ -839,7 +816,7 @@ pub fn match_lines(
                     let font_key = &tied[0];
                     let fe_opt = font_registry.by_key(font_key);
                     if let Some(fe) = fe_opt {
-                        if let Some((segs, wib, crops, pmap)) = build_for_font(fe, &word_infos, false, &mut seg_cache) {
+                        if let Some((segs, wib, crops, pmap)) = build_for_font(fe, &word_infos, false) {
                             winning_segs = segs;
                             winning_wib = wib;
                             winning_crops_vec = crops;
@@ -1169,12 +1146,9 @@ pub fn match_lines(
         // ── GT font segmentation / crops – always emit even on misses ──
         // Build GT segs using same per-word word_infos + GT collapsed_lig_set, so k differs correctly
         // for ligature fonts (e.g. Office k=4 vs k=5).  No extra compute beyond build_for_font.
-        // Deliberately unshared (see the tie-break site above): the GT
-        // rebuild segments into a fresh throwaway cache, exactly as
-        // before this change, pending Mike's decision on finding F12.
         let (gt_segs_opt, gt_wib_opt, gt_crops_opt) = if let Some(ref gfk) = gt_font_key {
             if let Some(gt_fe) = font_registry.by_key(gfk) {
-                if let Some((s, w, c, _pm)) = build_for_font(gt_fe, &word_infos, true, &mut crate::segment::SegmentCache::new()) {
+                if let Some((s, w, c, _pm)) = build_for_font(gt_fe, &word_infos, true) {
                     (Some(s), Some(w), Some(c))
                 } else { (None, None, None) }
             } else { (None, None, None) }
