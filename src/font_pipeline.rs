@@ -76,6 +76,83 @@ pub struct ObsRankProbs {
     pub gt_ink_width: HashMap<usize, f32>,
 }
 
+/// Insert one observation's rank/prob/glyph/geo values into the chosen-side
+/// maps of `rp` under `key` (F18: the four insert blocks in
+/// `build_obs_rank_probs` were copy-pasted). The chosen side alone falls
+/// back to `best_prob.ln()` for a missing glyph score; that difference
+/// from the GT side is preserved here rather than unified away.
+fn insert_chosen_obs(rp: &mut ObsRankProbs, key: usize, obs: &font_match::ObservationDetail) {
+    rp.chosen_ranks.insert(key, 1);
+    // prefer actual prob from classifier, fall back to best_prob
+    if let Some(p) = obs.prob { rp.chosen_probs.insert(key, p); }
+    else if obs.best_prob > 0.0 { rp.chosen_probs.insert(key, obs.best_prob); }
+    if let Some(gs) = obs.glyph_score { rp.chosen_glyph_scores.insert(key, gs); }
+    else if obs.best_prob > 0.0 { rp.chosen_glyph_scores.insert(key, obs.best_prob.ln()); }
+    if let Some(h) = obs.geo_h_ll { rp.chosen_geo_h_ll.insert(key, h); }
+    if let Some(v) = obs.geo_v_ll { rp.chosen_geo_v_ll.insert(key, v); }
+    if let Some(he) = obs.geo_h_err { rp.chosen_geo_h_err.insert(key, he); }
+    if let Some(ve) = obs.geo_v_err { rp.chosen_geo_v_err.insert(key, ve); }
+    if let Some(u) = obs.geo_h_overlap_correction_px { rp.chosen_geo_h_overlap_correction.insert(key, u); }
+    if let Some(v) = obs.obs_cx { rp.chosen_obs_cx.insert(key, v); }
+    if let Some(v) = obs.pred_cx { rp.chosen_pred_cx.insert(key, v); }
+    if let Some(v) = obs.obs_pitch { rp.chosen_obs_pitch.insert(key, v); }
+    if let Some(v) = obs.pred_pitch { rp.chosen_pred_pitch.insert(key, v); }
+    if let Some(v) = obs.geo_scale { rp.chosen_geo_scale.insert(key, v); }
+    if let Some(v) = obs.ink_width { rp.chosen_ink_width.insert(key, v); }
+}
+
+/// Insert one observation's rank/prob/glyph/geo values into the GT-side
+/// maps of `rp` under `key` (F18; the GT side has no glyph-score
+/// fallback — see `insert_chosen_obs`).
+fn insert_gt_obs(rp: &mut ObsRankProbs, key: usize, obs: &font_match::ObservationDetail) {
+    rp.gt_ranks.insert(key, 1);
+    if let Some(p) = obs.prob { rp.gt_probs.insert(key, p); }
+    else if obs.best_prob > 0.0 { rp.gt_probs.insert(key, obs.best_prob); }
+    if let Some(gs) = obs.glyph_score { rp.gt_glyph_scores.insert(key, gs); }
+    if let Some(h) = obs.geo_h_ll { rp.gt_geo_h_ll.insert(key, h); }
+    if let Some(v) = obs.geo_v_ll { rp.gt_geo_v_ll.insert(key, v); }
+    if let Some(he) = obs.geo_h_err { rp.gt_geo_h_err.insert(key, he); }
+    if let Some(ve) = obs.geo_v_err { rp.gt_geo_v_err.insert(key, ve); }
+    if let Some(u) = obs.geo_h_overlap_correction_px { rp.gt_geo_h_overlap_correction.insert(key, u); }
+    if let Some(v) = obs.obs_cx { rp.gt_obs_cx.insert(key, v); }
+    if let Some(v) = obs.pred_cx { rp.gt_pred_cx.insert(key, v); }
+    if let Some(v) = obs.obs_pitch { rp.gt_obs_pitch.insert(key, v); }
+    if let Some(v) = obs.pred_pitch { rp.gt_pred_pitch.insert(key, v); }
+    if let Some(v) = obs.geo_scale { rp.gt_geo_scale.insert(key, v); }
+    if let Some(v) = obs.ink_width { rp.gt_ink_width.insert(key, v); }
+}
+
+/// Map one winning/GT `WordSeg` to its audit summary (F19: the two
+/// mapping closures in `match_lines` were identical).
+fn word_seg_summary(ws: &crate::segment::WordSeg) -> crate::audit::WordSegSummary {
+    crate::audit::WordSegSummary {
+        word_text: ws.word_text.clone(),
+        source_word_idx: ws.source_word_idx,
+        image_w: ws.image_w,
+        image_h: ws.image_h,
+        n_chars_expected: ws.n_chars_expected,
+        n_segments_produced: ws.n_segments_produced,
+        mismatch: ws.mismatch,
+        ws_splits: ws.ws_splits.clone(),
+        seam_splits: ws.seam_splits.clone(),
+        seam_paths: ws.seam_paths.clone(),
+        seam_costs: ws.seam_costs.clone(),
+    }
+}
+
+/// Build the single-word `TextRegion` for a line's text-color detection
+/// (F20: the fast-path and full-pipeline constructions were identical).
+fn line_text_region(line: &TextLine) -> TextRegion {
+    TextRegion {
+        text: line.text.clone(),
+        x: line.x, y: line.y,
+        width: line.width, height: line.height,
+        font_size_pt: line.font_size_pt,
+        confidence: line.confidence,
+        level: 5, block_num: 0, par_num: 0, line_num: 0, word_num: 0,
+    }
+}
+
 /// Build per-observation rank/prob/glyph/geo maps for one path's observations
 /// against the GT observations (no recompute — `identify_fonts` already
 /// computed best_prob, logit as glyph_score, and geo_ll for each path).
@@ -88,23 +165,7 @@ fn build_obs_rank_probs(
 ) -> ObsRankProbs {
     let mut rp = ObsRankProbs::default();
     for obs in observations {
-        rp.chosen_ranks.insert(obs.crop_index, 1);
-        // prefer actual prob from classifier, fall back to best_prob
-        if let Some(p) = obs.prob { rp.chosen_probs.insert(obs.crop_index, p); }
-        else if obs.best_prob > 0.0 { rp.chosen_probs.insert(obs.crop_index, obs.best_prob); }
-        if let Some(gs) = obs.glyph_score { rp.chosen_glyph_scores.insert(obs.crop_index, gs); }
-        else if obs.best_prob > 0.0 { rp.chosen_glyph_scores.insert(obs.crop_index, obs.best_prob.ln()); }
-        if let Some(h) = obs.geo_h_ll { rp.chosen_geo_h_ll.insert(obs.crop_index, h); }
-        if let Some(v) = obs.geo_v_ll { rp.chosen_geo_v_ll.insert(obs.crop_index, v); }
-        if let Some(he) = obs.geo_h_err { rp.chosen_geo_h_err.insert(obs.crop_index, he); }
-        if let Some(ve) = obs.geo_v_err { rp.chosen_geo_v_err.insert(obs.crop_index, ve); }
-        if let Some(u) = obs.geo_h_overlap_correction_px { rp.chosen_geo_h_overlap_correction.insert(obs.crop_index, u); }
-        if let Some(v) = obs.obs_cx { rp.chosen_obs_cx.insert(obs.crop_index, v); }
-        if let Some(v) = obs.pred_cx { rp.chosen_pred_cx.insert(obs.crop_index, v); }
-        if let Some(v) = obs.obs_pitch { rp.chosen_obs_pitch.insert(obs.crop_index, v); }
-        if let Some(v) = obs.pred_pitch { rp.chosen_pred_pitch.insert(obs.crop_index, v); }
-        if let Some(v) = obs.geo_scale { rp.chosen_geo_scale.insert(obs.crop_index, v); }
-        if let Some(v) = obs.ink_width { rp.chosen_ink_width.insert(obs.crop_index, v); }
+        insert_chosen_obs(&mut rp, obs.crop_index, obs);
     }
     // GT side – from scoring.gt_observations (ensure font)
     // When window counts differ (ligature difference, e.g. Office 4 vs 5 glyphs),
@@ -113,21 +174,7 @@ fn build_obs_rank_probs(
     // mapping when k equal (common case, including p3:L34).
     if observations.len() == gt_observations.len() {
         for obs in gt_observations {
-            rp.gt_ranks.insert(obs.crop_index, 1);
-            if let Some(p) = obs.prob { rp.gt_probs.insert(obs.crop_index, p); }
-            else if obs.best_prob > 0.0 { rp.gt_probs.insert(obs.crop_index, obs.best_prob); }
-            if let Some(gs) = obs.glyph_score { rp.gt_glyph_scores.insert(obs.crop_index, gs); }
-            if let Some(h) = obs.geo_h_ll { rp.gt_geo_h_ll.insert(obs.crop_index, h); }
-            if let Some(v) = obs.geo_v_ll { rp.gt_geo_v_ll.insert(obs.crop_index, v); }
-            if let Some(he) = obs.geo_h_err { rp.gt_geo_h_err.insert(obs.crop_index, he); }
-            if let Some(ve) = obs.geo_v_err { rp.gt_geo_v_err.insert(obs.crop_index, ve); }
-            if let Some(u) = obs.geo_h_overlap_correction_px { rp.gt_geo_h_overlap_correction.insert(obs.crop_index, u); }
-            if let Some(v) = obs.obs_cx { rp.gt_obs_cx.insert(obs.crop_index, v); }
-            if let Some(v) = obs.pred_cx { rp.gt_pred_cx.insert(obs.crop_index, v); }
-            if let Some(v) = obs.obs_pitch { rp.gt_obs_pitch.insert(obs.crop_index, v); }
-            if let Some(v) = obs.pred_pitch { rp.gt_pred_pitch.insert(obs.crop_index, v); }
-            if let Some(v) = obs.geo_scale { rp.gt_geo_scale.insert(obs.crop_index, v); }
-            if let Some(v) = obs.ink_width { rp.gt_ink_width.insert(obs.crop_index, v); }
+            insert_gt_obs(&mut rp, obs.crop_index, obs);
         }
     } else {
         // Differing k – align by glyph identity, not ordinal.
@@ -141,21 +188,7 @@ fn build_obs_rank_probs(
             if gi >= gt_sorted.len() { break; }
             if gt_sorted[gi].ch == wo.ch {
                 let go = gt_sorted[gi];
-                rp.gt_ranks.insert(wo.crop_index, 1);
-                if let Some(p) = go.prob { rp.gt_probs.insert(wo.crop_index, p); }
-                else if go.best_prob > 0.0 { rp.gt_probs.insert(wo.crop_index, go.best_prob); }
-                if let Some(gs) = go.glyph_score { rp.gt_glyph_scores.insert(wo.crop_index, gs); }
-                if let Some(h) = go.geo_h_ll { rp.gt_geo_h_ll.insert(wo.crop_index, h); }
-                if let Some(v) = go.geo_v_ll { rp.gt_geo_v_ll.insert(wo.crop_index, v); }
-                if let Some(he) = go.geo_h_err { rp.gt_geo_h_err.insert(wo.crop_index, he); }
-                if let Some(ve) = go.geo_v_err { rp.gt_geo_v_err.insert(wo.crop_index, ve); }
-                if let Some(u) = go.geo_h_overlap_correction_px { rp.gt_geo_h_overlap_correction.insert(wo.crop_index, u); }
-                if let Some(v) = go.obs_cx { rp.gt_obs_cx.insert(wo.crop_index, v); }
-                if let Some(v) = go.pred_cx { rp.gt_pred_cx.insert(wo.crop_index, v); }
-                if let Some(v) = go.obs_pitch { rp.gt_obs_pitch.insert(wo.crop_index, v); }
-                if let Some(v) = go.pred_pitch { rp.gt_pred_pitch.insert(wo.crop_index, v); }
-                if let Some(v) = go.geo_scale { rp.gt_geo_scale.insert(wo.crop_index, v); }
-                if let Some(v) = go.ink_width { rp.gt_ink_width.insert(wo.crop_index, v); }
+                insert_gt_obs(&mut rp, wo.crop_index, go);
                 gi += 1;
             } else {
                 // Look ahead for same char – skip GT extras (e.g. f, fi before c).
@@ -168,21 +201,7 @@ fn build_obs_rank_probs(
                 }
                 if let Some(fidx) = found {
                     let go = gt_sorted[fidx];
-                    rp.gt_ranks.insert(wo.crop_index, 1);
-                    if let Some(p) = go.prob { rp.gt_probs.insert(wo.crop_index, p); }
-                    else if go.best_prob > 0.0 { rp.gt_probs.insert(wo.crop_index, go.best_prob); }
-                    if let Some(gs) = go.glyph_score { rp.gt_glyph_scores.insert(wo.crop_index, gs); }
-                    if let Some(h) = go.geo_h_ll { rp.gt_geo_h_ll.insert(wo.crop_index, h); }
-                    if let Some(v) = go.geo_v_ll { rp.gt_geo_v_ll.insert(wo.crop_index, v); }
-                    if let Some(he) = go.geo_h_err { rp.gt_geo_h_err.insert(wo.crop_index, he); }
-                    if let Some(ve) = go.geo_v_err { rp.gt_geo_v_err.insert(wo.crop_index, ve); }
-                    if let Some(u) = go.geo_h_overlap_correction_px { rp.gt_geo_h_overlap_correction.insert(wo.crop_index, u); }
-                    if let Some(v) = go.obs_cx { rp.gt_obs_cx.insert(wo.crop_index, v); }
-                    if let Some(v) = go.pred_cx { rp.gt_pred_cx.insert(wo.crop_index, v); }
-                    if let Some(v) = go.obs_pitch { rp.gt_obs_pitch.insert(wo.crop_index, v); }
-                    if let Some(v) = go.pred_pitch { rp.gt_pred_pitch.insert(wo.crop_index, v); }
-                    if let Some(v) = go.geo_scale { rp.gt_geo_scale.insert(wo.crop_index, v); }
-                    if let Some(v) = go.ink_width { rp.gt_ink_width.insert(wo.crop_index, v); }
+                    insert_gt_obs(&mut rp, wo.crop_index, go);
                     gi = fidx + 1;
                 } else {
                     // No GT counterpart (e.g. winner ffi not supported by GT Caladea) – leave —.
@@ -468,14 +487,7 @@ pub fn match_lines(
                 let text_color = color::detect_text_color_from_buffers(
                     gray_page,
                     rgba_page,
-                    &TextRegion {
-                        text: line.text.clone(),
-                        x: line.x, y: line.y,
-                        width: line.width, height: line.height,
-                        font_size_pt: line.font_size_pt,
-                        confidence: line.confidence,
-                        level: 5, block_num: 0, par_num: 0, line_num: 0, word_num: 0,
-                    },
+                    &line_text_region(line),
                 );
                 let mut result = fm.clone();
                 result.best_dy = vr.dy;
@@ -517,14 +529,7 @@ pub fn match_lines(
         let text_color = color::detect_text_color_from_buffers(
             gray_page,
             rgba_page,
-            &TextRegion {
-                text: line.text.clone(),
-                x: line.x, y: line.y,
-                width: line.width, height: line.height,
-                font_size_pt: line.font_size_pt,
-                confidence: line.confidence,
-                level: 5, block_num: 0, par_num: 0, line_num: 0, word_num: 0,
-            },
+            &line_text_region(line),
         );
         let font_scores: Vec<(String, Option<f32>)>;
         let mut observations: Vec<font_match::ObservationDetail>;
@@ -1298,35 +1303,11 @@ pub fn match_lines(
 
 
         let word_seg_summaries: Vec<crate::audit::WordSegSummary> = {
-            winning_segs.iter().map(|ws| crate::audit::WordSegSummary {
-                word_text: ws.word_text.clone(),
-                source_word_idx: ws.source_word_idx,
-                image_w: ws.image_w,
-                image_h: ws.image_h,
-                n_chars_expected: ws.n_chars_expected,
-                n_segments_produced: ws.n_segments_produced,
-                mismatch: ws.mismatch,
-                ws_splits: ws.ws_splits.clone(),
-                seam_splits: ws.seam_splits.clone(),
-                seam_paths: ws.seam_paths.clone(),
-                seam_costs: ws.seam_costs.clone(),
-            }).collect()
+            winning_segs.iter().map(word_seg_summary).collect()
         };
 
         let gt_word_seg_summaries: Vec<crate::audit::WordSegSummary> = if let Some(ref g_segs) = gt_segs_opt {
-            g_segs.iter().map(|ws| crate::audit::WordSegSummary {
-                word_text: ws.word_text.clone(),
-                source_word_idx: ws.source_word_idx,
-                image_w: ws.image_w,
-                image_h: ws.image_h,
-                n_chars_expected: ws.n_chars_expected,
-                n_segments_produced: ws.n_segments_produced,
-                mismatch: ws.mismatch,
-                ws_splits: ws.ws_splits.clone(),
-                seam_splits: ws.seam_splits.clone(),
-                seam_paths: ws.seam_paths.clone(),
-                seam_costs: ws.seam_costs.clone(),
-            }).collect()
+            g_segs.iter().map(word_seg_summary).collect()
         } else {
             Vec::new()
         };

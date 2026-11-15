@@ -2098,18 +2098,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "unprint-ocr"
-version = "0.1.0"
-dependencies = [
- "image",
- "serde",
- "serde_json",
- "tempfile",
- "thiserror 2.0.18",
- "unprint-geometry",
-]
-
-[[package]]
 name = "unprint-report"
 version = "0.1.0"
 dependencies = [
