@@ -147,6 +147,10 @@ struct SegCacheEntry {
     char_crops: std::sync::Arc<Vec<Option<(Arc<GrayImage>, u32, u32, u32, u32, f64, f64)>>>,
     // font-independent precomputed features for each char crop – hoisted out of per-font loop, Arc to avoid Vec<Option<CropFeatures>> clone 3.1%
     pre_features: std::sync::Arc<Vec<Option<crate::features::CropFeatures>>>,
+    // Char ink bounds, a pure function of the cached crops + boundaries —
+    // hoisted out of the per-font loop (redundancy F4), Arc to avoid the
+    // per-font Vec rebuild.
+    char_bounds: std::sync::Arc<Vec<CharInkBounds>>,
 }
 
 /// Font-independent classifier results for one char crop, computed once per
@@ -286,6 +290,8 @@ pub fn identify_fonts(
             summary: std::sync::Arc<SegSummary>,
             char_crops: std::sync::Arc<Vec<Option<(Arc<GrayImage>, u32,u32,u32,u32,f64,f64)>>>, // Arc<Vec> makes per-font clone Arc::clone cheap (was Vec<Option> 3.1%)
             pre_features: std::sync::Arc<Vec<Option<crate::features::CropFeatures>>>,
+            // Char ink bounds, hoisted once per (word, k) (redundancy F4).
+            char_bounds: std::sync::Arc<Vec<CharInkBounds>>,
             // Hoisted classifier results for this word's collapsed chars (F1) – Arc clone cheap.
             classify: std::sync::Arc<Vec<Option<HoistedClassify>>>,
             crop_h: u32,
@@ -329,7 +335,30 @@ pub fn identify_fonts(
                         pre_features.push(None);
                     }
                 }
-                cache.insert(k, SegCacheEntry { bounds: b, seams: std::sync::Arc::new(s), summary: std::sync::Arc::new(sum), char_crops: std::sync::Arc::new(char_crops), pre_features: std::sync::Arc::new(pre_features) });
+                // Hoist (F4): char ink bounds are a pure function of the
+                // cached crops + boundaries, identical for every font —
+                // compute once per (word, k). Verbatim the old per-font
+                // loop below, with char_crops/b/crop_h in place of
+                // wb.char_crops/wb.bounds/wb.crop_h.
+                let mut char_bounds: Vec<CharInkBounds> = Vec::with_capacity(k);
+                for pos in 0..k {
+                    if pos >= char_crops.len() {
+                        let (b_l, b_r) = if pos+1 < b.len() { (b[pos], b[pos+1]) } else { (0, crop_h) };
+                        let cx = (b_l as f64 + b_r as f64)*0.5;
+                        let cy = crop_h as f64 *0.5;
+                        char_bounds.push(CharInkBounds { cx, cy, width: b_r.saturating_sub(b_l) as f64, height: crop_h as f64, x_min: b_l, x_max: b_r, y_min: 0, y_max: crop_h, frac_left: b_l as f64, frac_right: b_r as f64 });
+                        continue;
+                    }
+                    if let Some((ref _norm, x_min, x_max, y_min, y_max, cx, cy)) = char_crops[pos] {
+                        char_bounds.push(CharInkBounds { cx, cy, width: (x_max - x_min +1) as f64, height: (y_max - y_min +1) as f64, x_min, x_max, y_min, y_max, frac_left: x_min as f64, frac_right: x_max as f64 +1.0 });
+                    } else {
+                        let (b_l, b_r) = if pos+1 < b.len() { (b[pos], b[pos+1]) } else { (0, crop_h) };
+                        let cx = (b_l as f64 + b_r as f64)*0.5;
+                        let cy = crop_h as f64 *0.5;
+                        char_bounds.push(CharInkBounds { cx, cy, width: b_r.saturating_sub(b_l) as f64, height: crop_h as f64, x_min: b_l, x_max: b_r, y_min: 0, y_max: crop_h, frac_left: b_l as f64, frac_right: b_r as f64 });
+                    }
+                }
+                cache.insert(k, SegCacheEntry { bounds: b, seams: std::sync::Arc::new(s), summary: std::sync::Arc::new(sum), char_crops: std::sync::Arc::new(char_crops), pre_features: std::sync::Arc::new(pre_features), char_bounds: std::sync::Arc::new(char_bounds) });
             }
             let ent = cache.get(&k).unwrap();
             // Hoist classifier results (F1): classify + raw_logits depend only
@@ -385,6 +414,7 @@ pub fn identify_fonts(
                 summary: std::sync::Arc::clone(&ent.summary),
                 char_crops: std::sync::Arc::clone(&ent.char_crops),
                 pre_features: std::sync::Arc::clone(&ent.pre_features),
+                char_bounds: std::sync::Arc::clone(&ent.char_bounds),
                 classify,
                 crop_h: wi.img.height(),
                 word_img: wi.img.clone(),
@@ -432,29 +462,10 @@ pub fn identify_fonts(
         let mut temps_collect: Vec<Temp> = Vec::new();
 
         for (_seg_idx, wb) in builds.iter().enumerate() {
-            let mut char_bounds: Vec<CharInkBounds> = Vec::with_capacity(wb.collapsed.len());
-            for (pos, _) in wb.collapsed.iter().enumerate() {
-                if pos >= wb.char_crops.len() {
-                    // fallback
-                    let (b_l, b_r) = if pos+1 < wb.bounds.len() { (wb.bounds[pos], wb.bounds[pos+1]) } else { (0,wb.crop_h) };
-                    let cx = (b_l as f64 + b_r as f64)*0.5;
-                    let cy = wb.crop_h as f64 *0.5;
-                    let cb = CharInkBounds { cx, cy, width: b_r.saturating_sub(b_l) as f64, height: wb.crop_h as f64, x_min: b_l, x_max: b_r, y_min: 0, y_max: wb.crop_h, frac_left: b_l as f64, frac_right: b_r as f64 };
-                    char_bounds.push(cb);
-                    continue;
-                }
-                if let Some((ref _norm, x_min, x_max, y_min, y_max, cx, cy)) = wb.char_crops[pos] {
-                    let cb = CharInkBounds { cx, cy, width: (x_max - x_min +1) as f64, height: (y_max - y_min +1) as f64, x_min, x_max, y_min, y_max, frac_left: x_min as f64, frac_right: x_max as f64 +1.0 };
-                    char_bounds.push(cb);
-                } else {
-                    let (b_l, b_r) = if pos+1 < wb.bounds.len() { (wb.bounds[pos], wb.bounds[pos+1]) } else { (0,wb.crop_h) };
-                    let cx = (b_l as f64 + b_r as f64)*0.5;
-                    let cy = wb.crop_h as f64 *0.5;
-                    let cb = CharInkBounds { cx, cy, width: b_r.saturating_sub(b_l) as f64, height: wb.crop_h as f64, x_min: b_l, x_max: b_r, y_min:0, y_max: wb.crop_h, frac_left: b_l as f64, frac_right: b_r as f64 };
-                    char_bounds.push(cb);
-                }
-            }
-            wib.push(WordGeoMeasurement { chars: char_bounds });
+            // F4: char ink bounds are hoisted once per (word, k) in the
+            // cache build above — the per-font rebuild here was identical
+            // for every font. Arc-clone only.
+            wib.push(WordGeoMeasurement { chars: std::sync::Arc::clone(&wb.char_bounds) });
 
             // For scoring, we will handle after wib built? Need temps now but wib already has cx
             // Actually temps need only crops, not wib
