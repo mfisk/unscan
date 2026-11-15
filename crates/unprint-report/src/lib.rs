@@ -1741,6 +1741,33 @@ fn build_tie_break_block(
     )
 }
 
+/// Try to load a single-character reference glyph from the zero-offset
+/// glyph PNG cache (populated by training) instead of re-rendering it.
+///
+/// Single characters only: kerning is undefined for one glyph (no pair),
+/// so the cached image is pixel-identical to a fresh render with default
+/// params. Multi-char sequences keep the fresh render — the report renders
+/// them unkerned (NoKern) while training cached them kerned, so the images
+/// can differ.
+///
+/// Returns None on any miss (no hash in the glyph map, no file, undecodable
+/// file) — the caller falls back to a fresh render. The report never fails
+/// on a missing cache entry.
+fn load_cached_ref_glyph(
+    glyph_map: &NgramGlyphMap,
+    fe: &FontEntry,
+    seq: &[char],
+) -> Option<GrayImage> {
+    if seq.len() != 1 {
+        return None;
+    }
+    glyph_map
+        .hash_for_font(seq, fe.font_key_ref())
+        .and_then(|hash| {
+            char_render::load_cached_ngram(seq, hash, &char_render::RenderParams::default())
+        })
+}
+
 #[allow(unused_variables, unused_assignments, unused_mut)]
 fn build_observation_table(
     entry: &AuditEntry,
@@ -1755,7 +1782,7 @@ fn build_observation_table(
     font_data_cache: &mut FontDataCache,
     diag_dir: Option<&Path>,
     _font_catalog: &[FontEntry],
-    _glyph_map: &NgramGlyphMap,
+    glyph_map: &NgramGlyphMap,
     crop_dir_name: &str,
 ) -> String {
     // NOTE (Finding 5): the reference renders in this table pass NoKern.
@@ -1813,7 +1840,19 @@ fn build_observation_table(
         let mut correct_ref_uri: Option<String> = None;
         let mut correct_mid: Option<(f32, f32)> = None;
         if let Some(fe) = correct_fe {
-            if let Some(data) = font_data_cache.load(&fe.path) {
+            // Normalize the sequence for THIS font (Mike Nov 6, 2026):
+            // the observation seq is the winner's collapsed sequence
+            // (e.g. ['\u{FB01}']). A nolig GT font must render that
+            // segment as separate f, i glyphs; a lig font as the
+            // single FB01 glyph. Overrides are computed from the
+            // normalized sequence, not the raw observation seq.
+            let render_seq = char_render::normalize_seq_for_font(fe, seq);
+            // Try the zero-offset glyph cache first (single chars only);
+            // fall back to a fresh render on any miss.
+            if let Some(img) = load_cached_ref_glyph(glyph_map, fe, &render_seq) {
+                correct_mid = ink_midpoint(&img);
+                correct_ref_uri = Some(img_to_b64_uri(&img));
+            } else if let Some(data) = font_data_cache.load(&fe.path) {
                 if let Ok(mut font) = FontRef::try_from_slice(data) {
                     if let Some(ref vars) = fe.variations {
                         use unprint_fonts::ab_glyph::VariableFont;
@@ -1821,13 +1860,6 @@ fn build_observation_table(
                             let _ = font.set_variation(tag, *val);
                         }
                     }
-                    // Normalize the sequence for THIS font (Mike Nov 6, 2026):
-                    // the observation seq is the winner's collapsed sequence
-                    // (e.g. ['\u{FB01}']). A nolig GT font must render that
-                    // segment as separate f, i glyphs; a lig font as the
-                    // single FB01 glyph. Overrides are computed from the
-                    // normalized sequence, not the raw observation seq.
-                    let render_seq = char_render::normalize_seq_for_font(fe, seq);
                     let gid_overrides: Vec<Option<unprint_fonts::ab_glyph::GlyphId>> = render_seq.iter().map(|c| {
                         fe.glyph_overrides.as_ref()
                             .and_then(|ovs| ovs.iter().find(|(gc, _)| *gc == *c).map(|(_, g)| unprint_fonts::ab_glyph::GlyphId(*g)))
@@ -1849,7 +1881,11 @@ fn build_observation_table(
             // a lig winner renders the combined segment as the FB01 glyph,
             // a nolig winner as separate f, i glyphs.
             let render_seq = char_render::normalize_seq_for_font(fe, seq);
-            if render_seq.len() == 1 {
+            // Try the zero-offset glyph cache first (single chars only).
+            if let Some(img) = load_cached_ref_glyph(glyph_map, fe, &render_seq) {
+                chosen_mid = ink_midpoint(&img);
+                chosen_ref_uri = Some(img_to_b64_uri(&img));
+            } else if render_seq.len() == 1 {
                 if let Some(path) = find_font_ref_ngram_png(audit_root, fe, render_seq[0]) {
                     chosen_ref_uri = file_to_b64_uri(&path);
                     if let Ok(img) = image::open(&path) {
@@ -1981,7 +2017,11 @@ fn build_observation_table(
                             // Render this component with the nolig font.
                             let mut comp_uri: Option<String> = None;
                             if let Some(fe) = correct_fe {
-                                if let Some(data) = font_data_cache.load(&fe.path) {
+                                // Try the zero-offset glyph cache first
+                                // (single char); fall back to a fresh render.
+                                if let Some(img) = load_cached_ref_glyph(glyph_map, fe, &[*comp]) {
+                                    comp_uri = Some(img_to_b64_uri(&img));
+                                } else if let Some(data) = font_data_cache.load(&fe.path) {
                                     if let Ok(mut font) = FontRef::try_from_slice(data) {
                                         if let Some(ref vars) = fe.variations {
                                             use unprint_fonts::ab_glyph::VariableFont;
