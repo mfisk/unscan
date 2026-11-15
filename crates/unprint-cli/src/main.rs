@@ -837,13 +837,8 @@ fn run(args: &cli::Args, classifier: &mut dyn classifier::Classifier) -> Result<
     if !args.quiet { eprintln!("[timing] get_pages {} pages {:.2}s (total {:.2}s)", pages.len(), t_pages.elapsed().as_secs_f64(), run_start.elapsed().as_secs_f64()); }
 
     // ── 2b. Extract source image data for pass-through ───────────────
-    // Skipped in test mode: source images feed only the raster-fragment
-    // passthrough decision in 3f, and the fragments are discarded when
-    // generate_pdf is skipped.
     let t_extract = std::time::Instant::now();
-    let source_images = if test_mode {
-        Vec::new()
-    } else if input.extension().and_then(|e| e.to_str()) == Some("pdf") {
+    let source_images = if input.extension().and_then(|e| e.to_str()) == Some("pdf") {
         pdf_out::extract_source_images(input)
     } else {
         Vec::new()
@@ -1234,68 +1229,54 @@ fn run(args: &cli::Args, classifier: &mut dyn classifier::Classifier) -> Result<
         };
 
         // 3e. Erase vectorised content from raster ────────────────────
-        // 3e+3f. Erase vectorised content, build raster fragments ──────
-        // Skipped in test mode: the fragments feed only the discarded
-        // PDF output (generate_pdf is skipped) and the erased image feeds
-        // nothing else. The only audit-visible trace is the fragment
-        // count in page_summaries, which no reader consumes (verified by
-        // grep: PageSummary has no readers outside main.rs/audit.rs);
-        // it reads 0 in test-mode audits. Geometry detection (3d) and
-        // placed_texts construction are NOT skipped: 3d feeds audit_geo,
-        // which is audit output.
-        let raster_fragments: Vec<pdf_out::RasterFragment> = if test_mode {
-            Vec::new()
-        } else {
-            // 3e. Erase vectorised content from raster ────────────────
-            let mut erase_rects: Vec<(u32, u32, u32, u32)> = Vec::new();
+        let mut erase_rects: Vec<(u32, u32, u32, u32)> = Vec::new();
 
-            if !args.overlay {
-                // Erase only text that was successfully vectorised.
-                for pt in &placed_texts {
-                    if !pt.keep_raster {
-                        erase_rects.push((pt.x as u32, pt.y as u32, pt.width as u32, pt.height as u32));
-                    }
+        if !args.overlay {
+            // Erase only text that was successfully vectorised.
+            for pt in &placed_texts {
+                if !pt.keep_raster {
+                    erase_rects.push((pt.x as u32, pt.y as u32, pt.width as u32, pt.height as u32));
                 }
-
-                // Erase vectorised geometry.
-                let geo_result = geometry::GeometryResult {
-                    lines: det_lines.clone(),
-                    fills: det_fills.clone(),
-                };
-                erase_rects.extend(geometry::erase_bboxes(&geo_result));
             }
 
-            let cleaned_img = color::erase_regions(page_img, &erase_rects, bg_color, 2);
+            // Erase vectorised geometry.
+            let geo_result = geometry::GeometryResult {
+                lines: det_lines.clone(),
+                fills: det_fills.clone(),
+            };
+            erase_rects.extend(geometry::erase_bboxes(&geo_result));
+        }
 
-            // 3f. Build raster fragments — prefer source pass-through ─
-            let anything_vectorized = pg_vec > 0 || !det_lines.is_empty() || !det_fills.is_empty();
-            let source_img = source_images.get(page_idx).and_then(|s| s.as_ref());
+        let cleaned_img = color::erase_regions(page_img, &erase_rects, bg_color, 2);
 
-            if !anything_vectorized && source_img.is_some() {
-                // Nothing was vectorized/erased — pass through the original
-                // compressed image stream verbatim.
-                let si = source_img.unwrap().clone();
-                let scale = 72.0 / args.dpi as f32;
-                let pw = page_img.width();
-                let ph = page_img.height();
-                vec![pdf_out::RasterFragment {
-                    raw_rgb: Vec::new(), // not used — passthrough takes precedence
-                    width_px: si.width,
-                    height_px: si.height,
-                    x_pt: 0.0,
-                    y_pt: 0.0,
-                    width_pt: pw as f32 * scale,
-                    height_pt: ph as f32 * scale,
-                    passthrough: Some(si),
-                }]
-            } else {
-                // Something was vectorized — we modified the image, must re-encode
-                pdf_out::extract_raster_fragments(
-                    &cleaned_img,
-                    args.dpi,
-                    page_img.height(),
-                )
-            }
+        // 3f. Build raster fragments — prefer source pass-through ─────
+        let anything_vectorized = pg_vec > 0 || !det_lines.is_empty() || !det_fills.is_empty();
+        let source_img = source_images.get(page_idx).and_then(|s| s.as_ref());
+
+        let raster_fragments = if !anything_vectorized && source_img.is_some() {
+            // Nothing was vectorized/erased — pass through the original
+            // compressed image stream verbatim.
+            let si = source_img.unwrap().clone();
+            let scale = 72.0 / args.dpi as f32;
+            let pw = page_img.width();
+            let ph = page_img.height();
+            vec![pdf_out::RasterFragment {
+                raw_rgb: Vec::new(), // not used — passthrough takes precedence
+                width_px: si.width,
+                height_px: si.height,
+                x_pt: 0.0,
+                y_pt: 0.0,
+                width_pt: pw as f32 * scale,
+                height_pt: ph as f32 * scale,
+                passthrough: Some(si),
+            }]
+        } else {
+            // Something was vectorized — we modified the image, must re-encode
+            pdf_out::extract_raster_fragments(
+                &cleaned_img,
+                args.dpi,
+                page_img.height(),
+            )
         };
 
         _stat_raster_frags += raster_fragments.len() as u32;

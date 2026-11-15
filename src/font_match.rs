@@ -14,7 +14,7 @@ use std::sync::Arc;
 use std::collections::HashMap;
 use image::GrayImage;
 use crate::classifier::{self, ObsStats};
-use crate::segment::{WordSeg, SegSummary, collapse_ligature_chars_for_allowed, char_crop_and_metrics};
+use crate::segment::{WordSeg, SegSummary, collapse_ligature_chars_for_allowed, segment_characters, char_crop_and_metrics};
 use crate::geometry_classifier::{CharInkBounds, WordGeoMeasurement};
 
 static GEO_WEIGHT: std::sync::LazyLock<f32> = std::sync::LazyLock::new(|| {
@@ -137,8 +137,12 @@ pub struct FontIdResult {
 
 struct SegCacheEntry {
     bounds: Vec<u32>,
-    seams: HashMap<u32, Vec<[u32; 2]>>,
-    summary: SegSummary,
+    // Arc so the per-font WordBuild clones the Arc instead of the whole
+    // seam-paths map (redundancy F3); built once per (word, k).
+    seams: std::sync::Arc<HashMap<u32, Vec<[u32; 2]>>>,
+    // Arc for the same reason (redundancy F3): the per-font WordBuild
+    // used to clone the whole summary, including its seam_costs map.
+    summary: std::sync::Arc<SegSummary>,
     // per-char crop+metrics for this k, length = k – Arc<Vec> to make per-font clone cheap (was Vec clone 3.1%)
     char_crops: std::sync::Arc<Vec<Option<(Arc<GrayImage>, u32, u32, u32, u32, f64, f64)>>>,
     // font-independent precomputed features for each char crop – hoisted out of per-font loop, Arc to avoid Vec<Option<CropFeatures>> clone 3.1%
@@ -205,7 +209,6 @@ pub fn identify_fonts(
     font_registry: &crate::font_scan::FontRegistry,
     font_cache: &crate::font_cache::FontCache,
     geo_cache: &crate::geo_cache::GeometryCache,
-    seg_cache: &mut crate::segment::SegmentCache,
 ) -> FontIdResult {
     if word_infos.is_empty() {
         return FontIdResult { scores: Vec::new(), observations: Vec::new(), gt_observations: Vec::new(), path_score: f32::MIN, gt_per_char_geo_ll: Vec::new() };
@@ -279,7 +282,7 @@ pub fn identify_fonts(
             collapsed: Vec<char>,
             bounds: Vec<u32>,
             seams: Arc<HashMap<u32, Vec<[u32;2]>>>,
-            summary: SegSummary,
+            summary: std::sync::Arc<SegSummary>,
             char_crops: std::sync::Arc<Vec<Option<(Arc<GrayImage>, u32,u32,u32,u32,f64,f64)>>>, // Arc<Vec> makes per-font clone Arc::clone cheap (was Vec<Option> 3.1%)
             pre_features: std::sync::Arc<Vec<Option<crate::features::CropFeatures>>>,
             // Hoisted classifier results for this word's collapsed chars (F1) – Arc clone cheap.
@@ -299,16 +302,7 @@ pub fn identify_fonts(
             // get or create cache entry for this word k
             let cache = &mut seg_caches[wi_idx];
             if !cache.contains_key(&k) {
-                // Shared per-line cache: segment_line (diag) and
-                // build_for_font (winner rebuild) segment this same
-                // (image, k) — compute it once per line. The local entry
-                // still caches the derived char crops + precomputed
-                // features, which are font-independent but expensive to
-                // rebuild per font.
-                let cached = seg_cache.get_or_compute(&wi.img, k, &wi.text);
-                let b = cached.bounds.clone();
-                let s = cached.seams.clone();
-                let sum = cached.summary.clone();
+                let (b, s, sum) = segment_characters(&wi.img, k, &wi.text);
                 let crop_h = wi.img.height();
                 let mut char_crops: Vec<Option<(Arc<GrayImage>,u32,u32,u32,u32,f64,f64)>> = Vec::with_capacity(k);
                 for i in 0..k {
@@ -325,7 +319,7 @@ pub fn identify_fonts(
                         pre_features.push(None);
                     }
                 }
-                cache.insert(k, SegCacheEntry { bounds: b, seams: s, summary: sum, char_crops: std::sync::Arc::new(char_crops), pre_features: std::sync::Arc::new(pre_features) });
+                cache.insert(k, SegCacheEntry { bounds: b, seams: std::sync::Arc::new(s), summary: std::sync::Arc::new(sum), char_crops: std::sync::Arc::new(char_crops), pre_features: std::sync::Arc::new(pre_features) });
             }
             let ent = cache.get(&k).unwrap();
             // Hoist classifier results (F1): classify + raw_logits depend only
@@ -371,12 +365,14 @@ pub fn identify_fonts(
                 cc_cache.insert(collapsed.clone(), std::sync::Arc::new(hoisted));
             }
             let classify = std::sync::Arc::clone(cc_cache.get(&collapsed).unwrap());
-            // Clone needed data for WordBuild (bounds clone cheap, seams Arc clone cheap, char_crops/pre_features now Arc clone cheap)
+            // Clone needed data for WordBuild (bounds clone is a small
+            // Vec of k+1 u32s; seams/summary are Arc clones — the HashMap
+            // clones they replaced were the F3 finding).
             builds.push(WordBuild {
                 collapsed,
                 bounds: ent.bounds.clone(),
-                seams: Arc::new(ent.seams.clone()),
-                summary: ent.summary.clone(),
+                seams: std::sync::Arc::clone(&ent.seams),
+                summary: std::sync::Arc::clone(&ent.summary),
                 char_crops: std::sync::Arc::clone(&ent.char_crops),
                 pre_features: std::sync::Arc::clone(&ent.pre_features),
                 classify,
@@ -486,7 +482,7 @@ pub fn identify_fonts(
                 chars: wb.collapsed.clone(),
                 boundaries: wb.bounds.clone(),
                 seam_paths: wb.seams.clone(),
-                seam_costs: Arc::new(wb.summary.seam_costs.clone()),
+                seam_costs: std::sync::Arc::clone(&wb.summary.seam_costs),
                 crop_h: wb.crop_h,
                 word_text: wb.word_text.clone(),
                 image_w: wb.summary.image_w,
