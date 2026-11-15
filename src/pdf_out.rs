@@ -31,6 +31,8 @@ pub struct PlacedText {
     pub font_match: Option<FontMatchResult>,
     pub keep_raster: bool,
     pub color: Rgb,
+    #[allow(dead_code)]
+    pub confidence: f32,
     /// Word-level bounding boxes from OCR for per-word positioning.
     pub words: Vec<WordBox>,
 }
@@ -40,6 +42,8 @@ pub struct PlacedText {
 pub struct WordBox {
     pub text: String,
     pub x: f32,
+    #[allow(dead_code)]
+    pub y: f32,
     pub width: f32,
     pub height: f32,
     /// If set by the smoothing pass, this overrides the per-word width-matched

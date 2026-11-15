@@ -4,7 +4,7 @@
 //!
 //! Optimized: raw buffer access, no get_pixel, histogram Otsu without Vec alloc.
 
-use image::{GrayImage, RgbaImage};
+use image::{DynamicImage, GrayImage, RgbaImage};
 
 pub use unprint_geometry::{DetectedLine, DetectedFill, GeometryResult};
 
@@ -362,4 +362,16 @@ fn detect_fills_from_rgba(
     }
 
     fills
+}
+
+// Backward compat wrapper that was previously used — now delegates to raw version.
+#[allow(dead_code)]
+fn detect_fills(
+    img: &DynamicImage,
+    text_mask: &[bool],
+    w: u32,
+    h: u32,
+) -> Vec<DetectedFill> {
+    let rgba = img.to_rgba8();
+    detect_fills_from_rgba(&rgba, text_mask, w, h)
 }

@@ -696,6 +696,26 @@ fn power_iteration_eigenvectors(mat: &[f64], n: usize, k: usize) -> Vec<f64> {
 // Inference: sliding window ngram scoring
 // ---------------------------------------------------------------------------
 
+/// Score a font against a line's crops using sliding-window bigram
+/// classification, falling back to unigram when a bigram classifier doesn't
+/// exist for the pair.
+///
+/// `bigram_crops` are the combined pair images extracted from word-image
+/// Build per-character scoring windows for font identification.
+///
+/// Returns `(windows, position_map)` where `windows` are single characters
+/// and `position_map[i] = (seg_idx, char_pos)` for window `i`.
+
+pub fn build_scoring_windows<'a>(
+    word_segs: &'a [crate::segment::WordSeg],
+    _classifier: &'a dyn crate::classifier::Classifier,
+    _glyph_map: &'a crate::glyph_map::NgramGlyphMap,
+    crop_store: &'a mut Vec<GrayImage>,
+) -> (Vec<crate::font_match::ScoringWindow<'a>>, Vec<(usize, usize)>) {
+    let (windows, pos, _wib) = build_scoring_windows_with_geo(word_segs, crop_store);
+    (windows, pos)
+}
+
 /// Build scoring windows plus geometry measurements in a single scan per character.
 /// Trim to ink is called exactly once per character via `char_crop_and_metrics`,
 /// which does seam handling (whitening) in scan-crop creation and returns center
