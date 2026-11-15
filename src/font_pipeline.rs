@@ -140,6 +140,19 @@ fn word_seg_summary(ws: &crate::segment::WordSeg) -> crate::audit::WordSegSummar
     }
 }
 
+/// Build the single-word `TextRegion` for a line's text-color detection
+/// (F20: the fast-path and full-pipeline constructions were identical).
+fn line_text_region(line: &TextLine) -> TextRegion {
+    TextRegion {
+        text: line.text.clone(),
+        x: line.x, y: line.y,
+        width: line.width, height: line.height,
+        font_size_pt: line.font_size_pt,
+        confidence: line.confidence,
+        level: 5, block_num: 0, par_num: 0, line_num: 0, word_num: 0,
+    }
+}
+
 /// Build per-observation rank/prob/glyph/geo maps for one path's observations
 /// against the GT observations (no recompute — `identify_fonts` already
 /// computed best_prob, logit as glyph_score, and geo_ll for each path).
@@ -474,14 +487,7 @@ pub fn match_lines(
                 let text_color = color::detect_text_color_from_buffers(
                     gray_page,
                     rgba_page,
-                    &TextRegion {
-                        text: line.text.clone(),
-                        x: line.x, y: line.y,
-                        width: line.width, height: line.height,
-                        font_size_pt: line.font_size_pt,
-                        confidence: line.confidence,
-                        level: 5, block_num: 0, par_num: 0, line_num: 0, word_num: 0,
-                    },
+                    &line_text_region(line),
                 );
                 let mut result = fm.clone();
                 result.best_dy = vr.dy;
@@ -523,14 +529,7 @@ pub fn match_lines(
         let text_color = color::detect_text_color_from_buffers(
             gray_page,
             rgba_page,
-            &TextRegion {
-                text: line.text.clone(),
-                x: line.x, y: line.y,
-                width: line.width, height: line.height,
-                font_size_pt: line.font_size_pt,
-                confidence: line.confidence,
-                level: 5, block_num: 0, par_num: 0, line_num: 0, word_num: 0,
-            },
+            &line_text_region(line),
         );
         let font_scores: Vec<(String, Option<f32>)>;
         let mut observations: Vec<font_match::ObservationDetail>;
