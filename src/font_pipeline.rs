@@ -122,6 +122,24 @@ fn insert_gt_obs(rp: &mut ObsRankProbs, key: usize, obs: &font_match::Observatio
     if let Some(v) = obs.ink_width { rp.gt_ink_width.insert(key, v); }
 }
 
+/// Map one winning/GT `WordSeg` to its audit summary (F19: the two
+/// mapping closures in `match_lines` were identical).
+fn word_seg_summary(ws: &crate::segment::WordSeg) -> crate::audit::WordSegSummary {
+    crate::audit::WordSegSummary {
+        word_text: ws.word_text.clone(),
+        source_word_idx: ws.source_word_idx,
+        image_w: ws.image_w,
+        image_h: ws.image_h,
+        n_chars_expected: ws.n_chars_expected,
+        n_segments_produced: ws.n_segments_produced,
+        mismatch: ws.mismatch,
+        ws_splits: ws.ws_splits.clone(),
+        seam_splits: ws.seam_splits.clone(),
+        seam_paths: ws.seam_paths.clone(),
+        seam_costs: ws.seam_costs.clone(),
+    }
+}
+
 /// Build per-observation rank/prob/glyph/geo maps for one path's observations
 /// against the GT observations (no recompute — `identify_fonts` already
 /// computed best_prob, logit as glyph_score, and geo_ll for each path).
@@ -1286,35 +1304,11 @@ pub fn match_lines(
 
 
         let word_seg_summaries: Vec<crate::audit::WordSegSummary> = {
-            winning_segs.iter().map(|ws| crate::audit::WordSegSummary {
-                word_text: ws.word_text.clone(),
-                source_word_idx: ws.source_word_idx,
-                image_w: ws.image_w,
-                image_h: ws.image_h,
-                n_chars_expected: ws.n_chars_expected,
-                n_segments_produced: ws.n_segments_produced,
-                mismatch: ws.mismatch,
-                ws_splits: ws.ws_splits.clone(),
-                seam_splits: ws.seam_splits.clone(),
-                seam_paths: ws.seam_paths.clone(),
-                seam_costs: ws.seam_costs.clone(),
-            }).collect()
+            winning_segs.iter().map(word_seg_summary).collect()
         };
 
         let gt_word_seg_summaries: Vec<crate::audit::WordSegSummary> = if let Some(ref g_segs) = gt_segs_opt {
-            g_segs.iter().map(|ws| crate::audit::WordSegSummary {
-                word_text: ws.word_text.clone(),
-                source_word_idx: ws.source_word_idx,
-                image_w: ws.image_w,
-                image_h: ws.image_h,
-                n_chars_expected: ws.n_chars_expected,
-                n_segments_produced: ws.n_segments_produced,
-                mismatch: ws.mismatch,
-                ws_splits: ws.ws_splits.clone(),
-                seam_splits: ws.seam_splits.clone(),
-                seam_paths: ws.seam_paths.clone(),
-                seam_costs: ws.seam_costs.clone(),
-            }).collect()
+            g_segs.iter().map(word_seg_summary).collect()
         } else {
             Vec::new()
         };
