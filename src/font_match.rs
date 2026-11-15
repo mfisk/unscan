@@ -14,7 +14,7 @@ use std::sync::Arc;
 use std::collections::HashMap;
 use image::GrayImage;
 use crate::classifier::{self, ObsStats};
-use crate::segment::{WordSeg, SegSummary, collapse_ligature_chars_for_allowed, segment_characters, char_crop_and_metrics};
+use crate::segment::{WordSeg, SegSummary, collapse_ligature_chars_for_allowed, char_crop_and_metrics};
 use crate::geometry_classifier::{CharInkBounds, WordGeoMeasurement};
 
 static GEO_WEIGHT: std::sync::LazyLock<f32> = std::sync::LazyLock::new(|| {
@@ -205,6 +205,7 @@ pub fn identify_fonts(
     font_registry: &crate::font_scan::FontRegistry,
     font_cache: &crate::font_cache::FontCache,
     geo_cache: &crate::geo_cache::GeometryCache,
+    seg_cache: &mut crate::segment::SegmentCache,
 ) -> FontIdResult {
     if word_infos.is_empty() {
         return FontIdResult { scores: Vec::new(), observations: Vec::new(), gt_observations: Vec::new(), path_score: f32::MIN, gt_per_char_geo_ll: Vec::new() };
@@ -298,7 +299,16 @@ pub fn identify_fonts(
             // get or create cache entry for this word k
             let cache = &mut seg_caches[wi_idx];
             if !cache.contains_key(&k) {
-                let (b, s, sum) = segment_characters(&wi.img, k, &wi.text);
+                // Shared per-line cache: segment_line (diag) and
+                // build_for_font (winner rebuild) segment this same
+                // (image, k) — compute it once per line. The local entry
+                // still caches the derived char crops + precomputed
+                // features, which are font-independent but expensive to
+                // rebuild per font.
+                let cached = seg_cache.get_or_compute(&wi.img, k, &wi.text);
+                let b = cached.bounds.clone();
+                let s = cached.seams.clone();
+                let sum = cached.summary.clone();
                 let crop_h = wi.img.height();
                 let mut char_crops: Vec<Option<(Arc<GrayImage>,u32,u32,u32,u32,f64,f64)>> = Vec::with_capacity(k);
                 for i in 0..k {
