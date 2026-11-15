@@ -1053,7 +1053,13 @@ fn run(args: &cli::Args, classifier: &mut dyn classifier::Classifier) -> Result<
                             fm_lig,
                             lm.diag_seg_dir.as_deref(),
                             None,
-                            None,
+                            // Render at the midpoint-derived em (fringe-
+                            // immune: observed vs predicted midpoint spans),
+                            // not the per-word ink-width median. None falls
+                            // back to the width-matched median as before.
+                            // frac_width stays None: a Some value would
+                            // replace this override with a width-derived em.
+                            lm.midpoint_em_px,
                             None,
                         );
                         let pass = vr.score >= MIN_VERIFY_SIMILARITY;
