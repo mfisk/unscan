@@ -5,8 +5,10 @@
 
 use std::collections::{HashMap, HashSet};
 use std::io::{BufReader, BufWriter, Read, Write};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicUsize, Ordering};
+
+use serde::{Deserialize, Serialize};
 
 use rand::prelude::*;
 use rand::rngs::SmallRng;
@@ -708,6 +710,181 @@ pub fn load_geo_cache_for_training(font_dir: &[PathBuf], quiet: bool) -> crate::
     crate::geo_cache::GeometryCache::load_or_build(&registry, &font_cache, quiet)
 }
 
+/// Feature-file path for one (sequence, height, AA) combination.
+/// Hoisted to module level so the Phase 1 checkpoint helpers share the
+/// exact path construction with run_train (single source of truth).
+fn combo_path(feat_dir: &Path, seq: &[char], ht: u32, aa_name: &str) -> PathBuf {
+    feat_dir.join(format!("{}_h{}_{}.bin", seq_key(seq), ht, aa_name))
+}
+
+// ---------------------------------------------------------------------------
+// Phase 1 resume checkpoint (perf proposal 4.4, Nov 2026)
+// ---------------------------------------------------------------------------
+//
+// Problem: a cold retrain restarts from font 0 on every interruption —
+// Phase 1 streamed all samples into tmp files and renamed them to final
+// only at the very end, so a kill (reboot, OOM) discarded hours of work
+// and a full cold retrain never completed under the ~2h reboot cadence.
+//
+// Protocol: after each 30-font chunk is written, Phase 1 flushes all
+// writers and then atomically records a checkpoint (tmp file + rename)
+// holding the number of fonts completed and the per-(combo, seq) record
+// counts. The flush-then-checkpoint order is the commit point: the
+// checkpoint only ever claims records already durable in the tmp files.
+//
+// A resume is accepted ONLY if every fingerprint field matches the
+// current run (catalog hash, font count, ink threshold, sequence count,
+// glyph-map hash, needed combos) AND every tmp file's size matches its
+// recorded count exactly (0 bytes for 0 records, else 12-byte header +
+// count * record bytes). Any mismatch — a torn write, a changed catalog,
+// a rebuilt glyph map, a corrupted file — discards the checkpoint (tmp
+// files + checkpoint deleted) and restarts Phase 1 from font 0. A
+// half-written file for the interrupted font can therefore never be
+// accepted: its size cannot match any recorded count, and the restart
+// re-renders it. Restarting is always correct; it only costs time.
+//
+// Resume state lives in the feature dir (the checkpoint JSON + the tmp
+// feature files) and never depends on the glyph PNG cache.
+
+/// Format version of the Phase 1 checkpoint file. Bump when the struct changes.
+const PHASE1_CHECKPOINT_VERSION: u32 = 1;
+/// Checkpoint file name inside the feature dir.
+const PHASE1_CHECKPOINT_NAME: &str = "phase1_checkpoint.json";
+
+/// Resume checkpoint for Phase 1 of training. Written atomically after
+/// each chunk; deleted when Phase 1 completes.
+#[derive(Serialize, Deserialize)]
+struct Phase1Checkpoint {
+    version: u32,
+    catalog_hash: u64,
+    total_fonts: usize,
+    fonts_done: usize,
+    ink_thresh: u8,
+    n_seqs: usize,
+    glyph_map_hash: u64,
+    needed_combos: Vec<(u32, usize)>,
+    /// Record counts, indexed [combo_idx][si]. The manifest is written
+    /// from these at the end, so they must match the tmp files exactly.
+    combo_counts: Vec<Vec<usize>>,
+}
+
+fn phase1_checkpoint_path(feat_dir: &Path) -> PathBuf {
+    feat_dir.join(PHASE1_CHECKPOINT_NAME)
+}
+
+/// Bytes per feature record: 4-byte glyph_id + FEAT_LEN f32s.
+fn phase1_record_bytes() -> usize {
+    4 + FEAT_LEN * 4
+}
+
+/// Expected tmp-file size for `count` records: empty when nothing has
+/// been written yet (the header is written with the first sample),
+/// otherwise the 12-byte header plus one record per sample.
+fn phase1_expected_tmp_size(count: usize) -> u64 {
+    if count == 0 {
+        0
+    } else {
+        12 + count as u64 * phase1_record_bytes() as u64
+    }
+}
+
+/// Stable (cross-process) hash of a file's bytes. FxHasher has a fixed
+/// seed, unlike DefaultHasher. A missing/unreadable file hashes as empty
+/// input, so a file that appears/disappears between runs fails validation.
+fn hash_file_bytes(path: &Path) -> u64 {
+    use std::hash::Hasher;
+    let mut hasher = rustc_hash::FxHasher::default();
+    if let Ok(bytes) = std::fs::read(path) {
+        hasher.write(&bytes);
+    }
+    hasher.finish()
+}
+
+/// Atomically write the checkpoint (tmp file + rename, like the manifests).
+fn write_phase1_checkpoint(feat_dir: &Path, ckpt: &Phase1Checkpoint) {
+    let path = phase1_checkpoint_path(feat_dir);
+    let tmp_path = crate::atomic_file::tmp_for(&path);
+    let json = serde_json::to_string(ckpt).expect("serialize phase1 checkpoint");
+    std::fs::write(&tmp_path, json).expect("write phase1 checkpoint tmp");
+    std::fs::rename(&tmp_path, &path).expect("atomic rename phase1 checkpoint");
+}
+
+/// Load and parse the checkpoint, if one exists and parses. Any failure
+/// (missing file, bad JSON, wrong version) returns None — the caller
+/// treats that as "no usable checkpoint" and restarts from font 0.
+fn load_phase1_checkpoint(feat_dir: &Path) -> Option<Phase1Checkpoint> {
+    let path = phase1_checkpoint_path(feat_dir);
+    let json = std::fs::read_to_string(&path).ok()?;
+    let ckpt: Phase1Checkpoint = serde_json::from_str(&json).ok()?;
+    if ckpt.version != PHASE1_CHECKPOINT_VERSION {
+        return None;
+    }
+    Some(ckpt)
+}
+
+/// Delete the checkpoint and all Phase 1 tmp files for the needed combos.
+/// Used when a checkpoint fails validation (restart from font 0) and when
+/// starting fresh, so a new run never appends to orphaned tmp files.
+fn discard_phase1_checkpoint(
+    feat_dir: &Path,
+    sequences: &[Vec<char>],
+    needed_combos: &[(u32, usize)],
+) {
+    let _ = std::fs::remove_file(phase1_checkpoint_path(feat_dir));
+    for seq in sequences {
+        for &(ht, aa_idx) in needed_combos {
+            let aa_name = crate::features::AaVariant::all()[aa_idx].name();
+            let final_path = combo_path(feat_dir, seq, ht, aa_name);
+            let _ = std::fs::remove_file(crate::atomic_file::tmp_for(&final_path));
+        }
+    }
+}
+
+/// Validate a checkpoint against the current run. Returns true only if
+/// the fingerprint matches exactly AND every tmp file exists with exactly
+/// the recorded size. Anything else is a corrupt/stale checkpoint.
+fn validate_phase1_checkpoint(
+    ckpt: &Phase1Checkpoint,
+    feat_dir: &Path,
+    sequences: &[Vec<char>],
+    needed_combos: &[(u32, usize)],
+    catalog_hash: u64,
+    total_fonts: usize,
+    glyph_map_hash: u64,
+) -> bool {
+    if ckpt.catalog_hash != catalog_hash
+        || ckpt.total_fonts != total_fonts
+        || ckpt.fonts_done > total_fonts
+        || ckpt.ink_thresh != crate::INK_THRESH
+        || ckpt.n_seqs != sequences.len()
+        || ckpt.glyph_map_hash != glyph_map_hash
+        || ckpt.needed_combos != needed_combos
+        || ckpt.combo_counts.len() != needed_combos.len()
+        || ckpt
+            .combo_counts
+            .iter()
+            .any(|counts| counts.len() != sequences.len())
+    {
+        return false;
+    }
+    // Every tmp file must exist with exactly the recorded size. A file
+    // that is short (torn flush) or long (killed between flush and
+    // checkpoint write) fails validation and forces a restart.
+    for (combo_idx, &(ht, aa_idx)) in needed_combos.iter().enumerate() {
+        let aa_name = crate::features::AaVariant::all()[aa_idx].name();
+        for (si, seq) in sequences.iter().enumerate() {
+            let final_path = combo_path(feat_dir, seq, ht, aa_name);
+            let tmp_path = crate::atomic_file::tmp_for(&final_path);
+            let expected = phase1_expected_tmp_size(ckpt.combo_counts[combo_idx][si]);
+            match std::fs::metadata(&tmp_path) {
+                Ok(m) if m.len() == expected => {}
+                _ => return false,
+            }
+        }
+    }
+    true
+}
+
 pub fn run_train(mut args: TrainArgs, geo_cache: &crate::geo_cache::GeometryCache) {
     // Respect wrapper env first, otherwise cap to avoid OOM on 7.8GB no-swap.
     // Previous version always forced 4 threads, ignoring RAYON_NUM_THREADS=1,
@@ -874,14 +1051,22 @@ pub fn run_train(mut args: TrainArgs, geo_cache: &crate::geo_cache::GeometryCach
             let mut need_render: Vec<usize> = Vec::new();
 
             for (si, seq) in sequences.iter().enumerate() {
-                // No-PNG-cache training (train-nocache-pngs): reuse the old
-                // glyph map's hash directly. Renders are deterministic, so the
-                // hash is valid without the PNG existence check main uses to
-                // validate it. No PNG is read here.
                 if let Some(old) = old_gmap.as_ref() {
                     if let Some(hash) = old.hash_for_font(seq, &fk) {
-                        local_hashes.push((si, hash));
-                        continue;
+                        let path = crate::char_render::ngram_cache_path(seq, hash, &prewarm_params);
+                        // Atomic-safe reuse check: exists + non-trivial size.
+                        // A SIGKILL during previous img.save could leave a 0-byte or truncated file.
+                        // Such files would still `exists()` but fail to decode; treat as miss.
+                        if path.exists() {
+                            if let Ok(md) = std::fs::metadata(&path) {
+                                if md.len() > 64 {
+                                    local_hashes.push((si, hash));
+                                    continue;
+                                }
+                            }
+                            // Corrupt/partial file detected — delete so fresh render heals it.
+                            let _ = std::fs::remove_file(&path);
+                        }
                     }
                 }
                 need_render.push(si);
@@ -927,9 +1112,34 @@ pub fn run_train(mut args: TrainArgs, geo_cache: &crate::geo_cache::GeometryCach
                         .collect();
                     if let Some(img) = crate::char_render::render_ngram_fresh(&font, seq, &gid_overrides, &prewarm_params, disable_kern, &kern
                     ) {
-                        // No-PNG-cache training (train-nocache-pngs): hash the
-                        // in-memory render for the glyph map; do not save the PNG.
                         let hash = crate::glyph_map::hash_image(&img);
+                        let path = crate::char_render::ngram_cache_path(seq, hash, &prewarm_params);
+                        // Always atomic write to heal any prior partial file; rename is atomic.
+                        // Explicit encoder needed — `.tmp` breaks `image::save` format detection.
+                        let tmp = crate::atomic_file::tmp_for(&path);
+                        if let Some(parent) = tmp.parent() {
+                            let _ = std::fs::create_dir_all(parent);
+                        }
+                        let ok = (|| -> std::io::Result<()> {
+                            use std::fs::File;
+                            use std::io::BufWriter;
+                            use image::codecs::png::PngEncoder;
+                            use image::ImageEncoder;
+                            let f = File::create(&tmp)?;
+                            let mut w = BufWriter::new(f);
+                            let enc = PngEncoder::new(&mut w);
+                            enc.write_image(img.as_raw(), img.width(), img.height(), image::ExtendedColorType::L8)
+                                .map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e))?;
+                            use std::io::Write;
+                            w.flush()?;
+                            Ok(())
+                        })()
+                        .is_ok();
+                        if ok {
+                            let _ = std::fs::rename(&tmp, &path);
+                        } else {
+                            let _ = std::fs::remove_file(&tmp);
+                        }
                         local_hashes.push((si, hash));
                         rendered += 1;
                     }
@@ -986,7 +1196,7 @@ pub fn run_train(mut args: TrainArgs, geo_cache: &crate::geo_cache::GeometryCach
             total_deduped
         );
         eprintln!(
-            "  Pre-warm reused {} glyph-map hashes and rendered {} missing glyphs",
+            "  Pre-warm reused {} cached PNGs and rendered {} missing glyphs",
             prewarm_reused.load(Ordering::Relaxed),
             prewarm_rendered.load(Ordering::Relaxed)
         );
@@ -1014,9 +1224,6 @@ pub fn run_train(mut args: TrainArgs, geo_cache: &crate::geo_cache::GeometryCach
     let _all_heights: &[u32] = &args.heights;
     let all_aa: &[AaVariant] = AaVariant::all();
 
-    fn combo_path(feat_dir: &std::path::Path, seq: &[char], ht: u32, aa_name: &str) -> std::path::PathBuf {
-        feat_dir.join(format!("{}_h{}_{}.bin", seq_key(seq), ht, aa_name))
-    }
     fn manifest_combo_path(feat_dir: &std::path::Path, ht: u32, aa_name: &str) -> std::path::PathBuf {
         feat_dir.join(format!("manifest_h{}_{}.txt", ht, aa_name))
     }
@@ -1203,6 +1410,10 @@ pub fn run_train(mut args: TrainArgs, geo_cache: &crate::geo_cache::GeometryCach
             .sum();
         eprintln!("\nReusing {} cached combos ({} samples) — glyph ids stable",
             cached_combos.len(), total_cached);
+        // No Phase 1 work: any checkpoint from an interrupted run is stale
+        // (its combos are cached now), so drop it rather than leaving a
+        // misleading resume point behind.
+        let _ = std::fs::remove_file(phase1_checkpoint_path(&feat_dir));
     } else {
         if !needed_combos.is_empty() {
             eprintln!("\nFull render needed for {} combos ({} fully cached, {} incremental pending)",
@@ -1218,9 +1429,47 @@ pub fn run_train(mut args: TrainArgs, geo_cache: &crate::geo_cache::GeometryCach
         // Build a set of needed combos for the inner loop
         let _needed_set: std::collections::HashSet<(u32, usize)> = needed_combos.iter().copied().collect();
 
+        // Resume (perf 4.4): accept a checkpoint from an interrupted run
+        // ONLY if its fingerprint matches this run exactly and every tmp
+        // file's size matches its recorded count. Anything else discards
+        // the checkpoint and restarts from font 0 — restarting is always
+        // correct, it only costs time.
+        let glyph_map_hash = hash_file_bytes(&crate::glyph_map::NgramGlyphMap::default_path());
+        let resumed = load_phase1_checkpoint(&feat_dir).and_then(|ck| {
+            if validate_phase1_checkpoint(
+                &ck,
+                &feat_dir,
+                &sequences,
+                &needed_combos,
+                catalog_hash,
+                catalog.len(),
+                glyph_map_hash,
+            ) {
+                Some(ck)
+            } else {
+                eprintln!("  Phase 1 checkpoint invalid (fingerprint or tmp-file mismatch) — discarding, restarting from font 0");
+                None
+            }
+        });
+        let (fonts_done, mut combo_counts) = match &resumed {
+            Some(ck) => {
+                eprintln!("  Resuming Phase 1 from font {}/{} (checkpoint validated)",
+                    ck.fonts_done, catalog.len());
+                (ck.fonts_done, ck.combo_counts.clone())
+            }
+            None => {
+                // No valid checkpoint: remove any stale checkpoint/tmp files
+                // so a fresh run never appends to orphaned tmp files.
+                discard_phase1_checkpoint(&feat_dir, &sequences, &needed_combos);
+                (0usize, vec![vec![0usize; n_seqs]; needed_combos.len()])
+            }
+        };
+        progress.store(fonts_done, Ordering::Relaxed);
+
         // Open writers: indexed by (ci, combo_index)
         // combo_index is position in needed_combos
-        let n_combos = needed_combos.len();
+        // On resume the tmp files are opened for append (their contents
+        // were validated above); on a fresh start they are truncated.
         let mut combo_tmp_paths: Vec<Vec<(std::path::PathBuf, std::path::PathBuf)>> = Vec::new();
         let mut combo_writers: Vec<Vec<BufWriter<std::fs::File>>> = (0..n_seqs).map(|si| {
             let mut paths_row = Vec::new();
@@ -1228,10 +1477,15 @@ pub fn run_train(mut args: TrainArgs, geo_cache: &crate::geo_cache::GeometryCach
                 let aa_name = all_aa[aa_idx].name();
                 let final_path = combo_path(&feat_dir, &sequences[si], ht, aa_name);
                 let tmp_path = crate::atomic_file::tmp_for(&final_path);
-                let w = BufWriter::with_capacity(
-                    64 * 1024,
-                    std::fs::File::create(&tmp_path).expect("create combo feature file"),
-                );
+                let file = if resumed.is_some() {
+                    std::fs::OpenOptions::new()
+                        .append(true)
+                        .open(&tmp_path)
+                        .expect("open combo feature tmp for append")
+                } else {
+                    std::fs::File::create(&tmp_path).expect("create combo feature file")
+                };
+                let w = BufWriter::with_capacity(64 * 1024, file);
                 paths_row.push((tmp_path, final_path));
                 w
             }).collect();
@@ -1239,10 +1493,21 @@ pub fn run_train(mut args: TrainArgs, geo_cache: &crate::geo_cache::GeometryCach
             writers
         }).collect();
 
-        // Per-combo per-char counts
-        let mut combo_counts: Vec<Vec<usize>> = vec![vec![0usize; n_seqs]; n_combos];
+        // Test-only fault injection (perf 4.4 resume test): abort Phase 1
+        // at the next chunk boundary once N fonts are done, leaving tmp
+        // files + checkpoint on disk with no manifests — the same on-disk
+        // state a SIGKILL/reboot leaves. The panic unwinds after the
+        // previous chunk's flush + checkpoint, so all state is consistent.
+        let abort_after_fonts: Option<usize> = std::env::var("UNPRINT_TRAIN_ABORT_AFTER_FONTS")
+            .ok()
+            .and_then(|s| s.parse().ok());
 
-        for chunk_start in (0..catalog.len()).step_by(chunk_size) {
+        for chunk_start in (fonts_done..catalog.len()).step_by(chunk_size) {
+            if let Some(n) = abort_after_fonts {
+                if chunk_start >= n {
+                    panic!("UNPRINT_TRAIN_ABORT_AFTER_FONTS: aborting Phase 1 at font {chunk_start} (test fault injection)");
+                }
+            }
             let chunk_end = (chunk_start + chunk_size).min(catalog.len());
             let chunk = &catalog[chunk_start..chunk_end];
 
@@ -1310,11 +1575,36 @@ pub fn run_train(mut args: TrainArgs, geo_cache: &crate::geo_cache::GeometryCach
                         params.aa = all_aa[aa_idx_all];
                         params.subpixel_dx = dx;
                         params.subpixel_dy = dy;
-                        // No-PNG-cache training (train-nocache-pngs): always render
-                        // fresh in memory and compute features directly. No cache
-                        // load, no PNG save. Renders are deterministic, so the
-                        // features are identical to the cached path's.
-                        let img = crate::char_render::render_ngram_fresh(&font, seq, &gid_overrides, &params, disable_kern, &kern);
+                        let matches_prewarm_params = params.height == prewarm_params.height
+                            && params.render_scale == prewarm_params.render_scale
+                            && params.aa == prewarm_params.aa
+                            && params.binarize_threshold == prewarm_params.binarize_threshold;
+                        let img = if matches_prewarm_params {
+                            glyph_map
+                                .hash_for_font(seq, &fk)
+                                .and_then(|hash| {
+                                    // Try cache first
+                                    if let Some(img) = crate::char_render::load_cached_ngram(seq, hash, &params) {
+                                        Some(img)
+                                    } else {
+                                        // Cache miss: render fresh and save to cache
+                                        let img = crate::char_render::render_ngram_fresh(&font, seq, &gid_overrides, &params, disable_kern, &kern)?;
+                                        let path = crate::char_render::ngram_cache_path(seq, hash, &params);
+                                        if let Some(parent) = path.parent() {
+                                            let _ = std::fs::create_dir_all(parent);
+                                        }
+                                        let _ = img.save(&path);
+                                        Some(img)
+                                    }
+                                })
+                                .or_else(|| {
+                                    crate::char_render::render_ngram_fresh(&font, seq, &gid_overrides, &params, disable_kern, &kern
+                    )
+                                })
+                        } else {
+                            crate::char_render::render_ngram_fresh(&font, seq, &gid_overrides, &params, disable_kern, &kern
+                    )
+                        };
                         let img = match img {
                             Some(img) => img,
                             None => continue,
@@ -1364,6 +1654,29 @@ pub fn run_train(mut args: TrainArgs, geo_cache: &crate::geo_cache::GeometryCach
                     combo_counts[combo_idx][si] += 1;
                 }
             }
+
+            // Checkpoint (perf 4.4): flush writers, then atomically record
+            // progress. The flush-then-checkpoint order is the commit
+            // protocol — the checkpoint only claims records already in the
+            // tmp files, so a kill at any point leaves either the old
+            // checkpoint (valid, resume from it) or tmp files that fail
+            // validation (restart from font 0). Never a torn resume.
+            for char_ws in &mut combo_writers {
+                for w in char_ws {
+                    w.flush().expect("flush combo features for checkpoint");
+                }
+            }
+            write_phase1_checkpoint(&feat_dir, &Phase1Checkpoint {
+                version: PHASE1_CHECKPOINT_VERSION,
+                catalog_hash,
+                total_fonts: catalog.len(),
+                fonts_done: chunk_end,
+                ink_thresh: crate::INK_THRESH,
+                n_seqs,
+                glyph_map_hash,
+                needed_combos: needed_combos.clone(),
+                combo_counts: combo_counts.clone(),
+            });
         }
 
         // Flush, close, and atomically rename all writers
@@ -1392,6 +1705,9 @@ pub fn run_train(mut args: TrainArgs, geo_cache: &crate::geo_cache::GeometryCach
             std::fs::write(&tmp_mpath, &manifest).expect("write combo manifest");
             std::fs::rename(&tmp_mpath, &mpath).expect("atomic rename manifest");
         }
+
+        // Phase 1 complete: the checkpoint has served its purpose.
+        let _ = std::fs::remove_file(phase1_checkpoint_path(&feat_dir));
 
         let rendered_samples: usize = combo_counts.iter().flat_map(|c| c.iter()).sum();
         let render_secs_inner = start.elapsed().as_secs_f64();
