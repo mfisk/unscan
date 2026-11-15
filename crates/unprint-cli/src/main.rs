@@ -1048,16 +1048,12 @@ fn run(args: &cli::Args, classifier: &mut dyn classifier::Classifier) -> Result<
                 if let Some(ref fm) = font_result {
                     let font_data = font_cache.load(&fm.font_path).ok();
                     if let Some(ref fd) = font_data {
-                        let norm_crop = {
-                            let iw = gray_page.width();
-                            let ih = gray_page.height();
-                            let cx = line.x.min(iw.saturating_sub(1));
-                            let cy = line.y.min(ih.saturating_sub(1));
-                            let cw = line.width.min(iw - cx);
-                            let ch = line.height.min(ih - cy);
-                            let raw = image::imageops::crop_imm(&gray_page, cx, cy, cw, ch).to_image();
-                            features::contrast_normalize_char(raw)
-                        };
+                        // Reuse the normalized crop match_lines computed
+                        // for this line (F9) — same page, same bbox, so it
+                        // is the crop this block used to recompute.
+                        let norm_crop = lm.norm_crop.as_ref().expect(
+                            "scored line must carry its normalized crop from match_lines",
+                        );
                         let verify_words = lm.corrected_words.as_deref().unwrap_or(&line.words);
                         // Honor the winning font's ligature determination via the
                         // durable segmentation signal carried in LineMatch.
@@ -1067,7 +1063,7 @@ fn run(args: &cli::Args, classifier: &mut dyn classifier::Classifier) -> Result<
                         let fm_lig = font_registry.by_key(&fm.font_key)
                             .map(|fe| fe.collapsed_lig_set()).unwrap_or(0);
                         let vr = verify::verify_text_region(
-                            &norm_crop,
+                            norm_crop,
                             fd.as_slice(),
                             &fm.font_path,
                             &line.text,

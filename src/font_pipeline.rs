@@ -228,6 +228,14 @@ pub struct LineMatch {
     pub fast_path: bool,
     /// ZNCC verify score from the fast-path check (so pass 2a can skip re-verification).
     pub fast_path_score: Option<f32>,
+    /// Contrast-normalized crop of the line bbox, computed once in
+    /// [`match_lines`] for the verify calls and reused by Pass 2a instead
+    /// of re-cropping + re-normalizing the same bbox (redundancy F9).
+    /// The line bbox is stable from Pass 1 through Pass 2a (word splitting
+    /// only rebuilds `line.words`), so the stored crop is the one Pass 2a
+    /// would compute. `None` for filter placeholders (never scored) and
+    /// fast-path lines (Pass 2a skips re-verification via `fast_path_score`).
+    pub norm_crop: Option<image::GrayImage>,
     /// Median em_px derived from midpoint center-span scales (obs_span/pred_span * upem).
     /// This reuses the exact scale calculation from geometry scoring for font-size,
     /// fixing L9 fox/jumps too-small issue where width-matched median was dragged down.
@@ -411,6 +419,7 @@ pub fn match_lines(
                     corrected_words: None,
                     fast_path: false,
                     fast_path_score: None,
+                    norm_crop: None,
                     midpoint_em_px: None,
                     gt_midpoint_em_px: None,
                     word_seg_summaries: Vec::new(),
@@ -487,6 +496,7 @@ pub fn match_lines(
                     corrected_words: None,
                     fast_path: true,
                     fast_path_score: Some(vr.score),
+                    norm_crop: None,
                     midpoint_em_px: None,
                     gt_midpoint_em_px: None,
                     word_seg_summaries: Vec::new(),
@@ -1318,7 +1328,7 @@ pub fn match_lines(
         // gt_word_seg_summaries (GT), which the report's scan-line
         // overlays render side by side.
 
-        LineMatch { font_result, text_color, font_scores, observations, gt_observations, seg_used_ligatures, diag_seg_dir, obs_rank_probs, gt_obs_rank_probs, tie_candidates: tie_candidates_audit, corrected_words, fast_path: false, fast_path_score: None, midpoint_em_px, gt_midpoint_em_px, word_seg_summaries, gt_word_seg_summaries, gt_per_char_geo_ll, ocr_corrections: ocr_correction_audit }
+        LineMatch { font_result, text_color, font_scores, observations, gt_observations, seg_used_ligatures, diag_seg_dir, obs_rank_probs, gt_obs_rank_probs, tie_candidates: tie_candidates_audit, corrected_words, fast_path: false, fast_path_score: None, norm_crop: Some(norm_crop), midpoint_em_px, gt_midpoint_em_px, word_seg_summaries, gt_word_seg_summaries, gt_per_char_geo_ll, ocr_corrections: ocr_correction_audit }
     }).collect();
 
     let fp_hits = fast_path_hits.load(Ordering::Relaxed);
