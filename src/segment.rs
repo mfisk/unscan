@@ -2534,28 +2534,29 @@ pub(crate) const LIGATURE_SEQUENCES: &[(&[char], char)] = &[
 /// it returns false are skipped entirely (no crop, no resize).
 /// Crop a single character from a word image at position `i`.
 /// Returns `None` if the region is too narrow or contains no ink.
-/// Crop `n` adjacent characters starting at position `i` from a word image.
-/// Spans boundaries[i] to boundaries[i+n], with seam masking at the
-/// outer edges.  Returns `None` if the region is too narrow or has no ink.
-pub fn crop_ngram(
+/// Shared seam-masked crop for `crop_ngram` and `char_crop_and_metrics`.
+///
+/// Expanded bounds include winding seam excursions (pre-1cfca57 `crop_ngram`
+/// behavior), clamped and ordered to avoid 5px h_err -> -690 ll; each row is
+/// then whitened outside the seam limits with darkest-adjacent ownership.
+/// Returns the whitened crop plus its left bound x0, or None when the span
+/// is empty or narrower than `min_width`.
+///
+/// The two callers keep their own tails on purpose: `crop_ngram` normalizes
+/// with INK_THRESH (240) to match training-time trimming, while
+/// `char_crop_and_metrics` trims with THRESH 200 and returns metrics, so the
+/// two normalized crops genuinely differ (F14 probe on real lob words:
+/// 149/454 chars) and must not be merged into one function.
+fn seam_masked_crop(
     word_img: &GrayImage,
-    i: usize,
-    n: usize,
-    boundaries: &[u32],
-    seam_paths: &HashMap<u32, Vec<[u32; 2]>>,
+    b_left: u32,
+    b_right: u32,
+    left_seam: Option<&Vec<[u32; 2]>>,
+    right_seam: Option<&Vec<[u32; 2]>>,
     crop_h: u32,
-) -> Option<GrayImage> {
+    min_width: u32,
+) -> Option<(GrayImage, u32)> {
     let (ww, _) = word_img.dimensions();
-
-    if i + n >= boundaries.len() {
-        return None;
-    }
-
-    let b_left = boundaries[i];
-    let b_right = boundaries[i + n];
-
-    let left_seam = seam_paths.get(&b_left);
-    let right_seam = seam_paths.get(&b_right);
 
     // Expanded bounds to include winding seam excursions (pre-1cfca57 crop_ngram behavior),
     // but with clamped, ordered limits to avoid 5px h_err -> -690 ll.
@@ -2571,127 +2572,7 @@ pub fn crop_ngram(
         b_right
     }.min(ww);
 
-    if x1 <= x0 || (x1 - x0) < 2 * (n as u32) {
-        return None;
-    }
-
-    let mut crop = image::imageops::crop_imm(word_img, x0, 0, x1 - x0, crop_h).to_image();
-
-    let crop_w = x1 - x0;
-    {
-        let cw_us = crop_w as usize;
-        let ch_us = crop_h as usize;
-        let raw = crop.as_mut();
-        let stride = cw_us;
-        for y in 0..ch_us {
-            let base = y * stride;
-            // Per-row limits – handles 1-3 px horizontal moves, darkest-adjacent ownership
-            let mut left_limit = x0;
-            let mut right_limit = x1;
-            if let Some(sp) = left_seam {
-                let cols: Vec<u32> = sp.iter().filter(|p| p[0] == y as u32).map(|p| p[1]).collect();
-                if !cols.is_empty() {
-                    let s_min = *cols.iter().min().unwrap();
-                    let s_max = *cols.iter().max().unwrap();
-                    let left_adj = if s_min > 0 {
-                        word_img.get_pixel(s_min - 1, y as u32).0[0]
-                    } else {
-                        255
-                    };
-                    let right_adj = if s_max + 1 < ww {
-                        word_img.get_pixel(s_max + 1, y as u32).0[0]
-                    } else {
-                        255
-                    };
-                    let assign_to_left = left_adj <= right_adj;
-                    left_limit = if assign_to_left {
-                        (s_max + 1).max(x0).min(x1)
-                    } else {
-                        s_min.max(x0).min(x1)
-                    };
-                }
-            }
-            if let Some(sp) = right_seam {
-                let cols: Vec<u32> = sp.iter().filter(|p| p[0] == y as u32).map(|p| p[1]).collect();
-                if !cols.is_empty() {
-                    let s_min = *cols.iter().min().unwrap();
-                    let s_max = *cols.iter().max().unwrap();
-                    let left_adj = if s_min > 0 {
-                        word_img.get_pixel(s_min - 1, y as u32).0[0]
-                    } else {
-                        255
-                    };
-                    let right_adj = if s_max + 1 < ww {
-                        word_img.get_pixel(s_max + 1, y as u32).0[0]
-                    } else {
-                        255
-                    };
-                    let assign_to_left = left_adj <= right_adj;
-                    let r = if assign_to_left {
-                        s_max + 1
-                    } else {
-                        s_min
-                    };
-                    right_limit = r.max(x0).min(x1).max(left_limit);
-                }
-            }
-            if left_limit >= x1 || right_limit <= x0 {
-                raw[base..base + cw_us].fill(255);
-                continue;
-            }
-            let l = (left_limit - x0) as usize;
-            let r = (right_limit - x0) as usize;
-            if l > 0 {
-                raw[base..base + l.min(cw_us)].fill(255);
-            }
-            if r < cw_us {
-                raw[base + r..base + cw_us].fill(255);
-            }
-        }
-    }
-
-    normalize_to_ink_bounds(&crop, NORM_H)
-}
-
-/// Crop a character and return its normalized image plus ink metrics in word coordinates.
-/// Scan crop does seam handling (whitening outside winding divider); trim itself
-/// finds ink bounds and returns center in caller's (word) coordinate system.
-/// This is the single source of truth for both recognition crop and geometry midpoint,
-/// so trim is called exactly once per character.
-pub fn char_crop_and_metrics(
-    word_img: &GrayImage,
-    i: usize,
-    boundaries: &[u32],
-    seam_paths: &HashMap<u32, Vec<[u32; 2]>>,
-    crop_h: u32,
-) -> Option<(GrayImage, u32, u32, u32, u32, f64, f64)> {
-    let (ww, _) = word_img.dimensions();
-    if i + 1 >= boundaries.len() {
-        return None;
-    }
-    let b_left = boundaries[i];
-    let b_right = boundaries[i + 1];
-    let left_seam = seam_paths.get(&b_left);
-    let right_seam = seam_paths.get(&b_right);
-
-    // Restore original clamped bounds: use nominal b_left/b_right, not expanded
-    // seam excursions. Expanded bounds shift cx for narrow glyphs (v,w,x,l,n) and
-    // Single source crop: expanded bounds to include winding seam excursions
-    // (avoids clipping ffi etc), but with clamped, ordered seam limits to avoid
-    // 5px h_err -> -690 ll. This merges pre-1cfca57 measure_char_ink_bounds (clamped)
-    // with pre-1cfca57 crop_ngram (expanded) into one correct implementation.
-    let x0 = if let Some(sp) = left_seam {
-        sp.iter().map(|p| p[1]).min().unwrap_or(b_left).min(b_left)
-    } else {
-        b_left
-    }.min(ww);
-    let x1 = if let Some(sp) = right_seam {
-        sp.iter().map(|p| p[1]).max().unwrap_or(b_right).max(b_right).saturating_add(1)
-    } else {
-        b_right
-    }.min(ww);
-
-    if x1 <= x0 || (x1 - x0) < 2 {
+    if x1 <= x0 || (x1 - x0) < min_width {
         return None;
     }
 
@@ -2771,6 +2652,69 @@ pub fn char_crop_and_metrics(
             }
         }
     }
+
+    Some((crop, x0))
+}
+
+/// Crop `n` adjacent characters starting at position `i` from a word image.
+/// Spans boundaries[i] to boundaries[i+n], with seam masking at the
+/// outer edges.  Returns `None` if the region is too narrow or has no ink.
+pub fn crop_ngram(
+    word_img: &GrayImage,
+    i: usize,
+    n: usize,
+    boundaries: &[u32],
+    seam_paths: &HashMap<u32, Vec<[u32; 2]>>,
+    crop_h: u32,
+) -> Option<GrayImage> {
+    if i + n >= boundaries.len() {
+        return None;
+    }
+
+    let b_left = boundaries[i];
+    let b_right = boundaries[i + n];
+
+    let left_seam = seam_paths.get(&b_left);
+    let right_seam = seam_paths.get(&b_right);
+
+    let (crop, _) = seam_masked_crop(
+        word_img,
+        b_left,
+        b_right,
+        left_seam,
+        right_seam,
+        crop_h,
+        2 * (n as u32),
+    )?;
+
+    normalize_to_ink_bounds(&crop, NORM_H)
+}
+
+/// Crop a character and return its normalized image plus ink metrics in word coordinates.
+/// Scan crop does seam handling (whitening outside winding divider); trim itself
+/// finds ink bounds and returns center in caller's (word) coordinate system.
+/// This is the single source of truth for both recognition crop and geometry midpoint,
+/// so trim is called exactly once per character.
+pub fn char_crop_and_metrics(
+    word_img: &GrayImage,
+    i: usize,
+    boundaries: &[u32],
+    seam_paths: &HashMap<u32, Vec<[u32; 2]>>,
+    crop_h: u32,
+) -> Option<(GrayImage, u32, u32, u32, u32, f64, f64)> {
+    if i + 1 >= boundaries.len() {
+        return None;
+    }
+    let b_left = boundaries[i];
+    let b_right = boundaries[i + 1];
+    let left_seam = seam_paths.get(&b_left);
+    let right_seam = seam_paths.get(&b_right);
+
+    // Bounds + seam masking shared with crop_ngram (see seam_masked_crop);
+    // the trim below keeps this function's own THRESH 200.
+    let (crop, x0) = seam_masked_crop(
+        word_img, b_left, b_right, left_seam, right_seam, crop_h, 2,
+    )?;
 
     // Trim to ink — single scan, raw buffer, no get_pixel.
     const THRESH: u8 = 200;
