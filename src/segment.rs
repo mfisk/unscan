@@ -2729,19 +2729,10 @@ pub fn char_crop_and_metrics(
     let mut max_x = 0u32;
     let mut min_y = ch;
     let mut max_y = 0u32;
-    // Subpixel geometry: per-column and per-row max darkness (255 - pixel),
-    // for fractional edge computation. Tracked in the same single scan;
-    // white gives 0 and never affects the max.
-    let mut col_dark = vec![0u8; cw_us];
-    let mut row_dark = vec![0u8; ch_us];
     for y in 0..ch_us {
         let base = y * cw_us;
         for x in 0..cw_us {
-            let pixel = raw_crop[base + x];
-            let darkness = 255u8.saturating_sub(pixel);
-            if darkness > col_dark[x] { col_dark[x] = darkness; }
-            if darkness > row_dark[y] { row_dark[y] = darkness; }
-            if pixel < THRESH {
+            if raw_crop[base + x] < THRESH {
                 let xu = x as u32;
                 let yu = y as u32;
                 if xu < min_x { min_x = xu; }
@@ -2760,31 +2751,8 @@ pub fn char_crop_and_metrics(
     let x_max_abs = x0 + max_x;
     let y_min_abs = min_y;
     let y_max_abs = max_y;
-
-    // Subpixel edges via the canonical helper (same formula as before, now
-    // shared with the word-level extents): edge-column darkness as a fraction
-    // of the character's darkest column/row. A half-dark edge column
-    // contributes only half its pixel width, so the edge sits at
-    // x_min + (1 - f) / x_max + f instead of at the integer column.
-    // Fractional bounds use INK_THRESH (240), the crate-wide ink threshold,
-    // so near-threshold antialiased edge pixels (e.g. value 215) count as ink
-    // here even though the THRESH=200 integer bounds used for the recognition
-    // crop drop them. The fractions are relative to the character's own
-    // darkest column/row, so grey ink (whose solid interior is not pure
-    // black) still gets correct relative coverage. Integer ink exists at
-    // THRESH=200 (darkness > 55), so a column/row at INK_THRESH darkness
-    // (>= 15) always exists; the fallbacks are unreachable.
-    let ink_min_dark = 255u16 - crate::INK_THRESH as u16;
-    let (fl, fr) = crate::ocr::frac_edges_from_profile(&col_dark, ink_min_dark)
-        .unwrap_or((min_x as f64, max_x as f64 + 1.0));
-    let (ft, fb) = crate::ocr::frac_edges_from_profile(&row_dark, ink_min_dark)
-        .unwrap_or((min_y as f64, max_y as f64 + 1.0));
-    let frac_left = x0 as f64 + fl;
-    let frac_right = x0 as f64 + fr;
-    let frac_top = ft;
-    let frac_bottom = fb;
-    let cx = (frac_left + frac_right) * 0.5;
-    let cy = (frac_top + frac_bottom) * 0.5;
+    let cx = (x_min_abs as f64 + x_max_abs as f64) * 0.5;
+    let cy = (y_min_abs as f64 + y_max_abs as f64) * 0.5;
 
     // Build normalized image from the same ink bounds (no second scan) - raw blit.
     let ink_w = max_x - min_x + 1;
