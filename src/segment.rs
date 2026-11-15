@@ -129,7 +129,8 @@ pub fn trailing_narrow_punct(word_text: &str) -> bool {
 }
 
 pub fn segment_characters(img: &GrayImage, n_chars: usize, word_text: &str) -> (Vec<u32>, HashMap<u32, Vec<[u32; 2]>>, SegSummary) {
-    segment_characters_inner(img, n_chars, None, word_text)
+    let outcome = segment_characters_inner(img, n_chars, word_text, false);
+    (outcome.bounds, outcome.seams, outcome.summary)
 }
 
 /// Same as `segment_characters` but dumps per-pass diagnostics when `diag_dir` is Some.
@@ -139,33 +140,261 @@ pub fn segment_characters_diag(
     diag_dir: &std::path::Path,
     word_text: &str,
 ) -> (Vec<u32>, HashMap<u32, Vec<[u32; 2]>>, SegSummary) {
-    segment_characters_inner(img, n_chars, Some(diag_dir), word_text)
+    let outcome = segment_characters_inner(img, n_chars, word_text, true);
+    if outcome.full_path {
+        write_seg_diag(img, word_text, &outcome, diag_dir);
+    }
+    (outcome.bounds, outcome.seams, outcome.summary)
+}
+
+/// Diag segmentation through the per-line cache: returns the chosen
+/// (bounds, seams, summary) triple and writes the diag files
+/// (word_crop.png, seam_overlay.png, final_overlay.png, summary.json)
+/// into `diag_dir` from the merged (chosen + traced) maps. On a cache
+/// hit with traced data this writes files without recomputing; on a miss
+/// (or an untraced entry) it computes with tracing once and upgrades the
+/// entry. Words from the early-return paths write no files, exactly as
+/// `segment_characters_diag`.
+pub fn segment_diag_cached(
+    cache: &mut SegmentCache,
+    img: &GrayImage,
+    n_chars: usize,
+    diag_dir: &std::path::Path,
+    word_text: &str,
+) -> (Vec<u32>, HashMap<u32, Vec<[u32; 2]>>, SegSummary) {
+    let entry = cache.get_or_compute_traced(img, n_chars, word_text);
+    if entry.full_path {
+        write_seg_diag(img, word_text, entry, diag_dir);
+    }
+    (entry.bounds.clone(), entry.seams.clone(), entry.summary.clone())
+}
+
+/// Full result of segmenting one word crop: the chosen segmentation plus,
+/// when computed with tracing, the extra candidate seam paths the viz
+/// reads. This is what the per-line `SegmentCache` stores, so a word crop
+/// is never segmented twice with the same k.
+#[derive(Debug, Clone)]
+pub struct CachedSegmentation {
+    /// Chosen split boundaries: [0, split1, ..., w].
+    pub bounds: Vec<u32>,
+    /// Chosen seam paths only (one per chosen split, keyed by column).
+    pub seams: HashMap<u32, Vec<[u32; 2]>>,
+    /// Summary with chosen-only seam costs (what scoring records).
+    pub summary: SegSummary,
+    /// Extra traced candidate paths/costs for the viz, sorted by total
+    /// cost ascending. Some only when computed with tracing (diag pass);
+    /// None for scoring-populated entries and for the early-return words
+    /// below, which have no candidates to trace.
+    pub traced: Option<Vec<(u32, SeamCost, Vec<[u32; 2]>)>>,
+    /// False for the n_chars<=1 / tiny-crop early returns, which write
+    /// no diag files.
+    pub full_path: bool,
+}
+
+/// Key for a cached segmentation. The exemption state is part of the key:
+/// exempt and non-exempt segmentations of the same image and k are
+/// different computations and must never share an entry. (Since the
+/// exemption is now uniform across callers, the flag is the same for
+/// every entry in practice — it stays in the key so the cache remains
+/// correct if a caller ever passes different text for the same pixels.)
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub struct SegCacheKey {
+    img_hash: u64,
+    w: u32,
+    h: u32,
+    k: usize,
+    trailing_punct: bool,
+}
+
+/// Per-line cache of segmentation results: never re-segment the same word
+/// crop twice with the same k. Created fresh per line in font_pipeline
+/// and threaded explicitly through segment_line, identify_fonts and
+/// build_for_font — never a global, so parallel lines (rayon par_iter)
+/// never share state.
+#[derive(Debug, Default)]
+pub struct SegmentCache {
+    map: HashMap<SegCacheKey, CachedSegmentation>,
+}
+
+impl SegmentCache {
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    fn key(img: &GrayImage, k: usize, word_text: &str) -> SegCacheKey {
+        SegCacheKey {
+            img_hash: hash_gray_image(img),
+            w: img.width(),
+            h: img.height(),
+            k,
+            trailing_punct: trailing_narrow_punct(word_text),
+        }
+    }
+
+    /// Return the segmentation for (img, k, word_text), computing and
+    /// caching it on a miss. Scoring path: no tracing, so the entry's
+    /// `traced` is None and the returned seams/summary are chosen-only,
+    /// bit-identical to a fresh `segment_characters` call.
+    /// The returned reference borrows the cache; callers clone what they keep.
+    pub fn get_or_compute(
+        &mut self,
+        img: &GrayImage,
+        k: usize,
+        word_text: &str,
+    ) -> &CachedSegmentation {
+        let key = Self::key(img, k, word_text);
+        if !self.map.contains_key(&key) {
+            let outcome = segment_characters_inner(img, k, word_text, false);
+            self.map.insert(key, outcome);
+        }
+        self.map.get(&key).unwrap()
+    }
+
+    /// Diag path: return the segmentation, computing with tracing on a
+    /// miss, or upgrading a scoring-populated entry (traced None,
+    /// full_path true) by recomputing with tracing. Early-return entries
+    /// (full_path false) are returned as-is — they have no candidates to
+    /// trace and write no diag files. The chosen data is never recomputed
+    /// on upgrade: tracing does not affect the greedy choices, so the
+    /// stored bounds/seams/summary are already the traced run's.
+    pub fn get_or_compute_traced(
+        &mut self,
+        img: &GrayImage,
+        k: usize,
+        word_text: &str,
+    ) -> &CachedSegmentation {
+        let key = Self::key(img, k, word_text);
+        let needs_trace = match self.map.get(&key) {
+            None => true,
+            Some(e) => e.full_path && e.traced.is_none(),
+        };
+        if needs_trace {
+            let outcome = segment_characters_inner(img, k, word_text, true);
+            match self.map.get_mut(&key) {
+                Some(e) => {
+                    e.traced = outcome.traced;
+                }
+                None => {
+                    self.map.insert(key, outcome);
+                }
+            }
+        }
+        self.map.get(&key).unwrap()
+    }
+}
+
+/// Content hash of a word image (pixels only; dimensions ride in the key).
+fn hash_gray_image(img: &GrayImage) -> u64 {
+    use std::hash::Hasher;
+    let mut hasher = rustc_hash::FxHasher::default();
+    hasher.write(img.as_raw());
+    hasher.finish()
+}
+
+/// Merge the chosen seam maps with the traced candidates (chosen wins on
+/// conflict, UNPRINT_EXTRA_SEAMS limit applied) — the maps the viz reads.
+fn merged_seam_maps(entry: &CachedSegmentation) -> (HashMap<u32, Vec<[u32; 2]>>, HashMap<u32, SeamCost>) {
+    let mut paths = entry.seams.clone();
+    let mut costs = entry.summary.seam_costs.clone();
+    if let Some(traced) = &entry.traced {
+        let extra_limit: Option<usize> = match std::env::var("UNPRINT_EXTRA_SEAMS").ok().as_deref() {
+            Some("all") | Some("ALL") => None,
+            Some(n) => n.parse().ok(),
+            None => Some(10),
+        };
+        let mut added = 0usize;
+        for (col, sc, path) in traced {
+            if let Some(limit) = extra_limit {
+                if added >= limit { break; }
+            }
+            if paths.contains_key(col) { continue; }
+            paths.insert(*col, path.clone());
+            costs.insert(*col, sc.clone());
+            added += 1;
+        }
+    }
+    (paths, costs)
+}
+
+/// Write the per-word diag files (word_crop.png, seam_overlay.png,
+/// final_overlay.png, summary.json) from a traced segmentation. The
+/// summary carries the merged (chosen + traced) seam maps — the viz reads
+/// seam_paths/seam_costs from here for columns that are not in the
+/// audit's (scoring) seam_paths. Called by `segment_characters_diag`
+/// and by `segment_diag_cached`; the computation itself never writes
+/// files, so a cached entry can serve the viz without recomputing.
+fn write_seg_diag(
+    img: &GrayImage,
+    word_text: &str,
+    entry: &CachedSegmentation,
+    ddir: &std::path::Path,
+) {
+    let _ = std::fs::create_dir_all(ddir);
+    let _ = img.save(ddir.join("word_crop.png"));
+    let (merged_paths, merged_costs) = merged_seam_maps(entry);
+    let summary = &entry.summary;
+    crate::seg_diag::save_split_overlay_with_paths(img, &summary.ws_splits, &summary.seam_splits, &[], &merged_paths, &ddir.join("seam_overlay.png"));
+    crate::seg_diag::save_split_overlay_with_paths(img, &summary.ws_splits, &summary.seam_splits, &[], &merged_paths, &ddir.join("final_overlay.png"));
+
+    // Seam summary for the viz: the recorded seam paths and costs,
+    // including tied-run candidates the DP rated equally good but did
+    // not choose (e.g. col 25 tied with chosen col 24). Written from
+    // the segmenter's own traced paths and costs — no reconstruction.
+    // The viz reads seam_paths/seam_costs from here for columns that
+    // are not in the audit's (identify_fonts) seam_paths.
+    let n_segs_sum = entry.bounds.len().saturating_sub(1);
+    let json = serde_json::json!({
+        "word_text": word_text,
+        "image_w": summary.image_w,
+        "image_h": summary.image_h,
+        "n_chars_expected": summary.n_chars_expected,
+        "n_segments_produced": n_segs_sum,
+        "ws_splits": &summary.ws_splits,
+        "seam_splits": &summary.seam_splits,
+        "final_boundaries": &entry.bounds,
+        "seam_paths": &merged_paths,
+        "seam_costs": &merged_costs,
+        "mismatch": n_segs_sum != summary.n_chars_expected as usize,
+    });
+    let _ = std::fs::write(ddir.join("summary.json"), serde_json::to_string_pretty(&json).unwrap_or_default());
 }
 
 fn segment_characters_inner(
     img: &GrayImage,
     n_chars: usize,
-    diag_dir: Option<&std::path::Path>,
     word_text: &str,
-) -> (Vec<u32>, HashMap<u32, Vec<[u32; 2]>>, SegSummary) {
+    trace: bool,
+) -> CachedSegmentation {
     let (w, h) = img.dimensions();
     if n_chars <= 1 {
-        return (vec![0, w], HashMap::new(), SegSummary {
-            image_w: w, image_h: h, n_chars_expected: n_chars as u32,
-            n_segments_produced: 1, mismatch: n_chars != 1,
-            ws_splits: Vec::new(), seam_splits: Vec::new(),
-            seam_costs: HashMap::new(),
-        });
+        return CachedSegmentation {
+            bounds: vec![0, w],
+            seams: HashMap::new(),
+            summary: SegSummary {
+                image_w: w, image_h: h, n_chars_expected: n_chars as u32,
+                n_segments_produced: 1, mismatch: n_chars != 1,
+                ws_splits: Vec::new(), seam_splits: Vec::new(),
+                seam_costs: HashMap::new(),
+            },
+            traced: None,
+            full_path: false,
+        };
     }
     if w < 2 || h < 2 {
         let bounds = uniform_boundaries(w, n_chars);
         let n_segs = bounds.len().saturating_sub(1) as u32;
-        return (bounds, HashMap::new(), SegSummary {
-            image_w: w, image_h: h, n_chars_expected: n_chars as u32,
-            n_segments_produced: n_segs, mismatch: n_segs != n_chars as u32,
-            ws_splits: Vec::new(), seam_splits: Vec::new(),
-            seam_costs: HashMap::new(),
-        });
+        return CachedSegmentation {
+            bounds,
+            seams: HashMap::new(),
+            summary: SegSummary {
+                image_w: w, image_h: h, n_chars_expected: n_chars as u32,
+                n_segments_produced: n_segs, mismatch: n_segs != n_chars as u32,
+                ws_splits: Vec::new(), seam_splits: Vec::new(),
+                seam_costs: HashMap::new(),
+            },
+            traced: None,
+            full_path: false,
+        };
     }
 
     let need = n_chars - 1; // number of splits needed
@@ -281,13 +510,6 @@ fn segment_characters_inner(
 
     let vp_splits = splits.clone();
 
-    // Diag: dump VP passes
-    if let Some(ddir) = diag_dir {
-        let _ = std::fs::create_dir_all(ddir);
-        let _ = img.save(ddir.join("word_crop.png"));
-
-    }
-
     // Segment-size penalty: discourages splits that create a segment
     // narrower than the expected character width.
     // (10 * avg_char_width / min_child_width)^2, applied additively to seam cost.
@@ -318,12 +540,16 @@ fn segment_characters_inner(
     // so we have them before DPs are consumed. Keyed by (col, cost_bits) to
     // avoid overwriting when same col appears in different segments.
     let mut candidate_paths: Vec<(u32, SeamCost, Vec<[u32; 2]>)> = Vec::new();  // (col, SeamCost, path)
+    // Traced candidates for the viz, sorted cheapest first. Collected only
+    // when tracing (diag pass); scoring leaves this None. Stored on the
+    // outcome so the diag writer can merge them without recomputing.
+    let mut traced: Option<Vec<(u32, SeamCost, Vec<[u32; 2]>)>> = None;
     // Seam instrumentation: capture seed candidates and greedy-loop events
     // for the audit summary JSON.
     if splits.len() < need {
         use std::cmp::Ordering;
         use std::collections::BinaryHeap;
-        let audit_mode = diag_dir.is_some();
+        let audit_mode = trace;
 
         // Ink-based energy for seam carving.  Each pixel's base cost is
         // its darkness (0 for white, 255 for black).  The DP adds an
@@ -788,25 +1014,14 @@ fn segment_characters_inner(
             }
         }
 
-        // After greedy loop: merge unused candidate paths into seam_paths
-        // for diagnostics. Only needed when auditing (win 2). Skip when audit_mode false.
+        // Traced candidates for the viz, sorted cheapest first. They are
+        // NOT merged into seam_paths/seam_costs here: scoring records
+        // chosen-only costs, and the diag writer merges them (with the
+        // UNPRINT_EXTRA_SEAMS limit) when writing summary.json.
+        // Only collected when tracing (diag pass).
         if audit_mode {
-            let extra_limit: Option<usize> = match std::env::var("UNPRINT_EXTRA_SEAMS").ok().as_deref() {
-                Some("all") | Some("ALL") => None,
-                Some(n) => n.parse().ok(),
-                None => Some(10),
-            };
             candidate_paths.sort_by(|a, b| a.1.total.partial_cmp(&b.1.total).unwrap_or(std::cmp::Ordering::Equal));
-            let mut added = 0usize;
-            for (col, sc, path) in candidate_paths {
-                if let Some(limit) = extra_limit {
-                    if added >= limit { break; }
-                }
-                if seam_paths.contains_key(&col) { continue; }
-                seam_paths.insert(col, path);
-                seam_costs.insert(col, sc);
-                added += 1;
-            }
+            traced = Some(candidate_paths);
         }
 
         // Return TLS arenas (keep capacity for next word)
@@ -820,11 +1035,6 @@ fn segment_characters_inner(
     if w == 492 && n_chars == 10 {
     }
 
-    // Diag: dump seam pass
-    if let Some(ddir) = diag_dir {
-        crate::seg_diag::save_split_overlay_with_paths(img, &vp_splits, &seam_splits, &[], &seam_paths, &ddir.join("seam_overlay.png"));
-    }
-
     // Build final boundaries: [0, split1, split2, ..., w]
     let mut bounds = Vec::with_capacity(n_chars + 1);
     bounds.push(0);
@@ -836,36 +1046,6 @@ fn segment_characters_inner(
     bounds.push(w);
     bounds.dedup();
 
-    // Diag: dump final overlay + seam summary JSON (the viz reads this).
-    if let Some(ddir) = diag_dir {
-        crate::seg_diag::save_split_overlay_with_paths(img, &vp_splits, &seam_splits, &[], &seam_paths, &ddir.join("final_overlay.png"));
-
-        // NOTE: char crops are saved by extract_chars_from_boundaries
-        // (the actual CI code path), not here — so diag shows exact CI inputs.
-
-        // Seam summary for the viz: the recorded seam paths and costs,
-        // including tied-run candidates the DP rated equally good but did
-        // not choose (e.g. col 25 tied with chosen col 24). Written from
-        // the segmenter's own traced paths and costs — no reconstruction.
-        // The viz reads seam_paths/seam_costs from here for columns that
-        // are not in the audit's (identify_fonts) seam_paths.
-        let n_segs_sum = bounds.len().saturating_sub(1);
-        let summary = serde_json::json!({
-            "word_text": word_text,
-            "image_w": w,
-            "image_h": h,
-            "n_chars_expected": n_chars,
-            "n_segments_produced": n_segs_sum,
-            "ws_splits": &vp_splits,
-            "seam_splits": &seam_splits,
-            "final_boundaries": &bounds,
-            "seam_paths": &seam_paths,
-            "seam_costs": &seam_costs,
-            "mismatch": n_segs_sum != n_chars,
-        });
-        let _ = std::fs::write(ddir.join("summary.json"), serde_json::to_string_pretty(&summary).unwrap_or_default());
-    }
-
     let n_segs = bounds.len().saturating_sub(1) as u32;
     let seg_summary = SegSummary {
         image_w: w,
@@ -875,10 +1055,20 @@ fn segment_characters_inner(
         mismatch: n_segs != n_chars as u32,
         ws_splits: vp_splits.clone(),
         seam_splits: seam_splits.clone(),
-        seam_costs: seam_costs,
+        seam_costs,
     };
 
-    (bounds, seam_paths, seg_summary)
+    // The computation never writes files: the diag writer
+    // (`write_seg_diag`) merges the traced candidates and writes the
+    // overlays + summary.json from the returned outcome, so a cached
+    // entry can serve the viz without recomputing.
+    CachedSegmentation {
+        bounds,
+        seams: seam_paths,
+        summary: seg_summary,
+        traced,
+        full_path: true,
+    }
 }
 
 /// Exhaustive (col, cost) candidates via dual-DP: for every interior column
@@ -2006,6 +2196,7 @@ pub fn segment_line(
     word_height: u32,
     diag_seg_dir: Option<&std::path::Path>,
     render_params: &crate::char_render::RenderParams,
+    seg_cache: &mut SegmentCache,
 ) -> LineCrops {
     let _ = render_params; // reserved for scan-side binarize
     if words.is_empty() || word_height == 0 {
@@ -2092,11 +2283,16 @@ pub fn segment_line(
         });
 
         // ── Path A: plain segmentation (OCR chars as-is) ────────────
+        // Through the per-line cache: the same (image, k) is segmented
+        // again by identify_fonts and the winner rebuild, so compute it
+        // once. With a diag dir the cached entry also serves the viz
+        // (traced candidates + summary.json) without recomputing.
         let (bounds_plain, seams_plain, seg_summary_plain) = if let Some(ref wdir) = word_diag_dir {
             let pdir = wdir.join("seg_plain");
-            segment_characters_diag(&word_img, all_chars.len(), &pdir, &word.text)
+            segment_diag_cached(seg_cache, &word_img, all_chars.len(), &pdir, &word.text)
         } else {
-            segment_characters(&word_img, all_chars.len(), &word.text)
+            let e = seg_cache.get_or_compute(&word_img, all_chars.len(), &word.text);
+            (e.bounds.clone(), e.seams.clone(), e.summary.clone())
         };
 
         // Destructure summary to allow moves instead of clones
@@ -2150,9 +2346,10 @@ pub fn segment_line(
             // ── Path B: ligature segmentation (reduced n_chars) ─────
             let (bounds_lig, seams_lig, seg_summary_lig) = if let Some(ref wdir) = word_diag_dir {
                 let ldir = wdir.join("seg_lig");
-                segment_characters_diag(&word_img_arc, lig_chars.len(), &ldir, &word.text)
+                segment_diag_cached(seg_cache, &word_img_arc, lig_chars.len(), &ldir, &word.text)
             } else {
-                segment_characters(&word_img_arc, lig_chars.len(), &word.text)
+                let e = seg_cache.get_or_compute(&word_img_arc, lig_chars.len(), &word.text);
+                (e.bounds.clone(), e.seams.clone(), e.summary.clone())
             };
 
             lig_word_segs.push(WordSeg {
