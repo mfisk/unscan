@@ -227,6 +227,13 @@ pub fn identify_fonts(
     let mut classify_caches: Vec<HashMap<Vec<char>, std::sync::Arc<Vec<Option<HoistedClassify>>>>> =
         (0..word_infos.len()).map(|_| HashMap::new()).collect();
 
+    // Hoisted median crop area per ligature-collapse mask (F5). The scored
+    // crops' area multiset is a pure function of the line's words and the
+    // font's lig mask, so the median is shared by every font with the same
+    // mask. Deliberately NOT reset on the pass-1 fallback: the inputs
+    // (word_infos, lig mask) are identical in both passes.
+    let mut median_area_cache: HashMap<u8, f32> = HashMap::new();
+
     let mut ensure_set: FxHashSet<&str> = FxHashSet::default();
     for &fk in ensure_font_keys { ensure_set.insert(fk); }
     let allow_opt = crate::cache::font_allowlist();
@@ -690,9 +697,17 @@ pub fn identify_fonts(
         // Median ink-bbox pixel area across this line's scored crops; small
         // punctuation upscaled to the canonical cell gets downweighted by
         // area/median so its (noisy) glyph evidence counts less.
-        let mut areas: Vec<f32> = scoring_temps.iter().map(|t| t.area_px).collect();
-        areas.sort_by(|a,b| a.partial_cmp(b).unwrap());
-        let median_area = if areas.is_empty() { 1.0 } else { areas[areas.len()/2].max(1.0) };
+        // Hoisted (F5): the area multiset depends only on the line's words
+        // and the font's ligature-collapse mask — the crops depend only on
+        // the per-word segment count k, and the collapsed sequences depend
+        // only on `allowed` — so fonts sharing a mask share the median.
+        // (Not once per line: lig vs nolig fonts collapse differently, so
+        // their temp multisets — and medians — genuinely differ.)
+        let median_area = *median_area_cache.entry(allowed).or_insert_with(|| {
+            let mut areas: Vec<f32> = scoring_temps.iter().map(|t| t.area_px).collect();
+            areas.sort_by(|a, b| a.partial_cmp(b).unwrap());
+            if areas.is_empty() { 1.0 } else { areas[areas.len() / 2].max(1.0) }
+        });
         for t in scoring_temps.iter_mut() {
             t.weight = t.area_px / median_area;
         }
