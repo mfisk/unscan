@@ -972,7 +972,6 @@ pub struct GeometryCache {
     #[allow(dead_code)]
     mmap: memmap2::Mmap,
     fonts: HashMap<String, FontMmapIndex>,
-    _cache_path: PathBuf,
     /// Glyph override maps for OT variants (smcp, onum, ss01, ss02).
     /// Maps font_key -> (char -> overridden glyph ID).
     /// Populated in-memory from FontRegistry; not serialized in mmap.
@@ -2146,32 +2145,6 @@ impl GeometryCache {
         v1[2] + v2[2]
     }
 
-    /// GPOS pair kern for rendering (Finding 5): `gid1`'s XAdvance
-    /// adjustment plus `gid2`'s XPlacement adjustment, in font units — the
-    /// scalar added to `gid1`'s advance when followed by `gid2`. This is the
-    /// same quantity the geometry predictor folds into the inter-glyph pitch
-    /// (`v1[2]` via the first glyph's advance adjustment, `v2[0]` via the
-    /// second glyph's placement). It differs from `kern_for_gids` (which
-    /// sums both glyphs' XAdvance adjustments for the predictor's
-    /// per-glyph advance accumulation) because a renderer spaces origins,
-    /// not advances. Returns 0 when the font is not in the cache, when the
-    /// pair has no kern, or when the font key is a nokern variant — the
-    /// geometry predictor skips pair kern for nokern keys (below), and the
-    /// render kern must agree with it, so a nokern variant's renders use
-    /// zero kern.
-    pub fn pair_kern_fu(&self, font_key: &str, gid1: u16, gid2: u16) -> i32 {
-        if font_key.contains("nokern") {
-            return 0;
-        }
-        match self.fonts.get(font_key) {
-            Some(f) => {
-                let (v1, v2) = self.pair_adjustment_full(f, gid1, gid2);
-                v1[2] + v2[0]
-            }
-            None => 0,
-        }
-    }
-
     /// A `KernProvider` bound to one font in this cache, for rendering
     /// (Finding 5). Resolves the font index once; per-pair lookups then
     /// need no map lookup. When the font key is not in the cache the
@@ -3254,7 +3227,7 @@ impl GeometryCache {
 
         let elapsed = t_build_start.elapsed().as_secs_f64();
         if !quiet { eprintln!("[geo-cache] Built Font geometry cache in {:.1}s ({} total, {} reused, {} built, GPOS full incl singles, Unicode both formats)", elapsed, n_total, n_reused, n_built); }
-        let tmp_cache = Self { mmap: memmap2::MmapOptions::new().len(0).map_anon().unwrap().make_read_only().unwrap(), fonts: HashMap::new(), _cache_path: cache_path.clone(), glyph_overrides: HashMap::new() };
+        let tmp_cache = Self { mmap: memmap2::MmapOptions::new().len(0).map_anon().unwrap().make_read_only().unwrap(), fonts: HashMap::new(), glyph_overrides: HashMap::new() };
         if let Err(e) = tmp_cache.write_bin_from_owned(&cache_path, catalog_hash, &owned_fonts) {
             eprintln!("warning: failed to write geo cache to {}: {e}", cache_path.display());
         } else {
@@ -3269,7 +3242,7 @@ impl GeometryCache {
             Err(e) => {
                 eprintln!("failed to reload just-written cache: {e}, returning empty");
                 let empty_mmap = memmap2::MmapOptions::new().len(0).map_anon().unwrap().make_read_only().unwrap();
-                Self { mmap: empty_mmap, fonts: HashMap::new(), _cache_path: cache_path, glyph_overrides: HashMap::new() }
+                Self { mmap: empty_mmap, fonts: HashMap::new(), glyph_overrides: HashMap::new() }
             }
         }
     }
@@ -4579,7 +4552,7 @@ impl GeometryCache {
             fonts.insert(font_key, idx.clone());
             ordered.push(idx);
         }
-        Ok((Self { mmap, fonts, _cache_path: path.to_path_buf(), glyph_overrides: HashMap::new() }, catalog_hash))
+        Ok((Self { mmap, fonts, glyph_overrides: HashMap::new() }, catalog_hash))
     }
 
     // compatibility for tests - returns old kern-only view

@@ -11,103 +11,6 @@ pub type Rgb = (u8, u8, u8);
 
 /// Detect the foreground text colour in a bounding box.
 ///
-/// Fast path: crop to the region first so we only convert the small
-/// ROI to luma/rgba instead of the whole page, and iterate over raw
-/// buffers instead of `get_pixel`.
-#[allow(dead_code)]
-pub fn detect_text_color(page_img: &DynamicImage, region: &TextRegion) -> Rgb {
-    let (iw, ih) = (page_img.width(), page_img.height());
-
-    let x0 = region.x.min(iw.saturating_sub(1));
-    let y0 = region.y.min(ih.saturating_sub(1));
-    let x1 = (region.x + region.width).min(iw);
-    let y1 = (region.y + region.height).min(ih);
-
-    if x1 <= x0 || y1 <= y0 {
-        return (0, 0, 0);
-    }
-    let w = x1 - x0;
-    let h = y1 - y0;
-
-    // Crop first — converting only the ROI is ~100-300x cheaper than
-    // converting the whole page (6 Mpx -> ~25 kpx for a line).
-    // Fast variant: avoid CicpRgb generic cast 8.7% leaf by using as_raw + manual luma.
-    let sub = page_img.crop_imm(x0, y0, w, h);
-    // Try to reuse underlying buffer type to avoid generic cast.
-    let (gray, rgba) = match &sub {
-        DynamicImage::ImageLuma8(l) => {
-            let (sw, sh) = l.dimensions();
-            // luma -> rgba expansion manual
-            let mut rbuf = Vec::with_capacity((sw * sh * 4) as usize);
-            for &v in l.as_raw() { rbuf.extend_from_slice(&[v, v, v, 255]); }
-            (l.clone(), image::RgbaImage::from_raw(sw, sh, rbuf).expect("rgba"))
-        }
-        DynamicImage::ImageRgba8(r) => {
-            // rgba -> luma fast Rec709 to match image 0.25
-            let (sw, sh) = r.dimensions();
-            let mut gbuf = Vec::with_capacity((sw * sh) as usize);
-            for chunk in r.as_raw().chunks_exact(4) {
-                gbuf.push(((chunk[0] as u32 * 2126 + chunk[1] as u32 * 7152 + chunk[2] as u32 * 722) / 10000) as u8);
-            }
-            (image::GrayImage::from_raw(sw, sh, gbuf).expect("gray"), r.clone())
-        }
-        _ => {
-            // fallback – small ROI so generic cost negligible
-            (sub.to_luma8(), sub.to_rgba8())
-        }
-    };
-
-    let gray_raw = gray.as_raw();
-    if gray_raw.is_empty() {
-        return (0, 0, 0);
-    }
-
-    // Build histogram directly — no Vec<u8> allocation for vals.
-    let mut hist = [0u32; 256];
-    for &v in gray_raw {
-        hist[v as usize] += 1;
-    }
-
-    // Otsu from histogram (same math as before).
-    let threshold = otsu_from_hist(&hist, gray_raw.len());
-
-    // Dark count from histogram instead of re-scanning vals.
-    let mut dark_count: u32 = 0;
-    for i in 0..=threshold as usize {
-        dark_count += hist[i];
-    }
-    let text_is_dark = (dark_count as usize) <= gray_raw.len() / 2;
-
-    // Average colour of text pixels using raw buffers (no bounds checks).
-    let rgba_raw = rgba.as_raw(); // w*h*4
-    let (mut rs, mut gs, mut bs, mut cnt) = (0u64, 0u64, 0u64, 0u64);
-    if text_is_dark {
-        for i in 0..gray_raw.len() {
-            if gray_raw[i] <= threshold {
-                let j = i * 4;
-                rs += rgba_raw[j] as u64;
-                gs += rgba_raw[j + 1] as u64;
-                bs += rgba_raw[j + 2] as u64;
-                cnt += 1;
-            }
-        }
-    } else {
-        for i in 0..gray_raw.len() {
-            if gray_raw[i] > threshold {
-                let j = i * 4;
-                rs += rgba_raw[j] as u64;
-                gs += rgba_raw[j + 1] as u64;
-                bs += rgba_raw[j + 2] as u64;
-                cnt += 1;
-            }
-        }
-    }
-    if cnt == 0 {
-        return (0, 0, 0);
-    }
-    ((rs / cnt) as u8, (gs / cnt) as u8, (bs / cnt) as u8)
-}
-
 /// Zero-alloc version for callers that already have the full-page
 /// Gray + RGBA buffers (hoisted conversion). No cropping allocation,
 /// just raw indexing into the full-page buffers.
@@ -192,16 +95,6 @@ pub fn detect_text_color_from_buffers(
         return (0, 0, 0);
     }
     ((rs / cnt) as u8, (gs / cnt) as u8, (bs / cnt) as u8)
-}
-
-/// Otsu's method: find threshold that maximises between-class variance.
-#[allow(dead_code)]
-pub fn otsu_threshold(vals: &[u8]) -> u8 {
-    let mut hist = [0u32; 256];
-    for &v in vals {
-        hist[v as usize] += 1;
-    }
-    otsu_from_hist(&hist, vals.len())
 }
 
 pub(crate) fn otsu_from_hist(hist: &[u32; 256], total_len: usize) -> u8 {
