@@ -10,7 +10,7 @@ pub use params::{quant_half_width_center_px, quant_half_width_pitch_px, quant_ha
 pub use text::{TextRegion, TextLine, RawWordBBox};
 pub use bbox::{Bbox, GlyphBBox, CharInkBounds, WordGeoMeasurement, center_span_scale, batch_center_span_scales, glyph_bboxes_batch_pure};
 pub use char_bounds::{measure_char_ink_bounds, measure_words_ink_bounds_batch, batch_per_char_errors, PerCharError, SeamPaths};
-pub use detect::{GeometryResult, DetectedLine, DetectedFill, detect_geometry, erase_bboxes, otsu_threshold, Rgb};
+pub use detect::{GeometryResult, DetectedLine, DetectedFill, Rgb};
 pub use word::{expand_words_to_ink, fix_overlapping_words_by_ink, trim_words_to_ink, ink_horizontal_extent, ink_vertical_extent, refine_words_batch};
 
 /// Batch API for per-char errors across many words.
