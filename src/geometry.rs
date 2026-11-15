@@ -12,27 +12,6 @@ pub use unprint_geometry::{DetectedLine, DetectedFill, GeometryResult};
 // Public API
 // ---------------------------------------------------------------------------
 
-/// Detect vectorisable geometry on `img`, ignoring pixels that fall inside
-/// any of the supplied `text_bboxes` (x, y, w, h).
-#[allow(dead_code)]
-pub fn detect_geometry(
-    img: &DynamicImage,
-    text_bboxes: &[(u32, u32, u32, u32)],
-    min_line_length_px: u32,
-) -> GeometryResult {
-    // Same fast path as page_cache::fast_rgba8_from_dynamic (F31).
-    let rgba = crate::page_cache::fast_rgba8_from_dynamic(img);
-    let gray = {
-        let (w, h) = rgba.dimensions();
-        let mut out = Vec::with_capacity((w*h) as usize);
-        for c in rgba.as_raw().chunks_exact(4) {
-            out.push(((c[0] as u32*2126 + c[1] as u32*7152 + c[2] as u32*722) / 10000) as u8);
-        }
-        image::GrayImage::from_raw(w, h, out).expect("gray")
-    };
-    detect_geometry_from_buffers(&gray, &rgba, text_bboxes, min_line_length_px)
-}
-
 pub fn detect_geometry_from_buffers(
     gray: &GrayImage,
     rgba: &RgbaImage,
