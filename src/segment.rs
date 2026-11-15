@@ -295,6 +295,8 @@ fn hash_gray_image(img: &GrayImage) -> u64 {
 /// conflict, UNPRINT_EXTRA_SEAMS limit applied) — the maps the viz reads.
 fn merged_seam_maps(entry: &CachedSegmentation) -> (HashMap<u32, Vec<[u32; 2]>>, HashMap<u32, SeamCost>) {
     let mut paths = entry.seams.clone();
+    // Owned copy: the traced candidates below are merged into it, so the
+    // shared Arc map cannot be reused directly.
     let mut costs = (*entry.summary.seam_costs).clone();
     if let Some(traced) = &entry.traced {
         let extra_limit: Option<usize> = match std::env::var("UNPRINT_EXTRA_SEAMS").ok().as_deref() {
