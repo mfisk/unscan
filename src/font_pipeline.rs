@@ -591,11 +591,10 @@ pub fn match_lines(
         // word_infos reuses them instead of re-cropping + re-normalizing
         // the same bbox. The diag pass crops the identical bbox with the
         // identical pure function, so a reused crop is bit-identical to
-        // a fresh one. Words the diag filter skipped (its iteration
-        // order differs from word_infos') fall back to a fresh crop
-        // below; non-audit runs have no diag pass at all. Consuming the
-        // LineCrops drops the diag WordSeg shells (their seam data lives
-        // in the seg cache); only the image Arcs are kept.
+        // a fresh one. Words the diag pass did not cover fall back to a
+        // fresh crop below; non-audit runs have no diag pass at all.
+        // Consuming the LineCrops drops the diag WordSeg shells (their
+        // seam data lives in the seg cache); only the image Arcs are kept.
         let diag_crop_by_word: std::collections::HashMap<usize, std::sync::Arc<image::GrayImage>> =
             match diag_crops {
                 Some(crops) => crops
@@ -608,15 +607,15 @@ pub fn match_lines(
         // Per-font pipeline: segmentation now happens inside identify_fonts.
         // ── Per-font ligature handling: build word image infos for inside identify_fonts ──
         use std::sync::Arc;
-        // Build filtered word infos (replicates segment_line filtering but without segmentation)
+        // Build word infos for every word on the line. No word is dropped:
+        // the old character-coverage filter (drop a word whose chars had
+        // all been seen twice) predates geometry scoring, where letter
+        // pairs matter, so every word's observations are scored.
         let word_infos: Vec<font_match::WordImgInfo> = {
             let pw = gray_page.width();
             let ph = gray_page.height();
-            let audit_all = crate::features::audit_all_chars_enabled();
-            let mut char_counts: std::collections::HashMap<char, usize> = std::collections::HashMap::new();
             let mut sorted: Vec<(usize, &crate::ocr::TextRegion)> = line.words.iter().enumerate().collect();
             // Sort left-to-right by x-position for correct character ordering.
-            // (Was: sort by char count descending, which reversed word order and broke geometry.)
             sorted.sort_by(|a,b| a.1.x.cmp(&b.1.x));
             let mut infos = Vec::new();
             for (orig_idx, w) in sorted {
@@ -626,11 +625,6 @@ pub fn match_lines(
                 let cw = ww.min(pw - wx);
                 let ch = wh.min(ph - wy);
                 if cw < 2 || ch < 2 { continue; }
-                let chars_supported: Vec<char> = if audit_all { w.text.chars().collect() } else { w.text.chars().filter(|c| crate::features::is_supported(*c)).collect() };
-                if !audit_all && chars_supported.len() <= 1 { continue; }
-                let need_any = if audit_all { true } else { chars_supported.iter().any(|c| char_counts.get(c).copied().unwrap_or(0) < 2) };
-                if !audit_all && chars_supported.len() > 2 && !need_any { continue; }
-                for &c in &chars_supported { if audit_all || crate::features::is_supported(c) { *char_counts.entry(c).or_insert(0) += 1; } }
                 // (F10) Reuse the diag pass's crop for this word when it
                 // has one; otherwise crop + normalize fresh (same bbox,
                 // same pure function, so the result is identical either
