@@ -324,7 +324,10 @@ pub fn match_lines(
     ground_truth: Option<&ground_truth::GroundTruth>,
     dominant_font_candidate: Option<&font_match::FontMatchResult>,
     args: &cli::Args,
-    // When set, only these line indices get diag/audit output on disk.
+    // When set, only these line indices are scored; every other line
+    // returns an unscored placeholder (its Pass 1 result stands — the
+    // Pass 1b caller swaps in only the filtered lines' results and drops
+    // the rest). The filter also gates diag/audit output on disk.
     audit_line_filter: Option<&std::collections::HashSet<usize>>,
     // Per-font LDA OCR correction data (None = skip correction)
     training_data: Option<&crate::train::RuntimeTrainingData>,
@@ -386,6 +389,37 @@ pub fn match_lines(
     // Profiling accumulators (microseconds, atomic for par_iter)
     let line_matches: Vec<LineMatch> = lines.par_iter().enumerate().map(|(li, line)| {
         let line_num = li + 1; // 1-indexed for output
+        // Pass 1b filter: this line was not split, so its Pass 1 result
+        // stands. Return an unscored placeholder without doing any work —
+        // the caller swaps in only the filtered lines' results and drops
+        // the rest, so this value is never read. It exists only to keep
+        // indices aligned with the input slice (diag-dir naming and the
+        // caller's swap both index by the original line number).
+        if let Some(f) = audit_line_filter {
+            if !f.contains(&li) {
+                return LineMatch {
+                    font_result: None,
+                    text_color: (0, 0, 0),
+                    font_scores: Vec::new(),
+                    observations: Vec::new(),
+                    gt_observations: Vec::new(),
+                    seg_used_ligatures: false,
+                    diag_seg_dir: None,
+                    obs_rank_probs: ObsRankProbs::default(),
+                    gt_obs_rank_probs: ObsRankProbs::default(),
+                    tie_candidates: Vec::new(),
+                    corrected_words: None,
+                    fast_path: false,
+                    fast_path_score: None,
+                    midpoint_em_px: None,
+                    gt_midpoint_em_px: None,
+                    word_seg_summaries: Vec::new(),
+                    gt_word_seg_summaries: Vec::new(),
+                    gt_per_char_geo_ll: Vec::new(),
+                    ocr_corrections: Vec::new(),
+                };
+            }
+        }
         // Crop and contrast-normalize the word-union bbox once for all verify calls.
         let norm_crop = {
             let iw = gray_page.width();
