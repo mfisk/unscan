@@ -59,7 +59,10 @@ impl Default for CharInkBounds {
 /// Batch result: one entry per char in a word.
 #[derive(Debug, Clone)]
 pub struct WordGeoMeasurement {
-    pub chars: Vec<CharInkBounds>,
+    // Arc so per-font rebuilds clone the Arc instead of the whole Vec
+    // (redundancy F4): the bounds are a pure function of the cached
+    // crops, identical for every font.
+    pub chars: std::sync::Arc<Vec<CharInkBounds>>,
 }
 
 /// Batch API: compute bounding boxes for many GlyphIds at once.
