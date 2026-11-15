@@ -77,11 +77,7 @@ const BGEO_MAGIC: &[u8; 4] = b"BGEO";
 // MarkMarkPos, ContextPos, ChainedContextPos) plus GDEF glyph classes
 // (Finding 2): the cached predictor now applies cursive, mark, and
 // contextual positioning like HarfBuzz. v24 tables are stale.
-//
-// The version is part of the cache filename (see cache::paths::geo_cache_bin),
-// so different versions coexist on disk instead of clobbering each other:
-// a version bump costs one rebuild, not one per flip.
-pub(crate) const BGEO_VERSION: u32 = 26;
+const BGEO_VERSION: u32 = 26;
 
 // ---------- BE helpers for OT parsing ----------
 #[inline]
