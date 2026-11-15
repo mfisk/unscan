@@ -1,8 +1,7 @@
 //! Font matching pipeline stages extracted from `run()`.
 //!
 //! - [`LineMatch`]: per-line font matching result
-//! - [`match_lines_fast_path`]: Pass 1 — dominant-font fast path only
-//! - [`match_lines`]: full pipeline — segmentation → font search → font match
+//! - [`match_lines`]: Pass 1 — parallel font matching with SSIM fast path
 //! - [`update_dominant_font`]: dominant font candidate update after Pass 1
 //!
 //! Rule-out via infinite penalty: if a font does not contain a character that
@@ -275,6 +274,14 @@ pub struct LineMatch {
 /// Minimum SSIM score for the fast-path dominant-font check.
 const FAST_PATH_MIN_SSIM: f32 = 0.95;
 
+/// Pass 1: parallel font matching with SSIM fast path.
+///
+/// For each line, tries the dominant font candidate via SSIM first; lines that
+/// pass skip segmentation and font matching entirely. Misses fall through to the full
+/// pipeline: segmentation → font search → font selection with tie-break.
+///
+/// Returns `(line_matches, fast_path_hit_count)`.
+
 /// Save observation crops to a subdirectory under diag_dir.
 /// Save observation crop images for the audit report.
 ///
@@ -329,23 +336,42 @@ fn save_obs_crops(
     }
 }
 
-/// Remove stale per-line diag dirs from a previous run in the same audit dir.
-///
-/// Serial, before any parallel work: cleaning inside the par_iter could race
-/// and would silently ignore errors, and could delete a dir that a later pass
-/// just recreated when old and new slugs are identical (line.text unchanged
-/// after word-split). When `filter` is set, only the filtered lines'
-/// prefixes are cleaned; otherwise every line on the page is cleaned.
-pub fn clean_stale_diag_dirs(
-    args: &cli::Args,
+pub fn match_lines(
     lines: &[TextLine],
+    gray_page: &image::GrayImage,
+    rgba_page: &image::RgbaImage,
+    page_img: &image::DynamicImage,
     page_num: usize,
-    filter: Option<&std::collections::HashSet<usize>>,
-) {
+    font_registry: &font_scan::FontRegistry,
+    font_cache: &font_cache::FontCache,
+    geo_cache: &crate::geo_cache::GeometryCache,
+    classifier: &dyn classifier::Classifier,
+    glyph_map: &NgramGlyphMap,
+    ground_truth: Option<&ground_truth::GroundTruth>,
+    dominant_font_candidate: Option<&font_match::FontMatchResult>,
+    args: &cli::Args,
+    // When set, only these line indices are scored; every other line
+    // returns an unscored placeholder (its Pass 1 result stands — the
+    // Pass 1b caller swaps in only the filtered lines' results and drops
+    // the rest). The filter also gates diag/audit output on disk.
+    audit_line_filter: Option<&std::collections::HashSet<usize>>,
+    // Per-font LDA OCR correction data (None = skip correction)
+    training_data: Option<&crate::train::RuntimeTrainingData>,
+) -> (Vec<LineMatch>, u64) {
+    let fast_path_font_data: Option<std::sync::Arc<Vec<u8>>> = dominant_font_candidate
+        .and_then(|fm| font_cache.load(&fm.font_path).ok());
+    let fast_path_hits = AtomicU64::new(0);
+
+    // ── Serialized diag-dir stale cleanup (before parallel work) ──
+    // Previously this was inside the par_iter with `let _ = remove_dir_all`,
+    // which could race and would silently ignore errors, and also deleted
+    // the dir that Pass1b had just recreated when old and new slugs are
+    // identical (line.text unchanged after word-split). We now clean once,
+    // serially, before any workers start.
     if let Some(diag_root) = args.diag_seg_dir() {
         let mut prefixes: Vec<String> = Vec::new();
         for (li, _line) in lines.iter().enumerate() {
-            if filter.as_ref().map_or(true, |f| f.contains(&li)) {
+            if audit_line_filter.as_ref().map_or(true, |f| f.contains(&li)) {
                 let line_num = li + 1;
                 prefixes.push(format!("p{}_L{:03}_", page_num, line_num));
             }
@@ -385,139 +411,7 @@ pub fn clean_stale_diag_dirs(
             }
         }
     }
-}
 
-/// Pass 1: dominant-font fast path only.
-///
-/// For each line, renders the dominant font candidate and computes ZNCC via
-/// `verify_text_region`. A line whose score clears `FAST_PATH_MIN_SSIM` is
-/// done: its `LineMatch` carries `fast_path: true` and `fast_path_score`,
-/// with no segmentation and no observations, and Pass 2a skips re-verification.
-/// Lines that miss return `None` — the full pipeline scores them.
-///
-/// Pass 1 performs no segmentation and no font matching.
-///
-/// Returns `(per_line_results, fast_path_hit_count)`.
-pub fn match_lines_fast_path(
-    lines: &[TextLine],
-    gray_page: &image::GrayImage,
-    rgba_page: &image::RgbaImage,
-    font_registry: &font_scan::FontRegistry,
-    font_cache: &font_cache::FontCache,
-    dominant_font_candidate: Option<&font_match::FontMatchResult>,
-) -> (Vec<Option<LineMatch>>, u64) {
-    let fast_path_font_data: Option<std::sync::Arc<Vec<u8>>> = dominant_font_candidate
-        .and_then(|fm| font_cache.load(&fm.font_path).ok());
-    let fast_path_hits = AtomicU64::new(0);
-
-    let results: Vec<Option<LineMatch>> = lines.par_iter().map(|line| {
-        // Without a dominant font there is nothing to verify against.
-        let (fm, fd) = match (dominant_font_candidate, &fast_path_font_data) {
-            (Some(fm), Some(fd)) => (fm, fd),
-            _ => return None,
-        };
-        // Crop and contrast-normalize the word-union bbox for the verify call.
-        let norm_crop = {
-            let iw = gray_page.width();
-            let ih = gray_page.height();
-            let cx = line.x.min(iw.saturating_sub(1));
-            let cy = line.y.min(ih.saturating_sub(1));
-            let cw = line.width.min(iw - cx);
-            let ch = line.height.min(ih - cy);
-            let raw = image::imageops::crop_imm(gray_page, cx, cy, cw, ch).to_image();
-            features::contrast_normalize_char(raw)
-        };
-        // The dominant font arrives as a FontMatchResult (no
-        // FontEntry); resolve its lig set through the registry.
-        let fm_lig = font_registry.by_key(&fm.font_key)
-            .map(|fe| fe.collapsed_lig_set()).unwrap_or(0);
-        let vr = verify::verify_text_region(
-            &norm_crop,
-            fd.as_slice(),
-            &fm.font_path,
-            &line.text,
-            &line.words,
-            line.x, line.y,
-            fm.glyph_overrides.as_deref(),
-            &fm.variant_tag,
-            fm.variations.as_deref(),
-            true,
-            fm_lig,
-            None,
-            Some(FAST_PATH_MIN_SSIM),
-            None,
-            None,
-        );
-        if vr.score >= FAST_PATH_MIN_SSIM {
-            fast_path_hits.fetch_add(1, Ordering::Relaxed);
-            let text_color = color::detect_text_color_from_buffers(
-                gray_page,
-                rgba_page,
-                &line_text_region(line),
-            );
-            let mut result = fm.clone();
-            result.best_dy = vr.dy;
-            Some(LineMatch {
-                font_result: Some(result),
-                text_color,
-                font_scores: Vec::new(),
-                observations: Vec::new(),
-                gt_observations: Vec::new(),
-                // Fast path performs no segmentation; re-verification is
-                // skipped for these lines (fast_path_score is Some).
-                seg_used_ligatures: false,
-                diag_seg_dir: None,
-                obs_rank_probs: ObsRankProbs::default(),
-                gt_obs_rank_probs: ObsRankProbs::default(),
-                tie_candidates: Vec::new(),
-                corrected_words: None,
-                fast_path: true,
-                fast_path_score: Some(vr.score),
-                norm_crop: None,
-                midpoint_em_px: None,
-                gt_midpoint_em_px: None,
-                word_seg_summaries: Vec::new(),
-                gt_word_seg_summaries: Vec::new(),
-                gt_per_char_geo_ll: Vec::new(),
-                ocr_corrections: Vec::new(),
-            })
-        } else {
-            None
-        }
-    }).collect();
-
-    let fp_hits = fast_path_hits.load(Ordering::Relaxed);
-    (results, fp_hits)
-}
-
-/// Full pipeline: parallel font matching — segmentation → font search →
-/// font selection with tie-break.
-///
-/// This is the non-fast-path scoring pass. Lines the fast path already
-/// matched are excluded via `audit_line_filter` (the Pass 1 caller passes
-/// the missed-lines set); Pass 1b passes the split-lines set. Filtered-out
-/// lines return unscored placeholders, never read by the caller.
-pub fn match_lines(
-    lines: &[TextLine],
-    gray_page: &image::GrayImage,
-    rgba_page: &image::RgbaImage,
-    page_img: &image::DynamicImage,
-    page_num: usize,
-    font_registry: &font_scan::FontRegistry,
-    font_cache: &font_cache::FontCache,
-    geo_cache: &crate::geo_cache::GeometryCache,
-    classifier: &dyn classifier::Classifier,
-    glyph_map: &NgramGlyphMap,
-    ground_truth: Option<&ground_truth::GroundTruth>,
-    args: &cli::Args,
-    // When set, only these line indices are scored; every other line
-    // returns an unscored placeholder (its Pass 1 result stands — the
-    // Pass 1b caller swaps in only the filtered lines' results and drops
-    // the rest). The filter also gates diag/audit output on disk.
-    audit_line_filter: Option<&std::collections::HashSet<usize>>,
-    // Per-font LDA OCR correction data (None = skip correction)
-    training_data: Option<&crate::train::RuntimeTrainingData>,
-) -> Vec<LineMatch> {
     // Profiling accumulators (microseconds, atomic for par_iter)
     let line_matches: Vec<LineMatch> = lines.par_iter().enumerate().map(|(li, line)| {
         let line_num = li + 1; // 1-indexed for output
@@ -565,6 +459,66 @@ pub fn match_lines(
             features::contrast_normalize_char(raw)
         };
 
+        // ── Fast path: try dominant font via SSIM ────────────────
+        if let (Some(fm), Some(ref fd)) = (dominant_font_candidate, &fast_path_font_data) {
+            // The dominant font arrives as a FontMatchResult (no
+            // FontEntry); resolve its lig set through the registry.
+            let fm_lig = font_registry.by_key(&fm.font_key)
+                .map(|fe| fe.collapsed_lig_set()).unwrap_or(0);
+            let vr = verify::verify_text_region(
+                &norm_crop,
+                fd.as_slice(),
+                &fm.font_path,
+                &line.text,
+                &line.words,
+                line.x, line.y,
+                fm.glyph_overrides.as_deref(),
+                &fm.variant_tag,
+                fm.variations.as_deref(),
+                true,
+                fm_lig,
+                None,
+                Some(FAST_PATH_MIN_SSIM),
+                None,
+                None,
+            );
+            if vr.score >= FAST_PATH_MIN_SSIM {
+                fast_path_hits.fetch_add(1, Ordering::Relaxed);
+                let text_color = color::detect_text_color_from_buffers(
+                    gray_page,
+                    rgba_page,
+                    &line_text_region(line),
+                );
+                let mut result = fm.clone();
+                result.best_dy = vr.dy;
+                return LineMatch {
+                    font_result: Some(result),
+                    text_color,
+                    font_scores: Vec::new(),
+                    observations: Vec::new(),
+                    gt_observations: Vec::new(),
+                    // Fast path performs no segmentation; re-verification is
+                    // skipped for these lines (fast_path_score is Some).
+                    seg_used_ligatures: false,
+                    diag_seg_dir: None,
+                    obs_rank_probs: ObsRankProbs::default(),
+                    gt_obs_rank_probs: ObsRankProbs::default(),
+                    tie_candidates: Vec::new(),
+                    corrected_words: None,
+                    fast_path: true,
+                    fast_path_score: Some(vr.score),
+                    norm_crop: None,
+                    midpoint_em_px: None,
+                    gt_midpoint_em_px: None,
+                    word_seg_summaries: Vec::new(),
+                    gt_word_seg_summaries: Vec::new(),
+                    gt_per_char_geo_ll: Vec::new(),
+                    ocr_corrections: Vec::new(),
+                };
+            } else if li < 3 {
+            }
+        }
+
         // ── Full pipeline: segmentation → font search → font match ─
         let _preview_end = {
             let mut end = line.text.len().min(30);
@@ -610,10 +564,9 @@ pub fn match_lines(
         // crops with the same k; each distinct (image, k, exemption)
         // triple is computed once. Threaded explicitly — never a global
         // — so parallel lines never share state. The GT and tie-break
-        // rebuilds share this cache too (finding F12): they segment
-        // the same word_infos images with the same k and the same
-        // trailing-punctuation exemption state, so a shared entry is
-        // the same computation.
+        // rebuilds deliberately use a fresh throwaway cache (see their
+        // call sites): sharing there is a separate decision pending
+        // Mike's review of the redundancy survey (finding F12).
         let mut seg_cache = crate::segment::SegmentCache::new();
         // Diagnostic-only segmentation: write the seam diagnostics
         // (word_crop.png, seg_plain/summary.json, seg_lig/...) for this
@@ -840,11 +793,13 @@ pub fn match_lines(
                             let _ = std::fs::create_dir_all(&p);
                             p
                         });
-                        // Shared per-line cache (finding F12): the
-                        // tie-break rebuilds segment the same word
-                        // crops with the same k and exemption state
-                        // as scoring, so they reuse its entries.
-                        let (segs, wib, _crops, _pmap) = match build_for_font(fe, &word_infos, false, &mut seg_cache) {
+                        // Deliberately unshared: the tie-break rebuilds
+                        // segment into a fresh throwaway cache. Sharing
+                        // the per-line cache here is a separate decision
+                        // pending Mike's review of the redundancy survey
+                        // (finding F12) — each tied font segments fresh,
+                        // exactly as before this change.
+                        let (segs, wib, _crops, _pmap) = match build_for_font(fe, &word_infos, false, &mut crate::segment::SegmentCache::new()) {
                             Some(v) => v,
                             None => continue,
                         };
@@ -1241,12 +1196,12 @@ pub fn match_lines(
         // ── GT font segmentation / crops – always emit even on misses ──
         // Build GT segs using same per-word word_infos + GT collapsed_lig_set, so k differs correctly
         // for ligature fonts (e.g. Office k=4 vs k=5).  No extra compute beyond build_for_font.
-        // Shared per-line cache (finding F12): the GT rebuild
-        // segments the same word crops as scoring; k differs only
-        // through the ligature mask, and k is part of the cache key.
+        // Deliberately unshared (see the tie-break site above): the GT
+        // rebuild segments into a fresh throwaway cache, exactly as
+        // before this change, pending Mike's decision on finding F12.
         let (gt_segs_opt, gt_wib_opt, gt_crops_opt) = if let Some(ref gfk) = gt_font_key {
             if let Some(gt_fe) = font_registry.by_key(gfk) {
-                if let Some((s, w, c, _pm)) = build_for_font(gt_fe, &word_infos, true, &mut seg_cache) {
+                if let Some((s, w, c, _pm)) = build_for_font(gt_fe, &word_infos, true, &mut crate::segment::SegmentCache::new()) {
                     (Some(s), Some(w), Some(c))
                 } else { (None, None, None) }
             } else { (None, None, None) }
@@ -1364,7 +1319,8 @@ pub fn match_lines(
         LineMatch { font_result, text_color, font_scores, observations, gt_observations, seg_used_ligatures, diag_seg_dir, obs_rank_probs, gt_obs_rank_probs, tie_candidates: tie_candidates_audit, corrected_words, fast_path: false, fast_path_score: None, norm_crop: Some(norm_crop), midpoint_em_px, gt_midpoint_em_px, word_seg_summaries, gt_word_seg_summaries, gt_per_char_geo_ll, ocr_corrections: ocr_correction_audit }
     }).collect();
 
-    line_matches
+    let fp_hits = fast_path_hits.load(Ordering::Relaxed);
+    (line_matches, fp_hits)
 }
 
 /// Update the dominant font candidate from this page's match results.
