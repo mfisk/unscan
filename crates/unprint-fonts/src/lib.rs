@@ -1,6 +1,5 @@
 pub mod kern;
 pub mod types;
-pub mod render;
 pub mod shape;
 pub mod verify;
 
@@ -17,7 +16,6 @@ pub use types::{Bbox, FontKey, GlyphId, RenderParams, ShapedGlyph, ShapedRun, Sh
 
 pub mod prelude {
     pub use crate::types::*;
-    pub use crate::render::render_glyph_at_ink_height;
     pub use crate::shape::{shape_word, FaceHandle};
     pub use crate::verify::{verify_render_batch, VerifyParams};
 }
