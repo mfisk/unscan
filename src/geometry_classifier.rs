@@ -107,7 +107,7 @@ pub fn measure_char_ink_bounds(
     let w_us = w as usize;
     let n_chars = chars.len();
     if n_chars == 0 {
-        return WordGeoMeasurement { chars: std::sync::Arc::new(Vec::new()) };
+        return WordGeoMeasurement { chars: Vec::new() };
     }
     // If segmentation failed to produce n_chars+1 boundaries, fallback to uniform
     // partitioning instead of returning empty (which would kill geo for the whole line).
@@ -300,7 +300,7 @@ pub fn measure_char_ink_bounds(
         };
         result.push(cb);
     }
-    WordGeoMeasurement { chars: std::sync::Arc::new(result) }
+    WordGeoMeasurement { chars: result }
 }
 
 /// Overlap-for-measurement threshold (px): a clean zero-ink column between two

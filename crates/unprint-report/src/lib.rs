@@ -335,15 +335,12 @@ fn find_font_in_catalog<'a>(
     gt_font_name: &str,
 ) -> Option<&'a FontEntry> {
     let gt_stripped = ground_truth::strip_subset_prefix_str(gt_font_name);
-    // Try full explicit key first (e.g. "SourceSerif4-400Italic|version=4.00|kern|nolig[wght=400,opsz=10]"),
+    // Try full explicit key first (e.g. "SourceSerif4-400Italic[wght=400,opsz=10]"),
     // then fall back to base PostScript name for backward compatibility.
-    // A bare name (no version specified) resolves to the latest version,
-    // then the shared variant preference. Variant entries carry
-    // "PSName|tag" so they won't collide with base "PSName".
-    font_catalog
-        .iter()
-        .find(|fe| fe.font_key() == gt_stripped)
-        .or_else(|| unprint::font_scan::best_entry_for_ps_name(font_catalog.iter(), &gt_stripped))
+    // Variant entries carry "PSName|tag" so they won't collide with base "PSName".
+    font_catalog.iter().find(|fe| {
+        fe.font_key() == gt_stripped || fe.postscript_name == gt_stripped
+    })
 }
 
 /// Try to find a font entry matching a CI candidate font_key.
@@ -598,7 +595,7 @@ impl FontDataCache {
 // ── Miss classification ─────────────────────────────────────────────────────
 
 #[derive(Clone)]
-pub struct ClassifiedEntry<'a> {
+struct ClassifiedEntry<'a> {
     entry: &'a AuditEntry,
     actual_font: Option<String>,
     kind: MissKind,
@@ -629,14 +626,7 @@ impl MissKind {
     }
 }
 
-/// Classify each audit entry against ground truth (hit / major / minor /
-/// similarity failure / kept raster / no GT). Pure function of its inputs:
-/// the caller computes it once per run and shares the result with
-/// `compute_accuracy` and `generate_report` (redundancy F32) instead of
-/// each recomputing it. (`enrich_audit_entries` still classifies
-/// internally: the classification borrows the entries, and enrich
-/// mutates them, so the two cannot share one Vec.)
-pub fn classify_entries<'a>(
+fn classify_entries<'a>(
     entries: &'a [AuditEntry],
     gt: Option<&GroundTruth>,
     dpi: u32,
@@ -1443,7 +1433,7 @@ fn render_correct_font_comparison(
     let correct_dir = dd.join("correct");
     let _ = std::fs::create_dir_all(&correct_dir);
     let vr = unprint::verify::verify_text_region(
-        &scan_gray, font_data, &fe.path, &entry.text, &words,
+        &scan_gray, font_data, &entry.text, &words,
         entry.bbox.x, entry.bbox.y,
         fe.glyph_overrides.as_ref().map(|v| v.as_slice()),
         &fe.variant_tag, fe.variations.as_deref(),
@@ -2238,20 +2228,24 @@ pub struct AccuracyResult {
     pub ocr_wrong_hits: usize,
 }
 
-/// Compute accuracy counts from a precomputed entry classification (see
-/// `classify_entries`) without generating any HTML or audit I/O. Used by
-/// --test for fast scoring. The caller computes the classification once
-/// per run and shares it with `generate_report` (redundancy F32).
+/// Compute accuracy without generating any HTML or audit I/O.
+/// Used by --test for fast scoring.
 pub fn compute_accuracy(
-    classified: &[ClassifiedEntry],
+    entries: &[AuditEntry],
+    gt: Option<&GroundTruth>,
+    dpi: u32,
+    font_catalog: &[FontEntry],
+    glyph_map: &NgramGlyphMap,
 ) -> AccuracyResult {
+    let classified = classify_entries(entries, gt, dpi, font_catalog, glyph_map);
+
     let mut hits = 0usize;
     let mut major_misses = 0usize;
     let mut minor_misses = 0usize;
     let mut similarity_failures = 0usize;
     let mut kept_raster = 0usize;
 
-    for ce in classified {
+    for ce in &classified {
         match ce.kind {
             MissKind::Hit => hits += 1,
             MissKind::MajorMiss => major_misses += 1,
@@ -2277,7 +2271,7 @@ pub fn compute_accuracy(
         let mut c_hits = 0usize;
         let mut w_total = 0usize;
         let mut w_hits = 0usize;
-        for ce in classified {
+        for ce in &classified {
             let is_hit = matches!(ce.kind, MissKind::Hit | MissKind::MinorMiss);
             match ce.entry.ocr_correct {
                 Some(true) => { c_total += 1; if is_hit { c_hits += 1; } },
@@ -2304,14 +2298,11 @@ pub fn compute_accuracy(
     }
 }
 
-/// Build the HTML report. Takes a precomputed entry classification (see
-/// `classify_entries`): the caller computes it once per run and shares it
-/// with `compute_accuracy` (redundancy F32).
 pub fn generate_report(
     report_path: &Path,
     audit_root: &Path,
     entries: &[AuditEntry],
-    classified: &[ClassifiedEntry],
+    gt: Option<&GroundTruth>,
     dpi: u32,
     font_catalog: &[FontEntry],
     glyph_map: &NgramGlyphMap,
@@ -2327,13 +2318,15 @@ pub fn generate_report(
     IMAGE_WRITER.with(|w| *w.borrow_mut() = Some(writer));
     AUDIT_ROOT_TL.with(|a| *a.borrow_mut() = Some(audit_root.to_path_buf()));
 
+    let classified = classify_entries(entries, gt, dpi, font_catalog, glyph_map);
+
     let mut hits: Vec<&ClassifiedEntry> = Vec::new();
     let mut major_misses: Vec<&ClassifiedEntry> = Vec::new();
     let mut minor_misses: Vec<&ClassifiedEntry> = Vec::new();
     let mut similarity_failures: Vec<&ClassifiedEntry> = Vec::new();
     let mut kept_raster: Vec<&ClassifiedEntry> = Vec::new();
     let mut no_ground_truth: Vec<&ClassifiedEntry> = Vec::new();
-    for ce in classified {
+    for ce in &classified {
         match ce.kind {
             MissKind::Hit => hits.push(ce),
             MissKind::MajorMiss => major_misses.push(ce),
@@ -2405,53 +2398,40 @@ pub fn generate_report(
 
     let mut font_data_cache = FontDataCache::new();
 
-    // F35: build each displayed entry's block once and reuse it. An entry
-    // appears in its kind section, in the OCR-miss section when OCR is
-    // wrong, and in All Lines when --report-all — and every
-    // build_miss_block re-verifies the GT font, so without this the same
-    // entry was verified up to 3 times. Entries shown in no section (hits
-    // and no-ground-truth lines with correct OCR, without --report-all)
-    // are not built, exactly as before.
-    let mut block_cache: HashMap<(usize, usize), String> = HashMap::new();
-    for ce in classified {
-        let shown = meta.report_all
-            || ce.entry.ocr_correct == Some(false)
-            || !matches!(ce.kind, MissKind::Hit | MissKind::NoGroundTruth);
-        if shown {
-            let (html, _chosen_zncc, _gt_zncc) = build_miss_block(
-                ce, audit_root, font_catalog, glyph_map, &mut font_data_cache, dpi,
-            );
-            block_cache.insert((ce.entry.page, ce.entry.line_index), html);
-        }
-    }
-    // Look up a pre-built block for a displayed entry. Panics on a missing
-    // entry: the `shown` predicate above must cover every displayed set.
-    let block_for = |ce: &ClassifiedEntry| -> &str {
-        &block_cache[&(ce.entry.page, ce.entry.line_index)]
-    };
-
     // Build major miss blocks (OCR-wrong already filtered out)
     let mut major_miss_blocks = String::new();
     for ce in &major_misses_sorted {
-        major_miss_blocks.push_str(block_for(ce));
+        let (html, _chosen_zncc, _gt_zncc) = build_miss_block(
+            ce, audit_root, font_catalog, glyph_map, &mut font_data_cache, dpi,
+        );
+        major_miss_blocks.push_str(&html);
     }
 
     // Build minor miss blocks — OCR-miss already filtered
     let mut minor_miss_blocks = String::new();
     for ce in &minor_misses_sorted {
-        minor_miss_blocks.push_str(block_for(ce));
+        let (html, _chosen_zncc, _gt_zncc) = build_miss_block(
+            ce, audit_root, font_catalog, glyph_map, &mut font_data_cache, dpi,
+        );
+        minor_miss_blocks.push_str(&html);
     }
 
     // Build similarity failure blocks (OCR-wrong filtered out)
     let mut sim_fail_blocks = String::new();
     for ce in &similarity_failures_sorted {
-        sim_fail_blocks.push_str(block_for(ce));
+        let (html, _chosen_zncc, _gt_zncc) = build_miss_block(
+            ce, audit_root, font_catalog, glyph_map, &mut font_data_cache, dpi,
+        );
+        sim_fail_blocks.push_str(&html);
     }
 
     // Build kept-raster blocks (OCR-wrong filtered out)
     let mut raster_blocks = String::new();
     for ce in &kept_raster_sorted {
-        raster_blocks.push_str(block_for(ce));
+        let (html, _chosen_zncc, _gt_zncc) = build_miss_block(
+            ce, audit_root, font_catalog, glyph_map, &mut font_data_cache, dpi,
+        );
+        raster_blocks.push_str(&html);
     }
 
     // Build hits / no_ground_truth blocks when --report-all
@@ -2460,10 +2440,16 @@ pub fn generate_report(
     let mut no_gt_blocks = String::new();
     if meta.report_all {
         for ce in &hits_sorted {
-            hits_blocks.push_str(block_for(ce));
+            let (html, _chosen_zncc, _gt_zncc) = build_miss_block(
+                ce, audit_root, font_catalog, glyph_map, &mut font_data_cache, dpi,
+            );
+            hits_blocks.push_str(&html);
         }
         for ce in &no_gt_sorted {
-            no_gt_blocks.push_str(block_for(ce));
+            let (html, _chosen_zncc, _gt_zncc) = build_miss_block(
+                ce, audit_root, font_catalog, glyph_map, &mut font_data_cache, dpi,
+            );
+            no_gt_blocks.push_str(&html);
         }
     }
 
@@ -2471,7 +2457,10 @@ pub fn generate_report(
     // Use full miss block so font info is preserved even for major misses.
     let mut ocr_miss_blocks = String::new();
     for ce in &ocr_misses {
-        ocr_miss_blocks.push_str(block_for(ce));
+        let (html, _chosen_zncc, _gt_zncc) = build_miss_block(
+            ce, audit_root, font_catalog, glyph_map, &mut font_data_cache, dpi,
+        );
+        ocr_miss_blocks.push_str(&html);
     }
 
     let sim_fail_section = if !sim_fail_blocks.is_empty() {
@@ -2526,14 +2515,17 @@ pub fn generate_report(
     // Full unfiltered listing when --audit-all / --report-all
     // Shows every line in page/line order regardless of hit/miss.
     let (all_lines_section, report_title) = if meta.report_all {
-        let mut all_sorted = classified.to_vec();
+        let mut all_sorted = classified.clone();
         all_sorted.sort_by(|a, b| {
             a.entry.page.cmp(&b.entry.page)
                 .then(a.entry.line_index.cmp(&b.entry.line_index))
         });
         let mut blocks = String::new();
         for ce in &all_sorted {
-            blocks.push_str(block_for(ce));
+            let (html, _chosen_zncc, _gt_zncc) = build_miss_block(
+                ce, audit_root, font_catalog, glyph_map, &mut font_data_cache, dpi,
+            );
+            blocks.push_str(&html);
         }
         let section = format!(
             "<h2 style=\"margin-top:2em;\">All Lines ({} lines)</h2>{}",
@@ -2593,7 +2585,7 @@ pub fn generate_report(
         let mut zncc = 0usize;
         let mut major = 0usize;
         let mut mrne = 0usize;
-        for ce in classified {
+        for ce in &classified {
             if ce.actual_font.is_none() {
                 continue; // only GT lines
             }
@@ -2647,7 +2639,7 @@ pub fn generate_report(
         let mut total = 0usize;
         let mut p_true = 0usize;
         let mut p_false = 0usize;
-        for ce in classified {
+        for ce in &classified {
             let gt_text = match ce.entry.gt_text.as_deref() {
                 Some(t) => t,
                 None => continue,

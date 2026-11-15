@@ -80,24 +80,17 @@ fn main() {
         std::process::exit(0);
     }
 
-    // ── resolve-fontkey: path/key/name -> verbatim catalog font_key ───
+    // ── resolve-fontkey: path -> verbatim catalog font_key ────────────
     // Per Mike Nov 3: Python must use verbatim strings from the catalog,
     // not construct fontkeys. This is the single source of truth.
-    // Each argument resolves in order: an exact font file path (the
-    // file's best variant — the version is fixed by the file); an exact
-    // font key (a specified version is honored exactly); a bare
-    // PostScript name (no version specified → latest version, then the
-    // shared variant preference). Names match exactly, no fuzzy matching.
     if !args.resolve_fontkey.is_empty() {
         let font_dirs = font_scan::default_font_dirs(&args.font_dir);
         let catalog = font_scan::scan_fonts(&font_dirs, args.quiet);
         // Build path -> best entry map. Shared preference with the
         // classifier tiebreakers (font_scan::font_key_preference_score):
-        // highest version first (a no-op here — entries sharing one path
-        // share one file and one version), then kern for fonts with
-        // kerning data, nokern otherwise; nolig; then opsz=10;
-        // OT-feature variants and non-default weight instances (-10 each)
-        // never win the default pick.
+        // prefer kern for fonts with kerning data, nokern otherwise; nolig;
+        // then opsz=10; OT-feature variants and non-default weight
+        // instances (-10 each) never win the default pick.
         // The entry's stored has_kern flag is the source of truth — the
         // scan drops font bytes, so parsing fe.data here always fails.
         use std::collections::HashMap;
@@ -109,7 +102,7 @@ fn main() {
             let should_replace = match existing {
                 None => true,
                 Some(existing_fe) => {
-                    // Higher preference wins.
+                    // Higher preference score wins.
                     font_scan::font_key_preference_score(&fe.font_key(), fe.has_kern)
                         > font_scan::font_key_preference_score(&existing_fe.font_key(), existing_fe.has_kern)
                 }
@@ -118,24 +111,15 @@ fn main() {
                 path_to_entry.insert(path, fe);
             }
         }
-        for arg in &args.resolve_fontkey {
-            let path = PathBuf::from(arg);
-            if let Some(fe) = path_to_entry.get(&path) {
-                println!("{}", fe.font_key());
-                continue;
+        for path_str in &args.resolve_fontkey {
+            let path = PathBuf::from(path_str);
+            match path_to_entry.get(&path) {
+                Some(fe) => println!("{}", fe.font_key()),
+                None => {
+                    eprintln!("No catalog entry for path {:?}", path_str);
+                    std::process::exit(1);
+                }
             }
-            // Exact font key (version specified) — honored exactly.
-            if let Some(fe) = catalog.iter().find(|fe| fe.font_key() == *arg) {
-                println!("{}", fe.font_key());
-                continue;
-            }
-            // Bare PostScript name (no version specified) — latest version.
-            if let Some(fe) = font_scan::best_entry_for_ps_name(catalog.iter(), arg) {
-                println!("{}", fe.font_key());
-                continue;
-            }
-            eprintln!("No catalog entry for path, font key, or PostScript name {:?}", arg);
-            std::process::exit(1);
         }
         std::process::exit(0);
     }
@@ -506,7 +490,7 @@ fn build_audit_entry(
 fn write_audit_report(
     audit_root: &std::path::Path,
     entries: &[AuditEntry],
-    classified: &[report::ClassifiedEntry],
+    ground_truth: Option<&ground_truth::GroundTruth>,
     dpi: u32,
     font_entries: &[font_scan::FontEntry],
     glyph_map: &glyph_map::NgramGlyphMap,
@@ -526,7 +510,7 @@ fn write_audit_report(
         &report_path,
         audit_root,
         entries,
-        classified,
+        ground_truth,
         dpi,
         font_entries,
         glyph_map,
@@ -655,8 +639,7 @@ fn run(args: &cli::Args, classifier: &mut dyn classifier::Classifier) -> Result<
                     continue;
                 }
                 let Some(fe) = font_registry.by_key(font_key) else { continue };
-                // Font bytes from the shared FontCache (F36).
-                let Ok(font_data) = font_cache.load(&fe.path) else { continue };
+                let Ok(font_data) = std::fs::read(&fe.path) else { continue };
                 let Ok(face) = unprint_fonts::ttf_parser::Face::parse(&font_data, 0) else { continue };
                 // Require at least one Latin letter (a-z) to avoid NotoColorEmoji (which has only digits 0-9)
                 // NotoColorEmoji has 0-9 but no letters -> would pass 'any supported char' and then hang indexing 11M CBDT
@@ -723,8 +706,8 @@ fn run(args: &cli::Args, classifier: &mut dyn classifier::Classifier) -> Result<
                 // re-enabled.
                 let kern = geo_cache.kern_provider(font_key);
 
-                // Load font data from the shared FontCache (F36).
-                let font_data = match font_cache.load(&fe.path) {
+                // Load font data
+                let font_data = match std::fs::read(&fe.path) {
                     Ok(d) => d,
                     Err(_) => continue,
                 };
@@ -838,13 +821,8 @@ fn run(args: &cli::Args, classifier: &mut dyn classifier::Classifier) -> Result<
     if !args.quiet { eprintln!("[timing] get_pages {} pages {:.2}s (total {:.2}s)", pages.len(), t_pages.elapsed().as_secs_f64(), run_start.elapsed().as_secs_f64()); }
 
     // ── 2b. Extract source image data for pass-through ───────────────
-    // Skipped in test mode: source images feed only the raster-fragment
-    // passthrough decision in 3f, and the fragments are discarded when
-    // generate_pdf is skipped.
     let t_extract = std::time::Instant::now();
-    let source_images = if test_mode {
-        Vec::new()
-    } else if input.extension().and_then(|e| e.to_str()) == Some("pdf") {
+    let source_images = if input.extension().and_then(|e| e.to_str()) == Some("pdf") {
         pdf_out::extract_source_images(input)
     } else {
         Vec::new()
@@ -915,7 +893,28 @@ fn run(args: &cli::Args, classifier: &mut dyn classifier::Classifier) -> Result<
         let mut lines = prepared.lines;
         let gray_page = prepared.gray;
         // Fast RGBA reuse – avoid image 0.25 generic CicpRgb::cast_pixels_by_layout 8.7% leaf.
-        let rgba_page = page_cache::fast_rgba8_from_dynamic(&page_img);
+        // Same fast path as page_cache::fast_rgba8_from_dynamic but inline for bin crate visibility.
+        let rgba_page = match page_img {
+            image::DynamicImage::ImageRgba8(rgba) => rgba.clone(),
+            image::DynamicImage::ImageRgb8(rgb) => {
+                let (w, h) = rgb.dimensions();
+                let raw = rgb.as_raw();
+                let mut out = Vec::with_capacity((w * h * 4) as usize);
+                for chunk in raw.chunks_exact(3) {
+                    out.extend_from_slice(chunk);
+                    out.push(255);
+                }
+                image::RgbaImage::from_raw(w, h, out).expect("rgba size")
+            }
+            image::DynamicImage::ImageLuma8(luma) => {
+                let (w, h) = luma.dimensions();
+                let raw = luma.as_raw();
+                let mut out = Vec::with_capacity((w * h * 4) as usize);
+                for &v in raw { out.extend_from_slice(&[v, v, v, 255]); }
+                image::RgbaImage::from_raw(w, h, out).expect("rgba size")
+            }
+            _ => page_img.to_rgba8(),
+        };
         let bg_color = prepared.bg_color;
         let ink_thresh = prepared.ink_thresh;
 
@@ -945,6 +944,9 @@ fn run(args: &cli::Args, classifier: &mut dyn classifier::Classifier) -> Result<
         }
         if scored_lines > 0 {
         }
+
+        // ── Pass 1.5: Paragraph-level font grouping ─────────────────
+        font_pipeline::paragraph_font_grouping(&lines, &line_matches);
 
         // ── Word split: split wide whitespace using matched fonts ──
         let mut split_indices: Vec<usize>;
@@ -1025,12 +1027,16 @@ fn run(args: &cli::Args, classifier: &mut dyn classifier::Classifier) -> Result<
                 if let Some(ref fm) = font_result {
                     let font_data = font_cache.load(&fm.font_path).ok();
                     if let Some(ref fd) = font_data {
-                        // Reuse the normalized crop match_lines computed
-                        // for this line (F9) — same page, same bbox, so it
-                        // is the crop this block used to recompute.
-                        let norm_crop = lm.norm_crop.as_ref().expect(
-                            "scored line must carry its normalized crop from match_lines",
-                        );
+                        let norm_crop = {
+                            let iw = gray_page.width();
+                            let ih = gray_page.height();
+                            let cx = line.x.min(iw.saturating_sub(1));
+                            let cy = line.y.min(ih.saturating_sub(1));
+                            let cw = line.width.min(iw - cx);
+                            let ch = line.height.min(ih - cy);
+                            let raw = image::imageops::crop_imm(&gray_page, cx, cy, cw, ch).to_image();
+                            features::contrast_normalize_char(raw)
+                        };
                         let verify_words = lm.corrected_words.as_deref().unwrap_or(&line.words);
                         // Honor the winning font's ligature determination via the
                         // durable segmentation signal carried in LineMatch.
@@ -1040,9 +1046,8 @@ fn run(args: &cli::Args, classifier: &mut dyn classifier::Classifier) -> Result<
                         let fm_lig = font_registry.by_key(&fm.font_key)
                             .map(|fe| fe.collapsed_lig_set()).unwrap_or(0);
                         let vr = verify::verify_text_region(
-                            norm_crop,
+                            &norm_crop,
                             fd.as_slice(),
-                            &fm.font_path,
                             &line.text,
                             verify_words,
                             line.x, line.y,
@@ -1208,68 +1213,54 @@ fn run(args: &cli::Args, classifier: &mut dyn classifier::Classifier) -> Result<
         };
 
         // 3e. Erase vectorised content from raster ────────────────────
-        // 3e+3f. Erase vectorised content, build raster fragments ──────
-        // Skipped in test mode: the fragments feed only the discarded
-        // PDF output (generate_pdf is skipped) and the erased image feeds
-        // nothing else. The only audit-visible trace is the fragment
-        // count in page_summaries, which no reader consumes (verified by
-        // grep: PageSummary has no readers outside main.rs/audit.rs);
-        // it reads 0 in test-mode audits. Geometry detection (3d) and
-        // placed_texts construction are NOT skipped: 3d feeds audit_geo,
-        // which is audit output.
-        let raster_fragments: Vec<pdf_out::RasterFragment> = if test_mode {
-            Vec::new()
-        } else {
-            // 3e. Erase vectorised content from raster ────────────────
-            let mut erase_rects: Vec<(u32, u32, u32, u32)> = Vec::new();
+        let mut erase_rects: Vec<(u32, u32, u32, u32)> = Vec::new();
 
-            if !args.overlay {
-                // Erase only text that was successfully vectorised.
-                for pt in &placed_texts {
-                    if !pt.keep_raster {
-                        erase_rects.push((pt.x as u32, pt.y as u32, pt.width as u32, pt.height as u32));
-                    }
+        if !args.overlay {
+            // Erase only text that was successfully vectorised.
+            for pt in &placed_texts {
+                if !pt.keep_raster {
+                    erase_rects.push((pt.x as u32, pt.y as u32, pt.width as u32, pt.height as u32));
                 }
-
-                // Erase vectorised geometry.
-                let geo_result = geometry::GeometryResult {
-                    lines: det_lines.clone(),
-                    fills: det_fills.clone(),
-                };
-                erase_rects.extend(geometry::erase_bboxes(&geo_result));
             }
 
-            let cleaned_img = color::erase_regions(page_img, &erase_rects, bg_color, 2);
+            // Erase vectorised geometry.
+            let geo_result = geometry::GeometryResult {
+                lines: det_lines.clone(),
+                fills: det_fills.clone(),
+            };
+            erase_rects.extend(geometry::erase_bboxes(&geo_result));
+        }
 
-            // 3f. Build raster fragments — prefer source pass-through ─
-            let anything_vectorized = pg_vec > 0 || !det_lines.is_empty() || !det_fills.is_empty();
-            let source_img = source_images.get(page_idx).and_then(|s| s.as_ref());
+        let cleaned_img = color::erase_regions(page_img, &erase_rects, bg_color, 2);
 
-            if !anything_vectorized && source_img.is_some() {
-                // Nothing was vectorized/erased — pass through the original
-                // compressed image stream verbatim.
-                let si = source_img.unwrap().clone();
-                let scale = 72.0 / args.dpi as f32;
-                let pw = page_img.width();
-                let ph = page_img.height();
-                vec![pdf_out::RasterFragment {
-                    raw_rgb: Vec::new(), // not used — passthrough takes precedence
-                    width_px: si.width,
-                    height_px: si.height,
-                    x_pt: 0.0,
-                    y_pt: 0.0,
-                    width_pt: pw as f32 * scale,
-                    height_pt: ph as f32 * scale,
-                    passthrough: Some(si),
-                }]
-            } else {
-                // Something was vectorized — we modified the image, must re-encode
-                pdf_out::extract_raster_fragments(
-                    &cleaned_img,
-                    args.dpi,
-                    page_img.height(),
-                )
-            }
+        // 3f. Build raster fragments — prefer source pass-through ─────
+        let anything_vectorized = pg_vec > 0 || !det_lines.is_empty() || !det_fills.is_empty();
+        let source_img = source_images.get(page_idx).and_then(|s| s.as_ref());
+
+        let raster_fragments = if !anything_vectorized && source_img.is_some() {
+            // Nothing was vectorized/erased — pass through the original
+            // compressed image stream verbatim.
+            let si = source_img.unwrap().clone();
+            let scale = 72.0 / args.dpi as f32;
+            let pw = page_img.width();
+            let ph = page_img.height();
+            vec![pdf_out::RasterFragment {
+                raw_rgb: Vec::new(), // not used — passthrough takes precedence
+                width_px: si.width,
+                height_px: si.height,
+                x_pt: 0.0,
+                y_pt: 0.0,
+                width_pt: pw as f32 * scale,
+                height_pt: ph as f32 * scale,
+                passthrough: Some(si),
+            }]
+        } else {
+            // Something was vectorized — we modified the image, must re-encode
+            pdf_out::extract_raster_fragments(
+                &cleaned_img,
+                args.dpi,
+                page_img.height(),
+            )
         };
 
         _stat_raster_frags += raster_fragments.len() as u32;
@@ -1362,21 +1353,16 @@ fn run(args: &cli::Args, classifier: &mut dyn classifier::Classifier) -> Result<
         font_registry.entries(),
         &glyph_map,
     );
-    // (F32) Classify the entries once and share the result with
-    // compute_accuracy and the HTML report, instead of each recomputing
-    // it. Enrich classified internally above (it mutates the entries, so
-    // it cannot share this Vec); this is the run's second and last pass.
-    let classified = report::classify_entries(
-        &audit.text_entries,
-        ground_truth.as_ref(),
-        args.dpi,
-        font_registry.entries(),
-        &glyph_map,
-    );
 
     if test_mode {
         // ── Test mode: compute accuracy, print JSON to stdout ────────
-        let acc = report::compute_accuracy(&classified);
+        let acc = report::compute_accuracy(
+            &audit.text_entries,
+            ground_truth.as_ref(),
+            args.dpi,
+            font_registry.entries(),
+            &glyph_map,
+        );
         // JSON output to stdout
         let zncc_avg: f64 = {
             let vals: Vec<f64> = audit.text_entries.iter()
@@ -1409,7 +1395,7 @@ fn run(args: &cli::Args, classifier: &mut dyn classifier::Classifier) -> Result<
             } else {
             }
             write_audit_report(
-                audit_root, &audit.text_entries, &classified,
+                audit_root, &audit.text_entries, ground_truth.as_ref(),
                 args.dpi, font_registry.entries(), &glyph_map, args, run_start.elapsed(),
             );
         }
@@ -1428,7 +1414,7 @@ fn run(args: &cli::Args, classifier: &mut dyn classifier::Classifier) -> Result<
     // ── 5b. HTML miss report ─────────────────────────────────────────
     if let Some(ref audit_root) = args.audit {
         write_audit_report(
-            audit_root, &audit.text_entries, &classified,
+            audit_root, &audit.text_entries, ground_truth.as_ref(),
             args.dpi, font_registry.entries(), &glyph_map, args, run_start.elapsed(),
         );
     }

@@ -221,7 +221,6 @@ pub fn ot_features(variant_tag: &str) -> Vec<unprint_fonts::rustybuzz::Feature> 
 }
 
 /// Result of shaping a word with rustybuzz, including sidebearing info.
-#[derive(Clone)]
 pub struct ShapedWord {
     /// Per-glyph IDs (post-shaping).
     pub glyph_ids: Vec<u32>,
