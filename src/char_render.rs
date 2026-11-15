@@ -1,7 +1,7 @@
-//! Unified n-gram rendering + caching module.
+//! Unified n-gram rendering module.
 //!
 //! All callers that need rendered font glyph images go through
-//! `render_ngram()` or its convenience wrapper `render_ngram_default()`.
+//! `render_ngram()` or the cache-free `render_ngram_fresh()`.
 //! Single characters are single-element sequences: `&['a']`.
 //!
 //! Pipeline (always this order):
@@ -9,10 +9,12 @@
 //! 2. `normalize_to_ink_bounds()` — find ink, crop with 1px pad, Lanczos3 resize to `height`
 //! 3. Apply AA variant
 //! 4. If `binarize_threshold` is Some(t): binarize
-//! 5. Hash → cache as PNG under `~/.cache/unprint/chars/`
+//! 5. Hash the image; the hash is the glyph_id key in the glyph map.
 //!
-//! Cache path: `chars/h{H}_s{S}/{aa}_{binarize}/{seq_dir}/{hash}.png`
-//! where `seq_dir` is `U+0061` for a single char or `U+0066_U+0069` for a bigram.
+//! Renders are always computed fresh in memory. Nothing in this module
+//! writes glyph PNGs. The hash-addressed PNG *load* (`load_cached_ngram`)
+//! remains only for `ZnccClassifier`, which reads pre-existing cached
+//! renders; no code path populates that cache anymore.
 
 use std::path::{Path, PathBuf};
 
@@ -134,6 +136,11 @@ pub fn ngram_cache_path(
 
 /// Load a cached ngram image by its content hash.
 /// Returns `None` if no cached image exists for this hash.
+///
+/// NOTE: nothing in the codebase writes these PNGs anymore (the glyph PNG
+/// cache was removed Nov 15, 2026). This load path remains only for
+/// `ZnccClassifier`, which reads pre-existing cached renders; on a cache
+/// without them it finds nothing.
 pub fn load_cached_ngram(
     seq: &[char],
     img_hash: u64,
@@ -148,7 +155,7 @@ pub fn load_cached_ngram(
 }
 
 /// Render an n-gram (one or more adjacent characters) through the canonical
-/// pipeline, with hash-addressed caching.
+/// pipeline, always fresh in memory (no image cache).
 ///
 /// All glyphs are rendered at the same em-size — the tallest glyph fills
 /// `params.height` and shorter glyphs appear proportionally smaller.
@@ -158,11 +165,10 @@ pub fn load_cached_ngram(
 /// Returns `None` if any glyph in the sequence is missing from the font.
 /// Returns `Some((hash, image))` — the content hash uniquely identifies
 /// the rendered image and is used as the glyph_id key.
-/// Render an n-gram for a font entry, with full cache integration.
+/// Render an n-gram for a font entry.
 ///
-/// 1. Check glyph_map for a known hash → try image cache → return on hit.
-/// 2. On miss: load font bytes from the shared FontCache (F36), render,
-///    update glyph_map and image cache.
+/// Loads font bytes from the shared FontCache (F36), renders fresh, and
+/// registers the hash in the glyph map. Nothing is written to disk.
 ///
 /// The caller owns glyph-map publication; this function never writes the
 /// process-wide glyph-map cache implicitly.
@@ -188,15 +194,9 @@ pub fn render_ngram(
     let collapsed = normalize_seq_for_font(fe, seq);
     let seq = &collapsed[..];
 
-    // Cache read: check glyph_map for known hash, then image cache
-    if let Some(hash) = glyph_map.hash_for_font(seq, &fk) {
-        if let Some(img) = load_cached_ngram(seq, hash, params) {
-            return Some((hash, img));
-        }
-    }
-
-    // Cache miss: load font bytes from the shared FontCache (F36),
-    // render, update caches.
+    // Always render fresh: load font bytes from the shared FontCache (F36),
+    // render, register the hash in the glyph map. No image cache is read
+    // or written.
     let font_data = font_cache.load(&fe.path).ok()?;
     let mut font = unprint_fonts::ab_glyph::FontRef::try_from_slice(&font_data).ok()?;
     fe.apply_variations(&mut font);
@@ -211,11 +211,6 @@ pub fn render_ngram(
 
     // Update glyph_map
     glyph_map.register(seq, &fk, img_hash);
-
-    // Write image cache — always atomic, and always overwrite on miss path
-    // to heal any previously partial/corrupt file (exists check alone would keep corrupt file).
-    let path = ngram_cache_path(seq, img_hash, params);
-    let _ = atomic_save_png(&img, &path);
 
     Some((img_hash, img))
 }
