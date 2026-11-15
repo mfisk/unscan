@@ -774,7 +774,7 @@ pub fn match_lines(
                                 let word_x = line.words.get(seg.source_word_idx)
                                     .map(|tw| tw.x as f64)
                                     .unwrap_or(0.0) - line.x as f64;
-                                for c in &w.chars {
+                                for c in w.chars.iter() {
                                     let l = word_x + c.frac_left;
                                     let r = word_x + c.frac_right;
                                     if l < min_l { min_l = l; }
