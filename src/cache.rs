@@ -167,7 +167,7 @@ pub mod paths {
 
     pub fn font_scan_bin() -> PathBuf { cache_dir().join("font_scan.bin") }
     pub fn catalog_bin() -> PathBuf { cache_dir().join("catalog.bin") }
-    pub fn geo_cache_bin() -> PathBuf { cache_dir().join("geo-cache.bin") }
+    pub fn geo_cache_bin() -> PathBuf { cache_dir().join(format!("geo-cache-v{}.bin", crate::geo_cache::BGEO_VERSION)) }
     pub fn glyph_map_bin() -> PathBuf { cache_dir().join("glyph-map.bin") }
     pub fn lda_weights_bin() -> PathBuf { cache_dir().join("lda-weights-global.bin") }
     pub fn fisher_weights_bin() -> PathBuf { cache_dir().join("fisher-weights.bin") }
