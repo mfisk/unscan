@@ -689,17 +689,25 @@ pub fn match_lines(
             Some((segs, wib, crop_store, p_map))
         };
 
+        // ── Ground-truth font name, looked up once per line (F17) ─────
+        // The ensure-key resolution below and the _is_miss gate both need
+        // the GT font name for this line's bbox; lookup_font runs the same
+        // span search both times, so retain the name and pass it to the
+        // hit check instead of looking it up again.
+        let gt_font_name: Option<String> = ground_truth.as_ref().and_then(|gt| {
+            let bbox_px = [line.x as f32, line.y as f32,
+                           (line.x + line.width) as f32,
+                           (line.y + line.height) as f32];
+            gt.lookup_font(page_num, &bbox_px, args.dpi).map(|s| s.to_string())
+        });
+
         let (font_result, tie_candidates_audit, gt_font_key, winning_segs, winning_wib, winning_pos_map, winning_crops) = {
 
             // ── Resolve ground-truth font key (if available) ─────
             // In --test mode, the GT MUST resolve to a registry entry. If the lookup
             // fails, error out instead of silently proceeding with an empty ensure list
             // (which would allow geometry pruning to eliminate the GT).
-            let gt_font_key: Option<String> = ground_truth.as_ref().and_then(|gt| {
-                let bbox_px = [line.x as f32, line.y as f32,
-                               (line.x + line.width) as f32,
-                               (line.y + line.height) as f32];
-                let gt_font_name = gt.lookup_font(page_num, &bbox_px, args.dpi)?;
+            let gt_font_key: Option<String> = gt_font_name.as_deref().and_then(|gt_font_name| {
                 let gt_ps = ground_truth::strip_subset_prefix_str(gt_font_name);
                 // Exact font-key match first: GT annotations carry the full
                 // verbatim key (e.g. "SourceSerif4-400Italic|version=4.00|kern|nolig[wght=400,opsz=10]"),
@@ -912,21 +920,21 @@ pub fn match_lines(
         // doing expensive audit I/O.  Without --audit, all lines
         // get full audit.  "Miss" means: ground-truth font mismatch, no
         // font matched, OCR too low, or font confidence too low.
-        let _is_miss = if let Some(ref gt) = ground_truth {
+        let _is_miss = if ground_truth.is_some() {
             // OCR too low → line will be kept raster, treat as miss
             let ocr_ok = line.confidence >= args.min_ocr_confidence as f32
                 && !line.text.trim().is_empty();
             if !ocr_ok {
                 true
             } else if let Some(ref fr) = font_result {
-                    let bbox_px = [line.x as f32, line.y as f32,
-                                   (line.x + line.width) as f32,
-                                   (line.y + line.height) as f32];
                     // Look up chosen font's PostScript name for exact comparison
                     let chosen_ps = font_registry.by_key(&fr.font_key)
                         .map(|fe| fe.postscript_name.as_str())
                         .unwrap_or("");
-                    !gt.is_hit(page_num, &bbox_px, args.dpi, chosen_ps)
+                    // (F17) The GT font name was already looked up for this
+                    // line's bbox; compare against it instead of running
+                    // the span lookup a second time.
+                    !ground_truth::GroundTruth::is_hit_with_font(gt_font_name.as_deref(), chosen_ps)
             } else {
                 true // no font matched → treat as miss
             }
