@@ -2,10 +2,10 @@
 //!
 //! Verifies GT midpoint jitter stays unbiased and RMS close to theory,
 //! using the **all-chars GT path** that must be used for jitter stats:
-//!   every word on the line is scored (the old character-coverage word-drop
-//!   filter was removed — it predated geometry scoring, where letter pairs
-//!   matter). This is the path `tools/gen_hist_flat_top.py` now uses —
-//!   GT-only, no fallback to chosen.
+//!   `UNPRINT_AUDIT_ALL_CHARS=1` includes 2-letter words (`is`/`in`/`or`) and
+//!   punctuation filtered by `is_supported()`; keeps `len<=1` only (segment.rs:1364)
+//!   and `need_any` gate `len>2` (segment.rs:1376). This is the path
+//!   `tools/gen_hist_flat_top.py` now uses — GT-only, no fallback to chosen.
 //!
 //! Theory:
 //!   sigma_center = 1/√12 ≈0.2887, sigma_pitch = 1/√6≈0.4082
@@ -15,7 +15,8 @@
 //!
 //! Procedure:
 //!   - gen-line-test.py --hardcoded (same HARDCODED as t59)
-//!   - run unprint with --test GT --audit (no UNPRINT_EXTRA_SEAMS — not debugging seams)
+//!   - run unprint with UNPRINT_AUDIT_ALL_CHARS=1,
+//!     --test GT --audit (no UNPRINT_EXTRA_SEAMS — not debugging seams)
 //!   - collect gt_geo_h_err / gt_geo_v_err for ocr_correct==True only
 //!   - assert mean≈0 within 2σ, RMS≤2.0, sum_h per word==0 (center-span)
 //!   - filtered |err|<1.5 gives sv/sh; assert sv=0.284±0.15 sh=0.435±0.20
@@ -78,9 +79,10 @@ fn geo_bias_is_zero() {
 
     let bin = unscan_bin();
 
-    // All-chars GT + all-lines: every word is scored by default (the old
-    // word-drop filter is gone), and CLI --audit-all-lines = audit all
-    // lines / hits in obs_votes + geo for t64.
+    // All-chars GT + all-lines: env = audit all chars (punct, 2-letter words),
+    // CLI --audit-all-lines = audit all lines / hits in obs_votes + geo for t64.
+    // Both are required per 43aad2c: Histogram BAP needs
+    //   UNPRINT_AUDIT_ALL_CHARS=1 ... --audit-all-lines
     // Do NOT set UNPRINT_EXTRA_SEAMS — we are not debugging seam splits.
     // Do NOT set UNPRINT_FLAT_TOP — use params.rs defaults (SIGMA_CENTER_PX=0.284 etc).
     let output = Command::new(&bin)
@@ -94,6 +96,7 @@ fn geo_bias_is_zero() {
         .env("MALLOC_ARENA_MAX", "1")
         .env("TMPDIR", "/home/hatch/workspace/tmp")
         .env("UNPRINT_CACHE_DIR", "/home/hatch/.cache/unprint")
+        .env("UNPRINT_AUDIT_ALL_CHARS", "1")
         .env("UNPRINT_SKIP_OCR_CORRECTION", "true")
         .output()
         .expect("run unprint");
@@ -161,7 +164,7 @@ fn geo_bias_is_zero() {
     assert!(!vs.is_empty(), "no GT v samples");
     assert!(
         total_obs >= 200,
-        "all-chars path not exercised: total_obs={total_obs} <200"
+        "all-chars path not exercised: total_obs={total_obs} <200; UNPRINT_AUDIT_ALL_CHARS may be ignored"
     );
     let pct_v = 100.0 * gt_v_count as f64 / total_obs as f64;
     assert!(
