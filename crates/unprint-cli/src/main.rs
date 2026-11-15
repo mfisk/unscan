@@ -1151,11 +1151,9 @@ fn run(args: &cli::Args, classifier: &mut dyn classifier::Classifier) -> Result<
                 font_match: font_result.clone(),
                 keep_raster,
                 color: text_color,
-                confidence: line.confidence,
                 words: lm.corrected_words.as_deref().unwrap_or(&line.words).iter().map(|w| pdf_out::WordBox {
                     text: w.text.clone(),
                     x: w.x as f32,
-                    y: w.y as f32,
                     width: w.width as f32,
                     height: w.height as f32,
                     smoothed_em_px: None,
