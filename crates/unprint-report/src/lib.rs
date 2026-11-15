@@ -1436,7 +1436,7 @@ fn render_correct_font_comparison(
     let correct_dir = dd.join("correct");
     let _ = std::fs::create_dir_all(&correct_dir);
     let vr = unprint::verify::verify_text_region(
-        &scan_gray, font_data, &entry.text, &words,
+        &scan_gray, font_data, &fe.path, &entry.text, &words,
         entry.bbox.x, entry.bbox.y,
         fe.glyph_overrides.as_ref().map(|v| v.as_slice()),
         &fe.variant_tag, fe.variations.as_deref(),

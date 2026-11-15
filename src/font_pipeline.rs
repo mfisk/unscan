@@ -441,6 +441,7 @@ pub fn match_lines(
             let vr = verify::verify_text_region(
                 &norm_crop,
                 fd.as_slice(),
+                &fm.font_path,
                 &line.text,
                 &line.words,
                 line.x, line.y,
@@ -788,7 +789,7 @@ pub fn match_lines(
                             }
                         };
                         let vr = verify::verify_text_region(
-                            &norm_crop, &fd, &line.text, &line.words, line.x, line.y,
+                            &norm_crop, &fd, &fe.path, &line.text, &line.words, line.x, line.y,
                             fe.glyph_overrides.as_deref(), &fe.variant_tag, fe.variations.as_deref(),
                             true, fe.collapsed_lig_set(), tie_audit_dir.as_deref(), None, None, frac_width,
                         );
