@@ -271,9 +271,15 @@ pub fn identify_fonts(
             best_path_score = f32::MIN;
             best_score = f32::MIN;
             pruned_count = 0;
-            // Reset seg caches for clean second pass
-            seg_caches = (0..word_infos.len()).map(|_| HashMap::new()).collect();
-            classify_caches = (0..word_infos.len()).map(|_| HashMap::new()).collect();
+            // (F6) Deliberately do NOT reset seg_caches / classify_caches
+            // on the fallback: both hold pure functions of (word image,
+            // k / collapsed chars), identical in both passes — the
+            // segmentation comes from the shared per-line SegmentCache
+            // (never reset), the char crops + features derive from it,
+            // and the classifier reads are deterministic. Resetting only
+            // forced a full re-segmentation + re-crop + re-features +
+            // re-classify on the second pass. Same precedent as
+            // median_area_cache above, which is also not reset.
         }
         let mut non_ensure_survivors: usize = 0;
         let mut total_survivors: usize = 0;
