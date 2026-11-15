@@ -962,14 +962,14 @@ pub fn match_lines(
                 let glyph_metrics: std::collections::HashMap<char, (f32, f32)> = {
                     let font_entry = ctx.catalog.iter().find(|fe| fe.font_key() == fr.font_key);
                     if let Some(fe) = font_entry {
-                        if let Ok(font_data) = std::fs::read(&fe.path) {
-                            if let Ok(mut font) = unprint_fonts::ab_glyph::FontVec::try_from_vec(font_data) {
-                                if let Some(ref vars) = fe.variations {
-                                    use unprint_fonts::ab_glyph::VariableFont;
-                                    for (tag, val) in vars {
-                                        font.set_variation(tag, *val);
-                                    }
-                                }
+                        // Font bytes come from the shared FontCache (F36):
+                        // the winning font recurs across lines, so a direct
+                        // read would re-allocate + re-parse it per line.
+                        // font_ref_with_variations parses + applies the
+                        // entry's variations, exactly as the old FontVec
+                        // path did (FontRef + apply_variations).
+                        if let Ok(font_data) = font_cache.load(&fe.path) {
+                            if let Some(font) = fe.font_ref_with_variations(&font_data) {
                                 // Gather all chars that appear in any segment
                                 let all_chars: Vec<char> = winning_word_segs.iter()
                                     .flat_map(|seg| seg.chars.iter().copied())
