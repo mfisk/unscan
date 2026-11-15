@@ -194,16 +194,6 @@ pub fn detect_text_color_from_buffers(
     ((rs / cnt) as u8, (gs / cnt) as u8, (bs / cnt) as u8)
 }
 
-/// Otsu's method: find threshold that maximises between-class variance.
-#[allow(dead_code)]
-pub fn otsu_threshold(vals: &[u8]) -> u8 {
-    let mut hist = [0u32; 256];
-    for &v in vals {
-        hist[v as usize] += 1;
-    }
-    otsu_from_hist(&hist, vals.len())
-}
-
 pub(crate) fn otsu_from_hist(hist: &[u32; 256], total_len: usize) -> u8 {
     if total_len == 0 {
         return 128;
