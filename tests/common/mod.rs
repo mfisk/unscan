@@ -26,29 +26,13 @@ pub fn ensure_index() {
 
 /// Locate the built `unscan` binary (release or debug).
 /// Supports new workspace layout where bin lives in `unprint-cli` crate.
-///
-/// NOTE: `cargo test --test <name>` does not build binary targets, so
-/// `CARGO_BIN_EXE_unprint` is unset for single-test runs and this fallback
-/// decides. The tests live in the root package, so the worktree's own
-/// target dir is directly under the manifest dir — check it FIRST, preferring
-/// the profile matching this test build. Falling through to another
-/// checkout's binary silently tests the wrong code (t59 did exactly that:
-/// it ran main's stale pre-merge binary until this fix).
 pub fn unscan_bin() -> PathBuf {
     if let Some(p) = option_env!("CARGO_BIN_EXE_unprint") {
         return PathBuf::from(p);
     }
     // fallback: workspace target layout after crate split (unprint-cli -> bin unprint)
     let manifest = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
-    // Prefer the binary built for this test's own profile.
-    let (own_first, own_second) = if cfg!(debug_assertions) {
-        ("target/debug/unprint", "target/release/unprint")
-    } else {
-        ("target/release/unprint", "target/debug/unprint")
-    };
     let candidates = [
-        manifest.join(own_first),
-        manifest.join(own_second),
         manifest.join("../target/debug/unprint"),
         manifest.join("../target/release/unprint"),
         manifest.join("../../target/debug/unprint"),
@@ -61,7 +45,7 @@ pub fn unscan_bin() -> PathBuf {
         }
     }
     // last resort - will error clearly if not built
-    manifest.join(own_first)
+    manifest.join("../target/debug/unprint")
 }
 
 /// Path into the test-docs directory.
@@ -193,52 +177,6 @@ pub fn setup() -> bool {
     ensure_fixtures()
 }
 
-/// Ensure the vintage specimen PDFs exist, generating them if missing.
-///
-/// Runs `test-docs/gen-vintage-specimen.py` with the same unprint binary
-/// the test harness resolves (via `unscan_bin()`), so the specimen's
-/// `--resolve-fontkey` calls and the audit run against one binary. The
-/// PDFs are git-ignored build products: a fresh checkout has none, and
-/// without this the t66 test fails before it starts. Regeneration takes
-/// ~10s and rewrites both PDFs (plus `vintage-font-keys.json`); existing
-/// PDFs are left untouched.
-pub fn ensure_vintage_specimen() {
-    let gt = test_doc("vintage-specimen-gt.pdf");
-    let raster = test_doc("vintage-specimen-rasterized.pdf");
-    if gt.exists() && raster.exists() {
-        return;
-    }
-    let manifest = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
-    let script = manifest
-        .join("test-docs")
-        .join("gen-vintage-specimen.py");
-    let bin = unscan_bin();
-    eprintln!("  Vintage specimen missing — generating via gen-vintage-specimen.py ...");
-    let output = Command::new("python3")
-        .arg(&script)
-        .args(["--unprint-bin", bin.to_str().unwrap()])
-        .current_dir(&manifest)
-        .output()
-        .unwrap_or_else(|e| panic!("failed to launch {}: {}", script.display(), e));
-    assert!(
-        output.status.success(),
-        "gen-vintage-specimen.py failed (exit {:?}):\n{}",
-        output.status.code(),
-        String::from_utf8_lossy(&output.stderr)
-    );
-    assert!(
-        gt.exists(),
-        "gen-vintage-specimen.py did not produce {}",
-        gt.display()
-    );
-    assert!(
-        raster.exists(),
-        "gen-vintage-specimen.py did not produce {}",
-        raster.display()
-    );
-    eprintln!("  Vintage specimen generated.");
-}
-
 // ── Run wrappers ─────────────────────────────────────────────────────
 
 /// Run unscan with output to /dev/null and return combined stdout+stderr.
@@ -250,22 +188,12 @@ pub fn run_unscan(input: &Path, extra_args: &[&str]) -> String {
         .args(extra_args)
         .env("RUST_LOG", "info")
         // Low-mem VM (7.8G no-swap) — t59 needs small cache + skip PFLDA to avoid OOM
+        // Stable config: small cache 5 fonts, per-font-lda dir empty to save mem, skip PFLDA true
         .env("RAYON_NUM_THREADS", "1")
         .env("MALLOC_ARENA_MAX", "1")
         .env("TMPDIR", "/home/hatch/workspace/tmp")
         .env("UNPRINT_CACHE_DIR", "/home/hatch/.cache/unprint-small")
-        // NO font allowlist (removed 2026-11-16, t59 regen): the allowlist
-        // cannot express the specimen's GT fontkeys, and --test mode aborts
-        // when a GT font is missing from the registry. Two of the 11
-        // distinct GT keys carry commas inside bracketed variations
-        // (OpenSans-400 [wght=400,wdth=100], SourceSerif4-400Italic
-        // [wght=400,opsz=10]); parse_allowlist_str splits on every comma in
-        // all three input forms, and no comma-free registry entry exists
-        // for either font, so no allowlist can cover the GT set. The
-        // previous 5-name allowlist matched nothing at all since the
-        // version-key merge (every key carries |version=X), which died
-        // with NoFonts. Full registry: the first run does a full scan
-        // into the small cache dir, later runs reuse it.
+        .env("UNPRINT_FONT_ALLOWLIST", "LibreBodoni-400,EBGaramond-400,Arial-BoldMT-700,Roboto-400Italic,PlayfairDisplay-400")
         .env("UNPRINT_SKIP_OCR_CORRECTION", "true")
         .env("UNPRINT_EXTRA_SEAMS", "all");
     let output = cmd.output()
@@ -432,39 +360,6 @@ pub struct AccuracyResult {
     pub report_path: PathBuf,
 }
 
-// ── Audit JSON helpers ───────────────────────────────────────────────
-
-/// Resolve the audit JSON path in `audit_dir`: prefer `audit.json.gz`
-/// (written by current unprint), fall back to plain `audit.json` (older
-/// runs). Returns the `.gz` path when neither exists, so callers
-/// asserting existence get a message naming the current format.
-pub fn audit_json_path(audit_dir: &Path) -> PathBuf {
-    let gz = audit_dir.join("audit.json.gz");
-    if gz.exists() {
-        return gz;
-    }
-    audit_dir.join("audit.json")
-}
-
-/// Read an audit JSON file as text, transparently decompressing when
-/// the path ends in `.gz`. Accepts either `audit.json.gz` or plain
-/// `audit.json`.
-pub fn read_audit_json_text(path: &Path) -> String {
-    use std::io::Read;
-    if path.extension().is_some_and(|e| e == "gz") {
-        let f = std::fs::File::open(path)
-            .unwrap_or_else(|e| panic!("cannot open {}: {}", path.display(), e));
-        let mut dec = flate2::read::GzDecoder::new(f);
-        let mut s = String::new();
-        dec.read_to_string(&mut s)
-            .unwrap_or_else(|e| panic!("cannot decompress {}: {}", path.display(), e));
-        s
-    } else {
-        std::fs::read_to_string(path)
-            .unwrap_or_else(|e| panic!("cannot read {}: {}", path.display(), e))
-    }
-}
-
 /// Run unprint with --audit and --test for spatial ground-truth
 /// comparison against the vector PDF.  The --test flag outputs JSON
 /// results to stdout; --audit writes audit.json and report.html.
@@ -500,7 +395,7 @@ pub fn measure_accuracy(raster: &Path, vector: &Path, label: &str) -> AccuracyRe
         output.status.code(),
         String::from_utf8_lossy(&output.stderr));
 
-    assert!(audit_json_path(&audit_dir).exists(),
+    assert!(audit_dir.join("audit.json").exists(),
         "audit.json not written");
 
     let report_path = audit_dir.join("report.html");

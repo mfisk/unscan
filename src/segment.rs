@@ -346,10 +346,7 @@ fn write_seg_diag(
         "seam_costs": &merged_costs,
         "mismatch": n_segs_sum != summary.n_chars_expected as usize,
     });
-    let _ = crate::audit::write_json_gz(
-        &ddir.join("summary.json"),
-        &serde_json::to_string(&json).unwrap_or_default(),
-    );
+    let _ = std::fs::write(ddir.join("summary.json"), serde_json::to_string_pretty(&json).unwrap_or_default());
 }
 
 fn segment_characters_inner(
@@ -2210,10 +2207,13 @@ pub fn segment_line(
     let mut any_ligatures = false;
     let mut words_with_ligatures: Vec<bool> = vec![false; words.len()];
 
-    for (orig_idx, word) in words.iter().enumerate().filter(|(_, w)| w.width > 0) {
+    for (orig_idx, word) in words.iter().enumerate().filter(|(_, w)| w.width > 0.0) {
         let wx = word.x_off;
         let wy = word.y_off;
-        let ww = word.width;
+        // Fractional width to integer crop: ceil so the crop covers the full
+        // fractional ink width (placements built from OCR boxes carry whole
+        // values, so this is exact there).
+        let ww = word.width.ceil() as u32;
         let wh = word.height;
 
         let (pw, ph) = page.dimensions();

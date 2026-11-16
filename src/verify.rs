@@ -57,7 +57,9 @@ pub struct WordPlacement {
     pub text: String,
     pub x_off: u32,
     pub y_off: u32,
-    pub width: u32,
+    /// Word ink width in scan px, measured fractionally from the scan
+    /// (subpixel). Feeds the width-matched em estimate in the fallback path.
+    pub width: f32,
     pub height: u32,
 }
 
@@ -71,45 +73,6 @@ pub struct VerifyResult {
     pub render_ink: Option<GrayImage>,
     /// Colored diff image: red = scan-only ink, blue = render-only ink, white = agreement.
     pub diff: Option<RgbImage>,
-}
-
-/// Measure each word's ink width on the scan crop: the horizontal ink
-/// extent of the word's box, falling back to the box width when the box
-/// is off-crop or holds no ink. Depends only on the crop and the word
-/// boxes — never on the font — so callers that verify the same line
-/// against several fonts measure once and reuse the widths across calls
-/// (redundancy F34). This is the single source of truth for the
-/// computation; `verify_text_region` takes the widths as a required
-/// parameter.
-pub fn measure_word_widths(
-    scan_crop: &GrayImage,
-    words: &[TextRegion],
-    crop_x: u32,
-    crop_y: u32,
-) -> Vec<u32> {
-    let ink_thresh = crate::ocr::INK_THRESHOLD;
-    let (crop_w, crop_h) = scan_crop.dimensions();
-    words
-        .iter()
-        .map(|wr| {
-            let x_off = wr.x.saturating_sub(crop_x);
-            let y_off = wr.y.saturating_sub(crop_y);
-            if x_off < crop_w && y_off < crop_h {
-                let bw = wr.width.min(crop_w.saturating_sub(x_off));
-                let bh = wr.height.min(crop_h.saturating_sub(y_off));
-                if bw >= 1 && bh >= 1 {
-                    // Height argument is bh: ink_horizontal_extent scans
-                    // rows y..y+h, so passing y_off+bh scanned to
-                    // 2*y_off+bh (clamped) — taller than the word box.
-                    let (il, ir) = crate::ocr::ink_horizontal_extent(
-                        scan_crop, y_off, bh, x_off, x_off + bw, ink_thresh
-                    );
-                    let mw = ir.saturating_sub(il);
-                    if mw >= 1 { mw } else { wr.width }
-                } else { wr.width }
-            } else { wr.width }
-        })
-        .collect()
 }
 
 /// Verify a vectorised text region by:
@@ -138,12 +101,6 @@ pub fn verify_text_region(
     bail_below: Option<f32>,
     override_em_px: Option<f32>,
     frac_width: Option<f32>,
-    // Per-word ink widths from `measure_word_widths` on this same crop and
-    // these same word boxes (F34): the widths depend only on the scan, not
-    // the font, so callers verifying one line against several fonts measure
-    // once and pass the result in. Required, not optional: every caller
-    // measures (or reuses) explicitly, and the length must match `words`.
-    measured_widths: &[u32],
 ) -> VerifyResult {
     let (w, h) = scan_crop.dimensions();
 
@@ -161,20 +118,24 @@ pub fn verify_text_region(
     // uniform line scale (midpoint-derived override_em_px).
     // Compute word widths from our crop's ink measurement, not Tesseract's bbox.
     // Tesseract widths are approximate; our ink_horizontal_extent measures actual ink.
-    // The widths arrive precomputed (see `measure_word_widths`): they depend
-    // only on the scan crop and the word boxes, never on the font, so the
-    // caller measures once per line and reuses them across verify calls (F34).
-    assert_eq!(
-        measured_widths.len(),
-        words.len(),
-        "measured_widths must cover every word"
-    );
+    let ink_thresh = crate::ocr::INK_THRESHOLD;
+    let (crop_w, crop_h) = scan_crop.dimensions();
     let placements: Vec<WordPlacement> = words
         .iter()
-        .zip(measured_widths.iter())
-        .map(|(wr, &measured_w)| {
+        .map(|wr| {
             let x_off = wr.x.saturating_sub(crop_x);
             let y_off = wr.y.saturating_sub(crop_y);
+            let measured_w = if x_off < crop_w && y_off < crop_h {
+                let bw = wr.width.min(crop_w.saturating_sub(x_off));
+                let bh = wr.height.min(crop_h.saturating_sub(y_off));
+                if bw >= 1 && bh >= 1 {
+                    let (il, ir) = crate::ocr::ink_horizontal_extent(
+                        scan_crop, y_off, y_off + bh, x_off, x_off + bw, ink_thresh
+                    );
+                    let mw = (ir - il) as f32;
+                    if mw >= 1.0 { mw } else { wr.width as f32 }
+                } else { wr.width as f32 }
+            } else { wr.width as f32 };
             WordPlacement {
                 // Normalize the word text for this font (Mike Nov 6, 2026):
                 // a lig font renders "fi" as the single U+FB01 glyph.
@@ -259,6 +220,9 @@ pub fn verify_text_region(
     // scan uses trim_words_to_ink -> ink_horizontal_extent; we use identical pair for render.
     let (r_top, r_bot) = crate::ocr::ink_vertical_extent(&full_render, 0, rw, 0, rh, ink_threshold);
     let (r_left, r_right) = crate::ocr::ink_horizontal_extent(&full_render, 0, rh, 0, rw, ink_threshold);
+    // Fractional bounds to integer crop: floor/ceil recovers the old integer
+    // bounds exactly, so the display crop is unchanged.
+    let (r_top, r_bot, r_left, r_right) = (r_top.floor() as u32, r_bot.ceil() as u32, r_left.floor() as u32, r_right.ceil() as u32);
     let ink_h = r_bot.saturating_sub(r_top);
     let ink_w = r_right.saturating_sub(r_left);
     let render_ink = if ink_h >= 3 && ink_w >= 3 {
@@ -481,7 +445,7 @@ fn render_via_freetype(
     let shaped_words: Vec<Option<crate::layout::ShapedWord>> = words
         .iter()
         .map(|w| {
-            if w.text.is_empty() || w.width < 1 {
+            if w.text.is_empty() || w.width < 1.0 {
                 None
             } else {
                 let key = (
@@ -506,7 +470,7 @@ fn render_via_freetype(
             let mut ems: Vec<f32> = words
                 .iter()
                 .zip(shaped_words.iter())
-                .filter_map(|(w, s)| s.as_ref()?.ink_matched_em_px(w.width as f32))
+                .filter_map(|(w, s)| s.as_ref()?.ink_matched_em_px(w.width))
                 .collect();
             if ems.is_empty() {
                 return None;
@@ -621,7 +585,7 @@ fn render_via_freetype(
         let canvas_raw = canvas.as_mut();
 
         for (wi, word) in words.iter().enumerate() {
-        if word.text.is_empty() || word.width < 1 {
+        if word.text.is_empty() || word.width < 1.0 {
             continue;
         }
 
@@ -696,6 +660,9 @@ fn render_via_freetype(
         crate::ocr::ink_horizontal_extent(&canvas, 0, canvas.height(), 0, canvas.width(), ink_thresh);
     let (rend_ink_top, rend_ink_bottom) =
         crate::ocr::ink_vertical_extent(&canvas, 0, canvas.width(), 0, canvas.height(), ink_thresh);
+    // Fractional bounds to integer crop: floor/ceil recovers the old integer
+    // bounds exactly, so the crop is unchanged.
+    let (rend_ink_left, rend_ink_right, rend_ink_top, rend_ink_bottom) = (rend_ink_left.floor() as u32, rend_ink_right.ceil() as u32, rend_ink_top.floor() as u32, rend_ink_bottom.ceil() as u32);
     let ink_w = rend_ink_right.saturating_sub(rend_ink_left);
     let ink_h = rend_ink_bottom.saturating_sub(rend_ink_top);
     if ink_w >= 3 && ink_h >= 3 {

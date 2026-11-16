@@ -141,42 +141,6 @@ fn main() {
     }
 
     // ── export-catalog-json: dump FontEntry records and exit ─────────
-    // ── select-font: structured criteria -> verbatim catalog font_key ───
-    // Per Mike Nov 15: specimen generators state what they want; Rust
-    // picks. Every present criterion is a hard filter (font_scan::
-    // select_entry_for_criteria); no match errors loudly, never relaxes.
-    // An unconstrained lig dimension prefers the lig variant (Mike Nov 17).
-    if !args.select_font.is_empty() {
-        let font_dirs = font_scan::default_font_dirs(&args.font_dir);
-        let catalog = font_scan::scan_fonts(&font_dirs, args.quiet);
-        for spec in &args.select_font {
-            let sel = match parse_font_selection(spec) {
-                Ok(sel) => sel,
-                Err(e) => {
-                    eprintln!("--select-font: invalid spec {spec:?}: {e}");
-                    std::process::exit(1);
-                }
-            };
-            match font_scan::select_entry_for_criteria(catalog.iter(), &sel) {
-                Some(fe) => println!("{}", fe.font_key()),
-                None => {
-                    eprintln!(
-                        "--select-font: no catalog entry matches {spec:?} \
-                         (family={:?}, weight={:?}, style={:?}, opsz={:?}, kern={:?}, lig={:?})",
-                        sel.family,
-                        sel.weight,
-                        sel.italic.map(|i| if i { "italic" } else { "regular" }),
-                        sel.opsz,
-                        sel.kern.map(|k| if k { "kern" } else { "nokern" }),
-                        sel.lig.map(|l| if l { "lig" } else { "nolig" }),
-                    );
-                    std::process::exit(1);
-                }
-            }
-        }
-        std::process::exit(0);
-    }
-
     if let Some(out_path) = &args.export_catalog_json {
         use serde::Serialize;
         use std::collections::HashMap;
@@ -320,71 +284,6 @@ fn main() {
 /// Writes catalog.bin so classifier loaders can validate catalog_hash.
 /// Centroids are already baked into classifier .bin files from training,
 /// so no runtime render+embed step is needed.
-/// Parse a `--select-font` spec: comma-separated `key=value` pairs.
-/// Keys: family (required), weight (u32), style (regular|italic),
-/// opsz (f32), kern (kern|nokern), lig (lig|nolig). Unknown or
-/// duplicate keys and malformed values are errors.
-fn parse_font_selection(spec: &str) -> Result<font_scan::FontSelection, String> {
-    let mut sel = font_scan::FontSelection::default();
-    let mut saw_family = false;
-    let mut seen: Vec<&str> = Vec::new();
-    for part in spec.split(',') {
-        let part = part.trim();
-        if part.is_empty() {
-            continue;
-        }
-        let Some((k, v)) = part.split_once('=') else {
-            return Err(format!("expected key=value, got {part:?}"));
-        };
-        let (k, v) = (k.trim(), v.trim());
-        if seen.contains(&k) {
-            return Err(format!("duplicate key {k:?}"));
-        }
-        seen.push(k);
-        match k {
-            "family" => {
-                if v.is_empty() {
-                    return Err("family must not be empty".to_string());
-                }
-                sel.family = v.to_string();
-                saw_family = true;
-            }
-            "weight" => {
-                sel.weight = Some(v.parse::<u32>().map_err(|_| format!("bad weight {v:?}"))?);
-            }
-            "style" => {
-                sel.italic = Some(match v {
-                    "regular" => false,
-                    "italic" => true,
-                    _ => return Err(format!("bad style {v:?} (regular|italic)")),
-                });
-            }
-            "opsz" => {
-                sel.opsz = Some(v.parse::<f32>().map_err(|_| format!("bad opsz {v:?}"))?);
-            }
-            "kern" => {
-                sel.kern = Some(match v {
-                    "kern" => true,
-                    "nokern" => false,
-                    _ => return Err(format!("bad kern {v:?} (kern|nokern)")),
-                });
-            }
-            "lig" => {
-                sel.lig = Some(match v {
-                    "lig" => true,
-                    "nolig" => false,
-                    _ => return Err(format!("bad lig {v:?} (lig|nolig)")),
-                });
-            }
-            _ => return Err(format!("unknown key {k:?}")),
-        }
-    }
-    if !saw_family {
-        return Err("missing required family=".to_string());
-    }
-    Ok(sel)
-}
-
 fn load_fonts(args: &cli::Args, _classifier: &mut dyn classifier::Classifier) -> Result<font_scan::FontRegistry, ScanTextError> {
     // ── Vintage font cache generation (lightweight, BEFORE heavy scan) ──
     // To avoid OOM on full rescan (685 files -> 2911 entries -> incremental 342k glyph renders),
@@ -392,12 +291,12 @@ fn load_fonts(args: &cli::Args, _classifier: &mut dyn classifier::Classifier) ->
     // This does NOT touch ~/.cache/unprint/font_scan.bin and stays <200MB RSS.
     let vintage_eras = vintage_cache::DEFAULT_ERAS;
     let vintage_paths = {
-        let mstt_bases = match font_scan::find_msttcorefonts_dir() {
-            Some(mstt_dir) => {
-                // scan_fonts_uncached is crate-private but same crate root — lightweight, no cache write
-                font_scan::scan_fonts_uncached(&[mstt_dir])
-            }
-            None => Vec::new(),
+        let mstt_dir = std::path::PathBuf::from("/usr/share/fonts/truetype/msttcorefonts");
+        let mstt_bases = if mstt_dir.exists() {
+            // scan_fonts_uncached is crate-private but same crate root — lightweight, no cache write
+            font_scan::scan_fonts_uncached(&[mstt_dir])
+        } else {
+            Vec::new()
         };
         vintage_cache::ensure_vintage_fonts(&mstt_bases, vintage_eras)
     };
@@ -589,8 +488,6 @@ fn build_audit_entry(
         tie_candidates: lm.tie_candidates.clone(),
         miss_type: None,
         expected_font: None,
-        gt_rank: None,
-        gt_score: None,
         gt_text: None,
         ocr_text: None,
         ocr_correct: None,
@@ -1176,12 +1073,6 @@ fn run(args: &cli::Args, classifier: &mut dyn classifier::Classifier) -> Result<
                             "scored line must carry its normalized crop from match_lines",
                         );
                         let verify_words = lm.corrected_words.as_deref().unwrap_or(&line.words);
-                        // Reuse the per-word ink widths match_lines measured
-                        // for this line (F34) — same crop, and corrected_words
-                        // keeps line.words' boxes (correction rewrites text only).
-                        let measured_widths = lm.measured_widths.as_deref().expect(
-                            "scored line must carry measured widths from match_lines",
-                        );
                         // Honor the winning font's ligature determination via the
                         // durable segmentation signal carried in LineMatch.
                         let allow_liga = lm.seg_used_ligatures;
@@ -1211,7 +1102,6 @@ fn run(args: &cli::Args, classifier: &mut dyn classifier::Classifier) -> Result<
                             // replace this override with a width-derived em.
                             lm.midpoint_em_px,
                             None,
-                            measured_widths,
                         );
                         let pass = vr.score >= MIN_VERIFY_SIMILARITY;
                         (Some(vr.score), Some(pass))
@@ -1280,9 +1170,9 @@ fn run(args: &cli::Args, classifier: &mut dyn classifier::Classifier) -> Result<
                         .collect::<Vec<_>>(),
                     "decision": if keep_raster { "raster" } else { "vectorized" },
                 });
-                let _ = audit::write_json_gz(
-                    &ddir.join("line_summary.json"),
-                    &serde_json::to_string(&line_summary).unwrap_or_default(),
+                let _ = std::fs::write(
+                    ddir.join("line_summary.json"),
+                    serde_json::to_string_pretty(&line_summary).unwrap_or_default(),
                 );
             }
 
@@ -1509,12 +1399,18 @@ fn run(args: &cli::Args, classifier: &mut dyn classifier::Classifier) -> Result<
         text_entries: audit_text,
         geometry_entries: audit_geo,
     };
-    // (F32 residual) Classify the entries once and share the result with
-    // enrich, compute_accuracy, and the HTML report. The classification
-    // is owned data (indices, not borrows), so it is computed before
-    // enrich mutates the entries: classification reads only bbox, page,
-    // decision, font_key_matched, and similarity_pass, none of which
-    // enrich writes. This is the run's only classification pass.
+    // Enrich entries with ground-truth classification before writing JSON.
+    report::enrich_audit_entries(
+        &mut audit.text_entries,
+        ground_truth.as_ref(),
+        args.dpi,
+        font_registry.entries(),
+        &glyph_map,
+    );
+    // (F32) Classify the entries once and share the result with
+    // compute_accuracy and the HTML report, instead of each recomputing
+    // it. Enrich classified internally above (it mutates the entries, so
+    // it cannot share this Vec); this is the run's second and last pass.
     let classified = report::classify_entries(
         &audit.text_entries,
         ground_truth.as_ref(),
@@ -1522,17 +1418,10 @@ fn run(args: &cli::Args, classifier: &mut dyn classifier::Classifier) -> Result<
         font_registry.entries(),
         &glyph_map,
     );
-    // Enrich entries with ground-truth classification before writing JSON.
-    report::enrich_audit_entries(
-        &mut audit.text_entries,
-        &classified,
-        ground_truth.as_ref(),
-        args.dpi,
-    );
 
     if test_mode {
         // ── Test mode: compute accuracy, print JSON to stdout ────────
-        let acc = report::compute_accuracy(&audit.text_entries, &classified);
+        let acc = report::compute_accuracy(&classified);
         // JSON output to stdout
         let zncc_avg: f64 = {
             let vals: Vec<f64> = audit.text_entries.iter()

@@ -26,7 +26,7 @@
 
 mod common;
 
-use common::{unscan_bin, audit_json_path, read_audit_json_text};
+use common::unscan_bin;
 use std::path::PathBuf;
 use std::process::Command;
 
@@ -106,11 +106,11 @@ fn geo_bias_is_zero() {
         stderr
     );
 
-    let audit_path = audit_json_path(&audit_dir);
+    let audit_path = audit_dir.join("audit.json");
     assert!(audit_path.exists(), "audit.json missing");
 
     let audit: serde_json::Value =
-        serde_json::from_str(&read_audit_json_text(&audit_path)).unwrap();
+        serde_json::from_str(&std::fs::read_to_string(&audit_path).unwrap()).unwrap();
     let entries = audit["text_entries"].as_array().expect("no text_entries");
 
     let mut hs: Vec<f64> = Vec::new();
