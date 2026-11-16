@@ -52,6 +52,21 @@ pub fn take_obs_stats() -> Option<ObsStats> {
     LAST_OBS_STATS.with(|cell| cell.borrow_mut().take())
 }
 
+thread_local! {
+    /// OOD confidence weight: min(1, med_nn / min_d). Always written by softmax_probs().
+    static LAST_OOD_WEIGHT: std::cell::Cell<f32> = const { std::cell::Cell::new(1.0) };
+}
+
+/// Retrieve the OOD confidence weight from the last softmax_probs() call.
+/// Returns min(1, med_nn / min_d): 1.0 when on-distribution, decaying toward 0 for OOD.
+pub fn take_ood_weight() -> f32 {
+    LAST_OOD_WEIGHT.with(|cell| {
+        let w = cell.get();
+        cell.set(1.0);
+        w
+    })
+}
+
 
 
 fn stash_obs_stats(min_d: f32, dists: &[(u32, f32)], sigma_sq: f32, med_nn: f32, softmax_probs: &[(u32, f32)]) {
@@ -91,10 +106,12 @@ fn softmax_unsorted(dists: &[(u32, f32)], sigma_sq: f32, med_nn: f32) -> (Vec<(u
     } else {
         let p = 1.0 / dists.len() as f32;
         let uniform: Vec<(u32, f32)> = dists.iter().map(|(id, _)| (*id, p)).collect();
-        // For degenerate sigma, min_d is 0 → stash with min_d=0
+        // For degenerate sigma, OOD weight is 1.0 and min_d is 0 → stash with min_d=0
         // to match previous early-return behaviour (no min_d calc originally).
         // Compute min_d for stash consistency anyway.
         let min_d = dists.iter().map(|(_, d)| *d).fold(f32::INFINITY, f32::min);
+        let ood_w = 1.0;
+        LAST_OOD_WEIGHT.with(|cell| cell.set(ood_w));
         stash_obs_stats(min_d, dists, sigma_sq, med_nn, &uniform);
         return (uniform, true);
     };
@@ -108,6 +125,13 @@ fn softmax_unsorted(dists: &[(u32, f32)], sigma_sq: f32, med_nn: f32) -> (Vec<(u
     } else {
         (dists.iter().zip(raw.iter()).map(|((id, _), &r)| (*id, r / sum)).collect::<Vec<(u32, f32)>>(), false)
     };
+    // Always stash OOD confidence weight (not gated by UNPRINT_OBS_STATS)
+    let ood_w = if min_d > 1e-30 && med_nn > 1e-30 {
+        (med_nn / min_d).min(1.0)
+    } else {
+        1.0
+    };
+    LAST_OOD_WEIGHT.with(|cell| cell.set(ood_w));
     stash_obs_stats(min_d, dists, sigma, med_nn, &softmax);
     (softmax, is_uniform)
 }

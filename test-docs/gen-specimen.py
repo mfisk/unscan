@@ -23,7 +23,7 @@ OUT_DIR = SCRIPT_DIR
 # Shared utilities — single source of truth for font finding / PDF pipeline
 from gen_common import (
     FAMILIES,
-    fc_find,
+    select_fontkey_via_api,
     escape_html as _escape,
     build_font_face_css as _font_face_css_from_entries,
     build_canonical_map_from_pdf,
@@ -42,11 +42,15 @@ def _is_primary_family(base):
     return base not in {"ArialMT", "Arial-BoldMT", "CourierNewPSMT", "TimesNewRomanPSMT",
                          "PrestigeEliteNormal", "NimbusSansL"}
 
-def resolve_all_fonts(catalog_json=None):
-    """Resolve all font families via the font catalog (not fontconfig).
+def resolve_all_fonts(catalog_json, unprint_bin):
+    """Resolve all font families via the --select-font API.
 
-    Per architectural change #2: the specimen must pick catalog entries directly,
-    not rely on fontconfig resolution which can disagree with the Rust scan.
+    The generator states what it wants (family, weight, style, size,
+    nokern); Rust picks the single best catalog entry (Mike Nov 15, 2026).
+    No list scanning in Python: selection lives entirely in
+    font_scan::select_entry_for_criteria, and the returned key is looked
+    up in the catalog by exact dict lookup for the file path — a
+    mechanical lookup, not selection.
 
     Returns (font_entries, all_font_files):
       font_entries[base] = {'regular': entry, 'bold': entry, 'italic': entry}
@@ -54,176 +58,108 @@ def resolve_all_fonts(catalog_json=None):
       all_font_files: deduplicated list of all resolved TTF paths
 
     Raises RuntimeError if a family/style has no catalog entry (per Mike's
-    "error out instead of silent skip" rule).
+    "error out instead of silent skip" rule). A missing Bold/Italic falls
+    back to Regular with a WARNING naming the failed criteria (pre-existing
+    specimen policy for families with no true bold/italic file); a missing
+    Regular aborts the build.
     """
     import json
-    import re
 
     if not catalog_json:
         raise RuntimeError("resolve_all_fonts requires catalog_json (catalog-based resolution)")
+    if not unprint_bin:
+        raise RuntimeError("resolve_all_fonts requires unprint_bin (--select-font API)")
 
     with open(catalog_json) as f:
         catalog = json.load(f)
 
-    # Build lookup: normalized family prefix -> list of entries
-    # e.g., "dejavusans" -> [DejaVuSans-400, DejaVuSans-700, ...]
-    def _norm_family(name):
-        # "DejaVu Sans" -> "dejavusans", "EB Garamond" -> "ebgaramond"
-        return re.sub(r'[^a-z0-9]', '', name.lower())
+    # Exact key -> entry lookup for file paths. The API returns the key;
+    # this dict is a mechanical lookup, not selection.
+    key_to_entry = {e['font_key']: e for e in catalog}
 
-    # Index catalog by normalized font_key prefix
-    # font_key like "DejaVuSans-400" -> prefix "dejavusans"
-    # font_key like "SourceSans3-200[wght=200]" -> prefix "sourcesans3"
-    prefix_to_entries = {}
-    for entry in catalog:
-        fk = entry.get('font_key', '')
-        # Extract family prefix: everything before "-<digit>" (weight)
-        # "SourceSans3-200[wght=200]" -> "SourceSans3"
-        m = re.match(r'^(.+?)-\d', fk)
-        if m:
-            prefix_raw = m.group(1)
-        else:
-            prefix_raw = re.split(r'[|\[]', fk)[0]
-        prefix = _norm_family(prefix_raw)
-        prefix_to_entries.setdefault(prefix, []).append(entry)
+    def _find_entry(family, style):
+        """Resolve family+style via the --select-font API (thin wrapper).
 
-    def _find_entry(family, style, base=None):
-        """Find catalog entry for family+style. Errors out if not found or ambiguous.
-        
-        Tries family name first, then base name (if provided), then suffix variations.
+        Specimen policy, stated as criteria: nokern (the specimen renders
+        with font-kerning: none) and opsz=10 (the optical size the specimen
+        renders at; vacuous for fonts without an opsz axis). Ligatures are
+        NOT constrained — the API's shared preference decides (nolig
+        preferred). The weight is passed explicitly, so the Italic branch
+        now selects the requested weight instead of the lexicographic
+        first (the old missing-weight-filter bug is gone by construction).
         """
-        candidates = []
-        # Try family name, then base name
-        names_to_try = [family]
-        if base and base != family:
-            names_to_try.append(base)
-        for name in names_to_try:
-            norm = _norm_family(name)
-            candidates = prefix_to_entries.get(norm, [])
-            if candidates:
-                if name != family:
-                    print(f"  NOTE: {family} mapped via base name '{name}'")
-                break
-            # Try suffix variations
-            for suffix in ["ps", "mt", "psmt", "normal"]:
-                candidates = prefix_to_entries.get(norm + suffix, [])
-                if candidates:
-                    print(f"  NOTE: {family} mapped to '{norm + suffix}' variant")
-                    break
-            if candidates:
-                break
-        if not candidates:
-            norm_fam = _norm_family(family)
-            raise RuntimeError(
-                f"No catalog entry for family '{family}' (normalized: '{norm_fam}'). "
-                f"Specimen requires a catalog entry. Fix the catalog or specimen."
-            )
-
-        # Filter by style
         if style == "Regular":
-            # Want weight 400, not italic, prefer non-variant (or nokern per specimen policy)
-            matches = [e for e in candidates
-                       if '400' in e.get('font_key', '')
-                       and 'italic' not in e.get('font_key', '').lower()]
+            weights = (400,)
+            italic = False
         elif style == "Bold":
-            matches = [e for e in candidates
-                       if '700' in e.get('font_key', '')
-                       and 'italic' not in e.get('font_key', '').lower()]
-            if not matches:
-                # Fallback to nearby weights
-                for w in ("800", "900", "600", "500"):
-                    matches = [e for e in candidates
-                               if w in e.get('font_key', '')
-                               and 'italic' not in e.get('font_key', '').lower()]
-                    if matches:
-                        print(f"  NOTE: {family} has no Bold — using weight {w}")
-                        break
+            # Nearby-weight fallback when 700 is missing (pre-existing
+            # specimen policy, expressed as successive strict API calls —
+            # each call is strict, the generator just asks a different
+            # question; the API never relaxes a constraint itself).
+            weights = (700, 800, 900, 600, 500)
+            italic = False
         elif style == "Italic":
-            matches = [e for e in candidates
-                       if 'italic' in e.get('font_key', '').lower()]
+            weights = (400,)
+            italic = True
         else:
-            matches = []
-
-        if not matches:
-            raise RuntimeError(
-                f"No catalog entry for '{family}' style '{style}'. "
-                f"Found {len(candidates)} candidates for family, none match style."
+            raise RuntimeError(f"Unknown style {style!r} for family {family!r}")
+        last_err = None
+        for w in weights:
+            spec = (
+                f"family={family},weight={w},"
+                f"style={'italic' if italic else 'regular'},opsz=10,kern=nokern"
             )
-
-        # Prefer nokern variant (specimen renders with font-kerning: none)
-        nokern = [e for e in matches if 'nokern' in e.get('font_key', '')]
-        if nokern:
-            matches = nokern
-
-        # Prefer opsz=10 if available
-        opsz10 = [e for e in matches if 'opsz=10' in e.get('font_key', '')]
-        if opsz10:
-            matches = opsz10
-
-        # Return first (deterministic: sorted by font_key)
-        matches.sort(key=lambda e: e.get('font_key', ''))
-        return matches[0]
+            try:
+                key = select_fontkey_via_api(unprint_bin, spec)
+            except RuntimeError as e:
+                last_err = e
+                continue
+            if w != weights[0]:
+                print(f"  NOTE: {family} has no Bold — using weight {w}")
+            entry = key_to_entry.get(key)
+            if entry is None:
+                raise RuntimeError(
+                    f"--select-font returned key {key!r} for {spec!r}, "
+                    "but the exported catalog has no such entry. "
+                    "The catalog export is stale — re-export it."
+                )
+            return entry
+        raise RuntimeError(
+            f"No catalog entry for '{family}' style '{style}' "
+            f"(tried weights {weights}): {last_err}"
+        )
 
     font_entries = {}
     all_font_files = []
     seen = set()
 
-    # Pre-check: collect all families missing from catalog before starting.
-    # Error out with the complete list (not one-by-one whack-a-mole).
-    missing_families = []
-    for base, family in FAMILIES.items():
-        if not _is_primary_family(base):
-            continue
-        # Try family name first, then base name (e.g., "Prestige Elite" -> "prestigeelite",
-        # but catalog has "prestigeelitenormal" from base "PrestigeEliteNormal")
-        candidates = []
-        for name_to_try in [family, base]:
-            norm = _norm_family(name_to_try)
-            candidates = prefix_to_entries.get(norm, [])
-            if candidates:
-                break
-            # Try suffix variations
-            for suffix in ["ps", "mt", "psmt", "normal"]:
-                candidates = prefix_to_entries.get(norm + suffix, [])
-                if candidates:
-                    break
-            if candidates:
-                break
-        if not candidates:
-            missing_families.append((base, family))
-    if missing_families:
-        msg = "Specimen requires catalog entries for the following families, but they are missing:\n"
-        for base, family in missing_families:
-            msg += f"  - {base}: '{family}'\n"
-        msg += "Fix the catalog (install fonts) or remove them from FAMILIES in gen_common.py."
-        raise RuntimeError(msg)
-
     for base, family in FAMILIES.items():
         if not _is_primary_family(base):
             continue
         entries = {}
-        reg = _find_entry(family, "Regular", base=base)
+        reg = _find_entry(family, "Regular")
         entries['regular'] = reg
 
         try:
-            bold = _find_entry(family, "Bold", base=base)
-        except RuntimeError:
+            bold = _find_entry(family, "Bold")
+        except RuntimeError as e:
             # WARNING: No Bold in catalog — falling back to Regular (400).
             # The HTML renders with font-weight:bold, but GT annotation is 400
             # (the font file used). For families without a true bold variant
-            # (e.g. IBM Plex Serif, Prestige Elite).
-            print(f"  WARNING: {family} has no Bold — falling back to 400")
+            # (e.g. IBM Plex Serif, Prestige Elite). The exception names the
+            # exact criteria that failed to resolve.
+            print(f"  WARNING: {family} has no Bold — falling back to 400 ({e})")
             bold = reg
         entries['bold'] = bold
 
         try:
-            italic = _find_entry(family, "Italic", base=base)
-        except RuntimeError:
+            italic = _find_entry(family, "Italic")
+        except RuntimeError as e:
             # WARNING: No Italic in catalog — falling back to Regular.
             # The HTML renders with font-style:italic, but GT annotation is the
             # regular fontkey (the font file used). For families without a true
-            # italic variant.
-            print(f"  WARNING: {family} has no Italic — falling back to Regular")
+            # italic variant. The exception names the exact criteria that failed.
+            print(f"  WARNING: {family} has no Italic — falling back to Regular ({e})")
             italic = reg
         entries['italic'] = italic
 
@@ -1089,7 +1025,7 @@ def main():
         raise RuntimeError("Unprint binary not found. Cannot build specimen without catalog.")
 
     print("Resolving fonts from catalog...")
-    font_entries, all_font_files = resolve_all_fonts(catalog_json)
+    font_entries, all_font_files = resolve_all_fonts(catalog_json, unprint_bin)
     print(f"  {len(font_entries)} font families resolved")
     print(f"  {len(all_font_files)} unique font files")
 

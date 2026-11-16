@@ -83,10 +83,11 @@ def main():
         print("  gen-line-test.py --hardcoded")
         sys.exit(1)
 
-    # Find unprint binary for --resolve-fontkey.
+    # Find unprint binary for --select-font, and export the catalog JSON
+    # for key -> path lookups (same pattern as gen-specimen.py main).
     # Per Mike Nov 3: Python must use verbatim catalog fontkeys via Rust,
-    # not construct them or match in Python. The --resolve-fontkey flag
-    # is the single source of truth.
+    # not construct them or match in Python. --select-font is the single
+    # source of truth for font selection (Mike Nov 15).
     import subprocess
     repo_root = SCRIPT_DIR.parent
     unprint_bin = None
@@ -102,22 +103,18 @@ def main():
     if not unprint_bin:
         print("ERROR: unprint binary not found, cannot resolve verbatim fontkeys", file=sys.stderr)
         sys.exit(1)
-
-    def resolve_fontkey_verbatim(ttf_path):
-        """Get verbatim fontkey from Rust via --resolve-fontkey."""
-        try:
-            r = subprocess.run(
-                [unprint_bin, "--resolve-fontkey", str(ttf_path)],
-                capture_output=True, text=True, timeout=30
-            )
-            if r.returncode == 0:
-                return r.stdout.strip()
-            else:
-                print(f"ERROR: --resolve-fontkey failed for {ttf_path}: {r.stderr}", file=sys.stderr)
-                sys.exit(1)
-        except Exception as e:
-            print(f"ERROR: Failed to resolve fontkey for {ttf_path}: {e}", file=sys.stderr)
-            sys.exit(1)
+    catalog_json = "/tmp/unprint-catalog.json"
+    try:
+        result = subprocess.run(
+            [unprint_bin, "--export-catalog-json", catalog_json],
+            capture_output=True, timeout=180)
+        if result.returncode != 0:
+            raise RuntimeError(f"Catalog export failed: {result.stderr.decode()[:500]}")
+    except Exception as e:
+        print(f"ERROR: Catalog export failed: {e}. Cannot build line test without catalog.", file=sys.stderr)
+        sys.exit(1)
+    with open(catalog_json) as f:
+        catalog = json.load(f)
 
     ttf_paths_for_map = []
     lines = []
@@ -134,11 +131,10 @@ def main():
                 print(f"ERROR: empty line for font '{expected_font}'", file=sys.stderr)
                 sys.exit(1)
             print(f"hardcoded: text='{text}', expected={expected_font}")
-            ttf_path, _, css_weight, css_style = resolve_expected_font(expected_font)
-            # Use verbatim fontkey from Rust via --resolve-fontkey.
-            # Per Mike Nov 3: Python must use verbatim strings from catalog,
-            # not construct them. Rust is the single source of truth.
-            verbatim_key = resolve_fontkey_verbatim(ttf_path)
+            # Verbatim fontkey from Rust via --select-font (selection lives
+            # in Rust; the path comes from the catalog by exact key lookup).
+            ttf_path, verbatim_key, css_weight, css_style = resolve_expected_font(
+                expected_font, catalog, unprint_bin)
             print(f"  font: {ttf_path}, canonical: {verbatim_key} (verbatim from catalog)")
             ttf_paths_for_map.append(ttf_path)
             font_face_entries.append((verbatim_key, ttf_path, css_weight, css_style))
@@ -167,11 +163,10 @@ def main():
                 sys.exit(1)
             if not text.endswith('.'):
                 text += '.'
-            ttf_path, _, css_weight, css_style = resolve_expected_font(expected_font)
-            # Use verbatim fontkey from Rust via --resolve-fontkey.
-            # Per Mike Nov 3: Python must use verbatim strings from catalog,
-            # not construct them. Rust is the single source of truth.
-            verbatim_key = resolve_fontkey_verbatim(ttf_path)
+            # Verbatim fontkey from Rust via --select-font (selection lives
+            # in Rust; the path comes from the catalog by exact key lookup).
+            ttf_path, verbatim_key, css_weight, css_style = resolve_expected_font(
+                expected_font, catalog, unprint_bin)
             ttf_paths_for_map.append(ttf_path)
             font_face_entries.append((verbatim_key, ttf_path, css_weight, css_style))
             lines.append((text, verbatim_key, str(ttf_path), css_weight, css_style))
