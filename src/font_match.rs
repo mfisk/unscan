@@ -161,8 +161,6 @@ struct SegCacheEntry {
 struct HoistedClassify {
     /// Top-3 picks from `classify` (glyph id, probability).
     picks: Vec<(usize, f32)>,
-    /// OOD confidence weight, taken right after the `classify` call.
-    ood: f32,
     /// Per-observation classifier stats, taken right after the `classify`
     /// call (Some only when UNPRINT_OBS_STATS=1). Capturing per char fixes
     /// the old attribution, where the thread-local held the LAST temp's
@@ -375,7 +373,7 @@ pub fn identify_fonts(
             // on (collapsed char, precomputed features), so compute once per
             // distinct collapsed sequence and reuse for every font. The
             // thread-local side channels are taken immediately after the
-            // classify call, so each char's ood/obs_stats attach to that char.
+            // classify call, so each char's obs_stats attach to that char.
             let cc_cache = &mut classify_caches[wi_idx];
             if !cc_cache.contains_key(&collapsed) {
                 let mut hoisted: Vec<Option<HoistedClassify>> = Vec::with_capacity(k);
@@ -392,7 +390,6 @@ pub fn identify_fonts(
                     let h = feat_opt.map(|feat| {
                         let seq = [c];
                         let picks = classifier.classify(&seq, &feat, 3);
-                        let ood = classifier::take_ood_weight();
                         let obs_stats = classifier::take_obs_stats();
                         let logits = classifier.raw_logits(&seq, &feat);
                         // Same max/sum operations, same order, as the old
@@ -407,7 +404,7 @@ pub fn identify_fonts(
                             let sum_exp: f32 = exps.iter().sum();
                             Some((max_logit, sum_exp))
                         };
-                        HoistedClassify { picks, ood, obs_stats, logits, logit_stats }
+                        HoistedClassify { picks, obs_stats, logits, logit_stats }
                     });
                     hoisted.push(h);
                 }
@@ -447,7 +444,6 @@ pub fn identify_fonts(
             ch: char,
             weight: f32,
             area_px: f32,
-            ood: f32,
             // Per-observation classifier stats, captured with the hoisted
             // classify call (Some only when UNPRINT_OBS_STATS=1).
             obs_stats: Option<ObsStats>,
@@ -578,7 +574,6 @@ pub fn identify_fonts(
                     ch: c,
                     weight: 1.0,
                     area_px,
-                    ood: 1.0,
                     obs_stats: None,
                     best_prob: 0.0,
                     nearest: Vec::new(),
@@ -596,14 +591,13 @@ pub fn identify_fonts(
                     geo_scale: cell.scale,
                     ink_width: cell.ink_width,
                 };
-                // Classify for ood + best_prob + nearest. Hoisted (F1): reuse
+                // Classify for best_prob + nearest. Hoisted (F1): reuse
                 // the per-(word, collapsed) classifier results computed when
                 // the cache entry was built; fall back to live calls only
                 // when no hoisted result exists (feature computation failed).
                 let seq = [c];
                 match wb.classify.get(pos).and_then(|o| o.as_ref()) {
                     Some(hc) => {
-                        t.ood = hc.ood;
                         t.obs_stats = hc.obs_stats.clone();
                         let best_prob = hc.picks.iter().map(|(_,p)| *p).fold(0.0f32, f32::max);
                         t.best_prob = best_prob;
@@ -631,8 +625,6 @@ pub fn identify_fonts(
                             }
                         };
                         let picks = classifier.classify(&seq, &feat, 3);
-                        let ood = classifier::take_ood_weight();
-                        t.ood = ood;
                         t.obs_stats = classifier::take_obs_stats();
                         let best_prob = picks.iter().map(|(_,p)| *p).fold(0.0f32, f32::max);
                         t.best_prob = best_prob;
@@ -793,16 +785,17 @@ pub fn identify_fonts(
         eprintln!("midpoint prune: pruned {}/{} fonts at threshold {:.2} (base {:.1} * thoroughness {:.2})", pruned_count, font_registry.iter().count(), prune_threshold, MIDPOINT_PRUNE_BASE, thoroughness);
     }
 
-    let mut present: std::collections::HashSet<String> = scored.iter().map(|(k,_)| k.clone()).collect();
-    for &efk in ensure_font_keys {
-        if !present.contains(efk) {
-            if let Some(_fe) = font_registry.by_key(efk) {
-                scored.push((efk.to_owned(), f32::MIN));
-                present.insert(efk.to_owned());
-            } else {
-                scored.push((efk.to_owned(), f32::MIN));
-            }
-        }
+    // Re-add ensure fonts the prune dropped, with f32::MIN scores, in ensure
+    // order, so they are not lost from the results. The missing keys are
+    // collected up front so no borrow of `scored` is held across the pushes
+    // (a borrowed membership set would conflict with them).
+    let missing: Vec<&str> = ensure_font_keys
+        .iter()
+        .copied()
+        .filter(|efk| !scored.iter().any(|(k, _)| k == efk))
+        .collect();
+    for efk in missing {
+        scored.push((efk.to_owned(), f32::MIN));
     }
 
     if scored.is_empty() {
