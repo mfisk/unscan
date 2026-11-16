@@ -1073,12 +1073,6 @@ fn run(args: &cli::Args, classifier: &mut dyn classifier::Classifier) -> Result<
                             "scored line must carry its normalized crop from match_lines",
                         );
                         let verify_words = lm.corrected_words.as_deref().unwrap_or(&line.words);
-                        // Reuse the per-word ink widths match_lines measured
-                        // for this line (F34) — same crop, and corrected_words
-                        // keeps line.words' boxes (correction rewrites text only).
-                        let measured_widths = lm.measured_widths.as_deref().expect(
-                            "scored line must carry measured widths from match_lines",
-                        );
                         // Honor the winning font's ligature determination via the
                         // durable segmentation signal carried in LineMatch.
                         let allow_liga = lm.seg_used_ligatures;
@@ -1108,7 +1102,6 @@ fn run(args: &cli::Args, classifier: &mut dyn classifier::Classifier) -> Result<
                             // replace this override with a width-derived em.
                             lm.midpoint_em_px,
                             None,
-                            measured_widths,
                         );
                         let pass = vr.score >= MIN_VERIFY_SIMILARITY;
                         (Some(vr.score), Some(pass))
@@ -1406,12 +1399,18 @@ fn run(args: &cli::Args, classifier: &mut dyn classifier::Classifier) -> Result<
         text_entries: audit_text,
         geometry_entries: audit_geo,
     };
-    // (F32 residual) Classify the entries once and share the result with
-    // enrich, compute_accuracy, and the HTML report. The classification
-    // is owned data (indices, not borrows), so it is computed before
-    // enrich mutates the entries: classification reads only bbox, page,
-    // decision, font_key_matched, and similarity_pass, none of which
-    // enrich writes. This is the run's only classification pass.
+    // Enrich entries with ground-truth classification before writing JSON.
+    report::enrich_audit_entries(
+        &mut audit.text_entries,
+        ground_truth.as_ref(),
+        args.dpi,
+        font_registry.entries(),
+        &glyph_map,
+    );
+    // (F32) Classify the entries once and share the result with
+    // compute_accuracy and the HTML report, instead of each recomputing
+    // it. Enrich classified internally above (it mutates the entries, so
+    // it cannot share this Vec); this is the run's second and last pass.
     let classified = report::classify_entries(
         &audit.text_entries,
         ground_truth.as_ref(),
@@ -1419,17 +1418,10 @@ fn run(args: &cli::Args, classifier: &mut dyn classifier::Classifier) -> Result<
         font_registry.entries(),
         &glyph_map,
     );
-    // Enrich entries with ground-truth classification before writing JSON.
-    report::enrich_audit_entries(
-        &mut audit.text_entries,
-        &classified,
-        ground_truth.as_ref(),
-        args.dpi,
-    );
 
     if test_mode {
         // ── Test mode: compute accuracy, print JSON to stdout ────────
-        let acc = report::compute_accuracy(&audit.text_entries, &classified);
+        let acc = report::compute_accuracy(&classified);
         // JSON output to stdout
         let zncc_avg: f64 = {
             let vals: Vec<f64> = audit.text_entries.iter()
