@@ -1048,6 +1048,20 @@ pub fn match_lines(
                     }
                 }
 
+                // F14: pflda's HOG input reuses the winning crops
+                // (char_crop_and_metrics, THRESH 200) instead of
+                // re-cropping at INK_THRESH 240 via crop_ngram. The two
+                // paths are identical except for the trim threshold
+                // (same seam-masked crop, same 1px pad, same Lanczos3
+                // resize to NORM_H), so reuse changes pflda inputs only
+                // where the 200- and 240-trims differ. Reverse map from
+                // (seg_idx, char_pos) to the winning-crop index.
+                let mut crop_index_by_pos: std::collections::HashMap<(usize, usize), usize> =
+                    std::collections::HashMap::with_capacity(winning_pos_map.len());
+                for (crop_i, &(si, cp)) in winning_pos_map.iter().enumerate() {
+                    crop_index_by_pos.insert((si, cp), crop_i);
+                }
+
                 // -- Pass 1: iterate chars, crop, classify ----------------
                 struct PfldaChar {
                     seg_idx: usize,
@@ -1060,14 +1074,21 @@ pub fn match_lines(
                 for (seg_idx, seg) in winning_word_segs.iter().enumerate() {
                     for (char_pos, &ocr_char) in seg.chars.iter().enumerate() {
                         if !crate::features::audit_all_chars_enabled() && !crate::features::is_supported(ocr_char) { continue; }
-                        let crop = match crate::segment::crop_ngram(
-                            &seg.word_img, char_pos, 1,
-                            &seg.boundaries, &seg.seam_paths, seg.crop_h,
-                        ) {
-                            Some(c) => c,
-                            None => continue,
+                        // F14: reuse the winning crop for pflda's HOG input;
+                        // fall back to crop_ngram where no winning crop exists
+                        // (no ink at THRESH 200, or an unsupported char under
+                        // AUDIT_ALL_CHARS) so pflda coverage is unchanged.
+                        let hog = match crop_index_by_pos
+                            .get(&(seg_idx, char_pos))
+                            .and_then(|&crop_i| winning_crops.get(crop_i))
+                        {
+                            Some(crop) => crate::hog::compute_hog(crop),
+                            None => crate::segment::crop_ngram(
+                                &seg.word_img, char_pos, 1,
+                                &seg.boundaries, &seg.seam_paths, seg.crop_h,
+                            ).and_then(|c| crate::hog::compute_hog(&c)),
                         };
-                        let hog = match crate::hog::compute_hog(&crop) {
+                        let hog = match hog {
                             Some(h) => h,
                             None => continue,
                         };
