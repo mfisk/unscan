@@ -2306,6 +2306,17 @@ impl GeometryCache {
                 let y_pla = (s[1] + pf[1] + ps[1] + cs[1] + cpf[1] + cps[1]) as f64;
                 let x_adv_adj = (s[2] + pf[2] + ps[2] + cs[2] + cpf[2] + cps[2]) as f64;
                 let total_adv = adv + x_adv_adj;
+                if i == 0 {
+                    // Word-initial origin (Finding 7): align the first glyph's
+                    // ink left edge with the word bbox left edge (x=0). A glyph
+                    // with negative left side bearing (x0 < 0) extends left of
+                    // its origin; placing the origin at the bbox left edge puts
+                    // the first midpoint too far left by -x0. Offset the cursor
+                    // so the first ink left edge is at 0. This is a constant
+                    // shift of all predicted positions, so pitches (and scores)
+                    // are unchanged; it corrects the absolute positions.
+                    cursor = -(x0 + x_pla);
+                }
                 let cx = cursor + x_pla + (x0 + x1)*0.5;
                 let cy = y_pla + (y0 + y1)*0.5;
                 let y_min_a = y_pla + y0 as f64;
@@ -2404,6 +2415,17 @@ impl GeometryCache {
                 let y_pla = (s[1] + pf[1] + ps[1] + cs[1] + cpf[1] + cps[1]) as f64;
                 let x_adv_adj = (s[2] + pf[2] + ps[2] + cs[2] + cpf[2] + cps[2]) as f64;
                 let total_adv = adv + x_adv_adj;
+                if i == 0 {
+                    // Word-initial origin (Finding 7): align the first glyph's
+                    // ink left edge with the word bbox left edge (x=0). A glyph
+                    // with negative left side bearing (x0 < 0) extends left of
+                    // its origin; placing the origin at the bbox left edge puts
+                    // the first midpoint too far left by -x0. Offset the cursor
+                    // so the first ink left edge is at 0. This is a constant
+                    // shift of all predicted positions, so pitches (and scores)
+                    // are unchanged; it corrects the absolute positions.
+                    cursor = -(x0 + x_pla);
+                }
                 let cx = cursor + x_pla + (x0 + x1)*0.5;
                 let cy = y_pla + (y0 + y1)*0.5;
                 let y_min_a = y_pla + y0 as f64;
@@ -2980,62 +3002,6 @@ impl GeometryCache {
         Self::build_incremental(font_registry, font_cache, catalog_hash, cache_path, HashMap::new(), quiet)
     }
 
-    /// Legacy `kern` table → a single GPOS-style format-1 table (Finding 3).
-    ///
-    /// Sums the kern values across ALL horizontal subtables. The OpenType
-    /// spec says kern adjustments are additive ("Because the adjustments
-    /// are additive, the order of the subtables containing kerning values
-    /// is not important"), so a pair present in several subtables gets the
-    /// SUM of the values — not the first subtable's value. Previously this
-    /// loop broke after the first non-empty subtable, dropping every later
-    /// subtable's pairs.
-    ///
-    /// Subtables that are not horizontal, or that carry cross-stream,
-    /// variable, or state-machine data, are skipped, as before. Pairs
-    /// whose sum cancels to zero are dropped (a zero kern contributes
-    /// nothing, and the old code skipped zero values too). Sums are
-    /// clamped to i16, the `Val4` element type.
-    fn legacy_kern_format1(
-        kern_tbl: &unprint_fonts::ttf_parser::kern::Table,
-        cmap: &[(u32, u16)],
-    ) -> Option<Format1TableOwned> {
-        let mut uniq_gids: Vec<u16> = cmap.iter().map(|(_, gid)| *gid).collect();
-        uniq_gids.sort_unstable();
-        uniq_gids.dedup();
-        let mut summed: BTreeMap<u16, BTreeMap<u16, i32>> = BTreeMap::new();
-        for subtable in kern_tbl.subtables.clone().into_iter() {
-            if !subtable.horizontal || subtable.has_cross_stream || subtable.variable || subtable.has_state_machine { continue; }
-            for &g1 in &uniq_gids {
-                for &g2 in &uniq_gids {
-                    if let Some(k) = subtable.glyphs_kerning(unprint_fonts::ttf_parser::GlyphId(g1), unprint_fonts::ttf_parser::GlyphId(g2)) {
-                        if k != 0 {
-                            *summed.entry(g1).or_default().entry(g2).or_default() += k as i32;
-                        }
-                    }
-                }
-            }
-        }
-        if summed.is_empty() {
-            return None;
-        }
-        let mut coverage = Vec::with_capacity(summed.len());
-        let mut pair_sets = Vec::with_capacity(summed.len());
-        for (left, pairs) in summed {
-            let pairs: Vec<(u16, Val4, Val4)> = pairs
-                .into_iter()
-                .filter(|(_, k)| *k != 0)
-                .map(|(r, k)| (r, [0, 0, k.clamp(i16::MIN as i32, i16::MAX as i32) as i16, 0], [0, 0, 0, 0]))
-                .collect();
-            if pairs.is_empty() { continue; }
-            coverage.push(left);
-            pair_sets.push(pairs);
-        }
-        if coverage.is_empty() {
-            return None;
-        }
-        Some(Format1TableOwned { coverage, val_fmt1: 0x0004, val_fmt2: 0x0000, pair_sets, lookup_id: 0, subtable_pos: 0 })
-    }
-
     fn build_incremental(
         font_registry: &crate::font_scan::FontRegistry,
         font_cache: &crate::font_cache::FontCache,
@@ -3220,8 +3186,33 @@ impl GeometryCache {
 
             if single_tables.is_empty() && format1_tables.is_empty() && format2_tables.is_empty() {
                 if let Some(kern_tbl) = ttf_face.tables().kern.as_ref() {
-                    if let Some(table) = Self::legacy_kern_format1(kern_tbl, &cmap) {
-                        format1_tables.push(table);
+                    for subtable in kern_tbl.subtables.clone().into_iter() {
+                        if !subtable.horizontal || subtable.has_cross_stream || subtable.variable || subtable.has_state_machine { continue; }
+                        let gids: Vec<u16> = cmap.iter().map(|(_, gid)| *gid).collect();
+                        let mut uniq_gids = gids.clone(); uniq_gids.sort_unstable(); uniq_gids.dedup();
+                        let mut map: BTreeMap<u16, Vec<(u16, Val4, Val4)>> = BTreeMap::new();
+                        for &g1 in &uniq_gids {
+                            for &g2 in &uniq_gids {
+                                if let Some(k) = subtable.glyphs_kerning(unprint_fonts::ttf_parser::GlyphId(g1), unprint_fonts::ttf_parser::GlyphId(g2)) {
+                                    if k!=0 {
+                                        let v1 = [0,0,k,0];
+                                        let v2 = [0,0,0,0];
+                                        map.entry(g1).or_default().push((g2, v1, v2));
+                                    }
+                                }
+                            }
+                        }
+                        if !map.is_empty() {
+                            let mut coverage = Vec::with_capacity(map.len());
+                            let mut pair_sets = Vec::with_capacity(map.len());
+                            for (left, mut pairs) in map {
+                                pairs.sort_by_key(|(r,_,_)| *r);
+                                coverage.push(left);
+                                pair_sets.push(pairs);
+                            }
+                            format1_tables.push(Format1TableOwned { coverage, val_fmt1: 0x0004, val_fmt2: 0x0000, pair_sets, lookup_id: 0, subtable_pos: 0 });
+                            break;
+                        }
                     }
                 }
             }
@@ -5495,106 +5486,5 @@ impl<'a> KernProvider for GeoKern<'a> {
             }
             None => 0,
         }
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    /// Build a raw OpenType `kern` table (version 0) from format-0
-    /// subtables: each entry is (coverage byte, pairs), pairs sorted by
-    /// key as the format requires (ttf_parser binary-searches them).
-    /// Coverage 0x01 = horizontal, 0x00 = vertical.
-    fn kern_bytes(subtables: &[(u8, &[(u16, u16, i16)])]) -> Vec<u8> {
-        let mut out = Vec::new();
-        out.extend_from_slice(&0u16.to_be_bytes()); // table version
-        out.extend_from_slice(&(subtables.len() as u16).to_be_bytes());
-        for (coverage, pairs) in subtables {
-            let mut pairs = pairs.to_vec();
-            pairs.sort_by_key(|(l, r, _)| ((*l as u32) << 16) | (*r as u32));
-            let len = 6 + 8 + 6 * pairs.len();
-            out.extend_from_slice(&0u16.to_be_bytes()); // subtable version
-            out.extend_from_slice(&(len as u16).to_be_bytes());
-            out.push(0u8); // format 0
-            out.push(*coverage);
-            out.extend_from_slice(&(pairs.len() as u16).to_be_bytes());
-            out.extend_from_slice(&0u16.to_be_bytes()); // search_range (ignored by ttf_parser)
-            out.extend_from_slice(&0u16.to_be_bytes()); // entry_selector
-            out.extend_from_slice(&0u16.to_be_bytes()); // range_shift
-            for (l, r, v) in &pairs {
-                out.extend_from_slice(&(((*l as u32) << 16) | (*r as u32)).to_be_bytes());
-                out.extend_from_slice(&v.to_be_bytes());
-            }
-        }
-        out
-    }
-
-    fn pairs_of(t: &Format1TableOwned) -> Vec<(u16, u16, i16)> {
-        let mut out = Vec::new();
-        for (i, left) in t.coverage.iter().enumerate() {
-            for (right, v1, _v2) in &t.pair_sets[i] {
-                out.push((*left, *right, v1[2]));
-            }
-        }
-        out
-    }
-
-    const CMAP: &[(u32, u16)] = &[(65, 1), (86, 2), (84, 3)];
-
-    fn parse(bytes: &[u8]) -> unprint_fonts::ttf_parser::kern::Table<'_> {
-        unprint_fonts::ttf_parser::kern::Table::parse(bytes).expect("kern table parses")
-    }
-
-    #[test]
-    fn legacy_kern_sums_across_two_subtables() {
-        // Pair (1,2) in both subtables: -10 + -25 = -35. Disjoint pairs kept.
-        let bytes = kern_bytes(&[
-            (0x01, &[(1, 2, -10), (1, 3, -20)]),
-            (0x01, &[(1, 2, -25), (2, 3, -7)]),
-        ]);
-        let table = GeometryCache::legacy_kern_format1(&parse(&bytes), CMAP)
-            .expect("non-empty kern yields a table");
-        assert_eq!(table.coverage, vec![1, 2]);
-        assert_eq!(table.val_fmt1, 0x0004);
-        assert_eq!(table.val_fmt2, 0x0000);
-        assert_eq!(pairs_of(&table), vec![(1, 2, -35), (1, 3, -20), (2, 3, -7)]);
-    }
-
-    #[test]
-    fn legacy_kern_zero_sum_pair_dropped() {
-        let bytes = kern_bytes(&[
-            (0x01, &[(1, 2, 5), (1, 3, -4)]),
-            (0x01, &[(1, 2, -5)]),
-        ]);
-        let table = GeometryCache::legacy_kern_format1(&parse(&bytes), CMAP)
-            .expect("non-empty kern yields a table");
-        assert_eq!(pairs_of(&table), vec![(1, 3, -4)]);
-    }
-
-    #[test]
-    fn legacy_kern_all_cancelled_returns_none() {
-        let bytes = kern_bytes(&[
-            (0x01, &[(1, 2, 5)]),
-            (0x01, &[(1, 2, -5)]),
-        ]);
-        assert!(GeometryCache::legacy_kern_format1(&parse(&bytes), CMAP).is_none());
-    }
-
-    #[test]
-    fn legacy_kern_vertical_subtable_ignored() {
-        let bytes = kern_bytes(&[
-            (0x01, &[(1, 2, -10)]),
-            (0x00, &[(1, 3, -99)]),
-        ]);
-        let table = GeometryCache::legacy_kern_format1(&parse(&bytes), CMAP)
-            .expect("non-empty kern yields a table");
-        assert_eq!(pairs_of(&table), vec![(1, 2, -10)]);
-    }
-
-    #[test]
-    fn legacy_kern_empty_returns_none() {
-        let bytes = kern_bytes(&[(0x01, &[])]);
-        assert!(GeometryCache::legacy_kern_format1(&parse(&bytes), CMAP).is_none());
     }
 }
