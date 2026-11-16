@@ -1442,6 +1442,10 @@ fn render_correct_font_comparison(
     // of clobbering them (same idiom as the tie-break tie_N/ subdirs).
     let correct_dir = dd.join("correct");
     let _ = std::fs::create_dir_all(&correct_dir);
+    // Single verify for this line: measure the widths here (F34).
+    let measured_widths = unprint::verify::measure_word_widths(
+        &scan_gray, &words, entry.bbox.x, entry.bbox.y,
+    );
     let vr = unprint::verify::verify_text_region(
         &scan_gray, font_data, &fe.path, &entry.text, &words,
         entry.bbox.x, entry.bbox.y,
@@ -1452,6 +1456,7 @@ fn render_correct_font_comparison(
         Some(&correct_dir), None,
         gt_em,
         None,
+        &measured_widths,
     );
 
     // Reference the saved files by audit-root-relative path, exactly like the
