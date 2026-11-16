@@ -255,17 +255,6 @@ pub struct LineMatch {
     /// would compute. `None` for filter placeholders (never scored) and
     /// fast-path lines (Pass 2a skips re-verification via `fast_path_score`).
     pub norm_crop: Option<image::GrayImage>,
-    /// Per-word ink widths from [`verify::measure_word_widths`] on this
-    /// line's normalized crop and word boxes, computed once in
-    /// [`match_lines`] (redundancy F34) and reused by every verify call
-    /// for the line — the tie-break loop and Pass 2a — instead of
-    /// re-scanning the same crop per font. The widths depend only on the
-    /// crop and the boxes, never on the font; Pass 2a verifies on
-    /// `corrected_words`, whose boxes are identical to `line.words`
-    /// (correction only rewrites text), so the stored widths apply there
-    /// too. `None` for filter placeholders and fast-path lines (never
-    /// re-verified).
-    pub measured_widths: Option<Vec<u32>>,
     /// Median em_px derived from midpoint center-span scales (obs_span/pred_span * upem).
     /// This reuses the exact scale calculation from geometry scoring for font-size,
     /// fixing L9 fox/jumps too-small issue where width-matched median was dragged down.
@@ -442,8 +431,6 @@ pub fn match_lines_fast_path(
         // FontEntry); resolve its lig set through the registry.
         let fm_lig = font_registry.by_key(&fm.font_key)
             .map(|fe| fe.collapsed_lig_set()).unwrap_or(0);
-        // Single verify for this line: measure the widths here (F34).
-        let measured_widths = verify::measure_word_widths(&norm_crop, &line.words, line.x, line.y);
         let vr = verify::verify_text_region(
             &norm_crop,
             fd.as_slice(),
@@ -460,7 +447,6 @@ pub fn match_lines_fast_path(
             Some(FAST_PATH_MIN_SSIM),
             None,
             None,
-            &measured_widths,
         );
         if vr.score >= FAST_PATH_MIN_SSIM {
             fast_path_hits.fetch_add(1, Ordering::Relaxed);
@@ -488,7 +474,6 @@ pub fn match_lines_fast_path(
                 fast_path: true,
                 fast_path_score: Some(vr.score),
                 norm_crop: None,
-                measured_widths: None,
                 midpoint_em_px: None,
                 gt_midpoint_em_px: None,
                 word_seg_summaries: Vec::new(),
@@ -559,7 +544,6 @@ pub fn match_lines(
                     fast_path: false,
                     fast_path_score: None,
                     norm_crop: None,
-                    measured_widths: None,
                     midpoint_em_px: None,
                     gt_midpoint_em_px: None,
                     word_seg_summaries: Vec::new(),
@@ -580,11 +564,6 @@ pub fn match_lines(
             let raw = image::imageops::crop_imm(gray_page, cx, cy, cw, ch).to_image();
             features::contrast_normalize_char(raw)
         };
-
-        // Measure the per-word ink widths once for all verify calls on
-        // this line (F34): the tie-break loop verifies the same crop
-        // against every tied font, and Pass 2a reuses the stored widths.
-        let measured_widths = verify::measure_word_widths(&norm_crop, &line.words, line.x, line.y);
 
         // ── Full pipeline: segmentation → font search → font match ─
         let _preview_end = {
@@ -884,7 +863,6 @@ pub fn match_lines(
                             &norm_crop, &fd, &fe.path, &line.text, &line.words, line.x, line.y,
                             fe.glyph_overrides.as_deref(), &fe.variant_tag, fe.variations.as_deref(),
                             true, fe.collapsed_lig_set(), tie_audit_dir.as_deref(), None, mid_em, None,
-                            &measured_widths,
                         );
                         tie_sim_results.push((fe.font_key(), fe.family_name.clone(), vr.score));
                         // Highest SSIM wins. On an exact SSIM tie, the shared
@@ -941,7 +919,11 @@ pub fn match_lines(
                         }
                     }
                     let score = top_score;
-                    let fm = font_registry.by_key(font_key).map(|fe| font_match::FontMatchResult {
+                    // Reuse the lookup from above: same key, same registry,
+                    // and nothing between the two lookups can mutate it
+                    // (build_for_font only borrows the entry and mutates
+                    // the segment cache).
+                    let fm = fe_opt.map(|fe| font_match::FontMatchResult {
                         font_name: fe.font_key(),
                         font_path: fe.path.clone(),
                         font_key: fe.font_key(),
@@ -1048,20 +1030,6 @@ pub fn match_lines(
                     }
                 }
 
-                // F14: pflda's HOG input reuses the winning crops
-                // (char_crop_and_metrics, THRESH 200) instead of
-                // re-cropping at INK_THRESH 240 via crop_ngram. The two
-                // paths are identical except for the trim threshold
-                // (same seam-masked crop, same 1px pad, same Lanczos3
-                // resize to NORM_H), so reuse changes pflda inputs only
-                // where the 200- and 240-trims differ. Reverse map from
-                // (seg_idx, char_pos) to the winning-crop index.
-                let mut crop_index_by_pos: std::collections::HashMap<(usize, usize), usize> =
-                    std::collections::HashMap::with_capacity(winning_pos_map.len());
-                for (crop_i, &(si, cp)) in winning_pos_map.iter().enumerate() {
-                    crop_index_by_pos.insert((si, cp), crop_i);
-                }
-
                 // -- Pass 1: iterate chars, crop, classify ----------------
                 struct PfldaChar {
                     seg_idx: usize,
@@ -1074,21 +1042,14 @@ pub fn match_lines(
                 for (seg_idx, seg) in winning_word_segs.iter().enumerate() {
                     for (char_pos, &ocr_char) in seg.chars.iter().enumerate() {
                         if !crate::features::audit_all_chars_enabled() && !crate::features::is_supported(ocr_char) { continue; }
-                        // F14: reuse the winning crop for pflda's HOG input;
-                        // fall back to crop_ngram where no winning crop exists
-                        // (no ink at THRESH 200, or an unsupported char under
-                        // AUDIT_ALL_CHARS) so pflda coverage is unchanged.
-                        let hog = match crop_index_by_pos
-                            .get(&(seg_idx, char_pos))
-                            .and_then(|&crop_i| winning_crops.get(crop_i))
-                        {
-                            Some(crop) => crate::hog::compute_hog(crop),
-                            None => crate::segment::crop_ngram(
-                                &seg.word_img, char_pos, 1,
-                                &seg.boundaries, &seg.seam_paths, seg.crop_h,
-                            ).and_then(|c| crate::hog::compute_hog(&c)),
+                        let crop = match crate::segment::crop_ngram(
+                            &seg.word_img, char_pos, 1,
+                            &seg.boundaries, &seg.seam_paths, seg.crop_h,
+                        ) {
+                            Some(c) => c,
+                            None => continue,
                         };
-                        let hog = match hog {
+                        let hog = match crate::hog::compute_hog(&crop) {
                             Some(h) => h,
                             None => continue,
                         };
@@ -1404,7 +1365,7 @@ pub fn match_lines(
         // gt_word_seg_summaries (GT), which the report's scan-line
         // overlays render side by side.
 
-        LineMatch { font_result, text_color, font_scores, observations, gt_observations, seg_used_ligatures, diag_seg_dir, obs_rank_probs, gt_obs_rank_probs, tie_candidates: tie_candidates_audit, corrected_words, fast_path: false, fast_path_score: None, norm_crop: Some(norm_crop), measured_widths: Some(measured_widths), midpoint_em_px, gt_midpoint_em_px, word_seg_summaries, gt_word_seg_summaries, gt_per_char_geo_ll, ocr_corrections: ocr_correction_audit }
+        LineMatch { font_result, text_color, font_scores, observations, gt_observations, seg_used_ligatures, diag_seg_dir, obs_rank_probs, gt_obs_rank_probs, tie_candidates: tie_candidates_audit, corrected_words, fast_path: false, fast_path_score: None, norm_crop: Some(norm_crop), midpoint_em_px, gt_midpoint_em_px, word_seg_summaries, gt_word_seg_summaries, gt_per_char_geo_ll, ocr_corrections: ocr_correction_audit }
     }).collect();
 
     line_matches
