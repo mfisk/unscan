@@ -28,12 +28,15 @@ from pdf_font_annotate import annotate_canonical_names
 from rasterize import rasterize
 
 # ---------------------------------------------------------------------------
-# Hardcoded 14-line test — page-break isolation for Tesseract LSTM reset
+# Hardcoded 18-line test — page-break isolation for Tesseract LSTM reset
 # p1: 8 lines (L01-L08), p2: 2 lines (LibreBaskerville + PTSerif italic fox with numbers),
 # p3: 1 line (Matthew Carter) isolated to avoid bbox shift.
 # Matches t59 + extensions requested: LibreBaskerville lower, PTSerif italic numbers.
 # Nimbus-400Italic AVAST line added Nov 14, 2026: t66 p1 l25, a segmentation-error
 # case (kern variant loses to nokern on the same text).
+# Four BAP major-miss lines added Nov 15, 2026 (first 5 in the BAP 1032 report;
+# the fifth, p2 L35, was already line 14): p1 L70 caps, p5 L48, p3 L52
+# (known segmenter bug: DP seam cuts 'M' in half), p1 L28.
 # ---------------------------------------------------------------------------
 HARDCODED = [
     ("LibreBodoni-400", "abcdefghijklmnopqrstuvwxyz."),
@@ -50,6 +53,10 @@ HARDCODED = [
     ("Arial-ItalicMT-400Italic", "Italic: The quick brown fox jumps over 1,234,567,890"),
     ("Nimbus-400Italic", "AVAST! WAYWARD YOUTH TO YONDER VALLEY, AWAY AT DAWN. Ryan Tries."),
     ("SourceSerif4-400It", "Font: fonts.google.com/specimen/Jost — OFL, Owen Earl"),
+    ("LibreBodoni-400", "ABCDEFGHIJKLMNOPQRSTUVWXYZ"),
+    ("SourceSerif4-400It", "Hunt for Adobe"),
+    ("Georgia-700", "1993 — Georgia (Microsoft)"),
+    ("LibreCaslonText-400", "saying: \"When in doubt, use Caslon.\""),
 ]
 
 def parse_args():
