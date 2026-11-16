@@ -1073,6 +1073,12 @@ fn run(args: &cli::Args, classifier: &mut dyn classifier::Classifier) -> Result<
                             "scored line must carry its normalized crop from match_lines",
                         );
                         let verify_words = lm.corrected_words.as_deref().unwrap_or(&line.words);
+                        // Reuse the per-word ink widths match_lines measured
+                        // for this line (F34) — same crop, and corrected_words
+                        // keeps line.words' boxes (correction rewrites text only).
+                        let measured_widths = lm.measured_widths.as_deref().expect(
+                            "scored line must carry measured widths from match_lines",
+                        );
                         // Honor the winning font's ligature determination via the
                         // durable segmentation signal carried in LineMatch.
                         let allow_liga = lm.seg_used_ligatures;
@@ -1102,6 +1108,7 @@ fn run(args: &cli::Args, classifier: &mut dyn classifier::Classifier) -> Result<
                             // replace this override with a width-derived em.
                             lm.midpoint_em_px,
                             None,
+                            measured_widths,
                         );
                         let pass = vr.score >= MIN_VERIFY_SIMILARITY;
                         (Some(vr.score), Some(pass))
