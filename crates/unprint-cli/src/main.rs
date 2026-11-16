@@ -291,12 +291,12 @@ fn load_fonts(args: &cli::Args, _classifier: &mut dyn classifier::Classifier) ->
     // This does NOT touch ~/.cache/unprint/font_scan.bin and stays <200MB RSS.
     let vintage_eras = vintage_cache::DEFAULT_ERAS;
     let vintage_paths = {
-        let mstt_dir = std::path::PathBuf::from("/usr/share/fonts/truetype/msttcorefonts");
-        let mstt_bases = if mstt_dir.exists() {
-            // scan_fonts_uncached is crate-private but same crate root — lightweight, no cache write
-            font_scan::scan_fonts_uncached(&[mstt_dir])
-        } else {
-            Vec::new()
+        let mstt_bases = match font_scan::find_msttcorefonts_dir() {
+            Some(mstt_dir) => {
+                // scan_fonts_uncached is crate-private but same crate root — lightweight, no cache write
+                font_scan::scan_fonts_uncached(&[mstt_dir])
+            }
+            None => Vec::new(),
         };
         vintage_cache::ensure_vintage_fonts(&mstt_bases, vintage_eras)
     };
