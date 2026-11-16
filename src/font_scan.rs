@@ -51,13 +51,6 @@ fn lig_bit(c: char) -> Option<u8> {
         _ => None,
     }
 }
-#[inline]
-#[allow(dead_code)]
-fn lig_contains(mask: LigMask, c: char) -> bool {
-    if let Some(b) = lig_bit(c) {
-        (mask & (1u8 << b)) != 0
-    } else { false }
-}
 
 /// Cache of final collapsed lig sets per font path — eliminates 33.9%
 /// inclusive hot path (font_match.rs:138, font_pipeline.rs:381) which
@@ -638,12 +631,6 @@ impl FontEntry {
         }
 
         mask
-    }
-
-    /// Back-compat shim: old name kept for any missed call sites.
-    #[allow(dead_code)]
-    pub fn allowed_lig_set(&self) -> LigMask {
-        self.collapsed_lig_set()
     }
 
     /// Count interior 100% top-to-bottom white vertical gutters inside the glyph
@@ -2578,23 +2565,58 @@ fn is_ot_feature_tag(seg: &str) -> bool {
         && seg[2..].bytes().all(|b| b.is_ascii_digit()))
 }
 
-/// Preference score for font-key selection and classifier tiebreaking.
+/// Numeric font version parsed from the `|version=X` key segment, in
+/// hundredths (2.50 → 250, 10.00 → 1000), for numeric comparison —
+/// string comparison would wrongly rank "10.00" below "2.50".
+/// A key without a version tag (tombstones omit it) scores 0 and loses
+/// to any versioned key. The minor part is read as two digits ("5" →
+/// 50, "505" → 50); `font_revision` always formats two decimals, so
+/// anything else is malformed input handled defensively.
+fn font_key_version(font_key: &str) -> u32 {
+    for seg in font_key.split('|').skip(1) {
+        let Some(v) = seg.strip_prefix("version=") else { continue };
+        let v = v.split('[').next().unwrap_or(v);
+        let (major_s, minor_s) = match v.split_once('.') {
+            Some((a, b)) => (a, b),
+            None => (v, ""),
+        };
+        let major: u32 = major_s.parse().unwrap_or(0);
+        let mut digits = minor_s.chars().filter(|c| c.is_ascii_digit());
+        let d1 = digits.next().and_then(|c| c.to_digit(10)).unwrap_or(0);
+        let d2 = digits.next().and_then(|c| c.to_digit(10)).unwrap_or(0);
+        return major.saturating_mul(100).saturating_add(d1 * 10 + d2);
+    }
+    0
+}
+
+/// Preference for font-key selection and classifier tiebreaking.
 /// Single source of truth, shared by --resolve-fontkey
 /// (crates/unprint-cli/src/main.rs) and the classifier tiebreakers
-/// (font_match.rs fine-score sort, font_pipeline.rs exact-tie resolution).
-/// Font with kerning data → +4 for kern (not nokern); font without
+/// (font_match.rs fine-score sort, font_pipeline.rs exact-tie
+/// resolution and GT resolution).
+///
+/// Returns `(version, variant_score)`, compared lexicographically:
+/// the numeric font version DOMINATES — when no version is specified
+/// (an exact-score tie between versions, or a bare PostScript-name
+/// query), the highest version wins (10.00 > 2.50, numeric, not
+/// string order). The variant score breaks ties within one version:
+/// font with kerning data → +4 for kern (not nokern); font without
 /// kerning → +4 for nokern; +2 for nolig; +1 for opsz=10; −10 per
 /// OT-feature variant tag (onum, lnum, smcp, c2sc, swsh, salt, titl,
 /// hist, ss01–ss20, allcaps) and −10 per non-default weight instance
 /// (`|wghtN`), so the base/default variant always wins the default-GT
 /// pick over an OT-feature variant or a non-default weight. Higher
-/// score wins. The kerning signal is `has_kern` (legacy `kern` table
+/// wins. The kerning signal is `has_kern` (legacy `kern` table
 /// or GPOS `kern` feature), not GPOS presence: a font with a legacy
 /// `kern` table but no GPOS (e.g. Trebuchet, Arial) still renders
 /// kerned by default, so its kerned variant is the default pick.
 /// Lig is explicit in the key but scores 0 (the default); nolig keeps
 /// +2, so the nolig variant still wins the default-GT pick.
-pub fn font_key_preference_score(font_key: &str, has_kern: bool) -> i32 {
+/// A key without a version tag scores version 0 and loses to any
+/// versioned key. An exact key match (version specified) bypasses
+/// this preference entirely — callers check exact matches first.
+pub fn font_key_preference_score(font_key: &str, has_kern: bool) -> (u32, i32) {
+    let version = font_key_version(font_key);
     let mut s = 0;
     let is_nokern = font_key.contains("nokern");
     // If has_kern: +4 for kern (not nokern).
@@ -2630,7 +2652,26 @@ pub fn font_key_preference_score(font_key: &str, has_kern: bool) -> i32 {
             s -= 10;
         }
     }
-    s
+    (version, s)
+}
+
+/// Best registry entry for a bare PostScript name (no version
+/// specified): latest version, then the shared variant preference,
+/// then the lowest font key (deterministic final fallback, matching
+/// the fine-score sort). Exact-match callers check `by_key` first —
+/// this helper is only for version-less queries.
+pub fn best_entry_for_ps_name<'a, I>(entries: I, ps_name: &str) -> Option<&'a FontEntry>
+where
+    I: Iterator<Item = &'a FontEntry>,
+{
+    entries.filter(|fe| fe.postscript_name == ps_name).max_by(|a, b| {
+        let pa = font_key_preference_score(a.font_key_ref(), a.has_kern);
+        let pb = font_key_preference_score(b.font_key_ref(), b.has_kern);
+        // Max-by prefers the greater; reverse the key comparison so
+        // the lowest key wins a full preference tie (same as the
+        // fine-score sort's key-asc final fallback).
+        pa.cmp(&pb).then_with(|| b.font_key_ref().cmp(a.font_key_ref()))
+    })
 }
 
 /// Font version from the `head` table `fontRevision` field, formatted
@@ -3468,5 +3509,57 @@ mod catalog_hash_tests {
         let h20 = FontRegistry::compute_hash(&[fe_20]);
         assert_eq!(h10_a, h10_b, "same opsz should give same hash (identical coords)");
         assert_ne!(h10_a, h20, "different opsz should give different hash (distinct geometry)");
+    }
+
+    #[test]
+    fn preference_version_dominates_variant() {
+        // Newest version wins even when the older version has the better
+        // variant score: v2.82 kern (4) beats v2.50 kern+nolig (6).
+        let old = super::font_key_preference_score("TimesNewRomanPSMT-400|version=2.50|kern|nolig", true);
+        let new = super::font_key_preference_score("TimesNewRomanPSMT-400|version=2.82|kern|lig", true);
+        assert_eq!(old, (250, 6));
+        assert_eq!(new, (282, 4));
+        assert!(new > old, "version must dominate the variant score");
+    }
+
+    #[test]
+    fn preference_version_compares_numerically() {
+        // 10.00 > 2.50 numerically; string comparison would rank "10.00" below "2.50".
+        let low = super::font_key_preference_score("X-400|version=2.50|kern|nolig", true);
+        let high = super::font_key_preference_score("X-400|version=10.00|kern|nolig", true);
+        assert_eq!(low.0, 250);
+        assert_eq!(high.0, 1000);
+        assert!(high > low, "10.00 must beat 2.50");
+    }
+
+    #[test]
+    fn preference_variant_breaks_same_version_tie() {
+        // Within one version, the existing variant preference decides.
+        let lig = super::font_key_preference_score("X-400|version=2.82|kern|lig", true);
+        let nolig = super::font_key_preference_score("X-400|version=2.82|kern|nolig", true);
+        assert_eq!(lig, (282, 4));
+        assert_eq!(nolig, (282, 6));
+        assert!(nolig > lig, "nolig must win within the same version");
+    }
+
+    #[test]
+    fn preference_missing_version_loses() {
+        // A key without a version tag scores version 0 and loses to any
+        // versioned key, whatever the variant score.
+        let unversioned = super::font_key_preference_score("X-400|kern|nolig", true);
+        let versioned = super::font_key_preference_score("X-400|version=1.00|kern|lig", true);
+        assert_eq!(unversioned, (0, 6));
+        assert_eq!(versioned, (100, 4));
+        assert!(versioned > unversioned, "versioned must beat unversioned");
+    }
+
+    #[test]
+    fn font_key_version_parses_hundredths() {
+        assert_eq!(super::font_key_version("X-400|version=2.50|kern|nolig"), 250);
+        assert_eq!(super::font_key_version("X-400|version=10.00|kern|nolig"), 1000);
+        assert_eq!(super::font_key_version("X-400|version=1.00"), 100);
+        assert_eq!(super::font_key_version("X-400|version=2.5|kern|nolig"), 250);
+        assert_eq!(super::font_key_version("X-400|kern|nolig"), 0);
+        assert_eq!(super::font_key_version("X-400|version=abc|kern|nolig"), 0);
     }
 }

@@ -94,34 +94,9 @@ pub fn build_ngram_glyph_map(
 
             if let Some(img) = crate::char_render::render_ngram_fresh(&font, seq, &gid_overrides, &params, disable_kern, &kern
                     ) {
+                // No-PNG-cache training (train-nocache-pngs): hash the
+                // in-memory render for the glyph map; do not save the PNG.
                 let hash = crate::glyph_map::hash_image(&img);
-                // Write image cache — always atomic; heals partial files from killed runs.
-                // Must use explicit encoder: `img.save(.tmp)` fails when extension is `.tmp`.
-                let path = crate::char_render::ngram_cache_path(seq, hash, &params);
-                let tmp = crate::atomic_file::tmp_for(&path);
-                if let Some(parent) = tmp.parent() {
-                    let _ = std::fs::create_dir_all(parent);
-                }
-                let ok = (|| -> std::io::Result<()> {
-                    use std::fs::File;
-                    use std::io::BufWriter;
-                    use image::codecs::png::PngEncoder;
-                    use image::ImageEncoder;
-                    let f = File::create(&tmp)?;
-                    let mut w = BufWriter::new(f);
-                    let enc = PngEncoder::new(&mut w);
-                    enc.write_image(img.as_raw(), img.width(), img.height(), image::ExtendedColorType::L8)
-                        .map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e))?;
-                    use std::io::Write;
-                    w.flush()?;
-                    Ok(())
-                })()
-                .is_ok();
-                if ok {
-                    let _ = std::fs::rename(&tmp, &path);
-                } else {
-                    let _ = std::fs::remove_file(&tmp);
-                }
                 hashes.push((seq.to_vec(), hash, fk.clone()));
             }
         }
@@ -696,26 +671,6 @@ fn power_iteration_eigenvectors(mat: &[f64], n: usize, k: usize) -> Vec<f64> {
 // Inference: sliding window ngram scoring
 // ---------------------------------------------------------------------------
 
-/// Score a font against a line's crops using sliding-window bigram
-/// classification, falling back to unigram when a bigram classifier doesn't
-/// exist for the pair.
-///
-/// `bigram_crops` are the combined pair images extracted from word-image
-/// Build per-character scoring windows for font identification.
-///
-/// Returns `(windows, position_map)` where `windows` are single characters
-/// and `position_map[i] = (seg_idx, char_pos)` for window `i`.
-
-pub fn build_scoring_windows<'a>(
-    word_segs: &'a [crate::segment::WordSeg],
-    _classifier: &'a dyn crate::classifier::Classifier,
-    _glyph_map: &'a crate::glyph_map::NgramGlyphMap,
-    crop_store: &'a mut Vec<GrayImage>,
-) -> (Vec<crate::font_match::ScoringWindow<'a>>, Vec<(usize, usize)>) {
-    let (windows, pos, _wib) = build_scoring_windows_with_geo(word_segs, crop_store);
-    (windows, pos)
-}
-
 /// Build scoring windows plus geometry measurements in a single scan per character.
 /// Trim to ink is called exactly once per character via `char_crop_and_metrics`,
 /// which does seam handling (whitening) in scan-crop creation and returns center
@@ -738,7 +693,7 @@ pub fn build_scoring_windows_with_geo<'a>(
     // Per-word geo, same order as word_segs, each inner Vec in char order
     let mut wib: Vec<WordGeoMeasurement> = Vec::with_capacity(word_segs.len());
     for _ in 0..word_segs.len() {
-        wib.push(WordGeoMeasurement { chars: Vec::new() });
+        wib.push(WordGeoMeasurement { chars: std::sync::Arc::new(Vec::new()) });
     }
 
     for (seg_idx, seg) in word_segs.iter().enumerate() {
@@ -796,7 +751,7 @@ pub fn build_scoring_windows_with_geo<'a>(
                 char_bounds.push(cb);
             }
         }
-        wib[seg_idx].chars = char_bounds;
+        wib[seg_idx].chars = std::sync::Arc::new(char_bounds);
     }
 
     crop_store.extend(temp_crops);

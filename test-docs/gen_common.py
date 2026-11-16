@@ -69,6 +69,7 @@ FAMILIES = {
     "SpecialElite": "Special Elite",
     # System / MS Core Fonts
     "TimesNewRoman": "Times New Roman",
+    "Nimbus": "Nimbus Roman",  # URW Base 35 clone of Times (NimbusRoman-*.otf)
     "CourierNew": "Courier New",
     "NimbusSans": "Arial",
     "Arial": "Arial",
@@ -478,12 +479,15 @@ def build_canonical_map_from_pdf(pdf_path, all_font_files, catalog_by_path=None,
                     f"Fix the specimen."
                 )
 
-            # Use --resolve-fontkey (Rust as single source of truth) if available,
-            # otherwise fall back to catalog's font_key (may be stale).
-            if unprint_bin and entry.get('path'):
-                fontkey = resolve_fontkey_via_api(unprint_bin, entry['path'])
-            else:
-                fontkey = entry.get('font_key', '')
+            # Use the entry's own font_key verbatim. The entry is the exact
+            # variant picked during generation, and its key came from the Rust
+            # scanner through the catalog, so Rust remains the single source
+            # of truth for key formatting. Do NOT re-resolve by file path:
+            # a path identifies the file, not the instance, and
+            # --resolve-fontkey returns a variable font's DEFAULT instance,
+            # discarding the picked variant (e.g. a line rendered in
+            # Open-Sans-Bold was annotated OpenSans-400).
+            fontkey = entry.get('font_key', '')
             if not fontkey:
                 raise RuntimeError(
                     f"Font entry for '{base}' variant '{variant}' has no font_key. Fix the catalog."

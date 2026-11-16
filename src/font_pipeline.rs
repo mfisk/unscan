@@ -1,9 +1,9 @@
 //! Font matching pipeline stages extracted from `run()`.
 //!
 //! - [`LineMatch`]: per-line font matching result
-//! - [`match_lines`]: Pass 1 — parallel font matching with SSIM fast path
+//! - [`match_lines_fast_path`]: Pass 1 — dominant-font fast path only
+//! - [`match_lines`]: full pipeline — segmentation → font search → font match
 //! - [`update_dominant_font`]: dominant font candidate update after Pass 1
-//! - [`paragraph_font_grouping`]: Pass 1.5 — paragraph-level font grouping
 //!
 //! Rule-out via infinite penalty: if a font does not contain a character that
 //! appears in the string, `per_char_geo` returns `None` (cmap miss). The
@@ -77,6 +77,83 @@ pub struct ObsRankProbs {
     pub gt_ink_width: HashMap<usize, f32>,
 }
 
+/// Insert one observation's rank/prob/glyph/geo values into the chosen-side
+/// maps of `rp` under `key` (F18: the four insert blocks in
+/// `build_obs_rank_probs` were copy-pasted). The chosen side alone falls
+/// back to `best_prob.ln()` for a missing glyph score; that difference
+/// from the GT side is preserved here rather than unified away.
+fn insert_chosen_obs(rp: &mut ObsRankProbs, key: usize, obs: &font_match::ObservationDetail) {
+    rp.chosen_ranks.insert(key, 1);
+    // prefer actual prob from classifier, fall back to best_prob
+    if let Some(p) = obs.prob { rp.chosen_probs.insert(key, p); }
+    else if obs.best_prob > 0.0 { rp.chosen_probs.insert(key, obs.best_prob); }
+    if let Some(gs) = obs.glyph_score { rp.chosen_glyph_scores.insert(key, gs); }
+    else if obs.best_prob > 0.0 { rp.chosen_glyph_scores.insert(key, obs.best_prob.ln()); }
+    if let Some(h) = obs.geo_h_ll { rp.chosen_geo_h_ll.insert(key, h); }
+    if let Some(v) = obs.geo_v_ll { rp.chosen_geo_v_ll.insert(key, v); }
+    if let Some(he) = obs.geo_h_err { rp.chosen_geo_h_err.insert(key, he); }
+    if let Some(ve) = obs.geo_v_err { rp.chosen_geo_v_err.insert(key, ve); }
+    if let Some(u) = obs.geo_h_overlap_correction_px { rp.chosen_geo_h_overlap_correction.insert(key, u); }
+    if let Some(v) = obs.obs_cx { rp.chosen_obs_cx.insert(key, v); }
+    if let Some(v) = obs.pred_cx { rp.chosen_pred_cx.insert(key, v); }
+    if let Some(v) = obs.obs_pitch { rp.chosen_obs_pitch.insert(key, v); }
+    if let Some(v) = obs.pred_pitch { rp.chosen_pred_pitch.insert(key, v); }
+    if let Some(v) = obs.geo_scale { rp.chosen_geo_scale.insert(key, v); }
+    if let Some(v) = obs.ink_width { rp.chosen_ink_width.insert(key, v); }
+}
+
+/// Insert one observation's rank/prob/glyph/geo values into the GT-side
+/// maps of `rp` under `key` (F18; the GT side has no glyph-score
+/// fallback — see `insert_chosen_obs`).
+fn insert_gt_obs(rp: &mut ObsRankProbs, key: usize, obs: &font_match::ObservationDetail) {
+    rp.gt_ranks.insert(key, 1);
+    if let Some(p) = obs.prob { rp.gt_probs.insert(key, p); }
+    else if obs.best_prob > 0.0 { rp.gt_probs.insert(key, obs.best_prob); }
+    if let Some(gs) = obs.glyph_score { rp.gt_glyph_scores.insert(key, gs); }
+    if let Some(h) = obs.geo_h_ll { rp.gt_geo_h_ll.insert(key, h); }
+    if let Some(v) = obs.geo_v_ll { rp.gt_geo_v_ll.insert(key, v); }
+    if let Some(he) = obs.geo_h_err { rp.gt_geo_h_err.insert(key, he); }
+    if let Some(ve) = obs.geo_v_err { rp.gt_geo_v_err.insert(key, ve); }
+    if let Some(u) = obs.geo_h_overlap_correction_px { rp.gt_geo_h_overlap_correction.insert(key, u); }
+    if let Some(v) = obs.obs_cx { rp.gt_obs_cx.insert(key, v); }
+    if let Some(v) = obs.pred_cx { rp.gt_pred_cx.insert(key, v); }
+    if let Some(v) = obs.obs_pitch { rp.gt_obs_pitch.insert(key, v); }
+    if let Some(v) = obs.pred_pitch { rp.gt_pred_pitch.insert(key, v); }
+    if let Some(v) = obs.geo_scale { rp.gt_geo_scale.insert(key, v); }
+    if let Some(v) = obs.ink_width { rp.gt_ink_width.insert(key, v); }
+}
+
+/// Map one winning/GT `WordSeg` to its audit summary (F19: the two
+/// mapping closures in `match_lines` were identical).
+fn word_seg_summary(ws: &crate::segment::WordSeg) -> crate::audit::WordSegSummary {
+    crate::audit::WordSegSummary {
+        word_text: ws.word_text.clone(),
+        source_word_idx: ws.source_word_idx,
+        image_w: ws.image_w,
+        image_h: ws.image_h,
+        n_chars_expected: ws.n_chars_expected,
+        n_segments_produced: ws.n_segments_produced,
+        mismatch: ws.mismatch,
+        ws_splits: ws.ws_splits.clone(),
+        seam_splits: ws.seam_splits.clone(),
+        seam_paths: ws.seam_paths.clone(),
+        seam_costs: ws.seam_costs.clone(),
+    }
+}
+
+/// Build the single-word `TextRegion` for a line's text-color detection
+/// (F20: the fast-path and full-pipeline constructions were identical).
+fn line_text_region(line: &TextLine) -> TextRegion {
+    TextRegion {
+        text: line.text.clone(),
+        x: line.x, y: line.y,
+        width: line.width, height: line.height,
+        font_size_pt: line.font_size_pt,
+        confidence: line.confidence,
+        level: 5, block_num: 0, par_num: 0, line_num: 0, word_num: 0,
+    }
+}
+
 /// Build per-observation rank/prob/glyph/geo maps for one path's observations
 /// against the GT observations (no recompute — `identify_fonts` already
 /// computed best_prob, logit as glyph_score, and geo_ll for each path).
@@ -89,23 +166,7 @@ fn build_obs_rank_probs(
 ) -> ObsRankProbs {
     let mut rp = ObsRankProbs::default();
     for obs in observations {
-        rp.chosen_ranks.insert(obs.crop_index, 1);
-        // prefer actual prob from classifier, fall back to best_prob
-        if let Some(p) = obs.prob { rp.chosen_probs.insert(obs.crop_index, p); }
-        else if obs.best_prob > 0.0 { rp.chosen_probs.insert(obs.crop_index, obs.best_prob); }
-        if let Some(gs) = obs.glyph_score { rp.chosen_glyph_scores.insert(obs.crop_index, gs); }
-        else if obs.best_prob > 0.0 { rp.chosen_glyph_scores.insert(obs.crop_index, obs.best_prob.ln()); }
-        if let Some(h) = obs.geo_h_ll { rp.chosen_geo_h_ll.insert(obs.crop_index, h); }
-        if let Some(v) = obs.geo_v_ll { rp.chosen_geo_v_ll.insert(obs.crop_index, v); }
-        if let Some(he) = obs.geo_h_err { rp.chosen_geo_h_err.insert(obs.crop_index, he); }
-        if let Some(ve) = obs.geo_v_err { rp.chosen_geo_v_err.insert(obs.crop_index, ve); }
-        if let Some(u) = obs.geo_h_overlap_correction_px { rp.chosen_geo_h_overlap_correction.insert(obs.crop_index, u); }
-        if let Some(v) = obs.obs_cx { rp.chosen_obs_cx.insert(obs.crop_index, v); }
-        if let Some(v) = obs.pred_cx { rp.chosen_pred_cx.insert(obs.crop_index, v); }
-        if let Some(v) = obs.obs_pitch { rp.chosen_obs_pitch.insert(obs.crop_index, v); }
-        if let Some(v) = obs.pred_pitch { rp.chosen_pred_pitch.insert(obs.crop_index, v); }
-        if let Some(v) = obs.geo_scale { rp.chosen_geo_scale.insert(obs.crop_index, v); }
-        if let Some(v) = obs.ink_width { rp.chosen_ink_width.insert(obs.crop_index, v); }
+        insert_chosen_obs(&mut rp, obs.crop_index, obs);
     }
     // GT side – from scoring.gt_observations (ensure font)
     // When window counts differ (ligature difference, e.g. Office 4 vs 5 glyphs),
@@ -114,21 +175,7 @@ fn build_obs_rank_probs(
     // mapping when k equal (common case, including p3:L34).
     if observations.len() == gt_observations.len() {
         for obs in gt_observations {
-            rp.gt_ranks.insert(obs.crop_index, 1);
-            if let Some(p) = obs.prob { rp.gt_probs.insert(obs.crop_index, p); }
-            else if obs.best_prob > 0.0 { rp.gt_probs.insert(obs.crop_index, obs.best_prob); }
-            if let Some(gs) = obs.glyph_score { rp.gt_glyph_scores.insert(obs.crop_index, gs); }
-            if let Some(h) = obs.geo_h_ll { rp.gt_geo_h_ll.insert(obs.crop_index, h); }
-            if let Some(v) = obs.geo_v_ll { rp.gt_geo_v_ll.insert(obs.crop_index, v); }
-            if let Some(he) = obs.geo_h_err { rp.gt_geo_h_err.insert(obs.crop_index, he); }
-            if let Some(ve) = obs.geo_v_err { rp.gt_geo_v_err.insert(obs.crop_index, ve); }
-            if let Some(u) = obs.geo_h_overlap_correction_px { rp.gt_geo_h_overlap_correction.insert(obs.crop_index, u); }
-            if let Some(v) = obs.obs_cx { rp.gt_obs_cx.insert(obs.crop_index, v); }
-            if let Some(v) = obs.pred_cx { rp.gt_pred_cx.insert(obs.crop_index, v); }
-            if let Some(v) = obs.obs_pitch { rp.gt_obs_pitch.insert(obs.crop_index, v); }
-            if let Some(v) = obs.pred_pitch { rp.gt_pred_pitch.insert(obs.crop_index, v); }
-            if let Some(v) = obs.geo_scale { rp.gt_geo_scale.insert(obs.crop_index, v); }
-            if let Some(v) = obs.ink_width { rp.gt_ink_width.insert(obs.crop_index, v); }
+            insert_gt_obs(&mut rp, obs.crop_index, obs);
         }
     } else {
         // Differing k – align by glyph identity, not ordinal.
@@ -142,21 +189,7 @@ fn build_obs_rank_probs(
             if gi >= gt_sorted.len() { break; }
             if gt_sorted[gi].ch == wo.ch {
                 let go = gt_sorted[gi];
-                rp.gt_ranks.insert(wo.crop_index, 1);
-                if let Some(p) = go.prob { rp.gt_probs.insert(wo.crop_index, p); }
-                else if go.best_prob > 0.0 { rp.gt_probs.insert(wo.crop_index, go.best_prob); }
-                if let Some(gs) = go.glyph_score { rp.gt_glyph_scores.insert(wo.crop_index, gs); }
-                if let Some(h) = go.geo_h_ll { rp.gt_geo_h_ll.insert(wo.crop_index, h); }
-                if let Some(v) = go.geo_v_ll { rp.gt_geo_v_ll.insert(wo.crop_index, v); }
-                if let Some(he) = go.geo_h_err { rp.gt_geo_h_err.insert(wo.crop_index, he); }
-                if let Some(ve) = go.geo_v_err { rp.gt_geo_v_err.insert(wo.crop_index, ve); }
-                if let Some(u) = go.geo_h_overlap_correction_px { rp.gt_geo_h_overlap_correction.insert(wo.crop_index, u); }
-                if let Some(v) = go.obs_cx { rp.gt_obs_cx.insert(wo.crop_index, v); }
-                if let Some(v) = go.pred_cx { rp.gt_pred_cx.insert(wo.crop_index, v); }
-                if let Some(v) = go.obs_pitch { rp.gt_obs_pitch.insert(wo.crop_index, v); }
-                if let Some(v) = go.pred_pitch { rp.gt_pred_pitch.insert(wo.crop_index, v); }
-                if let Some(v) = go.geo_scale { rp.gt_geo_scale.insert(wo.crop_index, v); }
-                if let Some(v) = go.ink_width { rp.gt_ink_width.insert(wo.crop_index, v); }
+                insert_gt_obs(&mut rp, wo.crop_index, go);
                 gi += 1;
             } else {
                 // Look ahead for same char – skip GT extras (e.g. f, fi before c).
@@ -169,21 +202,7 @@ fn build_obs_rank_probs(
                 }
                 if let Some(fidx) = found {
                     let go = gt_sorted[fidx];
-                    rp.gt_ranks.insert(wo.crop_index, 1);
-                    if let Some(p) = go.prob { rp.gt_probs.insert(wo.crop_index, p); }
-                    else if go.best_prob > 0.0 { rp.gt_probs.insert(wo.crop_index, go.best_prob); }
-                    if let Some(gs) = go.glyph_score { rp.gt_glyph_scores.insert(wo.crop_index, gs); }
-                    if let Some(h) = go.geo_h_ll { rp.gt_geo_h_ll.insert(wo.crop_index, h); }
-                    if let Some(v) = go.geo_v_ll { rp.gt_geo_v_ll.insert(wo.crop_index, v); }
-                    if let Some(he) = go.geo_h_err { rp.gt_geo_h_err.insert(wo.crop_index, he); }
-                    if let Some(ve) = go.geo_v_err { rp.gt_geo_v_err.insert(wo.crop_index, ve); }
-                    if let Some(u) = go.geo_h_overlap_correction_px { rp.gt_geo_h_overlap_correction.insert(wo.crop_index, u); }
-                    if let Some(v) = go.obs_cx { rp.gt_obs_cx.insert(wo.crop_index, v); }
-                    if let Some(v) = go.pred_cx { rp.gt_pred_cx.insert(wo.crop_index, v); }
-                    if let Some(v) = go.obs_pitch { rp.gt_obs_pitch.insert(wo.crop_index, v); }
-                    if let Some(v) = go.pred_pitch { rp.gt_pred_pitch.insert(wo.crop_index, v); }
-                    if let Some(v) = go.geo_scale { rp.gt_geo_scale.insert(wo.crop_index, v); }
-                    if let Some(v) = go.ink_width { rp.gt_ink_width.insert(wo.crop_index, v); }
+                    insert_gt_obs(&mut rp, wo.crop_index, go);
                     gi = fidx + 1;
                 } else {
                     // No GT counterpart (e.g. winner ffi not supported by GT Caladea) – leave —.
@@ -228,6 +247,14 @@ pub struct LineMatch {
     pub fast_path: bool,
     /// ZNCC verify score from the fast-path check (so pass 2a can skip re-verification).
     pub fast_path_score: Option<f32>,
+    /// Contrast-normalized crop of the line bbox, computed once in
+    /// [`match_lines`] for the verify calls and reused by Pass 2a instead
+    /// of re-cropping + re-normalizing the same bbox (redundancy F9).
+    /// The line bbox is stable from Pass 1 through Pass 2a (word splitting
+    /// only rebuilds `line.words`), so the stored crop is the one Pass 2a
+    /// would compute. `None` for filter placeholders (never scored) and
+    /// fast-path lines (Pass 2a skips re-verification via `fast_path_score`).
+    pub norm_crop: Option<image::GrayImage>,
     /// Median em_px derived from midpoint center-span scales (obs_span/pred_span * upem).
     /// This reuses the exact scale calculation from geometry scoring for font-size,
     /// fixing L9 fox/jumps too-small issue where width-matched median was dragged down.
@@ -247,14 +274,6 @@ pub struct LineMatch {
 
 /// Minimum SSIM score for the fast-path dominant-font check.
 const FAST_PATH_MIN_SSIM: f32 = 0.95;
-
-/// Pass 1: parallel font matching with SSIM fast path.
-///
-/// For each line, tries the dominant font candidate via SSIM first; lines that
-/// pass skip segmentation and font matching entirely. Misses fall through to the full
-/// pipeline: segmentation → font search → font selection with tie-break.
-///
-/// Returns `(line_matches, fast_path_hit_count)`.
 
 /// Save observation crops to a subdirectory under diag_dir.
 /// Save observation crop images for the audit report.
@@ -310,39 +329,23 @@ fn save_obs_crops(
     }
 }
 
-pub fn match_lines(
-    lines: &[TextLine],
-    gray_page: &image::GrayImage,
-    rgba_page: &image::RgbaImage,
-    page_img: &image::DynamicImage,
-    page_num: usize,
-    font_registry: &font_scan::FontRegistry,
-    font_cache: &font_cache::FontCache,
-    geo_cache: &crate::geo_cache::GeometryCache,
-    classifier: &dyn classifier::Classifier,
-    glyph_map: &NgramGlyphMap,
-    ground_truth: Option<&ground_truth::GroundTruth>,
-    dominant_font_candidate: Option<&font_match::FontMatchResult>,
+/// Remove stale per-line diag dirs from a previous run in the same audit dir.
+///
+/// Serial, before any parallel work: cleaning inside the par_iter could race
+/// and would silently ignore errors, and could delete a dir that a later pass
+/// just recreated when old and new slugs are identical (line.text unchanged
+/// after word-split). When `filter` is set, only the filtered lines'
+/// prefixes are cleaned; otherwise every line on the page is cleaned.
+pub fn clean_stale_diag_dirs(
     args: &cli::Args,
-    // When set, only these line indices get diag/audit output on disk.
-    audit_line_filter: Option<&std::collections::HashSet<usize>>,
-    // Per-font LDA OCR correction data (None = skip correction)
-    training_data: Option<&crate::train::RuntimeTrainingData>,
-) -> (Vec<LineMatch>, u64) {
-    let fast_path_font_data: Option<std::sync::Arc<Vec<u8>>> = dominant_font_candidate
-        .and_then(|fm| font_cache.load(&fm.font_path).ok());
-    let fast_path_hits = AtomicU64::new(0);
-
-    // ── Serialized diag-dir stale cleanup (before parallel work) ──
-    // Previously this was inside the par_iter with `let _ = remove_dir_all`,
-    // which could race and would silently ignore errors, and also deleted
-    // the dir that Pass1b had just recreated when old and new slugs are
-    // identical (line.text unchanged after word-split). We now clean once,
-    // serially, before any workers start.
+    lines: &[TextLine],
+    page_num: usize,
+    filter: Option<&std::collections::HashSet<usize>>,
+) {
     if let Some(diag_root) = args.diag_seg_dir() {
         let mut prefixes: Vec<String> = Vec::new();
         for (li, _line) in lines.iter().enumerate() {
-            if audit_line_filter.as_ref().map_or(true, |f| f.contains(&li)) {
+            if filter.as_ref().map_or(true, |f| f.contains(&li)) {
                 let line_num = li + 1;
                 prefixes.push(format!("p{}_L{:03}_", page_num, line_num));
             }
@@ -382,10 +385,174 @@ pub fn match_lines(
             }
         }
     }
+}
 
+/// Pass 1: dominant-font fast path only.
+///
+/// For each line, renders the dominant font candidate and computes ZNCC via
+/// `verify_text_region`. A line whose score clears `FAST_PATH_MIN_SSIM` is
+/// done: its `LineMatch` carries `fast_path: true` and `fast_path_score`,
+/// with no segmentation and no observations, and Pass 2a skips re-verification.
+/// Lines that miss return `None` — the full pipeline scores them.
+///
+/// Pass 1 performs no segmentation and no font matching.
+///
+/// Returns `(per_line_results, fast_path_hit_count)`.
+pub fn match_lines_fast_path(
+    lines: &[TextLine],
+    gray_page: &image::GrayImage,
+    rgba_page: &image::RgbaImage,
+    font_registry: &font_scan::FontRegistry,
+    font_cache: &font_cache::FontCache,
+    dominant_font_candidate: Option<&font_match::FontMatchResult>,
+) -> (Vec<Option<LineMatch>>, u64) {
+    let fast_path_font_data: Option<std::sync::Arc<Vec<u8>>> = dominant_font_candidate
+        .and_then(|fm| font_cache.load(&fm.font_path).ok());
+    let fast_path_hits = AtomicU64::new(0);
+
+    let results: Vec<Option<LineMatch>> = lines.par_iter().map(|line| {
+        // Without a dominant font there is nothing to verify against.
+        let (fm, fd) = match (dominant_font_candidate, &fast_path_font_data) {
+            (Some(fm), Some(fd)) => (fm, fd),
+            _ => return None,
+        };
+        // Crop and contrast-normalize the word-union bbox for the verify call.
+        let norm_crop = {
+            let iw = gray_page.width();
+            let ih = gray_page.height();
+            let cx = line.x.min(iw.saturating_sub(1));
+            let cy = line.y.min(ih.saturating_sub(1));
+            let cw = line.width.min(iw - cx);
+            let ch = line.height.min(ih - cy);
+            let raw = image::imageops::crop_imm(gray_page, cx, cy, cw, ch).to_image();
+            features::contrast_normalize_char(raw)
+        };
+        // The dominant font arrives as a FontMatchResult (no
+        // FontEntry); resolve its lig set through the registry.
+        let fm_lig = font_registry.by_key(&fm.font_key)
+            .map(|fe| fe.collapsed_lig_set()).unwrap_or(0);
+        let vr = verify::verify_text_region(
+            &norm_crop,
+            fd.as_slice(),
+            &fm.font_path,
+            &line.text,
+            &line.words,
+            line.x, line.y,
+            fm.glyph_overrides.as_deref(),
+            &fm.variant_tag,
+            fm.variations.as_deref(),
+            true,
+            fm_lig,
+            None,
+            Some(FAST_PATH_MIN_SSIM),
+            None,
+            None,
+        );
+        if vr.score >= FAST_PATH_MIN_SSIM {
+            fast_path_hits.fetch_add(1, Ordering::Relaxed);
+            let text_color = color::detect_text_color_from_buffers(
+                gray_page,
+                rgba_page,
+                &line_text_region(line),
+            );
+            let mut result = fm.clone();
+            result.best_dy = vr.dy;
+            Some(LineMatch {
+                font_result: Some(result),
+                text_color,
+                font_scores: Vec::new(),
+                observations: Vec::new(),
+                gt_observations: Vec::new(),
+                // Fast path performs no segmentation; re-verification is
+                // skipped for these lines (fast_path_score is Some).
+                seg_used_ligatures: false,
+                diag_seg_dir: None,
+                obs_rank_probs: ObsRankProbs::default(),
+                gt_obs_rank_probs: ObsRankProbs::default(),
+                tie_candidates: Vec::new(),
+                corrected_words: None,
+                fast_path: true,
+                fast_path_score: Some(vr.score),
+                norm_crop: None,
+                midpoint_em_px: None,
+                gt_midpoint_em_px: None,
+                word_seg_summaries: Vec::new(),
+                gt_word_seg_summaries: Vec::new(),
+                gt_per_char_geo_ll: Vec::new(),
+                ocr_corrections: Vec::new(),
+            })
+        } else {
+            None
+        }
+    }).collect();
+
+    let fp_hits = fast_path_hits.load(Ordering::Relaxed);
+    (results, fp_hits)
+}
+
+/// Full pipeline: parallel font matching — segmentation → font search →
+/// font selection with tie-break.
+///
+/// This is the non-fast-path scoring pass. Lines the fast path already
+/// matched are excluded via `audit_line_filter` (the Pass 1 caller passes
+/// the missed-lines set); Pass 1b passes the split-lines set. Filtered-out
+/// lines return unscored placeholders, never read by the caller.
+pub fn match_lines(
+    lines: &[TextLine],
+    gray_page: &image::GrayImage,
+    rgba_page: &image::RgbaImage,
+    page_img: &image::DynamicImage,
+    page_num: usize,
+    font_registry: &font_scan::FontRegistry,
+    font_cache: &font_cache::FontCache,
+    geo_cache: &crate::geo_cache::GeometryCache,
+    classifier: &dyn classifier::Classifier,
+    glyph_map: &NgramGlyphMap,
+    ground_truth: Option<&ground_truth::GroundTruth>,
+    args: &cli::Args,
+    // When set, only these line indices are scored; every other line
+    // returns an unscored placeholder (its Pass 1 result stands — the
+    // Pass 1b caller swaps in only the filtered lines' results and drops
+    // the rest). The filter also gates diag/audit output on disk.
+    audit_line_filter: Option<&std::collections::HashSet<usize>>,
+    // Per-font LDA OCR correction data (None = skip correction)
+    training_data: Option<&crate::train::RuntimeTrainingData>,
+) -> Vec<LineMatch> {
     // Profiling accumulators (microseconds, atomic for par_iter)
     let line_matches: Vec<LineMatch> = lines.par_iter().enumerate().map(|(li, line)| {
         let line_num = li + 1; // 1-indexed for output
+        // Pass 1b filter: this line was not split, so its Pass 1 result
+        // stands. Return an unscored placeholder without doing any work —
+        // the caller swaps in only the filtered lines' results and drops
+        // the rest, so this value is never read. It exists only to keep
+        // indices aligned with the input slice (diag-dir naming and the
+        // caller's swap both index by the original line number).
+        if let Some(f) = audit_line_filter {
+            if !f.contains(&li) {
+                return LineMatch {
+                    font_result: None,
+                    text_color: (0, 0, 0),
+                    font_scores: Vec::new(),
+                    observations: Vec::new(),
+                    gt_observations: Vec::new(),
+                    seg_used_ligatures: false,
+                    diag_seg_dir: None,
+                    obs_rank_probs: ObsRankProbs::default(),
+                    gt_obs_rank_probs: ObsRankProbs::default(),
+                    tie_candidates: Vec::new(),
+                    corrected_words: None,
+                    fast_path: false,
+                    fast_path_score: None,
+                    norm_crop: None,
+                    midpoint_em_px: None,
+                    gt_midpoint_em_px: None,
+                    word_seg_summaries: Vec::new(),
+                    gt_word_seg_summaries: Vec::new(),
+                    gt_per_char_geo_ll: Vec::new(),
+                    ocr_corrections: Vec::new(),
+                };
+            }
+        }
         // Crop and contrast-normalize the word-union bbox once for all verify calls.
         let norm_crop = {
             let iw = gray_page.width();
@@ -398,71 +565,6 @@ pub fn match_lines(
             features::contrast_normalize_char(raw)
         };
 
-        // ── Fast path: try dominant font via SSIM ────────────────
-        if let (Some(fm), Some(ref fd)) = (dominant_font_candidate, &fast_path_font_data) {
-            // The dominant font arrives as a FontMatchResult (no
-            // FontEntry); resolve its lig set through the registry.
-            let fm_lig = font_registry.by_key(&fm.font_key)
-                .map(|fe| fe.collapsed_lig_set()).unwrap_or(0);
-            let vr = verify::verify_text_region(
-                &norm_crop,
-                fd.as_slice(),
-                &line.text,
-                &line.words,
-                line.x, line.y,
-                fm.glyph_overrides.as_deref(),
-                &fm.variant_tag,
-                fm.variations.as_deref(),
-                true,
-                fm_lig,
-                None,
-                Some(FAST_PATH_MIN_SSIM),
-                None,
-                None,
-            );
-            if vr.score >= FAST_PATH_MIN_SSIM {
-                fast_path_hits.fetch_add(1, Ordering::Relaxed);
-                let text_color = color::detect_text_color_from_buffers(
-                    gray_page,
-                    rgba_page,
-                    &TextRegion {
-                        text: line.text.clone(),
-                        x: line.x, y: line.y,
-                        width: line.width, height: line.height,
-                        font_size_pt: line.font_size_pt,
-                        confidence: line.confidence,
-                        level: 5, block_num: 0, par_num: 0, line_num: 0, word_num: 0,
-                    },
-                );
-                let mut result = fm.clone();
-                result.best_dy = vr.dy;
-                return LineMatch {
-                    font_result: Some(result),
-                    text_color,
-                    font_scores: Vec::new(),
-                    observations: Vec::new(),
-                    gt_observations: Vec::new(),
-                    // Fast path performs no segmentation; re-verification is
-                    // skipped for these lines (fast_path_score is Some).
-                    seg_used_ligatures: false,
-                    diag_seg_dir: None,
-                    obs_rank_probs: ObsRankProbs::default(),
-                    gt_obs_rank_probs: ObsRankProbs::default(),
-                    tie_candidates: Vec::new(),
-                    corrected_words: None,
-                    fast_path: true,
-                    fast_path_score: Some(vr.score),
-                    midpoint_em_px: None,
-                    gt_midpoint_em_px: None,
-                    word_seg_summaries: Vec::new(),
-                    gt_word_seg_summaries: Vec::new(),
-                    gt_per_char_geo_ll: Vec::new(),
-                    ocr_corrections: Vec::new(),
-                };
-            } else if li < 3 {
-            }
-        }
-
         // ── Full pipeline: segmentation → font search → font match ─
         let _preview_end = {
             let mut end = line.text.len().min(30);
@@ -473,14 +575,7 @@ pub fn match_lines(
         let text_color = color::detect_text_color_from_buffers(
             gray_page,
             rgba_page,
-            &TextRegion {
-                text: line.text.clone(),
-                x: line.x, y: line.y,
-                width: line.width, height: line.height,
-                font_size_pt: line.font_size_pt,
-                confidence: line.confidence,
-                level: 5, block_num: 0, par_num: 0, line_num: 0, word_num: 0,
-            },
+            &line_text_region(line),
         );
         let font_scores: Vec<(String, Option<f32>)>;
         let mut observations: Vec<font_match::ObservationDetail>;
@@ -510,6 +605,16 @@ pub fn match_lines(
                 height: w.height,
             })
             .collect();
+        // Per-line segmentation cache: segment_line (diag),
+        // identify_fonts and the winner rebuild segment the same word
+        // crops with the same k; each distinct (image, k, exemption)
+        // triple is computed once. Threaded explicitly — never a global
+        // — so parallel lines never share state. The GT and tie-break
+        // rebuilds share this cache too (finding F12): they segment
+        // the same word_infos images with the same k and the same
+        // trailing-punctuation exemption state, so a shared entry is
+        // the same computation.
+        let mut seg_cache = crate::segment::SegmentCache::new();
         // Diagnostic-only segmentation: write the seam diagnostics
         // (word_crop.png, seg_plain/summary.json, seg_lig/...) for this
         // line. Scoring uses identify_fonts' own per-font segmentation;
@@ -518,26 +623,46 @@ pub fn match_lines(
         // segment_line was the only caller that wrote these files, and
         // a92d0bb (2026-08-11) removed the call, orphaning the writes.
         // Gated on diag_seg_dir so non-audit runs pay nothing.
-        if diag_seg_dir.is_some() {
+        let diag_crops = if diag_seg_dir.is_some() {
             let word_height = line.words.iter().map(|w| w.height).max().unwrap_or(0);
-            let _diag_crops = crate::segment::segment_line(
+            Some(crate::segment::segment_line(
                 gray_page, &word_placements, word_height,
                 diag_seg_dir.as_deref(),
                 &args.render_params(),
-            );
-        }
+                &mut seg_cache,
+            ))
+        } else {
+            None
+        };
+        // (F10) Index the diag pass's word crops by source word so
+        // word_infos reuses them instead of re-cropping + re-normalizing
+        // the same bbox. The diag pass crops the identical bbox with the
+        // identical pure function, so a reused crop is bit-identical to
+        // a fresh one. Words the diag pass did not cover fall back to a
+        // fresh crop below; non-audit runs have no diag pass at all.
+        // Consuming the LineCrops drops the diag WordSeg shells (their
+        // seam data lives in the seg cache); only the image Arcs are kept.
+        let diag_crop_by_word: std::collections::HashMap<usize, std::sync::Arc<image::GrayImage>> =
+            match diag_crops {
+                Some(crops) => crops
+                    .word_segs
+                    .into_iter()
+                    .map(|s| (s.source_word_idx, s.word_img))
+                    .collect(),
+                None => std::collections::HashMap::new(),
+            };
         // Per-font pipeline: segmentation now happens inside identify_fonts.
         // ── Per-font ligature handling: build word image infos for inside identify_fonts ──
         use std::sync::Arc;
-        // Build filtered word infos (replicates segment_line filtering but without segmentation)
+        // Build word infos for every word on the line. No word is dropped:
+        // the old character-coverage filter (drop a word whose chars had
+        // all been seen twice) predates geometry scoring, where letter
+        // pairs matter, so every word's observations are scored.
         let word_infos: Vec<font_match::WordImgInfo> = {
             let pw = gray_page.width();
             let ph = gray_page.height();
-            let audit_all = crate::features::audit_all_chars_enabled();
-            let mut char_counts: std::collections::HashMap<char, usize> = std::collections::HashMap::new();
             let mut sorted: Vec<(usize, &crate::ocr::TextRegion)> = line.words.iter().enumerate().collect();
             // Sort left-to-right by x-position for correct character ordering.
-            // (Was: sort by char count descending, which reversed word order and broke geometry.)
             sorted.sort_by(|a,b| a.1.x.cmp(&b.1.x));
             let mut infos = Vec::new();
             for (orig_idx, w) in sorted {
@@ -547,22 +672,26 @@ pub fn match_lines(
                 let cw = ww.min(pw - wx);
                 let ch = wh.min(ph - wy);
                 if cw < 2 || ch < 2 { continue; }
-                let chars_supported: Vec<char> = if audit_all { w.text.chars().collect() } else { w.text.chars().filter(|c| crate::features::is_supported(*c)).collect() };
-                if !audit_all && chars_supported.len() <= 1 { continue; }
-                let need_any = if audit_all { true } else { chars_supported.iter().any(|c| char_counts.get(c).copied().unwrap_or(0) < 2) };
-                if !audit_all && chars_supported.len() > 2 && !need_any { continue; }
-                for &c in &chars_supported { if audit_all || crate::features::is_supported(c) { *char_counts.entry(c).or_insert(0) += 1; } }
-                let word_img = image::imageops::crop_imm(gray_page, wx, wy, cw, ch).to_image();
-                let word_img = crate::features::contrast_normalize_char(word_img);
+                // (F10) Reuse the diag pass's crop for this word when it
+                // has one; otherwise crop + normalize fresh (same bbox,
+                // same pure function, so the result is identical either
+                // way).
+                let word_img: Arc<image::GrayImage> = match diag_crop_by_word.get(&orig_idx) {
+                    Some(img) => img.clone(),
+                    None => {
+                        let word_img = image::imageops::crop_imm(gray_page, wx, wy, cw, ch).to_image();
+                        Arc::new(crate::features::contrast_normalize_char(word_img))
+                    }
+                };
                 let all_chars: Vec<char> = w.text.chars().collect();
                 if all_chars.is_empty() { continue; }
-                infos.push(font_match::WordImgInfo::new(Arc::new(word_img), all_chars, orig_idx, w.text.clone()));
+                infos.push(font_match::WordImgInfo::new(word_img, all_chars, orig_idx, w.text.clone()));
             }
             infos
         };
 
         // Helper to build per-font WordSegs + wib for any font entry (used for tie and winner recompute)
-        let build_for_font = |fe: &crate::font_scan::FontEntry, infos: &[font_match::WordImgInfo], gt_segmentation: bool| -> Option<(Vec<crate::segment::WordSeg>, Vec<crate::geometry_classifier::WordGeoMeasurement>, Vec<image::GrayImage>, Vec<(usize,usize)>)> {
+        let build_for_font = |fe: &crate::font_scan::FontEntry, infos: &[font_match::WordImgInfo], gt_segmentation: bool, seg_cache: &mut crate::segment::SegmentCache| -> Option<(Vec<crate::segment::WordSeg>, Vec<crate::geometry_classifier::WordGeoMeasurement>, Vec<image::GrayImage>, Vec<(usize,usize)>)> {
             // GT segmentation uses the GT ligature mask (Finding 9):
             // collapse a pair when the render would produce fused ink —
             // either the variant is lig, or the separate glyphs overlap so
@@ -576,14 +705,19 @@ pub fn match_lines(
                 let collapsed = crate::segment::collapse_ligature_chars_for_allowed(&wi.orig_chars, allowed);
                 let k = collapsed.len();
                 if k == 0 { continue; }
-                let (bounds, seams, summary) = crate::segment::segment_characters(&wi.img, k);
+                // Shared per-line cache: identify_fonts already segmented
+                // this (image, k) for scoring; the diag pass did too.
+                // The entry is chosen-only, bit-identical to a fresh
+                // `segment_characters` call.
+                let cached = seg_cache.get_or_compute(&wi.img, k, &wi.text);
+                let (bounds, seams, summary) = (cached.bounds.clone(), cached.seams.clone(), cached.summary.clone());
                 segs.push(crate::segment::WordSeg {
                     source_word_idx: wi.source_idx,
                     word_img: wi.img.clone(),
                     chars: collapsed,
                     boundaries: bounds,
                     seam_paths: Arc::new(seams),
-                    seam_costs: Arc::new(summary.seam_costs.clone()),
+                    seam_costs: summary.seam_costs.clone(),
                     crop_h: wi.img.height(),
                     word_text: wi.text.clone(),
                     image_w: summary.image_w,
@@ -601,24 +735,38 @@ pub fn match_lines(
             Some((segs, wib, crop_store, p_map))
         };
 
+        // ── Ground-truth font name, looked up once per line (F17) ─────
+        // The ensure-key resolution below and the _is_miss gate both need
+        // the GT font name for this line's bbox; lookup_font runs the same
+        // span search both times, so retain the name and pass it to the
+        // hit check instead of looking it up again.
+        let gt_font_name: Option<String> = ground_truth.as_ref().and_then(|gt| {
+            let bbox_px = [line.x as f32, line.y as f32,
+                           (line.x + line.width) as f32,
+                           (line.y + line.height) as f32];
+            gt.lookup_font(page_num, &bbox_px, args.dpi).map(|s| s.to_string())
+        });
+
         let (font_result, tie_candidates_audit, gt_font_key, winning_segs, winning_wib, winning_pos_map, winning_crops) = {
 
             // ── Resolve ground-truth font key (if available) ─────
             // In --test mode, the GT MUST resolve to a registry entry. If the lookup
             // fails, error out instead of silently proceeding with an empty ensure list
             // (which would allow geometry pruning to eliminate the GT).
-            let gt_font_key: Option<String> = ground_truth.as_ref().and_then(|gt| {
-                let bbox_px = [line.x as f32, line.y as f32,
-                               (line.x + line.width) as f32,
-                               (line.y + line.height) as f32];
-                let gt_font_name = gt.lookup_font(page_num, &bbox_px, args.dpi)?;
+            let gt_font_key: Option<String> = gt_font_name.as_deref().and_then(|gt_font_name| {
                 let gt_ps = ground_truth::strip_subset_prefix_str(gt_font_name);
-                // Match against full explicit key (with bracketed variations)
-                // as well as base postscript_name, since GT annotations now
-                // carry the full form (e.g., "SourceSerif4-400Italic[wght=400,opsz=10]").
-                let found = font_registry.iter()
-                    .find(|fe| fe.postscript_name == gt_ps || fe.font_key() == gt_ps)
-                    .map(|fe| fe.font_key());
+                // Exact font-key match first: GT annotations carry the full
+                // verbatim key (e.g. "SourceSerif4-400Italic|version=4.00|kern|nolig[wght=400,opsz=10]"),
+                // and a specified version is honored exactly. Otherwise a
+                // bare PostScript name (no version specified) resolves to
+                // the latest version, then the shared variant preference —
+                // the first registry entry in scan order is arbitrary with
+                // respect to version.
+                let found = font_registry.by_key(&gt_ps).map(|fe| fe.font_key())
+                    .or_else(|| {
+                        crate::font_scan::best_entry_for_ps_name(font_registry.iter(), &gt_ps)
+                            .map(|fe| fe.font_key())
+                    });
                 if found.is_none() {
                     // GT lookup failed in test mode — this is a bug, not a skip.
                     // The GT annotation refers to a font not in the registry.
@@ -634,7 +782,8 @@ pub fn match_lines(
             });
             let ensure_keys: Vec<&str> = gt_font_key.as_deref().into_iter().collect();
 
-            // ── Score: per-font collapse + segmentation cached inside identify_fonts ──
+            // ── Score: per-font collapse + segmentation via the shared
+            // per-line seg_cache (identify_fonts) ──
             let scoring = font_match::identify_fonts(
                 &word_infos,
                 classifier,
@@ -646,6 +795,7 @@ pub fn match_lines(
                 font_registry,
                 font_cache,
                 geo_cache,
+                &mut seg_cache,
             );
 
             gt_per_char_geo_ll = scoring.gt_per_char_geo_ll;
@@ -671,8 +821,9 @@ pub fn match_lines(
                 if tied.len() >= 2 {
                     let mut best: Option<(font_match::FontMatchResult, f32, Vec<crate::segment::WordSeg>, Vec<crate::geometry_classifier::WordGeoMeasurement>, Vec<image::GrayImage>, Vec<(usize,usize)>)> = None;
                     // Shared font-key preference of the current best (same as
-                    // --resolve-fontkey). Breaks exact SSIM ties.
-                    let mut best_pref: i32 = i32::MIN;
+                    // --resolve-fontkey: highest version first, then variant
+                    // preference). Breaks exact SSIM ties.
+                    let mut best_pref: (u32, i32) = (0, i32::MIN);
                     let mut tie_sim_results: Vec<(String,String,f32)> = Vec::new();
                     let mut ti = 0usize;
                     for font_key in tied.iter() {
@@ -689,44 +840,29 @@ pub fn match_lines(
                             let _ = std::fs::create_dir_all(&p);
                             p
                         });
-                        let (segs, wib, _crops, _pmap) = match build_for_font(fe, &word_infos, false) {
+                        // Shared per-line cache (finding F12): the
+                        // tie-break rebuilds segment the same word
+                        // crops with the same k and exemption state
+                        // as scoring, so they reuse its entries.
+                        let (segs, wib, _crops, _pmap) = match build_for_font(fe, &word_infos, false, &mut seg_cache) {
                             Some(v) => v,
                             None => continue,
                         };
-                        let midpoint_em_px = crate::geometry_classifier::median_em_px_from_midpoints(font_key, &segs, &wib, geo_cache);
-                        // Fractional line width from subpixel ink bounds, in LINE
-                        // coordinates. frac_left/frac_right are word-local
-                        // (0..word width), so add each word's x offset within
-                        // the line crop to get line coordinates. Without the
-                        // offset, min/max across words is roughly the widest
-                        // word's width (~194px on L3) instead of the line's
-                        // width (~1853px), and width_matched_em_px_shaped
-                        // computes an em ~10x too small — tie renders came out
-                        // 4px tall instead of ~40px.
-                        let frac_width: Option<f32> = {
-                            let mut min_l = f64::INFINITY;
-                            let mut max_r = f64::NEG_INFINITY;
-                            for (seg, w) in segs.iter().zip(wib.iter()) {
-                                let word_x = line.words.get(seg.source_word_idx)
-                                    .map(|tw| tw.x as f64)
-                                    .unwrap_or(0.0) - line.x as f64;
-                                for c in &w.chars {
-                                    let l = word_x + c.frac_left;
-                                    let r = word_x + c.frac_right;
-                                    if l < min_l { min_l = l; }
-                                    if r > max_r { max_r = r; }
-                                }
-                            }
-                            if max_r > min_l && min_l.is_finite() {
-                                Some((max_r - min_l) as f32)
-                            } else {
-                                None
-                            }
-                        };
+                        // Render each tied font at its own midpoint-derived
+                        // em (observed vs predicted midpoint spans), the
+                        // same basis Pass 2a uses — not the full-line
+                        // width-fitted em, which fits the scan's scale and
+                        // inflates ZNCC. None falls back to the per-word
+                        // width-matched median as before. frac_width stays
+                        // None: a Some value would replace this override
+                        // with a width-derived em (verify.rs).
+                        let mid_em = crate::geometry_classifier::median_em_px_from_midpoints(
+                            font_key, &segs, &wib, geo_cache,
+                        );
                         let vr = verify::verify_text_region(
-                            &norm_crop, &fd, &line.text, &line.words, line.x, line.y,
+                            &norm_crop, &fd, &fe.path, &line.text, &line.words, line.x, line.y,
                             fe.glyph_overrides.as_deref(), &fe.variant_tag, fe.variations.as_deref(),
-                            true, fe.collapsed_lig_set(), tie_audit_dir.as_deref(), None, None, frac_width,
+                            true, fe.collapsed_lig_set(), tie_audit_dir.as_deref(), None, mid_em, None,
                         );
                         tie_sim_results.push((fe.font_key(), fe.family_name.clone(), vr.score));
                         // Highest SSIM wins. On an exact SSIM tie, the shared
@@ -775,7 +911,7 @@ pub fn match_lines(
                     let font_key = &tied[0];
                     let fe_opt = font_registry.by_key(font_key);
                     if let Some(fe) = fe_opt {
-                        if let Some((segs, wib, crops, pmap)) = build_for_font(fe, &word_infos, false) {
+                        if let Some((segs, wib, crops, pmap)) = build_for_font(fe, &word_infos, false, &mut seg_cache) {
                             winning_segs = segs;
                             winning_wib = wib;
                             winning_crops_vec = crops;
@@ -805,21 +941,21 @@ pub fn match_lines(
         // doing expensive audit I/O.  Without --audit, all lines
         // get full audit.  "Miss" means: ground-truth font mismatch, no
         // font matched, OCR too low, or font confidence too low.
-        let _is_miss = if let Some(ref gt) = ground_truth {
+        let _is_miss = if ground_truth.is_some() {
             // OCR too low → line will be kept raster, treat as miss
             let ocr_ok = line.confidence >= args.min_ocr_confidence as f32
                 && !line.text.trim().is_empty();
             if !ocr_ok {
                 true
             } else if let Some(ref fr) = font_result {
-                    let bbox_px = [line.x as f32, line.y as f32,
-                                   (line.x + line.width) as f32,
-                                   (line.y + line.height) as f32];
                     // Look up chosen font's PostScript name for exact comparison
                     let chosen_ps = font_registry.by_key(&fr.font_key)
                         .map(|fe| fe.postscript_name.as_str())
                         .unwrap_or("");
-                    !gt.is_hit(page_num, &bbox_px, args.dpi, chosen_ps)
+                    // (F17) The GT font name was already looked up for this
+                    // line's bbox; compare against it instead of running
+                    // the span lookup a second time.
+                    !ground_truth::GroundTruth::is_hit_with_font(gt_font_name.as_deref(), chosen_ps)
             } else {
                 true // no font matched → treat as miss
             }
@@ -854,14 +990,14 @@ pub fn match_lines(
                 let glyph_metrics: std::collections::HashMap<char, (f32, f32)> = {
                     let font_entry = ctx.catalog.iter().find(|fe| fe.font_key() == fr.font_key);
                     if let Some(fe) = font_entry {
-                        if let Ok(font_data) = std::fs::read(&fe.path) {
-                            if let Ok(mut font) = unprint_fonts::ab_glyph::FontVec::try_from_vec(font_data) {
-                                if let Some(ref vars) = fe.variations {
-                                    use unprint_fonts::ab_glyph::VariableFont;
-                                    for (tag, val) in vars {
-                                        font.set_variation(tag, *val);
-                                    }
-                                }
+                        // Font bytes come from the shared FontCache (F36):
+                        // the winning font recurs across lines, so a direct
+                        // read would re-allocate + re-parse it per line.
+                        // font_ref_with_variations parses + applies the
+                        // entry's variations, exactly as the old FontVec
+                        // path did (FontRef + apply_variations).
+                        if let Ok(font_data) = font_cache.load(&fe.path) {
+                            if let Some(font) = fe.font_ref_with_variations(&font_data) {
                                 // Gather all chars that appear in any segment
                                 let all_chars: Vec<char> = winning_word_segs.iter()
                                     .flat_map(|seg| seg.chars.iter().copied())
@@ -1105,9 +1241,12 @@ pub fn match_lines(
         // ── GT font segmentation / crops – always emit even on misses ──
         // Build GT segs using same per-word word_infos + GT collapsed_lig_set, so k differs correctly
         // for ligature fonts (e.g. Office k=4 vs k=5).  No extra compute beyond build_for_font.
+        // Shared per-line cache (finding F12): the GT rebuild
+        // segments the same word crops as scoring; k differs only
+        // through the ligature mask, and k is part of the cache key.
         let (gt_segs_opt, gt_wib_opt, gt_crops_opt) = if let Some(ref gfk) = gt_font_key {
             if let Some(gt_fe) = font_registry.by_key(gfk) {
-                if let Some((s, w, c, _pm)) = build_for_font(gt_fe, &word_infos, true) {
+                if let Some((s, w, c, _pm)) = build_for_font(gt_fe, &word_infos, true, &mut seg_cache) {
                     (Some(s), Some(w), Some(c))
                 } else { (None, None, None) }
             } else { (None, None, None) }
@@ -1180,35 +1319,11 @@ pub fn match_lines(
 
 
         let word_seg_summaries: Vec<crate::audit::WordSegSummary> = {
-            winning_segs.iter().map(|ws| crate::audit::WordSegSummary {
-                word_text: ws.word_text.clone(),
-                source_word_idx: ws.source_word_idx,
-                image_w: ws.image_w,
-                image_h: ws.image_h,
-                n_chars_expected: ws.n_chars_expected,
-                n_segments_produced: ws.n_segments_produced,
-                mismatch: ws.mismatch,
-                ws_splits: ws.ws_splits.clone(),
-                seam_splits: ws.seam_splits.clone(),
-                seam_paths: ws.seam_paths.clone(),
-                seam_costs: ws.seam_costs.clone(),
-            }).collect()
+            winning_segs.iter().map(word_seg_summary).collect()
         };
 
         let gt_word_seg_summaries: Vec<crate::audit::WordSegSummary> = if let Some(ref g_segs) = gt_segs_opt {
-            g_segs.iter().map(|ws| crate::audit::WordSegSummary {
-                word_text: ws.word_text.clone(),
-                source_word_idx: ws.source_word_idx,
-                image_w: ws.image_w,
-                image_h: ws.image_h,
-                n_chars_expected: ws.n_chars_expected,
-                n_segments_produced: ws.n_segments_produced,
-                mismatch: ws.mismatch,
-                ws_splits: ws.ws_splits.clone(),
-                seam_splits: ws.seam_splits.clone(),
-                seam_paths: ws.seam_paths.clone(),
-                seam_costs: ws.seam_costs.clone(),
-            }).collect()
+            g_segs.iter().map(word_seg_summary).collect()
         } else {
             Vec::new()
         };
@@ -1246,11 +1361,10 @@ pub fn match_lines(
         // gt_word_seg_summaries (GT), which the report's scan-line
         // overlays render side by side.
 
-        LineMatch { font_result, text_color, font_scores, observations, gt_observations, seg_used_ligatures, diag_seg_dir, obs_rank_probs, gt_obs_rank_probs, tie_candidates: tie_candidates_audit, corrected_words, fast_path: false, fast_path_score: None, midpoint_em_px, gt_midpoint_em_px, word_seg_summaries, gt_word_seg_summaries, gt_per_char_geo_ll, ocr_corrections: ocr_correction_audit }
+        LineMatch { font_result, text_color, font_scores, observations, gt_observations, seg_used_ligatures, diag_seg_dir, obs_rank_probs, gt_obs_rank_probs, tie_candidates: tie_candidates_audit, corrected_words, fast_path: false, fast_path_score: None, norm_crop: Some(norm_crop), midpoint_em_px, gt_midpoint_em_px, word_seg_summaries, gt_word_seg_summaries, gt_per_char_geo_ll, ocr_corrections: ocr_correction_audit }
     }).collect();
 
-    let fp_hits = fast_path_hits.load(Ordering::Relaxed);
-    (line_matches, fp_hits)
+    line_matches
 }
 
 /// Update the dominant font candidate from this page's match results.
@@ -1270,46 +1384,6 @@ pub fn update_dominant_font(line_matches: &[LineMatch]) -> Option<font_match::Fo
                 .cloned())
     } else {
         None
-    }
-}
-
-/// Pass 1.5: paragraph-level font grouping.
-///
-/// Finds the dominant body font: most common font among matched lines at the
-/// most common font size (±1pt tolerance). Currently diagnostic-only.
-pub fn paragraph_font_grouping(lines: &[TextLine], line_matches: &[LineMatch]) {
-    // Collect (font_size_bucket) frequencies
-    let mut size_freq: HashMap<i32, u32> = HashMap::new();
-    for (i, lm) in line_matches.iter().enumerate() {
-        if lm.font_result.is_some() {
-            let bucket = lines[i].font_size_pt.round() as i32;
-            *size_freq.entry(bucket).or_default() += 1;
-        }
-    }
-    // Find most common size bucket
-    let body_size = size_freq.iter()
-        .max_by_key(|(_, &v)| v)
-        .map(|(&k, _)| k);
-
-    if let Some(body_size) = body_size {
-        // Count fonts at body size (±1pt)
-        let mut font_freq: HashMap<String, (u32, PathBuf)> = HashMap::new();
-        for (i, lm) in line_matches.iter().enumerate() {
-            let sz = lines[i].font_size_pt.round() as i32;
-            if (sz - body_size).abs() <= 1 {
-                if let Some(ref fm) = lm.font_result {
-                    let entry = font_freq.entry(fm.font_name.clone())
-                        .or_insert_with(|| (0, fm.font_path.clone()));
-                    entry.0 += 1;
-                }
-            }
-        }
-        // Find majority font
-        if let Some((_majority_name, (_majority_count, _majority_path))) = font_freq.iter()
-            .max_by_key(|(_, (count, _))| *count)
-        {
-            let _total_body: u32 = font_freq.values().map(|(c, _)| c).sum();
-        }
     }
 }
 
