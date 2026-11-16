@@ -1056,8 +1056,7 @@ pub fn find_msttcorefonts_dir() -> Option<PathBuf> {
 
 const FSCN_MAGIC: &[u8; 4] = b"FSCN";
 // v20: font_version field (|version=X in font keys) + content-based identity.
-// v21: variable-font weight instances get the full kern/lig/opsz permutation.
-const FSCN_VERSION: u32 = 21;
+const FSCN_VERSION: u32 = 20;
 
 pub(crate) fn scan_cache_path() -> PathBuf {
     crate::cache::paths::font_scan_bin()
@@ -1748,60 +1747,52 @@ pub fn scan_fonts(dirs: &[PathBuf], quiet: bool) -> Vec<FontEntry> {
                 // ── Variable font weight instances ──────────────────────
                 // If the font has a wght axis, emit additional entries at
                 // each named-instance weight so the font matcher indexes bold/light/
-                // etc. renderings from the same file. Each weight instance
-                // gets the SAME kern/lig/opsz permutation as the base
-                // entry — a single kern|lig entry per weight cannot
-                // represent e.g. "400 italic, nokern, opsz 10", so the
-                // classifier could never match that rendering exactly.
+                // etc. renderings from the same file.
                 let weight_instances = detect_weight_instances(path, fe.class);
-                let has_ligatures = fe.collapsed_lig_set() != 0;
                 for wi in &weight_instances {
                     let var_ps = make_weight_explicit(&fe.raw_postscript_name, wi.os2_weight);
+                    // Weight instances carry the kern/nokern tag explicitly
+                    // (appended after wght): they render kerned unless the
+                    // font has no kerning data. Lig is explicit too (|lig —
+                    // ligatures on); there is no nolig permutation for
+                    // weight instances.
+                    let var_tag = format!("wght{}|{}|lig", wi.os2_weight, kern_tag);
                     let var_variations = Some(wi.axes.clone());
-                    let wght_tag = format!("wght{}", wi.os2_weight);
-                    let var_opts = var_perm_opts(&var_variations);
-                    for &is_nokern in kern_perm_opts(has_kern) {
-                        for &is_nolig in lig_perm_opts(has_ligatures) {
-                            for variations in &var_opts {
-                                let var_tag = append_kern_lig_markers(&wght_tag, is_nokern, is_nolig);
-                                let mut var_fe = FontEntry {
-                                    path: fe.path.clone(),
-                                    family_name: format!("{} [{}]", fe.family_name, var_tag),
-                                    postscript_name: var_ps.clone(),
-                                    raw_postscript_name: fe.raw_postscript_name.clone(),
-                                    is_bold: wi.os2_weight >= 700,
-                                    is_italic: fe.is_italic,
-                                    class: fe.class,
-                                    data: Vec::new(),
-                                    oldstyle_figures: fe.oldstyle_figures,
-                                    variant_tag: var_tag.clone(),
-                                    // Bracket notation distinguishes static "SourceSerif4-400Italic"
-                                    // from variable "SourceSerif4-400Italic|wght400[wght=400,opsz=20]"
-                                    // after normalization.
-                                    font_key_cache: FontEntry::compute_font_key_full(
-                                        &var_ps,
-                                        &var_tag,
-                                        None,
-                                        variations,
-                                        &fe.font_version,
-                                    ),
-                                    glyph_overrides: None,
-                                    variations: variations.clone(),
-                                    typographic_family: fe.typographic_family.clone(),
-                                    vintage_era: None,
-                                    opsz_range,
-                                    has_gpos: fe.has_gpos,
-                                    has_kern: fe.has_kern,
-                                    font_version: fe.font_version.clone(),
-                                };
-                                // Add ligature overrides to weight-instance entry
-                                if !ligatures.is_empty() {
-                                    var_fe.glyph_overrides = Some(ligatures.clone());
-                                }
-                                fonts.push(var_fe);
-                            }
-                        }
+                    let mut var_fe = FontEntry {
+                        path: fe.path.clone(),
+                        family_name: format!("{} [{}]", fe.family_name, var_tag),
+                        postscript_name: var_ps.clone(),
+                        raw_postscript_name: fe.raw_postscript_name.clone(),
+                        is_bold: wi.os2_weight >= 700,
+                        is_italic: fe.is_italic,
+                        class: fe.class,
+                        data: Vec::new(),
+                        oldstyle_figures: fe.oldstyle_figures,
+                        variant_tag: var_tag.clone(),
+                        // Bracket notation distinguishes static "SourceSerif4-400Italic"
+                        // from variable "SourceSerif4-400Italic|wght400[wght=400,opsz=20]"
+                        // after normalization.
+                        font_key_cache: FontEntry::compute_font_key_full(
+                            &var_ps,
+                            &var_tag,
+                            None,
+                            &var_variations,
+                            &fe.font_version,
+                        ),
+                        glyph_overrides: None,
+                        variations: var_variations,
+                        typographic_family: fe.typographic_family.clone(),
+                        vintage_era: None,
+                        opsz_range,
+                        has_gpos: fe.has_gpos,
+                        has_kern: fe.has_kern,
+                        font_version: fe.font_version.clone(),
+                    };
+                    // Add ligature overrides to weight-instance entry
+                    if !ligatures.is_empty() {
+                        var_fe.glyph_overrides = Some(ligatures.clone());
                     }
+                    fonts.push(var_fe);
                 }
 
                 // If this file is variable, mark the base entry as variable
@@ -1834,12 +1825,12 @@ pub fn scan_fonts(dirs: &[PathBuf], quiet: bool) -> Vec<FontEntry> {
                 //   variants carry |nolig.
                 // - opsz: [base, opsz10] if the font has an opsz axis, else [base].
                 // The classifier scores all permutations and picks the best.
-                // The same permutation applies to the variable-font weight
-                // instances above; the option computation is shared (see
-                // kern_perm_opts / lig_perm_opts / var_perm_opts).
-                let kern_opts = kern_perm_opts(has_kern);
-                let lig_opts = lig_perm_opts(has_ligatures);
-                let var_opts = var_perm_opts(&fe.variations);
+                let kern_opts: &[bool] = if has_kern { &[false, true] } else { &[true] };
+                let lig_opts: &[bool] = if fe.collapsed_lig_set() != 0 { &[false, true] } else { &[false] };
+                let mut var_opts: Vec<Variations> = vec![fe.variations.clone()];
+                if let Some(opsz10_vars) = make_opsz10_variations(&fe.variations) {
+                    var_opts.push(Some(opsz10_vars));
+                }
                 for &is_nokern in kern_opts {
                     for &is_nolig in lig_opts {
                         for variations in &var_opts {
@@ -1850,7 +1841,33 @@ pub fn scan_fonts(dirs: &[PathBuf], quiet: bool) -> Vec<FontEntry> {
                             // carry |nokern; ligature-enabled variants carry
                             // |lig, nolig variants carry |nolig.
                             // Use "|" separator to avoid ambiguity.
-                            let variant_tag = append_kern_lig_markers(&fe.variant_tag, is_nokern, is_nolig);
+                            let mut variant_tag = fe.variant_tag.clone();
+                            if is_nokern {
+                                variant_tag = if variant_tag.is_empty() {
+                                    "nokern".to_string()
+                                } else {
+                                    format!("{}|nokern", variant_tag)
+                                };
+                            } else {
+                                variant_tag = if variant_tag.is_empty() {
+                                    "kern".to_string()
+                                } else {
+                                    format!("{}|kern", variant_tag)
+                                };
+                            }
+                            if is_nolig {
+                                variant_tag = if variant_tag.is_empty() {
+                                    "nolig".to_string()
+                                } else {
+                                    format!("{}|nolig", variant_tag)
+                                };
+                            } else {
+                                variant_tag = if variant_tag.is_empty() {
+                                    "lig".to_string()
+                                } else {
+                                    format!("{}|lig", variant_tag)
+                                };
+                            }
                             let mut family_name = fe.family_name.clone();
                             if is_nokern {
                                 family_name = format!("{} [nokern]", family_name);
@@ -2347,54 +2364,6 @@ fn make_opsz10_variations(variations: &Variations) -> Variations {
         })
         .collect();
     Some(new_vars)
-}
-
-/// Kern options for the kern/lig/opsz permutation shared by the base
-/// entry and the variable-font weight instances. Values are `is_nokern`:
-/// [kern, nokern] when the font has kerning data, else [nokern] only —
-/// a font with no kerning renders identically with the kern feature on
-/// or off, so a kerned variant would be a byte-identical duplicate.
-fn kern_perm_opts(has_kern: bool) -> &'static [bool] {
-    if has_kern {
-        &[false, true]
-    } else {
-        &[true]
-    }
-}
-
-/// Lig options for the kern/lig/opsz permutation. Values are `is_nolig`:
-/// [lig, nolig] when the font has ligature glyphs, else [lig] only.
-fn lig_perm_opts(has_ligatures: bool) -> &'static [bool] {
-    if has_ligatures {
-        &[false, true]
-    } else {
-        &[false]
-    }
-}
-
-/// Opsz options for the kern/lig/opsz permutation: the given variations
-/// plus an opsz=10 variant when the font has an opsz axis not already
-/// at 10.
-fn var_perm_opts(variations: &Variations) -> Vec<Variations> {
-    let mut opts = vec![variations.clone()];
-    if let Some(opsz10_vars) = make_opsz10_variations(variations) {
-        opts.push(Some(opsz10_vars));
-    }
-    opts
-}
-
-/// Append the kern/nokern and lig/nolig markers to a variant tag.
-/// Both are explicit in every font key — no implicit default. An empty
-/// base tag yields just the two markers; otherwise they are appended
-/// after the base tag with `|` separators, kern first then lig.
-fn append_kern_lig_markers(base_tag: &str, is_nokern: bool, is_nolig: bool) -> String {
-    let kern = if is_nokern { "nokern" } else { "kern" };
-    let lig = if is_nolig { "nolig" } else { "lig" };
-    if base_tag.is_empty() {
-        format!("{kern}|{lig}")
-    } else {
-        format!("{base_tag}|{kern}|{lig}")
-    }
 }
 
 /// Detect named weight instances for a variable font.
