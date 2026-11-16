@@ -165,6 +165,13 @@ pub struct Args {
     /// Skip per-font LDA OCR correction. Env: UNPRINT_SKIP_OCR_CORRECTION
     #[arg(long, env = "UNPRINT_SKIP_OCR_CORRECTION", help_heading = "Cache")]
     pub skip_ocr_correction: bool,
+
+    /// Enable per-font LDA OCR correction (disabled by default). When set,
+    /// the per-font LDA model may replace Tesseract misreads with better
+    /// guesses; corrections are recorded as pflda_replaced in the audit.
+    /// Env: UNPRINT_OCR_CORRECTIONS
+    #[arg(long, env = "UNPRINT_OCR_CORRECTIONS", help_heading = "Processing")]
+    pub ocr_corrections: bool,
 }
 
 impl Args {
