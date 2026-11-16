@@ -836,10 +836,17 @@ fn run(args: &cli::Args, classifier: &mut dyn classifier::Classifier) -> Result<
     // All font access goes through the shared cache below.
 
     // ── 1c. Build runtime training data for per-font OCR correction ─
+    // Disabled by default: enable with --ocr-corrections. With no RTD,
+    // the pflda correction pass in match_lines cannot fire (it requires
+    // Some(rtd)), so scoring uses the OCR text as read.
     let t_rtd = std::time::Instant::now();
-    let rtd = train::RuntimeTrainingData::from_registry(
-        &font_registry, &glyph_map, &args.render_params(),
-    );
+    let rtd = if args.ocr_corrections {
+        train::RuntimeTrainingData::from_registry(
+            &font_registry, &glyph_map, &args.render_params(),
+        )
+    } else {
+        None
+    };
     if !args.quiet { eprintln!("[timing] rtd from_registry {:.2}s (total {:.2}s) -> {}", t_rtd.elapsed().as_secs_f64(), run_start.elapsed().as_secs_f64(), if rtd.is_some() { "Some" } else { "None" }); }
 
     // (font_cache and geo_cache are created before the glyph-map block
