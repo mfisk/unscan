@@ -406,6 +406,39 @@ pub struct AccuracyResult {
     pub report_path: PathBuf,
 }
 
+// ── Audit JSON helpers ───────────────────────────────────────────────
+
+/// Resolve the audit JSON path in `audit_dir`: prefer `audit.json.gz`
+/// (written by current unprint), fall back to plain `audit.json` (older
+/// runs). Returns the `.gz` path when neither exists, so callers
+/// asserting existence get a message naming the current format.
+pub fn audit_json_path(audit_dir: &Path) -> PathBuf {
+    let gz = audit_dir.join("audit.json.gz");
+    if gz.exists() {
+        return gz;
+    }
+    audit_dir.join("audit.json")
+}
+
+/// Read an audit JSON file as text, transparently decompressing when
+/// the path ends in `.gz`. Accepts either `audit.json.gz` or plain
+/// `audit.json`.
+pub fn read_audit_json_text(path: &Path) -> String {
+    use std::io::Read;
+    if path.extension().is_some_and(|e| e == "gz") {
+        let f = std::fs::File::open(path)
+            .unwrap_or_else(|e| panic!("cannot open {}: {}", path.display(), e));
+        let mut dec = flate2::read::GzDecoder::new(f);
+        let mut s = String::new();
+        dec.read_to_string(&mut s)
+            .unwrap_or_else(|e| panic!("cannot decompress {}: {}", path.display(), e));
+        s
+    } else {
+        std::fs::read_to_string(path)
+            .unwrap_or_else(|e| panic!("cannot read {}: {}", path.display(), e))
+    }
+}
+
 /// Run unprint with --audit and --test for spatial ground-truth
 /// comparison against the vector PDF.  The --test flag outputs JSON
 /// results to stdout; --audit writes audit.json and report.html.
@@ -441,7 +474,7 @@ pub fn measure_accuracy(raster: &Path, vector: &Path, label: &str) -> AccuracyRe
         output.status.code(),
         String::from_utf8_lossy(&output.stderr));
 
-    assert!(audit_dir.join("audit.json").exists(),
+    assert!(audit_json_path(&audit_dir).exists(),
         "audit.json not written");
 
     let report_path = audit_dir.join("report.html");

@@ -346,7 +346,10 @@ fn write_seg_diag(
         "seam_costs": &merged_costs,
         "mismatch": n_segs_sum != summary.n_chars_expected as usize,
     });
-    let _ = std::fs::write(ddir.join("summary.json"), serde_json::to_string_pretty(&json).unwrap_or_default());
+    let _ = crate::audit::write_json_gz(
+        &ddir.join("summary.json"),
+        &serde_json::to_string(&json).unwrap_or_default(),
+    );
 }
 
 fn segment_characters_inner(

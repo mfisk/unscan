@@ -8,7 +8,7 @@
 
 mod common;
 
-use common::run_unscan;
+use common::{run_unscan, audit_json_path, read_audit_json_text};
 use std::path::PathBuf;
 use std::process::Command;
 
@@ -148,7 +148,7 @@ fn seam_splits_match_ground_truth() {
             "--test", gt.to_str().unwrap(),
             "--audit", audit_dir.to_str().unwrap(),
         ]);
-        let audit_path = audit_dir.join("audit.json");
+        let audit_path = audit_json_path(&audit_dir);
         if audit_path.exists() {
             eprintln!("  audit.json produced on attempt {attempt}");
             break;
@@ -164,11 +164,11 @@ fn seam_splits_match_ground_truth() {
     }
 
     // Parse audit.json for seam splits
-    let audit_path = audit_dir.join("audit.json");
+    let audit_path = audit_json_path(&audit_dir);
     assert!(audit_path.exists(), "audit.json not produced after 3 attempts. last output: {}", last_output);
 
     let audit: serde_json::Value = serde_json::from_str(
-        &std::fs::read_to_string(&audit_path).unwrap()
+        &read_audit_json_text(&audit_path)
     ).unwrap();
 
     let entries = audit["text_entries"].as_array().expect("no text_entries");

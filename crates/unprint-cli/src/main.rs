@@ -1280,9 +1280,9 @@ fn run(args: &cli::Args, classifier: &mut dyn classifier::Classifier) -> Result<
                         .collect::<Vec<_>>(),
                     "decision": if keep_raster { "raster" } else { "vectorized" },
                 });
-                let _ = std::fs::write(
-                    ddir.join("line_summary.json"),
-                    serde_json::to_string_pretty(&line_summary).unwrap_or_default(),
+                let _ = audit::write_json_gz(
+                    &ddir.join("line_summary.json"),
+                    &serde_json::to_string(&line_summary).unwrap_or_default(),
                 );
             }
 

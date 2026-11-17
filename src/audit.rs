@@ -405,10 +405,26 @@ impl AuditLog {
         let mut value =
             serde_json::to_value(self).map_err(|e| ScanTextError::Serialize(e.to_string()))?;
         Self::dedup_gt_obs_votes(&mut value);
-        let json = serde_json::to_string_pretty(&value)
-            .map_err(|e| ScanTextError::Serialize(e.to_string()))?;
-        std::fs::write(path, json).map_err(ScanTextError::Io)
+        let json =
+            serde_json::to_string(&value).map_err(|e| ScanTextError::Serialize(e.to_string()))?;
+        write_json_gz(path, &json)
     }
+}
+
+/// Write `json` (already serialized, compact) gzip-compressed to `path`
+/// with `.gz` appended, e.g. `audit.json` -> `audit.json.gz`. Readers
+/// accept both `.json.gz` and plain `.json` (see tests/common/mod.rs).
+pub fn write_json_gz(path: &Path, json: &str) -> Result<(), ScanTextError> {
+    use flate2::write::GzEncoder;
+    use flate2::Compression;
+    use std::io::Write;
+    let mut gz_name = path.as_os_str().to_owned();
+    gz_name.push(".gz");
+    let file = std::fs::File::create(PathBuf::from(gz_name)).map_err(ScanTextError::Io)?;
+    let mut enc = GzEncoder::new(file, Compression::default());
+    enc.write_all(json.as_bytes()).map_err(ScanTextError::Io)?;
+    enc.finish().map_err(ScanTextError::Io)?;
+    Ok(())
 }
 
 // ── Image directory for audit artifacts ─────────────────────────────────

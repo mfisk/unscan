@@ -10,7 +10,7 @@
 
 mod common;
 
-use common::{setup, test_doc, unscan_bin};
+use common::{setup, test_doc, unscan_bin, audit_json_path, read_audit_json_text};
 use std::process::Command;
 
 /// Run unprint with --audit on a single-word fixture and parse audit.json
@@ -35,12 +35,12 @@ fn run_and_parse(input: &std::path::Path, extra_args: &[&str]) -> (Option<f64>, 
         status.status.code(),
         String::from_utf8_lossy(&status.stderr));
 
-    let json_path = audit_dir.join("audit.json");
+    let json_path = audit_json_path(&audit_dir);
     if !json_path.exists() {
         return (None, None);
     }
 
-    let data = std::fs::read_to_string(&json_path).unwrap();
+    let data = read_audit_json_text(&json_path);
     // Minimal JSON parsing — extract similarity_score and font_matched from first text_entry
     let ssim = extract_json_f64(&data, "similarity_score");
     let font = extract_json_string(&data, "font_matched");

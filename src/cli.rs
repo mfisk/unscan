@@ -206,6 +206,7 @@ impl Args {
     /// Resolve the audit JSON path.
     /// With --audit DIR, it's DIR/audit.json.
     /// Without --audit, falls back to <output>.audit.json.
+    /// write_to_file appends `.gz`, so the file on disk is `audit.json.gz`.
     pub fn audit_log_path(&self) -> PathBuf {
         if let Some(ref dir) = self.audit {
             dir.join("audit.json")

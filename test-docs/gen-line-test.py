@@ -8,6 +8,7 @@ Two modes:
   2) Legacy audit mode (deprecated, fragile)
 """
 
+import gzip
 import json
 import sys
 from pathlib import Path
@@ -145,8 +146,16 @@ def main():
         else:
             page = int(args[0])
             page_lines = [(page, int(a)) for a in args[1:]]
-        with open(audit_ref) as f:
-            audit = json.load(f)
+        # Current unprint writes compact gzip (audit.json.gz); accept both.
+        if audit_ref.endswith('.gz'):
+            with gzip.open(audit_ref, 'rt', encoding='utf-8') as f:
+                audit = json.load(f)
+        elif Path(audit_ref + '.gz').exists():
+            with gzip.open(audit_ref + '.gz', 'rt', encoding='utf-8') as f:
+                audit = json.load(f)
+        else:
+            with open(audit_ref) as f:
+                audit = json.load(f)
         for (page, li) in page_lines:
             entries = [e for e in audit['text_entries'] if e.get('page') == page and e.get('line_index') == li]
             if not entries:
