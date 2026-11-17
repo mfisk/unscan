@@ -70,6 +70,8 @@ pub struct AuditEntry {
     /// segmentation from these — the nolig-cell components and the
     /// GT-geo fallback when the winner's segmentation collapses a
     /// ligature the GT font renders as separate characters.
+    /// Omitted from the JSON when identical to obs_votes; readers must
+    /// treat a missing gt_obs_votes as equal to obs_votes.
     #[serde(skip_serializing_if = "Vec::is_empty")]
     pub gt_obs_votes: Vec<ObservationVote>,
     /// Word-level bounding boxes for this line (for miss-report visualisation).
@@ -374,9 +376,37 @@ pub struct AuditLog {
 }
 
 impl AuditLog {
+    /// Drop the gt_obs_votes key from entries where it duplicates
+    /// obs_votes (same values, i.e. the winner's segmentation equals
+    /// GT's own segmentation). Readers treat a missing gt_obs_votes as
+    /// equal to obs_votes. A field-level skip_serializing_if cannot do
+    /// this comparison (it only sees the one field), so the dedup runs
+    /// here on the serialized Value. The in-memory entries are untouched.
+    fn dedup_gt_obs_votes(value: &mut serde_json::Value) {
+        if let Some(entries) = value
+            .get_mut("text_entries")
+            .and_then(|v| v.as_array_mut())
+        {
+            for entry in entries {
+                let dup = matches!(
+                    (entry.get("obs_votes"), entry.get("gt_obs_votes")),
+                    (Some(o), Some(g)) if o == g
+                );
+                if dup {
+                    if let Some(obj) = entry.as_object_mut() {
+                        obj.remove("gt_obs_votes");
+                    }
+                }
+            }
+        }
+    }
+
     pub fn write_to_file(&self, path: &Path) -> Result<(), ScanTextError> {
-        let json =
-            serde_json::to_string_pretty(self).map_err(|e| ScanTextError::Serialize(e.to_string()))?;
+        let mut value =
+            serde_json::to_value(self).map_err(|e| ScanTextError::Serialize(e.to_string()))?;
+        Self::dedup_gt_obs_votes(&mut value);
+        let json = serde_json::to_string_pretty(&value)
+            .map_err(|e| ScanTextError::Serialize(e.to_string()))?;
         std::fs::write(path, json).map_err(ScanTextError::Io)
     }
 }
