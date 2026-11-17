@@ -57,7 +57,7 @@
 
 mod common;
 
-use common::{test_doc, ensure_index, ensure_vintage_specimen, audit_json_path, read_audit_json_text};
+use common::{test_doc, ensure_index, ensure_vintage_specimen};
 
 /// Minimum acceptable fraction of scored lines picking the expected font.
 /// 12/12 — the expected font is the correct answer for each scored line.
@@ -94,8 +94,9 @@ fn vintage_legacy_matching() {
     // Per-line results from the audit (the --test summary has no per-line picks).
     let audit_dir = r.report_path.parent().expect("report_path has no parent");
     let audit_json: serde_json::Value = {
-        let p = audit_json_path(audit_dir);
-        let s = read_audit_json_text(&p);
+        let p = audit_dir.join("audit.json");
+        let s = std::fs::read_to_string(&p)
+            .unwrap_or_else(|e| panic!("cannot read {}: {}", p.display(), e));
         serde_json::from_str(&s).expect("audit.json is not valid JSON")
     };
     let entries = audit_json["text_entries"]

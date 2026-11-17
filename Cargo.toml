@@ -61,9 +61,6 @@ flate2 = { workspace = true }
 memmap2 = { workspace = true }
 pprof = { workspace = true, optional = true }
 
-[dev-dependencies]
-flate2 = { workspace = true }
-
 [features]
 profile = ["pprof"]
 

@@ -4,7 +4,7 @@ use std::collections::HashMap;
 use std::sync::Arc;
 
 use crate::error::ScanTextError;
-use serde::{Serialize, Serializer};
+use serde::Serialize;
 use crate::classifier::ObsStats;
 
 use std::path::{Path, PathBuf};
@@ -26,22 +26,6 @@ pub struct WordSegSummary {
     pub seam_costs: Arc<HashMap<u32, crate::segment::SeamCost>>,
 }
 
-/// Serialize only the first 10 font candidates. The ranked list is
-/// score-descending (see `font_match::identify_fonts`, which sorts
-/// `scored` descending), so these are the top 10. The in-memory Vec
-/// stays full — the report generator reads it in memory and the GT
-/// rank/score are recorded separately (`gt_rank`/`gt_score`) — only
-/// the JSON writer truncates. The full list (typically ~700 entries
-/// per line) was the audit JSON's biggest component and no tool reads
-/// past the top 10.
-fn serialize_top10<S>(candidates: &Vec<FontCandidate>, serializer: S) -> Result<S::Ok, S::Error>
-where
-    S: Serializer,
-{
-    let n = candidates.len().min(10);
-    candidates[..n].serialize(serializer)
-}
-
 /// Per-text-region audit record.
 #[derive(Debug, Serialize)]
 pub struct AuditEntry {
@@ -60,7 +44,7 @@ pub struct AuditEntry {
     pub decision: Decision,
     pub reason: String,
     pub bbox: BBox,
-    #[serde(skip_serializing_if = "Vec::is_empty", serialize_with = "serialize_top10")]
+    #[serde(skip_serializing_if = "Vec::is_empty")]
     pub font_candidates: Vec<FontCandidate>,
     #[serde(skip_serializing_if = "Vec::is_empty")]
     pub obs_votes: Vec<ObservationVote>,
@@ -70,8 +54,6 @@ pub struct AuditEntry {
     /// segmentation from these — the nolig-cell components and the
     /// GT-geo fallback when the winner's segmentation collapses a
     /// ligature the GT font renders as separate characters.
-    /// Omitted from the JSON when identical to obs_votes; readers must
-    /// treat a missing gt_obs_votes as equal to obs_votes.
     #[serde(skip_serializing_if = "Vec::is_empty")]
     pub gt_obs_votes: Vec<ObservationVote>,
     /// Word-level bounding boxes for this line (for miss-report visualisation).
@@ -92,19 +74,6 @@ pub struct AuditEntry {
     /// Populated when --audit is provided.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub expected_font: Option<String>,
-    /// 1-based rank of the ground-truth font in the full ranked
-    /// `font_candidates` list (None when GT is absent from the list or
-    /// no GT is available). Populated when --audit is provided.
-    /// The JSON records only the top 10 candidates (see
-    /// `serialize_top10`), so the rank is kept explicitly — GT ranks
-    /// below the top 10 on a substantial minority of lines.
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub gt_rank: Option<usize>,
-    /// Score of the ground-truth font in the full ranked
-    /// `font_candidates` list (None when GT is absent from the list or
-    /// no GT is available). Populated when --audit is provided.
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub gt_score: Option<f32>,
     /// Ground-truth text from the vector PDF span.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub gt_text: Option<String>,
@@ -376,55 +345,11 @@ pub struct AuditLog {
 }
 
 impl AuditLog {
-    /// Drop the gt_obs_votes key from entries where it duplicates
-    /// obs_votes (same values, i.e. the winner's segmentation equals
-    /// GT's own segmentation). Readers treat a missing gt_obs_votes as
-    /// equal to obs_votes. A field-level skip_serializing_if cannot do
-    /// this comparison (it only sees the one field), so the dedup runs
-    /// here on the serialized Value. The in-memory entries are untouched.
-    fn dedup_gt_obs_votes(value: &mut serde_json::Value) {
-        if let Some(entries) = value
-            .get_mut("text_entries")
-            .and_then(|v| v.as_array_mut())
-        {
-            for entry in entries {
-                let dup = matches!(
-                    (entry.get("obs_votes"), entry.get("gt_obs_votes")),
-                    (Some(o), Some(g)) if o == g
-                );
-                if dup {
-                    if let Some(obj) = entry.as_object_mut() {
-                        obj.remove("gt_obs_votes");
-                    }
-                }
-            }
-        }
-    }
-
     pub fn write_to_file(&self, path: &Path) -> Result<(), ScanTextError> {
-        let mut value =
-            serde_json::to_value(self).map_err(|e| ScanTextError::Serialize(e.to_string()))?;
-        Self::dedup_gt_obs_votes(&mut value);
         let json =
-            serde_json::to_string(&value).map_err(|e| ScanTextError::Serialize(e.to_string()))?;
-        write_json_gz(path, &json)
+            serde_json::to_string_pretty(self).map_err(|e| ScanTextError::Serialize(e.to_string()))?;
+        std::fs::write(path, json).map_err(ScanTextError::Io)
     }
-}
-
-/// Write `json` (already serialized, compact) gzip-compressed to `path`
-/// with `.gz` appended, e.g. `audit.json` -> `audit.json.gz`. Readers
-/// accept both `.json.gz` and plain `.json` (see tests/common/mod.rs).
-pub fn write_json_gz(path: &Path, json: &str) -> Result<(), ScanTextError> {
-    use flate2::write::GzEncoder;
-    use flate2::Compression;
-    use std::io::Write;
-    let mut gz_name = path.as_os_str().to_owned();
-    gz_name.push(".gz");
-    let file = std::fs::File::create(PathBuf::from(gz_name)).map_err(ScanTextError::Io)?;
-    let mut enc = GzEncoder::new(file, Compression::default());
-    enc.write_all(json.as_bytes()).map_err(ScanTextError::Io)?;
-    enc.finish().map_err(ScanTextError::Io)?;
-    Ok(())
 }
 
 // ── Image directory for audit artifacts ─────────────────────────────────

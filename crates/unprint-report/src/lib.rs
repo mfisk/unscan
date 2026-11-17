@@ -770,21 +770,6 @@ pub fn enrich_audit_entries(
         e.miss_type = Some(ce.kind.as_str().to_string());
         e.expected_font = ce.actual_font.clone();
 
-        // Record the GT font's rank and score in the full ranked
-        // candidate list. The JSON keeps only the top 10 candidates
-        // (see `serialize_top10` in audit.rs), so the rank must be
-        // explicit — GT ranks below the top 10 on a substantial
-        // minority of lines. 1-based, matching gt_font_rank.
-        // (This is the entry's own record; the report's
-        // `find_correct_ci_candidate` computes a different gt_rank
-        // via the catalog and is untouched.)
-        if let Some(ref gt_key) = ce.actual_font {
-            if let Some(pos) = e.font_candidates.iter().position(|fc| fc.font_key == *gt_key) {
-                e.gt_rank = Some(pos + 1);
-                e.gt_score = e.font_candidates[pos].score;
-            }
-        }
-
         // Populate GT text and OCR text comparison
         if let Some(gt) = gt {
             let bbox_px = [e.bbox.x as f32, e.bbox.y as f32,

@@ -8,85 +8,146 @@
 
 mod common;
 
-use common::{run_unscan, audit_json_path, read_audit_json_text};
+use common::run_unscan;
 use std::path::PathBuf;
 use std::process::Command;
 
 /// Expected seam splits for each test line, per word.
-/// Regenerated 2026-08-02 from fresh audit after HARDCODED expanded to 11 lines
-/// (added "Font: Originally for IBM Executive typewriters — 12 characters per inch").
+/// Regenerated 2026-11-17 from fresh audit after HARDCODED expanded to 18 lines
+/// (all 11 original lines re-captured because the font registry changed,
+/// so winning fonts and seam columns moved).
 /// Captured from test-docs/t59-audit/audit.json after 2-horiz DP. Word_segmentation
 /// order is as emitted by Tesseract; first 10 lines share page for word-gap stats.
 const EXPECTED: &[(&str, &[&[u32]])] = &[
-    // 0: LibreBodoni-400 lowercase
+    // 0: LibreBodoni-400 "abcdefghijklmnopqrstuvwxyz."
     ("abcdefghijklmnopqrstuvwxyz.", &[
-        &[17, 112, 165, 198, 395, 424, 438, 459],
+        &[17, 112, 165, 198, 208, 373, 395, 424, 438, 459],
     ]),
-    // 1: LibreBodoni-400 uppercase
+    // 1: LibreBodoni-400 "ABCDEFGHIJKLMNOPQRSTUVWXYZ."
     ("ABCDEFGHIJKLMNOPQRSTUVWXYZ.", &[
-        &[24, 186, 216, 229, 276, 360, 545, 569, 604, 632, 656],
+        &[24, 185, 216, 229],
+        &[28, 84, 112, 223, 297, 321, 356, 384, 408],
     ]),
-    // 2: Georgia-400 uppercase
+    // 2: Georgia-400 "ABCDEFGHIJKLMNOPQRSTUVWXYZ."
     ("ABCDEFGHIJKLMNOPQRSTUVWXYZ.", &[
-        &[26, 268, 459, 530, 556, 592, 618, 642],
+        &[26, 268, 290, 459, 530, 556, 592, 618, 642],
     ]),
-    // 3: OpenSans-400 lowercase — now 5 words due to word-gap stats shift from 11-line page
+    // 3: OpenSans-400 "abcdefghijklmnopqrstuvwxyz."
     ("abcdefghijklmnopqrstuvwxyz.", &[
-        &[86, 134],
-        &[94],
-        &[],
-        &[4],
-        &[],
+        &[117, 167, 471],
     ]),
     // 4: LibreBodoni-400Italic "dogs."
     ("dogs.", &[
-        &[22, 43, 65],
+        &[20, 39, 58, 72],
     ]),
-    // 5: SourceSerif4-400It "Mayr-Duffner."
+    // 5: SourceSerif4-400Italic "Mayr-Duffner."
     ("Mayr-Duffner.", &[
-        &[19, 39, 60, 96, 162, 187, 243],
+        &[35, 56, 94, 155, 166, 181, 237],
     ]),
-    // 6: SourceSerif4-400It "Type"
+    // 6: SourceSerif4-400Italic "Type"
     ("Type", &[
-        &[15, 39],
+        &[14, 38],
     ]),
-    // 7: LibreBaskerville-400 lowercase
+    // 7: LibreBaskerville-400 "abcdefghijklmnopqrstuvwxyz."
     ("abcdefghijklmnopqrstuvwxyz.", &[
-        &[19, 127, 149, 187, 375, 448, 503, 526],
+        &[19, 127, 149, 187, 221, 375, 423, 448, 471, 503, 526],
     ]),
-    // 8: PTSerif-400Italic fox with numbers — 9 words (quick no longer split)
+    // 8: PTSerif-400Italic "Italic: The quick brown fox jumps over 1,234,567,890 lazy"
     ("Italic: The quick brown fox jumps over 1,234,567,890 lazy", &[
-        &[51, 73, 96, 129, 236],
-        &[15],
+        &[14, 26],
+        &[20],
+        &[65],
+        &[34],
+        &[14, 32],
         &[],
-        &[38],
-        &[],
-        &[38],
-        &[50],
-        &[22],
-        &[15, 35],
+        &[35],
+        &[46, 65, 87],
+        &[19, 52],
+        &[28, 45],
     ]),
-    // 9: SourceSerif4-400It "Font: Originally for IBM Executive typewriters — 12 characters per inch"
+    // 9: SourceSerif4-400Italic "Font: Originally for IBM Executive typewriters — 12 characte"
     ("Font: Originally for IBM Executive typewriters — 12 characters per inch", &[
-        &[11, 32, 145, 177],
-        &[55],
-        &[75, 127, 159],
-        &[23, 46, 119, 150],
-        &[22, 80],
+        &[21, 78],
+        &[53, 151],
+        &[19],
+        &[14, 36],
+        &[22, 128],
+        &[11, 30, 178],
         &[],
         &[],
-        &[15],
+        &[75, 159],
         &[],
         &[],
     ]),
     // 10: Georgia-400 "Matthew Carter created Georgia in 1993."
     ("Matthew Carter created Georgia in 1993.", &[
-        &[57, 72, 87, 130],
-        &[75],
-        &[88],
-        &[63],
+        &[53, 66, 79, 119],
+        &[58],
+        &[32, 67],
+        &[79, 99],
         &[],
         &[],
+    ]),
+    // 11: Arial-ItalicMT-400Italic "Italic: The quick brown fox jumps over 1,234,567,890"
+    ("Italic: The quick brown fox jumps over 1,234,567,890", &[
+        &[9, 20, 49, 57],
+        &[20],
+        &[40, 50, 68],
+        &[33, 81],
+        &[9, 30],
+        &[14, 64],
+        &[38],
+        &[162],
+    ]),
+    // 12: Nimbus-400Italic "AVAST! WAYWARD YOUTH TO YONDER VALLEY, AWAY AT DAWN. Ryan Tr"
+    ("AVAST! WAYWARD YOUTH TO YONDER VALLEY, AWAY AT DAWN. Ryan Tries.", &[
+        &[41, 107],
+        &[25, 73, 100, 123],
+        &[17, 72, 93],
+        &[19],
+        &[17, 43, 69, 96, 118],
+        &[16, 63, 84, 125],
+        &[50],
+        &[],
+        &[28, 80, 106],
+        &[22, 59],
+        &[16, 31, 57],
+    ]),
+    // 13: SourceSerif4-400Italic "Font: fonts.google.com/specimen/Jost — OFL, Owen Earl"
+    ("Font: fonts.google.com/specimen/Jost — OFL, Owen Earl", &[
+        &[21, 78],
+        &[19, 76],
+        &[21, 60, 191, 203, 217, 360, 368, 387, 406],
+        &[],
+        &[23, 45, 66],
+        &[],
+        &[],
+    ]),
+    // 14: LibreBodoni-400 "ABCDEFGHIJKLMNOPQRSTUVWXYZ"
+    ("ABCDEFGHIJKLMNOPQRSTUVWXYZ", &[
+        &[24, 186, 216, 229, 276, 332, 360, 471, 545, 569, 604, 632, 656],
+    ]),
+    // 15: SourceSerif4-400Italic "Hunt for Adobe"
+    ("Hunt for Adobe", &[
+        &[30],
+        &[19],
+        &[],
+    ]),
+    // 16: Georgia-700 "1993 — Georgia (Microsoft)"
+    ("1993 — Georgia (Microsoft)", &[
+        &[],
+        &[],
+        &[29, 94, 116],
+        &[34, 86, 202],
+    ]),
+    // 17: LibreCaslonText-400 "saying: \"When in doubt, use Caslon.\""
+    ("saying: \"When in doubt, use Caslon.\"", &[
+        &[31, 54, 89],
+        &[53],
+        &[],
+        &[],
+        &[],
+        &[128],
     ]),
 ];
 
@@ -148,7 +209,7 @@ fn seam_splits_match_ground_truth() {
             "--test", gt.to_str().unwrap(),
             "--audit", audit_dir.to_str().unwrap(),
         ]);
-        let audit_path = audit_json_path(&audit_dir);
+        let audit_path = audit_dir.join("audit.json");
         if audit_path.exists() {
             eprintln!("  audit.json produced on attempt {attempt}");
             break;
@@ -164,11 +225,11 @@ fn seam_splits_match_ground_truth() {
     }
 
     // Parse audit.json for seam splits
-    let audit_path = audit_json_path(&audit_dir);
+    let audit_path = audit_dir.join("audit.json");
     assert!(audit_path.exists(), "audit.json not produced after 3 attempts. last output: {}", last_output);
 
     let audit: serde_json::Value = serde_json::from_str(
-        &read_audit_json_text(&audit_path)
+        &std::fs::read_to_string(&audit_path).unwrap()
     ).unwrap();
 
     let entries = audit["text_entries"].as_array().expect("no text_entries");

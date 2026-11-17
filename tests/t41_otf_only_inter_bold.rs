@@ -6,7 +6,7 @@
 
 mod common;
 
-use common::{test_doc, unscan_bin, audit_json_path, read_audit_json_text};
+use common::{test_doc, unscan_bin};
 use std::process::Command;
 
 fn run_and_parse(input: &std::path::Path) -> (Option<f64>, Option<String>, usize) {
@@ -25,10 +25,10 @@ fn run_and_parse(input: &std::path::Path) -> (Option<f64>, Option<String>, usize
 
     assert!(output.status.success(), "unprint failed: {:?}", output.status.code());
 
-    let json_path = audit_json_path(&audit_dir);
+    let json_path = audit_dir.join("audit.json");
     if !json_path.exists() { return (None, None, 0); }
 
-    let data = read_audit_json_text(&json_path);
+    let data = std::fs::read_to_string(&json_path).unwrap();
     let ssim = {
         // Field was renamed from ssim_score to similarity_score
         let n = "\"similarity_score\":";

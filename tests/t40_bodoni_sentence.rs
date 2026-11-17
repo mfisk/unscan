@@ -6,7 +6,7 @@
 
 mod common;
 
-use common::{test_doc, unscan_bin, audit_json_path, read_audit_json_text};
+use common::{test_doc, unscan_bin};
 use std::process::Command;
 
 /// Run unprint with --audit and parse audit.json for font/SSIM/vectorized info.
@@ -26,10 +26,10 @@ fn run_and_parse(input: &std::path::Path) -> (Option<f64>, Option<String>, usize
 
     assert!(output.status.success(), "unprint failed: {:?}", output.status.code());
 
-    let json_path = audit_json_path(&audit_dir);
+    let json_path = audit_dir.join("audit.json");
     if !json_path.exists() { return (None, None, 0); }
 
-    let data = read_audit_json_text(&json_path);
+    let data = std::fs::read_to_string(&json_path).unwrap();
     let ssim = find_json_f64(&data, "similarity_score");
     let font = find_json_string(&data, "font_matched");
     let vectorized = count_json_field(&data, "lines_vectorized");

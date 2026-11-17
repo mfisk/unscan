@@ -141,42 +141,6 @@ fn main() {
     }
 
     // ── export-catalog-json: dump FontEntry records and exit ─────────
-    // ── select-font: structured criteria -> verbatim catalog font_key ───
-    // Per Mike Nov 15: specimen generators state what they want; Rust
-    // picks. Every present criterion is a hard filter (font_scan::
-    // select_entry_for_criteria); no match errors loudly, never relaxes.
-    // An unconstrained lig dimension prefers the lig variant (Mike Nov 17).
-    if !args.select_font.is_empty() {
-        let font_dirs = font_scan::default_font_dirs(&args.font_dir);
-        let catalog = font_scan::scan_fonts(&font_dirs, args.quiet);
-        for spec in &args.select_font {
-            let sel = match parse_font_selection(spec) {
-                Ok(sel) => sel,
-                Err(e) => {
-                    eprintln!("--select-font: invalid spec {spec:?}: {e}");
-                    std::process::exit(1);
-                }
-            };
-            match font_scan::select_entry_for_criteria(catalog.iter(), &sel) {
-                Some(fe) => println!("{}", fe.font_key()),
-                None => {
-                    eprintln!(
-                        "--select-font: no catalog entry matches {spec:?} \
-                         (family={:?}, weight={:?}, style={:?}, opsz={:?}, kern={:?}, lig={:?})",
-                        sel.family,
-                        sel.weight,
-                        sel.italic.map(|i| if i { "italic" } else { "regular" }),
-                        sel.opsz,
-                        sel.kern.map(|k| if k { "kern" } else { "nokern" }),
-                        sel.lig.map(|l| if l { "lig" } else { "nolig" }),
-                    );
-                    std::process::exit(1);
-                }
-            }
-        }
-        std::process::exit(0);
-    }
-
     if let Some(out_path) = &args.export_catalog_json {
         use serde::Serialize;
         use std::collections::HashMap;
@@ -320,71 +284,6 @@ fn main() {
 /// Writes catalog.bin so classifier loaders can validate catalog_hash.
 /// Centroids are already baked into classifier .bin files from training,
 /// so no runtime render+embed step is needed.
-/// Parse a `--select-font` spec: comma-separated `key=value` pairs.
-/// Keys: family (required), weight (u32), style (regular|italic),
-/// opsz (f32), kern (kern|nokern), lig (lig|nolig). Unknown or
-/// duplicate keys and malformed values are errors.
-fn parse_font_selection(spec: &str) -> Result<font_scan::FontSelection, String> {
-    let mut sel = font_scan::FontSelection::default();
-    let mut saw_family = false;
-    let mut seen: Vec<&str> = Vec::new();
-    for part in spec.split(',') {
-        let part = part.trim();
-        if part.is_empty() {
-            continue;
-        }
-        let Some((k, v)) = part.split_once('=') else {
-            return Err(format!("expected key=value, got {part:?}"));
-        };
-        let (k, v) = (k.trim(), v.trim());
-        if seen.contains(&k) {
-            return Err(format!("duplicate key {k:?}"));
-        }
-        seen.push(k);
-        match k {
-            "family" => {
-                if v.is_empty() {
-                    return Err("family must not be empty".to_string());
-                }
-                sel.family = v.to_string();
-                saw_family = true;
-            }
-            "weight" => {
-                sel.weight = Some(v.parse::<u32>().map_err(|_| format!("bad weight {v:?}"))?);
-            }
-            "style" => {
-                sel.italic = Some(match v {
-                    "regular" => false,
-                    "italic" => true,
-                    _ => return Err(format!("bad style {v:?} (regular|italic)")),
-                });
-            }
-            "opsz" => {
-                sel.opsz = Some(v.parse::<f32>().map_err(|_| format!("bad opsz {v:?}"))?);
-            }
-            "kern" => {
-                sel.kern = Some(match v {
-                    "kern" => true,
-                    "nokern" => false,
-                    _ => return Err(format!("bad kern {v:?} (kern|nokern)")),
-                });
-            }
-            "lig" => {
-                sel.lig = Some(match v {
-                    "lig" => true,
-                    "nolig" => false,
-                    _ => return Err(format!("bad lig {v:?} (lig|nolig)")),
-                });
-            }
-            _ => return Err(format!("unknown key {k:?}")),
-        }
-    }
-    if !saw_family {
-        return Err("missing required family=".to_string());
-    }
-    Ok(sel)
-}
-
 fn load_fonts(args: &cli::Args, _classifier: &mut dyn classifier::Classifier) -> Result<font_scan::FontRegistry, ScanTextError> {
     // ── Vintage font cache generation (lightweight, BEFORE heavy scan) ──
     // To avoid OOM on full rescan (685 files -> 2911 entries -> incremental 342k glyph renders),
@@ -589,8 +488,6 @@ fn build_audit_entry(
         tie_candidates: lm.tie_candidates.clone(),
         miss_type: None,
         expected_font: None,
-        gt_rank: None,
-        gt_score: None,
         gt_text: None,
         ocr_text: None,
         ocr_correct: None,
@@ -1280,9 +1177,9 @@ fn run(args: &cli::Args, classifier: &mut dyn classifier::Classifier) -> Result<
                         .collect::<Vec<_>>(),
                     "decision": if keep_raster { "raster" } else { "vectorized" },
                 });
-                let _ = audit::write_json_gz(
-                    &ddir.join("line_summary.json"),
-                    &serde_json::to_string(&line_summary).unwrap_or_default(),
+                let _ = std::fs::write(
+                    ddir.join("line_summary.json"),
+                    serde_json::to_string_pretty(&line_summary).unwrap_or_default(),
                 );
             }
 

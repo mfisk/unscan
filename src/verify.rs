@@ -98,11 +98,8 @@ pub fn measure_word_widths(
                 let bw = wr.width.min(crop_w.saturating_sub(x_off));
                 let bh = wr.height.min(crop_h.saturating_sub(y_off));
                 if bw >= 1 && bh >= 1 {
-                    // Height argument is bh: ink_horizontal_extent scans
-                    // rows y..y+h, so passing y_off+bh scanned to
-                    // 2*y_off+bh (clamped) — taller than the word box.
                     let (il, ir) = crate::ocr::ink_horizontal_extent(
-                        scan_crop, y_off, bh, x_off, x_off + bw, ink_thresh
+                        scan_crop, y_off, y_off + bh, x_off, x_off + bw, ink_thresh
                     );
                     let mw = ir.saturating_sub(il);
                     if mw >= 1 { mw } else { wr.width }
