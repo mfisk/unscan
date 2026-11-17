@@ -589,6 +589,8 @@ fn build_audit_entry(
         tie_candidates: lm.tie_candidates.clone(),
         miss_type: None,
         expected_font: None,
+        gt_rank: None,
+        gt_score: None,
         gt_text: None,
         ocr_text: None,
         ocr_correct: None,

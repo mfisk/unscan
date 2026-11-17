@@ -4,7 +4,7 @@ use std::collections::HashMap;
 use std::sync::Arc;
 
 use crate::error::ScanTextError;
-use serde::Serialize;
+use serde::{Serialize, Serializer};
 use crate::classifier::ObsStats;
 
 use std::path::{Path, PathBuf};
@@ -26,6 +26,22 @@ pub struct WordSegSummary {
     pub seam_costs: Arc<HashMap<u32, crate::segment::SeamCost>>,
 }
 
+/// Serialize only the first 10 font candidates. The ranked list is
+/// score-descending (see `font_match::identify_fonts`, which sorts
+/// `scored` descending), so these are the top 10. The in-memory Vec
+/// stays full — the report generator reads it in memory and the GT
+/// rank/score are recorded separately (`gt_rank`/`gt_score`) — only
+/// the JSON writer truncates. The full list (typically ~700 entries
+/// per line) was the audit JSON's biggest component and no tool reads
+/// past the top 10.
+fn serialize_top10<S>(candidates: &Vec<FontCandidate>, serializer: S) -> Result<S::Ok, S::Error>
+where
+    S: Serializer,
+{
+    let n = candidates.len().min(10);
+    candidates[..n].serialize(serializer)
+}
+
 /// Per-text-region audit record.
 #[derive(Debug, Serialize)]
 pub struct AuditEntry {
@@ -44,7 +60,7 @@ pub struct AuditEntry {
     pub decision: Decision,
     pub reason: String,
     pub bbox: BBox,
-    #[serde(skip_serializing_if = "Vec::is_empty")]
+    #[serde(skip_serializing_if = "Vec::is_empty", serialize_with = "serialize_top10")]
     pub font_candidates: Vec<FontCandidate>,
     #[serde(skip_serializing_if = "Vec::is_empty")]
     pub obs_votes: Vec<ObservationVote>,
@@ -74,6 +90,19 @@ pub struct AuditEntry {
     /// Populated when --audit is provided.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub expected_font: Option<String>,
+    /// 1-based rank of the ground-truth font in the full ranked
+    /// `font_candidates` list (None when GT is absent from the list or
+    /// no GT is available). Populated when --audit is provided.
+    /// The JSON records only the top 10 candidates (see
+    /// `serialize_top10`), so the rank is kept explicitly — GT ranks
+    /// below the top 10 on a substantial minority of lines.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub gt_rank: Option<usize>,
+    /// Score of the ground-truth font in the full ranked
+    /// `font_candidates` list (None when GT is absent from the list or
+    /// no GT is available). Populated when --audit is provided.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub gt_score: Option<f32>,
     /// Ground-truth text from the vector PDF span.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub gt_text: Option<String>,
