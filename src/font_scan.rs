@@ -2643,10 +2643,31 @@ fn font_key_version(font_key: &str) -> u32 {
 /// kerned by default, so its kerned variant is the default pick.
 /// Lig is explicit in the key but scores 0 (the default); nolig keeps
 /// +2, so the nolig variant still wins the default-GT pick.
+/// The lig dimension is parameterizable via
+/// `font_key_preference_score_with_lig`: the select API
+/// (`--select-font`) passes prefer_lig=true, so a specimen — which
+/// renders real text, ligatures on by default — picks the lig variant.
+/// The classifier tiebreakers and bare-name resolution keep the shared
+/// default here (nolig), so a specimen-config decision never moves
+/// audit picks.
 /// A key without a version tag scores version 0 and loses to any
 /// versioned key. An exact key match (version specified) bypasses
 /// this preference entirely — callers check exact matches first.
 pub fn font_key_preference_score(font_key: &str, has_kern: bool) -> (u32, i32) {
+    font_key_preference_score_with_lig(font_key, has_kern, false)
+}
+
+/// Same preference with the ligature dimension parameterized. With
+/// prefer_lig=true the +2 goes to the lig variant instead of nolig —
+/// used only by the select API (`select_entry_for_criteria`), which
+/// picks the font a specimen renders. Every other caller uses the
+/// shared default above. The lig match is segment-exact
+/// (`key_has_variant_tag`): a substring test would match "nolig" too.
+pub fn font_key_preference_score_with_lig(
+    font_key: &str,
+    has_kern: bool,
+    prefer_lig: bool,
+) -> (u32, i32) {
     let version = font_key_version(font_key);
     let mut s = 0;
     let is_nokern = font_key.contains("nokern");
@@ -2655,7 +2676,11 @@ pub fn font_key_preference_score(font_key: &str, has_kern: bool) -> (u32, i32) {
     if has_kern != is_nokern {
         s += 4;
     }
-    if font_key.contains("nolig") {
+    if prefer_lig {
+        if key_has_variant_tag(font_key, "lig") {
+            s += 2;
+        }
+    } else if font_key.contains("nolig") {
         s += 2;
     }
     if font_key.contains("opsz=10") {
@@ -2700,15 +2725,29 @@ where
 
 /// Best entry by the shared preference: highest version first, then
 /// variant preference, then the lowest font_key on a full tie. Shared by
-/// `best_entry_for_ps_name` and `select_entry_for_criteria` so bare-name
-/// resolution and structured selection can never drift apart.
+/// `best_entry_for_ps_name` and (via `best_by_preference_with_lig`)
+/// `select_entry_for_criteria`: the two agree on version, kern, opsz,
+/// and the OT/weight penalties, and differ only on lig — selection
+/// prefers lig (a specimen renders real text, ligatures on), while
+/// bare-name resolution follows the classifier tiebreak preference
+/// (nolig), so a specimen-config decision never moves audit picks.
 fn best_by_preference<'a, I>(entries: I) -> Option<&'a FontEntry>
 where
     I: Iterator<Item = &'a FontEntry>,
 {
+    best_by_preference_with_lig(entries, false)
+}
+
+/// `best_by_preference` with the ligature dimension parameterized;
+/// prefer_lig=true hands the +2 to the lig variant. Only the select
+/// API uses true.
+fn best_by_preference_with_lig<'a, I>(entries: I, prefer_lig: bool) -> Option<&'a FontEntry>
+where
+    I: Iterator<Item = &'a FontEntry>,
+{
     entries.max_by(|a, b| {
-        let pa = font_key_preference_score(a.font_key_ref(), a.has_kern);
-        let pb = font_key_preference_score(b.font_key_ref(), b.has_kern);
+        let pa = font_key_preference_score_with_lig(a.font_key_ref(), a.has_kern, prefer_lig);
+        let pb = font_key_preference_score_with_lig(b.font_key_ref(), b.has_kern, prefer_lig);
         // Max-by prefers the greater; reverse the key comparison so
         // the lowest key wins a full preference tie (same as the
         // fine-score sort's key-asc final fallback).
@@ -2790,9 +2829,11 @@ fn entry_opsz(fe: &FontEntry) -> Option<f32> {
 /// Select the single best catalog entry matching structured criteria
 /// (`--select-font`, Mike Nov 15, 2026: specimen generators state what
 /// they want; Rust picks). Every present criterion is a hard filter;
-/// among the survivors the shared preference breaks ties (latest
-/// version first, then variant preference, then lowest key). Returns
-/// None when nothing matches — the caller errors loudly, never relaxes.
+/// among the survivors the select preference breaks ties — the shared
+/// preference, except lig wins over nolig when lig is unconstrained
+/// (Mike Nov 17, 2026: the API prefers lig, so a specimen renders
+/// ligatures on, as real text does). Returns None when nothing
+/// matches — the caller errors loudly, never relaxes.
 pub fn select_entry_for_criteria<'a, I>(entries: I, sel: &FontSelection) -> Option<&'a FontEntry>
 where
     I: Iterator<Item = &'a FontEntry>,
@@ -2846,7 +2887,7 @@ where
         }
         true
     });
-    best_by_preference(filtered)
+    best_by_preference_with_lig(filtered, true)
 }
 
 /// Font version from the `head` table `fontRevision` field, formatted
@@ -3812,6 +3853,47 @@ mod select_font_tests {
         };
         let best = super::select_entry_for_criteria(entries.iter(), &sel).unwrap();
         assert_eq!(best.font_key_ref(), "CourierNewPSMT-400|version=2.82|nokern|lig");
+    }
+
+    #[test]
+    fn select_prefers_lig_when_unconstrained() {
+        // Mike Nov 17, 2026: the API prefers lig. With lig unconstrained,
+        // the lig variant wins over nolig within one version — the
+        // specimen renders ligatures on, as real text does.
+        let entries = vec![
+            entry("X-400|version=2.82|nokern|nolig", "X", None),
+            entry("X-400|version=2.82|nokern|lig", "X", None),
+        ];
+        let sel = FontSelection {
+            family: "X".to_string(),
+            weight: Some(400),
+            italic: Some(false),
+            opsz: None,
+            kern: Some(false),
+            lig: None,
+        };
+        let best = super::select_entry_for_criteria(entries.iter(), &sel).unwrap();
+        assert_eq!(best.font_key_ref(), "X-400|version=2.82|nokern|lig");
+    }
+
+    #[test]
+    fn select_explicit_nolig_still_constrains() {
+        // An explicit lig=false stays a hard filter: the nolig entry is
+        // the only survivor even though the API prefers lig.
+        let entries = vec![
+            entry("X-400|version=2.82|nokern|nolig", "X", None),
+            entry("X-400|version=2.82|nokern|lig", "X", None),
+        ];
+        let sel = FontSelection {
+            family: "X".to_string(),
+            weight: Some(400),
+            italic: Some(false),
+            opsz: None,
+            kern: Some(false),
+            lig: Some(false),
+        };
+        let best = super::select_entry_for_criteria(entries.iter(), &sel).unwrap();
+        assert_eq!(best.font_key_ref(), "X-400|version=2.82|nokern|nolig");
     }
 
     #[test]

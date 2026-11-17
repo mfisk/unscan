@@ -145,6 +145,7 @@ fn main() {
     // Per Mike Nov 15: specimen generators state what they want; Rust
     // picks. Every present criterion is a hard filter (font_scan::
     // select_entry_for_criteria); no match errors loudly, never relaxes.
+    // An unconstrained lig dimension prefers the lig variant (Mike Nov 17).
     if !args.select_font.is_empty() {
         let font_dirs = font_scan::default_font_dirs(&args.font_dir);
         let catalog = font_scan::scan_fonts(&font_dirs, args.quiet);
