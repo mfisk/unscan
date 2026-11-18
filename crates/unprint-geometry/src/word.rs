@@ -209,8 +209,9 @@ pub fn fix_overlapping_words_by_ink(lines: &mut [TextLine], gray: &GrayImage, in
 }
 
 /// Scan grayscale for horizontal ink extent.
-/// Returns (left, right_exclusive) of ink < threshold within y..y+h and search_left..search_right.
-/// Returns (search_left, search_left) if no ink found.
+/// Returns fractional (left, right_exclusive) of ink < threshold within
+/// y..y+h and search_left..search_right, from the canonical subpixel edge
+/// measurement. Returns (search_left, search_left) if no ink found.
 pub fn ink_horizontal_extent(
     gray: &GrayImage,
     y: u32,
@@ -218,42 +219,61 @@ pub fn ink_horizontal_extent(
     search_left: u32,
     search_right: u32,
     threshold: u8,
-) -> (u32, u32) {
+) -> (f64, f64) {
     let page_w = gray.width();
     let page_h = gray.height();
     let y0 = y.min(page_h.saturating_sub(1));
     let y1 = (y + h).min(page_h);
     let sl = search_left.min(page_w);
     let sr = search_right.min(page_w);
-    if sl >= sr || y0 >= y1 { return (sl, sl); }
-    let mut first: Option<u32> = None;
-    for col in sl..sr {
-        for row in y0..y1 {
-            if gray.get_pixel(col, row).0[0] < threshold {
-                first = Some(col);
-                break;
-            }
-        }
-        if first.is_some() { break; }
-    }
-    let Some(f) = first else { return (sl, sl); };
-    let mut last_ex = f + 1;
-    for col in (sl..sr).rev() {
-        for row in y0..y1 {
-            if gray.get_pixel(col, row).0[0] < threshold {
-                last_ex = col + 1;
-                return (f, last_ex);
-            }
+    if sl >= sr || y0 >= y1 { return (sl as f64, sl as f64); }
+    // Per-column max darkness over the row band; the edge comes from the
+    // canonical helper, so scan and render share one measurement.
+    let raw = gray.as_raw();
+    let w_us = page_w as usize;
+    let mut col_dark = vec![0u8; (sr - sl) as usize];
+    for row in y0..y1 {
+        let base = row as usize * w_us;
+        for col in sl..sr {
+            let d = 255u8.saturating_sub(raw[base + col as usize]);
+            let slot = &mut col_dark[(col - sl) as usize];
+            if d > *slot { *slot = d; }
         }
     }
-    (f, last_ex)
+    let min_dark = 256u16 - threshold as u16;
+    match frac_edges_from_profile(&col_dark, min_dark) {
+        Some((l, r)) => (sl as f64 + l, sl as f64 + r),
+        None => (sl as f64, sl as f64),
+    }
 }
 
 /// Scan grayscale for vertical ink extent - batch helper.
-pub fn ink_vertical_extent(gray: &GrayImage, x: u32, w: u32, search_top: u32, search_bot: u32, threshold: u8) -> (u32,u32) {
-    let mut first: Option<u32>=None; let mut last=search_top;
-    for row in search_top..search_bot { for col in x..x+w { if gray.get_pixel(col,row).0[0] < threshold { if first.is_none(){first=Some(row);} last=row; break; } } }
-    match first { Some(t)=>(t,last+1), None=>(search_top,search_top) }
+/// Returns fractional (top, bottom_exclusive) like `ink_horizontal_extent`.
+pub fn ink_vertical_extent(gray: &GrayImage, x: u32, w: u32, search_top: u32, search_bot: u32, threshold: u8) -> (f64, f64) {
+    let page_w = gray.width();
+    let page_h = gray.height();
+    let x0 = x.min(page_w);
+    let x1 = (x + w).min(page_w);
+    let top = search_top.min(page_h);
+    let bot = search_bot.min(page_h);
+    if x0 >= x1 || top >= bot { return (top as f64, top as f64); }
+    let raw = gray.as_raw();
+    let w_us = page_w as usize;
+    let mut row_dark = vec![0u8; (bot - top) as usize];
+    for row in top..bot {
+        let base = row as usize * w_us;
+        let mut m = 0u8;
+        for col in x0..x1 {
+            let d = 255u8.saturating_sub(raw[base + col as usize]);
+            if d > m { m = d; }
+        }
+        row_dark[(row - top) as usize] = m;
+    }
+    let min_dark = 256u16 - threshold as u16;
+    match frac_edges_from_profile(&row_dark, min_dark) {
+        Some((l, r)) => (top as f64 + l, top as f64 + r),
+        None => (top as f64, top as f64),
+    }
 }
 
 /// Batch API: trim words to ink.
@@ -276,8 +296,11 @@ pub fn trim_words_to_ink(lines: &mut [TextLine], gray: &GrayImage, ink_threshold
             let scan_right = (wx + ww).min(page_w);
             let (nl, nr_ex) = ink_horizontal_extent(gray, wy, wh, scan_left, scan_right, ink_threshold);
             if nr_ex <= nl { continue; } // no ink -> keep original
-            word.x = nl;
-            word.width = nr_ex - nl;
+            // Fractional bounds to integer bbox: floor/ceil recovers the old
+            // integer bounds exactly (the edge shift is always < 1px inward),
+            // so trimming is unchanged — a crop is inherently integer.
+            word.x = nl.floor() as u32;
+            word.width = nr_ex.ceil() as u32 - word.x;
         }
     }
 }
