@@ -26,7 +26,7 @@ Usage:
 
 from PIL import Image, ImageDraw, ImageFont
 import numpy as np
-import argparse, json, sys, os
+import argparse, gzip, json, sys, os
 
 DELTA_WEIGHT = 1.0
 SCALE = 32
@@ -343,14 +343,33 @@ def find_word_crop(audit_dir, page, line_index, word_text, source_word_idx):
     return None, None
 
 
+def resolve_json_path(path):
+    """Return the existing path for a JSON artifact: `path.gz` if present
+    (current unprint writes compact gzip), else `path` (older runs)."""
+    gz = path + '.gz'
+    return gz if os.path.exists(gz) else path
+
+
+def load_json_maybe_gz(path):
+    """Load a JSON file, accepting a `.gz` path, `path.gz`, or plain `path`."""
+    if path.endswith('.gz'):
+        with gzip.open(path, 'rt', encoding='utf-8') as f:
+            return json.load(f)
+    gz = path + '.gz'
+    if os.path.exists(gz):
+        with gzip.open(gz, 'rt', encoding='utf-8') as f:
+            return json.load(f)
+    with open(path) as f:
+        return json.load(f)
+
+
 def find_seg_summary(seg_plain_dir):
     """Load summary.json from seg_plain dir for candidate_seam_paths and seam_seed_candidates."""
     if seg_plain_dir is None:
         return {}
     summary_path = os.path.join(seg_plain_dir, 'summary.json')
-    if os.path.exists(summary_path):
-        with open(summary_path) as f:
-            return json.load(f)
+    if os.path.exists(summary_path) or os.path.exists(summary_path + '.gz'):
+        return load_json_maybe_gz(summary_path)
     return {}
 
 
@@ -371,7 +390,7 @@ if __name__ == '__main__':
 
     if a.seg_dir:
         # Legacy mode: read from seg_plain dir directly
-        summary_path = os.path.join(a.seg_dir, 'summary.json')
+        summary_path = resolve_json_path(os.path.join(a.seg_dir, 'summary.json'))
         crop_path = os.path.join(a.seg_dir, 'word_crop.png')
         if not os.path.exists(summary_path):
             print(f"ERROR: {summary_path} not found", file=sys.stderr)
@@ -379,8 +398,7 @@ if __name__ == '__main__':
         if not os.path.exists(crop_path):
             print(f"ERROR: {crop_path} not found", file=sys.stderr)
             sys.exit(1)
-        with open(summary_path) as f:
-            summary = json.load(f)
+        summary = load_json_maybe_gz(summary_path)
 
         seam_paths = {int(k): v for k, v in summary.get('seam_paths', {}).items()}
         seam_costs = {int(k): v for k, v in summary.get('seam_costs', {}).items()}
@@ -391,14 +409,14 @@ if __name__ == '__main__':
                 seam_costs[c['col']] = c['cost']
     else:
         # Primary mode: read from audit.json
-        if not os.path.exists(a.audit_json):
+        audit_path = resolve_json_path(a.audit_json)
+        if not os.path.exists(audit_path):
             print(f"ERROR: {a.audit_json} not found", file=sys.stderr)
             sys.exit(1)
 
-        with open(a.audit_json) as f:
-            audit = json.load(f)
+        audit = load_json_maybe_gz(audit_path)
 
-        audit_dir = os.path.dirname(os.path.abspath(a.audit_json))
+        audit_dir = os.path.dirname(os.path.abspath(audit_path))
 
         # Find the matching word_segmentation entry
         match = None

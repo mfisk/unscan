@@ -11,7 +11,7 @@
 
 mod common;
 
-use common::{test_doc, ensure_index};
+use common::{test_doc, ensure_index, audit_json_path, read_audit_json_text};
 
 /// Minimum acceptable accuracy (strict hits / compared).
 /// Old metric counted minor_misses as hits (primary_hits); scored 80.6%.
@@ -78,10 +78,10 @@ fn specimen_vectorizes_enough_lines() {
     assert!(result.status.success(), "unprint failed: {}",
         String::from_utf8_lossy(&result.stderr));
 
-    let audit_path = audit_dir.join("audit.json");
+    let audit_path = audit_json_path(&audit_dir);
     assert!(audit_path.exists(), "audit.json not written");
 
-    let audit_data = std::fs::read_to_string(&audit_path).expect("read audit.json");
+    let audit_data = read_audit_json_text(&audit_path);
     let json: serde_json::Value = serde_json::from_str(&audit_data)
         .expect("parse audit.json");
 

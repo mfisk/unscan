@@ -6,12 +6,23 @@ Generate zero-centered histograms with flat-top scoring overlay.
 - Output: PNG with v and h histograms + flat-top and Gaussian curves
 - Computes sv, sh from filtered data (abs err <1.5 px) matching prior sv=0.2486 sh=0.49799 methodology
 """
-import json, math, sys, pathlib
+import gzip, json, math, sys, pathlib
 import numpy as np
 import matplotlib.pyplot as plt
 
 AUDIT = sys.argv[1] if len(sys.argv)>1 else "test-docs/audit-flat-0.45/audit.json"
 OUT = sys.argv[2] if len(sys.argv)>2 else str(pathlib.Path.home()/"workspace/your_files/hist-0.45/hist-centered-zero-flat-top-20260729-fresh.png")
+
+def load_audit(path):
+    # Current unprint writes compact gzip (audit.json.gz); accept both.
+    if path.endswith('.gz'):
+        with gzip.open(path, 'rt', encoding='utf-8') as f:
+            return json.load(f)
+    gz = path + '.gz'
+    if pathlib.Path(gz).exists():
+        with gzip.open(gz, 'rt', encoding='utf-8') as f:
+            return json.load(f)
+    return json.load(open(path))
 
 def erf_phi(x):
     # Phi(x) = 0.5*(1+erf(x/sqrt2))
@@ -29,7 +40,7 @@ def quantized_ll(e, sigma, a):
 def gaussian_ll(e, sigma):
     return -e*e/(2*sigma*sigma)
 
-data=json.load(open(AUDIT))
+data=load_audit(AUDIT)
 v_errs=[]
 h_errs=[]
 total_obs=0
