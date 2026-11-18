@@ -75,6 +75,47 @@ pub struct VerifyResult {
     pub diff: Option<RgbImage>,
 }
 
+/// Measure each word's ink width on the scan crop: the horizontal ink
+/// extent of the word's box, falling back to the box width when the box
+/// is off-crop or holds no ink. Depends only on the crop and the word
+/// boxes — never on the font — so callers that verify the same line
+/// against several fonts measure once and reuse the widths across calls
+/// (redundancy F34). This is the single source of truth for the
+/// computation; `verify_text_region` takes the widths as a required
+/// parameter.
+pub fn measure_word_widths(
+    scan_crop: &GrayImage,
+    words: &[TextRegion],
+    crop_x: u32,
+    crop_y: u32,
+) -> Vec<f32> {
+    let ink_thresh = crate::ocr::INK_THRESHOLD;
+    let (crop_w, crop_h) = scan_crop.dimensions();
+    words
+        .iter()
+        .map(|wr| {
+            let x_off = wr.x.saturating_sub(crop_x);
+            let y_off = wr.y.saturating_sub(crop_y);
+            if x_off < crop_w && y_off < crop_h {
+                let bw = wr.width.min(crop_w.saturating_sub(x_off));
+                let bh = wr.height.min(crop_h.saturating_sub(y_off));
+                if bw >= 1 && bh >= 1 {
+                    // Height argument is bh: ink_horizontal_extent scans
+                    // rows y..y+h, so passing y_off+bh scanned to
+                    // 2*y_off+bh (clamped) — taller than the word box.
+                    let (il, ir) = crate::ocr::ink_horizontal_extent(
+                        scan_crop, y_off, bh, x_off, x_off + bw, ink_thresh
+                    );
+                    // Fractional (subpixel) ink width: the extent returns
+                    // fractional edges, so the width is fractional too.
+                    let mw = (ir - il) as f32;
+                    if mw >= 1.0 { mw } else { wr.width as f32 }
+                } else { wr.width as f32 }
+            } else { wr.width as f32 }
+        })
+        .collect()
+}
+
 /// Verify a vectorised text region by:
 /// 1. Computing an aspect-ratio penalty (natural advance widths vs OCR bbox widths)
 /// 2. Rendering with per-word width scaling (so ZNCC can compare glyph shapes)
@@ -101,6 +142,12 @@ pub fn verify_text_region(
     bail_below: Option<f32>,
     override_em_px: Option<f32>,
     frac_width: Option<f32>,
+    // Per-word ink widths from `measure_word_widths` on this same crop and
+    // these same word boxes (F34): the widths depend only on the scan, not
+    // the font, so callers verifying one line against several fonts measure
+    // once and pass the result in. Required, not optional: every caller
+    // measures (or reuses) explicitly, and the length must match `words`.
+    measured_widths: &[f32],
 ) -> VerifyResult {
     let (w, h) = scan_crop.dimensions();
 
@@ -118,24 +165,20 @@ pub fn verify_text_region(
     // uniform line scale (midpoint-derived override_em_px).
     // Compute word widths from our crop's ink measurement, not Tesseract's bbox.
     // Tesseract widths are approximate; our ink_horizontal_extent measures actual ink.
-    let ink_thresh = crate::ocr::INK_THRESHOLD;
-    let (crop_w, crop_h) = scan_crop.dimensions();
+    // The widths arrive precomputed (see `measure_word_widths`): they depend
+    // only on the scan crop and the word boxes, never on the font, so the
+    // caller measures once per line and reuses them across verify calls (F34).
+    assert_eq!(
+        measured_widths.len(),
+        words.len(),
+        "measured_widths must cover every word"
+    );
     let placements: Vec<WordPlacement> = words
         .iter()
-        .map(|wr| {
+        .zip(measured_widths.iter())
+        .map(|(wr, &measured_w)| {
             let x_off = wr.x.saturating_sub(crop_x);
             let y_off = wr.y.saturating_sub(crop_y);
-            let measured_w = if x_off < crop_w && y_off < crop_h {
-                let bw = wr.width.min(crop_w.saturating_sub(x_off));
-                let bh = wr.height.min(crop_h.saturating_sub(y_off));
-                if bw >= 1 && bh >= 1 {
-                    let (il, ir) = crate::ocr::ink_horizontal_extent(
-                        scan_crop, y_off, y_off + bh, x_off, x_off + bw, ink_thresh
-                    );
-                    let mw = (ir - il) as f32;
-                    if mw >= 1.0 { mw } else { wr.width as f32 }
-                } else { wr.width as f32 }
-            } else { wr.width as f32 };
             WordPlacement {
                 // Normalize the word text for this font (Mike Nov 6, 2026):
                 // a lig font renders "fi" as the single U+FB01 glyph.

@@ -132,6 +132,18 @@ pub struct Args {
     #[arg(long, value_name = "PATH|KEY|NAME", help_heading = "Classifier")]
     pub resolve_fontkey: Vec<String>,
 
+    /// Select a font by structured criteria and print its verbatim
+    /// catalog font_key. Spec: comma-separated key=value pairs —
+    /// family (required), weight, style (regular|italic), opsz,
+    /// kern (kern|nokern), lig (lig|nolig). Example:
+    /// --select-font "family=Noto Serif,weight=400,style=regular,opsz=10,kern=nokern".
+    /// All present criteria are hard filters; ties break by the shared
+    /// preference (latest version first). No match exits non-zero naming
+    /// the criteria — constraints are never relaxed. Specimen generators
+    /// use this instead of scanning the catalog in Python (Mike Nov 15).
+    #[arg(long, value_name = "SPEC", help_heading = "Classifier")]
+    pub select_font: Vec<String>,
+
     /// Export the font catalog as JSON to the given path and exit.
     /// The JSON contains all FontEntry records with their exact font_key,
     /// path, postscript_name, variant_tag, and variations.
@@ -194,6 +206,7 @@ impl Args {
     /// Resolve the audit JSON path.
     /// With --audit DIR, it's DIR/audit.json.
     /// Without --audit, falls back to <output>.audit.json.
+    /// write_to_file appends `.gz`, so the file on disk is `audit.json.gz`.
     pub fn audit_log_path(&self) -> PathBuf {
         if let Some(ref dir) = self.audit {
             dir.join("audit.json")
@@ -233,6 +246,7 @@ impl Args {
     pub fn is_utility_mode(&self) -> bool {
         !self.weight_explicit.is_empty()
             || !self.resolve_fontkey.is_empty()
+            || !self.select_font.is_empty()
             || self.export_catalog_json.is_some()
     }
 

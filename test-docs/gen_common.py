@@ -36,9 +36,28 @@ def resolve_fontkey_via_api(unprint_bin, font_path):
         )
     return result.stdout.strip()
 
+
+def select_fontkey_via_api(unprint_bin, spec):
+    """Select a font by structured criteria via --select-font.
+
+    spec is a comma-separated key=value string (family=, weight=,
+    style=, opsz=, kern=, lig=). Returns the verbatim font_key of the
+    single best-matching catalog entry. Raises RuntimeError when nothing
+    matches — the API never relaxes a constraint (Mike Nov 15, 2026).
+    """
+    result = subprocess.run(
+        [unprint_bin, "--select-font", spec],
+        capture_output=True, text=True, timeout=60
+    )
+    if result.returncode != 0:
+        raise RuntimeError(
+            f"--select-font failed for {spec}: {result.stderr.strip()[:500]}"
+        )
+    return result.stdout.strip()
+
 # Ensure tools/ is on path for pdf_font_annotate / rasterize
 sys.path.insert(0, str(REPO_ROOT / "tools"))
-from pdf_font_annotate import make_weight_explicit, annotate_canonical_names, read_postscript_name  # noqa: E402
+from pdf_font_annotate import annotate_canonical_names, read_postscript_name  # noqa: E402
 
 
 # ---------------------------------------------------------------------------
@@ -173,25 +192,47 @@ def fc_find(family, style="Regular"):
     )
 
 
-def resolve_expected_font(expected_font):
-    """Resolve an expected_font string from audit.json to (ttf_path, canonical, css_weight, css_style).
+def resolve_expected_font(expected_font, catalog=None, unprint_bin=None):
+    """Resolve an expected_font string to (ttf_path, verbatim_key, css_weight, css_style).
 
     expected_font examples:
       'EBGaramond-400', 'Arial-BoldMT-700', 'SourceSerif4-400It',
-      'ArialMT-400', 'Inter-400'
+      'ArialMT-400', 'Inter-400' — or a full audit.json fontkey
+      ('Georgia-700|version=1.00|nokern|nolig') in audit mode.
+
+    Selection lives in Rust (--select-font, Mike Nov 15, 2026): the
+    family + weight + style parsed here are passed as criteria, and the
+    API returns the verbatim fontkey of the single best entry (latest
+    version first). The file path comes from the catalog JSON by exact
+    key lookup — a mechanical lookup, not selection. No fontconfig:
+    fc_find used to pick the file, so the lob specimen's version was
+    decided by fontconfig ordering, not the API. No variant constraints
+    are passed — the lob takes the API's best variant (the shared
+    preference), matching the old file-based behavior.
     """
-    # Strip weight/style suffixes to get base key for FAMILIES
-    # Expected forms: Base-400, Base-400It, Base-BoldMT-700, etc.
-    # First split on '-' to get first token as family key candidate
+    import re
+    if catalog is None or unprint_bin is None:
+        raise RuntimeError(
+            "resolve_expected_font requires catalog + unprint_bin "
+            "(--select-font API); no fontconfig fallback"
+        )
+    # Weight + slant from the first segment (before any '|' variant tags):
+    # 'SourceSerif4-400It' -> (400, italic), 'Georgia-700|...' -> (700, upright).
+    first_seg = expected_font.split('|')[0]
+    m = re.search(r'-(\d{3})(?:Italic|It)?$', first_seg)
+    if not m:
+        raise RuntimeError(
+            f"Cannot parse weight from expected_font {expected_font!r}"
+        )
+    weight = int(m.group(1))
+    italic = first_seg.endswith(('Italic', 'It'))
+    # Family: first token of the spec, via the FAMILIES alias map.
     font_base = expected_font.split('-')[0] if '-' in expected_font else expected_font
-    # Handle known PS suffixes that contain family (e.g. Arial-BoldMT -> Arial)
-    # Already covered by FAMILIES aliases, but also strip Italic/It markers
     for suffix in ['Italic', 'It']:
         # Only strip trailing occurrence, not middle
         if font_base.endswith(suffix):
             font_base = font_base[: -len(suffix)]
             break
-    # Also handle if font_base still has -700 etc handled by earlier split; keep aliases
     fc_family = FAMILIES.get(font_base)
     if not fc_family:
         # Try removing MT/PS suffixes
@@ -200,24 +241,23 @@ def resolve_expected_font(expected_font):
     if not fc_family:
         raise RuntimeError(f"'{font_base}' (from '{expected_font}') not in FAMILIES; add alias")
 
-    style = "Regular"
+    spec = (
+        f"family={fc_family},weight={weight},"
+        f"style={'italic' if italic else 'regular'}"
+    )
+    key = select_fontkey_via_api(unprint_bin, spec)
+    key_to_path = {e['font_key']: e['path'] for e in catalog}
+    ttf_path = key_to_path.get(key)
+    if ttf_path is None:
+        raise RuntimeError(
+            f"--select-font returned key {key!r} for {spec!r}, "
+            "but the exported catalog has no such entry. "
+            "The catalog export is stale — re-export it."
+        )
+    # TTF is already bold — tell Pango font-weight: normal so it doesn't append "-Bold"
     css_weight = "400"
-    css_style = "normal"
-    if "Bold" in expected_font or "-700" in expected_font or "-600" in expected_font:
-        style = "Bold"
-        # TTF is already bold — tell Pango font-weight: normal so it doesn't append "-Bold"
-        css_weight = "400"
-    elif "Italic" in expected_font or expected_font.endswith("It") or "-400It" in expected_font:
-        style = "Italic"
-        css_style = "italic"
-
-    ttf_path = fc_find(fc_family, style)
-    try:
-        _, canonical_name, _ = make_weight_explicit(ttf_path)
-    except FileNotFoundError:
-        # fallback if unprint not built - use PS name directly
-        canonical_name = read_postscript_name(ttf_path) or fc_family.replace(' ','')
-    return ttf_path, canonical_name, css_weight, css_style
+    css_style = "italic" if italic else "normal"
+    return ttf_path, key, css_weight, css_style
 
 
 # ---------------------------------------------------------------------------

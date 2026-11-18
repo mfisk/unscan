@@ -972,6 +972,56 @@ pub fn default_font_dirs(extra: &[PathBuf]) -> Vec<PathBuf> {
     dirs
 }
 
+/// Find the MS Core Fonts directory from the environment — never a
+/// hardcoded user-specific path. First asks fontconfig (`fc-list`, the
+/// standard font-finding utility) where Times New Roman lives and takes
+/// that file's directory; if that fails, checks $MSTTCOREFONTS_DIR, then
+/// $HOME/.local/share/fonts/msttcorefonts, then the system
+/// /usr/share/fonts/truetype/msttcorefonts. Returns the first directory
+/// that contains times.ttf, or None if none is found (the caller handles
+/// the missing case — vintage generation is skipped, no crash).
+pub fn find_msttcorefonts_dir() -> Option<PathBuf> {
+    // fontconfig knows where the fonts are, whatever dir they were
+    // installed in. `fc-list "Times New Roman" file` prints one
+    // "<path>: " line per matching file.
+    if let Ok(out) = std::process::Command::new("fc-list")
+        .args(["Times New Roman", "file"])
+        .output()
+    {
+        if out.status.success() {
+            let text = String::from_utf8_lossy(&out.stdout);
+            for line in text.lines() {
+                let path = line.split(':').next().unwrap_or("").trim();
+                let p = PathBuf::from(path);
+                if p
+                    .file_name()
+                    .map(|n| n.eq_ignore_ascii_case("times.ttf"))
+                    .unwrap_or(false)
+                    && p.is_file()
+                {
+                    if let Some(dir) = p.parent() {
+                        return Some(dir.to_path_buf());
+                    }
+                }
+            }
+        }
+    }
+    let mut candidates: Vec<PathBuf> = Vec::new();
+    if let Ok(d) = std::env::var("MSTTCOREFONTS_DIR") {
+        candidates.push(PathBuf::from(d));
+    }
+    if let Ok(home) = std::env::var("HOME") {
+        candidates.push(PathBuf::from(home).join(".local/share/fonts/msttcorefonts"));
+    }
+    candidates.push(PathBuf::from("/usr/share/fonts/truetype/msttcorefonts"));
+    for dir in candidates {
+        if dir.join("times.ttf").is_file() {
+            return Some(dir);
+        }
+    }
+    None
+}
+
 
 // ---------------------------------------------------------------------------
 // Font scan cache (FSCN)
@@ -1006,7 +1056,8 @@ pub fn default_font_dirs(extra: &[PathBuf]) -> Vec<PathBuf> {
 
 const FSCN_MAGIC: &[u8; 4] = b"FSCN";
 // v20: font_version field (|version=X in font keys) + content-based identity.
-const FSCN_VERSION: u32 = 20;
+// v21: variable-font weight instances get the full kern/lig/opsz permutation.
+const FSCN_VERSION: u32 = 21;
 
 pub(crate) fn scan_cache_path() -> PathBuf {
     crate::cache::paths::font_scan_bin()
@@ -1697,52 +1748,60 @@ pub fn scan_fonts(dirs: &[PathBuf], quiet: bool) -> Vec<FontEntry> {
                 // ── Variable font weight instances ──────────────────────
                 // If the font has a wght axis, emit additional entries at
                 // each named-instance weight so the font matcher indexes bold/light/
-                // etc. renderings from the same file.
+                // etc. renderings from the same file. Each weight instance
+                // gets the SAME kern/lig/opsz permutation as the base
+                // entry — a single kern|lig entry per weight cannot
+                // represent e.g. "400 italic, nokern, opsz 10", so the
+                // classifier could never match that rendering exactly.
                 let weight_instances = detect_weight_instances(path, fe.class);
+                let has_ligatures = fe.collapsed_lig_set() != 0;
                 for wi in &weight_instances {
                     let var_ps = make_weight_explicit(&fe.raw_postscript_name, wi.os2_weight);
-                    // Weight instances carry the kern/nokern tag explicitly
-                    // (appended after wght): they render kerned unless the
-                    // font has no kerning data. Lig is explicit too (|lig —
-                    // ligatures on); there is no nolig permutation for
-                    // weight instances.
-                    let var_tag = format!("wght{}|{}|lig", wi.os2_weight, kern_tag);
                     let var_variations = Some(wi.axes.clone());
-                    let mut var_fe = FontEntry {
-                        path: fe.path.clone(),
-                        family_name: format!("{} [{}]", fe.family_name, var_tag),
-                        postscript_name: var_ps.clone(),
-                        raw_postscript_name: fe.raw_postscript_name.clone(),
-                        is_bold: wi.os2_weight >= 700,
-                        is_italic: fe.is_italic,
-                        class: fe.class,
-                        data: Vec::new(),
-                        oldstyle_figures: fe.oldstyle_figures,
-                        variant_tag: var_tag.clone(),
-                        // Bracket notation distinguishes static "SourceSerif4-400Italic"
-                        // from variable "SourceSerif4-400Italic|wght400[wght=400,opsz=20]"
-                        // after normalization.
-                        font_key_cache: FontEntry::compute_font_key_full(
-                            &var_ps,
-                            &var_tag,
-                            None,
-                            &var_variations,
-                            &fe.font_version,
-                        ),
-                        glyph_overrides: None,
-                        variations: var_variations,
-                        typographic_family: fe.typographic_family.clone(),
-                        vintage_era: None,
-                        opsz_range,
-                        has_gpos: fe.has_gpos,
-                        has_kern: fe.has_kern,
-                        font_version: fe.font_version.clone(),
-                    };
-                    // Add ligature overrides to weight-instance entry
-                    if !ligatures.is_empty() {
-                        var_fe.glyph_overrides = Some(ligatures.clone());
+                    let wght_tag = format!("wght{}", wi.os2_weight);
+                    let var_opts = var_perm_opts(&var_variations);
+                    for &is_nokern in kern_perm_opts(has_kern) {
+                        for &is_nolig in lig_perm_opts(has_ligatures) {
+                            for variations in &var_opts {
+                                let var_tag = append_kern_lig_markers(&wght_tag, is_nokern, is_nolig);
+                                let mut var_fe = FontEntry {
+                                    path: fe.path.clone(),
+                                    family_name: format!("{} [{}]", fe.family_name, var_tag),
+                                    postscript_name: var_ps.clone(),
+                                    raw_postscript_name: fe.raw_postscript_name.clone(),
+                                    is_bold: wi.os2_weight >= 700,
+                                    is_italic: fe.is_italic,
+                                    class: fe.class,
+                                    data: Vec::new(),
+                                    oldstyle_figures: fe.oldstyle_figures,
+                                    variant_tag: var_tag.clone(),
+                                    // Bracket notation distinguishes static "SourceSerif4-400Italic"
+                                    // from variable "SourceSerif4-400Italic|wght400[wght=400,opsz=20]"
+                                    // after normalization.
+                                    font_key_cache: FontEntry::compute_font_key_full(
+                                        &var_ps,
+                                        &var_tag,
+                                        None,
+                                        variations,
+                                        &fe.font_version,
+                                    ),
+                                    glyph_overrides: None,
+                                    variations: variations.clone(),
+                                    typographic_family: fe.typographic_family.clone(),
+                                    vintage_era: None,
+                                    opsz_range,
+                                    has_gpos: fe.has_gpos,
+                                    has_kern: fe.has_kern,
+                                    font_version: fe.font_version.clone(),
+                                };
+                                // Add ligature overrides to weight-instance entry
+                                if !ligatures.is_empty() {
+                                    var_fe.glyph_overrides = Some(ligatures.clone());
+                                }
+                                fonts.push(var_fe);
+                            }
+                        }
                     }
-                    fonts.push(var_fe);
                 }
 
                 // If this file is variable, mark the base entry as variable
@@ -1775,12 +1834,12 @@ pub fn scan_fonts(dirs: &[PathBuf], quiet: bool) -> Vec<FontEntry> {
                 //   variants carry |nolig.
                 // - opsz: [base, opsz10] if the font has an opsz axis, else [base].
                 // The classifier scores all permutations and picks the best.
-                let kern_opts: &[bool] = if has_kern { &[false, true] } else { &[true] };
-                let lig_opts: &[bool] = if fe.collapsed_lig_set() != 0 { &[false, true] } else { &[false] };
-                let mut var_opts: Vec<Variations> = vec![fe.variations.clone()];
-                if let Some(opsz10_vars) = make_opsz10_variations(&fe.variations) {
-                    var_opts.push(Some(opsz10_vars));
-                }
+                // The same permutation applies to the variable-font weight
+                // instances above; the option computation is shared (see
+                // kern_perm_opts / lig_perm_opts / var_perm_opts).
+                let kern_opts = kern_perm_opts(has_kern);
+                let lig_opts = lig_perm_opts(has_ligatures);
+                let var_opts = var_perm_opts(&fe.variations);
                 for &is_nokern in kern_opts {
                     for &is_nolig in lig_opts {
                         for variations in &var_opts {
@@ -1791,33 +1850,7 @@ pub fn scan_fonts(dirs: &[PathBuf], quiet: bool) -> Vec<FontEntry> {
                             // carry |nokern; ligature-enabled variants carry
                             // |lig, nolig variants carry |nolig.
                             // Use "|" separator to avoid ambiguity.
-                            let mut variant_tag = fe.variant_tag.clone();
-                            if is_nokern {
-                                variant_tag = if variant_tag.is_empty() {
-                                    "nokern".to_string()
-                                } else {
-                                    format!("{}|nokern", variant_tag)
-                                };
-                            } else {
-                                variant_tag = if variant_tag.is_empty() {
-                                    "kern".to_string()
-                                } else {
-                                    format!("{}|kern", variant_tag)
-                                };
-                            }
-                            if is_nolig {
-                                variant_tag = if variant_tag.is_empty() {
-                                    "nolig".to_string()
-                                } else {
-                                    format!("{}|nolig", variant_tag)
-                                };
-                            } else {
-                                variant_tag = if variant_tag.is_empty() {
-                                    "lig".to_string()
-                                } else {
-                                    format!("{}|lig", variant_tag)
-                                };
-                            }
+                            let variant_tag = append_kern_lig_markers(&fe.variant_tag, is_nokern, is_nolig);
                             let mut family_name = fe.family_name.clone();
                             if is_nokern {
                                 family_name = format!("{} [nokern]", family_name);
@@ -2316,6 +2349,54 @@ fn make_opsz10_variations(variations: &Variations) -> Variations {
     Some(new_vars)
 }
 
+/// Kern options for the kern/lig/opsz permutation shared by the base
+/// entry and the variable-font weight instances. Values are `is_nokern`:
+/// [kern, nokern] when the font has kerning data, else [nokern] only —
+/// a font with no kerning renders identically with the kern feature on
+/// or off, so a kerned variant would be a byte-identical duplicate.
+fn kern_perm_opts(has_kern: bool) -> &'static [bool] {
+    if has_kern {
+        &[false, true]
+    } else {
+        &[true]
+    }
+}
+
+/// Lig options for the kern/lig/opsz permutation. Values are `is_nolig`:
+/// [lig, nolig] when the font has ligature glyphs, else [lig] only.
+fn lig_perm_opts(has_ligatures: bool) -> &'static [bool] {
+    if has_ligatures {
+        &[false, true]
+    } else {
+        &[false]
+    }
+}
+
+/// Opsz options for the kern/lig/opsz permutation: the given variations
+/// plus an opsz=10 variant when the font has an opsz axis not already
+/// at 10.
+fn var_perm_opts(variations: &Variations) -> Vec<Variations> {
+    let mut opts = vec![variations.clone()];
+    if let Some(opsz10_vars) = make_opsz10_variations(variations) {
+        opts.push(Some(opsz10_vars));
+    }
+    opts
+}
+
+/// Append the kern/nokern and lig/nolig markers to a variant tag.
+/// Both are explicit in every font key — no implicit default. An empty
+/// base tag yields just the two markers; otherwise they are appended
+/// after the base tag with `|` separators, kern first then lig.
+fn append_kern_lig_markers(base_tag: &str, is_nokern: bool, is_nolig: bool) -> String {
+    let kern = if is_nokern { "nokern" } else { "kern" };
+    let lig = if is_nolig { "nolig" } else { "lig" };
+    if base_tag.is_empty() {
+        format!("{kern}|{lig}")
+    } else {
+        format!("{base_tag}|{kern}|{lig}")
+    }
+}
+
 /// Detect named weight instances for a variable font.
 ///
 /// Returns instances at each named weight that differs from the default.
@@ -2562,10 +2643,31 @@ fn font_key_version(font_key: &str) -> u32 {
 /// kerned by default, so its kerned variant is the default pick.
 /// Lig is explicit in the key but scores 0 (the default); nolig keeps
 /// +2, so the nolig variant still wins the default-GT pick.
+/// The lig dimension is parameterizable via
+/// `font_key_preference_score_with_lig`: the select API
+/// (`--select-font`) passes prefer_lig=true, so a specimen — which
+/// renders real text, ligatures on by default — picks the lig variant.
+/// The classifier tiebreakers and bare-name resolution keep the shared
+/// default here (nolig), so a specimen-config decision never moves
+/// audit picks.
 /// A key without a version tag scores version 0 and loses to any
 /// versioned key. An exact key match (version specified) bypasses
 /// this preference entirely — callers check exact matches first.
 pub fn font_key_preference_score(font_key: &str, has_kern: bool) -> (u32, i32) {
+    font_key_preference_score_with_lig(font_key, has_kern, false)
+}
+
+/// Same preference with the ligature dimension parameterized. With
+/// prefer_lig=true the +2 goes to the lig variant instead of nolig —
+/// used only by the select API (`select_entry_for_criteria`), which
+/// picks the font a specimen renders. Every other caller uses the
+/// shared default above. The lig match is segment-exact
+/// (`key_has_variant_tag`): a substring test would match "nolig" too.
+pub fn font_key_preference_score_with_lig(
+    font_key: &str,
+    has_kern: bool,
+    prefer_lig: bool,
+) -> (u32, i32) {
     let version = font_key_version(font_key);
     let mut s = 0;
     let is_nokern = font_key.contains("nokern");
@@ -2574,7 +2676,11 @@ pub fn font_key_preference_score(font_key: &str, has_kern: bool) -> (u32, i32) {
     if has_kern != is_nokern {
         s += 4;
     }
-    if font_key.contains("nolig") {
+    if prefer_lig {
+        if key_has_variant_tag(font_key, "lig") {
+            s += 2;
+        }
+    } else if font_key.contains("nolig") {
         s += 2;
     }
     if font_key.contains("opsz=10") {
@@ -2614,14 +2720,174 @@ pub fn best_entry_for_ps_name<'a, I>(entries: I, ps_name: &str) -> Option<&'a Fo
 where
     I: Iterator<Item = &'a FontEntry>,
 {
-    entries.filter(|fe| fe.postscript_name == ps_name).max_by(|a, b| {
-        let pa = font_key_preference_score(a.font_key_ref(), a.has_kern);
-        let pb = font_key_preference_score(b.font_key_ref(), b.has_kern);
+    best_by_preference(entries.filter(|fe| fe.postscript_name == ps_name))
+}
+
+/// Best entry by the shared preference: highest version first, then
+/// variant preference, then the lowest font_key on a full tie. Shared by
+/// `best_entry_for_ps_name` and (via `best_by_preference_with_lig`)
+/// `select_entry_for_criteria`: the two agree on version, kern, opsz,
+/// and the OT/weight penalties, and differ only on lig — selection
+/// prefers lig (a specimen renders real text, ligatures on), while
+/// bare-name resolution follows the classifier tiebreak preference
+/// (nolig), so a specimen-config decision never moves audit picks.
+fn best_by_preference<'a, I>(entries: I) -> Option<&'a FontEntry>
+where
+    I: Iterator<Item = &'a FontEntry>,
+{
+    best_by_preference_with_lig(entries, false)
+}
+
+/// `best_by_preference` with the ligature dimension parameterized;
+/// prefer_lig=true hands the +2 to the lig variant. Only the select
+/// API uses true.
+fn best_by_preference_with_lig<'a, I>(entries: I, prefer_lig: bool) -> Option<&'a FontEntry>
+where
+    I: Iterator<Item = &'a FontEntry>,
+{
+    entries.max_by(|a, b| {
+        let pa = font_key_preference_score_with_lig(a.font_key_ref(), a.has_kern, prefer_lig);
+        let pb = font_key_preference_score_with_lig(b.font_key_ref(), b.has_kern, prefer_lig);
         // Max-by prefers the greater; reverse the key comparison so
         // the lowest key wins a full preference tie (same as the
         // fine-score sort's key-asc final fallback).
         pa.cmp(&pb).then_with(|| b.font_key_ref().cmp(a.font_key_ref()))
     })
+}
+
+/// Criteria for structured font selection (`--select-font`).
+/// All fields except `family` are optional; an omitted field imposes no
+/// constraint. A present field is a HARD constraint — no match errors
+/// loudly, never relaxes (Mike Nov 15, 2026).
+#[derive(Debug, Clone, Default)]
+pub struct FontSelection {
+    /// Family name, e.g. "Noto Serif". Matched against the entry's
+    /// typographic family (nameID 16, else nameID 1) after normalization.
+    pub family: String,
+    /// Weight, e.g. 400 or 700. Matched against the weight in the
+    /// font_key's first segment.
+    pub weight: Option<u32>,
+    /// Slant: false = upright, true = italic.
+    pub italic: Option<bool>,
+    /// Optical size. Vacuous for entries whose variations carry no `opsz`
+    /// axis (static fonts and variable fonts without the axis).
+    pub opsz: Option<f32>,
+    /// Kerning: true = kern variant, false = nokern variant.
+    pub kern: Option<bool>,
+    /// Ligatures: true = lig variant, false = nolig variant.
+    pub lig: Option<bool>,
+}
+
+/// Normalize a family name for exact matching: lowercase, strip every
+/// non-alphanumeric character. "Noto Serif" -> "notoserif",
+/// "Source Serif 4" -> "sourceserif4". Same rule as the generators'
+/// old `_norm_family` (gen-specimen.py), now owned by Rust.
+pub fn normalize_family_name(name: &str) -> String {
+    name.chars()
+        .filter(|c| c.is_alphanumeric())
+        .flat_map(|c| c.to_lowercase())
+        .collect()
+}
+
+/// (weight, italic) from a font_key's first segment, e.g.
+/// "SourceSerif4-400Italic" -> (400, true), "Arial-BoldMT-700" ->
+/// (700, false). Returns None when the segment carries no trailing
+/// -NNN weight.
+fn key_weight_italic(font_key: &str) -> Option<(u32, bool)> {
+    let seg = font_key.split('|').next().unwrap_or(font_key);
+    let (base, italic) = match seg.strip_suffix("Italic") {
+        Some(b) => (b, true),
+        None => (seg, false),
+    };
+    let digits = base.rsplit('-').next()?;
+    if digits.is_empty() || !digits.bytes().all(|b| b.is_ascii_digit()) {
+        return None;
+    }
+    digits.parse::<u32>().ok().map(|w| (w, italic))
+}
+
+/// Whether the font_key carries the exact variant segment `tag`
+/// ("kern", "nokern", "lig", "nolig"). Segments match exactly —
+/// "nolig" is not "lig" — and a trailing bracket (`[wght=400,...]`) is
+/// stripped first, mirroring `font_key_preference_score`.
+fn key_has_variant_tag(font_key: &str, tag: &str) -> bool {
+    font_key.split('|').skip(1).any(|seg| {
+        let seg = seg.split('[').next().unwrap_or(seg);
+        seg == tag
+    })
+}
+
+/// The entry's `opsz` variation value, if it has one.
+fn entry_opsz(fe: &FontEntry) -> Option<f32> {
+    fe.variations
+        .as_ref()?
+        .iter()
+        .find(|(tag, _)| tag == b"opsz")
+        .map(|(_, v)| *v)
+}
+
+/// Select the single best catalog entry matching structured criteria
+/// (`--select-font`, Mike Nov 15, 2026: specimen generators state what
+/// they want; Rust picks). Every present criterion is a hard filter;
+/// among the survivors the select preference breaks ties — the shared
+/// preference, except lig wins over nolig when lig is unconstrained
+/// (Mike Nov 17, 2026: the API prefers lig, so a specimen renders
+/// ligatures on, as real text does). Returns None when nothing
+/// matches — the caller errors loudly, never relaxes.
+pub fn select_entry_for_criteria<'a, I>(entries: I, sel: &FontSelection) -> Option<&'a FontEntry>
+where
+    I: Iterator<Item = &'a FontEntry>,
+{
+    let want_family = normalize_family_name(&sel.family);
+    let filtered = entries.filter(|fe| {
+        // Family: typographic family (nameID 16, else nameID 1),
+        // normalized. Exact match — no fuzzy/nearest, no prefix.
+        if normalize_family_name(&fe.typographic_family) != want_family {
+            return false;
+        }
+        // Weight + slant come from the font_key's first segment, the
+        // canonical identity (never the OS/2 bits, which describe the
+        // file, not the instance).
+        if sel.weight.is_some() || sel.italic.is_some() {
+            let Some((w, it)) = key_weight_italic(fe.font_key_ref()) else {
+                return false;
+            };
+            if let Some(want_w) = sel.weight {
+                if w != want_w {
+                    return false;
+                }
+            }
+            if let Some(want_it) = sel.italic {
+                if it != want_it {
+                    return false;
+                }
+            }
+        }
+        // Optical size: an entry carrying an `opsz` axis value must
+        // equal the requested size; an entry without the axis passes
+        // vacuously (static fonts and axis-less variable fonts).
+        if let Some(want_opsz) = sel.opsz {
+            if let Some(v) = entry_opsz(fe) {
+                if v != want_opsz {
+                    return false;
+                }
+            }
+        }
+        if let Some(want_kern) = sel.kern {
+            let tag = if want_kern { "kern" } else { "nokern" };
+            if !key_has_variant_tag(fe.font_key_ref(), tag) {
+                return false;
+            }
+        }
+        if let Some(want_lig) = sel.lig {
+            let tag = if want_lig { "lig" } else { "nolig" };
+            if !key_has_variant_tag(fe.font_key_ref(), tag) {
+                return false;
+            }
+        }
+        true
+    });
+    best_by_preference_with_lig(filtered, true)
 }
 
 /// Font version from the `head` table `fontRevision` field, formatted
@@ -3511,5 +3777,185 @@ mod catalog_hash_tests {
         assert_eq!(super::font_key_version("X-400|version=2.5|kern|nolig"), 250);
         assert_eq!(super::font_key_version("X-400|kern|nolig"), 0);
         assert_eq!(super::font_key_version("X-400|version=abc|kern|nolig"), 0);
+    }
+}
+
+#[cfg(test)]
+mod select_font_tests {
+    use super::*;
+
+    fn entry(font_key: &str, typographic_family: &str, variations: Variations) -> FontEntry {
+        // font_key_cache is the key itself; postscript_name is the first
+        // segment (weight-explicit), as the scanner builds it.
+        let ps = font_key.split('|').next().unwrap_or(font_key).to_string();
+        FontEntry {
+            path: PathBuf::from("/font.ttf"),
+            family_name: typographic_family.to_string(),
+            postscript_name: ps,
+            raw_postscript_name: "Test".to_string(),
+            is_bold: false,
+            is_italic: font_key.contains("Italic"),
+            class: FontClass::Serif,
+            data: Vec::new(),
+            oldstyle_figures: false,
+            variant_tag: String::new(),
+            font_key_cache: font_key.to_string(),
+            glyph_overrides: None,
+            variations,
+            typographic_family: typographic_family.to_string(),
+            vintage_era: None,
+            opsz_range: None,
+            has_gpos: false,
+            has_kern: false,
+            font_version: "1.00".to_string(),
+        }
+    }
+
+    #[test]
+    fn normalize_family_name_strips_space_and_case() {
+        assert_eq!(super::normalize_family_name("Noto Serif"), "notoserif");
+        assert_eq!(super::normalize_family_name("Source Serif 4"), "sourceserif4");
+        assert_eq!(super::normalize_family_name("IBM Plex Serif"), "ibmplexserif");
+    }
+
+    #[test]
+    fn key_weight_italic_parses_first_segment() {
+        assert_eq!(
+            super::key_weight_italic("SourceSerif4-400Italic|version=4.00|kern|nolig"),
+            Some((400, true))
+        );
+        assert_eq!(
+            super::key_weight_italic("Arial-BoldMT-700|version=2.82|kern|nolig"),
+            Some((700, false))
+        );
+        assert_eq!(
+            super::key_weight_italic("NotoSerif-400|version=2.01|nokern|lig[wght=400,wdth=100]"),
+            Some((400, false))
+        );
+        assert_eq!(super::key_weight_italic("NoWeight|version=1.00|kern|lig"), None);
+    }
+
+    #[test]
+    fn select_prefers_latest_version() {
+        // Courier New Regular, Win31 v2.50 vs modern v2.82: the API must
+        // return v2.82 (the case that started this work).
+        let entries = vec![
+            entry("CourierNewPSMT-400|version=2.50|nokern|lig", "Courier New", None),
+            entry("CourierNewPSMT-400|version=2.82|nokern|lig", "Courier New", None),
+        ];
+        let sel = FontSelection {
+            family: "Courier New".to_string(),
+            weight: Some(400),
+            italic: Some(false),
+            opsz: Some(10.0),
+            kern: Some(false),
+            lig: None,
+        };
+        let best = super::select_entry_for_criteria(entries.iter(), &sel).unwrap();
+        assert_eq!(best.font_key_ref(), "CourierNewPSMT-400|version=2.82|nokern|lig");
+    }
+
+    #[test]
+    fn select_prefers_lig_when_unconstrained() {
+        // Mike Nov 17, 2026: the API prefers lig. With lig unconstrained,
+        // the lig variant wins over nolig within one version — the
+        // specimen renders ligatures on, as real text does.
+        let entries = vec![
+            entry("X-400|version=2.82|nokern|nolig", "X", None),
+            entry("X-400|version=2.82|nokern|lig", "X", None),
+        ];
+        let sel = FontSelection {
+            family: "X".to_string(),
+            weight: Some(400),
+            italic: Some(false),
+            opsz: None,
+            kern: Some(false),
+            lig: None,
+        };
+        let best = super::select_entry_for_criteria(entries.iter(), &sel).unwrap();
+        assert_eq!(best.font_key_ref(), "X-400|version=2.82|nokern|lig");
+    }
+
+    #[test]
+    fn select_explicit_nolig_still_constrains() {
+        // An explicit lig=false stays a hard filter: the nolig entry is
+        // the only survivor even though the API prefers lig.
+        let entries = vec![
+            entry("X-400|version=2.82|nokern|nolig", "X", None),
+            entry("X-400|version=2.82|nokern|lig", "X", None),
+        ];
+        let sel = FontSelection {
+            family: "X".to_string(),
+            weight: Some(400),
+            italic: Some(false),
+            opsz: None,
+            kern: Some(false),
+            lig: Some(false),
+        };
+        let best = super::select_entry_for_criteria(entries.iter(), &sel).unwrap();
+        assert_eq!(best.font_key_ref(), "X-400|version=2.82|nokern|nolig");
+    }
+
+    #[test]
+    fn select_no_match_returns_none() {
+        // Merriweather Italic 400 nokern opsz=10: the catalog holds only
+        // the kern opsz=18 entry, so the strict selection finds nothing.
+        let entries = vec![
+            entry(
+                "Merriweather-400Italic|version=2.10|wght400|kern|lig[wght=400,wdth=100,opsz=18]",
+                "Merriweather",
+                Some(vec![(*b"wght", 400.0), (*b"wdth", 100.0), (*b"opsz", 18.0)]),
+            ),
+        ];
+        let sel = FontSelection {
+            family: "Merriweather".to_string(),
+            weight: Some(400),
+            italic: Some(true),
+            opsz: Some(10.0),
+            kern: Some(false),
+            lig: None,
+        };
+        assert!(super::select_entry_for_criteria(entries.iter(), &sel).is_none());
+    }
+
+    #[test]
+    fn select_opsz_vacuous_without_axis() {
+        // A static font (no variations) passes an opsz constraint
+        // vacuously; a variable font with the axis must match it.
+        let entries = vec![
+            entry("Static-400|version=1.00|nokern|lig", "Static", None),
+            entry(
+                "Static-400|version=1.00|nokern|lig[wght=400,opsz=20]",
+                "Static",
+                Some(vec![(*b"wght", 400.0), (*b"opsz", 20.0)]),
+            ),
+        ];
+        let sel = FontSelection {
+            family: "Static".to_string(),
+            weight: Some(400),
+            italic: Some(false),
+            opsz: Some(10.0),
+            kern: Some(false),
+            lig: None,
+        };
+        let best = super::select_entry_for_criteria(entries.iter(), &sel).unwrap();
+        assert_eq!(best.font_key_ref(), "Static-400|version=1.00|nokern|lig");
+    }
+
+    #[test]
+    fn select_family_is_exact_not_prefix() {
+        // "Noto Sans" must not match "Noto Sans Mono".
+        let entries = vec![
+            entry("NotoSansMono-400|version=1.00|nokern|lig", "Noto Sans Mono", None),
+        ];
+        let sel = FontSelection {
+            family: "Noto Sans".to_string(),
+            weight: Some(400),
+            italic: Some(false),
+            opsz: None,
+            kern: None,
+            lig: None,
+        };
+        assert!(super::select_entry_for_criteria(entries.iter(), &sel).is_none());
     }
 }
