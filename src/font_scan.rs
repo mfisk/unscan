@@ -238,9 +238,8 @@ pub struct FontEntry {
     /// True if the font file contains a GPOS table. Captured during the scan
     /// while the font file bytes are available; cannot be re-derived later
     /// because `data` is dropped after the scan. Used by the shared font-key
-    /// preference (`font_key_preference_score`) for --resolve-fontkey,
-    /// --select-font, and classifier tiebreaking. Serialized in the
-    /// scan cache (v17+).
+    /// preference (`font_key_preference_score`) for --resolve-fontkey and
+    /// classifier tiebreaking. Serialized in the scan cache (v17+).
     pub has_gpos: bool,
     /// True if the font file has kerning data (legacy `kern` table with at
     /// least one pair, or a GPOS `kern` feature with at least one lookup).
@@ -2622,12 +2621,10 @@ fn font_key_version(font_key: &str) -> u32 {
 }
 
 /// Preference for font-key selection and classifier tiebreaking.
-/// Single source of truth, shared by --resolve-fontkey and
-/// --select-font (crates/unprint-cli/src/main.rs) and the classifier
-/// tiebreakers (font_match.rs fine-score sort, font_pipeline.rs
-/// exact-tie resolution and GT resolution). One implementation, one
-/// preference, everywhere — selection, bare-name resolution, and
-/// the audit tiebreakers all pick variants the same way.
+/// Single source of truth, shared by --resolve-fontkey
+/// (crates/unprint-cli/src/main.rs) and the classifier tiebreakers
+/// (font_match.rs fine-score sort, font_pipeline.rs exact-tie
+/// resolution and GT resolution).
 ///
 /// Returns `(version, variant_score)`, compared lexicographically:
 /// the numeric font version DOMINATES — when no version is specified
@@ -2635,7 +2632,7 @@ fn font_key_version(font_key: &str) -> u32 {
 /// query), the highest version wins (10.00 > 2.50, numeric, not
 /// string order). The variant score breaks ties within one version:
 /// font with kerning data → +4 for kern (not nokern); font without
-/// kerning → +4 for nokern; +2 for lig; +1 for opsz=10; −10 per
+/// kerning → +4 for nokern; +2 for nolig; +1 for opsz=10; −10 per
 /// OT-feature variant tag (onum, lnum, smcp, c2sc, swsh, salt, titl,
 /// hist, ss01–ss20, allcaps) and −10 per non-default weight instance
 /// (`|wghtN`), so the base/default variant always wins the default-GT
@@ -2644,17 +2641,33 @@ fn font_key_version(font_key: &str) -> u32 {
 /// or GPOS `kern` feature), not GPOS presence: a font with a legacy
 /// `kern` table but no GPOS (e.g. Trebuchet, Arial) still renders
 /// kerned by default, so its kerned variant is the default pick.
-/// Nolig is explicit in the key but scores 0 (the default); lig keeps
-/// +2, so the lig variant wins the default pick — a specimen renders
-/// real text, ligatures on by default (Mike Nov 17, 2026), and the
-/// audit tiebreakers use this same preference, so a lig/nolig tie
-/// resolves to the variant the specimen actually renders.
-/// The lig match is segment-exact (`key_has_variant_tag`): a
-/// substring test would match "nolig" too.
+/// Lig is explicit in the key but scores 0 (the default); nolig keeps
+/// +2, so the nolig variant still wins the default-GT pick.
+/// The lig dimension is parameterizable via
+/// `font_key_preference_score_with_lig`: the select API
+/// (`--select-font`) passes prefer_lig=true, so a specimen — which
+/// renders real text, ligatures on by default — picks the lig variant.
+/// The classifier tiebreakers and bare-name resolution keep the shared
+/// default here (nolig), so a specimen-config decision never moves
+/// audit picks.
 /// A key without a version tag scores version 0 and loses to any
 /// versioned key. An exact key match (version specified) bypasses
 /// this preference entirely — callers check exact matches first.
 pub fn font_key_preference_score(font_key: &str, has_kern: bool) -> (u32, i32) {
+    font_key_preference_score_with_lig(font_key, has_kern, false)
+}
+
+/// Same preference with the ligature dimension parameterized. With
+/// prefer_lig=true the +2 goes to the lig variant instead of nolig —
+/// used only by the select API (`select_entry_for_criteria`), which
+/// picks the font a specimen renders. Every other caller uses the
+/// shared default above. The lig match is segment-exact
+/// (`key_has_variant_tag`): a substring test would match "nolig" too.
+pub fn font_key_preference_score_with_lig(
+    font_key: &str,
+    has_kern: bool,
+    prefer_lig: bool,
+) -> (u32, i32) {
     let version = font_key_version(font_key);
     let mut s = 0;
     let is_nokern = font_key.contains("nokern");
@@ -2663,7 +2676,11 @@ pub fn font_key_preference_score(font_key: &str, has_kern: bool) -> (u32, i32) {
     if has_kern != is_nokern {
         s += 4;
     }
-    if key_has_variant_tag(font_key, "lig") {
+    if prefer_lig {
+        if key_has_variant_tag(font_key, "lig") {
+            s += 2;
+        }
+    } else if font_key.contains("nolig") {
         s += 2;
     }
     if font_key.contains("opsz=10") {
@@ -2708,15 +2725,29 @@ where
 
 /// Best entry by the shared preference: highest version first, then
 /// variant preference, then the lowest font_key on a full tie. Shared by
-/// `best_entry_for_ps_name` and `select_entry_for_criteria` — one
-/// implementation, one preference, everywhere.
+/// `best_entry_for_ps_name` and (via `best_by_preference_with_lig`)
+/// `select_entry_for_criteria`: the two agree on version, kern, opsz,
+/// and the OT/weight penalties, and differ only on lig — selection
+/// prefers lig (a specimen renders real text, ligatures on), while
+/// bare-name resolution follows the classifier tiebreak preference
+/// (nolig), so a specimen-config decision never moves audit picks.
 fn best_by_preference<'a, I>(entries: I) -> Option<&'a FontEntry>
 where
     I: Iterator<Item = &'a FontEntry>,
 {
+    best_by_preference_with_lig(entries, false)
+}
+
+/// `best_by_preference` with the ligature dimension parameterized;
+/// prefer_lig=true hands the +2 to the lig variant. Only the select
+/// API uses true.
+fn best_by_preference_with_lig<'a, I>(entries: I, prefer_lig: bool) -> Option<&'a FontEntry>
+where
+    I: Iterator<Item = &'a FontEntry>,
+{
     entries.max_by(|a, b| {
-        let pa = font_key_preference_score(a.font_key_ref(), a.has_kern);
-        let pb = font_key_preference_score(b.font_key_ref(), b.has_kern);
+        let pa = font_key_preference_score_with_lig(a.font_key_ref(), a.has_kern, prefer_lig);
+        let pb = font_key_preference_score_with_lig(b.font_key_ref(), b.has_kern, prefer_lig);
         // Max-by prefers the greater; reverse the key comparison so
         // the lowest key wins a full preference tie (same as the
         // fine-score sort's key-asc final fallback).
@@ -2798,11 +2829,11 @@ fn entry_opsz(fe: &FontEntry) -> Option<f32> {
 /// Select the single best catalog entry matching structured criteria
 /// (`--select-font`, Mike Nov 15, 2026: specimen generators state what
 /// they want; Rust picks). Every present criterion is a hard filter;
-/// among the survivors the shared preference breaks ties (latest
-/// version, then variant preference — lig over nolig when lig is
-/// unconstrained, Mike Nov 17, 2026: a specimen renders ligatures on,
-/// as real text does). Returns None when nothing matches — the caller
-/// errors loudly, never relaxes.
+/// among the survivors the select preference breaks ties — the shared
+/// preference, except lig wins over nolig when lig is unconstrained
+/// (Mike Nov 17, 2026: the API prefers lig, so a specimen renders
+/// ligatures on, as real text does). Returns None when nothing
+/// matches — the caller errors loudly, never relaxes.
 pub fn select_entry_for_criteria<'a, I>(entries: I, sel: &FontSelection) -> Option<&'a FontEntry>
 where
     I: Iterator<Item = &'a FontEntry>,
@@ -2856,7 +2887,7 @@ where
         }
         true
     });
-    best_by_preference(filtered)
+    best_by_preference_with_lig(filtered, true)
 }
 
 /// Font version from the `head` table `fontRevision` field, formatted
@@ -3699,9 +3730,9 @@ mod catalog_hash_tests {
     #[test]
     fn preference_version_dominates_variant() {
         // Newest version wins even when the older version has the better
-        // variant score: v2.82 kern (4) beats v2.50 kern+lig (6).
-        let old = super::font_key_preference_score("TimesNewRomanPSMT-400|version=2.50|kern|lig", true);
-        let new = super::font_key_preference_score("TimesNewRomanPSMT-400|version=2.82|kern|nolig", true);
+        // variant score: v2.82 kern (4) beats v2.50 kern+nolig (6).
+        let old = super::font_key_preference_score("TimesNewRomanPSMT-400|version=2.50|kern|nolig", true);
+        let new = super::font_key_preference_score("TimesNewRomanPSMT-400|version=2.82|kern|lig", true);
         assert_eq!(old, (250, 6));
         assert_eq!(new, (282, 4));
         assert!(new > old, "version must dominate the variant score");
@@ -3722,9 +3753,9 @@ mod catalog_hash_tests {
         // Within one version, the existing variant preference decides.
         let lig = super::font_key_preference_score("X-400|version=2.82|kern|lig", true);
         let nolig = super::font_key_preference_score("X-400|version=2.82|kern|nolig", true);
-        assert_eq!(lig, (282, 6));
-        assert_eq!(nolig, (282, 4));
-        assert!(lig > nolig, "lig must win within the same version");
+        assert_eq!(lig, (282, 4));
+        assert_eq!(nolig, (282, 6));
+        assert!(nolig > lig, "nolig must win within the same version");
     }
 
     #[test]
@@ -3733,8 +3764,8 @@ mod catalog_hash_tests {
         // versioned key, whatever the variant score.
         let unversioned = super::font_key_preference_score("X-400|kern|nolig", true);
         let versioned = super::font_key_preference_score("X-400|version=1.00|kern|lig", true);
-        assert_eq!(unversioned, (0, 4));
-        assert_eq!(versioned, (100, 6));
+        assert_eq!(unversioned, (0, 6));
+        assert_eq!(versioned, (100, 4));
         assert!(versioned > unversioned, "versioned must beat unversioned");
     }
 

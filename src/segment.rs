@@ -2121,7 +2121,7 @@ fn uniform_boundaries(width: u32, n: usize) -> Vec<u32> {
 
 
 /// Cost breakdown for a single seam, stored in audit data.
-#[derive(Debug, Clone, serde::Serialize)]
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub struct SeamCost {
     pub dp_cost: f32,
     pub seam_width_penalty: f32,
