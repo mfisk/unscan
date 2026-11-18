@@ -107,7 +107,7 @@ fn main() {
         // classifier tiebreakers (font_scan::font_key_preference_score):
         // highest version first (a no-op here — entries sharing one path
         // share one file and one version), then kern for fonts with
-        // kerning data, nokern otherwise; nolig; then opsz=10;
+        // kerning data, nokern otherwise; lig; then opsz=10;
         // OT-feature variants and non-default weight instances (-10 each)
         // never win the default pick.
         // The entry's stored has_kern flag is the source of truth — the
