@@ -1,8 +1,28 @@
 //! t59: Seam split regression test.
 //!
-//! Generates a 10-line test PDF covering LibreBodoni, Georgia, OpenSans,
+//! Generates an 18-line test PDF covering LibreBodoni, Georgia, OpenSans,
 //! LibreBaskerville, PTSerif italic fox, etc. Runs unprint with --audit
-//! and verifies seam splits match known-good positions after 2-horiz DP.
+//! and checks segmentation against recorded known-correct expectations.
+//!
+//! The EXPECTED table records, per word, what is KNOWN to be correct and
+//! nothing else:
+//! - `k`: the known-correct segment count, checked against the audit word
+//!   object's `n_segments_produced`.
+//! - `columns`: individual seam columns known to be correct; each must
+//!   appear in the observed `seam_splits`. Columns not recorded are not
+//!   checked at all.
+//! - A word with neither k nor columns recorded is fully undefined: no
+//!   assertion, counted and reported as unverified.
+//!
+//! Recorded values must be verified against primary evidence (the visible
+//! word text, the audit's `n_chars_expected`, crops), never copied from a
+//! previous run's output. The old snapshot table enshrined the segmenter's
+//! own bugs (e.g. the col-34 M-split for "(Microsoft)"); only the 86 and
+//! 202 columns for that word are recorded, because the seam overlay shows
+//! them falling in clean gaps at true character boundaries.
+//!
+//! The test prints a summary (verified checks passed, misses, unverified
+//! items) and fails on ANY miss among verified items.
 //!
 //! Run:  cargo test --release --test t59_seam_regression -- --nocapture
 
@@ -12,142 +32,98 @@ use common::{run_unscan, audit_json_path, read_audit_json_text};
 use std::path::PathBuf;
 use std::process::Command;
 
-/// Expected seam splits for each test line, per word.
-/// Regenerated 2026-11-17 from fresh audit after HARDCODED expanded to 18 lines
-/// (all 11 original lines re-captured because the font registry changed,
-/// so winning fonts and seam columns moved).
-/// Captured from test-docs/t59-audit/audit.json after 2-horiz DP. Word_segmentation
-/// order is as emitted by Tesseract; first 10 lines share page for word-gap stats.
-const EXPECTED: &[(&str, &[&[u32]])] = &[
+/// Per-word expectation: known-correct segment count and/or known-correct
+/// seam columns. Anything not recorded is unverified and not asserted.
+struct WordExpect {
+    /// Known-correct segment count (k), checked against `n_segments_produced`.
+    k: Option<usize>,
+    /// Individual seam columns known to be correct. Each must appear in the
+    /// observed `seam_splits`. Unrecorded columns are not checked.
+    columns: &'static [u32],
+}
+
+/// Word with only a known-correct segment count.
+const fn k_only(k: usize) -> WordExpect {
+    WordExpect { k: Some(k), columns: &[] }
+}
+
+/// Expected segmentation per test line, per word.
+///
+/// k values are verified against the visible word text and the audit's
+/// `n_chars_expected` (three-way agreement with the observed and GT segment
+/// counts, except where noted). Recorded columns are verified against the
+/// seam overlay crops. The col-34 M-split for "(Microsoft)" is a known
+/// segmenter bug and is deliberately NOT recorded; only 86 and 202 are,
+/// both falling in clean gaps at true character boundaries.
+/// Word_segmentation order is as emitted by Tesseract; first 10 lines share
+/// page for word-gap stats.
+const EXPECTED: &[(&str, &[WordExpect])] = &[
     // 0: LibreBodoni-400 "abcdefghijklmnopqrstuvwxyz."
-    ("abcdefghijklmnopqrstuvwxyz.", &[
-        &[17, 112, 165, 198, 208, 373, 395, 424, 438, 459],
-    ]),
+    ("abcdefghijklmnopqrstuvwxyz.", &[k_only(27)]),
     // 1: LibreBodoni-400 "ABCDEFGHIJKLMNOPQRSTUVWXYZ."
-    ("ABCDEFGHIJKLMNOPQRSTUVWXYZ.", &[
-        &[24, 185, 216, 229],
-        &[28, 84, 112, 223, 297, 321, 356, 384, 408],
-    ]),
+    ("ABCDEFGHIJKLMNOPQRSTUVWXYZ.", &[k_only(10), k_only(17)]),
     // 2: Georgia-400 "ABCDEFGHIJKLMNOPQRSTUVWXYZ."
-    ("ABCDEFGHIJKLMNOPQRSTUVWXYZ.", &[
-        &[26, 268, 290, 459, 530, 556, 592, 618, 642],
-    ]),
+    ("ABCDEFGHIJKLMNOPQRSTUVWXYZ.", &[k_only(27)]),
     // 3: OpenSans-400 "abcdefghijklmnopqrstuvwxyz."
-    ("abcdefghijklmnopqrstuvwxyz.", &[
-        &[117, 167, 471],
-    ]),
+    ("abcdefghijklmnopqrstuvwxyz.", &[k_only(27)]),
     // 4: LibreBodoni-400Italic "dogs."
-    ("dogs.", &[
-        &[20, 39, 58, 72],
-    ]),
+    ("dogs.", &[k_only(5)]),
     // 5: SourceSerif4-400Italic "Mayr-Duffner."
-    ("Mayr-Duffner.", &[
-        &[35, 56, 94, 155, 166, 181, 237],
-    ]),
+    // k=13 verified visually: the crop shows two separate f glyphs, each
+    // with its own crossbar — no ff ligature in the (nolig) render. The GT
+    // segmentation's 12 is a GT-path artifact (gt_ligature_mask collapses
+    // ff via support+overlap even for nolig variants).
+    ("Mayr-Duffner.", &[k_only(13)]),
     // 6: SourceSerif4-400Italic "Type"
-    ("Type", &[
-        &[14, 38],
-    ]),
+    ("Type", &[k_only(4)]),
     // 7: LibreBaskerville-400 "abcdefghijklmnopqrstuvwxyz."
-    ("abcdefghijklmnopqrstuvwxyz.", &[
-        &[19, 127, 149, 187, 221, 375, 423, 448, 471, 503, 526],
-    ]),
+    ("abcdefghijklmnopqrstuvwxyz.", &[k_only(27)]),
     // 8: PTSerif-400Italic "Italic: The quick brown fox jumps over 1,234,567,890 lazy"
+    // The number splits into "1,234," and "567,890" (wide-whitespace split).
     ("Italic: The quick brown fox jumps over 1,234,567,890 lazy", &[
-        &[14, 26],
-        &[20],
-        &[65],
-        &[34],
-        &[14, 32],
-        &[],
-        &[35],
-        &[46, 65, 87],
-        &[19, 52],
-        &[28, 45],
+        k_only(7), k_only(3), k_only(5), k_only(5), k_only(3),
+        k_only(5), k_only(4), k_only(6), k_only(7), k_only(4),
     ]),
-    // 9: SourceSerif4-400Italic "Font: Originally for IBM Executive typewriters — 12 characte"
+    // 9: SourceSerif4-400Italic "Font: Originally for IBM Executive typewriters — 12 characters per inch"
     ("Font: Originally for IBM Executive typewriters — 12 characters per inch", &[
-        &[21, 78],
-        &[53, 151],
-        &[19],
-        &[14, 36],
-        &[22, 128],
-        &[11, 30, 178],
-        &[],
-        &[],
-        &[75, 159],
-        &[],
-        &[],
+        k_only(5), k_only(10), k_only(3), k_only(3), k_only(9),
+        k_only(11), k_only(1), k_only(2), k_only(10), k_only(3), k_only(4),
     ]),
     // 10: Georgia-400 "Matthew Carter created Georgia in 1993."
     ("Matthew Carter created Georgia in 1993.", &[
-        &[53, 66, 79, 119],
-        &[58],
-        &[32, 67],
-        &[79, 99],
-        &[],
-        &[],
+        k_only(7), k_only(6), k_only(7), k_only(7), k_only(2), k_only(5),
     ]),
     // 11: Arial-ItalicMT-400Italic "Italic: The quick brown fox jumps over 1,234,567,890"
+    // The number stays whole here (unlike line 8).
     ("Italic: The quick brown fox jumps over 1,234,567,890", &[
-        &[9, 20, 49, 57],
-        &[20],
-        &[40, 50, 68],
-        &[33, 81],
-        &[9, 30],
-        &[14, 64],
-        &[38],
-        &[162],
+        k_only(7), k_only(3), k_only(5), k_only(5),
+        k_only(3), k_only(5), k_only(4), k_only(13),
     ]),
-    // 12: Nimbus-400Italic "AVAST! WAYWARD YOUTH TO YONDER VALLEY, AWAY AT DAWN. Ryan Tr"
+    // 12: Nimbus-400Italic "AVAST! WAYWARD YOUTH TO YONDER VALLEY, AWAY AT DAWN. Ryan Tries."
     ("AVAST! WAYWARD YOUTH TO YONDER VALLEY, AWAY AT DAWN. Ryan Tries.", &[
-        &[41, 107],
-        &[25, 73, 100, 123],
-        &[17, 72, 93],
-        &[19],
-        &[17, 43, 69, 96, 118],
-        &[16, 63, 84, 125],
-        &[50],
-        &[],
-        &[28, 80, 106],
-        &[22, 59],
-        &[16, 31, 57],
+        k_only(6), k_only(7), k_only(5), k_only(2), k_only(6),
+        k_only(7), k_only(4), k_only(2), k_only(5), k_only(4), k_only(6),
     ]),
     // 13: SourceSerif4-400Italic "Font: fonts.google.com/specimen/Jost — OFL, Owen Earl"
     ("Font: fonts.google.com/specimen/Jost — OFL, Owen Earl", &[
-        &[21, 78],
-        &[19, 76],
-        &[21, 60, 191, 203, 217, 360, 368, 387, 406],
-        &[],
-        &[23, 45, 66],
-        &[],
-        &[],
+        k_only(5), k_only(6), k_only(24), k_only(1),
+        k_only(4), k_only(4), k_only(4),
     ]),
     // 14: LibreBodoni-400 "ABCDEFGHIJKLMNOPQRSTUVWXYZ"
-    ("ABCDEFGHIJKLMNOPQRSTUVWXYZ", &[
-        &[24, 186, 216, 229, 276, 332, 360, 471, 545, 569, 604, 632, 656],
-    ]),
+    ("ABCDEFGHIJKLMNOPQRSTUVWXYZ", &[k_only(26)]),
     // 15: SourceSerif4-400Italic "Hunt for Adobe"
-    ("Hunt for Adobe", &[
-        &[30],
-        &[19],
-        &[],
-    ]),
+    ("Hunt for Adobe", &[k_only(4), k_only(3), k_only(5)]),
     // 16: Georgia-700 "1993 — Georgia (Microsoft)"
+    // "(Microsoft)": k=11, columns 86 and 202 verified against the seam
+    // overlay (both fall in clean gaps at true character boundaries).
+    // Column 34 is the known M-split bug and is deliberately NOT recorded.
     ("1993 — Georgia (Microsoft)", &[
-        &[],
-        &[],
-        &[29, 94, 116],
-        &[34, 86, 202],
+        k_only(4), k_only(1), k_only(7),
+        WordExpect { k: Some(11), columns: &[86, 202] },
     ]),
     // 17: LibreCaslonText-400 "saying: \"When in doubt, use Caslon.\""
     ("saying: \"When in doubt, use Caslon.\"", &[
-        &[31, 54, 89],
-        &[53],
-        &[],
-        &[],
-        &[],
-        &[128],
+        k_only(7), k_only(5), k_only(2), k_only(6), k_only(3), k_only(8),
     ]),
 ];
 
@@ -236,7 +212,16 @@ fn seam_splits_match_ground_truth() {
     assert_eq!(entries.len(), EXPECTED.len(),
         "expected {} lines, got {}", EXPECTED.len(), entries.len());
 
-    for (i, (entry, &(expected_text, expected_word_splits))) in entries.iter().zip(EXPECTED.iter()).enumerate() {
+    // Verified checks passed, misses (verified items that failed), and
+    // unverified items (recorded as nothing — reported, not asserted).
+    let mut verified: usize = 0;
+    let mut misses: Vec<String> = Vec::new();
+    let mut unverified: Vec<String> = Vec::new();
+    let mut n_k_recorded: usize = 0;
+    let mut n_cols_recorded: usize = 0;
+    let mut n_words_undef: usize = 0;
+
+    for (i, (entry, &(expected_text, expected_words))) in entries.iter().zip(EXPECTED.iter()).enumerate() {
         // Use gt_text when available (robust against pflda false corrections like x->w),
         // fallback to display text.
         let text = entry.get("gt_text").and_then(|v| v.as_str())
@@ -245,18 +230,61 @@ fn seam_splits_match_ground_truth() {
         assert_eq!(text, expected_text, "line {i}: text mismatch (gt_text vs expected)");
 
         let ws = entry["word_segmentation"].as_array().expect("no word_segmentation");
-        assert_eq!(ws.len(), expected_word_splits.len(),
+        assert_eq!(ws.len(), expected_words.len(),
             "line {i} ({text}): word count mismatch — got {} words, expected {}",
-            ws.len(), expected_word_splits.len());
+            ws.len(), expected_words.len());
 
-        for (j, (word, expected_splits)) in ws.iter().zip(expected_word_splits.iter()).enumerate() {
+        for (j, (word, exp)) in ws.iter().zip(expected_words.iter()).enumerate() {
+            let wtext = word.get("word_text").and_then(|v| v.as_str()).unwrap_or("?");
+            let n_seg = word["n_segments_produced"].as_u64().unwrap() as usize;
             let splits: Vec<u32> = match word["seam_splits"].as_array() {
                 Some(arr) => arr.iter().map(|v| v.as_u64().unwrap() as u32).collect(),
                 None => vec![],
             };
 
-            assert_eq!(splits, *expected_splits,
-                "line {i} word {j} ({text}): seam splits mismatch\n  got:      {splits:?}\n  expected: {expected_splits:?}");
+            match exp.k {
+                Some(k) => {
+                    n_k_recorded += 1;
+                    if n_seg == k {
+                        verified += 1;
+                    } else {
+                        misses.push(format!(
+                            "line {i} word {j} ({wtext}): k mismatch — got {n_seg} segments, expected {k}"));
+                    }
+                }
+                None => unverified.push(format!(
+                    "line {i} word {j} ({wtext}): k unverified")),
+            }
+
+            if exp.columns.is_empty() {
+                unverified.push(format!(
+                    "line {i} word {j} ({wtext}): columns unverified (0 recorded)"));
+            } else {
+                for &col in exp.columns {
+                    n_cols_recorded += 1;
+                    if splits.contains(&col) {
+                        verified += 1;
+                    } else {
+                        misses.push(format!(
+                            "line {i} word {j} ({wtext}): recorded column {col} missing from observed splits {splits:?}"));
+                    }
+                }
+            }
+
+            if exp.k.is_none() && exp.columns.is_empty() {
+                n_words_undef += 1;
+            }
         }
     }
+
+    // Report: verified counts, misses, and every unverified item.
+    eprintln!("t59 summary: {verified} verified checks passed, {} miss(es), {} unverified item(s)",
+        misses.len(), unverified.len());
+    eprintln!("  k recorded on {n_k_recorded} words, {n_cols_recorded} columns recorded, {n_words_undef} words fully undefined");
+    for u in &unverified {
+        eprintln!("  unverified: {u}");
+    }
+    // Break on misses: any verified item that fails, fails the test.
+    assert!(misses.is_empty(),
+        "t59 FAILED with {} miss(es):\n{}", misses.len(), misses.join("\n"));
 }

@@ -26,13 +26,29 @@ pub fn ensure_index() {
 
 /// Locate the built `unscan` binary (release or debug).
 /// Supports new workspace layout where bin lives in `unprint-cli` crate.
+///
+/// NOTE: `cargo test --test <name>` does not build binary targets, so
+/// `CARGO_BIN_EXE_unprint` is unset for single-test runs and this fallback
+/// decides. The tests live in the root package, so the worktree's own
+/// target dir is directly under the manifest dir — check it FIRST, preferring
+/// the profile matching this test build. Falling through to another
+/// checkout's binary silently tests the wrong code (t59 did exactly that:
+/// it ran main's stale pre-merge binary until this fix).
 pub fn unscan_bin() -> PathBuf {
     if let Some(p) = option_env!("CARGO_BIN_EXE_unprint") {
         return PathBuf::from(p);
     }
     // fallback: workspace target layout after crate split (unprint-cli -> bin unprint)
     let manifest = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
+    // Prefer the binary built for this test's own profile.
+    let (own_first, own_second) = if cfg!(debug_assertions) {
+        ("target/debug/unprint", "target/release/unprint")
+    } else {
+        ("target/release/unprint", "target/debug/unprint")
+    };
     let candidates = [
+        manifest.join(own_first),
+        manifest.join(own_second),
         manifest.join("../target/debug/unprint"),
         manifest.join("../target/release/unprint"),
         manifest.join("../../target/debug/unprint"),
@@ -45,7 +61,7 @@ pub fn unscan_bin() -> PathBuf {
         }
     }
     // last resort - will error clearly if not built
-    manifest.join("../target/debug/unprint")
+    manifest.join(own_first)
 }
 
 /// Path into the test-docs directory.
