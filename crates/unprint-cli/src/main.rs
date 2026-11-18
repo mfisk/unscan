@@ -40,10 +40,22 @@ fn main() {
         .blocklist(&["libc", "libgcc", "libpthread", "vdso"])
         .build()
         .expect("pprof guard");
-    let args = cli::parse();
+    let mut args = cli::parse();
     if let Err(msg) = args.validate() {
         eprintln!("Error: {msg}");
         std::process::exit(1);
+    }
+
+    // Parse --report-lines once, up front: a malformed spec errors
+    // loudly here instead of silently producing a full report.
+    if let Some(spec) = &args.report_lines {
+        match cli::parse_line_specs(spec) {
+            Ok(lines) => args.report_lines_parsed = Some(lines),
+            Err(e) => {
+                eprintln!("--report-lines: {e}");
+                std::process::exit(1);
+            }
+        }
     }
 
     // Initialize cache directory and font allowlist from CLI/env
@@ -95,7 +107,7 @@ fn main() {
         // classifier tiebreakers (font_scan::font_key_preference_score):
         // highest version first (a no-op here — entries sharing one path
         // share one file and one version), then kern for fonts with
-        // kerning data, nokern otherwise; nolig; then opsz=10;
+        // kerning data, nokern otherwise; lig; then opsz=10;
         // OT-feature variants and non-default weight instances (-10 each)
         // never win the default pick.
         // The entry's stored has_kern flag is the source of truth — the
@@ -233,6 +245,15 @@ fn main() {
         args.triplet_weights.as_deref(),
         Some((&args.font_dir, &args.render_params())),
     );
+
+    // ── report-from-audit: regenerate report.html from a saved audit ──
+    if let Some(audit_file) = &args.report_from_audit {
+        if let Err(e) = run_report_from_audit(&args, &mut *clf, audit_file) {
+            eprintln!("Error: {e}");
+            std::process::exit(1);
+        }
+        std::process::exit(0);
+    }
 
     if let Err(e) = run(&args, &mut *clf) {
         eprintln!("Error: {e}");
@@ -591,6 +612,7 @@ fn build_audit_entry(
         expected_font: None,
         gt_rank: None,
         gt_score: None,
+        gt_font_size_pt: None,
         gt_text: None,
         ocr_text: None,
         ocr_correct: None,
@@ -624,6 +646,7 @@ fn write_audit_report(
         render_binarize: args.render_binarize,
         elapsed,
         report_all: args.report_all || args.audit_all,
+        line_filter: args.report_lines_parsed.clone(),
     };
     let _ = report::generate_report(
         &report_path,
@@ -635,6 +658,75 @@ fn write_audit_report(
         glyph_map,
         &meta,
     );
+}
+
+/// Regenerate report.html from a saved audit file (--report-from-audit),
+/// without re-running the pipeline. Loads the entries and run metadata
+/// from the audit JSON, rebuilds the classification from the recorded
+/// miss_type/expected_font, loads the font catalog (same loader as the
+/// live run) and the glyph map (load-only: a report-only mode must
+/// never trigger a retrain), and calls the same generator the live path
+/// uses, so the output is the report generator's own HTML.
+fn run_report_from_audit(
+    args: &cli::Args,
+    classifier: &mut dyn classifier::Classifier,
+    audit_file: &std::path::Path,
+) -> Result<(), ScanTextError> {
+    let audit_root = args.audit.as_ref().ok_or_else(|| {
+        ScanTextError::Serialize(
+            "--report-from-audit requires --audit for the audit directory holding the crops".to_string(),
+        )
+    })?;
+    let data = audit::load_audit_file(audit_file)?;
+    let classified = report::classify_entries_from_audit(&data.entries, data.dpi);
+    let font_registry = load_fonts(args, classifier)?;
+    let gmap_path = glyph_map::NgramGlyphMap::default_path();
+    let glyph_map = glyph_map::NgramGlyphMap::load(&gmap_path).map_err(|e| {
+        ScanTextError::Serialize(format!(
+            "cannot load glyph map at {} for report generation ({e}); a report-only run never retrains",
+            gmap_path.display()
+        ))
+    })?;
+    let meta = report::ReportMeta {
+        classifier: data.classifier,
+        render_scale: data.render_scale,
+        render_aa: data.render_aa,
+        render_binarize: data.render_binarize,
+        elapsed: std::time::Duration::from_secs_f64(data.elapsed_secs),
+        report_all: args.report_all || args.audit_all,
+        line_filter: args.report_lines_parsed.clone(),
+    };
+    let report_path = audit_root.join("report.html");
+    report::generate_report(
+        &report_path,
+        audit_root,
+        &data.entries,
+        &classified,
+        data.dpi,
+        font_registry.entries(),
+        &glyph_map,
+        &meta,
+    )
+    .map_err(ScanTextError::Serialize)?;
+    if !args.quiet {
+        match &args.report_lines_parsed {
+            Some(lines) => {
+                let specs: Vec<String> = lines.iter().map(|(p, l)| format!("p{p}:L{l}")).collect();
+                eprintln!(
+                    "Wrote {} ({} entries, filtered to {})",
+                    report_path.display(),
+                    data.entries.len(),
+                    specs.join(", ")
+                );
+            }
+            None => eprintln!(
+                "Wrote {} ({} entries)",
+                report_path.display(),
+                data.entries.len()
+            ),
+        }
+    }
+    Ok(())
 }
 
 fn run(args: &cli::Args, classifier: &mut dyn classifier::Classifier) -> Result<(), ScanTextError> {
