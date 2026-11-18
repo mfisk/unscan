@@ -3,7 +3,7 @@
 //! - [`LineMatch`]: per-line font matching result
 //! - [`match_lines_fast_path`]: Pass 1 — dominant-font fast path only
 //! - [`match_lines`]: full pipeline — segmentation → font search → font match
-//! - [`update_dominant_font`]: dominant font candidate update after Pass 1
+//! - [`DominantFontTracker`]: dominant font candidate tracked across pages
 //!
 //! Rule-out via infinite penalty: if a font does not contain a character that
 //! appears in the string, `per_char_geo` returns `None` (cmap miss). The
@@ -16,7 +16,7 @@
 //! means ligature mismatch (no usable words) and is kept as `Some(empty)` with
 //! SSIM-only scoring, not infinite penalty.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 
@@ -1421,36 +1421,94 @@ pub fn match_lines(
     line_matches
 }
 
-/// Update the dominant font candidate from this page's match results.
+/// Per-font-key evidence accumulated across pages for the dominant-font election.
+struct DominantStats {
+    /// Pages (1-indexed) on which this key won at least one line.
+    pages: HashSet<usize>,
+    /// Total lines won across all pages seen so far.
+    total: usize,
+    /// Midpoint-derived ems of all lines won, for the dominant-size median.
+    ems: Vec<f32>,
+    /// Most recently seen match result for this key.
+    latest: Option<font_match::FontMatchResult>,
+}
+
+/// Tracks the dominant font across pages for the fast path.
 ///
-/// Returns the new dominant font candidate (most frequently matched font
-/// key) together with its dominant size: the median midpoint-derived em
-/// (`midpoint_em_px`) over the lines matched to that font. The midpoint em
-/// comes from character midpoint spans, not word width, so it is immune to
-/// the ~1 px antialiased-fringe inflation in the width-matched em. Lines
-/// that took the fast path carry no midpoint em and do not contribute; if
-/// no line matched to the dominant font has one, the size is None and the
-/// fast path falls back to the per-line width-matched em.
-pub fn update_dominant_font(line_matches: &[LineMatch]) -> (Option<font_match::FontMatchResult>, Option<f32>) {
-    let mut font_freq: HashMap<String, usize> = HashMap::new();
-    for lm in line_matches {
-        if let Some(ref fr) = lm.font_result {
-            *font_freq.entry(fr.font_key.clone()).or_insert(0) += 1;
-        }
+/// The dominant font predicts the next page: a font present on every page
+/// seen so far is a far better bet for the next page than a font that won
+/// many lines on a single page. Electing from one page alone is fragile —
+/// on the specimen, a retrain flipped five page-4 attribution lines from
+/// SourceSerif4-400Italic to 500Italic, fragmenting that font's ten votes
+/// into 4/5/1 across exact keys, so a one-page body font (OpenSans, 8
+/// votes) won the election and the fast path never fired on page 5, even
+/// though the attribution font recurs on every page. Accumulating across
+/// pages fixes this: the election ranks by (pages present, total lines),
+/// so the recurring font wins by 4 pages to 1 in both the baseline and the
+/// retrained run, and the representative key is the same in both.
+///
+/// The dominant size is the median midpoint-derived em over all lines won
+/// by the dominant font across all pages seen so far. The midpoint em comes
+/// from character midpoint spans, not word width, so it is immune to the
+/// ~1 px antialiased-fringe inflation in the width-matched em. Lines that
+/// took the fast path carry no midpoint em and do not contribute; if no
+/// line matched to the dominant font has one, the size is None and the fast
+/// path falls back to the per-line width-matched em.
+///
+/// Ties on (pages, total) break by font key ascending, so the election is
+/// deterministic — the previous per-page election broke ties by HashMap
+/// iteration order.
+#[derive(Default)]
+pub struct DominantFontTracker {
+    stats: HashMap<String, DominantStats>,
+}
+
+impl DominantFontTracker {
+    pub fn new() -> Self {
+        Self::default()
     }
-    if let Some((top_key, _)) = font_freq.iter().max_by_key(|(_, c)| *c) {
-        let font = line_matches.iter()
-            .find_map(|lm| lm.font_result.as_ref()
-                .filter(|fr| fr.font_key == *top_key)
-                .cloned());
-        let mut ems: Vec<f32> = line_matches.iter()
-            .filter(|lm| lm.font_result.as_ref().is_some_and(|fr| fr.font_key == *top_key))
-            .filter_map(|lm| lm.midpoint_em_px)
-            .collect();
-        let size = crate::geometry_scale::median_f32(&mut ems);
-        (font, size)
-    } else {
-        (None, None)
+
+    /// Feed one page's match results and return the current dominant font
+    /// candidate together with its dominant size. Returns (None, None) when
+    /// no line on any page seen so far has a font result.
+    pub fn update(
+        &mut self,
+        page_num: usize,
+        line_matches: &[LineMatch],
+    ) -> (Option<font_match::FontMatchResult>, Option<f32>) {
+        for lm in line_matches {
+            if let Some(ref fr) = lm.font_result {
+                let st = self.stats.entry(fr.font_key.clone()).or_insert_with(|| DominantStats {
+                    pages: HashSet::new(),
+                    total: 0,
+                    ems: Vec::new(),
+                    latest: None,
+                });
+                st.pages.insert(page_num);
+                st.total += 1;
+                if let Some(em) = lm.midpoint_em_px {
+                    st.ems.push(em);
+                }
+                st.latest = Some(fr.clone());
+            }
+        }
+        let top_key: Option<String> = {
+            let mut ranked: Vec<(&String, &DominantStats)> = self.stats.iter().collect();
+            ranked.sort_by(|(ka, sa), (kb, sb)| {
+                sb.pages.len()
+                    .cmp(&sa.pages.len())
+                    .then(sb.total.cmp(&sa.total))
+                    .then(ka.cmp(kb))
+            });
+            ranked.first().map(|(k, _)| (*k).clone())
+        };
+        if let Some(top_key) = top_key {
+            let st = self.stats.get_mut(&top_key).expect("elected key is in stats");
+            let size = crate::geometry_scale::median_f32(&mut st.ems);
+            (st.latest.clone(), size)
+        } else {
+            (None, None)
+        }
     }
 }
 

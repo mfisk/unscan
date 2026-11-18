@@ -990,11 +990,16 @@ fn run(args: &cli::Args, classifier: &mut dyn classifier::Classifier) -> Result<
     let mut _stat_raster_frags = 0u32;
     // Dominant font candidate for fast-path SSIM, persists across pages.
     let mut dominant_font_candidate: Option<font_match::FontMatchResult> = None;
-    // Dominant font size (median midpoint-derived em of the previous page's
-    // lines matched to the dominant font), for the fast-path render em.
-    // Persists across pages alongside the dominant font; None until some
-    // page elects a dominant font with at least one midpoint em.
+    // Dominant font size (median midpoint-derived em of the lines matched
+    // to the dominant font across all pages seen so far), for the
+    // fast-path render em. Persists across pages alongside the dominant
+    // font; None until some page elects a dominant font with at least one
+    // midpoint em.
     let mut dominant_font_size_px: Option<f32> = None;
+    // Dominant-font tracker: accumulates per-font evidence across pages
+    // and elects the font present on the most pages (see
+    // DominantFontTracker). Persists across pages.
+    let mut dominant_tracker = font_pipeline::DominantFontTracker::new();
 
     // Load ground truth from vector PDF (--audit or --test).
     let ground_truth: Option<ground_truth::GroundTruth> = if let Some(vpath) = args.gt_vector_pdf() {
@@ -1086,7 +1091,7 @@ fn run(args: &cli::Args, classifier: &mut dyn classifier::Classifier) -> Result<
             .collect();
 
         // Update dominant font candidate (and its dominant size) for next page
-        let (new_dom, new_size) = font_pipeline::update_dominant_font(&line_matches);
+        let (new_dom, new_size) = dominant_tracker.update(page_num, &line_matches);
         if let Some(new_dom) = new_dom {
             dominant_font_candidate = Some(new_dom);
             dominant_font_size_px = new_size;
