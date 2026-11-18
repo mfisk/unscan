@@ -23,7 +23,7 @@ use std::collections::HashMap;
 
 /// Raw distance metrics from a single probabilities() call.
 /// Populated only when UNPRINT_OBS_STATS=1.
-#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+#[derive(Debug, Clone, serde::Serialize)]
 pub struct ObsStats {
     pub min_d: f32,
     pub d_second: f32,

@@ -4,14 +4,14 @@ use std::collections::HashMap;
 use std::sync::Arc;
 
 use crate::error::ScanTextError;
-use serde::{Deserialize, Serialize, Serializer};
+use serde::{Serialize, Serializer};
 use crate::classifier::ObsStats;
 
 use std::path::{Path, PathBuf};
 
 /// Per-word segmentation summary, embedded in the audit entry so the report
 /// doesn't need to crawl summary.json files from disk.
-#[derive(Debug, Serialize, Deserialize, Clone)]
+#[derive(Debug, Serialize, Clone)]
 pub struct WordSegSummary {
     pub word_text: String,
     pub source_word_idx: usize,
@@ -43,7 +43,7 @@ where
 }
 
 /// Per-text-region audit record.
-#[derive(Debug, Serialize, Deserialize)]
+#[derive(Debug, Serialize)]
 pub struct AuditEntry {
     pub page: usize,
     pub line_index: usize,
@@ -60,9 +60,9 @@ pub struct AuditEntry {
     pub decision: Decision,
     pub reason: String,
     pub bbox: BBox,
-    #[serde(default, skip_serializing_if = "Vec::is_empty", serialize_with = "serialize_top10")]
+    #[serde(skip_serializing_if = "Vec::is_empty", serialize_with = "serialize_top10")]
     pub font_candidates: Vec<FontCandidate>,
-    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    #[serde(skip_serializing_if = "Vec::is_empty")]
     pub obs_votes: Vec<ObservationVote>,
     /// GT font's own per-observation votes, on GT's own segmentation
     /// (GT's collapsed ligature set: collapsed for lig GT, uncollapsed
@@ -72,16 +72,16 @@ pub struct AuditEntry {
     /// ligature the GT font renders as separate characters.
     /// Omitted from the JSON when identical to obs_votes; readers must
     /// treat a missing gt_obs_votes as equal to obs_votes.
-    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    #[serde(skip_serializing_if = "Vec::is_empty")]
     pub gt_obs_votes: Vec<ObservationVote>,
     /// Word-level bounding boxes for this line (for miss-report visualisation).
-    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    #[serde(skip_serializing_if = "Vec::is_empty")]
     pub word_bboxes: Vec<WordBBox>,
     /// Raw Tesseract word bboxes before post-processing (clip/drop/expand).
-    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    #[serde(skip_serializing_if = "Vec::is_empty")]
     pub word_bboxes_raw: Vec<WordBBox>,
     /// font tie-break candidates with per-candidate similarity (ZNCC) scores.
-    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    #[serde(skip_serializing_if = "Vec::is_empty")]
     pub tie_candidates: Vec<TieCandidate>,
     /// Ground-truth classification: "hit", "major_miss", "minor_miss",
     /// "similarity_failure", "kept_raster", or "no_ground_truth".
@@ -105,12 +105,6 @@ pub struct AuditEntry {
     /// no GT is available). Populated when --audit is provided.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub gt_score: Option<f32>,
-    /// Ground-truth font size in points, from the vector PDF span
-    /// (None when no GT is available). Populated when --audit is
-    /// provided. The report's Size row reads this; without it a
-    /// regenerated report cannot show the GT size.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub gt_font_size_pt: Option<f32>,
     /// Ground-truth text from the vector PDF span.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub gt_text: Option<String>,
@@ -130,29 +124,29 @@ pub struct AuditEntry {
     pub gt_midpoint_em_px: Option<f32>,
     /// Whether this line was matched via the dominant-font fast path
     /// (skipping full classification).
-    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    #[serde(skip_serializing_if = "std::ops::Not::not")]
     pub fast_path: bool,
     /// Per-word segmentation summaries for this line.
-    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    #[serde(skip_serializing_if = "Vec::is_empty")]
     pub word_segmentation: Vec<WordSegSummary>,
     /// GT font per-word segmentation summaries – always included when GT scored.
-    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    #[serde(skip_serializing_if = "Vec::is_empty")]
     pub gt_word_segmentation: Vec<WordSegSummary>,
     /// Per-character GT geometry log-likelihoods (h_ll + v_ll) in observation order.
     /// Enables offline evaluation of pruning statistics (min, mean, etc.) without re-running.
-    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    #[serde(skip_serializing_if = "Vec::is_empty")]
     pub gt_per_char_geo_ll: Vec<f32>,
     /// Whether GT would have been pruned by the geometry gate (min_ll < threshold)
     /// if not protected by ensure_set. Flags lines where --test changes the outcome.
-    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    #[serde(skip_serializing_if = "std::ops::Not::not")]
     pub gt_pruned: bool,
     /// PFLDA OCR corrections with decision data.
-    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    #[serde(skip_serializing_if = "Vec::is_empty")]
     pub ocr_corrections: Vec<OcrCorrection>,
 }
 
 /// A single PFLDA OCR correction with its decision data.
-#[derive(Debug, Serialize, Deserialize, Clone)]
+#[derive(Debug, Serialize, Clone)]
 pub struct OcrCorrection {
     /// Index into the character sequence (word-relative position).
     pub char_pos: usize,
@@ -172,7 +166,7 @@ pub struct OcrCorrection {
 }
 
 /// Word-level bounding box with OCR text.
-#[derive(Debug, Serialize, Deserialize, Clone)]
+#[derive(Debug, Serialize, Clone)]
 pub struct WordBBox {
     pub text: String,
     pub x: u32,
@@ -183,14 +177,14 @@ pub struct WordBBox {
 }
 
 /// font candidate font score.
-#[derive(Debug, Serialize, Deserialize, Clone)]
+#[derive(Debug, Serialize, Clone)]
 pub struct FontCandidate {
     pub font_key: String,
     pub score: Option<f32>,
 }
 
 /// Similarity (ZNCC) tie-break candidate detail.
-#[derive(Debug, Serialize, Deserialize, Clone)]
+#[derive(Debug, Serialize, Clone)]
 pub struct TieCandidate {
     pub font_key: String,
     pub family_name: String,
@@ -200,7 +194,7 @@ pub struct TieCandidate {
 }
 
 /// Per-window font-scoring vote detail (1-gram or bigram).
-#[derive(Debug, Serialize, Deserialize, Clone)]
+#[derive(Debug, Serialize, Clone)]
 pub struct ObservationVote {
     /// Full scored sequence (e.g. ['T','i'] for bigram, ['a'] for 1-gram).
     pub seq: Vec<char>,
@@ -318,7 +312,7 @@ pub struct ObservationVote {
     pub gt_ink_width: Option<f32>,
 }
 
-#[derive(Debug, Serialize, Deserialize, Clone)]
+#[derive(Debug, Serialize, Clone)]
 pub struct BBox {
     pub x: u32,
     pub y: u32,
@@ -326,7 +320,7 @@ pub struct BBox {
     pub height: u32,
 }
 
-#[derive(Debug, Serialize, Deserialize, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Serialize, Clone, Copy, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
 pub enum Decision {
     Vectorized,
@@ -431,118 +425,6 @@ pub fn write_json_gz(path: &Path, json: &str) -> Result<(), ScanTextError> {
     enc.write_all(json.as_bytes()).map_err(ScanTextError::Io)?;
     enc.finish().map_err(ScanTextError::Io)?;
     Ok(())
-}
-
-/// A saved audit file's entries plus the run metadata the report header
-/// needs. Loaded by --report-from-audit so a report can be regenerated
-/// without re-running the pipeline.
-pub struct AuditFileData {
-    pub entries: Vec<AuditEntry>,
-    pub dpi: u32,
-    pub classifier: String,
-    pub render_scale: u32,
-    pub render_aa: String,
-    pub render_binarize: Option<u8>,
-    pub elapsed_secs: f64,
-}
-
-/// Load a saved audit JSON (.json or .json.gz) for report regeneration.
-/// A `.json` path whose `.gz` sibling exists resolves to the sibling,
-/// matching the reader convention in tests/common/mod.rs. Errors loudly
-/// on a missing file, bad gzip, malformed JSON, or missing entries —
-/// never silently produces a partial report.
-pub fn load_audit_file(path: &Path) -> Result<AuditFileData, ScanTextError> {
-    use std::io::Read;
-    let resolved: PathBuf = if path.exists() {
-        path.to_path_buf()
-    } else {
-        let mut gz_name = path.as_os_str().to_owned();
-        gz_name.push(".gz");
-        let gz_path = PathBuf::from(gz_name);
-        if gz_path.exists() {
-            gz_path
-        } else {
-            return Err(ScanTextError::Serialize(format!(
-                "audit file not found: {} (nor {}.gz)",
-                path.display(),
-                path.display()
-            )));
-        }
-    };
-    let is_gz = resolved.extension().map_or(false, |e| e == "gz");
-    let json: String = if is_gz {
-        let file = std::fs::File::open(&resolved).map_err(ScanTextError::Io)?;
-        let mut decoder = flate2::read::GzDecoder::new(file);
-        let mut buf = String::new();
-        decoder
-            .read_to_string(&mut buf)
-            .map_err(|e| ScanTextError::Serialize(format!("bad gzip in {}: {e}", resolved.display())))?;
-        buf
-    } else {
-        std::fs::read_to_string(&resolved).map_err(ScanTextError::Io)?
-    };
-    let value: serde_json::Value = serde_json::from_str(&json)
-        .map_err(|e| ScanTextError::Serialize(format!("malformed audit JSON in {}: {e}", resolved.display())))?;
-    let obj = value
-        .as_object()
-        .ok_or_else(|| ScanTextError::Serialize(format!("audit JSON in {} is not an object", resolved.display())))?;
-    let entries_value = obj.get("text_entries").ok_or_else(|| {
-        ScanTextError::Serialize(format!("audit JSON in {} has no text_entries", resolved.display()))
-    })?;
-    let mut entries: Vec<AuditEntry> = serde_json::from_value(entries_value.clone()).map_err(|e| {
-        ScanTextError::Serialize(format!("cannot parse text_entries in {}: {e}", resolved.display()))
-    })?;
-    // The writer drops gt_obs_votes when it duplicates obs_votes, so a
-    // missing key on a ground-truth line means "equal to obs_votes" —
-    // restore it, or the report's GT-observation fallback table would
-    // come up empty on those lines. Lines without ground truth never
-    // had GT observations, so they stay empty; and a wrong restore is
-    // harmless anyway, since the fallback map only keeps observations
-    // whose gt_* fields are populated.
-    for e in entries.iter_mut() {
-        if e.gt_obs_votes.is_empty() && !e.obs_votes.is_empty() && e.expected_font.is_some() {
-            e.gt_obs_votes = e.obs_votes.clone();
-        }
-    }
-    // Run metadata for the report header. dpi is load-bearing (font-size
-    // conversions); the rest only label the header, so a missing value
-    // falls back to the live path's defaults rather than failing.
-    let dpi = obj
-        .get("dpi")
-        .and_then(|v| v.as_u64())
-        .ok_or_else(|| ScanTextError::Serialize(format!("audit JSON in {} has no dpi", resolved.display())))?
-        as u32;
-    let classifier = obj
-        .get("classifier")
-        .and_then(|v| v.as_str())
-        .unwrap_or("lda")
-        .to_string();
-    let render_scale = obj
-        .get("render_scale")
-        .and_then(|v| v.as_u64())
-        .unwrap_or(1) as u32;
-    let render_aa = obj
-        .get("render_aa")
-        .and_then(|v| v.as_str())
-        .unwrap_or("native")
-        .to_string();
-    let render_binarize = obj
-        .get("render_binarize")
-        .and_then(|v| v.as_u64())
-        .map(|v| v as u8);
-    let elapsed_secs = obj
-        .get("elapsed_secs")
-        .and_then(|v| v.as_f64())
-        .unwrap_or(0.0);
-    Ok(AuditFileData {
-        entries,
-        dpi,
-        classifier,
-        render_scale,
-        render_aa,
-        render_binarize,
-        elapsed_secs,
-    })
 }
 
 // ── Image directory for audit artifacts ─────────────────────────────────
