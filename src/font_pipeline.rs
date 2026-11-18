@@ -265,7 +265,7 @@ pub struct LineMatch {
     /// (correction only rewrites text), so the stored widths apply there
     /// too. `None` for filter placeholders and fast-path lines (never
     /// re-verified).
-    pub measured_widths: Option<Vec<f32>>,
+    pub measured_widths: Option<Vec<u32>>,
     /// Median em_px derived from midpoint center-span scales (obs_span/pred_span * upem).
     /// This reuses the exact scale calculation from geometry scoring for font-size,
     /// fixing L9 fox/jumps too-small issue where width-matched median was dragged down.
@@ -622,7 +622,7 @@ pub fn match_lines(
                 text: w.text.clone(),
                 x_off: w.x,
                 y_off: w.y,
-                width: w.width as f32,
+                width: w.width,
                 height: w.height,
             })
             .collect();

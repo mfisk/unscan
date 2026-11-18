@@ -2210,13 +2210,10 @@ pub fn segment_line(
     let mut any_ligatures = false;
     let mut words_with_ligatures: Vec<bool> = vec![false; words.len()];
 
-    for (orig_idx, word) in words.iter().enumerate().filter(|(_, w)| w.width > 0.0) {
+    for (orig_idx, word) in words.iter().enumerate().filter(|(_, w)| w.width > 0) {
         let wx = word.x_off;
         let wy = word.y_off;
-        // Fractional width to integer crop: ceil so the crop covers the full
-        // fractional ink width (placements built from OCR boxes carry whole
-        // values, so this is exact there).
-        let ww = word.width.ceil() as u32;
+        let ww = word.width;
         let wh = word.height;
 
         let (pw, ph) = page.dimensions();
