@@ -40,22 +40,10 @@ fn main() {
         .blocklist(&["libc", "libgcc", "libpthread", "vdso"])
         .build()
         .expect("pprof guard");
-    let mut args = cli::parse();
+    let args = cli::parse();
     if let Err(msg) = args.validate() {
         eprintln!("Error: {msg}");
         std::process::exit(1);
-    }
-
-    // Parse --report-lines once, up front: a malformed spec errors
-    // loudly here instead of silently producing a full report.
-    if let Some(spec) = &args.report_lines {
-        match cli::parse_line_specs(spec) {
-            Ok(lines) => args.report_lines_parsed = Some(lines),
-            Err(e) => {
-                eprintln!("--report-lines: {e}");
-                std::process::exit(1);
-            }
-        }
     }
 
     // Initialize cache directory and font allowlist from CLI/env
@@ -107,7 +95,7 @@ fn main() {
         // classifier tiebreakers (font_scan::font_key_preference_score):
         // highest version first (a no-op here — entries sharing one path
         // share one file and one version), then kern for fonts with
-        // kerning data, nokern otherwise; lig; then opsz=10;
+        // kerning data, nokern otherwise; nolig; then opsz=10;
         // OT-feature variants and non-default weight instances (-10 each)
         // never win the default pick.
         // The entry's stored has_kern flag is the source of truth — the
@@ -245,15 +233,6 @@ fn main() {
         args.triplet_weights.as_deref(),
         Some((&args.font_dir, &args.render_params())),
     );
-
-    // ── report-from-audit: regenerate report.html from a saved audit ──
-    if let Some(audit_file) = &args.report_from_audit {
-        if let Err(e) = run_report_from_audit(&args, &mut *clf, audit_file) {
-            eprintln!("Error: {e}");
-            std::process::exit(1);
-        }
-        std::process::exit(0);
-    }
 
     if let Err(e) = run(&args, &mut *clf) {
         eprintln!("Error: {e}");
@@ -612,7 +591,6 @@ fn build_audit_entry(
         expected_font: None,
         gt_rank: None,
         gt_score: None,
-        gt_font_size_pt: None,
         gt_text: None,
         ocr_text: None,
         ocr_correct: None,
@@ -646,7 +624,6 @@ fn write_audit_report(
         render_binarize: args.render_binarize,
         elapsed,
         report_all: args.report_all || args.audit_all,
-        line_filter: args.report_lines_parsed.clone(),
     };
     let _ = report::generate_report(
         &report_path,
@@ -658,75 +635,6 @@ fn write_audit_report(
         glyph_map,
         &meta,
     );
-}
-
-/// Regenerate report.html from a saved audit file (--report-from-audit),
-/// without re-running the pipeline. Loads the entries and run metadata
-/// from the audit JSON, rebuilds the classification from the recorded
-/// miss_type/expected_font, loads the font catalog (same loader as the
-/// live run) and the glyph map (load-only: a report-only mode must
-/// never trigger a retrain), and calls the same generator the live path
-/// uses, so the output is the report generator's own HTML.
-fn run_report_from_audit(
-    args: &cli::Args,
-    classifier: &mut dyn classifier::Classifier,
-    audit_file: &std::path::Path,
-) -> Result<(), ScanTextError> {
-    let audit_root = args.audit.as_ref().ok_or_else(|| {
-        ScanTextError::Serialize(
-            "--report-from-audit requires --audit for the audit directory holding the crops".to_string(),
-        )
-    })?;
-    let data = audit::load_audit_file(audit_file)?;
-    let classified = report::classify_entries_from_audit(&data.entries, data.dpi);
-    let font_registry = load_fonts(args, classifier)?;
-    let gmap_path = glyph_map::NgramGlyphMap::default_path();
-    let glyph_map = glyph_map::NgramGlyphMap::load(&gmap_path).map_err(|e| {
-        ScanTextError::Serialize(format!(
-            "cannot load glyph map at {} for report generation ({e}); a report-only run never retrains",
-            gmap_path.display()
-        ))
-    })?;
-    let meta = report::ReportMeta {
-        classifier: data.classifier,
-        render_scale: data.render_scale,
-        render_aa: data.render_aa,
-        render_binarize: data.render_binarize,
-        elapsed: std::time::Duration::from_secs_f64(data.elapsed_secs),
-        report_all: args.report_all || args.audit_all,
-        line_filter: args.report_lines_parsed.clone(),
-    };
-    let report_path = audit_root.join("report.html");
-    report::generate_report(
-        &report_path,
-        audit_root,
-        &data.entries,
-        &classified,
-        data.dpi,
-        font_registry.entries(),
-        &glyph_map,
-        &meta,
-    )
-    .map_err(ScanTextError::Serialize)?;
-    if !args.quiet {
-        match &args.report_lines_parsed {
-            Some(lines) => {
-                let specs: Vec<String> = lines.iter().map(|(p, l)| format!("p{p}:L{l}")).collect();
-                eprintln!(
-                    "Wrote {} ({} entries, filtered to {})",
-                    report_path.display(),
-                    data.entries.len(),
-                    specs.join(", ")
-                );
-            }
-            None => eprintln!(
-                "Wrote {} ({} entries)",
-                report_path.display(),
-                data.entries.len()
-            ),
-        }
-    }
-    Ok(())
 }
 
 fn run(args: &cli::Args, classifier: &mut dyn classifier::Classifier) -> Result<(), ScanTextError> {
@@ -1082,16 +990,6 @@ fn run(args: &cli::Args, classifier: &mut dyn classifier::Classifier) -> Result<
     let mut _stat_raster_frags = 0u32;
     // Dominant font candidate for fast-path SSIM, persists across pages.
     let mut dominant_font_candidate: Option<font_match::FontMatchResult> = None;
-    // Dominant font size (median midpoint-derived em of the lines matched
-    // to the dominant font across all pages seen so far), for the
-    // fast-path render em. Persists across pages alongside the dominant
-    // font; None until some page elects a dominant font with at least one
-    // midpoint em.
-    let mut dominant_font_size_px: Option<f32> = None;
-    // Dominant-font tracker: accumulates per-font evidence across pages
-    // and elects the font present on the most pages (see
-    // DominantFontTracker). Persists across pages.
-    let mut dominant_tracker = font_pipeline::DominantFontTracker::new();
 
     // Load ground truth from vector PDF (--audit or --test).
     let ground_truth: Option<ground_truth::GroundTruth> = if let Some(vpath) = args.gt_vector_pdf() {
@@ -1160,7 +1058,6 @@ fn run(args: &cli::Args, classifier: &mut dyn classifier::Classifier) -> Result<
             &lines, &gray_page, &rgba_page,
             &font_registry, &font_cache,
             dominant_font_candidate.as_ref(),
-            dominant_font_size_px,
         );
 
         // ── Full pipeline: segmentation → font search → font match ──
@@ -1182,11 +1079,9 @@ fn run(args: &cli::Args, classifier: &mut dyn classifier::Classifier) -> Result<
             .map(|(fast, full)| fast.unwrap_or(full))
             .collect();
 
-        // Update dominant font candidate (and its dominant size) for next page
-        let (new_dom, new_size) = dominant_tracker.update(page_num, &line_matches);
-        if let Some(new_dom) = new_dom {
+        // Update dominant font candidate for next page
+        if let Some(new_dom) = font_pipeline::update_dominant_font(&line_matches) {
             dominant_font_candidate = Some(new_dom);
-            dominant_font_size_px = new_size;
         }
 
         let scored_lines = lines.len() as u64 - fp_hits;

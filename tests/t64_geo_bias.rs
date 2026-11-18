@@ -9,10 +9,7 @@
 //!
 //! Theory:
 //!   sigma_center = 1/√12 ≈0.2887, sigma_pitch = 1/√6≈0.4082
-//!   (whole-pixel uniform quantization; the pre-subpixel model).
-//!   Expected values are the MEASURED filtered sds on main with subpixel
-//!   measurement (Nov 20, 2026: sv=0.0737, sh=0.2697); the assertions are
-//!   one-sided ceilings that fail on excess error only (Mike Nov 20, 2026).
+//!   tuned from flat-top sweep: SIGMA_CENTER_PX=0.284 SIGMA_PITCH_PX=0.435 a=0.45
 //!   quantized_ll(e,σ,a)=ln[Φ((e+a)/σ)-Φ((e-a)/σ)]-ln(2a) via libm::erf
 //!   (crates/unprint-geometry/src/params.rs)
 //!
@@ -21,8 +18,7 @@
 //!   - run unprint with --test GT --audit (no UNPRINT_EXTRA_SEAMS — not debugging seams)
 //!   - collect gt_geo_h_err / gt_geo_v_err for ocr_correct==True only
 //!   - assert mean≈0 within 2σ, RMS≤2.0, sum_h per word==0 (center-span)
-//!   - filtered |err|<1.5 gives sv/sh; assert sv<=0.074+0.15 sh<=0.270+0.20
-//!     (one-sided: fail on excess error only, never on too-little error)
+//!   - filtered |err|<1.5 gives sv/sh; assert sv=0.284±0.15 sh=0.435±0.20
 //!   - GT coverage pct_v>75% and total_obs≥200 proves all-chars path exercised
 //!   - No fallback to chosen_geo — if gt_geo missing, skip obs (prevents pollution)
 //!
@@ -230,16 +226,9 @@ fn geo_bias_is_zero() {
             .collect::<Vec<_>>()
     );
 
-    // One-sided sigma ceilings (Mike Nov 20, 2026): fail only on EXCESS
-    // error, never on too-little error — tighter-than-expected measurement
-    // is an improvement, not a regression. Expected values are the measured
-    // filtered sds on main (Nov 20, 2026: sv=0.0737, sh=0.2697, subpixel
-    // measurement); tolerances are the headroom above them.
-    const SIGMA_V_EXPECTED: f64 = 0.074;
-    const SIGMA_H_EXPECTED: f64 = 0.270;
     let sigma_center_theory = 0.2886751345948129;
     let sigma_pitch_theory = 0.408248290463863;
-    eprintln!("theory sigma_center={sigma_center_theory:.4} sigma_pitch={sigma_pitch_theory:.4} expected sv<={SIGMA_V_EXPECTED:.3}+0.15 sh<={SIGMA_H_EXPECTED:.3}+0.20 a=0.45");
+    eprintln!("theory sigma_center={sigma_center_theory:.4} sigma_pitch={sigma_pitch_theory:.4} tuned 0.284/0.435 a=0.45");
 
     let h_allowed = (2.0 * h_rms / (hs.len() as f64).sqrt()).max(0.05);
     assert!(
@@ -259,12 +248,15 @@ fn geo_bias_is_zero() {
     }
     assert!(h_mean.abs() < 1.0 && v_mean.abs() < 0.5);
 
+    // Lock tuned sigmas (params.rs SIGMA_CENTER_PX=0.284 SIGMA_PITCH_PX=0.435) via filtered sd.
+    const SIGMA_V_TUNED: f64 = 0.284;
+    const SIGMA_H_TUNED: f64 = 0.435;
     assert!(
-        sv <= SIGMA_V_EXPECTED + 0.15,
-        "sv excess {sv:.4} > {SIGMA_V_EXPECTED} + 0.15 — vertical geo error grew; check subpixel measurement"
+        (sv - SIGMA_V_TUNED).abs() <= 0.15,
+        "sv drift {sv:.4} vs {SIGMA_V_TUNED} ±0.15 — check quant_half_width_px/quantized_ll"
     );
     assert!(
-        sh <= SIGMA_H_EXPECTED + 0.20,
-        "sh excess {sh:.4} > {SIGMA_H_EXPECTED} + 0.20 — pitch geo error grew"
+        (sh - SIGMA_H_TUNED).abs() <= 0.20,
+        "sh drift {sh:.4} vs {SIGMA_H_TUNED} ±0.20"
     );
 }

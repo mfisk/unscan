@@ -888,6 +888,7 @@ body {{
   font-family: 'SourceSerif4';
   font-style: italic;
   font-size: 10pt;
+  font-variation-settings: 'opsz' 10;
   line-height: 1.3;
   color: #444444;
   margin: 0 0 2pt 0;
@@ -915,6 +916,7 @@ body {{
   font-family: 'SourceSerif4';
   font-style: italic;
   font-size: 7pt;
+  font-variation-settings: 'opsz' 10;
   line-height: 1.29;
   color: #777777;
   margin: 0 0 3pt 0;

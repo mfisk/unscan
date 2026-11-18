@@ -68,24 +68,6 @@ pub struct Args {
     #[arg(long, help_heading = "Evaluation")]
     pub report_all: bool,
 
-    /// Only include these lines in report.html, as comma-separated
-    /// p<page>:L<line> specs (e.g. p1:L2,p3:L52). Header stats still
-    /// cover the full run; the report is labeled as filtered.
-    #[arg(long, value_name = "SPEC", help_heading = "Evaluation")]
-    pub report_lines: Option<String>,
-
-    /// Regenerate report.html from a saved audit JSON (.json or .json.gz)
-    /// without re-running the pipeline. Requires --audit for the audit
-    /// directory holding the crops; the report is written there
-    /// (images/ is regenerated), so use a copy if the original must
-    /// stay untouched. Combines with --report-lines.
-    #[arg(long, value_name = "FILE", help_heading = "Evaluation")]
-    pub report_from_audit: Option<PathBuf>,
-
-    /// Parsed --report-lines filter, filled in main() after parsing.
-    #[arg(skip)]
-    pub report_lines_parsed: Option<Vec<(usize, usize)>>,
-
     /// Include all lines (hits) in audit.json obs_votes and compute geo for all,
     /// not just misses. Implies --report-all. Use for geo bias regression
     /// tests where GT metrics on hits are needed (t64). Primary flag is
@@ -266,7 +248,6 @@ impl Args {
             || !self.resolve_fontkey.is_empty()
             || !self.select_font.is_empty()
             || self.export_catalog_json.is_some()
-            || self.report_from_audit.is_some()
     }
 
     /// Validate: utility modes need neither input nor output; document
@@ -326,73 +307,4 @@ pub fn parse_pages(spec: &str) -> Result<std::collections::HashSet<usize>, Strin
         return Err("empty page specification".into());
     }
     Ok(set)
-}
-
-/// Parse a report-lines specification into (page, line_index) pairs.
-/// Accepts comma-separated `p<page>:L<line>` specs: "p1:L2" or
-/// "p1:L2,p3:L52". The numbers are the report's own labels (the `pN:Lnn`
-/// headings), which are the audit entry's `page` and `line_index`
-/// directly — no 0/1-based conversion. Duplicates are kept out;
-/// order is the spec's order. Errors loudly on any malformed part.
-pub fn parse_line_specs(spec: &str) -> Result<Vec<(usize, usize)>, String> {
-    let mut out: Vec<(usize, usize)> = Vec::new();
-    for part in spec.split(',') {
-        let part = part.trim();
-        if part.is_empty() {
-            continue;
-        }
-        let (page_s, line_s) = part
-            .split_once(':')
-            .ok_or_else(|| format!("bad line spec {part:?} — expected p<page>:L<line>"))?;
-        let page_s = page_s
-            .strip_prefix('p')
-            .ok_or_else(|| format!("bad line spec {part:?} — expected p<page>:L<line>"))?;
-        let line_s = line_s
-            .strip_prefix('L')
-            .ok_or_else(|| format!("bad line spec {part:?} — expected p<page>:L<line>"))?;
-        let page: usize = page_s
-            .parse()
-            .map_err(|_| format!("bad page number in {part:?}"))?;
-        let line: usize = line_s
-            .parse()
-            .map_err(|_| format!("bad line number in {part:?}"))?;
-        if page == 0 {
-            return Err(format!("page numbers are 1-indexed in {part:?}"));
-        }
-        if !out.contains(&(page, line)) {
-            out.push((page, line));
-        }
-    }
-    if out.is_empty() {
-        return Err("empty line specification".into());
-    }
-    Ok(out)
-}
-
-#[cfg(test)]
-mod tests {
-    use super::parse_line_specs;
-
-    #[test]
-    fn single_line_spec() {
-        assert_eq!(parse_line_specs("p1:L2"), Ok(vec![(1, 2)]));
-    }
-
-    #[test]
-    fn multiple_line_specs_keep_order_and_dedup() {
-        assert_eq!(
-            parse_line_specs("p1:L2,p3:L52,p1:L2"),
-            Ok(vec![(1, 2), (3, 52)])
-        );
-    }
-
-    #[test]
-    fn line_specs_reject_malformed() {
-        assert!(parse_line_specs("1:2").is_err());
-        assert!(parse_line_specs("p1:2").is_err());
-        assert!(parse_line_specs("p1:Lx").is_err());
-        assert!(parse_line_specs("p0:L2").is_err());
-        assert!(parse_line_specs("").is_err());
-        assert!(parse_line_specs("p1:L2,").is_ok());
-    }
 }
