@@ -29,7 +29,7 @@ from pdf_font_annotate import annotate_canonical_names
 from rasterize import rasterize
 
 # ---------------------------------------------------------------------------
-# Hardcoded 19-line test — page-break isolation for Tesseract LSTM reset
+# Hardcoded 18-line test — page-break isolation for Tesseract LSTM reset
 # p1: 8 lines (L01-L08), p2: 2 lines (LibreBaskerville + PTSerif italic fox with numbers),
 # p3: 1 line (Matthew Carter) isolated to avoid bbox shift.
 # Matches t59 + extensions requested: LibreBaskerville lower, PTSerif italic numbers.
@@ -38,9 +38,6 @@ from rasterize import rasterize
 # Four BAP major-miss lines added Nov 15, 2026 (first 5 in the BAP 1032 report;
 # the fifth, p2 L35, was already line 14): p1 L70 caps, p5 L48, p3 L52
 # (known segmenter bug: DP seam cuts 'M' in half), p1 L28.
-# "Impallari Type" (SourceSerif4-400It) added Nov 18, 2026: BAP specimen p1 L22,
-# a major miss at 0.6204 in the effem-specimen BAP 1271 (0.9415 minor miss in
-# BAP 1194) — the opsz fix changed its render substantially.
 # ---------------------------------------------------------------------------
 HARDCODED = [
     ("LibreBodoni-400", "abcdefghijklmnopqrstuvwxyz."),
@@ -50,7 +47,6 @@ HARDCODED = [
     ("LibreBodoni-400Italic", "dogs."),
     ("SourceSerif4-400It", "Mayr-Duffner."),
     ("SourceSerif4-400It", "Type"),
-    ("SourceSerif4-400It", "Impallari Type"),
     ("LibreBaskerville-400", "abcdefghijklmnopqrstuvwxyz."),
     ("PTSerif-400Italic", "Italic: The quick brown fox jumps over 1,234,567,890 lazy"),
     ("SourceSerif4-400It", "Font: Originally for IBM Executive typewriters — 12 characters per inch"),

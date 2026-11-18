@@ -265,7 +265,7 @@ pub struct LineMatch {
     /// (correction only rewrites text), so the stored widths apply there
     /// too. `None` for filter placeholders and fast-path lines (never
     /// re-verified).
-    pub measured_widths: Option<Vec<f32>>,
+    pub measured_widths: Option<Vec<u32>>,
     /// Median em_px derived from midpoint center-span scales (obs_span/pred_span * upem).
     /// This reuses the exact scale calculation from geometry scoring for font-size,
     /// fixing L9 fox/jumps too-small issue where width-matched median was dragged down.
@@ -406,6 +406,12 @@ pub fn clean_stale_diag_dirs(
 /// with no segmentation and no observations, and Pass 2a skips re-verification.
 /// Lines that miss return `None` — the full pipeline scores them.
 ///
+/// The render uses the dominant font size (`dominant_em_px`, the median
+/// midpoint-derived em of the previous page's lines matched to the dominant
+/// font) when one exists, so the fast path verifies at a fringe-immune em
+/// instead of the per-line width-matched em. When no dominant size exists
+/// yet, `verify_text_region` falls back to the width-matched em as before.
+///
 /// Pass 1 performs no segmentation and no font matching.
 ///
 /// Returns `(per_line_results, fast_path_hit_count)`.
@@ -416,6 +422,7 @@ pub fn match_lines_fast_path(
     font_registry: &font_scan::FontRegistry,
     font_cache: &font_cache::FontCache,
     dominant_font_candidate: Option<&font_match::FontMatchResult>,
+    dominant_em_px: Option<f32>,
 ) -> (Vec<Option<LineMatch>>, u64) {
     let fast_path_font_data: Option<std::sync::Arc<Vec<u8>>> = dominant_font_candidate
         .and_then(|fm| font_cache.load(&fm.font_path).ok());
@@ -458,7 +465,7 @@ pub fn match_lines_fast_path(
             fm_lig,
             None,
             Some(FAST_PATH_MIN_SSIM),
-            None,
+            dominant_em_px,
             None,
             &measured_widths,
         );
@@ -622,7 +629,7 @@ pub fn match_lines(
                 text: w.text.clone(),
                 x_off: w.x,
                 y_off: w.y,
-                width: w.width as f32,
+                width: w.width,
                 height: w.height,
             })
             .collect();
@@ -1416,8 +1423,15 @@ pub fn match_lines(
 
 /// Update the dominant font candidate from this page's match results.
 ///
-/// Returns the new dominant font candidate (most frequently matched font key).
-pub fn update_dominant_font(line_matches: &[LineMatch]) -> Option<font_match::FontMatchResult> {
+/// Returns the new dominant font candidate (most frequently matched font
+/// key) together with its dominant size: the median midpoint-derived em
+/// (`midpoint_em_px`) over the lines matched to that font. The midpoint em
+/// comes from character midpoint spans, not word width, so it is immune to
+/// the ~1 px antialiased-fringe inflation in the width-matched em. Lines
+/// that took the fast path carry no midpoint em and do not contribute; if
+/// no line matched to the dominant font has one, the size is None and the
+/// fast path falls back to the per-line width-matched em.
+pub fn update_dominant_font(line_matches: &[LineMatch]) -> (Option<font_match::FontMatchResult>, Option<f32>) {
     let mut font_freq: HashMap<String, usize> = HashMap::new();
     for lm in line_matches {
         if let Some(ref fr) = lm.font_result {
@@ -1425,12 +1439,18 @@ pub fn update_dominant_font(line_matches: &[LineMatch]) -> Option<font_match::Fo
         }
     }
     if let Some((top_key, _)) = font_freq.iter().max_by_key(|(_, c)| *c) {
-        line_matches.iter()
+        let font = line_matches.iter()
             .find_map(|lm| lm.font_result.as_ref()
                 .filter(|fr| fr.font_key == *top_key)
-                .cloned())
+                .cloned());
+        let mut ems: Vec<f32> = line_matches.iter()
+            .filter(|lm| lm.font_result.as_ref().is_some_and(|fr| fr.font_key == *top_key))
+            .filter_map(|lm| lm.midpoint_em_px)
+            .collect();
+        let size = crate::geometry_scale::median_f32(&mut ems);
+        (font, size)
     } else {
-        None
+        (None, None)
     }
 }
 

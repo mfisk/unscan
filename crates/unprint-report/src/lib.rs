@@ -29,11 +29,6 @@ pub struct ReportMeta {
     pub render_binarize: Option<u8>,
     pub elapsed: std::time::Duration,
     pub report_all: bool,
-    /// When set, only per-line blocks for these (page, line_index)
-    /// pairs are shown. Header stats still cover the full run and the
-    /// title names the filter, so a filtered report never presents a
-    /// subset as a full-run score.
-    pub line_filter: Option<Vec<(usize, usize)>>,
 }
 
 // ── Glyph helpers ───────────────────────────────────────────────────────────
@@ -756,42 +751,6 @@ pub fn classify_entries(
         .collect()
 }
 
-/// Rebuild the entry classification from a saved audit file's enriched
-/// fields, for --report-from-audit. `enrich_audit_entries` wrote the
-/// live classification into each entry as `miss_type` (the
-/// `MissKind::as_str` string) and the GT font as `expected_font`, so
-/// this reproduces the live classification exactly without the vector
-/// PDF or a second ground-truth lookup. The GT font size comes from
-/// the recorded `gt_font_size_pt` when the audit has it; audits
-/// written before that field existed fall back to the GT font's own
-/// midpoint em (the measured render size, within ~0.3% of the PDF's
-/// nominal size on the lob lines).
-pub fn classify_entries_from_audit(entries: &[AuditEntry], dpi: u32) -> Vec<ClassifiedEntry> {
-    entries
-        .iter()
-        .enumerate()
-        .map(|(entry_index, e)| {
-            let kind = match e.miss_type.as_deref() {
-                Some("hit") => MissKind::Hit,
-                Some("major_miss") => MissKind::MajorMiss,
-                Some("minor_miss") => MissKind::MinorMiss,
-                Some("similarity_failure") => MissKind::SimilarityFailure,
-                Some("kept_raster") => MissKind::KeptRaster,
-                _ => MissKind::NoGroundTruth,
-            };
-            let gt_font_size_pt = e.gt_font_size_pt.or_else(|| {
-                e.gt_midpoint_em_px.map(|em| em * 72.0 / dpi as f32)
-            });
-            ClassifiedEntry {
-                entry_index,
-                actual_font: e.expected_font.clone(),
-                kind,
-                gt_font_size_pt,
-            }
-        })
-        .collect()
-}
-
 /// Enrich audit entries with ground-truth classification fields
 /// (`miss_type` and `expected_font`).  Call this before writing
 /// the audit JSON so downstream tools never have to parse the HTML
@@ -810,10 +769,6 @@ pub fn enrich_audit_entries(
     for (e, ce) in entries.iter_mut().zip(classified) {
         e.miss_type = Some(ce.kind.as_str().to_string());
         e.expected_font = ce.actual_font.clone();
-        // Record the GT font size in points so a regenerated report
-        // (--report-from-audit) can show the Size row without the
-        // vector PDF.
-        e.gt_font_size_pt = ce.gt_font_size_pt;
 
         // Record the GT font's rank and score in the full ranked
         // candidate list. The JSON keeps only the top 10 candidates
@@ -884,15 +839,6 @@ fn find_correct_ci_candidate(
             if fe.font_key() == gt_key {
                 return (Some(c.font_key.clone()), c.score, Some(i + 1));
             }
-        }
-    }
-    // Fallback for regenerated reports: the audit JSON keeps only the
-    // top 10 candidates, so GT below rank 10 is not in the list — but
-    // enrich recorded its rank and score explicitly. The live path
-    // (full in-memory list) never reaches this branch.
-    if let (Some(rank), Some(score)) = (entry.gt_rank, entry.gt_score) {
-        if find_font_by_key(font_catalog, &gt_key).is_some() {
-            return (Some(gt_key), Some(score), Some(rank));
         }
     }
     (None, None, None)
@@ -2436,24 +2382,10 @@ pub fn generate_report(
         }
     }
 
-    // When a line filter is set (--report-lines), only the named lines
-    // appear in any displayed section. Header stats are computed from
-    // the full run regardless (below), so the filter only narrows
-    // which per-line blocks are shown, never the reported score.
-    let filter_set: Option<std::collections::HashSet<(usize, usize)>> =
-        meta.line_filter.as_ref().map(|v| v.iter().copied().collect());
-    let line_shown = |page: usize, line_index: usize| -> bool {
-        match &filter_set {
-            None => true,
-            Some(set) => set.contains(&(page, line_index)),
-        }
-    };
-
     // Collect ALL OCR-wrong entries (any miss kind) – these move to the very end.
     // Previously only Hit|MinorMiss were moved, leaving 303 Major+82 ZNCC with OCR WRONG at front.
     let mut ocr_misses: Vec<&ClassifiedEntry> = classified.iter()
-        .filter(|ce| entries[ce.entry_index].ocr_correct == Some(false)
-            && line_shown(entries[ce.entry_index].page, entries[ce.entry_index].line_index))
+        .filter(|ce| entries[ce.entry_index].ocr_correct == Some(false))
         .collect();
     ocr_misses.sort_by(|a, b| {
         entries[a.entry_index].similarity_score.partial_cmp(&entries[b.entry_index].similarity_score).unwrap_or(std::cmp::Ordering::Equal)
@@ -2475,12 +2407,11 @@ pub fn generate_report(
 
 
     // Filtered views for display – OCR-wrong entries are excluded here and shown only in final section.
-    // A line filter narrows every displayed list to the named lines.
-    let major_misses_display: Vec<&ClassifiedEntry> = major_misses.iter().filter(|ce| entries[ce.entry_index].ocr_correct != Some(false) && line_shown(entries[ce.entry_index].page, entries[ce.entry_index].line_index)).copied().collect();
-    let minor_misses_display: Vec<&ClassifiedEntry> = minor_misses.iter().filter(|ce| entries[ce.entry_index].ocr_correct != Some(false) && line_shown(entries[ce.entry_index].page, entries[ce.entry_index].line_index)).copied().collect();
-    let similarity_failures_display: Vec<&ClassifiedEntry> = similarity_failures.iter().filter(|ce| entries[ce.entry_index].ocr_correct != Some(false) && line_shown(entries[ce.entry_index].page, entries[ce.entry_index].line_index)).copied().collect();
-    let kept_raster_display: Vec<&ClassifiedEntry> = kept_raster.iter().filter(|ce| entries[ce.entry_index].ocr_correct != Some(false) && line_shown(entries[ce.entry_index].page, entries[ce.entry_index].line_index)).copied().collect();
-    let hits_display: Vec<&ClassifiedEntry> = hits.iter().filter(|ce| entries[ce.entry_index].ocr_correct != Some(false) && line_shown(entries[ce.entry_index].page, entries[ce.entry_index].line_index)).copied().collect();
+    let major_misses_display: Vec<&ClassifiedEntry> = major_misses.iter().filter(|ce| entries[ce.entry_index].ocr_correct != Some(false)).copied().collect();
+    let minor_misses_display: Vec<&ClassifiedEntry> = minor_misses.iter().filter(|ce| entries[ce.entry_index].ocr_correct != Some(false)).copied().collect();
+    let similarity_failures_display: Vec<&ClassifiedEntry> = similarity_failures.iter().filter(|ce| entries[ce.entry_index].ocr_correct != Some(false)).copied().collect();
+    let kept_raster_display: Vec<&ClassifiedEntry> = kept_raster.iter().filter(|ce| entries[ce.entry_index].ocr_correct != Some(false)).copied().collect();
+    let hits_display: Vec<&ClassifiedEntry> = hits.iter().filter(|ce| entries[ce.entry_index].ocr_correct != Some(false)).copied().collect();
 
     // Sort each miss category by increasing ZNCC (worst visual matches first) – using filtered lists
     let mut major_misses_sorted = major_misses_display.clone();
@@ -2500,9 +2431,7 @@ pub fn generate_report(
         entries[a.entry_index].similarity_score.partial_cmp(&entries[b.entry_index].similarity_score).unwrap_or(std::cmp::Ordering::Equal)
     });
     let mut hits_sorted = hits_display.clone();
-    let mut no_gt_sorted: Vec<&ClassifiedEntry> = no_ground_truth.iter()
-        .filter(|ce| line_shown(entries[ce.entry_index].page, entries[ce.entry_index].line_index))
-        .copied().collect();
+    let mut no_gt_sorted = no_ground_truth.clone();
     if meta.report_all {
         hits_sorted.sort_by(|a, b| {
             entries[a.entry_index].similarity_score.partial_cmp(&entries[b.entry_index].similarity_score).unwrap_or(std::cmp::Ordering::Equal)
@@ -2523,10 +2452,9 @@ pub fn generate_report(
     // are not built, exactly as before.
     let mut block_cache: HashMap<(usize, usize), String> = HashMap::new();
     for ce in classified {
-        let shown = (meta.report_all
+        let shown = meta.report_all
             || entries[ce.entry_index].ocr_correct == Some(false)
-            || !matches!(ce.kind, MissKind::Hit | MissKind::NoGroundTruth))
-            && line_shown(entries[ce.entry_index].page, entries[ce.entry_index].line_index);
+            || !matches!(ce.kind, MissKind::Hit | MissKind::NoGroundTruth);
         if shown {
             let (html, _chosen_zncc, _gt_zncc) = build_miss_block(
                 ce, &entries[ce.entry_index], audit_root, font_catalog, glyph_map, &mut font_data_cache, dpi,
@@ -2635,14 +2563,8 @@ pub fn generate_report(
 
     // Full unfiltered listing when --audit-all / --report-all
     // Shows every line in page/line order regardless of hit/miss.
-    // A line filter narrows it to the named lines.
     let (all_lines_section, report_title) = if meta.report_all {
-        let mut all_sorted: Vec<&ClassifiedEntry> = classified
-            .iter()
-            .filter(|ce| {
-                line_shown(entries[ce.entry_index].page, entries[ce.entry_index].line_index)
-            })
-            .collect();
+        let mut all_sorted = classified.to_vec();
         all_sorted.sort_by(|a, b| {
             entries[a.entry_index].page.cmp(&entries[b.entry_index].page)
                 .then(entries[a.entry_index].line_index.cmp(&entries[b.entry_index].line_index))
@@ -2659,16 +2581,6 @@ pub fn generate_report(
         (section, format!("unprint full report — {primary_hits}/{compared} ({pct:.1}%)"))
     } else {
         (String::new(), format!("unprint miss report — {primary_hits}/{compared} ({pct:.1}%)"))
-    };
-    // A filtered report keeps the full-run stats in its title and
-    // header but names the filter, so the subset is never mistaken
-    // for the whole run.
-    let report_title = match &meta.line_filter {
-        Some(lines) if !lines.is_empty() => {
-            let specs: Vec<String> = lines.iter().map(|(p, l)| format!("p{p}:L{l}")).collect();
-            format!("{report_title} — lines {} only", specs.join(", "))
-        }
-        _ => report_title,
     };
 
     // ── Summary line 1: Similarity ──────────────────────────────────
