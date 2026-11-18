@@ -71,6 +71,13 @@ pub fn extract_text_regions_from_gray(
     gray.save(tmp.path())
         .map_err(|e| ScanTextError::Ocr(format!("Failed to save temp image: {e}")))?;
 
+    // OMP_WAIT_POLICY=PASSIVE: tesseract's LSTM forward pass parallelizes
+    // across OpenMP sections (LSTM::Forward -> GOMP_parallel_sections).
+    // libgomp's default ACTIVE wait policy makes the threads spin at the
+    // barriers; under load the spin burns ~70x more CPU than the actual
+    // recognition work and a page never finishes (97s CPU, killed at 300s).
+    // PASSIVE makes threads sleep at barriers instead. The recognized text
+    // is byte-identical (verified on a full page, Nov 18).
     let output = Command::new("tesseract")
         .args([
             tmp.path().to_str().unwrap(),
@@ -81,6 +88,7 @@ pub fn extract_text_regions_from_gray(
             "eng",
             "tsv",
         ])
+        .env("OMP_WAIT_POLICY", "PASSIVE")
         .output()
         .map_err(|e| {
             ScanTextError::Ocr(format!(
