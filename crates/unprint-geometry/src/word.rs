@@ -122,8 +122,18 @@ pub fn expand_words_to_ink(lines: &mut [TextLine], gray: &GrayImage, ink_thresho
                         let scan_y_top = prev_y_top.min(word_y);
                         let scan_y_bot = prev_y_bot.max(word_y+word_h);
                         let scan_left = prev_right.saturating_sub(prev_y_top).max(prev_x);
+                        // Scan only up to the next word's left edge: the gap
+                        // we want is the whitespace between the two words,
+                        // not the rightmost zero-ink column anywhere in the
+                        // previous box (which can land inside a later word
+                        // entirely — on the Hunt line it landed at column
+                        // 396, inside "Adobe", instead of the whitespace
+                        // at 275). Bounding at left_edge also opens the
+                        // left-expansion gate below (left_edge > limit),
+                        // so the next word grows left to include its own
+                        // ink instead of keeping Tesseract's left edge.
                         let mut gap_col: Option<u32> = None;
-                        for col in (scan_left..prev_right).rev() {
+                        for col in (scan_left..left_edge).rev() {
                             let ink: u32 = (scan_y_top..scan_y_bot).map(|row| if gray.get_pixel(col.min(page_w-1), row).0[0] < ink_threshold {1} else {0}).sum();
                             if ink==0 { gap_col = Some(col); break; }
                         }
