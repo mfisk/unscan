@@ -438,15 +438,16 @@ pub struct AccuracyResult {
     /// Above-threshold tally: scored lines (entries with a
     /// similarity_score) at or above ABOVE_THRESHOLD_SIMILARITY,
     /// regardless of hit status, broken down by miss_type.
-    /// `above_threshold_other` holds any miss_type outside the four
+    /// `above_threshold_other` holds any miss_type outside the three
     /// named buckets (e.g. kept_raster); the buckets always sum to
-    /// `above_threshold`.
+    /// `above_threshold`. similarity_failure has no bucket: it means
+    /// the score is below the gate, so it is 0 above the gate by
+    /// definition, not a measurement.
     pub above_threshold: usize,
     pub above_threshold_scored: usize,
     pub above_threshold_hit: usize,
     pub above_threshold_minor: usize,
     pub above_threshold_major: usize,
-    pub above_threshold_sim_fail: usize,
     pub above_threshold_other: usize,
 }
 
@@ -461,10 +462,10 @@ impl AccuracyResult {
             0.0
         };
         let mut s = format!(
-            "Above 0.9: {}/{} ({:.1}%) — {} hit, {} minor, {} major, {} sim_fail",
+            "Above 0.9: {}/{} ({:.1}%) — {} hit, {} minor, {} major",
             self.above_threshold, self.above_threshold_scored, pct,
             self.above_threshold_hit, self.above_threshold_minor,
-            self.above_threshold_major, self.above_threshold_sim_fail,
+            self.above_threshold_major,
         );
         if self.above_threshold_other > 0 {
             s.push_str(&format!(" (+ {} other)", self.above_threshold_other));
@@ -571,7 +572,7 @@ pub fn measure_accuracy(raster: &Path, vector: &Path, label: &str) -> AccuracyRe
     // similarity_score at or above the gate, regardless of hit status,
     // broken down by miss_type. Report-only — no assertion on it.
     let (above_threshold, above_threshold_scored, above_threshold_hit,
-         above_threshold_minor, above_threshold_major, above_threshold_sim_fail,
+         above_threshold_minor, above_threshold_major,
          above_threshold_other) = {
         let audit_data = read_audit_json_text(&audit_json_path(&audit_dir));
         let audit: serde_json::Value = serde_json::from_str(&audit_data)
@@ -581,7 +582,6 @@ pub fn measure_accuracy(raster: &Path, vector: &Path, label: &str) -> AccuracyRe
         let mut hit = 0usize;
         let mut minor = 0usize;
         let mut major = 0usize;
-        let mut sim_fail = 0usize;
         let mut other = 0usize;
         if let Some(entries) = audit["text_entries"].as_array() {
             for e in entries {
@@ -593,13 +593,15 @@ pub fn measure_accuracy(raster: &Path, vector: &Path, label: &str) -> AccuracyRe
                     Some("hit") => hit += 1,
                     Some("minor_miss") => minor += 1,
                     Some("major_miss") => major += 1,
-                    Some("similarity_failure") => sim_fail += 1,
+                    // No bucket: a similarity failure scores below the
+                    // gate by definition and cannot appear here.
+                    Some("similarity_failure") => {}
                     _ => other += 1,
                 }
             }
         }
-        (total, scored, hit, minor, major, sim_fail, other)
+        (total, scored, hit, minor, major, other)
     };
 
-    AccuracyResult { hits, minor_misses, major_misses, similarity_failures, compared, accuracy, primary_hits, zncc_avg, report_path, above_threshold, above_threshold_scored, above_threshold_hit, above_threshold_minor, above_threshold_major, above_threshold_sim_fail, above_threshold_other }
+    AccuracyResult { hits, minor_misses, major_misses, similarity_failures, compared, accuracy, primary_hits, zncc_avg, report_path, above_threshold, above_threshold_scored, above_threshold_hit, above_threshold_minor, above_threshold_major, above_threshold_other }
 }

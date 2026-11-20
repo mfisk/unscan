@@ -2690,11 +2690,12 @@ pub fn generate_report(
             // Above-threshold tally by miss type: every scored line
             // with similarity >= MIN_VERIFY_SIMILARITY, regardless of
             // hit status. The buckets sum to `above` (the classification
-            // is 1:1 with the entries). similarity_failure is 0 by
-            // definition — its similarity is below the gate; kept_raster
-            // and no_ground_truth are shown only when nonzero.
-            let (mut ab_hit, mut ab_minor, mut ab_major, mut ab_simfail,
-                 mut ab_kept, mut ab_nogt) = (0usize, 0usize, 0usize, 0usize, 0usize, 0usize);
+            // is 1:1 with the entries). similarity_failure has no bucket:
+            // it means the score is below the gate, so it is 0 above the
+            // gate by definition, not a measurement; kept_raster and
+            // no_ground_truth are shown only when nonzero.
+            let (mut ab_hit, mut ab_minor, mut ab_major,
+                 mut ab_kept, mut ab_nogt) = (0usize, 0usize, 0usize, 0usize, 0usize);
             for ce in classified {
                 let Some(score) = entries[ce.entry_index].similarity_score else { continue; };
                 if score < MIN_VERIFY_SIMILARITY { continue; }
@@ -2702,13 +2703,15 @@ pub fn generate_report(
                     MissKind::Hit => ab_hit += 1,
                     MissKind::MinorMiss => ab_minor += 1,
                     MissKind::MajorMiss => ab_major += 1,
-                    MissKind::SimilarityFailure => ab_simfail += 1,
+                    // No bucket: a similarity failure scores below the
+                    // gate by definition and cannot appear here.
+                    MissKind::SimilarityFailure => {}
                     MissKind::KeptRaster => ab_kept += 1,
                     MissKind::NoGroundTruth => ab_nogt += 1,
                 }
             }
             let mut breakdown = format!(
-                "hit {ab_hit} · minor {ab_minor} · major {ab_major} · similarity_failure {ab_simfail}"
+                "hit {ab_hit} · minor {ab_minor} · major {ab_major}"
             );
             if ab_kept > 0 {
                 breakdown.push_str(&format!(" · kept_raster {ab_kept}"));
