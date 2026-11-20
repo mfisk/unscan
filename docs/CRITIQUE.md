@@ -1,6 +1,6 @@
 # Branch critique
 
-Before any merge, always critique the branch, including the errors and redundancies it is adding and how it could be better. Address those items on the branch before merging. (Mike Nov 20, 2026.)
+Before every commit, always critique the change, including the errors and redundancies it is adding and how it could be better. Address those items before committing. The same critique applies at merge time, over the whole branch. (Mike Nov 20, 2026.)
 
 ## How to critique
 
@@ -14,7 +14,7 @@ Before any merge, always critique the branch, including the errors and redundanc
 
 - Verify the BAP numbers from the frozen audits yourself with targeted extraction, recompute the deltas, and check per-line attribution for every differing line.
 
-- Check the three regression axes below, each against the baseline BAP.
+- Check the three regression axes below, each against the baseline BAP, for changes that can move the numbers. Verify with a BAP where applicable. Docs-only and test-only changes carry the unchanged baseline score in the commit message instead.
 
 - Present three parts with file and line references and measured numbers: errors the branch adds, redundancies it adds, and how it could be better.
 
