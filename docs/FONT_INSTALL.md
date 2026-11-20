@@ -16,6 +16,20 @@ Run the automated installer:
 sudo bash tools/install-all-fonts.sh
 ```
 
+### Install routes
+
+The installer has two routes, selected by a single flag:
+
+- Default (no flag): fonts from apt packages on Linux or Homebrew casks on
+  macOS, plus direct downloads for fonts with no package.
+- `--home` (Linux only): every manifest font is downloaded into
+  `~/.local/share/fonts` instead of apt — for VMs where apt state is wiped
+  by reboots but `$HOME` persists. Prerequisites (tesseract, weasyprint,
+  Python packages) still install via apt.
+
+On the Hatch VM, always run with `--home` (this is what `check-fonts.sh`
+passes when fonts are missing).
+
 This script:
 1. Installs apt packages (`ttf-mscorefonts-installer`, `fonts-crosextra-caladea`, `fonts-liberation`, etc.)
 2. Installs Microsoft Core Fonts via `cabextract` (EULA workaround)
