@@ -14,7 +14,7 @@ Before every commit, always critique the change, including the errors and redund
 
 - Verify the BAP numbers from the frozen audits yourself with targeted extraction, recompute the deltas, and check per-line attribution for every differing line.
 
-- Check the three regression axes below, each against the baseline BAP, for changes that can move the numbers. Verify with a BAP where applicable. Docs-only and test-only changes carry the unchanged baseline score in the commit message instead.
+- Check the three regression axes below, each against the baseline BAP, for changes that can move the numbers. Verify with a BAP where applicable. A commit that cannot change performance and was not BAP-tested carries no BAP score in its message: restating the baseline score is restating unmeasured data.
 
 - Present three parts with file and line references and measured numbers: errors the branch adds, redundancies it adds, and how it could be better.
 
@@ -242,7 +242,7 @@ Check all three axes against the baseline BAP and report each separately. They c
 
 - Report lig-vs-nolig comparison: when the report compares a lig font against a nolig font, show both renderings side by side, each side rendered according to its own font key's lig/nolig state. The comparison is shown IN ADDITION TO the top 6 deltas in the observation table, not instead of them. (AGENTS.md)
 
-- Commit messages report the BAP score (hits out of the specimen line count, ZNCC, p50, p90). A child branch reads the BAP score from the commit message and uses it as its baseline instead of recomputing a BAP. (AGENTS.md)
+- Commit messages report the BAP score (hits out of the specimen line count, ZNCC, p50, p90) when a BAP was run for that commit. A commit that cannot change performance and was not BAP-tested carries no BAP score in its message. A child branch reads the BAP score from the commit message and uses it as its baseline instead of recomputing a BAP. If the commit has no BAP score in its message, the child runs a BAP baseline before making changes. (AGENTS.md)
 
 - A line is vectorized only if it passes OCR confidence, font-match score, AND SSIM at or above 0.3. All others keep the original raster. (README.md)
 
