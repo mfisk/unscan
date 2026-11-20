@@ -130,7 +130,7 @@ Audit baseline: `d3f76a2` 428/84.4%/0.9425 ZNCC with `K_INNER=2σ OFFSET=0.21093
 - `crates/unprint-geometry/src/char_bounds.rs:18-120` – `measure_char_ink_bounds`, seam `left_limit`/`right_limit`, `<200` bounds vs `<250` weighted, `sum_x/sum_y/sum_m`
 - `char_bounds.rs:78-110` – fallback paths, `width = x_max-x_min+1`
 - `src/geometry_classifier.rs:296-310` – `v_err`, `h_err`, `v_ll=quantized_ll(v_err, SIGMA_CENTER)`, `h_ll=quantized_ll(h_err, SIGMA_PITCH)`
-- `src/geometry_classifier.rs:46-70` – comment deriving `σ=1/√12`, `σ_pitch=1/√6`, `E[err]=0` symmetry
+- `src/geometry_classifier.rs:64-80` – comment on error symmetry (`E[err]=0`); sigmas derived in `params.rs`
 - `src/font_match.rs` – `per_char_geo_for_font`, `GEO_WEIGHT=1.0`, `midpoint prune`
 
 ## 9. Next Experiments

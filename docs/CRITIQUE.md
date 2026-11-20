@@ -82,7 +82,7 @@ Check all three axes against the baseline BAP and report each separately. They c
 
 - Vertical error is word-relative, zero-centered by construction, sum of v_err equals 0. (docs/midpoint-geometry.md)
 
-- Sigmas are first-principles uniform-quantization values (sigma_center 1/sqrt(12), sigma_pitch 1/sqrt(6)) with inflection at 0.75 sigma per dimension, not a shared absolute threshold. (docs/midpoint-geometry.md)
+- Sigmas are first-principles values derived from the subpixel error model (sigma_center 0.0599, sigma_pitch 0.243; derivation in `crates/unprint-geometry/src/params.rs`) with inflection at 0.75 sigma per dimension, not a shared absolute threshold. (docs/midpoint-geometry.md)
 
 - CI #1 wins directly. There is no word-level SSIM reranking. SSIM is a verification gate, not a selector. (docs/text-matching-approach.md, docs/char-index-methodology.md)
 
