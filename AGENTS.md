@@ -1,8 +1,8 @@
 # AGENTS.md — Unprint Project
 
-## Universal Principle
+## Principles
 
-**Correctness is the universal goal in everything.** Not a narrow PT Serif fix, not a sub-task — every change is judged by correctness first. Metrics measure correctness; they are not to be gamed with looser tolerances, sigma tweaks, or fuzzy matching. Fix input quality at the source. When geometry or naming is wrong, fix the geometry or naming — don't wallpaper over it.
+The project's principles live in `docs/CRITIQUE.md`: correctness first, fix things right, one canonical implementation, measurements in the context of the low-res word scans, and the full mistake-class catalog. Read that doc before changing code.
 
 ## Context Window Hygiene
 
@@ -23,18 +23,10 @@
 
 ## Development Rules (from Mike)
 
-- **Always fix things right. We're not afraid of refactors. We avoid creating tech debt (Mike Nov 10, 2026).** When a fix needs a structural change (a trait in a shared crate, a required parameter instead of an optional closure, threading a dependency into a call path), do the refactor. Do not ship a minimal workaround that leaves a design wart (an opt-in `Option` closure, a silently-skipped code path) to avoid the refactor.
-- **Always crop to ink bounds first.** Before segmenting, matching, or computing features on a word or character image, trim it down to just the ink. Raw word crops from Tesseract include adjacent lines, extra whitespace, and other garbage. Use `trim_whitespace()` or `normalize_to_ink_bounds()` before doing anything with the image.
 - **Always ask before committing.** Never auto-commit.
-- **Commit messages report the BAP score (Mike Nov 9, 2026).** Every commit message includes the BAP score for that commit (hits out of 505, ZNCC, p50, p90), e.g. `BAP: 451/505, ZNCC 0.9275, p50 0.9552, p90 0.9772`. A child branch or worktree starting from that commit reads the BAP score from the commit message and uses it as its baseline instead of recomputing a BAP. If the commit has no BAP score in its message, the child runs a BAP baseline before making changes.
-- **Report ligatures (Mike Nov 6, 2026):** when showing characters in the report, always include ligature characters. If a character is part of a ligature (e.g. "fi" in a lig variant), the report must show the ligature glyph (U+FB01), not just the separate f and i glyphs.
-- **Report lig-vs-nolig comparison (Mike Nov 6, 2026):** when the report compares a lig font against a nolig font, show both renderings side by side — the nolig side as the two separate characters (f, i) as two glyphs, the lig side as the one combined ligature glyph (U+FB01) as a single glyph — so the difference is visible. Each side renders according to its own font key's lig/nolig state.
-- **Report lig/nolig shown in addition to top 6 (Mike Nov 6, 2026):** the lig-vs-nolig comparison display is shown IN ADDITION TO the top 6 deltas in the observation table, not instead of them. The B′ picker still shows the top 6 observations by |weight × (glyphD + GEO_WEIGHT × geoD)|, and the lig/nolig comparison rendering is an additional display alongside it.
-- **"Stop vibing shit"** — deliberate changes only, no speculative fixes.
-- **"Stop doing 1-off diagnostics and ONLY use the main code path."**
-- **"Focus on input quality, not fancier algorithms."** Fix images first.
 - **Show crops visually** — always present character crops as inline images.
-- **Both index-build and index-lookup must use identical crop geometry.**
+
+The remaining development rules (fix things right, crop to ink bounds first, BAP scores in commit messages, ligature report rules, deliberate changes only, main code path only, input quality over fancier algorithms, identical crop geometry, critique before every commit) live in `docs/CRITIQUE.md`.
 
 ## Architecture
 
