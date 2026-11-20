@@ -57,7 +57,9 @@ pub struct WordPlacement {
     pub text: String,
     pub x_off: u32,
     pub y_off: u32,
-    pub width: u32,
+    /// Word ink width in scan px, measured fractionally from the scan
+    /// (subpixel). Feeds the width-matched em estimate in the fallback path.
+    pub width: f32,
     pub height: u32,
 }
 
@@ -86,7 +88,7 @@ pub fn measure_word_widths(
     words: &[TextRegion],
     crop_x: u32,
     crop_y: u32,
-) -> Vec<u32> {
+) -> Vec<f32> {
     let ink_thresh = crate::ocr::INK_THRESHOLD;
     let (crop_w, crop_h) = scan_crop.dimensions();
     words
@@ -104,10 +106,12 @@ pub fn measure_word_widths(
                     let (il, ir) = crate::ocr::ink_horizontal_extent(
                         scan_crop, y_off, bh, x_off, x_off + bw, ink_thresh
                     );
-                    let mw = ir.saturating_sub(il);
-                    if mw >= 1 { mw } else { wr.width }
-                } else { wr.width }
-            } else { wr.width }
+                    // Fractional (subpixel) ink width: the extent returns
+                    // fractional edges, so the width is fractional too.
+                    let mw = (ir - il) as f32;
+                    if mw >= 1.0 { mw } else { wr.width as f32 }
+                } else { wr.width as f32 }
+            } else { wr.width as f32 }
         })
         .collect()
 }
@@ -143,7 +147,7 @@ pub fn verify_text_region(
     // the font, so callers verifying one line against several fonts measure
     // once and pass the result in. Required, not optional: every caller
     // measures (or reuses) explicitly, and the length must match `words`.
-    measured_widths: &[u32],
+    measured_widths: &[f32],
 ) -> VerifyResult {
     let (w, h) = scan_crop.dimensions();
 
@@ -259,6 +263,9 @@ pub fn verify_text_region(
     // scan uses trim_words_to_ink -> ink_horizontal_extent; we use identical pair for render.
     let (r_top, r_bot) = crate::ocr::ink_vertical_extent(&full_render, 0, rw, 0, rh, ink_threshold);
     let (r_left, r_right) = crate::ocr::ink_horizontal_extent(&full_render, 0, rh, 0, rw, ink_threshold);
+    // Fractional bounds to integer crop: floor/ceil recovers the old integer
+    // bounds exactly, so the display crop is unchanged.
+    let (r_top, r_bot, r_left, r_right) = (r_top.floor() as u32, r_bot.ceil() as u32, r_left.floor() as u32, r_right.ceil() as u32);
     let ink_h = r_bot.saturating_sub(r_top);
     let ink_w = r_right.saturating_sub(r_left);
     let render_ink = if ink_h >= 3 && ink_w >= 3 {
@@ -481,7 +488,7 @@ fn render_via_freetype(
     let shaped_words: Vec<Option<crate::layout::ShapedWord>> = words
         .iter()
         .map(|w| {
-            if w.text.is_empty() || w.width < 1 {
+            if w.text.is_empty() || w.width < 1.0 {
                 None
             } else {
                 let key = (
@@ -506,7 +513,7 @@ fn render_via_freetype(
             let mut ems: Vec<f32> = words
                 .iter()
                 .zip(shaped_words.iter())
-                .filter_map(|(w, s)| s.as_ref()?.ink_matched_em_px(w.width as f32))
+                .filter_map(|(w, s)| s.as_ref()?.ink_matched_em_px(w.width))
                 .collect();
             if ems.is_empty() {
                 return None;
@@ -621,7 +628,7 @@ fn render_via_freetype(
         let canvas_raw = canvas.as_mut();
 
         for (wi, word) in words.iter().enumerate() {
-        if word.text.is_empty() || word.width < 1 {
+        if word.text.is_empty() || word.width < 1.0 {
             continue;
         }
 
@@ -696,6 +703,9 @@ fn render_via_freetype(
         crate::ocr::ink_horizontal_extent(&canvas, 0, canvas.height(), 0, canvas.width(), ink_thresh);
     let (rend_ink_top, rend_ink_bottom) =
         crate::ocr::ink_vertical_extent(&canvas, 0, canvas.width(), 0, canvas.height(), ink_thresh);
+    // Fractional bounds to integer crop: floor/ceil recovers the old integer
+    // bounds exactly, so the crop is unchanged.
+    let (rend_ink_left, rend_ink_right, rend_ink_top, rend_ink_bottom) = (rend_ink_left.floor() as u32, rend_ink_right.ceil() as u32, rend_ink_top.floor() as u32, rend_ink_bottom.ceil() as u32);
     let ink_w = rend_ink_right.saturating_sub(rend_ink_left);
     let ink_h = rend_ink_bottom.saturating_sub(rend_ink_top);
     if ink_w >= 3 && ink_h >= 3 {

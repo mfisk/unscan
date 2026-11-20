@@ -2121,7 +2121,7 @@ fn uniform_boundaries(width: u32, n: usize) -> Vec<u32> {
 
 
 /// Cost breakdown for a single seam, stored in audit data.
-#[derive(Debug, Clone, serde::Serialize)]
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub struct SeamCost {
     pub dp_cost: f32,
     pub seam_width_penalty: f32,
@@ -2210,10 +2210,13 @@ pub fn segment_line(
     let mut any_ligatures = false;
     let mut words_with_ligatures: Vec<bool> = vec![false; words.len()];
 
-    for (orig_idx, word) in words.iter().enumerate().filter(|(_, w)| w.width > 0) {
+    for (orig_idx, word) in words.iter().enumerate().filter(|(_, w)| w.width > 0.0) {
         let wx = word.x_off;
         let wy = word.y_off;
-        let ww = word.width;
+        // Fractional width to integer crop: ceil so the crop covers the full
+        // fractional ink width (placements built from OCR boxes carry whole
+        // values, so this is exact there).
+        let ww = word.width.ceil() as u32;
         let wh = word.height;
 
         let (pw, ph) = page.dimensions();

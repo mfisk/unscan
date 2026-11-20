@@ -11,23 +11,34 @@
 // Prints the resolved glyph ID for U+FB01 and saves PNGs to /tmp for
 // visual inspection.
 //
-// Usage: cargo run --release --example render_lig_check -- [BASE_KEY]
-// Default base: DejaVuSerif-400 (static, real GSUB liga).
+// Usage: cargo run --release --example render_lig_check -- [FAMILY]
+// Default family: DejaVu Serif (static, real GSUB liga).
 use unprint::char_render::{render_ngram, render_ngram_fresh, RenderParams};
 use unprint::font_scan;
 use unprint::glyph_map::NgramGlyphMap;
 use unprint_fonts::ab_glyph::{Font, FontRef};
 
 fn main() {
-    let base = std::env::args().nth(1).unwrap_or_else(|| "DejaVuSerif-400".to_string());
+    let family = std::env::args().nth(1).unwrap_or_else(|| "DejaVu Serif".to_string());
     let dirs = font_scan::default_font_dirs(&[]);
     let catalog = font_scan::scan_fonts(&dirs, true);
-    let lig_key = format!("{}|kern|lig", base);
-    let nolig_key = format!("{}|kern|nolig", base);
-    let lig_fe = catalog.iter().find(|fe| fe.font_key() == lig_key)
-        .unwrap_or_else(|| panic!("lig entry not in catalog: {}", lig_key));
-    let nolig_fe = catalog.iter().find(|fe| fe.font_key() == nolig_key)
-        .unwrap_or_else(|| panic!("nolig entry not in catalog: {}", nolig_key));
+    // Expand the partial spec via the select API — never string-build a
+    // font key (Mike Nov 18, 2026: tests use the API to expand a partial
+    // spec to a full font key). Kern and lig are explicit hard criteria,
+    // so the result never depends on the default variant preference.
+    let lig_sel = font_scan::FontSelection {
+        family: family.clone(),
+        weight: Some(400),
+        italic: Some(false),
+        kern: Some(true),
+        lig: Some(true),
+        ..Default::default()
+    };
+    let nolig_sel = font_scan::FontSelection { lig: Some(false), ..lig_sel.clone() };
+    let lig_fe = font_scan::select_entry_for_criteria(catalog.iter(), &lig_sel)
+        .unwrap_or_else(|| panic!("lig entry not in catalog for family {family}"));
+    let nolig_fe = font_scan::select_entry_for_criteria(catalog.iter(), &nolig_sel)
+        .unwrap_or_else(|| panic!("nolig entry not in catalog for family {family}"));
     println!("lig   entry: {} lig_set={:#07b}", lig_fe.font_key(), lig_fe.collapsed_lig_set());
     println!("nolig entry: {} lig_set={:#07b}", nolig_fe.font_key(), nolig_fe.collapsed_lig_set());
     // Resolved glyph IDs for U+FB01: override first, then cmap.
