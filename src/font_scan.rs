@@ -20,25 +20,19 @@
 use unprint_fonts::ab_glyph::{Font, FontRef, PxScale, ScaleFont};
 use std::cell::RefCell;
 use std::collections::HashMap;
+use std::collections::hash_map::DefaultHasher;
+use std::hash::{Hash, Hasher};
 use std::path::{Path, PathBuf};
-use std::sync::{OnceLock, RwLock};
+use std::sync::{Arc, OnceLock, RwLock};
 use walkdir::WalkDir;
 
-/// Cache of render-scale gutter counts per (font path, ligature char) —
-/// avoids re-rendering the same shaped probe string for every candidate
-/// per line. 52% of CPU was here in nightly pprof.
+/// Cache of vertical-gap counts per (font path, ligature char) — avoids
+/// re-rasterizing the same FB00-FB04 glyph for every candidate per line.
+/// 52% of CPU was here in nightly pprof.
 static GAP_CACHE: OnceLock<RwLock<HashMap<(PathBuf, char), usize>>> = OnceLock::new();
 
 fn gap_cache() -> &'static RwLock<HashMap<(PathBuf, char), usize>> {
     GAP_CACHE.get_or_init(|| RwLock::new(HashMap::new()))
-}
-
-/// FreeType library for the ligature-fusion probe, one per thread —
-/// the same pattern as the verify render (src/verify.rs). Faces keep
-/// the library alive through their own C-level reference, so a face
-/// created inside the `with` closure outlives the borrow.
-thread_local! {
-    static LIG_FT_LIB: RefCell<Option<unprint_fonts::freetype::Library>> = RefCell::new(None);
 }
 
 /// Compact bitmask for FB00-FB04 ligatures: bit0=FF,1=FI,2=FL,3=FFI,4=FFL.
@@ -93,60 +87,78 @@ fn lig_overlap_cache() -> &'static RwLock<HashMap<PathBuf, LigMask>> {
     LIG_OVERLAP_CACHE.get_or_init(|| RwLock::new(HashMap::new()))
 }
 
-// NOTE (Nov 20): the mask shapes with plain `rustybuzz::shape`, exactly
-// as the verify render does (src/layout.rs `shape_word`). An earlier
-// version cached ShapePlans keyed by the font data's heap address
-// (data_ptr); the address is freed and reused as files are scanned in
-// turn, so a later font could inherit an earlier font's plan and shape
-// wrong — Lato and IBMPlexSans shaped 'fi' to two glyphs under the
-// cached plan while plain shaping (and HarfBuzz itself) substitute the
-// single FB01 ligature. The plan cache is gone; plain shaping rebuilds
-// the plan per call, which the scan absorbs (scan time measured in the
-// BAP).
-#[inline]
-fn shape_probes_collapsed(face: &unprint_fonts::rustybuzz::Face, features: &[unprint_fonts::rustybuzz::Feature], probe: &str) -> bool {
-    let mut buf = unprint_fonts::rustybuzz::UnicodeBuffer::new();
-    buf.push_str(probe);
-    buf.guess_segment_properties();
-    let out = unprint_fonts::rustybuzz::shape(face, features, buf);
-    out.glyph_infos().len() == 1 && out.glyph_infos()[0].glyph_id != 0
+// Thread-local ShapePlan cache for lig probe — mirrors
+// crates/unprint-fonts/src/shape.rs which caches 8.3% leaf
+// find_language_feature. Keyed by (font_data_ptr, features_hash).
+type PlanKey = (usize, u64);
+thread_local! {
+    static PROBE_PLAN_CACHE: RefCell<HashMap<PlanKey, Arc<unprint_fonts::rustybuzz::ShapePlan>>> =
+        RefCell::new(HashMap::new());
 }
 
-/// Shape `probe` with liga/dlig on and kerning OFF, returning the shaped
-/// glyph sequence as (glyph_id, x_advance, x_offset, y_offset) in font
-/// units. Kerning is off: the mask is variant-independent and the
-/// overlap test it complements ignores kern (raw glyph overlap
-/// dominates); the nokern GT render the mask must match uses raw
-/// advances. The glyph COUNT is kern-independent (kern only moves
-/// glyphs, never substitutes), so one glyph here also means the shaper
-/// collapsed the probe. Shaping is plain `rustybuzz::shape` — the same
-/// path the verify render uses — so the mask judges what the pipeline
-/// itself renders. Returns an empty vec when shaping fails or yields
-/// no glyphs.
 #[inline]
-fn shape_probe_sequence(
+fn probe_plan_hash(features: &[unprint_fonts::rustybuzz::Feature]) -> u64 {
+    let mut h = DefaultHasher::new();
+    // Dir/Script/Lang are constant for Latin LTR probes (Directional guess
+    // always LTR, Latn), so we only hash features; if guess ever diverges
+    // the miss just rebuilds — still correct because shape_with_plan debug
+    // asserts dir/script match.
+    for f in features {
+        f.tag.hash(&mut h);
+        f.value.hash(&mut h);
+        f.start.hash(&mut h);
+        f.end.hash(&mut h);
+    }
+    h.finish()
+}
+
+#[inline]
+fn probe_plan_cached(
     face: &unprint_fonts::rustybuzz::Face,
-    probe: &str,
-) -> Vec<(u32, i32, i32, i32)> {
-    let liga_tag = unprint_fonts::ttf_parser::Tag::from_bytes(b"liga");
-    let dlig_tag = unprint_fonts::ttf_parser::Tag::from_bytes(b"dlig");
-    let kern_tag = unprint_fonts::ttf_parser::Tag::from_bytes(b"kern");
-    let features = [
-        unprint_fonts::rustybuzz::Feature::new(liga_tag, 1, ..),
-        unprint_fonts::rustybuzz::Feature::new(dlig_tag, 1, ..),
-        unprint_fonts::rustybuzz::Feature::new(kern_tag, 0, ..),
-    ];
+    data_ptr: usize,
+    features: &[unprint_fonts::rustybuzz::Feature],
+) -> Arc<unprint_fonts::rustybuzz::ShapePlan> {
+    let hash = probe_plan_hash(features);
+    let key = (data_ptr, hash);
+    if let Some(hit) = PROBE_PLAN_CACHE.with(|c| c.borrow().get(&key).cloned()) {
+        return hit;
+    }
+    // We guess inside shape_probe; but plan creation needs dir/script/lang.
+    // All our probes are Latin LTR, no language — matches what UnicodeBuffer
+    // guess returns for ff/fi/fl etc. Using explicit None avoids needing
+    // buffer to build plan; shape_with_plan will assert dir/script match and
+    // they do match because guess → LTR Latn.
+    let plan = Arc::new(unprint_fonts::rustybuzz::ShapePlan::new(
+        face,
+        unprint_fonts::rustybuzz::Direction::LeftToRight,
+        Some(unprint_fonts::rustybuzz::script::LATIN),
+        None,
+        features,
+    ));
+    PROBE_PLAN_CACHE.with(|c| {
+        c.borrow_mut().insert(key, plan.clone());
+    });
+    plan
+}
+
+#[inline]
+fn shape_probes_collapsed(face: &unprint_fonts::rustybuzz::Face, data_ptr: usize, features: &[unprint_fonts::rustybuzz::Feature], probe: &str) -> bool {
     let mut buf = unprint_fonts::rustybuzz::UnicodeBuffer::new();
     buf.push_str(probe);
     buf.guess_segment_properties();
-    let out = unprint_fonts::rustybuzz::shape(face, &features, buf);
-    let infos = out.glyph_infos();
-    let positions = out.glyph_positions();
-    infos
-        .iter()
-        .zip(positions.iter())
-        .map(|(info, pos)| (info.glyph_id, pos.x_advance, pos.x_offset, pos.y_offset))
-        .collect()
+    // If guess diverges from our cached plan's dir/script (unlikely for ASCII
+    // probes) fall back to fresh shape — correctness over cache hit.
+    let dir = buf.direction();
+    let script = buf.script();
+    let latin_ltr = dir == unprint_fonts::rustybuzz::Direction::LeftToRight
+        && (script == unprint_fonts::rustybuzz::script::LATIN || script == unprint_fonts::rustybuzz::script::UNKNOWN);
+    if !latin_ltr {
+        let out = unprint_fonts::rustybuzz::shape(face, features, buf);
+        return out.glyph_infos().len() == 1 && out.glyph_infos()[0].glyph_id != 0;
+    }
+    let plan = probe_plan_cached(face, data_ptr, features);
+    let out = unprint_fonts::rustybuzz::shape_with_plan(face, &plan, buf);
+    out.glyph_infos().len() == 1 && out.glyph_infos()[0].glyph_id != 0
 }
 
 // ---------------------------------------------------------------------------
@@ -396,12 +408,10 @@ impl FontEntry {
     /// Those should be scored as separate characters.
     ///
     /// New name is `collapsed_lig_set`.  It filters the supported set by
-    /// shaping each ligature's probe string and rendering the shaped
-    /// glyphs at the word-scan scale, checking the render for a clear
-    /// vertical gutter (see `count_render_gutters_for_shaped`).  Two-char
-    /// ligs (ff, fi, fl) need ≥1 such interior gutter to be excluded;
-    /// three-char ligs (ffi, ffl) need ≥2.  Only FB00–FB04 are
-    /// considered; quote ligature probes are excluded.
+    /// checking actual glyph ink for a clear vertical whitespace (no white
+    /// padding, 100% top-to-bottom).  Two-char ligs (ff, fi, fl) need ≥1 such
+    /// interior gutter to be excluded; three-char ligs (ffi, ffl) need ≥2.
+    /// Only FB00–FB04 are considered; quote ligature probes are excluded.
     pub fn collapsed_lig_set(&self) -> LigMask {
         // nolig variant: disable ligature collapsing entirely.
         // The cache is keyed by fontkey (not path) so nolig variants
@@ -574,11 +584,12 @@ impl FontEntry {
                         unprint_fonts::rustybuzz::Feature::new(liga_tag, 1, ..),
                         unprint_fonts::rustybuzz::Feature::new(dlig_tag, 1, ..),
                     ];
+                    let data_ptr = data.as_ptr() as usize;
                     for &(probe, lig_char) in LIGATURE_PROBES {
                         let Some(b) = lig_bit(lig_char) else { continue };
                         if (mask & (1u8<<b)) != 0 { continue; }
                         if probe.chars().count() <= 1 { continue; }
-                        if shape_probes_collapsed(&face, &features, probe) {
+                        if shape_probes_collapsed(&face, data_ptr, &features, probe) {
                             mask |= 1u8<<b;
                         }
                     }
@@ -592,21 +603,8 @@ impl FontEntry {
         }
 
         // --- collapsed filtering: exclude ligs that are really two/three inks ---
-        // Fusion is judged per ligature at the word-scan scale on the
-        // SHAPED result (see `count_render_gutters_for_shaped`): the
-        // probe string is shaped with liga/dlig, the shaped glyphs are
-        // rendered, and a clean vertical gutter in the render means
-        // separate ink and the ligature must not collapse. Shaping
-        // first matters: most fonts never substitute a ligature glyph
-        // for the text, so the FB01 glyph's ink is not what the scan
-        // shows. One FreeType face and one rustybuzz face per font
-        // file, created lazily on the first uncached ligature.
         if let Some(ref data) = data_cache {
             let path_key = self.path.clone();
-            let mut ft_face: Option<unprint_fonts::freetype::Face<Vec<u8>>> = None;
-            let mut ft_face_tried = false;
-            let mut buzz_face: Option<unprint_fonts::rustybuzz::Face> = None;
-            let mut buzz_face_tried = false;
             for &lig in &FB_LIGS {
                 let b = lig_bit(lig).unwrap();
                 if (mask & (1u8<<b)) == 0 { continue; }
@@ -622,27 +620,7 @@ impl FontEntry {
                 let gaps = if let Some(g) = cached {
                     g
                 } else {
-                    if !ft_face_tried {
-                        ft_face_tried = true;
-                        ft_face =
-                            Self::ft_face_for_lig_probe(data, Self::LIG_PROBE_EMS_PX[0]);
-                    }
-                    if !buzz_face_tried {
-                        buzz_face_tried = true;
-                        buzz_face = unprint_fonts::rustybuzz::Face::from_slice(data, 0);
-                    }
-                    let g = match (ft_face.as_mut(), buzz_face.as_ref()) {
-                        (Some(ft), Some(bz)) => {
-                            let probe = LIGATURE_PROBES
-                                .iter()
-                                .find(|&&(_, l)| l == lig)
-                                .map(|&(p, _)| p)
-                                .unwrap_or("");
-                            let glyphs = shape_probe_sequence(bz, probe);
-                            Self::count_render_gutters_for_shaped(ft, &glyphs)
-                        }
-                        _ => 0,
-                    };
+                    let g = Self::count_vertical_gaps_for_lig(data, lig);
                     let mut guard = gap_cache().write().unwrap();
                     guard.insert((path_key.clone(), lig), g);
                     g
@@ -656,276 +634,117 @@ impl FontEntry {
         mask
     }
 
-    /// Em sizes (px) the ligature-fusion test renders at: the
-    /// word-scan scales the pipeline receives. The specimen's text
-    /// carrying ligature pairs is set at 7pt, 9pt, and 10pt
-    /// (test-docs/gen-specimen.py: 7pt source lines, 9pt lining
-    /// figures, 10pt body), rasterized at 300 dpi
-    /// (tools/rasterize.py), so pt * 300 / 72 px em; the measured
-    /// midpoint_em_px across BAP 1364 spans 29.3–43.4 for lines
-    /// containing a ligature pair, consistent with 7–10pt. Fusion is
-    /// judged at all three sizes, never at outline truth: a gap that
-    /// is a clean column at 10pt can be fused at 7pt, and the mask is
-    /// one bit per font file, so a gutter counts only when it
-    /// survives every size (see `count_render_gutters_for_shaped`).
-    const LIG_PROBE_EMS_PX: [f32; 3] = [
-        7.0 * 300.0 / 72.0,
-        9.0 * 300.0 / 72.0,
-        10.0 * 300.0 / 72.0,
-    ];
-
-    /// Size `face` for the ligature-fusion probe at `em_px`
-    /// (pixels-as-points at 72 dpi, exactly as the verify render
-    /// in src/verify.rs). Returns false on failure; the caller
-    /// treats that as fused (keeps the mask bit).
-    fn set_lig_probe_size(
-        face: &mut unprint_fonts::freetype::Face<Vec<u8>>,
-        em_px: f32,
-    ) -> bool {
-        let size_26_6 = (em_px as f64 * 64.0) as isize;
-        face.set_char_size(size_26_6, size_26_6, 72, 72).is_ok()
+    /// Count interior 100% top-to-bottom white vertical gutters inside the glyph
+    /// for `lig_char`. No white padding around glyph — tight ink bounds only.
+    /// Returns number of whitespace regions separating ink (0,1,2...).
+    fn count_vertical_gaps_for_lig(data: &[u8], lig_char: char) -> usize {
+        // High-res 200px no-hint gives outline truth. Low-res 40px was previously
+        // computed but discarded — skip it to halve CPU.
+        Self::vertical_gaps_at_scale(data, lig_char, 200.0, 20.0 / 255.0)
     }
 
-    /// A FreeType face for the ligature-fusion probe, sized at
-    /// `em_px`. Default instance: the mask is a property of the
-    /// font file, not of a variant (see `ligature_support_mask`), and
-    /// the ab_glyph path this replaces also measured the default
-    /// instance. Returns None when the face cannot be created or
-    /// sized; the caller treats that as fused (keeps the mask bit).
-    fn ft_face_for_lig_probe(
-        data: &[u8],
-        em_px: f32,
-    ) -> Option<unprint_fonts::freetype::Face<Vec<u8>>> {
-        LIG_FT_LIB.with(|lib_cell| -> Option<unprint_fonts::freetype::Face<Vec<u8>>> {
-            let mut borrow = lib_cell.borrow_mut();
-            if borrow.is_none() {
-                *borrow = unprint_fonts::freetype::Library::init().ok();
+    fn vertical_gaps_at_scale(data: &[u8], lig_char: char, px: f32, cov_thresh: f32) -> usize {
+        let font = match FontRef::try_from_slice(data) {
+            Ok(f) => f,
+            Err(_) => return 0,
+        };
+        let scale = PxScale::from(px);
+        let sf = font.as_scaled(scale);
+        let gid = font.glyph_id(lig_char);
+        if gid.0 == 0 {
+            return 0;
+        }
+        let glyph = gid.with_scale_and_position(scale, unprint_fonts::ab_glyph::point(0.0, sf.ascent()));
+        let outlined = match font.outline_glyph(glyph) {
+            Some(o) => o,
+            None => return 0,
+        };
+        let bounds = outlined.px_bounds();
+        let w_f = bounds.max.x - bounds.min.x;
+        let h_f = bounds.max.y - bounds.min.y;
+        if w_f < 1.0 || h_f < 1.0 {
+            return 0;
+        }
+        let w = w_f.ceil() as usize;
+        let h = h_f.ceil() as usize;
+        if w < 2 || h < 2 || w > 4096 || h > 4096 {
+            return 0;
+        }
+        // Tight bitmap, no padding — single allocation.
+        let mut ink = vec![false; w * h];
+        outlined.draw(|gx, gy, cov| {
+            if cov <= cov_thresh {
+                return;
             }
-            let lib = borrow.as_ref()?;
-            let mut face = lib.new_memory_face2(data.to_vec(), 0).ok()?;
-            if !Self::set_lig_probe_size(&mut face, em_px) {
-                return None;
+            let x = gx as usize;
+            let y = gy as usize;
+            if x < w && y < h {
+                ink[y * w + x] = true;
             }
-            Some(face)
-        })
-    }
+        });
 
-    /// Count interior runs of clean columns in a per-column ink map: a
-    /// run counts when it closes against ink on the right having seen
-    /// ink on the left (the segmenter's VP pass only splits within the
-    /// ink extent).
-    fn count_interior_clean_runs(col_has_ink: &[bool]) -> usize {
-        let mut gaps = 0usize;
-        let mut in_gap = false;
-        let mut seen_ink = false;
-        for &has_ink in col_has_ink {
-            if has_ink {
-                if in_gap && seen_ink {
-                    gaps += 1;
+        // One pass: column ink presence
+        let mut col_has = vec![false; w];
+        for y in 0..h {
+            let row = y * w;
+            for x in 0..w {
+                if ink[row + x] {
+                    col_has[x] = true;
                 }
-                in_gap = false;
-                seen_ink = true;
-            } else if !in_gap {
-                in_gap = true;
             }
         }
-        gaps
-    }
 
-    /// Render the shaped sequence `glyphs` (from
-    /// `shape_probe_sequence`) onto one canvas at `em_px`, with the
-    /// pen starting at subpixel phase `phase`, using the same
-    /// FreeType rendering the verify path scores with (hinting on,
-    /// RENDER load flag), and return the per-column ink map (a column
-    /// has ink iff any pixel is below INK_THRESH, gray 240). The
-    /// glyphs are blitted at their shaped advances, exactly as the
-    /// verify render blits shaped words.
-    /// Each glyph is rendered with its true fractional pen offset
-    /// applied via FT_Set_Transform (the delta is 26.6 fixed point,
-    /// like all FT_Pos values; the matrix is NULL for identity):
-    /// FreeType hints the glyph and then translates the hinted
-    /// outline, which is how a FreeType-based renderer positions
-    /// glyphs at fractional pen offsets. Returns None when the
-    /// sequence is empty or any render fails.
-    fn render_shaped_columns(
-        face: &mut unprint_fonts::freetype::Face<Vec<u8>>,
-        glyphs: &[(u32, i32, i32, i32)],
-        phase: f64,
-        em_px: f32,
-    ) -> Option<Vec<bool>> {
-        if glyphs.is_empty() {
-            return None;
+        // Gap columns = columns with no ink at all
+        let mut gap_cols = Vec::new();
+        for x in 0..w {
+            if !col_has[x] {
+                gap_cols.push(x);
+            }
         }
-        if !Self::set_lig_probe_size(face, em_px) {
-            return None;
+        if gap_cols.is_empty() {
+            return 0;
         }
-        let upem = face.raw().units_per_EM as f32;
-        if upem <= 0.0 {
-            return None;
+
+        // Group consecutive empty columns
+        let mut gaps: Vec<(usize, usize)> = Vec::new();
+        let mut start = gap_cols[0];
+        let mut prev = gap_cols[0];
+        for &cx in gap_cols.iter().skip(1) {
+            if cx == prev + 1 {
+                prev = cx;
+            } else {
+                gaps.push((start, prev));
+                start = cx;
+                prev = cx;
+            }
         }
-        let px_per_unit = em_px / upem;
-        // Canvas: total advance plus a full em of margin on each side
-        // for overhang; two ems tall with the baseline one em down.
-        let total_adv: f32 = glyphs
-            .iter()
-            .map(|&(_, adv, _, _)| adv as f32 * px_per_unit)
-            .sum();
-        let margin = em_px.ceil() as i32;
-        let canvas_w = (total_adv.ceil() as i32 + 2 * margin).max(4) as usize;
-        let canvas_h = (2.0 * em_px).ceil() as usize;
-        let baseline_y = em_px as f64;
-        let mut canvas = vec![255.0f32; canvas_w * canvas_h];
-        let mut pen_x = margin as f64 + phase;
-        for &(gid, x_adv, x_off, y_off) in glyphs {
-            if gid == 0 {
-                return None;
+        gaps.push((start, prev));
+
+        // Prefix sums of col_has for O(1) left/right mass
+        let mut prefix = vec![0usize; w + 1];
+        for i in 0..w {
+            prefix[i + 1] = prefix[i] + (col_has[i] as usize);
+        }
+
+        let mut valid = 0usize;
+        for (gs, ge) in gaps {
+            if gs == 0 || ge + 1 >= w {
+                continue; // edge artifact from ceil
             }
-            // The glyph's true pen position, fractional part carried
-            // by the transform, integer part by the blit.
-            let pen_eff = pen_x + x_off as f64 * px_per_unit as f64;
-            let frac = pen_eff.fract();
-            let mut delta = unprint_fonts::freetype::freetype_sys::FT_Vector {
-                x: (frac * 64.0).round() as i64,
-                y: 0,
-            };
-            let raw_face = face.raw() as *const _ as *mut _;
-            unsafe {
-                unprint_fonts::freetype::freetype_sys::FT_Set_Transform(
-                    raw_face,
-                    std::ptr::null_mut(),
-                    &mut delta as *mut _,
-                );
-            }
-            if face
-                .load_glyph(gid, unprint_fonts::freetype::face::LoadFlag::RENDER)
-                .is_err()
-            {
-                return None;
-            }
-            let glyph = face.glyph();
-            let bitmap = glyph.bitmap();
-            if !matches!(
-                bitmap.pixel_mode(),
-                Ok(unprint_fonts::freetype::bitmap::PixelMode::Gray)
-            ) {
-                return None;
-            }
-            let bmp_w = bitmap.width() as usize;
-            let bmp_h = bitmap.rows() as usize;
-            let buf = bitmap.buffer();
-            let pitch = bitmap.pitch().unsigned_abs() as usize;
-            if bmp_w == 0 || bmp_h == 0 || buf.is_empty() {
-                pen_x += x_adv as f64 * px_per_unit as f64;
+            let left_mass = prefix[gs]; // columns with ink in [0, gs)
+            if left_mass < 1 {
                 continue;
             }
-            if pitch < bmp_w || buf.len() < pitch * bmp_h.saturating_sub(1) + bmp_w {
-                return None;
+            let right_mass = prefix[w] - prefix[ge + 1]; // [ge+1, w)
+            if right_mass < 1 {
+                continue;
             }
-            // Blit at the integer pen plus the bitmap bearing (which
-            // already accounts for the fractional transform).
-            let blit_x = pen_eff.floor() as i32 + glyph.bitmap_left();
-            let blit_y = (baseline_y
-                - y_off as f64 * px_per_unit as f64
-                - glyph.bitmap_top() as f64)
-                .round() as i32;
-            // Alpha compositing mirrors the verify render: the canvas
-            // holds gray values (255 = white) and each glyph darkens
-            // by (1 - alpha). The f32 canvas and the verify path's u8
-            // canvas agree exactly on the < 240 verdict (240 is an
-            // integer, so flooring cannot move a value across it).
-            for row in 0..bmp_h {
-                for col in 0..bmp_w {
-                    let cx = blit_x + col as i32;
-                    let cy = blit_y + row as i32;
-                    if cx < 0 || cy < 0 || cx >= canvas_w as i32 || cy >= canvas_h as i32 {
-                        continue;
-                    }
-                    let alpha = buf[row * pitch + col] as f32 / 255.0;
-                    if alpha < 0.01 {
-                        continue;
-                    }
-                    let idx = cy as usize * canvas_w + cx as usize;
-                    canvas[idx] *= 1.0 - alpha;
-                }
+            if px >= 100.0 && (left_mass < 3 || right_mass < 3) {
+                continue;
             }
-            pen_x += x_adv as f64 * px_per_unit as f64;
+            valid += 1;
         }
-        // One pass: column ink presence (any pixel below INK_THRESH).
-        let thresh = crate::INK_THRESH as f32;
-        let mut col_has_ink = vec![false; canvas_w];
-        for y in 0..canvas_h {
-            let row = y * canvas_w;
-            for x in 0..canvas_w {
-                if canvas[row + x] < thresh {
-                    col_has_ink[x] = true;
-                }
-            }
-        }
-        Some(col_has_ink)
-    }
-
-    /// Count interior clean vertical gutters in the RENDER of what the
-    /// text shapes to for a ligature, at the word-scan scales
-    /// (LIG_PROBE_EMS_PX), using the same FreeType rendering the verify
-    /// path scores with (hinting on, RENDER load flag). `glyphs` is the
-    /// shaped sequence from `shape_probe_sequence`. Shaping first
-    /// matters because most fonts do not substitute a ligature glyph
-    /// for the text at all — Arial, CourierNew, and SourceSans3 have
-    /// no GSUB fi ligature, so Pango renders f+i and the FB01 glyph's
-    /// ink is never in the scan; judging the FB01 glyph instead of
-    /// the shaped pair misjudges CourierNew as fused.
-    ///
-    /// One glyph means the shaper substituted a ligature: there is no
-    /// inter-glyph gap to judge, and a clean column inside the glyph
-    /// is not a split point the segmenter should use. Splitting
-    /// Roboto's and Lato's single FB01 glyphs collapses their GT
-    /// scores (BAP 1469: Roboto gt_score -0.70 -> -21.12, Lato -0.46
-    /// -> -786.12), while collapsing them scores fine. Fused.
-    ///
-    /// Otherwise the count is the MINIMUM over every sampled size
-    /// (7/9/10pt) and subpixel phase (0, 0.25, 0.5, 0.75): the mask
-    /// is per font file but words land at arbitrary subpixel phases
-    /// and sizes, and a sub-pixel gutter exists only at some of
-    /// them — Arial's f/i gap is 1.32px unhinted, showing one clean
-    /// column at phase 0 while the scan's word is fused, and the
-    /// lining-figures lines are set at 9pt, where a marginal gap
-    /// closes. A gutter counts only when it survives every sampled
-    /// size and phase. That is the safe side of a size- and
-    /// phase-dependent call: splitting fused ink costs a headline
-    /// hit (the phantom-'i' geo penalty), while collapsing separate
-    /// ink costs only an exact hit (the nolig twin still wins the
-    /// line).
-    ///
-    /// Returns 0 when the sequence is empty or any render fails — the
-    /// ligature is treated as fused, keeping the mask bit (the
-    /// existing failure semantics).
-    fn count_render_gutters_for_shaped(
-        face: &mut unprint_fonts::freetype::Face<Vec<u8>>,
-        glyphs: &[(u32, i32, i32, i32)],
-    ) -> usize {
-        if glyphs.is_empty() {
-            return 0;
-        }
-        if glyphs.len() == 1 {
-            return 0;
-        }
-        const PHASES: [f64; 4] = [0.0, 0.25, 0.5, 0.75];
-        let mut min_gaps = usize::MAX;
-        for &em_px in &Self::LIG_PROBE_EMS_PX {
-            for &phase in &PHASES {
-                match Self::render_shaped_columns(face, glyphs, phase, em_px) {
-                    Some(cols) => {
-                        let gaps = Self::count_interior_clean_runs(&cols);
-                        min_gaps = min_gaps.min(gaps);
-                        if min_gaps == 0 {
-                            return 0;
-                        }
-                    }
-                    None => return 0,
-                }
-            }
-        }
-        min_gaps
+        valid
     }
 
     /// (min, default, max) for the `opsz` axis, or None if this font has no
@@ -1239,14 +1058,7 @@ pub fn find_msttcorefonts_dir() -> Option<PathBuf> {
 const FSCN_MAGIC: &[u8; 4] = b"FSCN";
 // v20: font_version field (|version=X in font keys) + content-based identity.
 // v21: variable-font weight instances get the full kern/lig/opsz permutation.
-// v22: ligature gutter filter judges width at render scale (40px em, 2px bar).
-// v25: the mask shapes with plain rustybuzz::shape (the verify
-// render's path); the cached-ShapePlan keyed by heap address is gone
-// (it could hand a later font an earlier font's plan). Fusion is
-// judged on the shaped probe string at the word-scan scales
-// (FreeType render at 7/9/10pt); a single shaped glyph is fused
-// outright, and a gutter must survive every size and subpixel phase.
-const FSCN_VERSION: u32 = 25;
+const FSCN_VERSION: u32 = 21;
 
 pub(crate) fn scan_cache_path() -> PathBuf {
     crate::cache::paths::font_scan_bin()
