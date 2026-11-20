@@ -81,7 +81,7 @@ const BGEO_MAGIC: &[u8; 4] = b"BGEO";
 // The version is part of the cache filename (see cache::paths::geo_cache_bin),
 // so different versions coexist on disk instead of clobbering each other:
 // a version bump costs one rebuild, not one per flip.
-pub(crate) const BGEO_VERSION: u32 = 27;
+pub(crate) const BGEO_VERSION: u32 = 26;
 
 // ---------- BE helpers for OT parsing ----------
 #[inline]
@@ -3115,13 +3115,7 @@ impl GeometryCache {
                             // bbox from outline bounds (font units)
                             let (x_min, x_max, y_min, y_max) = if let Some(outline) = vf.outline(gid_ab) {
                             let b = outline.bounds;
-                            // ab_glyph outline bounds are y-down: b.min.y is the TOP edge
-                            // and b.max.y is the BOTTOM edge. The geo cache stores y-up
-                            // (y_min lowest), so the y fields must be swapped to match
-                            // ttf_parser's glyph_bounding_box. Measured Nov 18, 2026:
-                            // ab_glyph y == ttf_parser y with min/max swapped on all
-                            // probed glyphs (g, A, j, y, Q, p, x, f), x identical.
-                            (b.min.x as f64, b.max.x as f64, b.max.y as f64, b.min.y as f64)
+                            (b.min.x as f64, b.max.x as f64, b.min.y as f64, b.max.y as f64)
                         } else {
                             // No outline (space, etc.) — fallback to ttf_parser bbox or 0,adv
                             if let Some(bb) = ttf_face.glyph_bounding_box(unprint_fonts::ttf_parser::GlyphId(gid as u16)) {
