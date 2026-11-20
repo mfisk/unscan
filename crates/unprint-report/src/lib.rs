@@ -2687,8 +2687,37 @@ pub fn generate_report(
             let p50 = sim_vals[n / 2];
             let p90_idx = (n as f64 * 0.9).ceil() as usize;
             let p90 = sim_vals[p90_idx.min(n - 1)];
+            // Above-threshold tally by miss type: every scored line
+            // with similarity >= MIN_VERIFY_SIMILARITY, regardless of
+            // hit status. The buckets sum to `above` (the classification
+            // is 1:1 with the entries). similarity_failure is 0 by
+            // definition — its similarity is below the gate; kept_raster
+            // and no_ground_truth are shown only when nonzero.
+            let (mut ab_hit, mut ab_minor, mut ab_major, mut ab_simfail,
+                 mut ab_kept, mut ab_nogt) = (0usize, 0usize, 0usize, 0usize, 0usize, 0usize);
+            for ce in classified {
+                let Some(score) = entries[ce.entry_index].similarity_score else { continue; };
+                if score < MIN_VERIFY_SIMILARITY { continue; }
+                match ce.kind {
+                    MissKind::Hit => ab_hit += 1,
+                    MissKind::MinorMiss => ab_minor += 1,
+                    MissKind::MajorMiss => ab_major += 1,
+                    MissKind::SimilarityFailure => ab_simfail += 1,
+                    MissKind::KeptRaster => ab_kept += 1,
+                    MissKind::NoGroundTruth => ab_nogt += 1,
+                }
+            }
+            let mut breakdown = format!(
+                "hit {ab_hit} · minor {ab_minor} · major {ab_major} · similarity_failure {ab_simfail}"
+            );
+            if ab_kept > 0 {
+                breakdown.push_str(&format!(" · kept_raster {ab_kept}"));
+            }
+            if ab_nogt > 0 {
+                breakdown.push_str(&format!(" · no_ground_truth {ab_nogt}"));
+            }
             format!(
-                "Similarity: <b>avg={avg:.4}</b> · <b>{above}/{n} ({pct_above:.0}%)</b> above {:.1} threshold · p50={p50:.4} · p90={p90:.4}",
+                "Similarity: <b>avg={avg:.4}</b> · <b>{above}/{n} ({pct_above:.0}%)</b> above {:.1} threshold ({breakdown}) · p50={p50:.4} · p90={p90:.4}",
                 MIN_VERIFY_SIMILARITY,
             )
         }

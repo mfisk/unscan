@@ -5,115 +5,50 @@ FONTS="$HOME/.local/share/fonts"
 GF="https://raw.githubusercontent.com/google/fonts/main"
 OS="$(uname -s)"
 
-# Install route: default (apt on Linux, Homebrew casks on macOS) or --home
-# (Linux only: download every manifest font into $FONTS instead of
-# apt-installing it). --home exists for VMs where apt state is wiped by
-# reboots but $HOME persists. The flag is the only switch: no
-# environment-variable fallback, no auto-detection. Unknown arguments are a
-# hard error — a silently ignored flag once let an apt install run when a
-# download route was intended (the --brew flag died in the Nov 1, 2026
-# rewrite while its caller kept passing it).
-usage() {
-  cat <<'EOF'
-Usage: install-all-fonts.sh [--home] [--help]
-
-Install the fonts in the FONTS_TO_INSTALL manifest plus prerequisites.
-
-  (default)  Fonts from apt packages (Linux) or Homebrew casks (macOS),
-             plus direct downloads for fonts with no package.
-  --home     Linux only. Download every manifest font into
-             ~/.local/share/fonts instead of apt-installing it.
-             Prerequisites (tesseract, weasyprint, Python packages)
-             still install via apt.
-  --help     Show this message and exit.
-EOF
-}
-
-HOME_MODE=0
-for arg in "$@"; do
-  case "$arg" in
-    --home) HOME_MODE=1 ;;
-    --help|-h) usage; exit 0 ;;
-    *)
-      echo "ERROR: unknown argument: $arg" >&2
-      usage >&2
-      exit 1
-      ;;
-  esac
-done
-if [[ "$HOME_MODE" == 1 && "$OS" == "Darwin" ]]; then
-  echo "ERROR: --home is Linux-only; macOS installs fonts via Homebrew casks" >&2
-  exit 1
-fi
-
 # ---------------------------------------------------------------------------
 # Single source of truth for fonts and prerequisites to install
 # ---------------------------------------------------------------------------
 
 # Unified font manifest:
-#   "Expected Fontconfig Family|apt package(s)|brew cask(s)|Google Fonts path(s)|Home downloads"
+#   "Expected Fontconfig Family|apt package(s)|brew cask(s)|Google Fonts path(s)"
 #
 # - Column 1: Family name verified via fc-scan (comma-separated if platform
 #             versions use alternate family names).
 # - Column 2: Debian/Ubuntu apt package(s) to install (first is verified via
-#             dpkg-query -L + fc-scan). Skipped with --home.
+#             dpkg-query -L + fc-scan).
 # - Column 3: macOS Homebrew cask(s) to install (first is verified via
 #             Caskroom + fc-scan).
 # - Column 4: Upstream Google Fonts repo path(s) to download directly to
-#             $FONTS/<path> and verify via fc-scan. Downloaded in both
-#             routes: families with no package need it, and families with
-#             one get the upstream variable file the specimen was built
-#             against.
-# - Column 5: Home-route downloads for fonts NOT in Google Fonts, used only
-#             with --home (the apt route ignores this column):
-#             space-separated tokens, either URL>DEST (single file to
-#             $FONTS/DEST) or deb:URL>DESTDIR:GLOB (download a .deb, extract
-#             its data tarball, and copy files whose basename matches GLOB
-#             into $FONTS/DESTDIR — for fonts whose built files are only
-#             distributed as distro packages). Every entry must have column
-#             4 or column 5 coverage, or --home fails loudly in verification.
+#             $FONTS/<path> and verify via fc-scan.
 FONTS_TO_INSTALL=(
-  "Carlito|fonts-crosextra-carlito|font-carlito|ofl/carlito/Carlito-Regular.ttf ofl/carlito/Carlito-Bold.ttf ofl/carlito/Carlito-Italic.ttf ofl/carlito/Carlito-BoldItalic.ttf|"
-  "Caladea|fonts-crosextra-caladea|font-caladea|ofl/caladea/Caladea-Regular.ttf ofl/caladea/Caladea-Bold.ttf ofl/caladea/Caladea-Italic.ttf ofl/caladea/Caladea-BoldItalic.ttf|"
-  "DejaVu Sans|fonts-dejavu-core fonts-dejavu-extra|font-dejavu||deb:https://deb.debian.org/debian/pool/main/f/fonts-dejavu/fonts-dejavu-core_2.37-8_all.deb>dejavu:DejaVuSans*.ttf deb:https://deb.debian.org/debian/pool/main/f/fonts-dejavu/fonts-dejavu-extra_2.37-8_all.deb>dejavu:DejaVuSans-*Oblique.ttf"
-  "DejaVu Serif|fonts-dejavu-core fonts-dejavu-extra|font-dejavu||deb:https://deb.debian.org/debian/pool/main/f/fonts-dejavu/fonts-dejavu-core_2.37-8_all.deb>dejavu:DejaVuSerif*.ttf deb:https://deb.debian.org/debian/pool/main/f/fonts-dejavu/fonts-dejavu-extra_2.37-8_all.deb>dejavu:DejaVuSerif-*Italic.ttf"
-  "DejaVu Sans Mono|fonts-dejavu-mono|font-dejavu||deb:https://deb.debian.org/debian/pool/main/f/fonts-dejavu/fonts-dejavu-mono_2.37-8_all.deb>dejavu:DejaVuSansMono*.ttf"
-  "Liberation Sans|fonts-liberation|font-liberation||deb:https://deb.debian.org/debian/pool/main/f/fonts-liberation/fonts-liberation_2.1.5-3_all.deb>liberation:LiberationSans-*.ttf"
-  "Liberation Serif|fonts-liberation|font-liberation||deb:https://deb.debian.org/debian/pool/main/f/fonts-liberation/fonts-liberation_2.1.5-3_all.deb>liberation:LiberationSerif-*.ttf"
-  "Liberation Mono|fonts-liberation|font-liberation||deb:https://deb.debian.org/debian/pool/main/f/fonts-liberation/fonts-liberation_2.1.5-3_all.deb>liberation:LiberationMono-*.ttf"
-  "Latin Modern Roman,LM Roman 10|fonts-lmodern|font-latin-modern||https://mirrors.ctan.org/fonts/lm/fonts/opentype/public/lm/lmroman10-regular.otf>lm/lmroman10-regular.otf https://mirrors.ctan.org/fonts/lm/fonts/opentype/public/lm/lmroman10-bold.otf>lm/lmroman10-bold.otf https://mirrors.ctan.org/fonts/lm/fonts/opentype/public/lm/lmroman10-italic.otf>lm/lmroman10-italic.otf https://mirrors.ctan.org/fonts/lm/fonts/opentype/public/lm/lmroman10-bolditalic.otf>lm/lmroman10-bolditalic.otf"
-  "Latin Modern Mono,LM Mono 10|fonts-lmodern|font-latin-modern||https://mirrors.ctan.org/fonts/lm/fonts/opentype/public/lm/lmmono10-regular.otf>lm/lmmono10-regular.otf https://mirrors.ctan.org/fonts/lm/fonts/opentype/public/lm/lmmono10-italic.otf>lm/lmmono10-italic.otf"
-  "Latin Modern Sans,LM Sans 10|fonts-lmodern|font-latin-modern||https://mirrors.ctan.org/fonts/lm/fonts/opentype/public/lm/lmsans10-regular.otf>lm/lmsans10-regular.otf https://mirrors.ctan.org/fonts/lm/fonts/opentype/public/lm/lmsans10-oblique.otf>lm/lmsans10-oblique.otf https://mirrors.ctan.org/fonts/lm/fonts/opentype/public/lm/lmsans10-bold.otf>lm/lmsans10-bold.otf https://mirrors.ctan.org/fonts/lm/fonts/opentype/public/lm/lmsans10-boldoblique.otf>lm/lmsans10-boldoblique.otf"
-  "CMU Serif|fonts-cmu|font-computer-modern||https://mirrors.ctan.org/fonts/cm-unicode/fonts/otf/cmunrm.otf>cmu/cmunrm.otf https://mirrors.ctan.org/fonts/cm-unicode/fonts/otf/cmunbx.otf>cmu/cmunbx.otf https://mirrors.ctan.org/fonts/cm-unicode/fonts/otf/cmunti.otf>cmu/cmunti.otf https://mirrors.ctan.org/fonts/cm-unicode/fonts/otf/cmunbi.otf>cmu/cmunbi.otf"
-  "TeX Gyre Termes|fonts-texgyre texlive-fonts-recommended|font-tex-gyre-termes font-tex-gyre-cursor||https://mirrors.ctan.org/fonts/tex-gyre/opentype/texgyretermes-regular.otf>texgyre/texgyretermes-regular.otf https://mirrors.ctan.org/fonts/tex-gyre/opentype/texgyretermes-italic.otf>texgyre/texgyretermes-italic.otf https://mirrors.ctan.org/fonts/tex-gyre/opentype/texgyretermes-bold.otf>texgyre/texgyretermes-bold.otf https://mirrors.ctan.org/fonts/tex-gyre/opentype/texgyretermes-bolditalic.otf>texgyre/texgyretermes-bolditalic.otf"
-  "TeX Gyre Heros|fonts-texgyre|font-tex-gyre-heros||https://mirrors.ctan.org/fonts/tex-gyre/opentype/texgyreheros-regular.otf>texgyre/texgyreheros-regular.otf https://mirrors.ctan.org/fonts/tex-gyre/opentype/texgyreheros-italic.otf>texgyre/texgyreheros-italic.otf https://mirrors.ctan.org/fonts/tex-gyre/opentype/texgyreheros-bold.otf>texgyre/texgyreheros-bold.otf https://mirrors.ctan.org/fonts/tex-gyre/opentype/texgyreheros-bolditalic.otf>texgyre/texgyreheros-bolditalic.otf"
-  "TeX Gyre Pagella|fonts-texgyre|font-tex-gyre-pagella||https://mirrors.ctan.org/fonts/tex-gyre/opentype/texgyrepagella-regular.otf>texgyre/texgyrepagella-regular.otf https://mirrors.ctan.org/fonts/tex-gyre/opentype/texgyrepagella-italic.otf>texgyre/texgyrepagella-italic.otf https://mirrors.ctan.org/fonts/tex-gyre/opentype/texgyrepagella-bold.otf>texgyre/texgyrepagella-bold.otf https://mirrors.ctan.org/fonts/tex-gyre/opentype/texgyrepagella-bolditalic.otf>texgyre/texgyrepagella-bolditalic.otf"
-  "Noto Sans|fonts-noto-core fonts-noto fonts-noto-cjk fonts-noto-color-emoji fonts-noto-extra fonts-noto-mono fonts-noto-ui-core fonts-noto-ui-extra fonts-noto-unhinted|font-noto-sans font-noto-color-emoji|ofl/notosans/NotoSans[wdth,wght].ttf ofl/notosans/NotoSans-Italic[wdth,wght].ttf|"
-  "Noto Serif||font-noto-serif|ofl/notoserif/NotoSerif[wdth,wght].ttf|"
-  "Noto Sans Mono|fonts-noto-mono|font-noto-sans-mono|ofl/notosansmono/NotoSansMono[wdth,wght].ttf|"
-  "Courier Prime|fonts-courier-prime|font-courier-prime|ofl/courierprime/CourierPrime-Regular.ttf ofl/courierprime/CourierPrime-Bold.ttf ofl/courierprime/CourierPrime-Italic.ttf ofl/courierprime/CourierPrime-BoldItalic.ttf|"
-  "EB Garamond|fonts-ebgaramond|font-eb-garamond|ofl/ebgaramond/EBGaramond[wght].ttf ofl/ebgaramond/EBGaramond-Italic[wght].ttf|"
-  "IBM Plex Sans|fonts-ibm-plex|font-ibm-plex-sans|ofl/ibmplexsans/IBMPlexSans[wdth,wght].ttf ofl/ibmplexsans/IBMPlexSans-Italic[wdth,wght].ttf|"
-  "IBM Plex Serif|fonts-ibm-plex|font-ibm-plex-serif|ofl/ibmplexserif/IBMPlexSerif-Regular.ttf|"
-  "IBM Plex Mono|fonts-ibm-plex|font-ibm-plex-mono|ofl/ibmplexmono/IBMPlexMono-Regular.ttf|"
-  "Inter|fonts-inter|font-inter|ofl/inter/Inter[opsz,wght].ttf ofl/inter/Inter-Italic[opsz,wght].ttf|"
-  "Inter Display|fonts-inter|font-inter||deb:https://deb.debian.org/debian/pool/main/f/fonts-inter/fonts-inter_4.1+ds-1_all.deb>inter:InterDisplay-*.otf"
-  "Lato|fonts-lato|font-lato|ofl/lato/Lato-Regular.ttf ofl/lato/Lato-Bold.ttf ofl/lato/Lato-Italic.ttf ofl/lato/Lato-BoldItalic.ttf|"
-  "Open Sans|fonts-open-sans|font-open-sans|ofl/opensans/OpenSans[wdth,wght].ttf ofl/opensans/OpenSans-Italic[wdth,wght].ttf|"
-  "Roboto|fonts-roboto-unhinted fonts-roboto|font-roboto|ofl/roboto/Roboto[wdth,wght].ttf ofl/roboto/Roboto-Italic[wdth,wght].ttf|"
-  "Roboto Condensed|fonts-roboto-unhinted fonts-roboto|font-roboto-condensed|ofl/robotocondensed/RobotoCondensed[wght].ttf ofl/robotocondensed/RobotoCondensed-Italic[wght].ttf|"
-  "Libre Baskerville|||ofl/librebaskerville/LibreBaskerville[wght].ttf ofl/librebaskerville/LibreBaskerville-Italic[wght].ttf|"
-  "Libre Bodoni|||ofl/librebodoni/LibreBodoni[wght].ttf ofl/librebodoni/LibreBodoni-Italic[wght].ttf|"
-  "Libre Caslon Text|||ofl/librecaslontext/LibreCaslonText[wght].ttf ofl/librecaslontext/LibreCaslonText-Italic[wght].ttf|"
-  "Zilla Slab|||ofl/zillaslab/ZillaSlab-Regular.ttf ofl/zillaslab/ZillaSlab-Bold.ttf|"
-  "Jost|||ofl/jost/Jost[wght].ttf|"
-  "Playfair Display|||ofl/playfairdisplay/PlayfairDisplay[wght].ttf ofl/playfairdisplay/PlayfairDisplay-Italic[wght].ttf|"
-  "Merriweather|||ofl/merriweather/Merriweather[opsz,wdth,wght].ttf ofl/merriweather/Merriweather-Italic[opsz,wdth,wght].ttf|"
-  "Source Sans 3|||ofl/sourcesans3/SourceSans3[wght].ttf|"
-  "PT Serif|||ofl/ptserif/PT_Serif-Web-Regular.ttf ofl/ptserif/PT_Serif-Web-Italic.ttf ofl/ptserif/PT_Serif-Web-Bold.ttf|"
-  "PT Sans|||ofl/ptsans/PT_Sans-Web-Regular.ttf ofl/ptsans/PT_Sans-Web-Bold.ttf|"
-  "Source Serif 4|||ofl/sourceserif4/SourceSerif4[opsz,wght].ttf ofl/sourceserif4/SourceSerif4-Italic[opsz,wght].ttf|"
-  "Special Elite|||apache/specialelite/SpecialElite-Regular.ttf|"
+  "Carlito|fonts-crosextra-carlito|font-carlito|"
+  "Caladea|fonts-crosextra-caladea|font-caladea|"
+  "Liberation Sans|fonts-liberation|font-liberation|"
+  "Latin Modern Roman,LMRoman10|fonts-lmodern|font-latin-modern|"
+  "TeX Gyre Termes|fonts-texgyre texlive-fonts-recommended|font-tex-gyre-termes font-tex-gyre-heros font-tex-gyre-pagella font-tex-gyre-cursor|"
+  "Noto Sans|fonts-noto-core fonts-noto fonts-noto-cjk fonts-noto-color-emoji fonts-noto-extra fonts-noto-mono fonts-noto-ui-core fonts-noto-ui-extra fonts-noto-unhinted|font-noto-sans font-noto-serif font-noto-sans-mono font-noto-color-emoji|"
+  "Noto Serif|||ofl/notoserif/NotoSerif[wdth,wght].ttf"
+  "Courier Prime|fonts-courier-prime|font-courier-prime|"
+  "EB Garamond|fonts-ebgaramond|font-eb-garamond|"
+  "IBM Plex Sans|fonts-ibm-plex|font-ibm-plex-sans|"
+  "IBM Plex Serif|fonts-ibm-plex|font-ibm-plex-serif|"
+  "IBM Plex Mono|fonts-ibm-plex|font-ibm-plex-mono|"
+  "Inter|fonts-inter|font-inter|"
+  "Lato|fonts-lato|font-lato|"
+  "Open Sans|fonts-open-sans|font-open-sans|ofl/opensans/OpenSans[wdth,wght].ttf ofl/opensans/OpenSans-Italic[wdth,wght].ttf"
+  "Roboto|fonts-roboto-unhinted fonts-roboto|font-roboto|"
+  "Libre Baskerville|||ofl/librebaskerville/LibreBaskerville[wght].ttf ofl/librebaskerville/LibreBaskerville-Italic[wght].ttf"
+  "Libre Bodoni|||ofl/librebodoni/LibreBodoni[wght].ttf ofl/librebodoni/LibreBodoni-Italic[wght].ttf"
+  "Libre Caslon Text|||ofl/librecaslontext/LibreCaslonText[wght].ttf ofl/librecaslontext/LibreCaslonText-Italic[wght].ttf"
+  "Zilla Slab|||ofl/zillaslab/ZillaSlab-Regular.ttf ofl/zillaslab/ZillaSlab-Bold.ttf"
+  "Jost|||ofl/jost/Jost[wght].ttf"
+  "Playfair Display|||ofl/playfairdisplay/PlayfairDisplay[wght].ttf ofl/playfairdisplay/PlayfairDisplay-Italic[wght].ttf"
+  "Merriweather|||ofl/merriweather/Merriweather[opsz,wdth,wght].ttf ofl/merriweather/Merriweather-Italic[opsz,wdth,wght].ttf"
+  "Source Sans 3|||ofl/sourcesans3/SourceSans3[wght].ttf"
+  "PT Serif|||ofl/ptserif/PT_Serif-Web-Regular.ttf ofl/ptserif/PT_Serif-Web-Italic.ttf ofl/ptserif/PT_Serif-Web-Bold.ttf"
+  "PT Sans|||ofl/ptsans/PT_Sans-Web-Regular.ttf ofl/ptsans/PT_Sans-Web-Bold.ttf"
+  "Source Serif 4|||ofl/sourceserif4/SourceSerif4[opsz,wght].ttf ofl/sourceserif4/SourceSerif4-Italic[opsz,wght].ttf"
+  "Special Elite|||apache/specialelite/SpecialElite-Regular.ttf"
 )
 
 # Microsoft Core Fonts archives (SHA-256 + filename from pinned mirror):
@@ -184,14 +119,6 @@ append_unique() {
   done
 }
 
-# file_has_family <file> <expected-family>: exit 0 if fc-scan reports one of
-# the comma-separated expected families for the file.
-file_has_family() {
-  local font_file="$1" expected_family="$2"
-  fc-scan --format '%{family}\n' "$font_file" 2>/dev/null |
-    tr ',' '\n' | grep -Fxq -f <(printf '%s\n' "$expected_family" | tr ',' '\n')
-}
-
 # ---------------------------------------------------------------------------
 # Platform package installation (Homebrew on macOS, apt on Linux)
 # ---------------------------------------------------------------------------
@@ -243,7 +170,7 @@ if [[ "$OS" == "Darwin" ]]; then
 
   brew_casks=()
   for entry in "${FONTS_TO_INSTALL[@]}"; do
-    IFS='|' read -r _ _ casks _ _ <<<"$entry"
+    IFS='|' read -r _ _ casks _ <<<"$entry"
     append_unique brew_casks $casks
   done
 
@@ -309,15 +236,10 @@ else
     sudo debconf-set-selections || true
 
   apt_packages=()
-  # With --home, fonts come from downloads (columns 4/5), so no font apt
-  # packages are collected. Prerequisites and Python deps still install
-  # via apt.
-  if [[ "$HOME_MODE" == 0 ]]; then
-    for entry in "${FONTS_TO_INSTALL[@]}"; do
-      IFS='|' read -r _ pkgs _ _ _ <<<"$entry"
-      append_unique apt_packages $pkgs
-    done
-  fi
+  for entry in "${FONTS_TO_INSTALL[@]}"; do
+    IFS='|' read -r _ pkgs _ _ <<<"$entry"
+    append_unique apt_packages $pkgs
+  done
   for entry in "${PREREQ_TOOLS[@]}"; do
     pkgs="${entry%%|*}"
     append_unique apt_packages $pkgs
@@ -501,7 +423,7 @@ fi
 # Google Fonts (direct upstream downloads from FONTS_TO_INSTALL)
 # ---------------------------------------------------------------------------
 for entry in "${FONTS_TO_INSTALL[@]}"; do
-  IFS='|' read -r _ _ _ gf_paths _ <<<"$entry"
+  IFS='|' read -r _ _ _ gf_paths <<<"$entry"
   read -r -a gf_list <<<"$gf_paths"
   for p in ${gf_list[@]+"${gf_list[@]}"}; do
     dest="$FONTS/$p"
@@ -514,58 +436,6 @@ for entry in "${FONTS_TO_INSTALL[@]}"; do
     curl -fsSL -o "$dest" "$url" || echo "  WARN: $p"
   done
 done
-
-# ---------------------------------------------------------------------------
-# Home-route downloads (--home only): fonts not in Google Fonts
-# ---------------------------------------------------------------------------
-# Column 5 tokens: URL>DEST downloads a single file to $FONTS/DEST;
-# deb:URL>DESTDIR:GLOB downloads a .deb, extracts its data tarball, and
-# copies files whose basename matches GLOB into $FONTS/DESTDIR.
-# Already-installed files are skipped, like the Google Fonts loop above.
-if [[ "$HOME_MODE" == 1 ]]; then
-  for entry in "${FONTS_TO_INSTALL[@]}"; do
-    IFS='|' read -r _ _ _ _ home_downloads <<<"$entry"
-    read -r -a dl_list <<<"$home_downloads"
-    for token in ${dl_list[@]+"${dl_list[@]}"}; do
-      if [[ "$token" == deb:* ]]; then
-        rest="${token#deb:}"
-        url="${rest%%>*}"
-        spec="${rest#*>}"
-        destdir="${spec%%:*}"
-        glob="${spec#*:}"
-        if compgen -G "$FONTS/$destdir/$glob" >/dev/null; then
-          continue
-        fi
-        [[ -d "$FONTS/$destdir" ]] || mkdir -p "$FONTS/$destdir"
-        tmp_deb="$(mktemp --suffix=.deb /tmp/home-fonts-XXXXXX)"
-        tmp_dir="$(mktemp -d /tmp/home-fonts-deb-XXXXXX)"
-        echo "  $url"
-        if curl -fsSL -o "$tmp_deb" "$url" &&
-            (cd "$tmp_dir" && ar x "$tmp_deb" && tar -xf data.tar.*) &&
-            found=false &&
-            while IFS= read -r font_file; do
-              cp "$font_file" "$FONTS/$destdir/"
-              found=true
-            done < <(find "$tmp_dir" -name "$glob" -type f); then
-          [[ "$found" == true ]] || echo "  WARN: no $glob in $url" >&2
-        else
-          echo "  WARN: $url" >&2
-        fi
-        rm -f "$tmp_deb"
-        rm -rf "$tmp_dir"
-      else
-        url="${token%%>*}"
-        dest="${token#*>}"
-        if [[ -s "$FONTS/$dest" ]]; then
-          continue
-        fi
-        mkdir -p "$(dirname "$FONTS/$dest")"
-        echo "  $dest"
-        curl -fsSL -o "$FONTS/$dest" "$url" || echo "  WARN: $url"
-      fi
-    done
-  done
-fi
 
 # ---------------------------------------------------------------------------
 # Verification
@@ -601,7 +471,7 @@ else
 fi
 
 for entry in "${FONTS_TO_INSTALL[@]}"; do
-  IFS='|' read -r expected_family apt_pkgs brew_casks gf_paths home_downloads <<<"$entry"
+  IFS='|' read -r expected_family apt_pkgs brew_casks gf_paths <<<"$entry"
   if [[ "$OS" == "Darwin" ]]; then
     pkgs="$brew_casks"
   else
@@ -609,14 +479,7 @@ for entry in "${FONTS_TO_INSTALL[@]}"; do
   fi
   package="${pkgs%% *}"
 
-  if [[ "$HOME_MODE" == 1 ]]; then
-    # Home route: fonts come from downloads, so there is no package payload
-    # to verify. Every entry must declare a download in column 4 or 5.
-    if [[ -z "$gf_paths" && -z "$home_downloads" ]]; then
-      echo "ERROR: $expected_family has no home-route download (columns 4/5)" >&2
-      exit 1
-    fi
-  elif [[ -n "$package" ]]; then
+  if [[ -n "$package" ]]; then
     found_family=false
     found_payload=false
     while IFS= read -r font_file; do
@@ -626,7 +489,8 @@ for entry in "${FONTS_TO_INSTALL[@]}"; do
         echo "ERROR: $package font payload is missing: $font_file" >&2
         exit 1
       }
-      if file_has_family "$font_file" "$expected_family"; then
+      if fc-scan --format '%{family}\n' "$font_file" 2>/dev/null |
+          tr ',' '\n' | grep -Fxq -f <(printf '%s\n' "$expected_family" | tr ',' '\n'); then
         found_family=true
         break
       fi
@@ -649,57 +513,12 @@ for entry in "${FONTS_TO_INSTALL[@]}"; do
       echo "ERROR: missing Google Font file: $font_file" >&2
       exit 1
     }
-    if ! file_has_family "$font_file" "$expected_family"; then
+    if ! fc-scan --format '%{family}\n' "$font_file" 2>/dev/null |
+        tr ',' '\n' | grep -Fxq -f <(printf '%s\n' "$expected_family" | tr ',' '\n'); then
       echo "ERROR: $font_file does not contain expected family $expected_family" >&2
       exit 1
     fi
   done
-
-  if [[ "$HOME_MODE" == 1 ]]; then
-    read -r -a dl_list <<<"$home_downloads"
-    for token in ${dl_list[@]+"${dl_list[@]}"}; do
-      if [[ "$token" == deb:* ]]; then
-        rest="${token#deb:}"
-        spec="${rest#*>}"
-        destdir="${spec%%:*}"
-        glob="${spec#*:}"
-        found_family=false
-        found_payload=false
-        while IFS= read -r font_file; do
-          [[ -n "$font_file" ]] || continue
-          found_payload=true
-          [[ -s "$font_file" ]] || {
-            echo "ERROR: $expected_family file is missing: $font_file" >&2
-            exit 1
-          }
-          if file_has_family "$font_file" "$expected_family"; then
-            found_family=true
-            break
-          fi
-        done < <(compgen -G "$FONTS/$destdir/$glob")
-
-        if [[ "$found_payload" != true ]]; then
-          echo "ERROR: no $expected_family files extracted to $FONTS/$destdir" >&2
-          exit 1
-        fi
-        if [[ "$found_family" != true ]]; then
-          echo "ERROR: $FONTS/$destdir does not contain expected family $expected_family" >&2
-          exit 1
-        fi
-      else
-        dest="${token#*>}"
-        font_file="$FONTS/$dest"
-        [[ -s "$font_file" ]] || {
-          echo "ERROR: missing home-route font file: $font_file" >&2
-          exit 1
-        }
-        if ! file_has_family "$font_file" "$expected_family"; then
-          echo "ERROR: $font_file does not contain expected family $expected_family" >&2
-          exit 1
-        fi
-      fi
-    done
-  fi
 done
 
 # Verify every executable and Python dependency used by the fixture generator.
