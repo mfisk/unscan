@@ -1,6 +1,6 @@
 # Branch critique
 
-Before every commit, always critique the change, including the errors and redundancies it is adding and how it could be better. Address those items before committing. The same critique applies at merge time, over the whole branch. (Mike Nov 20, 2026.)
+Before every commit, always critique the change, including the errors and redundancies it is adding and how it could be better. Address those items before committing. A merge is a commit: the change under critique is the whole branch. (Mike Nov 20, 2026.)
 
 ## How to critique
 

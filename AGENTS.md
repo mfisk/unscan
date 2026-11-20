@@ -2,7 +2,7 @@
 
 ## Principles
 
-The project's principles live in `docs/CRITIQUE.md`: correctness first, fix things right, one canonical implementation, measurements in the context of the low-res word scans, and the full mistake-class catalog. The critique checks every change against them before every commit. Read that doc before changing code.
+The project's principles live in `docs/CRITIQUE.md`: correctness first, fix things right, one canonical implementation, measurements in the context of the low-res word scans, and the full mistake-class catalog. Read that doc before changing code.
 
 ## Context Window Hygiene
 
@@ -25,9 +25,8 @@ The project's principles live in `docs/CRITIQUE.md`: correctness first, fix thin
 
 - **Always ask before committing.** Never auto-commit.
 - **Show crops visually** — always present character crops as inline images.
-- **Critique before every commit (Mike Nov 20, 2026).** Before every commit, critique the change per `docs/CRITIQUE.md` — the errors and redundancies it adds, how it could be better — and address those items before committing.
 
-The remaining development rules (fix things right, crop to ink bounds first, BAP scores in commit messages, ligature report rules, deliberate changes only, main code path only, input quality over fancier algorithms, identical crop geometry) live in `docs/CRITIQUE.md`.
+The remaining development rules (fix things right, crop to ink bounds first, BAP scores in commit messages, ligature report rules, deliberate changes only, main code path only, input quality over fancier algorithms, identical crop geometry, critique before every commit) live in `docs/CRITIQUE.md`.
 
 ## Architecture
 
