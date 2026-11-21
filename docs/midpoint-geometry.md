@@ -71,24 +71,24 @@ Plan: sweep γ 1.0 vs 1.8 vs 2.2, verify `'.'` leak (col16 115/96) not pulled in
 
 ## 5. Scoring – `quantized_ll`
 
-**File:** `crates/unprint-geometry/src/params.rs:52-78`
+**File:** `crates/unprint-geometry/src/params.rs:122-135`
 
-First-principles uniform quantization:
+First-principles subpixel error model (full derivation in the `params.rs` header comment; the old 1/sqrt(12) / 1/sqrt(6) uniform-quantization values assumed whole-pixel edges and no longer apply now that edges are measured fractionally):
 
 ```
-σ_center = sqrt(1/12) ≈ 0.28867513459481287 // center uniform [-0.5,0.5]
-σ_pitch = sqrt(2/12) = sqrt(1/6) ≈ 0.40824829046386302 // difference of two centers
+σ_center = 0.0599 // gamma-mismatch bias, rendered case; center averages two edges
+σ_pitch = 0.243 // center error twice + stable per-glyph offsets + context noise
 ```
 
 User requirement: inflection points same for pitch and vertical – based on `0.75*σ` per dimension, not shared absolute.
 
-- `thresh_center = 0.75*σ_center ≈0.2165`
-- `thresh_pitch = 0.75*σ_pitch ≈0.3062`
+- `thresh_center = 0.75*σ_center ≈0.0449`
+- `thresh_pitch = 0.75*σ_pitch ≈0.1822`
 - `K_INNER = 2.0`, `OFFSET = 0.2109375` (ensures continuity)
-- Inside: `|e| < thresh → -0.5*(e/(K_INNER*σ))^2` → 0.2px center -0.06, pitch -0.03 (almost free, penalty near zero per "0.2 should get almost none")
+- Inside: `|e| < thresh → -0.5*(e/(K_INNER*σ))^2` → 0.04px center -0.06, pitch -0.003 (almost free)
 - Outside: `|e| ≥ thresh → -0.5*(e/σ)^2 + OFFSET`
 - Continuity check: `inner(thresh)= -0.5*(0.75/2)^2 = -0.0703125`, `outer_raw(thresh)= -0.5*0.75^2 = -0.28125`, `+OFFSET = -0.0703125` continuous.
-- At 0.6px: center `-1.95`, pitch `-0.87` (per "0.6px should get quite a bit of penalty").
+- At 0.2px: center `-5.36`, pitch `-0.13`.
 
 Flat-top alternative: `FLAT_TOP_DEFAULT = 0.45*0.75 = 0.3375` (env `UNPRINT_FLAT_TOP`, `QUANT_HALF_WIDTH_PX`). Currently `quant_half_width_*` params are stored but not used in `quantized_ll` when conditional path active (`_half_width` ignored); kept for env override compatibility.
 
@@ -125,12 +125,12 @@ Audit baseline: `d3f76a2` 428/84.4%/0.9425 ZNCC with `K_INNER=2σ OFFSET=0.21093
 
 ## 8. Implementation Map
 
-- `crates/unprint-geometry/src/params.rs:6-11` – sigmas, `FLAT_*`
-- `params.rs:52-78` – `quantized_ll`, `K_INNER`, `OFFSET`, continuity comment
+- `crates/unprint-geometry/src/params.rs:68-69` – sigmas, `FLAT_*`
+- `params.rs:122-135` – `quantized_ll`, `K_INNER`, `OFFSET`, continuity comment
 - `crates/unprint-geometry/src/char_bounds.rs:18-120` – `measure_char_ink_bounds`, seam `left_limit`/`right_limit`, `<200` bounds vs `<250` weighted, `sum_x/sum_y/sum_m`
 - `char_bounds.rs:78-110` – fallback paths, `width = x_max-x_min+1`
 - `src/geometry_classifier.rs:296-310` – `v_err`, `h_err`, `v_ll=quantized_ll(v_err, SIGMA_CENTER)`, `h_ll=quantized_ll(h_err, SIGMA_PITCH)`
-- `src/geometry_classifier.rs:46-70` – comment deriving `σ=1/√12`, `σ_pitch=1/√6`, `E[err]=0` symmetry
+- `src/geometry_classifier.rs:64-80` – comment on error symmetry (`E[err]=0`); sigmas derived in `params.rs`
 - `src/font_match.rs` – `per_char_geo_for_font`, `GEO_WEIGHT=1.0`, `midpoint prune`
 
 ## 9. Next Experiments

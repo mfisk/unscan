@@ -69,14 +69,11 @@ pub struct PerCharGeo {
 // If the font is correct and perfectly aligned, the mean error is 0 by symmetry:
 // for every grid offset +d there is a matching -d, so E[obs - pred] = 0.
 //
-// What remains is quantization noise from the unknown phase. The true continuous
-// center can lie anywhere inside the central pixel, uniform in [-0.5,+0.5] px.
-//
-//   Var[uniform -0.5..0.5] = 1/12 px²  →  sigma_center = 1/√12 ≈ 0.2887 px
-//   pitch = cx[i] - cx[i-1] is difference of two independent centers
-//       Var[pitch] = 2/12 = 1/6  →  sigma_pitch = 1/√6 ≈ 0.4082 px
-//
-// No invented constants: 1/12 comes from uniform quantization.
+// What remains is the subpixel measurement error. The sigmas are derived from
+// the estimator and imaging chain in crates/unprint-geometry/src/params.rs
+// (sigma_center 0.0599, sigma_pitch 0.243); the old uniform-quantization
+// values (1/sqrt(12), 1/sqrt(6)) assumed whole-pixel edges and no longer
+// apply now that edges are measured fractionally.
 //
 // When expressed in em units, sigma_em = sigma_px / em_px, so sigma_em is a
 // function of how many pixels per em we sampled at. In pixel space sigma_px is
