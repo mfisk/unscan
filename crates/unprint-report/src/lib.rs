@@ -650,6 +650,13 @@ impl MissKind {
 /// reads only bbox, page, decision, font_key_matched, and
 /// similarity_pass, none of which enrich writes (it writes miss_type,
 /// expected_font, gt_text, ocr_text, ocr_correct).
+///
+/// A font-key match is a Hit regardless of the similarity score: the
+/// score is a separate attribute (see the independent zncc_miss count),
+/// not part of font identity. The ground-truth branch therefore never
+/// yields SimilarityFailure; that kind survives only in the
+/// no-ground-truth branch (where the score is the only signal) and in
+/// `classify_entries_from_audit` for old audits.
 pub fn classify_entries(
     entries: &[AuditEntry],
     gt: Option<&GroundTruth>,
@@ -693,12 +700,10 @@ pub fn classify_entries(
                         fk_base == actual_base
                     });
 
+                    // A font-key match is a hit regardless of the
+                    // similarity score (see the doc comment above).
                     if ps_match {
-                        if e.similarity_pass == Some(false) {
-                            MissKind::SimilarityFailure
-                        } else {
-                            MissKind::Hit
-                        }
+                        MissKind::Hit
                     } else {
                         // Font miss — classify as major or minor.
                         // Read identity from both the picked font and the GT font.
@@ -737,7 +742,10 @@ pub fn classify_entries(
                     gt_font_size_pt,
                 }
             } else {
-                // No ground truth: classify kept-raster, similarity failure, or hit
+                // No ground truth, so there is no font key to match:
+                // the similarity score is the only signal, and a low
+                // score stays a similarity failure here (unlike the
+                // ground-truth branch above).
                 let kind = if e.decision == Decision::KeptRaster {
                     MissKind::KeptRaster
                 } else if e.similarity_pass == Some(false) {
@@ -2687,28 +2695,68 @@ pub fn generate_report(
             let p50 = sim_vals[n / 2];
             let p90_idx = (n as f64 * 0.9).ceil() as usize;
             let p90 = sim_vals[p90_idx.min(n - 1)];
+            // Above-threshold tally by miss type: every scored line
+            // with similarity >= MIN_VERIFY_SIMILARITY, regardless of
+            // hit status. The buckets sum to `above` (the classification
+            // is 1:1 with the entries). similarity_failure has no bucket:
+            // it means the score is below the gate, so it is 0 above the
+            // gate by definition, not a measurement; kept_raster and
+            // no_ground_truth are shown only when nonzero.
+            let (mut ab_hit, mut ab_minor, mut ab_major,
+                 mut ab_kept, mut ab_nogt) = (0usize, 0usize, 0usize, 0usize, 0usize);
+            for ce in classified {
+                let Some(score) = entries[ce.entry_index].similarity_score else { continue; };
+                if score < MIN_VERIFY_SIMILARITY { continue; }
+                match ce.kind {
+                    MissKind::Hit => ab_hit += 1,
+                    MissKind::MinorMiss => ab_minor += 1,
+                    MissKind::MajorMiss => ab_major += 1,
+                    // No bucket: a similarity failure scores below the
+                    // gate by definition and cannot appear here.
+                    MissKind::SimilarityFailure => {}
+                    MissKind::KeptRaster => ab_kept += 1,
+                    MissKind::NoGroundTruth => ab_nogt += 1,
+                }
+            }
+            let mut breakdown = format!(
+                "exact {ab_hit} · minor {ab_minor} · major {ab_major}"
+            );
+            if ab_kept > 0 {
+                breakdown.push_str(&format!(" · kept_raster {ab_kept}"));
+            }
+            if ab_nogt > 0 {
+                breakdown.push_str(&format!(" · no_ground_truth {ab_nogt}"));
+            }
             format!(
-                "Similarity: <b>avg={avg:.4}</b> · <b>{above}/{n} ({pct_above:.0}%)</b> above {:.1} threshold · p50={p50:.4} · p90={p90:.4}",
+                "Similarity: <b>avg={avg:.4}</b> · <b>{above}/{n} ({pct_above:.0}%)</b> above {:.1} threshold ({breakdown}) · p50={p50:.4} · p90={p90:.4}",
                 MIN_VERIFY_SIMILARITY,
             )
         }
     };
 
-    // ── Summary line 2: Font accuracy ────────────────────────────────
+    // ── Summary line 2: Font hits ────────────────────────────────────
+    // A font hit is a font-key match, regardless of the similarity
+    // score. Exact = key match at or above the verify gate;
+    // major-only = key match below the gate. SimilarityFailure
+    // entries count as font hits: in a ground-truth run they are key
+    // matches below the gate (the old classification recorded them
+    // separately); new ground-truth runs never produce them. The
+    // total is shared with the independent attribute stats below.
+    let font_hits = hits.len() + similarity_failures.len();
     let font_summary = if compared > 0 {
-        let major_correct = compared - major_misses.len() - similarity_failures.len();
-        let major_pct = major_correct as f64 / compared as f64 * 100.0;
-        let minor_correct = hits.len(); // hits = exact match
-        let minor_pct = minor_correct as f64 / compared as f64 * 100.0;
-        let major_ignore = compared - major_misses.len();
-        let major_ignore_pct = major_ignore as f64 / compared as f64 * 100.0;
-        let exact_correct = hits.len() + similarity_failures.len();
-        let exact_pct = exact_correct as f64 / compared as f64 * 100.0;
+        let exact = hits.iter().chain(similarity_failures.iter())
+            .filter(|ce| {
+                entries[ce.entry_index].similarity_score
+                    .map_or(false, |s| s >= MIN_VERIFY_SIMILARITY)
+            })
+            .count();
+        let major_only = font_hits - exact;
+        let font_pct = font_hits as f64 / compared as f64 * 100.0;
         format!(
-            "Font accuracy: <b>{major_correct}/{compared} ({major_pct:.0}%)</b> major correct · <b>{minor_correct}/{compared} ({minor_pct:.0}%)</b> exact match<br>Ignoring similarity threshold (<0.9 ZNCC): <b>{major_ignore}/{compared} ({major_ignore_pct:.0}%)</b> not major miss · <b>{exact_correct}/{compared} ({exact_pct:.0}%)</b> exact PS name"
+            "Font hits: <b>{font_hits}/{compared} ({font_pct:.0}%)</b> (exact {exact} + major-only {major_only})"
         )
     } else {
-        String::from("Font accuracy: no GT data")
+        String::from("Font hits: no GT data")
     };
 
     // ── Independent attribute stats (each line can have multiple) ──────
@@ -2748,15 +2796,14 @@ pub fn generate_report(
         let zncc_ok_pct = zncc_ok as f64 / compared as f64 * 100.0;
         let not_major = compared.saturating_sub(major_miss_ind_cnt);
         let not_major_pct = not_major as f64 / compared as f64 * 100.0;
-        let exact = hits.len() + similarity_failures.len();
-        let exact_pct = exact as f64 / compared as f64 * 100.0;
+        let exact_pct = font_hits as f64 / compared as f64 * 100.0;
         format!(
             "<h3 style=\"margin:1em 0 0.3em;\">Independent attribute stats — passes only (each line can have multiple)</h3>\
              <ul style=\"margin:0 0 0.5em 1.2em; line-height:1.6;\">\
                <li>OCR correct: <b>{ocr_ok}/{compared} ({ocr_ok_pct:.1}%)</b></li>\
                <li>ZNCC pass (≥0.9): <b>{zncc_ok}/{compared} ({zncc_ok_pct:.1}%)</b></li>\
                <li>Major correct (not major miss): <b>{not_major}/{compared} ({not_major_pct:.1}%)</b></li>\
-               <li>Exact PS name match: <b>{exact}/{compared} ({exact_pct:.1}%)</b></li>\
+               <li>Exact PS name match: <b>{font_hits}/{compared} ({exact_pct:.1}%)</b></li>\
              </ul>",
         )
     } else {
