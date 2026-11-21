@@ -45,8 +45,11 @@ def _is_primary_family(base):
 def resolve_all_fonts(catalog_json, unprint_bin):
     """Resolve all font families via the --select-font API.
 
-    The generator states what it wants (family, weight, style, size,
-    nokern); Rust picks the single best catalog entry (Mike Nov 15, 2026).
+    The generator states what it wants (family, weight, style, size);
+    Rust picks the single best catalog entry (Mike Nov 15, 2026).
+    Kerning is NOT constrained — the API's shared preference decides
+    (kern for fonts with kerning data, nokern otherwise: the specimen
+    defaults to kerning, Mike Nov 19, 2026).
     No list scanning in Python: selection lives entirely in
     font_scan::select_entry_for_criteria, and the returned key is looked
     up in the catalog by exact dict lookup for the file path — a
@@ -80,10 +83,12 @@ def resolve_all_fonts(catalog_json, unprint_bin):
     def _find_entry(family, style):
         """Resolve family+style via the --select-font API (thin wrapper).
 
-        Specimen policy, stated as criteria: nokern (the specimen renders
-        with font-kerning: none) and opsz=10 (the optical size the specimen
-        renders at; vacuous for fonts without an opsz axis). Ligatures are
-        NOT constrained — the API's shared preference decides (nolig
+        Specimen policy, stated as criteria: opsz=10 (the optical size
+        the specimen renders at; vacuous for fonts without an opsz axis).
+        Kerning is NOT constrained — the API's shared preference decides
+        (kern for fonts with kerning data, nokern otherwise; the specimen
+        defaults to kerning, Mike Nov 19, 2026). Ligatures are NOT
+        constrained either — the API's shared preference decides (lig
         preferred). The weight is passed explicitly, so the Italic branch
         now selects the requested weight instead of the lexicographic
         first (the old missing-weight-filter bug is gone by construction).
@@ -107,7 +112,7 @@ def resolve_all_fonts(catalog_json, unprint_bin):
         for w in weights:
             spec = (
                 f"family={family},weight={w},"
-                f"style={'italic' if italic else 'regular'},opsz=10,kern=nokern"
+                f"style={'italic' if italic else 'regular'},opsz=10"
             )
             try:
                 key = select_fontkey_via_api(unprint_bin, spec)
@@ -651,6 +656,63 @@ def generate_html(font_paths):
 
     font_face_css = _font_face_css(font_paths)
 
+    # Kerning CSS from a catalog entry (architectural: use the kerning
+    # value in the fontkey, never the CSS default — every font rule
+    # carries an explicit font-kerning declaration, Mike Nov 19, 2026).
+    # If entry is not a dict, or the key has neither |kern nor |nokern,
+    # ERROR OUT (per Mike: no silent fallback, be consistent).
+    # 'nokern' is checked first: 'kern' is a substring of 'nokern'.
+    def _kerning_css_for_entry(entry, label):
+        if not isinstance(entry, dict):
+            raise RuntimeError(
+                f"Font entry for {label} is not a dict: {type(entry)}. "
+                f"Cannot determine CSS from fontkey. Fix the catalog or specimen."
+            )
+        fk = entry.get('font_key', '')
+        if 'nokern' in fk:
+            return 'font-kerning: none;'
+        if '|kern' in fk:
+            return 'font-kerning: normal;'
+        raise RuntimeError(
+            f"Cannot determine font-kerning for {label}: "
+            f"fontkey '{fk}' has neither |kern nor |nokern. Fix the catalog."
+        )
+
+    # Get font-variation-settings CSS from catalog entry — MUST match the
+    # fontkey exactly. Planned font -> fontkey -> render. Never hardcode.
+    # Parses [wght=...,opsz=...] from fontkey and generates CSS.
+    # Note: wght is handled via font-weight (WeasyPrint bug #1981), so we skip it here.
+    # Only opsz (and other non-wght axes) go in font-variation-settings.
+    # Returns '' when the key carries no variation bracket (vacuous for
+    # fonts without variation axes). Mirrors _variation_css for static rules.
+    def _variation_css_for_entry(entry, label):
+        if not isinstance(entry, dict):
+            raise RuntimeError(
+                f"Font entry for {label} is not a dict: {type(entry)}. "
+                f"Cannot determine CSS from fontkey. Fix the catalog or specimen."
+            )
+        fk = entry.get('font_key', '')
+        # Extract variations from [tag=value,...]
+        import re
+        m = re.search(r'\[([^\]]+)\]', fk)
+        if not m:
+            return ''
+        variations = []
+        for part in m.group(1).split(','):
+            part = part.strip()
+            if '=' not in part:
+                continue
+            tag, value = part.split('=', 1)
+            tag = tag.strip()
+            value = value.strip()
+            # Skip wght (handled via font-weight per WeasyPrint bug #1981)
+            if tag == 'wght':
+                continue
+            variations.append(f"'{tag}' {value}")
+        if variations:
+            return f"font-variation-settings: {', '.join(variations)};"
+        return ''
+
     # SourceSerif4 for source lines — resolve its italic path
     # font_paths values are entry dicts (catalog-based) or path strings (legacy)
     def _get_path(base, variant):
@@ -671,20 +733,11 @@ def generate_html(font_paths):
                 f"run tools/install-all-fonts.sh to install missing fonts"
             )
 
-        # Get kerning value from catalog entry (architectural: use the kerning
-        # value returned by font catalog matching, which prefers nokern when available)
-        # If entry is not a dict, ERROR OUT (per Mike: no silent fallback, be consistent).
+        # Kerning CSS for this section's reading lines, from the catalog
+        # entry (see _kerning_css_for_entry above).
         def _kerning_css(variant):
-            entry = font_paths[rl].get(variant, {})
-            if not isinstance(entry, dict):
-                raise RuntimeError(
-                    f"Font entry for '{rl}' variant '{variant}' is not a dict: {type(entry)}. "
-                    f"Cannot determine CSS from fontkey. Fix the catalog or specimen."
-                )
-            fk = entry.get('font_key', '')
-            if 'nokern' in fk:
-                return 'font-kerning: none;'
-            return 'font-kerning: normal;'
+            return _kerning_css_for_entry(
+                font_paths[rl].get(variant, {}), f"'{rl}' variant '{variant}'")
 
         # Get ligature value from catalog entry (architectural: use the
         # fontkey, never the CSS default). Lig/nolig is explicit in every
@@ -851,6 +904,22 @@ def generate_html(font_paths):
 
     all_sections = "\n".join(sections_html)
 
+    # Static rules (.source/.subtitle/.intro/h1) must carry explicit
+    # font-kerning too — derived from the same catalog entries, never
+    # hardcoded and never left to Pango's implicit default (Mike Nov 19).
+    kern_ss4_italic = _kerning_css_for_entry(
+        font_paths.get("SourceSerif4", {}).get("italic", {}),
+        "SourceSerif4 italic (.source/.subtitle)")
+    var_ss4_italic = _variation_css_for_entry(
+        font_paths.get("SourceSerif4", {}).get("italic", {}),
+        "SourceSerif4 italic (.source/.subtitle)")
+    kern_ss4_regular = _kerning_css_for_entry(
+        font_paths.get("SourceSerif4", {}).get("regular", {}),
+        "SourceSerif4 regular (.intro)")
+    kern_pd_regular = _kerning_css_for_entry(
+        font_paths.get("PlayfairDisplay", {}).get("regular", {}),
+        "PlayfairDisplay regular (h1)")
+
     return f"""<!DOCTYPE html>
 <html>
 <head>
@@ -879,6 +948,7 @@ body {{
 
 .title-block h1 {{
   font-family: 'PlayfairDisplay';
+  {kern_pd_regular}
   font-size: 22pt;
   line-height: 1.18;
   margin: 0 0 4pt 0;
@@ -887,7 +957,9 @@ body {{
 .title-block .subtitle {{
   font-family: 'SourceSerif4';
   font-style: italic;
+  {kern_ss4_italic}
   font-size: 10pt;
+  {var_ss4_italic}
   line-height: 1.3;
   color: #444444;
   margin: 0 0 2pt 0;
@@ -895,6 +967,7 @@ body {{
 
 .title-block .intro {{
   font-family: 'SourceSerif4';
+  {kern_ss4_regular}
   font-size: 9pt;
   line-height: 1.33;
   margin: 0 0 10pt 0;
@@ -914,7 +987,9 @@ body {{
 .section .source {{
   font-family: 'SourceSerif4';
   font-style: italic;
+  {kern_ss4_italic}
   font-size: 7pt;
+  {var_ss4_italic}
   line-height: 1.29;
   color: #777777;
   margin: 0 0 3pt 0;

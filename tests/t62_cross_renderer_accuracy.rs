@@ -51,6 +51,7 @@ fn specimen_font_accuracy_poppler() {
         "  {} hits, {} minor, {} major, {} sim_fail",
         r.hits, r.minor_misses, r.major_misses, r.similarity_failures,
     );
+    eprintln!("  {}", r.above_threshold_summary());
     eprintln!("  Miss report: {}", r.report_path.display());
 
     assert!(
