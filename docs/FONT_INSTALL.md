@@ -43,6 +43,42 @@ This script:
 5. Refreshes font cache
 6. Generates `font-timeline-specimen.pdf` with real fonts
 
+## Manifest coverage
+
+Every family in the specimen ground truth is covered by the manifest, the
+Microsoft Core Fonts section, or the typewriter section. The manifest also
+covers the common families real documents use, in both install routes (apt /
+Homebrew and `--home` downloads), including:
+
+- DejaVu Sans / Serif / Sans Mono (the Linux default family; the `--home`
+  route extracts them from the Debian packages, since upstream publishes no
+  raw-file download — the Condensed variants and DejaVu Math TeX Gyre are
+  deliberately not extracted)
+- Liberation Serif and Liberation Mono (the metric clones of Times New Roman
+  and Courier New; Liberation Sans was already covered)
+- Noto Sans Mono (the monospace companion to Noto Sans / Noto Serif)
+- Latin Modern Mono and Latin Modern Sans (the TeX default family, alongside
+  Latin Modern Roman; Latin Modern Mono has no bold weight)
+- Roboto Condensed and Inter Display (the width/display generations of
+  Roboto and Inter)
+- TeX Gyre Heros and TeX Gyre Pagella (the Helvetica and Palatino
+  generations of the TeX Gyre family, alongside TeX Gyre Termes)
+
+Deliberately not in the manifest:
+
+- Noto CJK, Noto emoji, Noto UI — no canonical upstream tarball exists for
+  the `--home` route
+- TeX Gyre Cursor, Schola, Bonum, Adventor, Chorus — rarely used; the URW
+  Base 35 section already installs near-twins (Nimbus Mono PS, C059, URW
+  Bookman, URW Gothic, Z003)
+- Source Sans Pro / Source Serif Pro — superseded generations; Adobe's
+  current distribution is Source Sans 3 / Source Serif 4, and the Pro
+  releases are only available as stale release zips
+- Calibri, Cambria, Consolas, and other proprietary Microsoft / Apple
+  families — no free source; Carlito and Caladea are the metric clones
+- Arimo, Tinos, Cousine — metric clones of Arial, Times New Roman, and
+  Courier New, which are already covered
+
 ## Specimen font directory
 
 Real fonts are installed to:
