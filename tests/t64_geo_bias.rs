@@ -8,10 +8,8 @@
 //!   GT-only, no fallback to chosen.
 //!
 //! Theory:
-//!   sigma_center = 0.0599, sigma_pitch = 0.243
-//!   (subpixel error model; derivation in crates/unprint-geometry/src/params.rs.
-//!   The old 1/sqrt(12) / 1/sqrt(6) values assumed whole-pixel uniform
-//!   quantization — the pre-subpixel model).
+//!   sigma_center = 1/√12 ≈0.2887, sigma_pitch = 1/√6≈0.4082
+//!   (whole-pixel uniform quantization; the pre-subpixel model).
 //!   Expected values are the MEASURED filtered sds on main with subpixel
 //!   measurement (Nov 20, 2026: sv=0.0737, sh=0.2697); the assertions are
 //!   one-sided ceilings that fail on excess error only (Mike Nov 20, 2026).
@@ -239,8 +237,8 @@ fn geo_bias_is_zero() {
     // measurement); tolerances are the headroom above them.
     const SIGMA_V_EXPECTED: f64 = 0.074;
     const SIGMA_H_EXPECTED: f64 = 0.270;
-    let sigma_center_theory = 0.0599;
-    let sigma_pitch_theory = 0.243;
+    let sigma_center_theory = 0.2886751345948129;
+    let sigma_pitch_theory = 0.408248290463863;
     eprintln!("theory sigma_center={sigma_center_theory:.4} sigma_pitch={sigma_pitch_theory:.4} expected sv<={SIGMA_V_EXPECTED:.3}+0.15 sh<={SIGMA_H_EXPECTED:.3}+0.20 a=0.45");
 
     let h_allowed = (2.0 * h_rms / (hs.len() as f64).sqrt()).max(0.05);

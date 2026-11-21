@@ -16,6 +16,8 @@ Before every commit, always critique the change, including the errors and redund
 
 - Check the three regression axes below, each against the baseline BAP, for changes that can move the numbers. Verify with a BAP where applicable. A commit that cannot change performance and was not BAP-tested carries no BAP score in its message: restating the baseline score is restating unmeasured data.
 
+- Check the branch's user-visible wording — commit messages, code comments, docs — for invented shorthand, and translate each flagged term per the rule in the mistake classes below.
+
 - Present three parts with file and line references and measured numbers: errors the branch adds, redundancies it adds, and how it could be better.
 
 ## Regression checks
@@ -24,7 +26,7 @@ Check all three axes against the baseline BAP and report each separately. They c
 
 - Runtime: warm-cache audit time. Baseline BAP 1315 audit 254s. Identical code measured 254 to 390s, so judge by re-measurement and mechanism, not single runs. A runtime regression blocks merging.
 
-- ZNCC: mean ZNCC with p50 and p90. Baseline BAP 1364: ZNCC 0.9334, p50 0.9582, p90 0.9782.
+- ZNCC: mean ZNCC with p50 and p90. Baseline BAP 1364: ZNCC 0.9334, p50 0.9582, p90 0.9785.
 
 - Font matching: font hits (exact plus major-only, where exact is a key match at or above 0.9 and major-only is a key match below 0.9) and headline hits (hit plus minor miss). Baseline BAP 1364: font hits 289/506, headline hits 453/506.
 
@@ -82,7 +84,7 @@ Check all three axes against the baseline BAP and report each separately. They c
 
 - Vertical error is word-relative, zero-centered by construction, sum of v_err equals 0. (docs/midpoint-geometry.md)
 
-- Sigmas are first-principles values derived from the subpixel error model (sigma_center 0.0599, sigma_pitch 0.243; derivation in `crates/unprint-geometry/src/params.rs`) with inflection at 0.75 sigma per dimension, not a shared absolute threshold. (docs/midpoint-geometry.md)
+- Sigmas are first-principles uniform-quantization values (sigma_center 1/sqrt(12), sigma_pitch 1/sqrt(6)) with inflection at 0.75 sigma per dimension, not a shared absolute threshold. (docs/midpoint-geometry.md)
 
 - CI #1 wins directly. There is no word-level SSIM reranking. SSIM is a verification gate, not a selector. (docs/text-matching-approach.md, docs/char-index-methodology.md)
 
@@ -369,6 +371,8 @@ Recorded from the November 20, 2026 gutter-fix exchange. Each class names the mi
 - Every mechanism claim must trace to code or measured audit data. When a claim has no measured evidence behind it, say so plainly and say "I do not have data" when unmeasured.
 
 - Never propose new terminology. Two attempts to propose new metric names were both rejected as invented.
+
+- Translate all user-visible output. Shorthand is permitted in reasoning, but every user-visible term must trace to the codebase with file and line, a spec, or Mike's own words; anything else gets spelled out in plain words. (Mike Nov 20, 2026.) Two words were flagged as invented shorthand and are not to be used: 'gutter', which meant a vertical column with no ink, and 'fusion', which meant the letters' ink joined with no white column between them.
 
 ### Cross-candidate comparison across different observation sets
 
