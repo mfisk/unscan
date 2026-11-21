@@ -462,7 +462,7 @@ impl AccuracyResult {
             0.0
         };
         let mut s = format!(
-            "Above 0.9: {}/{} ({:.1}%) — {} hit, {} minor, {} major",
+            "Above 0.9: {}/{} ({:.1}%) — {} exact, {} minor, {} major",
             self.above_threshold, self.above_threshold_scored, pct,
             self.above_threshold_hit, self.above_threshold_minor,
             self.above_threshold_major,
